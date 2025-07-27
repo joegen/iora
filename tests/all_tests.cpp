@@ -395,3 +395,232 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
 
   REQUIRE_FALSE(std::filesystem::exists(oldFile));
 }
+
+/* 
+ * IoraService unit tests
+ *
+ * These tests exercise the high–level IoraService singleton.  The service
+ * aggregates a WebhookServer, state store, expiring cache, configuration
+ * loader, persistent JsonFileStore and logging subsystem.  Each test
+ * configures the service via a combination of command–line arguments
+ * and/or a temporary configuration file.  Command‑line flags must always
+ * override the TOML configuration regardless of order, and component
+ * factories should operate correctly in multi‑threaded contexts.  To avoid
+ * interference between tests, each test uses a unique port and state file
+ * name.  Log files and JSON files created during tests are cleaned up at
+ * the end of each test.
+ */
+
+TEST_CASE("IoraService basic operations", "[iora][IoraService]")
+{
+  // prepare argv with explicit port and state file to avoid conflicts
+  const char* args[] = {"program", "--port", "8110",
+                        "--state-file", "ioraservice_basic_state.json",
+                        "--log-file", "ioraservice_basic_log"};
+  int argc = static_cast<int>(sizeof(args)/sizeof(args[0]));
+
+  // Initialise the service with the provided arguments
+  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+
+  // in-memory state store works
+  svc.stateStore().set("foo","bar");
+  REQUIRE(svc.stateStore().get("foo").value() == "bar");
+
+  // cache works and expires
+  svc.cache().set("cacheKey", std::string("cacheValue"), std::chrono::seconds(1));
+  REQUIRE(svc.cache().get("cacheKey").value() == "cacheValue");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  REQUIRE_FALSE(svc.cache().get("cacheKey").has_value());
+
+  // persistent JsonFileStore writes to disk
+  svc.jsonFileStore().set("persist","value");
+  REQUIRE(svc.jsonFileStore().get("persist").value() == "value");
+  {
+    std::ifstream infile("ioraservice_basic_state.json");
+    REQUIRE(infile.is_open());
+    std::string content((std::istreambuf_iterator<char>(infile)), {});
+    REQUIRE(content.find("persist") != std::string::npos);
+  }
+
+  // factory JsonFileStore is independent
+  {
+    iora::state::JsonFileStore tmp = svc.makeJsonFileStore("ioraservice_factory_state.json");
+    tmp.set("altKey","altValue");
+    REQUIRE(tmp.get("altKey").value() == "altValue");
+    REQUIRE_FALSE(svc.jsonFileStore().get("altKey").has_value());
+    std::filesystem::remove("ioraservice_factory_state.json");
+  }
+
+  // factory HttpClient returns distinct stateless objects
+  {
+    auto c1 = svc.makeHttpClient();
+    auto c2 = svc.makeHttpClient();
+    REQUIRE(&c1 != &c2);
+  }
+
+  // register endpoint, start server and call it to confirm correct port
+  svc.webhookServer().onJsonGet("/basic",[](const httplib::Request&)->iora::Json{
+    return {{"ok",true}};
+  });
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  {
+    auto client = svc.makeHttpClient();
+    auto res = client.get("http://localhost:8110/basic");
+    REQUIRE(res["ok"] == true);
+  }
+  svc.stopWebhookServer();
+  iora::log::Logger::shutdown();
+  // clean up generated files
+  for (const auto& file : std::filesystem::directory_iterator(".")) {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_basic_log")!=std::string::npos ||
+        name.find("ioraservice_basic_state.json")!=std::string::npos) {
+      std::filesystem::remove(file.path());
+    }
+  }
+}
+
+TEST_CASE("IoraService configuration file override", "[iora][IoraService][config]")
+{
+  // create a temp config TOML with custom server, state and logger settings
+  const std::string cfg = "ioraservice_cfg_override.toml";
+  {
+    std::ofstream out(cfg);
+    out<<"[server]\nport = 8111\n";
+    out<<"[state]\nfile = 'ioraservice_cfg_state.json'\n";
+    out<<"[log]\nlevel = 'debug'\nfile = 'ioraservice_cfg_log'\n";
+    out<<"async = false\nretention_days = 2\n";
+    out<<"time_format = '%Y%m%d'\n";
+  }
+
+  const char* args[] = {"program","--config",cfg.c_str()};
+  int argc = static_cast<int>(sizeof(args)/sizeof(args[0]));
+  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+
+  svc.webhookServer().onJsonGet("/cfg",[](const httplib::Request&)->iora::Json{
+    return {{"cfg",true}};
+  });
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  {
+    auto client = svc.makeHttpClient();
+    auto res = client.get("http://localhost:8111/cfg");
+    REQUIRE(res["cfg"] == true);
+  }
+  // state file override works
+  svc.jsonFileStore().set("cfgKey","cfgValue");
+  REQUIRE(std::filesystem::exists("ioraservice_cfg_state.json"));
+  // logger override writes file
+  LOG_DEBUG("Configuration override test message");
+  iora::log::Logger::shutdown();
+  std::string logFile = std::string("ioraservice_cfg_log.") + iora::log::Logger::currentDate() + ".log";
+  REQUIRE(std::filesystem::exists(logFile));
+  svc.stopWebhookServer();
+  // clean up
+  for (const auto& file : std::filesystem::directory_iterator(".")) {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_cfg_log") != std::string::npos ||
+        name.find("ioraservice_cfg_state.json") != std::string::npos ||
+        name == cfg) {
+      std::filesystem::remove(file.path());
+    }
+  }
+}
+
+TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
+{
+  // config file with one port and state file; CLI should override both
+  const std::string cfg = "ioraservice_cli_precedence.toml";
+  {
+    std::ofstream out(cfg);
+    out<<"[server]\nport = 8112\n";
+    out<<"[state]\nfile = 'ioraservice_cli_state.json'\n";
+    out<<"[log]\nlevel = 'info'\nfile = 'ioraservice_cli_log'\n";
+    out<<"async = false\nretention_days = 1\n";
+    out<<"time_format = '%Y%m%d'\n";
+  }
+  const char* args[] = {
+    "program",
+    "--port","8123",
+    "--state-file","ioraservice_cli_override_state.json",
+    "--config",cfg.c_str(),
+    "--log-file","ioraservice_cli_override_log",
+    "--log-level","error"
+  };
+  int argc = static_cast<int>(sizeof(args)/sizeof(args[0]));
+  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+
+  svc.webhookServer().onJsonGet("/cli",[](const httplib::Request&)->iora::Json{
+    return {{"cli",true}};
+  });
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  {
+    auto client = svc.makeHttpClient();
+    auto res = client.get("http://localhost:8123/cli");
+    REQUIRE(res["cli"] == true);
+  }
+  // state file uses CLI override, not config
+  svc.jsonFileStore().set("cliKey","cliValue");
+  REQUIRE(std::filesystem::exists("ioraservice_cli_override_state.json"));
+  // logger uses CLI override; error logs should appear
+  LOG_ERROR("CLI override log test");
+  iora::log::Logger::shutdown();
+  std::string logFile = std::string("ioraservice_cli_override_log.") + iora::log::Logger::currentDate() + ".log";
+  REQUIRE(std::filesystem::exists(logFile));
+  svc.stopWebhookServer();
+  // clean up files
+  for (const auto& file : std::filesystem::directory_iterator(".")) {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_cli_override_log")!=std::string::npos ||
+        name.find("ioraservice_cli_state.json")!=std::string::npos ||
+        name.find("ioraservice_cli_override_state.json")!=std::string::npos ||
+        name == cfg) {
+      std::filesystem::remove(file.path());
+    }
+  }
+}
+
+TEST_CASE("IoraService concurrent HTTP clients", "[iora][IoraService][concurrency]")
+{
+  // unique port for this test
+  const char* args[] = {"program","--port","8113","--state-file","ioraservice_concurrency_state.json",
+                        "--log-file","ioraservice_concurrency_log"};
+  int argc = static_cast<int>(sizeof(args)/sizeof(args[0]));
+  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+
+  svc.webhookServer().onJsonGet("/ping",[](const httplib::Request&)->iora::Json{
+    return {{"pong",true}};
+  });
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  const int threadCount = 5;
+  std::vector<std::thread> workers;
+  std::atomic<int> successCount{0};
+  for (int i = 0; i < threadCount; ++i) {
+    workers.emplace_back([&svc,&successCount](){
+      auto client = svc.makeHttpClient();
+      try {
+        auto res = client.get("http://localhost:8113/ping");
+        if (res["pong"] == true) {
+          successCount.fetch_add(1);
+        }
+      } catch (...) {}
+    });
+  }
+  for (auto& t : workers) t.join();
+  REQUIRE(successCount.load() == threadCount);
+  iora::log::Logger::shutdown();
+  svc.stopWebhookServer();
+  // clean up
+  for (const auto& file : std::filesystem::directory_iterator(".")) {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_concurrency_log")!=std::string::npos ||
+        name.find("ioraservice_concurrency_state.json")!=std::string::npos) {
+      std::filesystem::remove(file.path());
+    }
+  }
+}
+
