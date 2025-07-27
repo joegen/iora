@@ -1,0 +1,42 @@
+# NOTICE: Third-Party Attributions for Iora
+
+This project includes third-party code licensed under the MIT License:
+
+---
+
+**cpr** – A modern C++ HTTP client library  
+https://github.com/libcpr/cpr  
+Copyright (c) 2015-present Tim Stack  
+License: MIT
+
+---
+
+**cpp-httplib** – A C++11 single-header HTTP/HTTPS server and client  
+https://github.com/yhirose/cpp-httplib  
+Copyright (c) 2020 Yuji Hirose  
+License: MIT
+
+---
+
+**nlohmann/json** – JSON for Modern C++  
+https://github.com/nlohmann/json  
+Copyright (c) 2013-2023 Niels Lohmann  
+License: MIT
+
+---
+
+**toml++** – TOML parser for C++  
+https://github.com/marzer/tomlplusplus  
+Copyright (c) 2019–2024 Mark Gillard  
+License: MIT
+
+---
+
+**tiktoken-cpp** – Byte pair encoding tokenizer for OpenAI models  
+https://github.com/gh-markt/tiktoken  
+Copyright (c) 2023 gh-markt  
+License: MIT
+
+---
+
+These components are used in accordance with their licenses. Each retains its own copyright.
