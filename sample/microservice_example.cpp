@@ -23,18 +23,20 @@ int main()
   iora::log::Logger::info("StateStore initialized.");
 
   // Initialize ExpiringCache
-  iora::util::ExpiringCache<std::string, std::string> cache(std::chrono::seconds(60));
+  iora::util::ExpiringCache<std::string, std::string> cache(
+      std::chrono::seconds(60));
   cache.set("cacheKey", "cacheValue");
   iora::log::Logger::info("Cache initialized.");
 
   // Start WebhookServer
   iora::http::WebhookServer server(port);
   server.on("/webhook",
-    [](const httplib::Request& req, httplib::Response& res)
-    {
-      iora::log::Logger::info("Received webhook: " + req.body);
-      res.set_content("Webhook received", "text/plain");
-    });
+            [](const httplib::Request& req, httplib::Response& res)
+            {
+              iora::log::Logger::info("Received webhook: " + req.body);
+              res.set_content("Webhook received", "text/plain");
+            });
   server.start();
-  iora::log::Logger::info("WebhookServer started on port " + std::to_string(port) + ".");
+  iora::log::Logger::info("WebhookServer started on port " +
+                          std::to_string(port) + ".");
 }
