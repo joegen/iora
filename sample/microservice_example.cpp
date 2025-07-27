@@ -40,8 +40,18 @@ int main(int argc, char** argv)
   if (!tokenOpt)
   {
     // first run: read from environment or CLI and persist
-    std::string token = std::getenv("OPENAI_API_KEY");
-    svc.jsonFileStore().set("apiToken", token);
+    const char* envToken = std::getenv("OPENAI_API_KEY");
+    if (envToken)
+    {
+      std::string token = envToken;
+      svc.jsonFileStore().set("apiToken", token);
+    }
+    else
+    {
+      LOG_ERROR("Environment variable OPENAI_API_KEY is not set.");
+      std::cerr << "Error: OPENAI_API_KEY is required but not set." << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
   }
 
   // /summarize accepts JSON { "text": "...", "max_tokens": 256 }
