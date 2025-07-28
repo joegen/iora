@@ -174,6 +174,64 @@ sudo make install
 
 ---
 
+## 🔌 Plugin Support
+
+Iora now supports a dynamic plugin system, allowing you to extend its functionality by loading plugins at runtime. Plugins are shared libraries that implement the `IoraService::Plugin` interface and are loaded using the `IORA_DECLARE_PLUGIN` macro.
+
+### How It Works
+
+1. **Plugin Interface**: All plugins must inherit from `IoraService::Plugin` and implement the `onLoad` and `onUnload` methods.
+2. **Plugin Declaration**: Use the `IORA_DECLARE_PLUGIN` macro to define the `loadModule` function required for dynamic loading.
+3. **Dynamic Loading**: Plugins are loaded from a specified directory at runtime. The directory can be configured via the `--modules` command-line argument or the configuration file.
+
+### Example Plugin
+
+Here is an example of a simple plugin:
+
+```cpp
+#include "iora/iora.hpp"
+
+class MyPlugin : public iora::IoraService::Plugin
+{
+public:
+  explicit MyPlugin(iora::IoraService* service) : Plugin(service) {}
+
+  void onLoad(iora::IoraService* service) override
+  {
+    // Initialization logic
+  }
+
+  void onUnload() override
+  {
+    // Cleanup logic
+  }
+};
+
+IORA_DECLARE_PLUGIN(MyPlugin);
+```
+
+### Configuration
+
+To enable plugin loading, specify the directory containing your plugins:
+
+- **Command-line**: Use the `--modules` argument:
+  ```bash
+  ./iora --modules /path/to/plugins
+  ```
+
+- **Configuration File**: Add the following to your TOML configuration:
+  ```toml
+  [modules]
+  directory = "/path/to/plugins"
+  ```
+
+### Logging and Error Handling
+
+- Plugin initialization errors are logged using the `iora::log::Logger`.
+- If a plugin fails to load, it will be skipped, and the system will continue loading other plugins.
+
+---
+
 ## 📝 License
 
 Iora is licensed under the [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/).  
