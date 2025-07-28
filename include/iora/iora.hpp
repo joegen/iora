@@ -1298,6 +1298,30 @@ public:
   /// \brief Factory for creating a new stateless HTTP client.
   http::HttpClient makeHttpClient() const { return http::HttpClient{}; }
 
+  /// @brief Push an event to the EventQueue
+  void pushEvent(const iora::Json& event)
+  {
+    _eventQueue.push(event);
+  }
+
+  /// @brief Register a handler for an event by its ID
+  void registerEventHandlerById(const std::string& eventId, util::EventQueue::Handler handler)
+  {
+    _eventQueue.onEventId(eventId, std::move(handler));
+  }
+
+  /// @brief Register a handler for an event by its name
+  void registerEventHandlerByName(const std::string& eventName, util::EventQueue::Handler handler)
+  {
+    _eventQueue.onEventName(eventName, std::move(handler));
+  }
+
+  /// @brief Provides access to the EventQueue for managing events.
+  util::EventQueue& eventQueue()
+  {
+    return _eventQueue;
+  }
+
 private:
   /// \brief Private constructor initialises members and loads configuration.
   IoraService()
@@ -1560,6 +1584,9 @@ private:
   config::ConfigLoader _configLoader;
   state::JsonFileStore _jsonFileStore;
   bool _serverRunning;
+
+  /// @brief EventQueue for managing and dispatching events
+  util::EventQueue _eventQueue{4}; // Default to 4 worker threads
 };
 
 } // namespace iora

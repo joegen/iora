@@ -713,3 +713,43 @@ TEST_CASE("EventQueue shuts down gracefully", "[EventQueue]")
   REQUIRE(counter == 1); // Ensure event was processed before shutdown
 }
 
+TEST_CASE("IoraService integrates EventQueue", "[iora][IoraService][EventQueue]")
+{
+  // prepare argv with explicit port and state file to avoid conflicts
+  const char* args[] = {"program", "--port", "8114",
+                        "--state-file", "ioraservice_eventqueue_state.json",
+                        "--log-file", "ioraservice_eventqueue_log"};
+  int argc = static_cast<int>(sizeof(args)/sizeof(args[0]));
+
+  // Initialise the service with the provided arguments
+  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+
+  // Register an event handler in the EventQueue
+  std::atomic<int> counter{0};
+  svc.eventQueue().onEventId("testEventId", [&](const iora::Json& event) {
+    REQUIRE(event["eventId"] == "testEventId");
+    counter++;
+  });
+
+  // Push an event to the EventQueue
+  iora::Json event = { {"eventId", "testEventId"}, {"eventName", "testEventName"} };
+  svc.eventQueue().push(event);
+
+  // Allow some time for the event to be processed
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  // Verify the event was processed
+  REQUIRE(counter == 1);
+
+  // Clean up generated files
+  for (const auto& file : std::filesystem::directory_iterator("."))
+  {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_eventqueue_log") != std::string::npos ||
+        name.find("ioraservice_eventqueue_state.json") != std::string::npos)
+    {
+      std::filesystem::remove(file.path());
+    }
+  }
+}
+

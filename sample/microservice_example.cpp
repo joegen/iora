@@ -30,6 +30,10 @@
 
 #include "iora/iora.hpp"
 
+#include <atomic>
+#include <unordered_map>
+#include <mutex>
+
 int main(int argc, char** argv)
 {
   // Initialise service (reads config.toml, overrides via CLI)
@@ -54,46 +58,63 @@ int main(int argc, char** argv)
     }
   }
 
-  // /summarize accepts JSON { "text": "...", "max_tokens": 256 }
-  svc.webhookServer().onJson("/summarize",
-    [&](const iora::Json& input) -> iora::Json
+  // Map to store request statuses and results
+  std::unordered_map<std::string, iora::Json> results;
+  std::mutex resultsMutex;
+
+  // Register EventQueue handler for processing summarization requests
+  svc.eventQueue().onEventId("summarize", [&](const iora::Json& input) {
+    std::string requestId = input["requestId"];
+    std::string text = input["text"];
+    int maxTokens = input.value("max_tokens", 256);
+
+    // Build payload for LLM
+    iora::Json payload = {
+      { "model", "gpt-3.5-turbo" },
+      { "messages", { { { "role","user" }, { "content", "Summarise: " + text } } } },
+      { "max_tokens", maxTokens }
+    };
+
+    // Call LLM provider
+    auto client = svc.makeHttpClient();
+    auto headers = std::map<std::string, std::string>{
+      { "Authorization", "Bearer " + svc.jsonFileStore().get("apiToken").value() },
+      { "Content-Type", "application/json" }
+    };
+
+    auto llmRes = client.postJson("https://api.openai.com/v1/chat/completions", payload, headers);
+    std::string summary = llmRes["choices"][0]["message"]["content"];
+
+    // Store result in the map
     {
-      std::string text      = input["text"];
-      int maxTokens         = input.value("max_tokens", 256);
-      std::string cacheKey  = std::to_string(std::hash<std::string>{}(text));
+      std::lock_guard<std::mutex> lock(resultsMutex);
+      results[requestId] = { { "summary", summary } };
+    }
+  });
 
-      // check cache
-      if (auto cached = svc.cache().get(cacheKey))
-      {
-        LOG_INFO("Cache hit");
-        return *cached;
-      }
+  // /summarize endpoint queues requests
+  svc.webhookServer().onJson("/summarize", [&](const iora::Json& input) -> iora::Json {
+    std::string text = input["text"];
+    int maxTokens = input.value("max_tokens", 256);
+    std::string requestId = std::to_string(std::hash<std::string>{}(text));
 
-      // build payload for LLM
-      iora::Json payload = {
-        { "model", "gpt-3.5-turbo" },
-        { "messages", { { { "role","user" }, { "content", "Summarise: " + text } } } },
-        { "max_tokens", maxTokens }
-      };
+    // Queue the request
+    svc.eventQueue().push({ { "eventId", "summarize" }, { "requestId", requestId }, { "text", text }, { "max_tokens", maxTokens } });
 
-      // call LLM provider
-      auto client  = svc.makeHttpClient();
-      auto headers = std::map<std::string,std::string>{
-        { "Authorization", "Bearer " + svc.jsonFileStore().get("apiToken").value() },
-        { "Content-Type", "application/json" }
-      };
+    return { { "status", "processing" }, { "requestId", requestId } };
+  });
 
-      auto llmRes = client.postJson("https://api.openai.com/v1/chat/completions",
-                                    payload, headers);
+  // /status endpoint retrieves results
+  svc.webhookServer().onJson("/status", [&](const iora::Json& input) -> iora::Json {
+    std::string requestId = input["requestId"];
 
-      std::string summary = llmRes["choices"][0]["message"]["content"];
-      iora::Json result   = { { "summary", summary } };
-
-      // store in cache
-      svc.cache().set(cacheKey, result, std::chrono::seconds(300));
-      return result;
-    });
-
+    std::lock_guard<std::mutex> lock(resultsMutex);
+    if (results.find(requestId) != results.end())
+    {
+      return results[requestId];
+    }
+    return { { "status", "pending" } };
+  });
 
   svc.startWebhookServer();
   while (true) { std::this_thread::sleep_for(std::chrono::seconds(60)); }
