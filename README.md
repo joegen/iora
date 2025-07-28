@@ -32,6 +32,7 @@ While originally built to support projects in AI and VoIP, `iora` is designed to
 - **util::ExpiringCache<K,V>** – TTL-based thread-safe cache.
 - **util::CaselessMap** – Case-insensitive `unordered_map`.
 - **log::Logger** – Static class with levels (debug/info/warn/error).
+- **util::EventQueue** – Thread-safe event queue for dispatching JSON events to registered handlers.
 
 ---
 
