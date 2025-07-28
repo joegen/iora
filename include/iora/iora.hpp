@@ -168,11 +168,20 @@ namespace util
       _handlersById[eventId].emplace_back(std::move(handler));
     }
 
-    /// @brief Register a handler for an eventName (can be a glob pattern)
-    void onEventName(const std::string& eventNamePattern, Handler handler)
+    /// @brief Register a handler for an exact eventName
+    void onEventName(const std::string& eventName, Handler handler)
     {
       std::unique_lock<std::mutex> lock(_mutex);
-      _handlersByName[eventNamePattern].emplace_back(std::move(handler));
+      _handlersByName[eventName].emplace_back(std::move(handler));
+    }
+
+    /// @brief Register a handler for an eventName using regex matching
+    void onEventNameMatches(const std::string& eventNamePattern,
+                            Handler handler)
+    {
+      std::unique_lock<std::mutex> lock(_mutex);
+      _compiledHandlersByName[eventNamePattern] =
+          std::make_pair(std::regex(eventNamePattern), std::move(handler));
     }
 
   private:
@@ -186,6 +195,8 @@ namespace util
     std::queue<iora::Json> _queue;
     std::map<std::string, std::vector<Handler>> _handlersById;
     std::map<std::string, std::vector<Handler>> _handlersByName;
+    std::map<std::string, std::pair<std::regex, Handler>>
+        _compiledHandlersByName;
     std::vector<std::thread> _threads;
     bool _shutdown = false;
 
@@ -220,7 +231,7 @@ namespace util
       bool handled = false;
 
       std::vector<Handler> idHandlers;
-      std::vector<std::pair<std::string, std::vector<Handler>>> nameHandlers;
+      std::vector<Handler> nameHandlers;
 
       {
         std::unique_lock<std::mutex> lock(_mutex);
@@ -231,11 +242,17 @@ namespace util
           idHandlers = idHandlersIt->second;
         }
 
-        for (const auto& [pattern, handlers] : _handlersByName)
+        auto nameHandlersIt = _handlersByName.find(eventName);
+        if (nameHandlersIt != _handlersByName.end())
         {
-          if (eventNameMatches(pattern, eventName))
+          nameHandlers = nameHandlersIt->second;
+        }
+
+        for (const auto& [pattern, compiledHandler] : _compiledHandlersByName)
+        {
+          if (std::regex_match(eventName, compiledHandler.first))
           {
-            nameHandlers.emplace_back(pattern, handlers);
+            nameHandlers.emplace_back(compiledHandler.second);
           }
         }
       }
@@ -246,13 +263,10 @@ namespace util
         handled = true;
       }
 
-      for (const auto& [pattern, handlers] : nameHandlers)
+      for (const auto& handler : nameHandlers)
       {
-        for (const auto& handler : handlers)
-        {
-          handler(event);
-          handled = true;
-        }
+        handler(event);
+        handled = true;
       }
 
       if (!handled)
@@ -1299,28 +1313,24 @@ public:
   http::HttpClient makeHttpClient() const { return http::HttpClient{}; }
 
   /// @brief Push an event to the EventQueue
-  void pushEvent(const iora::Json& event)
-  {
-    _eventQueue.push(event);
-  }
+  void pushEvent(const iora::Json& event) { _eventQueue.push(event); }
 
   /// @brief Register a handler for an event by its ID
-  void registerEventHandlerById(const std::string& eventId, util::EventQueue::Handler handler)
+  void registerEventHandlerById(const std::string& eventId,
+                                util::EventQueue::Handler handler)
   {
     _eventQueue.onEventId(eventId, std::move(handler));
   }
 
   /// @brief Register a handler for an event by its name
-  void registerEventHandlerByName(const std::string& eventName, util::EventQueue::Handler handler)
+  void registerEventHandlerByName(const std::string& eventName,
+                                  util::EventQueue::Handler handler)
   {
     _eventQueue.onEventName(eventName, std::move(handler));
   }
 
   /// @brief Provides access to the EventQueue for managing events.
-  util::EventQueue& eventQueue()
-  {
-    return _eventQueue;
-  }
+  util::EventQueue& eventQueue() { return _eventQueue; }
 
 private:
   /// \brief Private constructor initialises members and loads configuration.
