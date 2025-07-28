@@ -15,15 +15,16 @@
 #include <algorithm>
 #include <cpr/cpr.h>
 #include <stdexcept>
+#include <filesystem>
 
 #ifdef iora_USE_TIKTOKEN
 #include <tiktoken/encodings.h>
 #endif
 
 #ifdef _WIN32
-  #include <windows.h>
+#include <windows.h>
 #else
-  #include <dlfcn.h>
+#include <dlfcn.h>
 #endif
 
 namespace iora
@@ -514,16 +515,16 @@ namespace util
     /// \tparam T Function or object pointer type
     /// \param name Symbol name to resolve
     /// \return Resolved symbol cast to type T
-    template <typename T>
-    T resolve(const std::string& name)
+    template <typename T> T resolve(const std::string& name)
     {
-        if (!isValid())
-        {
-            throw std::runtime_error("Cannot resolve symbol from an invalid library: " + name);
-        }
+      if (!isValid())
+      {
+        throw std::runtime_error(
+            "Cannot resolve symbol from an invalid library: " + name);
+      }
 
 #ifdef _WIN32
-      FARPROC symbol = GetProcAddress((HMODULE)_handle, name.c_str());
+      FARPROC symbol = GetProcAddress((HMODULE) _handle, name.c_str());
 #else
       void* symbol = dlsym(_handle, name.c_str());
 #endif
@@ -532,8 +533,8 @@ namespace util
         throw std::runtime_error("Failed to resolve symbol: " + name);
       }
 
-    _symbolCache[name] = symbol;
-    return reinterpret_cast<T>(symbol);
+      _symbolCache[name] = symbol;
+      return reinterpret_cast<T>(symbol);
     }
 
     /// \brief Check whether the library loaded successfully
@@ -1386,9 +1387,35 @@ namespace shell
 ///        components (HTTP server, configuration loader, caches and stores)
 ///        and provides factory methods for stateless utilities such as the
 ///        HTTP client and JSON file stores.
-class IoraService
+class IoraService : public util::PluginManager
 {
 public:
+  /// \brief Abstract interface all Iora plugins must implement
+  class Plugin
+  {
+  public:
+    /// \brief Constructor that sets the service instance
+    explicit Plugin(IoraService* service) : _service(service)
+    {
+      if (!_service)
+      {
+        throw std::invalid_argument("IoraService instance cannot be null");
+      }
+    }
+    virtual ~Plugin() = default;
+
+    /// \brief Called when the plugin is loaded
+    virtual void onLoad(IoraService* service) = 0;
+
+    /// \brief Called before the plugin is unloaded
+    virtual void onUnload() = 0;
+
+    IoraService* service() const { return _service; }
+
+  private:
+    IoraService* _service = nullptr;
+  };
+
   /// \brief Retrieves the global instance of the service.
   static IoraService& instance()
   {
@@ -1527,6 +1554,53 @@ private:
   /// \brief Private destructor stops the server.
   ~IoraService() { stopWebhookServer(); }
 
+  void loadModules()
+  {
+    if (_modules.empty())
+    {
+      LOG_INFO("No modules specified, skipping plugin loading.");
+      return;
+    }
+    LOG_INFO("Loading modules from: " + _modules);
+    std::filesystem::path modulesPath(_modules);
+    if (!std::filesystem::exists(modulesPath))
+    {
+      LOG_ERROR("Modules path does not exist: " + _modules);
+      return;
+    }
+    if (!std::filesystem::is_directory(modulesPath))
+    {
+      LOG_ERROR("Modules path is not a directory: " + _modules);
+      return;
+    }
+    const std::vector<std::string> supportedExtensions = {".so", ".dll"};
+    for (const auto& entry : std::filesystem::directory_iterator(modulesPath))
+    {
+      if (entry.is_regular_file() &&
+          std::find(supportedExtensions.begin(), supportedExtensions.end(),
+                    entry.path().extension()) != supportedExtensions.end())
+      {
+        try
+        {
+          std::string pluginName = entry.path().filename().string();
+          LOG_INFO("Loading plugin: " + pluginName);
+          loadPlugin(pluginName, entry.path().string());
+
+          // Resolve and call the exported loadModule function
+          using LoadModuleFunc = Plugin* (*)(iora::IoraService*);
+          auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
+          loadModule(this);
+        }
+        catch (const std::exception& e)
+        {
+          LOG_ERROR("Failed to load plugin: " + entry.path().string() + " - " +
+                    e.what());
+        }
+      }
+    }
+    LOG_INFO("Module loading complete.");
+  }
+
   /// \brief Parses command‑line arguments and overrides configuration
   /// accordingly.
   void parseCommandLine(int argc, char** argv)
@@ -1570,6 +1644,10 @@ private:
       else if ((arg == "-f" || arg == "--log-file") && i + 1 < argc)
       {
         cliLogFile = std::string{argv[++i]};
+      }
+      else if ((arg == "-m" || arg == "--modules") && i + 1 < argc)
+      {
+        _modules = std::string{argv[++i]};
       }
       else if (arg == "--log-async" && i + 1 < argc)
       {
@@ -1619,6 +1697,19 @@ private:
           {
             if (auto portInt = portVal->as_integer())
               _port = static_cast<int>(portInt->get());
+          }
+        }
+        if (auto serverTable = cfg["modules"].as_table())
+        {
+          if (auto modulesVal = serverTable->get("directory"))
+          {
+            if (auto modulesStr = modulesVal->as_string())
+            {
+              if (_modules.empty())
+              {
+                _modules = modulesStr->get();
+              }
+            }
           }
         }
         if (auto stateTable = cfg["state"].as_table())
@@ -1733,6 +1824,8 @@ private:
     // format:contentReference[oaicite:2]{index=2}.
     log::Logger::init(finalLevel, finalFile, finalAsync, finalRetention,
                       finalTimeFormat);
+
+    loadModules();
   }
 
   int _port;
@@ -1742,9 +1835,27 @@ private:
   config::ConfigLoader _configLoader;
   state::JsonFileStore _jsonFileStore;
   bool _serverRunning;
+  std::string _modules;
 
   /// @brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads
 };
+
+using IoraPlugin = IoraService::Plugin;
+#define IORA_DECLARE_PLUGIN(PluginType)                                        \
+  extern "C" iora::IoraPlugin* loadModule(iora::IoraService* service)          \
+  {                                                                            \
+    try                                                                        \
+    {                                                                          \
+      static PluginType instance(service);                                     \
+      instance.onLoad(service);                                                \
+      return &instance;                                                        \
+    }                                                                          \
+    catch (const std::exception& e)                                            \
+    {                                                                          \
+      iora::log::Logger::error("Plugin initialization failed: " + std::string(e.what())); \
+      return nullptr;                                                          \
+    }                                                                          \
+  }
 
 } // namespace iora
