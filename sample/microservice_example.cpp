@@ -59,17 +59,17 @@ int main(int argc, char** argv)
   }
 
   // Map to store request statuses and results
-  std::unordered_map<std::string, iora::Json> results;
+  std::unordered_map<std::string, iora::json::Json> results;
   std::mutex resultsMutex;
 
   // Register EventQueue handler for processing summarization requests
-  svc.eventQueue().onEventId("summarize", [&](const iora::Json& input) {
+  svc.eventQueue().onEventId("summarize", [&](const iora::json::Json& input) {
     std::string requestId = input["requestId"];
     std::string text = input["text"];
     int maxTokens = input.value("max_tokens", 256);
 
     // Build payload for LLM
-    iora::Json payload = {
+    iora::json::Json payload = {
       { "model", "gpt-3.5-turbo" },
       { "messages", { { { "role","user" }, { "content", "Summarise: " + text } } } },
       { "max_tokens", maxTokens }
@@ -93,7 +93,7 @@ int main(int argc, char** argv)
   });
 
   // /summarize endpoint queues requests
-  svc.webhookServer().onJson("/summarize", [&](const iora::Json& input) -> iora::Json {
+  svc.webhookServer().onJson("/summarize", [&](const iora::json::Json& input) -> iora::json::Json {
     std::string text = input["text"];
     int maxTokens = input.value("max_tokens", 256);
     std::string requestId = std::to_string(std::hash<std::string>{}(text));
@@ -105,7 +105,7 @@ int main(int argc, char** argv)
   });
 
   // /status endpoint retrieves results
-  svc.webhookServer().onJson("/status", [&](const iora::Json& input) -> iora::Json {
+  svc.webhookServer().onJson("/status", [&](const iora::json::Json& input) -> iora::json::Json {
     std::string requestId = input["requestId"];
 
     std::lock_guard<std::mutex> lock(resultsMutex);

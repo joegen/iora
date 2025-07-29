@@ -7,12 +7,12 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
   iora::http::WebhookServer server(8081);
 
   server.onJson("/test-post-json",
-                [](const iora::Json& input) -> iora::Json {
+                [](const iora::json::Json& input) -> iora::json::Json {
                   return {{"echo", input}};
                 });
 
   server.onJsonGet("/test-get",
-                   [](const httplib::Request&) -> iora::Json {
+                   [](const httplib::Request&) -> iora::json::Json {
                      return {{"status", "ok"}};
                    });
 
@@ -24,7 +24,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
                   });
 
   server.onJson("/test-async",
-                [](const iora::Json& input) -> iora::Json {
+                [](const iora::json::Json& input) -> iora::json::Json {
                   return {{"async", true}, {"received", input}};
                 });
 
@@ -51,7 +51,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
 
   SECTION("POST JSON request with payload")
   {
-    iora::Json payload = {{"message", "hello"}};
+    iora::json::Json payload = {{"message", "hello"}};
     auto res = client.postJson("http://localhost:8081/test-post-json", payload);
     REQUIRE(res["echo"]["message"] == "hello");
   }
@@ -65,8 +65,8 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
 
   SECTION("Async POST JSON returns future")
   {
-    iora::Json payload = {{"async_test", 1}};
-    std::future<iora::Json> future =
+    iora::json::Json payload = {{"async_test", 1}};
+    std::future<iora::json::Json> future =
         client.postJsonAsync("http://localhost:8081/test-async", payload);
     auto res = future.get();
     REQUIRE(res["async"] == true);
@@ -75,7 +75,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
 
   SECTION("Streamed POST returns line chunks")
   {
-    iora::Json payload = {{}};
+    iora::json::Json payload = {{}};
     std::vector<std::string> chunks;
     client.postStream("http://localhost:8081/test-stream", payload, {},
                       [&](const std::string& line)
@@ -466,7 +466,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 
   // register endpoint, start server and call it to confirm correct port
   svc.webhookServer().onJsonGet("/basic",
-                                [](const httplib::Request&) -> iora::Json {
+                                [](const httplib::Request&) -> iora::json::Json {
                                   return {{"ok", true}};
                                 });
   svc.startWebhookServer();
@@ -510,7 +510,7 @@ TEST_CASE("IoraService configuration file override",
       iora::IoraService::init(argc, const_cast<char**>(args));
 
   svc.webhookServer().onJsonGet("/cfg",
-                                [](const httplib::Request&) -> iora::Json {
+                                [](const httplib::Request&) -> iora::json::Json {
                                   return {{"cfg", true}};
                                 });
   svc.startWebhookServer();
@@ -571,7 +571,7 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
       iora::IoraService::init(argc, const_cast<char**>(args));
 
   svc.webhookServer().onJsonGet("/cli",
-                                [](const httplib::Request&) -> iora::Json {
+                                [](const httplib::Request&) -> iora::json::Json {
                                   return {{"cli", true}};
                                 });
   svc.startWebhookServer();
@@ -621,7 +621,7 @@ TEST_CASE("IoraService concurrent HTTP clients",
       iora::IoraService::init(argc, const_cast<char**>(args));
 
   svc.webhookServer().onJsonGet("/ping",
-                                [](const httplib::Request&) -> iora::Json {
+                                [](const httplib::Request&) -> iora::json::Json {
                                   return {{"pong", true}};
                                 });
   svc.startWebhookServer();
@@ -672,13 +672,13 @@ TEST_CASE("EventQueue processes valid events", "[EventQueue]")
   std::atomic<int> counter{0};
 
   queue.onEventId("testId",
-                  [&](const iora::Json& event)
+                  [&](const iora::json::Json& event)
                   {
                     REQUIRE(event["eventId"] == "testId");
                     counter++;
                   });
 
-  iora::Json validEvent = {{"eventId", "testId"}, {"eventName", "testEvent"}};
+  iora::json::Json validEvent = {{"eventId", "testId"}, {"eventName", "testEvent"}};
   queue.push(validEvent);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -690,9 +690,9 @@ TEST_CASE("EventQueue drops invalid events", "[EventQueue]")
   iora::util::EventQueue queue(2);
   std::atomic<int> counter{0};
 
-  queue.onEventId("testId", [&](const iora::Json&) { counter++; });
+  queue.onEventId("testId", [&](const iora::json::Json&) { counter++; });
 
-  iora::Json invalidEvent = {{"eventName", "testEvent"}};
+  iora::json::Json invalidEvent = {{"eventName", "testEvent"}};
   queue.push(invalidEvent);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -706,14 +706,14 @@ TEST_CASE("EventQueue matches eventName with glob patterns", "[EventQueue]")
 
   queue.onEventNameMatches(
       "^test.*",
-      [&](const iora::Json& event)
+      [&](const iora::json::Json& event)
       {
         REQUIRE(event["eventName"].get<std::string>().find("test") == 0);
         counter++;
       });
 
-  iora::Json matchingEvent = {{"eventId", "id1"}, {"eventName", "testEvent"}};
-  iora::Json nonMatchingEvent = {{"eventId", "id2"},
+  iora::json::Json matchingEvent = {{"eventId", "id1"}, {"eventName", "testEvent"}};
+  iora::json::Json nonMatchingEvent = {{"eventId", "id2"},
                                  {"eventName", "otherEvent"}};
 
   queue.push(matchingEvent);
@@ -729,15 +729,15 @@ TEST_CASE("EventQueue matches eventName exactly", "[EventQueue]")
   std::atomic<int> counter{0};
 
   queue.onEventName("testEvent",
-                    [&](const iora::Json& event)
+                    [&](const iora::json::Json& event)
                     {
                       REQUIRE(event["eventName"].get<std::string>() ==
                               "testEvent");
                       counter++;
                     });
 
-  iora::Json matchingEvent = {{"eventId", "id1"}, {"eventName", "testEvent"}};
-  iora::Json nonMatchingEvent = {{"eventId", "id2"},
+  iora::json::Json matchingEvent = {{"eventId", "id1"}, {"eventName", "testEvent"}};
+  iora::json::Json nonMatchingEvent = {{"eventId", "id2"},
                                  {"eventName", "otherEvent"}};
 
   queue.push(matchingEvent);
@@ -752,7 +752,7 @@ TEST_CASE("EventQueue handles concurrent pushes and handlers", "[EventQueue]")
   iora::util::EventQueue queue(4);
   std::atomic<int> counter{0};
 
-  queue.onEventId("testId", [&](const iora::Json&) { counter++; });
+  queue.onEventId("testId", [&](const iora::json::Json&) { counter++; });
 
   std::vector<std::thread> threads;
   for (int i = 0; i < 10; ++i)
@@ -760,7 +760,7 @@ TEST_CASE("EventQueue handles concurrent pushes and handlers", "[EventQueue]")
     threads.emplace_back(
         [&queue]()
         {
-          iora::Json event = {{"eventId", "testId"},
+          iora::json::Json event = {{"eventId", "testId"},
                               {"eventName", "testEvent"}};
           queue.push(event);
         });
@@ -780,9 +780,9 @@ TEST_CASE("EventQueue shuts down gracefully", "[EventQueue]")
   iora::util::EventQueue queue(2);
   std::atomic<int> counter{0};
 
-  queue.onEventId("testId", [&](const iora::Json&) { counter++; });
+  queue.onEventId("testId", [&](const iora::json::Json&) { counter++; });
 
-  iora::Json event = {{"eventId", "testId"}, {"eventName", "testEvent"}};
+  iora::json::Json event = {{"eventId", "testId"}, {"eventName", "testEvent"}};
   queue.push(event);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -809,14 +809,14 @@ TEST_CASE("IoraService integrates EventQueue",
   // Register an event handler in the EventQueue
   std::atomic<int> counter{0};
   svc.eventQueue().onEventId("testEventId",
-                             [&](const iora::Json& event)
+                             [&](const iora::json::Json& event)
                              {
                                REQUIRE(event["eventId"] == "testEventId");
                                counter++;
                              });
 
   // Push an event to the EventQueue
-  iora::Json event = {{"eventId", "testEventId"},
+  iora::json::Json event = {{"eventId", "testEventId"},
                       {"eventName", "testEventName"}};
   svc.eventQueue().push(event);
 

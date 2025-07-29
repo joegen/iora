@@ -30,7 +30,11 @@
 namespace iora
 {
 /// JSON type alias to avoid exposing third-party namespaces.
-using Json = nlohmann::json;
+namespace json
+{
+  using Json = nlohmann::json;
+} // namespace json
+
 namespace config
 {
   /// \brief Loads and parses TOML configuration files for the application.
@@ -94,12 +98,12 @@ namespace state
         }
         catch (...)
         {
-          _store = nlohmann::json::object();
+          _store = json::Json::object();
         }
       }
       else
       {
-        _store = nlohmann::json::object();
+        _store = json::Json::object();
       }
 
       registerStore();
@@ -244,7 +248,7 @@ namespace state
 
     const std::string _filename;
     mutable std::mutex _mutex;
-    nlohmann::json _store;
+    json::Json _store;
     bool _dirty;
 
     static inline std::set<JsonFileStore*> _registry;
@@ -262,7 +266,7 @@ namespace util
   class EventQueue
   {
   public:
-    using Handler = std::function<void(const iora::Json&)>;
+    using Handler = std::function<void(const json::Json&)>;
 
     /// \brief Construct the event queue and spin up worker threads
     EventQueue(std::size_t threadCount = std::thread::hardware_concurrency())
@@ -293,7 +297,7 @@ namespace util
     }
 
     /// \brief Enqueue an event for processing
-    void push(const iora::Json& event)
+    void push(const json::Json& event)
     {
       if (!isValidEvent(event))
       {
@@ -332,14 +336,14 @@ namespace util
     }
 
   private:
-    bool isValidEvent(const iora::Json& event) const
+    bool isValidEvent(const json::Json& event) const
     {
       return event.contains("eventId") && event.contains("eventName");
     }
 
     std::mutex _mutex;
     std::condition_variable _cv;
-    std::queue<iora::Json> _queue;
+    std::queue<json::Json> _queue;
     std::map<std::string, std::vector<Handler>> _handlersById;
     std::map<std::string, std::vector<Handler>> _handlersByName;
     std::map<std::string, std::pair<std::regex, Handler>>
@@ -351,7 +355,7 @@ namespace util
     {
       while (true)
       {
-        iora::Json event;
+        json::Json event;
 
         {
           std::unique_lock<std::mutex> lock(_mutex);
@@ -370,7 +374,7 @@ namespace util
       }
     }
 
-    void dispatch(const iora::Json& event)
+    void dispatch(const json::Json& event)
     {
       const std::string eventId = event["eventId"];
       const std::string eventName = event["eventName"];
@@ -603,9 +607,9 @@ namespace util
     }
 
     /// \brief Parses JSON formatted CLI output.
-    static nlohmann::json parseJson(const std::string& input)
+    static json::Json parseJson(const std::string& input)
     {
-      return nlohmann::json::parse(input);
+      return json::Json::parse(input);
     }
   };
 
@@ -794,7 +798,7 @@ namespace http
   {
   public:
     /// \brief Performs a GET request with optional headers.
-    Json get(const std::string& url,
+    json::Json get(const std::string& url,
              const std::map<std::string, std::string>& headers = {},
              int retries = 0) const
     {
@@ -808,7 +812,7 @@ namespace http
     }
 
     /// \brief Performs a POST request with JSON payload.
-    Json postJson(const std::string& url, const Json& body,
+    json::Json postJson(const std::string& url, const json::Json& body,
                   const std::map<std::string, std::string>& headers = {},
                   int retries = 0) const
     {
@@ -825,7 +829,7 @@ namespace http
     }
 
     /// \brief Performs a POST request with multipart form-data.
-    Json postSingleFile(const std::string& url,
+    json::Json postSingleFile(const std::string& url,
                         const std::string& fileFieldName,
                         const std::string& filePath,
                         const std::map<std::string, std::string>& headers = {},
@@ -845,7 +849,7 @@ namespace http
     }
 
     /// \brief Performs a DELETE request.
-    Json deleteRequest(const std::string& url,
+    json::Json deleteRequest(const std::string& url,
                        const std::map<std::string, std::string>& headers = {},
                        int retries = 0) const
     {
@@ -859,8 +863,8 @@ namespace http
     }
 
     /// \brief Performs a POST request asynchronously using std::future.
-    std::future<Json>
-    postJsonAsync(const std::string& url, const Json& body,
+    std::future<json::Json>
+    postJsonAsync(const std::string& url, const json::Json& body,
                   const std::map<std::string, std::string>& headers = {},
                   int retries = 0) const
     {
@@ -870,7 +874,7 @@ namespace http
 
     /// \brief Performs a POST request and streams line-delimited responses via
     /// callback.
-    void postStream(const std::string& url, const Json& body,
+    void postStream(const std::string& url, const json::Json& body,
                     const std::map<std::string, std::string>& headers,
                     const std::function<void(const std::string&)>& onChunk,
                     int retries = 0) const
@@ -889,7 +893,7 @@ namespace http
     }
 
     /// \brief Parses the response as JSON or throws.
-    static Json parseJsonOrThrow(const cpr::Response& response)
+    static json::Json parseJsonOrThrow(const cpr::Response& response)
     {
       if (response.status_code < 200 || response.status_code >= 300)
       {
@@ -899,7 +903,7 @@ namespace http
 
       try
       {
-        return Json::parse(response.text);
+        return json::Json::parse(response.text);
       }
       catch (const std::exception& e)
       {
@@ -929,7 +933,7 @@ namespace http
 
   private:
     template <typename Callable>
-    Json retry(Callable&& action, int retries) const
+    json::Json retry(Callable&& action, int retries) const
     {
       int attempt = 0;
       while (true)
@@ -987,7 +991,7 @@ namespace http
     }
 
     void onJson(const std::string& endpoint,
-                const std::function<Json(const Json&)>& handler)
+                const std::function<json::Json(const json::Json&)>& handler)
     {
       _server->Post(
           endpoint.c_str(),
@@ -995,8 +999,8 @@ namespace http
           {
             try
             {
-              Json requestJson = Json::parse(req.body);
-              Json responseJson = handler(requestJson);
+              json::Json requestJson = json::Json::parse(req.body);
+              json::Json responseJson = handler(requestJson);
               res.set_content(responseJson.dump(), "application/json");
             }
             catch (const std::exception& e)
@@ -1008,7 +1012,7 @@ namespace http
     }
 
     void onJsonGet(const std::string& endpoint,
-                   const std::function<Json(const httplib::Request&)>& handler)
+                   const std::function<json::Json(const httplib::Request&)>& handler)
     {
       _server->Get(
           endpoint.c_str(),
@@ -1016,7 +1020,7 @@ namespace http
           {
             try
             {
-              Json responseJson = handler(req);
+              json::Json responseJson = handler(req);
               res.set_content(responseJson.dump(), "application/json");
             }
             catch (const std::exception& e)
@@ -1624,7 +1628,7 @@ public:
   http::HttpClient makeHttpClient() const { return http::HttpClient{}; }
 
   /// \brief Push an event to the EventQueue
-  void pushEvent(const iora::Json& event) { _eventQueue.push(event); }
+  void pushEvent(const json::Json& event) { _eventQueue.push(event); }
 
   /// \brief Register a handler for an event by its ID
   void registerEventHandlerById(const std::string& eventId,
