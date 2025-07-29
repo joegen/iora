@@ -845,14 +845,14 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   iora::IoraService& svc = iora::IoraService::instance();
 
   // Try both build and source tree locations for the plugin
-  std::string pluginPath = "tests/plugins/libtestplugin.so";
+  std::string pluginPath = "tests/plugins/testplugin.so";
   if (!std::filesystem::exists(pluginPath))
   {
-    pluginPath = "build/tests/plugins/libtestplugin.so";
+    pluginPath = "build/tests/plugins/testplugin.so";
   }
   if (!std::filesystem::exists(pluginPath))
   {
-    pluginPath = "iora/build/tests/plugins/libtestplugin.so";
+    pluginPath = "iora/build/tests/plugins/testplugin.so";
   }
   INFO(std::string("Checked plugin path: ") + pluginPath);
   REQUIRE(std::filesystem::exists(pluginPath));

@@ -8,3 +8,4 @@ target_include_directories(testplugin PRIVATE
 )
 target_link_libraries(testplugin PRIVATE iora_lib cpr::cpr)
 set_target_properties(testplugin PROPERTIES OUTPUT_NAME "testplugin")
+set_target_properties(testplugin PROPERTIES PREFIX "")
