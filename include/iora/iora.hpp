@@ -258,14 +258,14 @@ namespace state
 
 namespace util
 {
-  /// @brief A thread-safe event queue for dispatching JSON events to registered
+  /// \brief A thread-safe event queue for dispatching JSON events to registered
   /// handlers
   class EventQueue
   {
   public:
     using Handler = std::function<void(const iora::Json&)>;
 
-    /// @brief Construct the event queue and spin up worker threads
+    /// \brief Construct the event queue and spin up worker threads
     EventQueue(std::size_t threadCount = std::thread::hardware_concurrency())
     {
       for (std::size_t i = 0; i < threadCount; ++i)
@@ -274,7 +274,7 @@ namespace util
       }
     }
 
-    /// @brief Destructor gracefully shuts down the worker threads
+    /// \brief Destructor gracefully shuts down the worker threads
     ~EventQueue()
     {
       {
@@ -293,7 +293,7 @@ namespace util
       }
     }
 
-    /// @brief Enqueue an event for processing
+    /// \brief Enqueue an event for processing
     void push(const iora::Json& event)
     {
       if (!isValidEvent(event))
@@ -309,21 +309,21 @@ namespace util
       _cv.notify_one();
     }
 
-    /// @brief Register a handler for an exact eventId
+    /// \brief Register a handler for an exact eventId
     void onEventId(const std::string& eventId, Handler handler)
     {
       std::unique_lock<std::mutex> lock(_mutex);
       _handlersById[eventId].emplace_back(std::move(handler));
     }
 
-    /// @brief Register a handler for an exact eventName
+    /// \brief Register a handler for an exact eventName
     void onEventName(const std::string& eventName, Handler handler)
     {
       std::unique_lock<std::mutex> lock(_mutex);
       _handlersByName[eventName].emplace_back(std::move(handler));
     }
 
-    /// @brief Register a handler for an eventName using regex matching
+    /// \brief Register a handler for an eventName using regex matching
     void onEventNameMatches(const std::string& eventNamePattern,
                             Handler handler)
     {
@@ -1631,24 +1631,24 @@ public:
   /// \brief Factory for creating a new stateless HTTP client.
   http::HttpClient makeHttpClient() const { return http::HttpClient{}; }
 
-  /// @brief Push an event to the EventQueue
+  /// \brief Push an event to the EventQueue
   void pushEvent(const iora::Json& event) { _eventQueue.push(event); }
 
-  /// @brief Register a handler for an event by its ID
+  /// \brief Register a handler for an event by its ID
   void registerEventHandlerById(const std::string& eventId,
                                 util::EventQueue::Handler handler)
   {
     _eventQueue.onEventId(eventId, std::move(handler));
   }
 
-  /// @brief Register a handler for an event by its name
+  /// \brief Register a handler for an event by its name
   void registerEventHandlerByName(const std::string& eventName,
                                   util::EventQueue::Handler handler)
   {
     _eventQueue.onEventName(eventName, std::move(handler));
   }
 
-  /// @brief Provides access to the EventQueue for managing events.
+  /// \brief Provides access to the EventQueue for managing events.
   util::EventQueue& eventQueue() { return _eventQueue; }
 
 private:
@@ -2040,7 +2040,7 @@ private:
   bool _serverRunning;
   std::string _modules;
 
-  /// @brief EventQueue for managing and dispatching events
+  /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads
 };
 
