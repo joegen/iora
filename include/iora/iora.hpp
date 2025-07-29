@@ -56,7 +56,8 @@ namespace config
 
 namespace state
 {
-  /// \brief In-memory key-value store for string data with basic get/set operations.
+  /// \brief In-memory key-value store for string data with basic get/set
+  /// operations.
   class ConcreteStateStore
   {
   public:
@@ -81,7 +82,8 @@ namespace state
     std::unordered_map<std::string, std::string> _store;
   };
 
-  /// \brief Thread-safe key-value store backed by a JSON file with background flushing and persistence.
+  /// \brief Thread-safe key-value store backed by a JSON file with background
+  /// flushing and persistence.
   class JsonFileStore
   {
   public:
@@ -262,7 +264,8 @@ namespace state
 
 namespace util
 {
-  /// \brief Thread-safe event queue for dispatching JSON events to registered handlers using worker threads.
+  /// \brief Thread-safe event queue for dispatching JSON events to registered
+  /// handlers using worker threads.
   class EventQueue
   {
   public:
@@ -467,7 +470,8 @@ namespace util
 
   // Forward declaration for friend accessor
   template <typename K, typename V> struct ExpiringCacheTestAccessor;
-  /// \brief Thread-safe expiring cache with time-to-live (TTL) and automatic purging of stale entries.
+  /// \brief Thread-safe expiring cache with time-to-live (TTL) and automatic
+  /// purging of stale entries.
   template <typename K, typename V> class ExpiringCache
   {
   public:
@@ -571,7 +575,6 @@ namespace util
     }
   };
 
-
   /// \brief Provides unit test access to internal state of ExpiringCache.
   template <typename K, typename V> struct ExpiringCacheTestAccessor
   {
@@ -582,7 +585,8 @@ namespace util
     }
   };
 
-  /// \brief Utility for parsing CLI output into key-value pairs or JSON objects.
+  /// \brief Utility for parsing CLI output into key-value pairs or JSON
+  /// objects.
   class CliParser
   {
   public:
@@ -691,7 +695,8 @@ namespace util
     std::unordered_map<std::string, void*> _symbolCache;
   };
 
-  /// \brief Manages the lifecycle and symbol resolution of multiple dynamically loaded plugins.
+  /// \brief Manages the lifecycle and symbol resolution of multiple dynamically
+  /// loaded plugins.
   class PluginManager
   {
   public:
@@ -757,7 +762,8 @@ namespace util
 
 namespace http
 {
-  /// \brief Estimates or computes token counts for input text, optionally using external encoders.
+  /// \brief Estimates or computes token counts for input text, optionally using
+  /// external encoders.
   class Tokenizer
   {
   public:
@@ -793,14 +799,15 @@ namespace http
     }
   };
 
-  /// \brief Feature-rich HTTP client supporting synchronous, asynchronous, and streaming API calls.
+  /// \brief Feature-rich HTTP client supporting synchronous, asynchronous, and
+  /// streaming API calls.
   class HttpClient
   {
   public:
     /// \brief Performs a GET request with optional headers.
     json::Json get(const std::string& url,
-             const std::map<std::string, std::string>& headers = {},
-             int retries = 0) const
+                   const std::map<std::string, std::string>& headers = {},
+                   int retries = 0) const
     {
       return retry(
           [&]()
@@ -813,8 +820,8 @@ namespace http
 
     /// \brief Performs a POST request with JSON payload.
     json::Json postJson(const std::string& url, const json::Json& body,
-                  const std::map<std::string, std::string>& headers = {},
-                  int retries = 0) const
+                        const std::map<std::string, std::string>& headers = {},
+                        int retries = 0) const
     {
       auto allHeaders = headers;
       allHeaders.emplace("Content-Type", "application/json");
@@ -829,11 +836,11 @@ namespace http
     }
 
     /// \brief Performs a POST request with multipart form-data.
-    json::Json postSingleFile(const std::string& url,
-                        const std::string& fileFieldName,
-                        const std::string& filePath,
-                        const std::map<std::string, std::string>& headers = {},
-                        int retries = 0) const
+    json::Json
+    postSingleFile(const std::string& url, const std::string& fileFieldName,
+                   const std::string& filePath,
+                   const std::map<std::string, std::string>& headers = {},
+                   int retries = 0) const
     {
       // Only support a single file part due to cpr::Multipart limitations
       cpr::Multipart multipart{
@@ -849,9 +856,10 @@ namespace http
     }
 
     /// \brief Performs a DELETE request.
-    json::Json deleteRequest(const std::string& url,
-                       const std::map<std::string, std::string>& headers = {},
-                       int retries = 0) const
+    json::Json
+    deleteRequest(const std::string& url,
+                  const std::map<std::string, std::string>& headers = {},
+                  int retries = 0) const
     {
       return retry(
           [&]()
@@ -958,7 +966,8 @@ namespace http
     }
   };
 
-  /// \brief Lightweight, testable HTTP webhook server for handling REST and JSON endpoints.
+  /// \brief Lightweight, testable HTTP webhook server for handling REST and
+  /// JSON endpoints.
   class WebhookServer
   {
   public:
@@ -1011,8 +1020,9 @@ namespace http
           });
     }
 
-    void onJsonGet(const std::string& endpoint,
-                   const std::function<json::Json(const httplib::Request&)>& handler)
+    void
+    onJsonGet(const std::string& endpoint,
+              const std::function<json::Json(const httplib::Request&)>& handler)
     {
       _server->Get(
           endpoint.c_str(),
@@ -1060,7 +1070,8 @@ namespace log
   // Forward declaration
   class LoggerStream;
 
-  /// \brief Thread-safe logger supporting log levels, async mode, file rotation, and retention.
+  /// \brief Thread-safe logger supporting log levels, async mode, file
+  /// rotation, and retention.
   class Logger
   {
   public:
@@ -1421,7 +1432,8 @@ namespace log
     }
   };
 
-  /// \brief Stream interface for composing and emitting log messages with levels.
+  /// \brief Stream interface for composing and emitting log messages with
+  /// levels.
   class LoggerStream
   {
   public:
@@ -1522,7 +1534,8 @@ namespace shell
   };
 } // namespace shell
 
-/// \brief Singleton entry point for the Iora library, managing all core components and providing factory methods for utilities and plugins.
+/// \brief Singleton entry point for the Iora library, managing all core
+/// components and providing factory methods for utilities and plugins.
 class IoraService : public util::PluginManager
 {
 public:
@@ -1646,6 +1659,62 @@ public:
 
   /// \brief Provides access to the EventQueue for managing events.
   util::EventQueue& eventQueue() { return _eventQueue; }
+
+  /// \brief Registers a plugin API function that can be called by plugins.
+  template <typename Func>
+  void registerPluginApi(const std::string& name, Func&& func)
+  {
+    std::lock_guard<std::mutex> lock(_apiMutex);
+    using func_type = std::decay_t<Func>;
+    using signature = decltype(&func_type::operator());
+    _pluginApis[name] = makeStdFunction(std::forward<Func>(func), signature{});
+
+  }
+
+  // Helper to deduce lambda signature and wrap in std::function
+  template <typename Func, typename Ret, typename... Args>
+  static std::function<Ret(Args...)> makeStdFunction(Func&& f, Ret (Func::*)(Args...) const)
+  {
+    return std::function<Ret(Args...)>(std::forward<Func>(f));
+  }
+  template <typename Func, typename Ret, typename... Args>
+  static std::function<Ret(Args...)> makeStdFunction(Func&& f, Ret (Func::*)(Args...) )
+  {
+    return std::function<Ret(Args...)>(std::forward<Func>(f));
+  }
+
+  /// \brief Retrieves a registered plugin API as a std::function for repeated
+  /// calls.
+  /// Throws std::runtime_error if the API is not found or the signature does
+  /// not match.
+  template <typename FuncSignature>
+  std::function<FuncSignature> getPluginApi(const std::string& name)
+  {
+    std::lock_guard<std::mutex> lock(_apiMutex);
+    auto it = _pluginApis.find(name);
+    if (it == _pluginApis.end())
+    {
+      throw std::runtime_error("API not found: " + name);
+    }
+    try
+    {
+      return std::any_cast<std::function<FuncSignature>>(it->second);
+    }
+    catch (const std::bad_any_cast&)
+    {
+      throw std::runtime_error("API signature mismatch for: " + name);
+    }
+  }
+
+  /// \brief Calls a registered plugin API by name with arguments.
+  /// Throws std::runtime_error if the API is not found or the signature does
+  /// not match.
+  template <typename Ret, typename... Args>
+  Ret callPluginApi(const std::string& name, Args&&... args)
+  {
+    auto func = getPluginApi<Ret(Args...)>(name);
+    return func(std::forward<Args>(args)...);
+  }
 
 private:
   /// \brief Private constructor initialises members and loads configuration.
@@ -2038,6 +2107,9 @@ private:
 
   /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads
+
+  std::unordered_map<std::string, std::any> _pluginApis;
+  std::mutex _apiMutex;
 };
 
 using IoraPlugin = IoraService::Plugin;

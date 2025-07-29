@@ -843,7 +843,18 @@ TEST_CASE("IoraService integrates EventQueue",
 TEST_CASE("Dynamic loading of testplugin shared library")
 {
   iora::IoraService& svc = iora::IoraService::instance();
+
+  // Try both build and source tree locations for the plugin
   std::string pluginPath = "tests/plugins/libtestplugin.so";
+  if (!std::filesystem::exists(pluginPath))
+  {
+    pluginPath = "build/tests/plugins/libtestplugin.so";
+  }
+  if (!std::filesystem::exists(pluginPath))
+  {
+    pluginPath = "iora/build/tests/plugins/libtestplugin.so";
+  }
+  INFO(std::string("Checked plugin path: ") + pluginPath);
   REQUIRE(std::filesystem::exists(pluginPath));
 
   // Load the plugin using the PluginManager
@@ -860,10 +871,38 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   REQUIRE_NOTHROW(plugin = loadModule(&svc));
   REQUIRE(plugin != nullptr);
 
-  //Optionally, check plugin state if RTTI is enabled
-  //auto* testPlugin = dynamic_cast<TestPlugin*>(plugin);
-  //REQUIRE(testPlugin != nullptr);
-  //REQUIRE(testPlugin->loaded);
+  // Test calling plugin APIs via callPluginApi
+  SECTION("callPluginApi: add")
+  {
+    int sum = svc.callPluginApi<int, int, int>("testplugin.add", 2, 3);
+    REQUIRE(sum == 5);
+  }
+  SECTION("callPluginApi: greet")
+  {
+    std::string greet = svc.callPluginApi<std::string, const std::string&>("testplugin.greet", "World");
+    REQUIRE(greet == "Hello, World!");
+  }
+  SECTION("callPluginApi: toggleLoaded and isLoaded")
+  {
+    bool loaded1 = svc.callPluginApi<bool>("testplugin.isLoaded");
+    bool toggled = svc.callPluginApi<bool>("testplugin.toggleLoaded");
+    bool loaded2 = svc.callPluginApi<bool>("testplugin.isLoaded");
+    REQUIRE(loaded1 == true);
+    REQUIRE(toggled == false);
+    REQUIRE(loaded2 == false);
+  }
+
+  // Test caching API function with getPluginApi
+  SECTION("getPluginApi: add")
+  {
+    auto addApi = svc.getPluginApi<int(int, int)>("testplugin.add");
+    REQUIRE(addApi(10, 20) == 30);
+  }
+  SECTION("getPluginApi: greet")
+  {
+    auto greetApi = svc.getPluginApi<std::string(const std::string&)>("testplugin.greet");
+    REQUIRE(greetApi("Iora") == "Hello, Iora!");
+  }
 
   // Unload the plugin
   REQUIRE_NOTHROW(svc.unloadPlugin("testplugin"));
