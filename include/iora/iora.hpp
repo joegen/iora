@@ -1539,6 +1539,51 @@ namespace shell
 class IoraService : public util::PluginManager
 {
 public:
+  /// \brief Cleans up all global Iora resources, notifies plugins, and unloads shared libraries.
+  /// Should be called at program exit or at the end of main().
+  static void shutdown()
+  {
+    IoraService& svc = instance();
+    // Notify all loaded plugins before unloading libraries
+    for (auto* plugin : svc._loadedModules)
+    {
+      if (plugin)
+      {
+        try { plugin->onUnload(); } catch (...) {/* swallow */}
+      }
+    }
+    svc._loadedModules.clear();
+    // Unload all plugin libraries
+    // Flush the JSON file store
+    if (svc._jsonFileStore)
+    {
+      svc._jsonFileStore->flush();
+    }
+    svc.unloadAll();
+    // Stop the webhook server if running
+    svc.stopWebhookServer();
+    // Flush and shutdown logger
+    log::Logger::shutdown();
+    // (Optionally) clear other global resources, caches, etc.
+  }
+
+  /// \brief Blocks until terminate() is called. Use to keep main() alive.
+  void waitForTermination()
+  {
+    std::unique_lock<std::mutex> lock(_terminationMutex);
+    _terminationCv.wait(lock, [this]() { return _terminated; });
+  }
+
+  /// \brief Signals termination and unblocks waitForTermination().
+  void terminate()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_terminationMutex);
+      _terminated = true;
+    }
+    _terminationCv.notify_all();
+  }
+
   /// \brief Abstract interface all Iora plugins must implement
   class Plugin
   {
@@ -1717,6 +1762,12 @@ public:
   }
 
 private:
+  // For main thread blocking/termination
+  std::mutex _terminationMutex;
+  std::condition_variable _terminationCv;
+  bool _terminated = false;
+  // Track loaded plugin instances for proper onUnload notification
+  std::vector<Plugin*> _loadedModules;
   /// \brief Private constructor initialises members and loads configuration.
   IoraService()
     : _port(8080),
@@ -1761,25 +1812,28 @@ private:
   }
 
   /// \brief Private destructor stops the server.
-  ~IoraService() { stopWebhookServer(); }
+  ~IoraService() 
+  { 
+    stopWebhookServer(); 
+  }
 
   void loadModules()
   {
-    if (_modules.empty())
+    if (_modulesPath.empty())
     {
       LOG_INFO("No modules specified, skipping plugin loading.");
       return;
     }
-    LOG_INFO("Loading modules from: " + _modules);
-    std::filesystem::path modulesPath(_modules);
+    LOG_INFO("Loading modules from: " + _modulesPath);
+    std::filesystem::path modulesPath(_modulesPath);
     if (!std::filesystem::exists(modulesPath))
     {
-      LOG_ERROR("Modules path does not exist: " + _modules);
+      LOG_ERROR("Modules path does not exist: " + _modulesPath);
       return;
     }
     if (!std::filesystem::is_directory(modulesPath))
     {
-      LOG_ERROR("Modules path is not a directory: " + _modules);
+      LOG_ERROR("Modules path is not a directory: " + _modulesPath);
       return;
     }
     const std::vector<std::string> supportedExtensions = {".so", ".dll"};
@@ -1798,7 +1852,11 @@ private:
           // Resolve and call the exported loadModule function
           using LoadModuleFunc = Plugin* (*) (iora::IoraService*);
           auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
-          loadModule(this);
+          Plugin* pluginInstance = loadModule(this);
+          if (pluginInstance)
+          {
+            _loadedModules.push_back(pluginInstance);
+          }
         }
         catch (const std::exception& e)
         {
@@ -1856,7 +1914,7 @@ private:
       }
       else if ((arg == "-m" || arg == "--modules") && i + 1 < argc)
       {
-        _modules = std::string{argv[++i]};
+        _modulesPath = std::string{argv[++i]};
       }
       else if (arg == "--log-async" && i + 1 < argc)
       {
@@ -1920,9 +1978,9 @@ private:
           {
             if (auto modulesStr = modulesVal->as_string())
             {
-              if (_modules.empty())
+              if (_modulesPath.empty())
               {
-                _modules = modulesStr->get();
+                _modulesPath = modulesStr->get();
               }
             }
           }
@@ -2103,7 +2161,7 @@ private:
   config::ConfigLoader _configLoader;
   std::unique_ptr<state::JsonFileStore> _jsonFileStore;
   bool _serverRunning;
-  std::string _modules;
+  std::string _modulesPath;
 
   /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads

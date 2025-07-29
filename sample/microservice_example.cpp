@@ -1,3 +1,4 @@
+#include <csignal>
 /// \file microservice_example.cpp
 /// \brief Example microservice using IoraService to expose a text‑summarisation API.
 /// 
@@ -116,7 +117,25 @@ int main(int argc, char** argv)
     return { { "status", "pending" } };
   });
 
+  // Start the webhook server
   svc.startWebhookServer();
-  while (true) { std::this_thread::sleep_for(std::chrono::seconds(60)); }
+  
+  // Setup signal handler for Ctrl+C
+  std::signal(SIGINT, 
+    [](int) 
+    {
+      auto& svc = iora::IoraService::instance();
+      svc.terminate();
+    }
+  );
+  
+  // Wait for service termination
+  LOG_INFO("Microservice is running. Press Ctrl+C to stop.");
+  svc.waitForTermination();
+
+  LOG_INFO("Microservice shutting down...");
+  // Cleanup and shutdown
+  iora::IoraService::shutdown();
+
   return 0;
 }
