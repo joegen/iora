@@ -29,6 +29,9 @@ include_directories(${CPR_INCLUDE_DIR})
 add_executable(all_tests all_tests.cpp)
 target_link_libraries(all_tests PRIVATE nlohmann_json Catch2WithMain iora_lib cpr::cpr)
 
+# Build test plugins for dynamic loading tests
+add_subdirectory(plugins)
+
 # Standalone streamed POST parse logic test
 
 # Add a custom target for `make check` to run the all_tests executable

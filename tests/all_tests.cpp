@@ -837,3 +837,34 @@ TEST_CASE("IoraService integrates EventQueue",
     }
   }
 }
+
+#include <dlfcn.h>
+
+TEST_CASE("Dynamic loading of testplugin shared library")
+{
+  iora::IoraService& svc = iora::IoraService::instance();
+  std::string pluginPath = "tests/plugins/libtestplugin.so";
+  REQUIRE(std::filesystem::exists(pluginPath));
+
+  // Load the plugin using the PluginManager
+  REQUIRE_NOTHROW(svc.loadPlugin("testplugin", pluginPath));
+
+  // Resolve the loadModule symbol
+  using LoadModuleFunc = iora::IoraPlugin* (*)(iora::IoraService*);
+  LoadModuleFunc loadModule = nullptr;
+  REQUIRE_NOTHROW(loadModule = svc.resolve<LoadModuleFunc>("testplugin", "loadModule"));
+  REQUIRE(loadModule != nullptr);
+
+  // Call loadModule and check the returned plugin pointer
+  iora::IoraPlugin* plugin = nullptr;
+  REQUIRE_NOTHROW(plugin = loadModule(&svc));
+  REQUIRE(plugin != nullptr);
+
+  //Optionally, check plugin state if RTTI is enabled
+  //auto* testPlugin = dynamic_cast<TestPlugin*>(plugin);
+  //REQUIRE(testPlugin != nullptr);
+  //REQUIRE(testPlugin->loaded);
+
+  // Unload the plugin
+  REQUIRE_NOTHROW(svc.unloadPlugin("testplugin"));
+}
