@@ -33,7 +33,7 @@ namespace iora
 using Json = nlohmann::json;
 namespace config
 {
-  /// \brief Loads configuration from TOML files.
+  /// \brief Loads and parses TOML configuration files for the application.
   class ConfigLoader
   {
   public:
@@ -52,7 +52,7 @@ namespace config
 
 namespace state
 {
-  /// \brief A simple key-value state store.
+  /// \brief In-memory key-value store for string data with basic get/set operations.
   class ConcreteStateStore
   {
   public:
@@ -77,7 +77,7 @@ namespace state
     std::unordered_map<std::string, std::string> _store;
   };
 
-  /// \brief A JSON file-backed key-value store.
+  /// \brief Thread-safe key-value store backed by a JSON file with background flushing and persistence.
   class JsonFileStore
   {
   public:
@@ -258,8 +258,7 @@ namespace state
 
 namespace util
 {
-  /// \brief A thread-safe event queue for dispatching JSON events to registered
-  /// handlers
+  /// \brief Thread-safe event queue for dispatching JSON events to registered handlers using worker threads.
   class EventQueue
   {
   public:
@@ -464,7 +463,7 @@ namespace util
 
   // Forward declaration for friend accessor
   template <typename K, typename V> struct ExpiringCacheTestAccessor;
-  /// \brief A thread-safe cache with time-to-live (TTL) and automatic purging.
+  /// \brief Thread-safe expiring cache with time-to-live (TTL) and automatic purging of stale entries.
   template <typename K, typename V> class ExpiringCache
   {
   public:
@@ -568,8 +567,8 @@ namespace util
     }
   };
 
-  // Friend accessor struct for unit testing ExpiringCache
-  /// \brief Friend accessor struct for unit testing ExpiringCache
+
+  /// \brief Provides unit test access to internal state of ExpiringCache.
   template <typename K, typename V> struct ExpiringCacheTestAccessor
   {
     static std::size_t mapSize(ExpiringCache<K, V>& cache)
@@ -579,7 +578,7 @@ namespace util
     }
   };
 
-  /// \brief Parses CLI output into key-value pairs or JSON.
+  /// \brief Utility for parsing CLI output into key-value pairs or JSON objects.
   class CliParser
   {
   public:
@@ -610,7 +609,7 @@ namespace util
     }
   };
 
-  /// \brief Cross-platform plugin loader for shared libraries
+  /// \brief Cross-platform dynamic library loader for plugins.
   class PluginLoader
   {
   public:
@@ -688,7 +687,7 @@ namespace util
     std::unordered_map<std::string, void*> _symbolCache;
   };
 
-  /// \brief Manages multiple dynamically loaded plugins
+  /// \brief Manages the lifecycle and symbol resolution of multiple dynamically loaded plugins.
   class PluginManager
   {
   public:
@@ -754,8 +753,7 @@ namespace util
 
 namespace http
 {
-  /// \brief Optional tokenizer class for estimating or computing exact token
-  /// counts.
+  /// \brief Estimates or computes token counts for input text, optionally using external encoders.
   class Tokenizer
   {
   public:
@@ -791,8 +789,7 @@ namespace http
     }
   };
 
-  /// Lightweight and feature-rich header-only HTTP client for sync and async
-  /// API calls.
+  /// \brief Feature-rich HTTP client supporting synchronous, asynchronous, and streaming API calls.
   class HttpClient
   {
   public:
@@ -957,7 +954,7 @@ namespace http
     }
   };
 
-  /// \brief A simple and testable webhook server.
+  /// \brief Lightweight, testable HTTP webhook server for handling REST and JSON endpoints.
   class WebhookServer
   {
   public:
@@ -1059,8 +1056,7 @@ namespace log
   // Forward declaration
   class LoggerStream;
 
-  /// \brief Logger for logging messages with levels, async, rotation, and
-  /// retention.
+  /// \brief Thread-safe logger supporting log levels, async mode, file rotation, and retention.
   class Logger
   {
   public:
@@ -1421,7 +1417,7 @@ namespace log
     }
   };
 
-  /// \brief LoggerStream for streaming log messages.
+  /// \brief Stream interface for composing and emitting log messages with levels.
   class LoggerStream
   {
   public:
@@ -1463,7 +1459,7 @@ namespace log
     }
   };
 
-  /// \brief LoggerProxy for streaming log levels.
+  /// \brief Proxy for streaming log messages at specific log levels.
   class LoggerProxy
   {
   public:
@@ -1500,7 +1496,7 @@ namespace log
 
 namespace shell
 {
-  /// \brief Executes shell commands and captures their output.
+  /// \brief Executes shell commands and captures their output as strings.
   class ShellRunner
   {
   public:
@@ -1522,11 +1518,7 @@ namespace shell
   };
 } // namespace shell
 
-/// \brief Header-only singleton that encapsulates all functionality
-///        provided by the Iora library.  It owns and manages stateful
-///        components (HTTP server, configuration loader, caches and stores)
-///        and provides factory methods for stateless utilities such as the
-///        HTTP client and JSON file stores.
+/// \brief Singleton entry point for the Iora library, managing all core components and providing factory methods for utilities and plugins.
 class IoraService : public util::PluginManager
 {
 public:
