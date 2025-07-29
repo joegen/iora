@@ -52,17 +52,15 @@ You are assisting with a modern C++17 codebase that follows the **Applied Inform
   - Public classes
   - Public functions
   - Enums and typedefs
-- All source files must begin with a file header including:
-  - Filename
-  - Module/package name
-  - License information (if applicable)
+- Use `//` for inline comments and explanations.
+- Keep comments concise and relevant. Avoid obvious comments that restate the code.
+
 
 ## 🧩 Project Layout
 
-- `include/` — Public headers (organized in subdirectories like `sip/`, `portal/`, `routing/`, etc.)
-- `src/` — Implementation files (`.cpp`)
+- `include/iora` — Public headers for the Iora library
 - `tests/` — Unit tests (Catch2)
-- `tests/sip/`, `tests/portal/` — Organized per subsystem
+- `tests/plugins/` - Sample plugins for testing
 
 ## 🚫 Code Reuse Restriction
 
