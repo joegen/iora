@@ -81,39 +81,179 @@ namespace state
   class JsonFileStore
   {
   public:
-    explicit JsonFileStore(const std::string& filename) : _filename(filename) {}
-
-    void set(const std::string& key, const std::string& value)
+    /// \brief Construct and load JSON file if it exists
+    explicit JsonFileStore(std::string filename)
+      : _filename(std::move(filename)), _dirty(false)
     {
-      _store[key] = value;
-      saveToFile();
+      std::ifstream file(_filename);
+      if (file)
+      {
+        try
+        {
+          file >> _store;
+        }
+        catch (...)
+        {
+          _store = nlohmann::json::object();
+        }
+      }
+      else
+      {
+        _store = nlohmann::json::object();
+      }
+
+      registerStore();
     }
 
-    std::optional<std::string> get(const std::string& key) const
+    /// \brief Destructor unregisters the store
+    ~JsonFileStore()
     {
+      unregisterStore();
+      flush();
+    }
+
+    /// \brief Set a key to a value and mark store dirty
+    template <typename T> void set(const std::string& key, const T& value)
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _store[key] = value;
+      _dirty = true;
+    }
+
+    /// \brief Specialization for std::string
+    void set(const std::string& key, const std::string& value)
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _store[key] = value;
+      _dirty = true;
+    }
+
+    /// \brief Get a value from the store
+    template <typename T> std::optional<T> get(const std::string& key) const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
       if (_store.contains(key))
       {
-        return _store[key].get<std::string>();
+        try
+        {
+          return _store[key].get<T>();
+        }
+        catch (...)
+        {
+          return std::nullopt;
+        }
       }
       return std::nullopt;
     }
 
+    /// \brief Specialization for std::string
+    std::optional<std::string> get(const std::string& key) const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_store.contains(key))
+      {
+        try
+        {
+          return _store[key].get<std::string>();
+        }
+        catch (...)
+        {
+          return std::nullopt;
+        }
+      }
+      return std::nullopt;
+    }
+
+    /// \brief Remove a key from the store and mark dirty
     void remove(const std::string& key)
     {
+      std::lock_guard<std::mutex> lock(_mutex);
       _store.erase(key);
+      _dirty = true;
+    }
+
+    /// \brief Immediately write the store to disk
+    void flush()
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
       saveToFile();
+      _dirty = false;
+    }
+
+    /// \brief Configure the background flush interval (in milliseconds)
+    static void setFlushInterval(std::chrono::milliseconds interval)
+    {
+      _flushInterval = interval;
     }
 
   private:
     void saveToFile() const
     {
       std::ofstream file(_filename);
-      file << _store.dump(4);
+      if (file)
+      {
+        file << _store.dump(2);
+      }
     }
 
-    std::string _filename;
+    void tryFlushIfDirty()
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_dirty)
+      {
+        saveToFile();
+        _dirty = false;
+      }
+    }
+
+    void registerStore()
+    {
+      std::lock_guard<std::mutex> lock(_registryMutex);
+      _registry.insert(this);
+      if (_registry.size() == 1)
+      {
+        _stopFlushThread = false;
+        _flushThread = std::thread(flushThreadFunc);
+        _flushThread.detach();
+      }
+    }
+
+    void unregisterStore()
+    {
+      std::lock_guard<std::mutex> lock(_registryMutex);
+      _registry.erase(this);
+      if (_registry.empty())
+      {
+        _stopFlushThread = true;
+      }
+    }
+
+    static void flushThreadFunc()
+    {
+      while (!_stopFlushThread)
+      {
+        std::this_thread::sleep_for(_flushInterval);
+
+        std::lock_guard<std::mutex> lock(_registryMutex);
+        for (auto* store : _registry)
+        {
+          store->tryFlushIfDirty();
+        }
+      }
+    }
+
+    const std::string _filename;
+    mutable std::mutex _mutex;
     nlohmann::json _store;
+    bool _dirty;
+
+    static inline std::set<JsonFileStore*> _registry;
+    static inline std::mutex _registryMutex;
+    static inline std::thread _flushThread;
+    static inline std::atomic<bool> _stopFlushThread{false};
+    static inline std::chrono::milliseconds _flushInterval{2000};
   };
+
 } // namespace state
 
 namespace util
@@ -1476,12 +1616,16 @@ public:
   config::ConfigLoader& configLoader() { return _configLoader; }
 
   /// \brief Accessor for the embedded JSON file store.
-  state::JsonFileStore& jsonFileStore() { return _jsonFileStore; }
+  const std::unique_ptr<state::JsonFileStore>& jsonFileStore() const
+  {
+    return _jsonFileStore;
+  }
 
   /// \brief Factory for creating a JSON file store backed by the given file.
-  state::JsonFileStore makeJsonFileStore(const std::string& filename) const
+  std::unique_ptr<state::JsonFileStore>
+  makeJsonFileStore(const std::string& filename) const
   {
-    return state::JsonFileStore{filename};
+    return std::make_unique<state::JsonFileStore>(filename);
   }
 
   /// \brief Factory for creating a new stateless HTTP client.
@@ -1515,7 +1659,6 @@ private:
       _stateStore(),
       _cache(std::chrono::seconds{60}),
       _configLoader("config.toml"),
-      _jsonFileStore("state.json"),
       _serverRunning(false)
   {
     // Load configuration from file and override defaults.
@@ -1538,7 +1681,8 @@ private:
         {
           if (auto fileStr = fileVal->as_string())
           {
-            _jsonFileStore = state::JsonFileStore{fileStr->get()};
+            _jsonFileStore =
+                std::make_unique<state::JsonFileStore>(fileStr->get());
           }
         }
       }
@@ -1587,7 +1731,7 @@ private:
           loadPlugin(pluginName, entry.path().string());
 
           // Resolve and call the exported loadModule function
-          using LoadModuleFunc = Plugin* (*)(iora::IoraService*);
+          using LoadModuleFunc = Plugin* (*) (iora::IoraService*);
           auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
           loadModule(this);
         }
@@ -1656,9 +1800,13 @@ private:
                        [](unsigned char c)
                        { return static_cast<char>(std::tolower(c)); });
         if (val == "true" || val == "1" || val == "yes")
+        {
           cliLogAsync = true;
+        }
         else if (val == "false" || val == "0" || val == "no")
+        {
           cliLogAsync = false;
+        }
       }
       else if (arg == "--log-retention" && i + 1 < argc)
       {
@@ -1696,7 +1844,9 @@ private:
           if (auto portVal = serverTable->get("port"))
           {
             if (auto portInt = portVal->as_integer())
+            {
               _port = static_cast<int>(portInt->get());
+            }
           }
         }
         if (auto serverTable = cfg["modules"].as_table())
@@ -1717,7 +1867,10 @@ private:
           if (auto fileVal = stateTable->get("file"))
           {
             if (auto fileStr = fileVal->as_string())
-              _jsonFileStore = state::JsonFileStore{fileStr->get()};
+            {
+              _jsonFileStore =
+                  std::make_unique<state::JsonFileStore>(fileStr->get());
+            }
           }
         }
         if (auto logTable = cfg["log"].as_table())
@@ -1725,27 +1878,37 @@ private:
           if (auto levelVal = logTable->get("level"))
           {
             if (auto levelStr = levelVal->as_string())
+            {
               cfgLogLevel = levelStr->get();
+            }
           }
           if (auto fileVal = logTable->get("file"))
           {
             if (auto fileStr = fileVal->as_string())
+            {
               cfgLogFile = fileStr->get();
+            }
           }
           if (auto asyncVal = logTable->get("async"))
           {
             if (auto asyncBool = asyncVal->as_boolean())
+            {
               cfgLogAsync = asyncBool->get();
+            }
           }
           if (auto retentionVal = logTable->get("retention_days"))
           {
             if (auto retentionInt = retentionVal->as_integer())
+            {
               cfgLogRetention = static_cast<int>(retentionInt->get());
+            }
           }
           if (auto formatVal = logTable->get("time_format"))
           {
             if (auto formatStr = formatVal->as_string())
+            {
               cfgLogTimeFormat = formatStr->get();
+            }
           }
         }
       }
@@ -1757,9 +1920,19 @@ private:
 
     // Apply explicit overrides for server port and state file.
     if (cliPort)
+    {
       _port = *cliPort;
+    }
+
     if (cliStateFile)
-      _jsonFileStore = state::JsonFileStore{*cliStateFile};
+    {
+      _jsonFileStore = std::make_unique<state::JsonFileStore>(*cliStateFile);
+    }
+    else if (!_jsonFileStore)
+    {
+      // If no state file was specified, use the default.
+      _jsonFileStore = std::make_unique<state::JsonFileStore>("state.json");
+    }
 
     // Reconstruct the webhook server if the port has changed.
     _webhookServer = std::make_unique<http::WebhookServer>(_port);
@@ -1783,41 +1956,71 @@ private:
             static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
       }
       if (v == "trace")
+      {
         return log::Logger::Level::Trace;
+      }
       if (v == "debug")
+      {
         return log::Logger::Level::Debug;
+      }
       if (v == "warn" || v == "warning")
+      {
         return log::Logger::Level::Warning;
+      }
       if (v == "error")
+      {
         return log::Logger::Level::Error;
+      }
       if (v == "fatal")
+      {
         return log::Logger::Level::Fatal;
+      }
       return log::Logger::Level::Info;
     };
 
     // Apply config-file values.
     if (cfgLogLevel)
+    {
       finalLevel = toLevel(*cfgLogLevel);
+    }
     if (cfgLogFile)
+    {
       finalFile = *cfgLogFile;
+    }
     if (cfgLogAsync)
+    {
       finalAsync = *cfgLogAsync;
+    }
     if (cfgLogRetention)
+    {
       finalRetention = *cfgLogRetention;
+    }
     if (cfgLogTimeFormat)
+    {
       finalTimeFormat = *cfgLogTimeFormat;
+    }
 
     // Override with CLI values.
     if (cliLogLevel)
+    {
       finalLevel = toLevel(*cliLogLevel);
+    }
     if (cliLogFile)
+    {
       finalFile = *cliLogFile;
+    }
     if (cliLogAsync)
+    {
       finalAsync = *cliLogAsync;
+    }
     if (cliLogRetention)
+    {
       finalRetention = *cliLogRetention;
+    }
     if (cliLogTimeFormat)
+    {
       finalTimeFormat = *cliLogTimeFormat;
+    }
 
     // Initialise the logger.  This sets the log level, file base path,
     // asynchronous mode, retention days and time
@@ -1833,7 +2036,7 @@ private:
   state::ConcreteStateStore _stateStore;
   util::ExpiringCache<std::string, std::string> _cache;
   config::ConfigLoader _configLoader;
-  state::JsonFileStore _jsonFileStore;
+  std::unique_ptr<state::JsonFileStore> _jsonFileStore;
   bool _serverRunning;
   std::string _modules;
 
@@ -1853,7 +2056,8 @@ using IoraPlugin = IoraService::Plugin;
     }                                                                          \
     catch (const std::exception& e)                                            \
     {                                                                          \
-      iora::log::Logger::error("Plugin initialization failed: " + std::string(e.what())); \
+      iora::log::Logger::error("Plugin initialization failed: " +              \
+                               std::string(e.what()));                         \
       return nullptr;                                                          \
     }                                                                          \
   }

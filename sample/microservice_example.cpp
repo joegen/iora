@@ -40,7 +40,7 @@ int main(int argc, char** argv)
   auto& svc = iora::IoraService::init(argc, argv);
 
   // Load API token from persistent store
-  auto tokenOpt = svc.jsonFileStore().get("apiToken");
+  auto tokenOpt = svc.jsonFileStore()->get("apiToken");
   if (!tokenOpt)
   {
     // first run: read from environment or CLI and persist
@@ -48,7 +48,7 @@ int main(int argc, char** argv)
     if (envToken)
     {
       std::string token = envToken;
-      svc.jsonFileStore().set("apiToken", token);
+      svc.jsonFileStore()->set("apiToken", token);
     }
     else
     {
@@ -78,7 +78,7 @@ int main(int argc, char** argv)
     // Call LLM provider
     auto client = svc.makeHttpClient();
     auto headers = std::map<std::string, std::string>{
-      { "Authorization", "Bearer " + svc.jsonFileStore().get("apiToken").value() },
+      { "Authorization", "Bearer " + svc.jsonFileStore()->get("apiToken").value() },
       { "Content-Type", "application/json" }
     };
 

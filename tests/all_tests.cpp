@@ -438,8 +438,8 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
   REQUIRE_FALSE(svc.cache().get("cacheKey").has_value());
 
   // persistent JsonFileStore writes to disk
-  svc.jsonFileStore().set("persist", "value");
-  REQUIRE(svc.jsonFileStore().get("persist").value() == "value");
+  svc.jsonFileStore()->set("persist", "value");
+  REQUIRE(svc.jsonFileStore()->get("persist").value() == "value");
   {
     std::ifstream infile("ioraservice_basic_state.json");
     REQUIRE(infile.is_open());
@@ -449,11 +449,11 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 
   // factory JsonFileStore is independent
   {
-    iora::state::JsonFileStore tmp =
+    std::unique_ptr<iora::state::JsonFileStore> tmp =
         svc.makeJsonFileStore("ioraservice_factory_state.json");
-    tmp.set("altKey", "altValue");
-    REQUIRE(tmp.get("altKey").value() == "altValue");
-    REQUIRE_FALSE(svc.jsonFileStore().get("altKey").has_value());
+    tmp->set("altKey", "altValue");
+    REQUIRE(tmp->get("altKey").value() == "altValue");
+    REQUIRE_FALSE(svc.jsonFileStore()->get("altKey").has_value());
     std::filesystem::remove("ioraservice_factory_state.json");
   }
 
@@ -521,7 +521,7 @@ TEST_CASE("IoraService configuration file override",
     REQUIRE(res["cfg"] == true);
   }
   // state file override works
-  svc.jsonFileStore().set("cfgKey", "cfgValue");
+  svc.jsonFileStore()->set("cfgKey", "cfgValue");
   REQUIRE(std::filesystem::exists("ioraservice_cfg_state.json"));
   // logger override writes file
   LOG_DEBUG("Configuration override test message");
@@ -582,7 +582,7 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
     REQUIRE(res["cli"] == true);
   }
   // state file uses CLI override, not config
-  svc.jsonFileStore().set("cliKey", "cliValue");
+  svc.jsonFileStore()->set("cliKey", "cliValue");
   REQUIRE(std::filesystem::exists("ioraservice_cli_override_state.json"));
   // logger uses CLI override; error logs should appear
   LOG_ERROR("CLI override log test");
