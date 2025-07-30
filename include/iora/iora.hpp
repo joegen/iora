@@ -2158,83 +2158,50 @@ private:
       _configLoader = config::ConfigLoader{*cliConfigPath};
       try
       {
-        toml::table cfg = _configLoader.load();
-        if (auto serverTable = cfg["server"].as_table())
+      _configLoader.reload();
+
+      if (auto portOpt = _configLoader.getInt("server.port"))
+      {
+        _port = static_cast<int>(*portOpt);
+      }
+
+      if (auto modulesDirOpt = _configLoader.getString("modules.directory"))
+      {
+        if (_modulesPath.empty())
         {
-          if (auto portVal = serverTable->get("port"))
-          {
-            if (auto portInt = portVal->as_integer())
-            {
-              _port = static_cast<int>(portInt->get());
-            }
-          }
+        _modulesPath = *modulesDirOpt;
         }
-        if (auto serverTable = cfg["modules"].as_table())
-        {
-          if (auto modulesVal = serverTable->get("directory"))
-          {
-            if (auto modulesStr = modulesVal->as_string())
-            {
-              if (_modulesPath.empty())
-              {
-                _modulesPath = modulesStr->get();
-              }
-            }
-          }
-        }
-        if (auto stateTable = cfg["state"].as_table())
-        {
-          if (auto fileVal = stateTable->get("file"))
-          {
-            if (auto fileStr = fileVal->as_string())
-            {
-              _jsonFileStore =
-                  std::make_unique<state::JsonFileStore>(fileStr->get());
-            }
-          }
-        }
-        if (auto logTable = cfg["log"].as_table())
-        {
-          if (auto levelVal = logTable->get("level"))
-          {
-            if (auto levelStr = levelVal->as_string())
-            {
-              cfgLogLevel = levelStr->get();
-            }
-          }
-          if (auto fileVal = logTable->get("file"))
-          {
-            if (auto fileStr = fileVal->as_string())
-            {
-              cfgLogFile = fileStr->get();
-            }
-          }
-          if (auto asyncVal = logTable->get("async"))
-          {
-            if (auto asyncBool = asyncVal->as_boolean())
-            {
-              cfgLogAsync = asyncBool->get();
-            }
-          }
-          if (auto retentionVal = logTable->get("retention_days"))
-          {
-            if (auto retentionInt = retentionVal->as_integer())
-            {
-              cfgLogRetention = static_cast<int>(retentionInt->get());
-            }
-          }
-          if (auto formatVal = logTable->get("time_format"))
-          {
-            if (auto formatStr = formatVal->as_string())
-            {
-              cfgLogTimeFormat = formatStr->get();
-            }
-          }
-        }
+      }
+
+      if (auto stateFileOpt = _configLoader.getString("state.file"))
+      {
+        _jsonFileStore = std::make_unique<state::JsonFileStore>(*stateFileOpt);
+      }
+
+      if (auto logLevelOpt = _configLoader.getString("log.level"))
+      {
+        cfgLogLevel = *logLevelOpt;
+      }
+      if (auto logFileOpt = _configLoader.getString("log.file"))
+      {
+        cfgLogFile = *logFileOpt;
+      }
+      if (auto logAsyncOpt = _configLoader.getBool("log.async"))
+      {
+        cfgLogAsync = *logAsyncOpt;
+      }
+      if (auto logRetentionOpt = _configLoader.getInt("log.retention_days"))
+      {
+        cfgLogRetention = static_cast<int>(*logRetentionOpt);
+      }
+      if (auto logTimeFormatOpt = _configLoader.getString("log.time_format"))
+      {
+        cfgLogTimeFormat = *logTimeFormatOpt;
+      }
       }
       catch (...)
       {
-        // Ignore errors and keep defaults.
+      // Ignore errors and keep defaults.
       }
     }
 

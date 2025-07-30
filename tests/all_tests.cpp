@@ -1,6 +1,11 @@
 #define CATCH_CONFIG_MAIN
-#include "catch2/catch_test_macros.hpp"
+#include "catch2/catch_test_macros.hpp"    // For TEST_CASE, SECTION, REQUIRE, etc.
+#include "catch2/catch_approx.hpp"         // For Approx (floating-point comparison)
+#include "catch2/catch_session.hpp"        // For advanced session control (if needed)
+#include "catch2/catch_tostring.hpp"       // For custom string conversions (optional)
+#include "catch2/catch_all.hpp"            // Includes most commonly used Catch2 features
 #include "iora/iora.hpp"
+
 
 TEST_CASE("HttpClient and WebhookServer integration tests")
 {
@@ -1026,4 +1031,65 @@ TEST_CASE("ConcreteStateStore basic operations", "[state][ConcreteStateStore]")
     REQUIRE(std::find(matched.begin(), matched.end(), "banana") != matched.end());
     REQUIRE(std::find(matched.begin(), matched.end(), "carrot") != matched.end());
   }
+}
+
+TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
+{
+  // Write a temporary TOML config file
+  const std::string cfgFile = "test_config.toml";
+  {
+    std::ofstream out(cfgFile);
+    out << "[section]\n";
+    out << "int_val = 42\n";
+    out << "bool_val = true\n";
+    out << "str_val = 'hello'\n";
+    out << "[other]\n";
+    out << "float_val = 3.14\n";
+  }
+
+  iora::config::ConfigLoader loader(cfgFile);
+
+  SECTION("Reload and load returns table")
+  {
+    REQUIRE(loader.reload());
+    const auto& tbl = loader.load();
+    REQUIRE(tbl.contains("section"));
+    REQUIRE(tbl.contains("other"));
+  }
+
+  SECTION("get<T> returns correct values")
+  {
+    loader.reload();
+    REQUIRE(loader.get<int64_t>("section.int_val").value() == 42);
+    REQUIRE(loader.get<bool>("section.bool_val").value() == true);
+    REQUIRE(loader.get<std::string>("section.str_val").value() == "hello");
+    REQUIRE(loader.get<double>("other.float_val").value() ==  Catch::Approx(3.14));
+    REQUIRE_FALSE(loader.get<int64_t>("section.missing").has_value());
+  }
+
+  SECTION("getInt, getBool, getString work as expected")
+  {
+    loader.reload();
+    REQUIRE(loader.getInt("section.int_val").value() == 42);
+    REQUIRE(loader.getBool("section.bool_val").value() == true);
+    REQUIRE(loader.getString("section.str_val").value() == "hello");
+    REQUIRE_FALSE(loader.getInt("section.missing").has_value());
+  }
+
+  SECTION("table() returns the parsed table")
+  {
+    loader.reload();
+    const auto& tbl = loader.table();
+    REQUIRE(tbl.contains("section"));
+    REQUIRE(tbl.at_path("section.int_val").is_value());
+  }
+
+  SECTION("load throws on missing file")
+  {
+    iora::config::ConfigLoader badLoader("does_not_exist.toml");
+    REQUIRE_THROWS_AS(badLoader.load(), std::runtime_error);
+  }
+
+  // Clean up
+  std::filesystem::remove(cfgFile);
 }
