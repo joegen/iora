@@ -1761,6 +1761,16 @@ public:
     return func(std::forward<Args>(args)...);
   }
 
+  // --- Fluent API builder class declarations ---
+  class RouteBuilder;
+  class EventBuilder;
+
+  /// \brief Begin fluent registration of a webhook endpoint.
+  RouteBuilder on(const std::string& endpoint);
+
+  /// \brief Begin fluent registration of an event handler.
+  EventBuilder onEvent(const std::string& eventId);
+
 private:
   // For main thread blocking/termination
   std::mutex _terminationMutex;
@@ -2169,6 +2179,47 @@ private:
   std::unordered_map<std::string, std::any> _pluginApis;
   std::mutex _apiMutex;
 };
+
+class IoraService::RouteBuilder
+{
+public:
+  RouteBuilder(http::WebhookServer& server, const std::string& endpoint)
+    : _server(server), _endpoint(endpoint) {}
+
+  void handleJson(const std::function<json::Json(const json::Json&)>& handler)
+  {
+    _server.onJson(_endpoint, handler);
+  }
+private:
+  http::WebhookServer& _server;
+  std::string _endpoint;
+};
+
+class IoraService::EventBuilder
+{
+public:
+  EventBuilder(util::EventQueue& queue, const std::string& eventId)
+    : _queue(queue), _eventId(eventId) {}
+
+  void handle(const util::EventQueue::Handler& handler)
+  {
+    _queue.onEventId(_eventId, handler);
+  }
+private:
+  util::EventQueue& _queue;
+  std::string _eventId;
+};
+
+inline IoraService::RouteBuilder IoraService::on(const std::string& endpoint)
+{
+  return RouteBuilder(*_webhookServer, endpoint);
+}
+
+inline IoraService::EventBuilder IoraService::onEvent(const std::string& eventId)
+{
+  return EventBuilder(_eventQueue, eventId);
+}
+
 
 using IoraPlugin = IoraService::Plugin;
 #define IORA_DECLARE_PLUGIN(PluginType)                                        \

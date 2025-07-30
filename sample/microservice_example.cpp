@@ -63,8 +63,8 @@ int main(int argc, char** argv)
   std::unordered_map<std::string, iora::json::Json> results;
   std::mutex resultsMutex;
 
-  // Register EventQueue handler for processing summarization requests
-  svc.eventQueue().onEventId("summarize", [&](const iora::json::Json& input) {
+  // Register EventQueue handler for processing summarization requests (fluent)
+  svc.onEvent("summarize").handle([&](const iora::json::Json& input) {
     std::string requestId = input["requestId"];
     std::string text = input["text"];
     int maxTokens = input.value("max_tokens", 256);
@@ -93,20 +93,20 @@ int main(int argc, char** argv)
     }
   });
 
-  // /summarize endpoint queues requests
-  svc.webhookServer().onJson("/summarize", [&](const iora::json::Json& input) -> iora::json::Json {
+  // /summarize endpoint queues requests (fluent)
+  svc.on("/summarize").handleJson([&](const iora::json::Json& input) -> iora::json::Json {
     std::string text = input["text"];
     int maxTokens = input.value("max_tokens", 256);
     std::string requestId = std::to_string(std::hash<std::string>{}(text));
 
     // Queue the request
-    svc.eventQueue().push({ { "eventId", "summarize" }, { "requestId", requestId }, { "text", text }, { "max_tokens", maxTokens } });
+    svc.pushEvent({ { "eventId", "summarize" }, { "requestId", requestId }, { "text", text }, { "max_tokens", maxTokens } });
 
     return { { "status", "processing" }, { "requestId", requestId } };
   });
 
-  // /status endpoint retrieves results
-  svc.webhookServer().onJson("/status", [&](const iora::json::Json& input) -> iora::json::Json {
+  // /status endpoint retrieves results (fluent)
+  svc.on("/status").handleJson([&](const iora::json::Json& input) -> iora::json::Json {
     std::string requestId = input["requestId"];
 
     std::lock_guard<std::mutex> lock(resultsMutex);

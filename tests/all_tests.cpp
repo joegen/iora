@@ -806,19 +806,17 @@ TEST_CASE("IoraService integrates EventQueue",
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
 
-  // Register an event handler in the EventQueue
-  std::atomic<int> counter{0};
-  svc.eventQueue().onEventId("testEventId",
-                             [&](const iora::json::Json& event)
-                             {
-                               REQUIRE(event["eventId"] == "testEventId");
-                               counter++;
-                             });
 
-  // Push an event to the EventQueue
-  iora::json::Json event = {{"eventId", "testEventId"},
-                      {"eventName", "testEventName"}};
-  svc.eventQueue().push(event);
+  // Register an event handler using the fluent API
+  std::atomic<int> counter{0};
+  svc.onEvent("testEventId").handle([&](const iora::json::Json& event)
+  {
+    REQUIRE(event["eventId"] == "testEventId");
+    counter++;
+  });
+
+  // Push an event using the fluent API
+  svc.pushEvent({{"eventId", "testEventId"}, {"eventName", "testEventName"}});
 
   // Allow some time for the event to be processed
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
