@@ -1,3 +1,4 @@
+
 #define CATCH_CONFIG_MAIN
 #include "catch2/catch_test_macros.hpp"
 #include "iora/iora.hpp"
@@ -904,4 +905,57 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
   // Unload the plugin
   REQUIRE_NOTHROW(svc.unloadPlugin("testplugin"));
+}
+
+TEST_CASE("IoraService fluent event handler registration by name and pattern", "[iora][IoraService][EventQueue][fluent]")
+{
+  // prepare argv with explicit port and state file to avoid conflicts
+  const char* args[] = {"program",
+                        "--port",
+                        "8120",
+                        "--state-file",
+                        "ioraservice_fluent_eventqueue_state.json",
+                        "--log-file",
+                        "ioraservice_fluent_eventqueue_log"};
+  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
+
+  iora::IoraService& svc =
+      iora::IoraService::init(argc, const_cast<char**>(args));
+
+  // Test onEventName (exact match)
+  std::atomic<int> nameCounter{0};
+  svc.onEventName("fluentEvent").handle([&](const iora::json::Json& event)
+  {
+    REQUIRE(event["eventName"] == "fluentEvent");
+    nameCounter++;
+  });
+
+  // Test onEventNameMatches (regex match)
+  std::atomic<int> patternCounter{0};
+  svc.onEventNameMatches("^fluent.*").handle([&](const iora::json::Json& event)
+  {
+    REQUIRE(event["eventName"].get<std::string>().find("fluent") == 0);
+    patternCounter++;
+  });
+
+  // Push events
+  svc.pushEvent({{"eventId", "id1"}, {"eventName", "fluentEvent"}}); // matches both
+  svc.pushEvent({{"eventId", "id2"}, {"eventName", "fluentPattern"}}); // matches pattern only
+  svc.pushEvent({{"eventId", "id3"}, {"eventName", "otherEvent"}}); // matches neither
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  REQUIRE(nameCounter == 1);      // only "fluentEvent" matches exactly
+  REQUIRE(patternCounter == 2);   // both "fluentEvent" and "fluentPattern" match pattern
+
+  // Clean up generated files
+  for (const auto& file : std::filesystem::directory_iterator("."))
+  {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_fluent_eventqueue_log") != std::string::npos ||
+        name.find("ioraservice_fluent_eventqueue_state.json") != std::string::npos)
+    {
+      std::filesystem::remove(file.path());
+    }
+  }
 }

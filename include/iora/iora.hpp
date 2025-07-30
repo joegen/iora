@@ -1771,6 +1771,12 @@ public:
   /// \brief Begin fluent registration of an event handler.
   EventBuilder onEvent(const std::string& eventId);
 
+  /// \brief Begin fluent registration of an event handler by name.
+  EventBuilder onEventName(const std::string& eventName);
+
+  /// \brief Begin fluent registration of an event handler matching a name
+  EventBuilder onEventNameMatches(const std::string& eventNamePattern);
+
 private:
   // For main thread blocking/termination
   std::mutex _terminationMutex;
@@ -2198,16 +2204,42 @@ private:
 class IoraService::EventBuilder
 {
 public:
-  EventBuilder(util::EventQueue& queue, const std::string& eventId)
-    : _queue(queue), _eventId(eventId) {}
+  enum class EventType
+  {
+    ID,
+    NAME,
+    NAME_MATCHES
+  };
+
+  EventBuilder(util::EventQueue& queue, const std::string& eventId, 
+               EventType type)
+    : _queue(queue), _eventId(eventId), _eventType(type)  
+  {
+  }
 
   void handle(const util::EventQueue::Handler& handler)
   {
-    _queue.onEventId(_eventId, handler);
+    if (_eventType == EventType::NAME)
+    {
+      _queue.onEventName(_eventId, handler);
+    }
+    else if (_eventType == EventType::NAME_MATCHES)
+    {
+      _queue.onEventNameMatches(_eventId, handler);
+    }
+    else if (_eventType == EventType::ID)
+    {
+      _queue.onEventId(_eventId, handler);
+    }
+    else
+    {
+      throw std::invalid_argument("Invalid event type specified");
+    }
   }
 private:
   util::EventQueue& _queue;
   std::string _eventId;
+  EventType _eventType = EventType::ID; // Default to ID type
 };
 
 inline IoraService::RouteBuilder IoraService::on(const std::string& endpoint)
@@ -2217,7 +2249,17 @@ inline IoraService::RouteBuilder IoraService::on(const std::string& endpoint)
 
 inline IoraService::EventBuilder IoraService::onEvent(const std::string& eventId)
 {
-  return EventBuilder(_eventQueue, eventId);
+  return EventBuilder(_eventQueue, eventId, EventBuilder::EventType::ID);
+}
+
+inline IoraService::EventBuilder IoraService::onEventName(const std::string& eventName)
+{
+  return EventBuilder(_eventQueue, eventName, EventBuilder::EventType::NAME);
+}
+
+inline IoraService::EventBuilder IoraService::onEventNameMatches(const std::string& eventNamePattern)
+{
+  return EventBuilder(_eventQueue, eventNamePattern, EventBuilder::EventType::NAME_MATCHES);
 }
 
 
