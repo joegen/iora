@@ -41,17 +41,80 @@ namespace config
   class ConfigLoader
   {
   public:
-    /// \brief Constructs a ConfigLoader with the given filename.
-    /// \param filename The path to the TOML configuration file.
-    explicit ConfigLoader(const std::string& filename) : _filename(filename) {}
+    /// \brief Constructs and loads a TOML configuration file.
+    explicit ConfigLoader(const std::string& filename) : _filename(filename)
+    {
+    }
 
-    /// \brief Loads the TOML configuration file.
-    /// \return A toml::table representing the configuration.
-    toml::table load() const { return toml::parse_file(_filename); }
+    /// \brief Reloads the configuration from disk.
+    bool reload()
+    {
+      try
+      {
+        _table = toml::parse_file(_filename);
+        return true;
+      }
+      catch (...)
+      {
+        _table = toml::table{};
+        return false;
+      }
+    }
+
+    const toml::table& load()
+    {
+      if (_table.empty())
+      {
+        if (!reload())
+        {
+          throw std::runtime_error("Failed to load configuration file: " + _filename);
+        }
+      }
+      return _table;
+    }
+
+    /// \brief Gets the full configuration table.
+    const toml::table& table() const { return _table; }
+
+    /// \brief Gets a typed value from the configuration.
+    /// \tparam T Must be a TOML native type (int64_t, double, bool, std::string, etc.)
+    template <typename T>
+    std::optional<T> get(const std::string& dottedKey) const
+    {
+      auto node = _table.at_path(dottedKey);
+      if (node && node.is_value())
+      {
+        if (auto val = node.as<T>())
+        {
+          return val->get();
+        }
+      }
+      return std::nullopt;
+    }
+
+    /// \brief Gets an int value from the configuration.
+    std::optional<int64_t> getInt(const std::string& key) const
+    {
+      return get<int64_t>(key);
+    }
+
+    /// \brief Gets a bool value from the configuration.
+    std::optional<bool> getBool(const std::string& key) const
+    {
+      return get<bool>(key);
+    }
+
+    /// \brief Gets a string value from the configuration.
+    std::optional<std::string> getString(const std::string& key) const
+    {
+      return get<std::string>(key);
+    }
 
   private:
     std::string _filename;
+    toml::table _table;
   };
+
 } // namespace config
 
 namespace state
