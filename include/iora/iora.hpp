@@ -58,18 +58,41 @@ namespace state
 {
   /// \brief In-memory key-value store for string data with basic get/set
   /// operations.
+  struct CaseInsensitiveHash
+  {
+    std::size_t operator()(const std::string& key) const
+    {
+      std::string lowered = key;
+      std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                     ::tolower);
+      return std::hash<std::string>{}(lowered);
+    }
+  };
+
+  struct CaseInsensitiveEqual
+  {
+    bool operator()(const std::string& lhs, const std::string& rhs) const
+    {
+      return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
+                        [](char a, char b)
+                        { return std::tolower(a) == std::tolower(b); });
+    }
+  };
+
   class ConcreteStateStore
   {
   public:
     /// \brief Sets a key-value pair in the store.
     void set(const std::string& key, const std::string& value)
     {
+      std::lock_guard<std::mutex> lock(_mutex);
       _store[key] = value;
     }
 
     /// \brief Gets a value by key from the store.
     std::optional<std::string> get(const std::string& key) const
     {
+      std::lock_guard<std::mutex> lock(_mutex);
       auto it = _store.find(key);
       if (it != _store.end())
       {
@@ -78,8 +101,98 @@ namespace state
       return std::nullopt;
     }
 
+    /// \brief Removes a key from the store.
+    bool remove(const std::string& key)
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      return _store.erase(key) > 0;
+    }
+
+    /// \brief Checks if a key exists in the store.
+    bool contains(const std::string& key) const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      return _store.find(key) != _store.end();
+    }
+
+    /// \brief Returns all keys in the store.
+    std::vector<std::string> keys() const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      std::vector<std::string> result;
+      result.reserve(_store.size());
+      for (const auto& [k, _] : _store)
+      {
+        result.push_back(k);
+      }
+      return result;
+    }
+
+    /// \brief Returns the number of entries in the store.
+    std::size_t size() const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      return _store.size();
+    }
+
+    /// \brief Returns true if the store is empty.
+    bool empty() const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      return _store.empty();
+    }
+
+    /// \brief Finds all keys with the given prefix.
+    std::vector<std::string> findKeysWithPrefix(const std::string& prefix) const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      std::vector<std::string> result;
+      for (const auto& [key, _] : _store)
+      {
+        if (key.rfind(prefix, 0) == 0) // key starts with prefix
+        {
+          result.push_back(key);
+        }
+      }
+      return result;
+    }
+
+    /// \brief Finds all keys whose values match the provided value.
+    std::vector<std::string> findKeysByValue(const std::string& value) const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      std::vector<std::string> result;
+      for (const auto& [key, val] : _store)
+      {
+        if (val == value)
+        {
+          result.push_back(key);
+        }
+      }
+      return result;
+    }
+
+    /// \brief Finds all keys satisfying a custom matcher.
+    std::vector<std::string>
+    findKeysMatching(std::function<bool(const std::string&)> matcher) const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      std::vector<std::string> result;
+      for (const auto& [key, _] : _store)
+      {
+        if (matcher(key))
+        {
+          result.push_back(key);
+        }
+      }
+      return result;
+    }
+
   private:
-    std::unordered_map<std::string, std::string> _store;
+    mutable std::mutex _mutex;
+    std::unordered_map<std::string, std::string, CaseInsensitiveHash,
+                       CaseInsensitiveEqual>
+        _store;
   };
 
   /// \brief Thread-safe key-value store backed by a JSON file with background
@@ -1539,8 +1652,9 @@ namespace shell
 class IoraService : public util::PluginManager
 {
 public:
-  /// \brief Cleans up all global Iora resources, notifies plugins, and unloads shared libraries.
-  /// Should be called at program exit or at the end of main().
+  /// \brief Cleans up all global Iora resources, notifies plugins, and unloads
+  /// shared libraries. Should be called at program exit or at the end of
+  /// main().
   static void shutdown()
   {
     IoraService& svc = instance();
@@ -1549,7 +1663,13 @@ public:
     {
       if (plugin)
       {
-        try { plugin->onUnload(); } catch (...) {/* swallow */}
+        try
+        {
+          plugin->onUnload();
+        }
+        catch (...)
+        { /* swallow */
+        }
       }
     }
     svc._loadedModules.clear();
@@ -1713,17 +1833,18 @@ public:
     using func_type = std::decay_t<Func>;
     using signature = decltype(&func_type::operator());
     _pluginApis[name] = makeStdFunction(std::forward<Func>(func), signature{});
-
   }
 
   // Helper to deduce lambda signature and wrap in std::function
   template <typename Func, typename Ret, typename... Args>
-  static std::function<Ret(Args...)> makeStdFunction(Func&& f, Ret (Func::*)(Args...) const)
+  static std::function<Ret(Args...)>
+  makeStdFunction(Func&& f, Ret (Func::*)(Args...) const)
   {
     return std::function<Ret(Args...)>(std::forward<Func>(f));
   }
   template <typename Func, typename Ret, typename... Args>
-  static std::function<Ret(Args...)> makeStdFunction(Func&& f, Ret (Func::*)(Args...) )
+  static std::function<Ret(Args...)> makeStdFunction(Func&& f,
+                                                     Ret (Func::*)(Args...))
   {
     return std::function<Ret(Args...)>(std::forward<Func>(f));
   }
@@ -1828,10 +1949,7 @@ private:
   }
 
   /// \brief Private destructor stops the server.
-  ~IoraService() 
-  { 
-    stopWebhookServer(); 
-  }
+  ~IoraService() { stopWebhookServer(); }
 
   void loadModules()
   {
@@ -2190,12 +2308,15 @@ class IoraService::RouteBuilder
 {
 public:
   RouteBuilder(http::WebhookServer& server, const std::string& endpoint)
-    : _server(server), _endpoint(endpoint) {}
+    : _server(server), _endpoint(endpoint)
+  {
+  }
 
   void handleJson(const std::function<json::Json(const json::Json&)>& handler)
   {
     _server.onJson(_endpoint, handler);
   }
+
 private:
   http::WebhookServer& _server;
   std::string _endpoint;
@@ -2211,9 +2332,9 @@ public:
     NAME_MATCHES
   };
 
-  EventBuilder(util::EventQueue& queue, const std::string& eventId, 
+  EventBuilder(util::EventQueue& queue, const std::string& eventId,
                EventType type)
-    : _queue(queue), _eventId(eventId), _eventType(type)  
+    : _queue(queue), _eventId(eventId), _eventType(type)
   {
   }
 
@@ -2236,6 +2357,7 @@ public:
       throw std::invalid_argument("Invalid event type specified");
     }
   }
+
 private:
   util::EventQueue& _queue;
   std::string _eventId;
@@ -2247,21 +2369,24 @@ inline IoraService::RouteBuilder IoraService::on(const std::string& endpoint)
   return RouteBuilder(*_webhookServer, endpoint);
 }
 
-inline IoraService::EventBuilder IoraService::onEvent(const std::string& eventId)
+inline IoraService::EventBuilder
+IoraService::onEvent(const std::string& eventId)
 {
   return EventBuilder(_eventQueue, eventId, EventBuilder::EventType::ID);
 }
 
-inline IoraService::EventBuilder IoraService::onEventName(const std::string& eventName)
+inline IoraService::EventBuilder
+IoraService::onEventName(const std::string& eventName)
 {
   return EventBuilder(_eventQueue, eventName, EventBuilder::EventType::NAME);
 }
 
-inline IoraService::EventBuilder IoraService::onEventNameMatches(const std::string& eventNamePattern)
+inline IoraService::EventBuilder
+IoraService::onEventNameMatches(const std::string& eventNamePattern)
 {
-  return EventBuilder(_eventQueue, eventNamePattern, EventBuilder::EventType::NAME_MATCHES);
+  return EventBuilder(_eventQueue, eventNamePattern,
+                      EventBuilder::EventType::NAME_MATCHES);
 }
-
 
 using IoraPlugin = IoraService::Plugin;
 #define IORA_DECLARE_PLUGIN(PluginType)                                        \
