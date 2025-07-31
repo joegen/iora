@@ -2092,7 +2092,7 @@ public:
   static IoraService& init(int argc, char** argv)
   {
     IoraService& svc = instance();
-    svc.parseCommandLine(argc, argv);
+    svc.parseConfig(argc, argv);
 #ifdef IORA_TEST
     // In test mode, destroy the singleton after command line parsing to ensure correct destruction order
     destroyInstance();
@@ -2338,7 +2338,7 @@ public:
 
   /// \brief Parses command‑line arguments and overrides configuration
   /// accordingly.
-  void parseCommandLine(int argc, char** argv)
+  void parseConfig(int argc, char** argv)
   {
     // Holders for command-line overrides.
     std::optional<int> cliPort;
@@ -2349,6 +2349,11 @@ public:
     std::optional<bool> cliLogAsync;
     std::optional<int> cliLogRetention;
     std::optional<std::string> cliLogTimeFormat;
+    // TLS CLI overrides
+    std::optional<std::string> cliTlsCert;
+    std::optional<std::string> cliTlsKey;
+    std::optional<std::string> cliTlsCa;
+    std::optional<bool> cliTlsRequireClientCert;
 
     // Scan the arguments to capture CLI values.
     for (int i = 1; i < argc; ++i)
@@ -2356,13 +2361,7 @@ public:
       std::string arg = argv[i];
       if ((arg == "-p" || arg == "--port") && i + 1 < argc)
       {
-        try
-        {
-          cliPort = std::stoi(argv[++i]);
-        }
-        catch (...)
-        {
-        }
+        try { cliPort = std::stoi(argv[++i]); } catch (...) {}
       }
       else if ((arg == "-c" || arg == "--config") && i + 1 < argc)
       {
@@ -2388,30 +2387,38 @@ public:
       {
         std::string val = std::string{argv[++i]};
         std::transform(val.begin(), val.end(), val.begin(),
-                       [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
-        if (val == "true" || val == "1" || val == "yes")
-        {
-          cliLogAsync = true;
-        }
-        else if (val == "false" || val == "0" || val == "no")
-        {
-          cliLogAsync = false;
-        }
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (val == "true" || val == "1" || val == "yes") cliLogAsync = true;
+        else if (val == "false" || val == "0" || val == "no") cliLogAsync = false;
       }
       else if (arg == "--log-retention" && i + 1 < argc)
       {
-        try
-        {
-          cliLogRetention = std::stoi(argv[++i]);
-        }
-        catch (...)
-        {
-        }
+        try { cliLogRetention = std::stoi(argv[++i]); } catch (...) {}
       }
       else if (arg == "--log-time-format" && i + 1 < argc)
       {
         cliLogTimeFormat = std::string{argv[++i]};
+      }
+      // TLS CLI
+      else if (arg == "--tls-cert" && i + 1 < argc)
+      {
+        cliTlsCert = std::string{argv[++i]};
+      }
+      else if (arg == "--tls-key" && i + 1 < argc)
+      {
+        cliTlsKey = std::string{argv[++i]};
+      }
+      else if (arg == "--tls-ca" && i + 1 < argc)
+      {
+        cliTlsCa = std::string{argv[++i]};
+      }
+      else if (arg == "--tls-require-client-cert" && i + 1 < argc)
+      {
+        std::string val = std::string{argv[++i]};
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (val == "true" || val == "1" || val == "yes") cliTlsRequireClientCert = true;
+        else if (val == "false" || val == "0" || val == "no") cliTlsRequireClientCert = false;
       }
       // Unrecognised arguments are ignored.
     }
@@ -2422,6 +2429,11 @@ public:
     std::optional<bool> cfgLogAsync;
     std::optional<int> cfgLogRetention;
     std::optional<std::string> cfgLogTimeFormat;
+    // TLS config values
+    std::optional<std::string> cfgTlsCert;
+    std::optional<std::string> cfgTlsKey;
+    std::optional<std::string> cfgTlsCa;
+    std::optional<bool> cfgTlsRequireClientCert;
 
     // If a config file was specified, load it and update defaults.
     if (cliConfigPath)
@@ -2470,6 +2482,39 @@ public:
         {
           cfgLogTimeFormat = *logTimeFormatOpt;
         }
+        // TLS config from TOML
+        if (auto tlsCertOpt = _configLoader.getString("tls.cert_file"))
+        {
+          cfgTlsCert = *tlsCertOpt;
+        }
+        if (auto tlsKeyOpt = _configLoader.getString("tls.key_file"))
+        {
+          cfgTlsKey = *tlsKeyOpt;
+        }
+        if (auto tlsCaOpt = _configLoader.getString("tls.ca_file"))
+        {
+          cfgTlsCa = *tlsCaOpt;
+        }
+        if (auto tlsReqOpt = _configLoader.getBool("tls.require_client_cert"))
+        {
+          cfgTlsRequireClientCert = *tlsReqOpt;
+        }
+    // --- TLS config merge and application ---
+    // CLI always overrides config file
+    std::optional<std::string> finalTlsCert = cliTlsCert ? cliTlsCert : cfgTlsCert;
+    std::optional<std::string> finalTlsKey = cliTlsKey ? cliTlsKey : cfgTlsKey;
+    std::optional<std::string> finalTlsCa = cliTlsCa ? cliTlsCa : cfgTlsCa;
+    std::optional<bool> finalTlsRequireClientCert = cliTlsRequireClientCert ? cliTlsRequireClientCert : cfgTlsRequireClientCert;
+
+    if (finalTlsCert || finalTlsKey || finalTlsCa || finalTlsRequireClientCert)
+    {
+      http::WebhookServer::TlsConfig tlsCfg;
+      tlsCfg.certFile = finalTlsCert.value_or("");
+      tlsCfg.keyFile = finalTlsKey.value_or("");
+      tlsCfg.caFile = finalTlsCa.value_or("");
+      tlsCfg.requireClientCert = finalTlsRequireClientCert.value_or(false);
+      _webhookServer->enableTls(tlsCfg);
+    }
       }
       catch (...)
       {
