@@ -54,8 +54,22 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 add_library(iora_lib INTERFACE)
 target_include_directories(iora_lib INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
+
 # Add subdirectories
 add_subdirectory(tests)
+
+# Ensure all_tests and testplugin have SSL and httplib support
+set(CPP_HTTPLIB_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cpp_httplib-src")
+if(TARGET all_tests)
+  target_compile_definitions(all_tests PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+  target_include_directories(all_tests PRIVATE ${CPP_HTTPLIB_INCLUDE_DIR})
+  target_link_libraries(all_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+if(TARGET testplugin)
+  target_compile_definitions(testplugin PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+  target_include_directories(testplugin PRIVATE ${CPP_HTTPLIB_INCLUDE_DIR})
+  target_link_libraries(testplugin PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # Add the sample microservice application
 set(SOURCES sample/microservice_example.cpp)
@@ -72,6 +86,7 @@ target_include_directories(microservice_example PRIVATE ${TOMLPLUSPLUS_INCLUDE_D
 set(NLOHMANN_JSON_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/nlohmann_json-src/include")
 target_include_directories(microservice_example PRIVATE ${NLOHMANN_JSON_INCLUDE_DIR})
 
+
 # Add cpp-httplib include directory
 # Check for system tiktoken installation
 find_path(TIKTOKEN_INCLUDE_DIR tiktoken/encodings.h)
@@ -87,6 +102,14 @@ else()
 endif()
 set(CPP_HTTPLIB_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cpp_httplib-src")
 target_include_directories(microservice_example PRIVATE ${CPP_HTTPLIB_INCLUDE_DIR})
+
+
+# --- OpenSSL for cpp-httplib SSL support ---
+find_package(OpenSSL REQUIRED)
+target_link_libraries(microservice_example PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+# Define CPPHTTPLIB_OPENSSL_SUPPORT globally for all targets
+add_definitions(-DCPPHTTPLIB_OPENSSL_SUPPORT)
 
 # Correct cpr include directory to point to the include folder
 set(CPR_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cpr-src/include")

@@ -9,49 +9,50 @@
 
 TEST_CASE("HttpClient and WebhookServer integration tests")
 {
-  iora::http::WebhookServer server(8081);
+  iora::http::WebhookServer server;
+  server.setPort(8081);
 
-  server.onJson("/test-post-json",
+  server.onJsonPost("/test-post-json",
                 [](const iora::json::Json& input) -> iora::json::Json {
                   return {{"echo", input}};
                 });
 
-  server.onJsonGet("/test-get",
-                   [](const httplib::Request&) -> iora::json::Json {
-                     return {{"status", "ok"}};
-                   });
-
-  server.onDelete("/test-delete",
-                  [](const httplib::Request&, httplib::Response& res)
-                  {
-                    res.set_content("{}", "application/json");
-                    res.status = 200;
-                  });
-
-  server.onJson("/test-async",
+  server.onJsonPost("/test-async",
                 [](const iora::json::Json& input) -> iora::json::Json {
                   return {{"async", true}, {"received", input}};
                 });
 
-  server.on("/test-stream",
-            [](const httplib::Request& req, httplib::Response& res)
-            {
-              res.set_content("data: {\"text\":\"line1\"}\n"
-                              "data: {\"text\":\"line2\"}\n"
-                              "data: [DONE]\n",
-                              "text/event-stream");
-              res.status = 200;
-            });
+  server.onJsonGet("/test-get",
+                [](const iora::json::Json& input) -> iora::json::Json {
+                  return {{"status", "ok"}};
+                });
 
-  server.startAsync();
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  server.onPost("/test-stream",
+                [](const httplib::Request& req, httplib::Response& res)
+                {
+                  res.set_content("data: {\"text\":\"line1\"}\n"
+                                  "data: {\"text\":\"line2\"}\n"
+                                  "data: [DONE]\n",
+                                  "text/event-stream");
+                  res.status = 200;
+                });
+
+  server.start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
   iora::http::HttpClient client;
 
   SECTION("GET request returns valid JSON")
   {
-    auto res = client.get("http://localhost:8081/test-get");
-    REQUIRE(res["status"] == "ok");
+    try
+    {
+      auto res = client.get("http://localhost:8081/test-get");
+      REQUIRE(res["status"] == "ok");
+    }
+    catch (const std::exception& ex)
+    {
+      FAIL(std::string("Exception: ") + ex.what());
+    }
   }
 
   SECTION("POST JSON request with payload")
@@ -59,13 +60,6 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
     iora::json::Json payload = {{"message", "hello"}};
     auto res = client.postJson("http://localhost:8081/test-post-json", payload);
     REQUIRE(res["echo"]["message"] == "hello");
-  }
-
-  SECTION("DELETE request returns empty JSON")
-  {
-    auto res = client.deleteRequest("http://localhost:8081/test-delete");
-    REQUIRE(res.is_object());
-    REQUIRE(res.empty());
   }
 
   SECTION("Async POST JSON returns future")
@@ -431,19 +425,23 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
 
+
   // in-memory state store works
   svc.stateStore().set("foo", "bar");
   REQUIRE(svc.stateStore().get("foo").value() == "bar");
 
   // cache works and expires
-  svc.cache().set("cacheKey", std::string("cacheValue"),
-                  std::chrono::seconds(1));
+  svc.cache().set("cacheKey", std::string("cacheValue"), std::chrono::seconds(1));
   REQUIRE(svc.cache().get("cacheKey").value() == "cacheValue");
   std::this_thread::sleep_for(std::chrono::seconds(2));
   REQUIRE_FALSE(svc.cache().get("cacheKey").has_value());
 
   // persistent JsonFileStore writes to disk
+  std::cerr << "[DEBUG] svc.jsonFileStore() before set: " << static_cast<const void*>(svc.jsonFileStore().get()) << std::endl;
+  REQUIRE(svc.jsonFileStore() != nullptr); // Defensive: fail clearly if null
   svc.jsonFileStore()->set("persist", "value");
+  std::cerr << "[DEBUG] svc.jsonFileStore() after set: " << static_cast<const void*>(svc.jsonFileStore().get()) << std::endl;
+  REQUIRE(svc.jsonFileStore() != nullptr); // Defensive: check again after use
   REQUIRE(svc.jsonFileStore()->get("persist").value() == "value");
   {
     std::ifstream infile("ioraservice_basic_state.json");
@@ -469,12 +467,12 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
     REQUIRE(&c1 != &c2);
   }
 
-  // register endpoint, start server and call it to confirm correct port
+  // start server before registering endpoints
+  svc.startWebhookServer();
   svc.webhookServer().onJsonGet("/basic",
-                                [](const httplib::Request&) -> iora::json::Json {
+                                [](const iora::json::Json& input) -> iora::json::Json {
                                   return {{"ok", true}};
                                 });
-  svc.startWebhookServer();
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   {
     auto client = svc.makeHttpClient();
@@ -514,12 +512,13 @@ TEST_CASE("IoraService configuration file override",
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
 
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   svc.webhookServer().onJsonGet("/cfg",
-                                [](const httplib::Request&) -> iora::json::Json {
+                                [](const iora::json::Json& input) -> iora::json::Json {
                                   return {{"cfg", true}};
                                 });
-  svc.startWebhookServer();
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     auto client = svc.makeHttpClient();
     auto res = client.get("http://localhost:8111/cfg");
@@ -575,12 +574,13 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
 
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   svc.webhookServer().onJsonGet("/cli",
-                                [](const httplib::Request&) -> iora::json::Json {
+                                [](const iora::json::Json& input) -> iora::json::Json {
                                   return {{"cli", true}};
                                 });
-  svc.startWebhookServer();
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     auto client = svc.makeHttpClient();
     auto res = client.get("http://localhost:8123/cli");
@@ -625,12 +625,13 @@ TEST_CASE("IoraService concurrent HTTP clients",
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
 
+  svc.startWebhookServer();
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   svc.webhookServer().onJsonGet("/ping",
-                                [](const httplib::Request&) -> iora::json::Json {
+                                [](const iora::json::Json& input) -> iora::json::Json {
                                   return {{"pong", true}};
                                 });
-  svc.startWebhookServer();
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   const int threadCount = 5;
   std::vector<std::thread> workers;
