@@ -40,6 +40,452 @@ namespace json
   using Json = nlohmann::json;
 } // namespace json
 
+// Namespace log
+namespace log
+{
+
+  // Forward declaration
+  class LoggerStream;
+
+  /// \brief Thread-safe logger supporting log levels, async mode, file
+  /// rotation, and retention.
+  class Logger
+  {
+  public:
+    enum class Level
+    {
+      Trace,
+      Debug,
+      Info,
+      Warning,
+      Error,
+      Fatal
+    };
+
+    struct Endl
+    {
+    };
+    static inline constexpr Endl endl{};
+
+    static void init(Level level = Level::Info,
+                     const std::string& filePath = "", bool async = false,
+                     int retentionDays = 7,
+                     const std::string& timeFormat = "%Y-%m-%d %H:%M:%S")
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+
+      _minLevel = level;
+      _asyncMode = async;
+      _exit = false;
+      // If no filePath provided, use default in current directory
+      if (filePath.empty())
+      {
+        _logBasePath = "iora.log";
+      }
+      else
+      {
+        _logBasePath = filePath;
+      }
+      _retentionDays = retentionDays;
+      _timestampFormat = timeFormat;
+      // Reset current log date so rotateLogFileIfNeeded always opens a new file
+      _currentLogDate.clear();
+      rotateLogFileIfNeeded();
+
+      if (_asyncMode && !_workerThread.joinable())
+      {
+        _workerThread = std::thread(runWorker);
+      }
+    }
+
+    static void flush()
+    {
+      std::unique_lock<std::mutex> lock(_mutex);
+      // Always flush queue for both sync and async modes
+      while (!_queue.empty())
+      {
+        rotateLogFileIfNeeded();
+        const std::string& entry = _queue.front();
+        std::cout << entry;
+        if (_fileStream)
+        {
+          (*_fileStream) << entry;
+          _fileStream->flush();
+        }
+        _queue.pop();
+      }
+      // Also flush file stream if open
+      if (_fileStream)
+      {
+        _fileStream->flush();
+      }
+    }
+
+    static void shutdown()
+    {
+      flush();
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _exit = true;
+      }
+      _cv.notify_one();
+
+      if (_workerThread.joinable())
+      {
+        _workerThread.join();
+      }
+    }
+
+    static void setLevel(Level level)
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _minLevel = level;
+    }
+
+    static void trace(const std::string& message)
+    {
+      log(Level::Trace, message);
+    }
+    static void debug(const std::string& message)
+    {
+      log(Level::Debug, message);
+    }
+    static void info(const std::string& message) { log(Level::Info, message); }
+    static void warning(const std::string& message)
+    {
+      log(Level::Warning, message);
+    }
+    static void error(const std::string& message)
+    {
+      log(Level::Error, message);
+    }
+    static void fatal(const std::string& message)
+    {
+      log(Level::Fatal, message);
+    }
+
+    static LoggerStream stream(Level level);
+
+    static void log(Level level, const std::string& message)
+    {
+      if (level < _minLevel)
+      {
+        return;
+      }
+
+      std::ostringstream oss;
+      oss << "[" << timestamp() << "] "
+          << "[" << levelToString(level) << "] " << message << std::endl;
+
+      std::string output = oss.str();
+
+      if (_asyncMode)
+      {
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          _queue.push(std::move(output));
+        }
+        _cv.notify_one();
+      }
+      else
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        rotateLogFileIfNeeded();
+        std::cout << output;
+        if (_fileStream)
+        {
+          (*_fileStream) << output;
+          _fileStream->flush();
+        }
+      }
+    }
+
+  public:
+    friend class LoggerStream;
+
+    static inline std::mutex _mutex;
+    static inline std::condition_variable _cv;
+    static inline std::queue<std::string> _queue;
+    static inline std::thread _workerThread;
+    static inline std::atomic<bool> _exit{false};
+    static inline bool _asyncMode = false;
+    static inline Level _minLevel = Level::Info;
+    static inline std::unique_ptr<std::ofstream> _fileStream;
+    static inline std::string _logBasePath;
+    static inline std::string _currentLogDate;
+    static inline int _retentionDays = 7;
+    static inline std::string _timestampFormat = "%Y-%m-%d %H:%M:%S";
+
+    static void runWorker()
+    {
+      while (true)
+      {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _cv.wait(lock, [] { return !_queue.empty() || _exit; });
+
+        while (!_queue.empty())
+        {
+          rotateLogFileIfNeeded();
+          const std::string& entry = _queue.front();
+          std::cout << entry;
+          if (_fileStream)
+          {
+            (*_fileStream) << entry;
+            _fileStream->flush();
+          }
+          _queue.pop();
+        }
+
+        if (_exit)
+        {
+          break;
+        }
+      }
+    }
+
+    static std::string timestamp()
+    {
+      auto now = std::chrono::system_clock::now();
+      auto t = std::chrono::system_clock::to_time_t(now);
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()) %
+                1000;
+
+      std::ostringstream oss;
+      oss << std::put_time(std::localtime(&t), _timestampFormat.c_str());
+      if (_timestampFormat.find("%S") != std::string::npos)
+      {
+        oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+      }
+      return oss.str();
+    }
+
+    static std::string currentDate()
+    {
+      auto now = std::chrono::system_clock::now();
+      auto t = std::chrono::system_clock::to_time_t(now);
+      std::ostringstream oss;
+      oss << std::put_time(std::localtime(&t), "%Y-%m-%d");
+      return oss.str();
+    }
+
+    static void rotateLogFileIfNeeded()
+    {
+      if (_logBasePath.empty())
+      {
+        // No log file path specified, skip file logging
+        return;
+      }
+
+      namespace fs = std::filesystem;
+      auto logPath = fs::path(_logBasePath);
+      auto logDir = logPath.parent_path();
+      // If logDir is empty, use current directory
+      if (logDir.empty())
+      {
+        logDir = fs::current_path();
+      }
+      if (!fs::exists(logDir))
+      {
+        std::error_code ec;
+        fs::create_directories(logDir, ec);
+        if (ec)
+        {
+          std::cerr << "[Logger] Failed to create log directory: " << logDir
+                    << " - " << ec.message() << std::endl;
+          return;
+        }
+      }
+
+      std::string today = currentDate();
+      if (today != _currentLogDate)
+      {
+        _currentLogDate = today;
+        std::string rotatedPath = (logDir / (logPath.filename().string() + "." +
+                                             _currentLogDate + ".log"))
+                                      .string();
+
+        _fileStream =
+            std::make_unique<std::ofstream>(rotatedPath, std::ios::app);
+        if (!_fileStream->is_open())
+        {
+          std::cerr << "[Logger] Failed to open rotated log file: "
+                    << rotatedPath << std::endl;
+          _fileStream.reset();
+        }
+
+        deleteOldLogFiles();
+      }
+    }
+
+    static void deleteOldLogFiles()
+    {
+      if (_logBasePath.empty() || _retentionDays <= 0)
+      {
+        return;
+      }
+
+      namespace fs = std::filesystem;
+      auto now = std::chrono::system_clock::now();
+      auto logPath = fs::path(_logBasePath);
+      auto logDir = logPath.parent_path();
+      if (logDir.empty())
+      {
+        logDir = fs::current_path();
+      }
+      std::string baseName = logPath.filename().string();
+      std::string prefix = baseName + ".";
+
+      std::error_code dir_ec;
+      if (!fs::exists(logDir, dir_ec))
+      {
+        // Directory does not exist, nothing to delete
+        return;
+      }
+
+      for (const auto& entry : fs::directory_iterator(logDir, dir_ec))
+      {
+        if (dir_ec)
+        {
+          std::cerr << "[Logger] Failed to iterate log directory: " << logDir
+                    << " - " << dir_ec.message() << std::endl;
+          break;
+        }
+        const auto& path = entry.path();
+        std::string fname = path.filename().string();
+        if (fname.find(prefix) != 0 || fname.size() <= prefix.size())
+        {
+          continue;
+        }
+
+        // Extract date from filename: baseName.YYYY-MM-DD.log
+        std::string datePart = fname.substr(prefix.size(), 10); // YYYY-MM-DD
+        std::tm tm = {};
+        std::istringstream ss(datePart);
+        ss >> std::get_time(&tm, "%Y-%m-%d");
+        if (ss.fail())
+        {
+          continue;
+        }
+        auto fileTime =
+            std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        // Only compare date, not time-of-day
+        auto fileDays =
+            std::chrono::duration_cast<std::chrono::hours>(now - fileTime)
+                .count() /
+            24;
+        if (fileDays >= _retentionDays)
+        {
+          std::error_code ec;
+          fs::remove(path, ec);
+          if (ec)
+          {
+            std::cerr << "[Logger] Failed to delete old log file: " << path
+                      << " - " << ec.message() << std::endl;
+          }
+        }
+      }
+    }
+
+    static const char* levelToString(Level level)
+    {
+      switch (level)
+      {
+      case Level::Trace:
+        return "TRACE";
+      case Level::Debug:
+        return "DEBUG";
+      case Level::Info:
+        return "INFO";
+      case Level::Warning:
+        return "WARN";
+      case Level::Error:
+        return "ERROR";
+      case Level::Fatal:
+        return "FATAL";
+      default:
+        return "UNKNOWN";
+      }
+    }
+  };
+
+  /// \brief Stream interface for composing and emitting log messages with
+  /// levels.
+  class LoggerStream
+  {
+  public:
+    explicit LoggerStream(Logger::Level level) : _level(level), _flushed(false)
+    {
+    }
+
+    template <typename T> LoggerStream& operator<<(const T& value)
+    {
+      _stream << value;
+      return *this;
+    }
+
+    LoggerStream& operator<<(Logger::Endl)
+    {
+      flush();
+      return *this;
+    }
+
+    ~LoggerStream()
+    {
+      if (!_flushed && !_stream.str().empty())
+      {
+        flush();
+      }
+    }
+
+  private:
+    Logger::Level _level;
+    std::ostringstream _stream;
+    bool _flushed;
+
+    void flush()
+    {
+      Logger::log(_level, _stream.str());
+      _flushed = true;
+      // Ensure log content is flushed to disk for tests
+      iora::log::Logger::flush();
+    }
+  };
+
+  /// \brief Proxy for streaming log messages at specific log levels.
+  class LoggerProxy
+  {
+  public:
+    LoggerStream operator<<(Logger::Level level)
+    {
+      return Logger::stream(level);
+    }
+  };
+
+  inline LoggerProxy Logger;
+
+#define LOG_CONTEXT_PREFIX                                                     \
+  "[" << __FILE__ << ":" << __LINE__ << " " << __func__ << "] "
+
+#define LOG_WITH_LEVEL(level, msg)                                             \
+  do                                                                           \
+  {                                                                            \
+    iora::log::Logger << iora::log::Logger::Level::level << LOG_CONTEXT_PREFIX \
+                      << msg << iora::log::Logger::endl;                       \
+  } while (0)
+
+#define LOG_TRACE(msg) LOG_WITH_LEVEL(Trace, msg)
+#define LOG_DEBUG(msg) LOG_WITH_LEVEL(Debug, msg)
+#define LOG_INFO(msg) LOG_WITH_LEVEL(Info, msg)
+#define LOG_WARN(msg) LOG_WITH_LEVEL(Warning, msg)
+#define LOG_ERROR(msg) LOG_WITH_LEVEL(Error, msg)
+#define LOG_FATAL(msg) LOG_WITH_LEVEL(Fatal, msg)
+
+  inline LoggerStream Logger::stream(Logger::Level level)
+  {
+    return LoggerStream(level);
+  }
+}
 namespace config
 {
   /// \brief Loads and parses TOML configuration files for the application.
@@ -1003,6 +1449,7 @@ namespace http
     }
   };
 
+  using namespace ::iora::log;
   /// \brief Feature-rich HTTP client supporting synchronous, asynchronous, and
   /// streaming API calls.
   class HttpClient
@@ -1174,175 +1621,203 @@ namespace http
   /// JSON endpoints.
   class WebhookServer
   {
-  public:
-    // Explicitly delete copy/move constructors and assignment operators
-    WebhookServer(const WebhookServer&) = delete;
-    WebhookServer& operator=(const WebhookServer&) = delete;
-    WebhookServer(WebhookServer&&) = delete;
-    WebhookServer& operator=(WebhookServer&&) = delete;
-    struct TlsConfig
+public:
+  /// \brief Explicitly delete copy/move constructors and assignment operators
+  WebhookServer(const WebhookServer&) = delete;
+  WebhookServer& operator=(const WebhookServer&) = delete;
+  WebhookServer(WebhookServer&&) = delete;
+  WebhookServer& operator=(WebhookServer&&) = delete;
+
+  /// \brief TLS configuration for the server
+  struct TlsConfig
+  {
+    std::string certFile;
+    std::string keyFile;
+    std::string caFile;
+    bool requireClientCert = false;
+  };
+
+  using Handler = std::function<void(const httplib::Request&, httplib::Response&)>;
+  using JsonHandler = std::function<json::Json(const json::Json&)>;
+
+  static constexpr int DEFAULT_PORT = 8080;
+
+  /// \brief Constructs a WebhookServer with the default port.
+  WebhookServer() : _port(DEFAULT_PORT) {}
+
+  /// \brief Sets the port for the server.
+  void setPort(int port)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _port = port;
+  }
+
+  /// \brief Enables TLS with the given configuration. Throws if cert/key files are missing.
+  void enableTls(const TlsConfig& config)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    // Validate cert/key files exist
+    if (config.certFile.empty() || config.keyFile.empty())
     {
-      std::string certFile;
-      std::string keyFile;
-      std::string caFile;
-      bool requireClientCert = false;
-    };
-
-    using Handler = std::function<void(const httplib::Request&, httplib::Response&)>;
-    using JsonHandler = std::function<json::Json(const json::Json&)>;
-
-    WebhookServer() : _port(8080) {}
-
-    void setPort(int port)
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _port = port;
+      throw std::runtime_error("TLS: certFile and keyFile must be set");
     }
-
-    void enableTls(const TlsConfig& config)
+    std::ifstream certTest(config.certFile);
+    std::ifstream keyTest(config.keyFile);
+    if (!certTest.good() || !keyTest.good())
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _tlsConfig = config;
+      throw std::runtime_error("TLS: certFile or keyFile not readable");
     }
-
-    void onGet(const std::string& path, Handler handler)
+    if (config.requireClientCert && config.caFile.empty())
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (isServerActiveLocked())
+      throw std::runtime_error("TLS: requireClientCert is true but caFile is not set");
+    }
+    if (config.requireClientCert)
+    {
+      std::ifstream caTest(config.caFile);
+      if (!caTest.good())
       {
-        withActiveServerLocked([&](auto& server)
-                               { server.Get(path.c_str(), handler); });
+        throw std::runtime_error("TLS: caFile not readable");
       }
-      else
-      {
-        _pendingGetHandlers.emplace_back(path, std::move(handler));
-      }
     }
+    _tlsConfig = config;
+  }
 
-    void onJsonGet(const std::string& endpoint, JsonHandler handler)
+  /// \brief Registers a GET handler for the given path.
+  void onGet(const std::string& path, Handler handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (isServerActiveLocked())
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (isServerActiveLocked())
-      {
-        withActiveServerLocked(
-            [&](auto& server)
-            {
-              server.Get(
-                  endpoint.c_str(),
-                  [handler](const httplib::Request& req, httplib::Response& res)
+      withActiveServerLocked([&](auto& server)
+                             { server.Get(path.c_str(), std::move(handler)); });
+    }
+    else
+    {
+      _pendingGetHandlers.emplace_back(path, std::move(handler));
+    }
+  }
+
+  /// \brief Registers a GET handler for JSON endpoints.
+  void onJsonGet(const std::string& endpoint, JsonHandler handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (isServerActiveLocked())
+    {
+      withActiveServerLocked(
+          [&](auto& server)
+          {
+            server.Get(
+                endpoint.c_str(),
+                [handler = std::move(handler)](const httplib::Request& req, httplib::Response& res)
+                {
+                  try
                   {
-                    try
+                    json::Json requestJson;
+                    if (!req.body.empty())
                     {
-                      json::Json requestJson;
-                      if (!req.body.empty())
-                      {
-                        requestJson = json::Json::parse(req.body);
-                      }
-                      else
-                      {
-                        requestJson = json::Json::object();
-                      }
-                      json::Json responseJson = handler(requestJson);
-                      res.set_content(responseJson.dump(), "application/json");
+                      requestJson = json::Json::parse(req.body);
                     }
-                    catch (const std::exception& ex)
+                    else
                     {
-                      res.status = 500;
-                      res.set_content(ex.what(), "text/plain");
+                      requestJson = json::Json::object();
                     }
-                  });
-            });
-      }
-      else
-      {
-        _pendingJsonGetHandlers.emplace_back(endpoint, std::move(handler));
-      }
-    }
-
-    void onPost(const std::string& path, Handler handler)
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (isServerActiveLocked())
-      {
-        withActiveServerLocked([&](auto& server)
-                               { server.Post(path.c_str(), handler); });
-      }
-      else
-      {
-        _pendingPostHandlers.emplace_back(path, std::move(handler));
-      }
-    }
-
-    void onJsonPost(const std::string& endpoint, JsonHandler handler)
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (isServerActiveLocked())
-      {
-        withActiveServerLocked(
-            [&](auto& server)
-            {
-              server.Post(
-                  endpoint.c_str(),
-                  [handler](const httplib::Request& req, httplib::Response& res)
+                    json::Json responseJson = handler(requestJson);
+                    res.set_content(responseJson.dump(), "application/json");
+                  }
+                  catch (const std::exception& ex)
                   {
-                    try
-                    {
-                      json::Json requestJson = json::Json::parse(req.body);
-                      json::Json responseJson = handler(requestJson);
-                      res.set_content(responseJson.dump(), "application/json");
-                    }
-                    catch (const std::exception& ex)
-                    {
-                      res.status = 500;
-                      res.set_content(ex.what(), "text/plain");
-                    }
-                  });
-            });
-      }
-      else
-      {
-        _pendingJsonPostHandlers.emplace_back(endpoint, std::move(handler));
-      }
+                    res.status = 500;
+                    res.set_content(ex.what(), "text/plain");
+                    iora::log::Logger::error(std::string("WebhookServer onJsonGet handler error: ") + ex.what());
+                  }
+                });
+          });
     }
-
-    void onDelete(const std::string& path, Handler handler)
+    else
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (isServerActiveLocked())
-      {
-        withActiveServerLocked([&](auto& server)
-                               { server.Delete(path.c_str(), handler); });
-      }
-      else
-      {
-        _pendingDeleteHandlers.emplace_back(path, std::move(handler));
-      }
+      _pendingJsonGetHandlers.emplace_back(endpoint, std::move(handler));
     }
-    
-    void start()
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
+  }
 
+  /// \brief Registers a POST handler for the given path.
+  void onPost(const std::string& path, Handler handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (isServerActiveLocked())
+    {
+      withActiveServerLocked([&](auto& server)
+                             { server.Post(path.c_str(), std::move(handler)); });
+    }
+    else
+    {
+      _pendingPostHandlers.emplace_back(path, std::move(handler));
+    }
+  }
+
+  /// \brief Registers a POST handler for JSON endpoints.
+  void onJsonPost(const std::string& endpoint, JsonHandler handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (isServerActiveLocked())
+    {
+      withActiveServerLocked(
+          [&](auto& server)
+          {
+            server.Post(
+                endpoint.c_str(),
+                [handler = std::move(handler)](const httplib::Request& req, httplib::Response& res)
+                {
+                  try
+                  {
+                    json::Json requestJson = json::Json::parse(req.body);
+                    json::Json responseJson = handler(requestJson);
+                    res.set_content(responseJson.dump(), "application/json");
+                  }
+                  catch (const std::exception& ex)
+                  {
+                    res.status = 500;
+                    res.set_content(ex.what(), "text/plain");
+                    iora::log::Logger::error(std::string("WebhookServer onJsonPost handler error: ") + ex.what());
+                  }
+                });
+          });
+    }
+    else
+    {
+      _pendingJsonPostHandlers.emplace_back(endpoint, std::move(handler));
+    }
+  }
+
+  /// \brief Registers a DELETE handler for the given path.
+  void onDelete(const std::string& path, Handler handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (isServerActiveLocked())
+    {
+      withActiveServerLocked([&](auto& server)
+                             { server.Delete(path.c_str(), std::move(handler)); });
+    }
+    else
+    {
+      _pendingDeleteHandlers.emplace_back(path, std::move(handler));
+    }
+  }
+
+  /// \brief Starts the server. Throws on error.
+  void start()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    try
+    {
       if (_tlsConfig.has_value())
       {
         const auto& cfg = _tlsConfig.value();
-        // If client certs are required, caFile must be provided for
-        // verification
-        if (cfg.requireClientCert && cfg.caFile.empty())
-        {
-          throw std::runtime_error(
-              "TLS: requireClientCert is true but caFile is not set");
-        }
         _server.emplace<httplib::SSLServer>(
             cfg.certFile.c_str(), cfg.keyFile.c_str(),
             cfg.caFile.empty() ? nullptr : cfg.caFile.c_str());
-
-        // In cpp-httplib, providing a CA file enables client cert verification.
-        // No explicit method call is needed.
         auto& ssl = std::get<httplib::SSLServer>(_server);
         bindHandlersLocked(ssl);
-
-        _thread = std::thread(
+        _thread.emplace(
             [this]() {
               std::get<httplib::SSLServer>(_server).listen("0.0.0.0", _port);
             });
@@ -1350,577 +1825,139 @@ namespace http
       else
       {
         _server.emplace<httplib::Server>();
-
         auto& server = std::get<httplib::Server>(_server);
         bindHandlersLocked(server);
-
-        _thread = std::thread(
+        _thread.emplace(
             [this]()
             { std::get<httplib::Server>(_server).listen("0.0.0.0", _port); });
       }
     }
-
-    void stop()
+    catch (const std::exception& ex)
     {
-      std::lock_guard<std::mutex> lock(_mutex);
+      iora::log::Logger::error(std::string("WebhookServer start error: ") + ex.what());
+      throw;
+    }
+  }
 
-      std::visit(
-          [](auto& s)
+  /// \brief Stops the server and joins the thread if needed.
+  void stop()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::visit(
+        [](auto& s)
+        {
+          using T = std::decay_t<decltype(s)>;
+          if constexpr (!std::is_same_v<T, std::monostate>)
           {
-            using T = std::decay_t<decltype(s)>;
-            if constexpr (!std::is_same_v<T, std::monostate>)
-            {
-              s.stop();
-            }
-          },
-          _server);
-
-      if (_thread.joinable())
-      {
-        _thread.join();
-      }
-    }
-
-  private:
-    // More clear: return _server.index() != 0;
-    bool isServerActiveLocked() const { return _server.index() != 0; }
-
-    template <typename F> void withActiveServerLocked(F&& f)
+            s.stop();
+          }
+        },
+        _server);
+    if (_thread && _thread->joinable() && std::this_thread::get_id() != _thread->get_id())
     {
-      std::visit(
-          [&](auto& s)
+      _thread->join();
+    }
+    _thread.reset();
+  }
+
+private:
+  /// \brief Returns true if the server is active (not monostate).
+  [[nodiscard]] bool isServerActiveLocked() const { return _server.index() != 0; }
+
+  /// \brief Calls the given function with the active server instance.
+  template <typename F> void withActiveServerLocked(F&& f)
+  {
+    std::visit(
+        [&](auto& s)
+        {
+          using T = std::decay_t<decltype(s)>;
+          if constexpr (!std::is_same_v<T, std::monostate>)
           {
-            using T = std::decay_t<decltype(s)>;
-            if constexpr (!std::is_same_v<T, std::monostate>)
-            {
-              f(s);
-            }
-          },
-          _server);
-    }
+            f(s);
+          }
+        },
+        _server);
+  }
 
-    template <typename ServerT> void bindHandlersLocked(ServerT& server)
+  /// \brief Binds all pending handlers to the given server instance.
+  template <typename ServerT> void bindHandlersLocked(ServerT& server)
+  {
+    for (auto& [path, handler] : _pendingPostHandlers)
     {
-      for (const auto& [path, handler] : _pendingPostHandlers)
-      {
-        server.Post(path.c_str(), handler);
-      }
-
-      for (const auto& [path, handler] : _pendingJsonGetHandlers)
-      {
-        server.Get(
-            path.c_str(),
-            [handler](const httplib::Request& req, httplib::Response& res)
-            {
-              try
-              {
-                json::Json requestJson;
-                if (!req.body.empty())
-                {
-                  requestJson = json::Json::parse(req.body);
-                }
-                else
-                {
-                  requestJson = json::Json::object();
-                }
-                json::Json responseJson = handler(requestJson);
-                res.set_content(responseJson.dump(), "application/json");
-              }
-              catch (const std::exception& ex)
-              {
-                res.status = 500;
-                res.set_content(ex.what(), "text/plain");
-              }
-            });
-      }
-
-      for (const auto& [path, handler] : _pendingJsonPostHandlers)
-      {
-        server.Post(
-            path.c_str(),
-            [handler](const httplib::Request& req, httplib::Response& res)
-            {
-              try
-              {
-                json::Json requestJson = json::Json::parse(req.body);
-                json::Json responseJson = handler(requestJson);
-                res.set_content(responseJson.dump(), "application/json");
-              }
-              catch (const std::exception& ex)
-              {
-                res.status = 500;
-                res.set_content(ex.what(), "text/plain");
-              }
-            });
-      }
-
-      _pendingPostHandlers.clear();
-      _pendingGetHandlers.clear();
-      _pendingDeleteHandlers.clear();
-      _pendingJsonGetHandlers.clear();
-      _pendingJsonPostHandlers.clear();
+      server.Post(path.c_str(), std::move(handler));
     }
+    for (auto& [path, handler] : _pendingGetHandlers)
+    {
+      server.Get(path.c_str(), std::move(handler));
+    }
+    for (auto& [path, handler] : _pendingJsonGetHandlers)
+    {
+      server.Get(
+          path.c_str(),
+          [handler = std::move(handler)](const httplib::Request& req, httplib::Response& res)
+          {
+            try
+            {
+              json::Json requestJson;
+              if (!req.body.empty())
+              {
+                requestJson = json::Json::parse(req.body);
+              }
+              else
+              {
+                requestJson = json::Json::object();
+              }
+              json::Json responseJson = handler(requestJson);
+              res.set_content(responseJson.dump(), "application/json");
+            }
+            catch (const std::exception& ex)
+            {
+              res.status = 500;
+              res.set_content(ex.what(), "text/plain");
+              iora::log::Logger::error(std::string("WebhookServer bindHandlersLocked onJsonGet error: ") + ex.what());
+            }
+          });
+    }
+    for (auto& [path, handler] : _pendingJsonPostHandlers)
+    {
+      server.Post(
+          path.c_str(),
+          [handler = std::move(handler)](const httplib::Request& req, httplib::Response& res)
+          {
+            try
+            {
+              json::Json requestJson = json::Json::parse(req.body);
+              json::Json responseJson = handler(requestJson);
+              res.set_content(responseJson.dump(), "application/json");
+            }
+            catch (const std::exception& ex)
+            {
+              res.status = 500;
+              res.set_content(ex.what(), "text/plain");
+              iora::log::Logger::error(std::string("WebhookServer bindHandlersLocked onJsonPost error: ") + ex.what());
+            }
+          });
+    }
+    _pendingPostHandlers.clear();
+    _pendingGetHandlers.clear();
+    _pendingJsonGetHandlers.clear();
+    _pendingJsonPostHandlers.clear();
+  }
 
-    mutable std::mutex _mutex;
+  mutable std::mutex _mutex;
 
-    int _port;
-    std::optional<TlsConfig> _tlsConfig;
-    std::variant<std::monostate, httplib::Server, httplib::SSLServer> _server;
-    std::thread _thread;
+  int _port;
+  std::optional<TlsConfig> _tlsConfig;
+  std::variant<std::monostate, httplib::Server, httplib::SSLServer> _server;
+  std::optional<std::thread> _thread;
 
-    std::vector<std::pair<std::string, Handler>> _pendingPostHandlers;
-    std::vector<std::pair<std::string, Handler>> _pendingGetHandlers;
-    std::vector<std::pair<std::string, Handler>> _pendingDeleteHandlers;
-    std::vector<std::pair<std::string, JsonHandler>> _pendingJsonGetHandlers;
-    std::vector<std::pair<std::string, JsonHandler>> _pendingJsonPostHandlers;
+  std::vector<std::pair<std::string, Handler>> _pendingPostHandlers;
+  std::vector<std::pair<std::string, Handler>> _pendingGetHandlers;
+  std::vector<std::pair<std::string, Handler>> _pendingDeleteHandlers;
+  std::vector<std::pair<std::string, JsonHandler>> _pendingJsonGetHandlers;
+  std::vector<std::pair<std::string, JsonHandler>> _pendingJsonPostHandlers;
   };
 } // namespace http
-
-namespace log
-{
-
-  // Forward declaration
-  class LoggerStream;
-
-  /// \brief Thread-safe logger supporting log levels, async mode, file
-  /// rotation, and retention.
-  class Logger
-  {
-  public:
-    enum class Level
-    {
-      Trace,
-      Debug,
-      Info,
-      Warning,
-      Error,
-      Fatal
-    };
-
-    struct Endl
-    {
-    };
-    static inline constexpr Endl endl{};
-
-    static void init(Level level = Level::Info,
-                     const std::string& filePath = "", bool async = false,
-                     int retentionDays = 7,
-                     const std::string& timeFormat = "%Y-%m-%d %H:%M:%S")
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-
-      _minLevel = level;
-      _asyncMode = async;
-      _exit = false;
-      // If no filePath provided, use default in current directory
-      if (filePath.empty())
-      {
-        _logBasePath = "iora.log";
-      }
-      else
-      {
-        _logBasePath = filePath;
-      }
-      _retentionDays = retentionDays;
-      _timestampFormat = timeFormat;
-      // Reset current log date so rotateLogFileIfNeeded always opens a new file
-      _currentLogDate.clear();
-      rotateLogFileIfNeeded();
-
-      if (_asyncMode && !_workerThread.joinable())
-      {
-        _workerThread = std::thread(runWorker);
-      }
-    }
-
-    static void flush()
-    {
-      std::unique_lock<std::mutex> lock(_mutex);
-      // Always flush queue for both sync and async modes
-      while (!_queue.empty())
-      {
-        rotateLogFileIfNeeded();
-        const std::string& entry = _queue.front();
-        std::cout << entry;
-        if (_fileStream)
-        {
-          (*_fileStream) << entry;
-          _fileStream->flush();
-        }
-        _queue.pop();
-      }
-      // Also flush file stream if open
-      if (_fileStream)
-      {
-        _fileStream->flush();
-      }
-    }
-
-    static void shutdown()
-    {
-      flush();
-      {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _exit = true;
-      }
-      _cv.notify_one();
-
-      if (_workerThread.joinable())
-      {
-        _workerThread.join();
-      }
-    }
-
-    static void setLevel(Level level)
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _minLevel = level;
-    }
-
-    static void trace(const std::string& message)
-    {
-      log(Level::Trace, message);
-    }
-    static void debug(const std::string& message)
-    {
-      log(Level::Debug, message);
-    }
-    static void info(const std::string& message) { log(Level::Info, message); }
-    static void warning(const std::string& message)
-    {
-      log(Level::Warning, message);
-    }
-    static void error(const std::string& message)
-    {
-      log(Level::Error, message);
-    }
-    static void fatal(const std::string& message)
-    {
-      log(Level::Fatal, message);
-    }
-
-    static LoggerStream stream(Level level);
-
-    static void log(Level level, const std::string& message)
-    {
-      if (level < _minLevel)
-      {
-        return;
-      }
-
-      std::ostringstream oss;
-      oss << "[" << timestamp() << "] "
-          << "[" << levelToString(level) << "] " << message << std::endl;
-
-      std::string output = oss.str();
-
-      if (_asyncMode)
-      {
-        {
-          std::lock_guard<std::mutex> lock(_mutex);
-          _queue.push(std::move(output));
-        }
-        _cv.notify_one();
-      }
-      else
-      {
-        std::lock_guard<std::mutex> lock(_mutex);
-        rotateLogFileIfNeeded();
-        std::cout << output;
-        if (_fileStream)
-        {
-          (*_fileStream) << output;
-          _fileStream->flush();
-        }
-      }
-    }
-
-  public:
-    friend class LoggerStream;
-
-    static inline std::mutex _mutex;
-    static inline std::condition_variable _cv;
-    static inline std::queue<std::string> _queue;
-    static inline std::thread _workerThread;
-    static inline std::atomic<bool> _exit{false};
-    static inline bool _asyncMode = false;
-    static inline Level _minLevel = Level::Info;
-    static inline std::unique_ptr<std::ofstream> _fileStream;
-    static inline std::string _logBasePath;
-    static inline std::string _currentLogDate;
-    static inline int _retentionDays = 7;
-    static inline std::string _timestampFormat = "%Y-%m-%d %H:%M:%S";
-
-    static void runWorker()
-    {
-      while (true)
-      {
-        std::unique_lock<std::mutex> lock(_mutex);
-        _cv.wait(lock, [] { return !_queue.empty() || _exit; });
-
-        while (!_queue.empty())
-        {
-          rotateLogFileIfNeeded();
-          const std::string& entry = _queue.front();
-          std::cout << entry;
-          if (_fileStream)
-          {
-            (*_fileStream) << entry;
-            _fileStream->flush();
-          }
-          _queue.pop();
-        }
-
-        if (_exit)
-        {
-          break;
-        }
-      }
-    }
-
-    static std::string timestamp()
-    {
-      auto now = std::chrono::system_clock::now();
-      auto t = std::chrono::system_clock::to_time_t(now);
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()) %
-                1000;
-
-      std::ostringstream oss;
-      oss << std::put_time(std::localtime(&t), _timestampFormat.c_str());
-      if (_timestampFormat.find("%S") != std::string::npos)
-      {
-        oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-      }
-      return oss.str();
-    }
-
-    static std::string currentDate()
-    {
-      auto now = std::chrono::system_clock::now();
-      auto t = std::chrono::system_clock::to_time_t(now);
-      std::ostringstream oss;
-      oss << std::put_time(std::localtime(&t), "%Y-%m-%d");
-      return oss.str();
-    }
-
-    static void rotateLogFileIfNeeded()
-    {
-      if (_logBasePath.empty())
-      {
-        // No log file path specified, skip file logging
-        return;
-      }
-
-      namespace fs = std::filesystem;
-      auto logPath = fs::path(_logBasePath);
-      auto logDir = logPath.parent_path();
-      // If logDir is empty, use current directory
-      if (logDir.empty())
-      {
-        logDir = fs::current_path();
-      }
-      if (!fs::exists(logDir))
-      {
-        std::error_code ec;
-        fs::create_directories(logDir, ec);
-        if (ec)
-        {
-          std::cerr << "[Logger] Failed to create log directory: " << logDir
-                    << " - " << ec.message() << std::endl;
-          return;
-        }
-      }
-
-      std::string today = currentDate();
-      if (today != _currentLogDate)
-      {
-        _currentLogDate = today;
-        std::string rotatedPath = (logDir / (logPath.filename().string() + "." +
-                                             _currentLogDate + ".log"))
-                                      .string();
-
-        _fileStream =
-            std::make_unique<std::ofstream>(rotatedPath, std::ios::app);
-        if (!_fileStream->is_open())
-        {
-          std::cerr << "[Logger] Failed to open rotated log file: "
-                    << rotatedPath << std::endl;
-          _fileStream.reset();
-        }
-
-        deleteOldLogFiles();
-      }
-    }
-
-    static void deleteOldLogFiles()
-    {
-      if (_logBasePath.empty() || _retentionDays <= 0)
-      {
-        return;
-      }
-
-      namespace fs = std::filesystem;
-      auto now = std::chrono::system_clock::now();
-      auto logPath = fs::path(_logBasePath);
-      auto logDir = logPath.parent_path();
-      if (logDir.empty())
-      {
-        logDir = fs::current_path();
-      }
-      std::string baseName = logPath.filename().string();
-      std::string prefix = baseName + ".";
-
-      std::error_code dir_ec;
-      if (!fs::exists(logDir, dir_ec))
-      {
-        // Directory does not exist, nothing to delete
-        return;
-      }
-
-      for (const auto& entry : fs::directory_iterator(logDir, dir_ec))
-      {
-        if (dir_ec)
-        {
-          std::cerr << "[Logger] Failed to iterate log directory: " << logDir
-                    << " - " << dir_ec.message() << std::endl;
-          break;
-        }
-        const auto& path = entry.path();
-        std::string fname = path.filename().string();
-        if (fname.find(prefix) != 0 || fname.size() <= prefix.size())
-        {
-          continue;
-        }
-
-        // Extract date from filename: baseName.YYYY-MM-DD.log
-        std::string datePart = fname.substr(prefix.size(), 10); // YYYY-MM-DD
-        std::tm tm = {};
-        std::istringstream ss(datePart);
-        ss >> std::get_time(&tm, "%Y-%m-%d");
-        if (ss.fail())
-        {
-          continue;
-        }
-        auto fileTime =
-            std::chrono::system_clock::from_time_t(std::mktime(&tm));
-        // Only compare date, not time-of-day
-        auto fileDays =
-            std::chrono::duration_cast<std::chrono::hours>(now - fileTime)
-                .count() /
-            24;
-        if (fileDays >= _retentionDays)
-        {
-          std::error_code ec;
-          fs::remove(path, ec);
-          if (ec)
-          {
-            std::cerr << "[Logger] Failed to delete old log file: " << path
-                      << " - " << ec.message() << std::endl;
-          }
-        }
-      }
-    }
-
-    static const char* levelToString(Level level)
-    {
-      switch (level)
-      {
-      case Level::Trace:
-        return "TRACE";
-      case Level::Debug:
-        return "DEBUG";
-      case Level::Info:
-        return "INFO";
-      case Level::Warning:
-        return "WARN";
-      case Level::Error:
-        return "ERROR";
-      case Level::Fatal:
-        return "FATAL";
-      default:
-        return "UNKNOWN";
-      }
-    }
-  };
-
-  /// \brief Stream interface for composing and emitting log messages with
-  /// levels.
-  class LoggerStream
-  {
-  public:
-    explicit LoggerStream(Logger::Level level) : _level(level), _flushed(false)
-    {
-    }
-
-    template <typename T> LoggerStream& operator<<(const T& value)
-    {
-      _stream << value;
-      return *this;
-    }
-
-    LoggerStream& operator<<(Logger::Endl)
-    {
-      flush();
-      return *this;
-    }
-
-    ~LoggerStream()
-    {
-      if (!_flushed && !_stream.str().empty())
-      {
-        flush();
-      }
-    }
-
-  private:
-    Logger::Level _level;
-    std::ostringstream _stream;
-    bool _flushed;
-
-    void flush()
-    {
-      Logger::log(_level, _stream.str());
-      _flushed = true;
-      // Ensure log content is flushed to disk for tests
-      iora::log::Logger::flush();
-    }
-  };
-
-  /// \brief Proxy for streaming log messages at specific log levels.
-  class LoggerProxy
-  {
-  public:
-    LoggerStream operator<<(Logger::Level level)
-    {
-      return Logger::stream(level);
-    }
-  };
-
-  inline LoggerProxy Logger;
-
-#define LOG_CONTEXT_PREFIX                                                     \
-  "[" << __FILE__ << ":" << __LINE__ << " " << __func__ << "] "
-
-#define LOG_WITH_LEVEL(level, msg)                                             \
-  do                                                                           \
-  {                                                                            \
-    iora::log::Logger << iora::log::Logger::Level::level << LOG_CONTEXT_PREFIX \
-                      << msg << iora::log::Logger::endl;                       \
-  } while (0)
-
-#define LOG_TRACE(msg) LOG_WITH_LEVEL(Trace, msg)
-#define LOG_DEBUG(msg) LOG_WITH_LEVEL(Debug, msg)
-#define LOG_INFO(msg) LOG_WITH_LEVEL(Info, msg)
-#define LOG_WARN(msg) LOG_WITH_LEVEL(Warning, msg)
-#define LOG_ERROR(msg) LOG_WITH_LEVEL(Error, msg)
-#define LOG_FATAL(msg) LOG_WITH_LEVEL(Fatal, msg)
-
-  inline LoggerStream Logger::stream(Logger::Level level)
-  {
-    return LoggerStream(level);
-  }
-} // namespace log
 
 namespace shell
 {
