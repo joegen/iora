@@ -117,15 +117,11 @@ int main(int argc, char** argv)
     return { { "status", "pending" } };
   });
 
-  // Start the webhook server
-  svc.startWebhookServer();
-  
   // Setup signal handler for Ctrl+C
   std::signal(SIGINT, 
     [](int) 
     {
-      auto& svc = iora::IoraService::instance();
-      svc.terminate();
+      iora::IoraService::instance().terminate();
     }
   );
   

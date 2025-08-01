@@ -1645,6 +1645,11 @@ public:
   /// \brief Constructs a WebhookServer with the default port.
   WebhookServer() : _port(DEFAULT_PORT) {}
 
+  ~WebhookServer()
+  {
+    stop();
+  }
+
   /// \brief Sets the port for the server.
   void setPort(int port)
   {
@@ -1988,6 +1993,58 @@ namespace shell
 class IoraService : public util::PluginManager
 {
 public:
+  /// \brief Deleted copy constructor and assignment operator.
+  IoraService(const IoraService&) = delete;
+  IoraService& operator=(const IoraService&) = delete;
+
+  /// \brief Constructor initialises members and loads configuration.
+  IoraService()
+  {
+  }
+
+  /// \brief Destructor stops the server.
+  ~IoraService() 
+  { 
+  }
+
+  static IoraService& instance()
+  {
+    return *instancePtr();
+  }
+
+
+  /// \brief Holds all configuration options for IoraService, reflecting the nested TOML structure.
+  struct Config
+  {
+    struct ServerConfig
+    {
+      std::optional<int> port;
+      struct TlsConfig
+      {
+        std::optional<std::string> certFile;
+        std::optional<std::string> keyFile;
+        std::optional<std::string> caFile;
+        std::optional<bool> requireClientCert;
+      } tls;
+    } server;
+    struct ModulesConfig
+    {
+      std::optional<std::string> directory;
+    } modules;
+    struct StateConfig
+    {
+      std::optional<std::string> file;
+    } state;
+    struct LogConfig
+    {
+      std::optional<std::string> level;
+      std::optional<std::string> file;
+      std::optional<bool> async;
+      std::optional<int> retentionDays;
+      std::optional<std::string> timeFormat;
+    } log;
+  };
+
   /// \brief Cleans up all global Iora resources, notifies plugins, and unloads
   /// shared libraries. Should be called at program exit or at the end of
   /// main().
@@ -2017,10 +2074,24 @@ public:
     }
     svc.unloadAll();
     // Stop the webhook server if running
-    svc.stopWebhookServer();
+    svc._webhookServer->stop();
+    
+    // (Optionally) clear other global resources, caches, etc.
+    // Destroy unique_ptr members
+    svc._webhookServer.reset();
+    svc._stateStore.reset();
+    svc._jsonFileStore.reset();
+    svc._configLoader.reset();
+    svc._cache.reset();
+
+    svc._config = Config(); // Reset configuration
+    svc._isRunning = false;
+
     // Flush and shutdown logger
     log::Logger::shutdown();
-    // (Optionally) clear other global resources, caches, etc.
+
+    // Finally, destroy the singleton instance
+    IoraService::destroyInstance();
   }
 
   /// \brief Blocks until terminate() is called. Use to keep main() alive.
@@ -2066,23 +2137,6 @@ public:
     IoraService* _service = nullptr;
   };
 
-  /// \brief Retrieves the global instance of the service.
-  static std::unique_ptr<IoraService>& instancePtr()
-  {
-    static std::unique_ptr<IoraService> instance{new IoraService()};
-    return instance;
-  }
-
-  static IoraService& instance()
-  {
-    return *instancePtr();
-  }
-
-  /// \brief Explicitly destroy the singleton instance (for test shutdown order)
-  static void destroyInstance()
-  {
-    instancePtr().reset();
-  }
 
   /// \brief Initialises the singleton with command‑line arguments.
   ///        Supported options: `--port/-p`, `--config/-c`, `--state-file/-s`,
@@ -2100,63 +2154,20 @@ public:
     return svc;
   }
 
-  /// \brief Deleted copy constructor and assignment operator.
-  IoraService(const IoraService&) = delete;
-  IoraService& operator=(const IoraService&) = delete;
-
-  /// \brief Starts the embedded webhook server on its configured port.
-  void startWebhookServer()
-  {
-    if (!_serverRunning)
-    {
-      _webhookServer->start(); // Use -> to access the method
-      _serverRunning = true;
-    }
-  }
-
-  /// \brief Stops the embedded webhook server if it is running.
-  void stopWebhookServer()
-  {
-    if (_serverRunning && _webhookServer)
-    {
-      _webhookServer->stop(); // Use -> to access the method
-      _serverRunning = false;
-    }
-  }
-
   /// \brief Accessor for the webhook server.
-  http::WebhookServer& webhookServer()
-  {
-    if (!_webhookServer)
-    {
-      throw std::runtime_error("Webhook server is not initialized. Call startWebhookServer() before use.");
-    }
-    return *_webhookServer;
-  }
+  const std::unique_ptr<http::WebhookServer>& webhookServer() const{ return _webhookServer; }
 
   /// \brief Accessor for the in-memory state store.
-  state::ConcreteStateStore& stateStore() { return _stateStore; }
+  const std::unique_ptr<state::ConcreteStateStore>& stateStore() const { return _stateStore; }
 
   /// \brief Accessor for the expiring cache.
-  util::ExpiringCache<std::string, std::string>& cache() { return _cache; }
+  const std::unique_ptr<util::ExpiringCache<std::string, std::string>>& cache() const { return _cache; }
 
   /// \brief Accessor for the configuration loader.
-  config::ConfigLoader& configLoader() { return _configLoader; }
-
-
-  /// \brief Returns true if a JSON file store is configured.
-  bool hasJsonFileStore() const
-  {
-    return static_cast<bool>(_jsonFileStore);
-  }
+  const std::unique_ptr<config::ConfigLoader>& configLoader() const { return _configLoader; }
 
   /// \brief Accessor for the embedded JSON file store.
-  /// \return Reference to the unique_ptr holding the file store, or nullptr if not configured.
-  /// \note Always check hasJsonFileStore() before using the pointer. May be null if not configured.
-  const std::unique_ptr<state::JsonFileStore>& jsonFileStore() const
-  {
-    return _jsonFileStore;
-  }
+  const std::unique_ptr<state::JsonFileStore>& jsonFileStore() const { return _jsonFileStore; }
 
   /// \brief Factory for creating a JSON file store backed by the given file.
   std::unique_ptr<state::JsonFileStore>
@@ -2172,15 +2183,13 @@ public:
   void pushEvent(const json::Json& event) { _eventQueue.push(event); }
 
   /// \brief Register a handler for an event by its ID
-  void registerEventHandlerById(const std::string& eventId,
-                                util::EventQueue::Handler handler)
+  void registerEventHandlerById(const std::string& eventId, util::EventQueue::Handler handler)
   {
     _eventQueue.onEventId(eventId, std::move(handler));
   }
 
   /// \brief Register a handler for an event by its name
-  void registerEventHandlerByName(const std::string& eventName,
-                                  util::EventQueue::Handler handler)
+  void registerEventHandlerByName(const std::string& eventName, util::EventQueue::Handler handler)
   {
     _eventQueue.onEventName(eventName, std::move(handler));
   }
@@ -2261,28 +2270,23 @@ public:
   /// \brief Begin fluent registration of an event handler matching a name
   EventBuilder onEventNameMatches(const std::string& eventNamePattern);
 
-public:
-  // For main thread blocking/termination
-  std::mutex _terminationMutex;
-  std::condition_variable _terminationCv;
-  bool _terminated = false;
-  // Track loaded plugin instances for proper onUnload notification
-  std::vector<Plugin*> _loadedModules;
-  /// \brief Constructor initialises members and loads configuration.
-  IoraService()
-    : _port(8080),
-      _webhookServer(std::make_unique<http::WebhookServer>()),
-      _stateStore(),
-      _cache(std::chrono::seconds{60}),
-      _configLoader("config.toml"),
-      _serverRunning(false)
+ 
+protected:
+  /// \brief Retrieves the global instance of the service.
+  static std::unique_ptr<IoraService>& instancePtr()
   {
+    static std::unique_ptr<IoraService> instance{nullptr};
+    if (!instance)
+    {      
+      instance = std::make_unique<IoraService>();
+    }
+    return instance;
   }
 
-  /// \brief Destructor stops the server.
-  ~IoraService() 
-  { 
-    stopWebhookServer(); 
+  /// \brief Explicitly destroy the singleton instance (for test shutdown order)
+  static void destroyInstance()
+  {
+    instancePtr().reset();
   }
 
   void loadModules()
@@ -2336,324 +2340,333 @@ public:
     LOG_INFO("Module loading complete.");
   }
 
-  /// \brief Parses command‑line arguments and overrides configuration
-  /// accordingly.
-  void parseConfig(int argc, char** argv)
+  /// \brief Parses command-line arguments and stores CLI overrides in _config.
+  void parseCliArgs(int argc, char** argv)
   {
-    // Holders for command-line overrides.
-    std::optional<int> cliPort;
-    std::optional<std::string> cliConfigPath;
-    std::optional<std::string> cliStateFile;
-    std::optional<std::string> cliLogLevel;
-    std::optional<std::string> cliLogFile;
-    std::optional<bool> cliLogAsync;
-    std::optional<int> cliLogRetention;
-    std::optional<std::string> cliLogTimeFormat;
-    // TLS CLI overrides
-    std::optional<std::string> cliTlsCert;
-    std::optional<std::string> cliTlsKey;
-    std::optional<std::string> cliTlsCa;
-    std::optional<bool> cliTlsRequireClientCert;
-
-    // Scan the arguments to capture CLI values.
     for (int i = 1; i < argc; ++i)
     {
       std::string arg = argv[i];
       if ((arg == "-p" || arg == "--port") && i + 1 < argc)
       {
-        try { cliPort = std::stoi(argv[++i]); } catch (...) {}
+        try { _config.server.port = std::stoi(argv[++i]); } catch (...) {}
       }
       else if ((arg == "-c" || arg == "--config") && i + 1 < argc)
       {
-        cliConfigPath = std::string{argv[++i]};
+        _configLoader = std::make_unique<config::ConfigLoader>(argv[++i]);
       }
       else if ((arg == "-s" || arg == "--state-file") && i + 1 < argc)
       {
-        cliStateFile = std::string{argv[++i]};
+        _config.state.file = argv[++i];
       }
       else if ((arg == "-l" || arg == "--log-level") && i + 1 < argc)
       {
-        cliLogLevel = std::string{argv[++i]};
+        _config.log.level = argv[++i];
       }
       else if ((arg == "-f" || arg == "--log-file") && i + 1 < argc)
       {
-        cliLogFile = std::string{argv[++i]};
+        _config.log.file = argv[++i];
       }
       else if ((arg == "-m" || arg == "--modules") && i + 1 < argc)
       {
-        _modulesPath = std::string{argv[++i]};
+        _config.modules.directory = argv[++i];
       }
       else if (arg == "--log-async" && i + 1 < argc)
       {
-        std::string val = std::string{argv[++i]};
+        std::string val = argv[++i];
         std::transform(val.begin(), val.end(), val.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (val == "true" || val == "1" || val == "yes") cliLogAsync = true;
-        else if (val == "false" || val == "0" || val == "no") cliLogAsync = false;
+        if (val == "true" || val == "1" || val == "yes") _config.log.async = true;
+        else if (val == "false" || val == "0" || val == "no") _config.log.async = false;
       }
       else if (arg == "--log-retention" && i + 1 < argc)
       {
-        try { cliLogRetention = std::stoi(argv[++i]); } catch (...) {}
+        try { _config.log.retentionDays = std::stoi(argv[++i]); } catch (...) {}
       }
       else if (arg == "--log-time-format" && i + 1 < argc)
       {
-        cliLogTimeFormat = std::string{argv[++i]};
+        _config.log.timeFormat = argv[++i];
       }
       // TLS CLI
       else if (arg == "--tls-cert" && i + 1 < argc)
       {
-        cliTlsCert = std::string{argv[++i]};
+        _config.server.tls.certFile = argv[++i];
       }
       else if (arg == "--tls-key" && i + 1 < argc)
       {
-        cliTlsKey = std::string{argv[++i]};
+        _config.server.tls.keyFile = argv[++i];
       }
       else if (arg == "--tls-ca" && i + 1 < argc)
       {
-        cliTlsCa = std::string{argv[++i]};
+        _config.server.tls.caFile = argv[++i];
       }
       else if (arg == "--tls-require-client-cert" && i + 1 < argc)
       {
-        std::string val = std::string{argv[++i]};
+        std::string val = argv[++i];
         std::transform(val.begin(), val.end(), val.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (val == "true" || val == "1" || val == "yes") cliTlsRequireClientCert = true;
-        else if (val == "false" || val == "0" || val == "no") cliTlsRequireClientCert = false;
+        if (val == "true" || val == "1" || val == "yes") _config.server.tls.requireClientCert = true;
+        else if (val == "false" || val == "0" || val == "no") _config.server.tls.requireClientCert = false;
       }
       // Unrecognised arguments are ignored.
     }
+  }
 
-    // Holders for values loaded from the configuration file.
-    std::optional<std::string> cfgLogLevel;
-    std::optional<std::string> cfgLogFile;
-    std::optional<bool> cfgLogAsync;
-    std::optional<int> cfgLogRetention;
-    std::optional<std::string> cfgLogTimeFormat;
-    // TLS config values
-    std::optional<std::string> cfgTlsCert;
-    std::optional<std::string> cfgTlsKey;
-    std::optional<std::string> cfgTlsCa;
-    std::optional<bool> cfgTlsRequireClientCert;
-
-    // If a config file was specified, load it and update defaults.
-    if (cliConfigPath)
+  /// \brief Loads TOML configuration and updates _config with file values.
+  void parseTomlConfig()
+  {
+    try
     {
-      _configLoader = config::ConfigLoader{*cliConfigPath};
-      try
+      if (!_configLoader)
       {
-        _configLoader.reload();
-
-        if (auto portOpt = _configLoader.getInt("server.port"))
-        {
-          _port = static_cast<int>(*portOpt);
-        }
-
-        if (auto modulesDirOpt = _configLoader.getString("modules.directory"))
-        {
-          if (_modulesPath.empty())
-          {
-            _modulesPath = *modulesDirOpt;
-          }
-        }
-
-        if (auto stateFileOpt = _configLoader.getString("state.file"))
-        {
-          _jsonFileStore =
-              std::make_unique<state::JsonFileStore>(*stateFileOpt);
-        }
-
-        if (auto logLevelOpt = _configLoader.getString("log.level"))
-        {
-          cfgLogLevel = *logLevelOpt;
-        }
-        if (auto logFileOpt = _configLoader.getString("log.file"))
-        {
-          cfgLogFile = *logFileOpt;
-        }
-        if (auto logAsyncOpt = _configLoader.getBool("log.async"))
-        {
-          cfgLogAsync = *logAsyncOpt;
-        }
-        if (auto logRetentionOpt = _configLoader.getInt("log.retention_days"))
-        {
-          cfgLogRetention = static_cast<int>(*logRetentionOpt);
-        }
-        if (auto logTimeFormatOpt = _configLoader.getString("log.time_format"))
-        {
-          cfgLogTimeFormat = *logTimeFormatOpt;
-        }
-        // TLS config from TOML
-        if (auto tlsCertOpt = _configLoader.getString("tls.cert_file"))
-        {
-          cfgTlsCert = *tlsCertOpt;
-        }
-        if (auto tlsKeyOpt = _configLoader.getString("tls.key_file"))
-        {
-          cfgTlsKey = *tlsKeyOpt;
-        }
-        if (auto tlsCaOpt = _configLoader.getString("tls.ca_file"))
-        {
-          cfgTlsCa = *tlsCaOpt;
-        }
-        if (auto tlsReqOpt = _configLoader.getBool("tls.require_client_cert"))
-        {
-          cfgTlsRequireClientCert = *tlsReqOpt;
-        }
-    // --- TLS config merge and application ---
-    // CLI always overrides config file
-    std::optional<std::string> finalTlsCert = cliTlsCert ? cliTlsCert : cfgTlsCert;
-    std::optional<std::string> finalTlsKey = cliTlsKey ? cliTlsKey : cfgTlsKey;
-    std::optional<std::string> finalTlsCa = cliTlsCa ? cliTlsCa : cfgTlsCa;
-    std::optional<bool> finalTlsRequireClientCert = cliTlsRequireClientCert ? cliTlsRequireClientCert : cfgTlsRequireClientCert;
-
-    if (finalTlsCert || finalTlsKey || finalTlsCa || finalTlsRequireClientCert)
-    {
-      http::WebhookServer::TlsConfig tlsCfg;
-      tlsCfg.certFile = finalTlsCert.value_or("");
-      tlsCfg.keyFile = finalTlsKey.value_or("");
-      tlsCfg.caFile = finalTlsCa.value_or("");
-      tlsCfg.requireClientCert = finalTlsRequireClientCert.value_or(false);
-      _webhookServer->enableTls(tlsCfg);
-    }
+        _configLoader = std::make_unique<config::ConfigLoader>("config.toml");
       }
-      catch (...)
+      _configLoader->reload();
+      if (!_config.server.port.has_value())
       {
-        // Ignore errors and keep defaults.
+        if (auto portOpt = _configLoader->getInt("iora.server.port"))
+        {
+          _config.server.port = static_cast<int>(*portOpt);
+        }
+      }
+      if (!_config.modules.directory.has_value())
+      {
+        if (auto modulesDirOpt = _configLoader->getString("iora.modules.directory"))
+        {
+          _config.modules.directory = *modulesDirOpt;
+        }
+      }
+      if (!_config.state.file.has_value())
+      {
+        if (auto stateFileOpt = _configLoader->getString("iora.state.file"))
+        {
+          _config.state.file = *stateFileOpt;
+        }
+      }
+      if (!_config.log.level.has_value())
+      {
+        if (auto logLevelOpt = _configLoader->getString("iora.log.level"))
+        {
+          _config.log.level = *logLevelOpt;
+        }
+      }
+      if (!_config.log.file.has_value())
+      {
+        if (auto logFileOpt = _configLoader->getString("iora.log.file"))
+        {
+          _config.log.file = *logFileOpt;
+        }
+      }
+      if (!_config.log.async.has_value())
+      {
+        if (auto logAsyncOpt = _configLoader->getBool("iora.log.async"))
+        {
+          _config.log.async = *logAsyncOpt;
+        }
+      }
+      if (!_config.log.retentionDays.has_value())
+      {
+        if (auto logRetentionOpt = _configLoader->getInt("iora.log.retention_days"))
+        {
+          _config.log.retentionDays = static_cast<int>(*logRetentionOpt);
+        }
+      }
+      if (!_config.log.timeFormat.has_value())
+      {
+        if (auto logTimeFormatOpt = _configLoader->getString("iora.log.time_format"))
+        {
+          _config.log.timeFormat = *logTimeFormatOpt;
+        }
+      }
+      // TLS config from TOML
+      if (!_config.server.tls.certFile.has_value())
+      {
+        if (auto tlsCertOpt = _configLoader->getString("iora.server.tls.cert_file"))
+        {
+          _config.server.tls.certFile = *tlsCertOpt;
+        }
+      }
+      if (!_config.server.tls.keyFile.has_value())
+      {
+        if (auto tlsKeyOpt = _configLoader->getString("iora.server.tls.key_file"))
+        {
+          _config.server.tls.keyFile = *tlsKeyOpt;
+        }
+      }
+      if (!_config.server.tls.caFile.has_value())
+      {
+        if (auto tlsCaOpt = _configLoader->getString("iora.server.tls.ca_file"))
+        {
+          _config.server.tls.caFile = *tlsCaOpt;
+        }
+      }
+      if (!_config.server.tls.requireClientCert.has_value())
+      {
+        if (auto tlsReqOpt = _configLoader->getBool("iora.server.tls.require_client_cert"))
+        {
+          _config.server.tls.requireClientCert = *tlsReqOpt;
+        }
       }
     }
-
-    // Apply explicit overrides for server port and state file.
-    if (cliPort)
+    catch (...)
     {
-      _port = *cliPort;
+      // Ignore errors and keep defaults.
     }
+  }
 
-    if (cliStateFile)
+  /// \brief Applies the merged configuration in _config to the service.
+  void applyConfig()
+  {
+    if (_isRunning)
     {
-      _jsonFileStore = std::make_unique<state::JsonFileStore>(*cliStateFile);
+      LOG_ERROR("applyConfig: Cannot apply config while service is running");
+      throw std::runtime_error("Cannot apply config while service is running");
     }
+    // Fill in defaults for any unset config values
+    const int DEFAULT_PORT = 8080;
+    const char* DEFAULT_STATE_FILE = "state.json";
+    const char* DEFAULT_LOG_LEVEL = "info";
+    const char* DEFAULT_LOG_FILE = "";
+    const bool DEFAULT_LOG_ASYNC = false;
+    const int DEFAULT_LOG_RETENTION = 7;
+    const char* DEFAULT_LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S";
 
-    if (!_jsonFileStore)
-    {
-      // If no state file was specified, use the default.
-      _jsonFileStore = std::make_unique<state::JsonFileStore>("state.json");
-    }
-
-    // _jsonFileStore must never be null after this point
-    assert(_jsonFileStore && "_jsonFileStore must be initialized after parseCommandLine");
-
-
-    // Default logger settings based on Logger::init
-    // signature:contentReference[oaicite:1]{index=1}.
-    log::Logger::Level finalLevel = log::Logger::Level::Info;
-    std::string finalFile;
-    bool finalAsync = false;
-    int finalRetention = 7;
-    std::string finalTimeFormat = "%Y-%m-%d %H:%M:%S";
-
-    // Convert a log-level string to an enum (case-insensitive).
+    // Logger: must be initialized first
     auto toLevel = [](const std::string& s)
     {
       std::string v;
       v.reserve(s.size());
       for (char c : s)
       {
-        v.push_back(
-            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        v.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
       }
-      if (v == "trace")
-      {
-        return log::Logger::Level::Trace;
-      }
-      if (v == "debug")
-      {
-        return log::Logger::Level::Debug;
-      }
-      if (v == "warn" || v == "warning")
-      {
-        return log::Logger::Level::Warning;
-      }
-      if (v == "error")
-      {
-        return log::Logger::Level::Error;
-      }
-      if (v == "fatal")
-      {
-        return log::Logger::Level::Fatal;
-      }
+      if (v == "trace") return log::Logger::Level::Trace;
+      if (v == "debug") return log::Logger::Level::Debug;
+      if (v == "warn" || v == "warning") return log::Logger::Level::Warning;
+      if (v == "error") return log::Logger::Level::Error;
+      if (v == "fatal") return log::Logger::Level::Fatal;
       return log::Logger::Level::Info;
     };
+    std::string logLevel = _config.log.level.value_or(DEFAULT_LOG_LEVEL);
+    std::string logFile = _config.log.file.value_or(DEFAULT_LOG_FILE);
+    bool logAsync = _config.log.async.value_or(DEFAULT_LOG_ASYNC);
+    int logRetention = _config.log.retentionDays.value_or(DEFAULT_LOG_RETENTION);
+    std::string logTimeFormat = _config.log.timeFormat.value_or(DEFAULT_LOG_TIME_FORMAT);
+    log::Logger::init(
+      toLevel(logLevel),
+      logFile,
+      logAsync,
+      logRetention,
+      logTimeFormat
+    );
+    LOG_INFO("applyConfig: Logger initialized");
 
-    // Apply config-file values.
-    if (cfgLogLevel)
+    // Log config values for diagnostics (now logger is ready)
+    LOG_INFO("applyConfig: state.file = " << _config.state.file.value_or("<unset>"));
+    LOG_INFO("applyConfig: log.level = " << _config.log.level.value_or("<unset>"));
+    LOG_INFO("applyConfig: log.file = " << _config.log.file.value_or("<unset>"));
+    LOG_INFO("applyConfig: log.async = " << ( _config.log.async.has_value() ? ( _config.log.async.value() ? "true" : "false" ) : "<unset>"));
+    LOG_INFO("applyConfig: log.retentionDays = " << ( _config.log.retentionDays.has_value() ? std::to_string(_config.log.retentionDays.value()) : "<unset>"));
+    LOG_INFO("applyConfig: log.timeFormat = " << _config.log.timeFormat.value_or("<unset>"));
+    LOG_INFO("applyConfig: server.port = " << ( _config.server.port.has_value() ? std::to_string(_config.server.port.value()) : "<unset>"));
+    LOG_INFO("applyConfig: server.tls.certFile = " << _config.server.tls.certFile.value_or("<unset>"));
+    LOG_INFO("applyConfig: server.tls.keyFile = " << _config.server.tls.keyFile.value_or("<unset>"));
+    LOG_INFO("applyConfig: server.tls.caFile = " << _config.server.tls.caFile.value_or("<unset>"));
+    LOG_INFO("applyConfig: server.tls.requireClientCert = " << ( _config.server.tls.requireClientCert.has_value() ? ( _config.server.tls.requireClientCert.value() ? "true" : "false" ) : "<unset>"));
+    LOG_INFO("applyConfig: modules.directory = " << _config.modules.directory.value_or("<unset>"));
+
+    // State file
+    std::string stateFile = _config.state.file.value_or(DEFAULT_STATE_FILE);
+    LOG_INFO("applyConfig: Creating JsonFileStore at: " << stateFile);
+    _jsonFileStore = std::make_unique<state::JsonFileStore>(stateFile);
+    assert(_jsonFileStore && "_jsonFileStore must be initialized after config");
+    LOG_INFO("applyConfig: JsonFileStore created at: " << stateFile);
+
+    // Webhook Server
+    _webhookServer = std::make_unique<http::WebhookServer>();
+    auto port = _config.server.port.value_or(DEFAULT_PORT);
+    LOG_INFO("applyConfig: Setting webhook server port to: " << port);
+    _webhookServer->setPort(port);
+
+    // TLS
+    bool hasTls = _config.server.tls.certFile.has_value() ||
+                  _config.server.tls.keyFile.has_value() ||
+                  _config.server.tls.caFile.has_value() ||
+                  _config.server.tls.requireClientCert.value_or(false);
+    if (hasTls)
     {
-      finalLevel = toLevel(*cfgLogLevel);
+      LOG_INFO("applyConfig: TLS is enabled");
+      http::WebhookServer::TlsConfig tlsCfg;
+      tlsCfg.certFile = _config.server.tls.certFile.value_or("");
+      tlsCfg.keyFile = _config.server.tls.keyFile.value_or("");
+      tlsCfg.caFile = _config.server.tls.caFile.value_or("");
+      tlsCfg.requireClientCert = _config.server.tls.requireClientCert.value_or(false);
+      LOG_INFO("applyConfig: Enabling TLS with certFile=" + tlsCfg.certFile + ", keyFile=" + tlsCfg.keyFile + ", caFile=" + tlsCfg.caFile + ", requireClientCert=" + (tlsCfg.requireClientCert ? "true" : "false"));
+      _webhookServer->enableTls(tlsCfg);
     }
-    if (cfgLogFile)
+    else
     {
-      finalFile = *cfgLogFile;
-    }
-    if (cfgLogAsync)
-    {
-      finalAsync = *cfgLogAsync;
-    }
-    if (cfgLogRetention)
-    {
-      finalRetention = *cfgLogRetention;
-    }
-    if (cfgLogTimeFormat)
-    {
-      finalTimeFormat = *cfgLogTimeFormat;
+      LOG_INFO("applyConfig: TLS is not enabled");
     }
 
-    // Override with CLI values.
-    if (cliLogLevel)
+    // Modules path
+    if (_config.modules.directory.has_value())
     {
-      finalLevel = toLevel(*cliLogLevel);
-    }
-    if (cliLogFile)
-    {
-      finalFile = *cliLogFile;
-    }
-    if (cliLogAsync)
-    {
-      finalAsync = *cliLogAsync;
-    }
-    if (cliLogRetention)
-    {
-      finalRetention = *cliLogRetention;
-    }
-    if (cliLogTimeFormat)
-    {
-      finalTimeFormat = *cliLogTimeFormat;
+      _modulesPath = _config.modules.directory.value();
     }
 
-    // Initialise the logger.  This sets the log level, file base path,
-    // asynchronous mode, retention days and time
-    // format:contentReference[oaicite:2]{index=2}.
-    log::Logger::init(finalLevel, finalFile, finalAsync, finalRetention,
-                      finalTimeFormat);
+    // State store
+    _stateStore = std::make_unique<state::ConcreteStateStore>();
 
-    // Initialize the webhook server with the configured port.
-    _webhookServer->setPort(_port);
+    // Expiring cache
+    _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(std::chrono::minutes(1)); // Default flush interval of 1 minute
 
+    LOG_INFO("applyConfig: Loading modules");
     loadModules();
+    LOG_INFO("applyConfig: Configuration applied");
+
+    // Start the webhook server
+    try
+    {
+      _webhookServer->start(); 
+    }
+    catch (const std::exception& ex)
+    {
+      LOG_ERROR("applyConfig: Failed to start webhook server: " + std::string(ex.what()));
+      throw;
+    }
+
+    _isRunning = true;
   }
 
-  int _port;
-  std::unique_ptr<http::WebhookServer> _webhookServer;
-  state::ConcreteStateStore _stateStore;
-  util::ExpiringCache<std::string, std::string> _cache;
-  config::ConfigLoader _configLoader;
-  std::unique_ptr<state::JsonFileStore> _jsonFileStore;
-  bool _serverRunning;
-  std::string _modulesPath;
+  /// \brief Parses CLI args, loads TOML config, and applies merged config.
+  void parseConfig(int argc, char** argv)
+  {
+    parseCliArgs(argc, argv);
+    parseTomlConfig();
+    applyConfig();
+  }
 
+private:
+  // For main thread blocking/termination
+  std::mutex _terminationMutex;
+  std::condition_variable _terminationCv;
+  bool _terminated = false;
+  // Track loaded plugin instances for proper onUnload notification
+  std::vector<Plugin*> _loadedModules;
+  std::unique_ptr<http::WebhookServer> _webhookServer;
+  std::unique_ptr<state::ConcreteStateStore> _stateStore;
+  std::unique_ptr<util::ExpiringCache<std::string, std::string>> _cache;
+  std::unique_ptr<config::ConfigLoader> _configLoader;
+  std::unique_ptr<state::JsonFileStore> _jsonFileStore;
+  std::string _modulesPath;
   /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads
-
   std::unordered_map<std::string, std::any> _pluginApis;
   std::mutex _apiMutex;
+  std::atomic<bool> _isRunning{false};
+
+  /// \brief Holds the merged configuration (CLI, TOML, defaults).
+  Config _config;
 };
 
 class IoraService::RouteBuilder
@@ -2719,7 +2732,7 @@ private:
 inline IoraService::RouteBuilder IoraService::on(const std::string& endpoint)
 {
   // Use the accessor to ensure runtime check
-  return RouteBuilder(webhookServer(), endpoint);
+  return RouteBuilder(*_webhookServer, endpoint);
 }
 
 inline IoraService::EventBuilder
