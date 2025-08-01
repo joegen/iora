@@ -881,19 +881,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   INFO(std::string("Checked plugin path: ") + pluginPath);
   REQUIRE(std::filesystem::exists(pluginPath));
 
-  // Load the plugin using the PluginManager
-  REQUIRE_NOTHROW(svc.loadPlugin("testplugin", pluginPath));
-
-  // Resolve the loadModule symbol
-  using LoadModuleFunc = iora::IoraPlugin* (*)(iora::IoraService*);
-  LoadModuleFunc loadModule = nullptr;
-  REQUIRE_NOTHROW(loadModule = svc.resolve<LoadModuleFunc>("testplugin", "loadModule"));
-  REQUIRE(loadModule != nullptr);
-
-  // Call loadModule and check the returned plugin pointer
-  iora::IoraPlugin* plugin = nullptr;
-  REQUIRE_NOTHROW(plugin = loadModule(&svc));
-  REQUIRE(plugin != nullptr);
+  REQUIRE(svc.loadSingleModule(pluginPath));
 
   // Test calling plugin APIs via callPluginApi
   SECTION("callPluginApi: add")
@@ -927,9 +915,6 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto greetApi = svc.getPluginApi<std::string(const std::string&)>("testplugin.greet");
     REQUIRE(greetApi("Iora") == "Hello, Iora!");
   }
-
-  // Unload the plugin
-  REQUIRE_NOTHROW(svc.unloadPlugin("testplugin"));
 
   // Shutdown the service and clean up generated files
   for (const auto& file : std::filesystem::directory_iterator("."))

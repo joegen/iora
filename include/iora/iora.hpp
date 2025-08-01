@@ -1990,7 +1990,7 @@ namespace shell
 
 /// \brief Singleton entry point for the Iora library, managing all core
 /// components and providing factory methods for utilities and plugins.
-class IoraService : public util::PluginManager
+class IoraService : private util::PluginManager
 {
 public:
   /// \brief Deleted copy constructor and assignment operator.
@@ -2270,7 +2270,26 @@ public:
   /// \brief Begin fluent registration of an event handler matching a name
   EventBuilder onEventNameMatches(const std::string& eventNamePattern);
 
- 
+  /// \brief Loads a single module from the specified path.
+  bool loadSingleModule(const std::string& modulePath)
+  {
+    try
+    {
+      std::filesystem::path entry(modulePath);
+      if (!std::filesystem::exists(entry) || !std::filesystem::is_regular_file(entry))
+      {
+        LOG_ERROR("Module path does not exist or is not a file: " + modulePath);
+        return false;
+      }
+      return loadSingleModule(std::filesystem::directory_entry(entry));
+    }
+    catch (const std::exception& e)
+    {
+      LOG_ERROR("Failed to load module: " + modulePath + " - " + e.what());
+      return false;
+    }
+  }
+
 protected:
   /// \brief Retrieves the global instance of the service.
   static std::unique_ptr<IoraService>& instancePtr()
@@ -2287,6 +2306,37 @@ protected:
   static void destroyInstance()
   {
     instancePtr().reset();
+  }
+
+  bool loadSingleModule(const std::filesystem::directory_entry& entry)
+  {
+    try
+    {
+      std::string pluginName = entry.path().filename().string();
+      LOG_INFO("Loading plugin: " + pluginName);
+      loadPlugin(pluginName, entry.path().string());
+
+      // Resolve and call the exported loadModule function
+      using LoadModuleFunc = Plugin* (*) (iora::IoraService*);
+      auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
+      Plugin* pluginInstance = loadModule(this);
+      if (pluginInstance)
+      {
+        _loadedModules.push_back(pluginInstance);
+      }
+      else
+      {
+        LOG_ERROR("Plugin " + pluginName + " did not return a valid instance.");
+        return false;
+      }
+    }
+    catch (const std::exception& e)
+    {
+      LOG_ERROR("Failed to load plugin: " + entry.path().string() + " - " +
+                e.what());
+      return false;
+    }
+    return true;
   }
 
   void loadModules()
@@ -2315,26 +2365,7 @@ protected:
           std::find(supportedExtensions.begin(), supportedExtensions.end(),
                     entry.path().extension()) != supportedExtensions.end())
       {
-        try
-        {
-          std::string pluginName = entry.path().filename().string();
-          LOG_INFO("Loading plugin: " + pluginName);
-          loadPlugin(pluginName, entry.path().string());
-
-          // Resolve and call the exported loadModule function
-          using LoadModuleFunc = Plugin* (*) (iora::IoraService*);
-          auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
-          Plugin* pluginInstance = loadModule(this);
-          if (pluginInstance)
-          {
-            _loadedModules.push_back(pluginInstance);
-          }
-        }
-        catch (const std::exception& e)
-        {
-          LOG_ERROR("Failed to load plugin: " + entry.path().string() + " - " +
-                    e.what());
-        }
+        loadSingleModule(entry);
       }
     }
     LOG_INFO("Module loading complete.");
