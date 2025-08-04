@@ -883,37 +883,63 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
   REQUIRE(svc.loadSingleModule(pluginPath));
 
-  // Test calling plugin APIs via callPluginApi
-  SECTION("callPluginApi: add")
+  // Test calling plugin APIs via callExportedApi
+  SECTION("callExportedApi: add")
   {
-    int sum = svc.callPluginApi<int, int, int>("testplugin.add", 2, 3);
+    int sum = svc.callExportedApi<int, int, int>("testplugin.add", 2, 3);
     REQUIRE(sum == 5);
   }
-  SECTION("callPluginApi: greet")
+  SECTION("callExportedApi: greet")
   {
-    std::string greet = svc.callPluginApi<std::string, const std::string&>("testplugin.greet", "World");
+    std::string greet = svc.callExportedApi<std::string, const std::string&>("testplugin.greet", "World");
     REQUIRE(greet == "Hello, World!");
   }
-  SECTION("callPluginApi: toggleLoaded and isLoaded")
+  SECTION("callExportedApi: toggleLoaded and isLoaded")
   {
-    bool loaded1 = svc.callPluginApi<bool>("testplugin.isLoaded");
-    bool toggled = svc.callPluginApi<bool>("testplugin.toggleLoaded");
-    bool loaded2 = svc.callPluginApi<bool>("testplugin.isLoaded");
+    bool loaded1 = svc.callExportedApi<bool>("testplugin.isLoaded");
+    bool toggled = svc.callExportedApi<bool>("testplugin.toggleLoaded");
+    bool loaded2 = svc.callExportedApi<bool>("testplugin.isLoaded");
     REQUIRE(loaded1 == true);
     REQUIRE(toggled == false);
     REQUIRE(loaded2 == false);
   }
 
-  // Test caching API function with getPluginApi
-  SECTION("getPluginApi: add")
+  // Test caching API function with getExportedApi
+  SECTION("getExportedApi: add")
   {
-    auto addApi = svc.getPluginApi<int(int, int)>("testplugin.add");
+    auto addApi = svc.getExportedApi<int(int, int)>("testplugin.add");
     REQUIRE(addApi(10, 20) == 30);
   }
-  SECTION("getPluginApi: greet")
+  SECTION("getExportedApi: greet")
   {
-    auto greetApi = svc.getPluginApi<std::string(const std::string&)>("testplugin.greet");
+    auto greetApi = svc.getExportedApi<std::string(const std::string&)>("testplugin.greet");
     REQUIRE(greetApi("Iora") == "Hello, Iora!");
+  }
+
+  // New: Test plugin reload (unload and reload)
+  SECTION("Plugin reload: unload and reload shared library")
+  {
+    // Unload the plugin
+    REQUIRE(svc.unloadSingleModule("testplugin.so"));
+    // After unload, API calls should fail or throw
+    bool threw = false;
+    try
+    {
+      (void)svc.callExportedApi<int, int, int>("testplugin.add", 1, 1);
+    }
+    catch (...)
+    {
+      threw = true;
+    }
+    REQUIRE(threw);
+
+    // Reload the plugin
+    REQUIRE(svc.loadSingleModule(pluginPath));
+    // API calls should work again
+    int sum = svc.callExportedApi<int, int, int>("testplugin.add", 7, 8);
+    REQUIRE(sum == 15);
+    std::string greet = svc.callExportedApi<std::string, const std::string&>("testplugin.greet", "Reloaded");
+    REQUIRE(greet == "Hello, Reloaded!");
   }
 
   // Shutdown the service and clean up generated files

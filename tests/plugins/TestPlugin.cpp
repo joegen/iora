@@ -14,7 +14,7 @@ public:
     loaded = true;
 
     // Register a simple API: returns the sum of two integers
-    svc->registerPluginApi("testplugin.add",
+    svc->exportApi(*this, "testplugin.add",
       [this](int a, int b) 
       { 
         return a + b; 
@@ -22,7 +22,7 @@ public:
     );
 
     // Register an API: returns a greeting string
-    svc->registerPluginApi("testplugin.greet",
+    svc->exportApi(*this,"testplugin.greet",
       [this](const std::string& name) 
       { 
         return std::string("Hello, ") + name + "!"; 
@@ -30,7 +30,7 @@ public:
     );
 
     // Register an API: toggles and returns the loaded state
-    svc->registerPluginApi("testplugin.toggleLoaded",
+    svc->exportApi(*this, "testplugin.toggleLoaded",
       [this]() 
       { 
         loaded = !loaded; 
@@ -39,7 +39,7 @@ public:
     );
 
     // Register an API: returns the loaded state
-    svc->registerPluginApi("testplugin.isLoaded",
+    svc->exportApi(*this, "testplugin.isLoaded",
       [this]() 
       { 
         return loaded; 

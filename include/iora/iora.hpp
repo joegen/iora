@@ -2051,28 +2051,16 @@ public:
   static void shutdown()
   {
     IoraService& svc = instance();
-    // Notify all loaded plugins before unloading libraries
-    for (auto* plugin : svc._loadedModules)
-    {
-      if (plugin)
-      {
-        try
-        {
-          plugin->onUnload();
-        }
-        catch (...)
-        { /* swallow */
-        }
-      }
-    }
-    svc._loadedModules.clear();
+    
+    svc.unloadAllModules();
+
     // Unload all plugin libraries
     // Flush the JSON file store
     if (svc._jsonFileStore)
     {
       svc._jsonFileStore->flush();
     }
-    svc.unloadAll();
+
     // Stop the webhook server if running
     svc._webhookServer->stop();
     
@@ -2135,6 +2123,10 @@ public:
 
   private:
     IoraService* _service = nullptr;
+    std::vector<std::string> _apiExports; // APIs this plugin exports
+    std::string _name; // Plugin name for identification
+    std::string _path; // Path to the plugin library
+    friend class IoraService; // Allow IoraService to access private members
   };
 
 
@@ -2199,13 +2191,24 @@ public:
 
   /// \brief Registers a plugin API function that can be called by plugins.
   template <typename Func>
-  void registerPluginApi(const std::string& name, Func&& func)
+  void exportApi(Plugin& plugin, const std::string& name, Func&& func)
   {
+    if (name.empty())
+    {
+      throw std::invalid_argument("Plugin API name cannot be empty");
+    }
+    if (_apiExports.find(name) != _apiExports.end())
+    {
+      throw std::runtime_error("Plugin API already registered: " + name);
+    }
     std::lock_guard<std::mutex> lock(_apiMutex);
     using func_type = std::decay_t<Func>;
     using signature = decltype(&func_type::operator());
-    _pluginApis[name] = makeStdFunction(std::forward<Func>(func), signature{});
+    _apiExports[name] = makeStdFunction(std::forward<Func>(func), signature{});
+    plugin._apiExports.push_back(name);
   }
+
+  
 
   // Helper to deduce lambda signature and wrap in std::function
   template <typename Func, typename Ret, typename... Args>
@@ -2226,11 +2229,11 @@ public:
   /// Throws std::runtime_error if the API is not found or the signature does
   /// not match.
   template <typename FuncSignature>
-  std::function<FuncSignature> getPluginApi(const std::string& name)
+  std::function<FuncSignature> getExportedApi(const std::string& name)
   {
     std::lock_guard<std::mutex> lock(_apiMutex);
-    auto it = _pluginApis.find(name);
-    if (it == _pluginApis.end())
+    auto it = _apiExports.find(name);
+    if (it == _apiExports.end())
     {
       throw std::runtime_error("API not found: " + name);
     }
@@ -2248,9 +2251,9 @@ public:
   /// Throws std::runtime_error if the API is not found or the signature does
   /// not match.
   template <typename Ret, typename... Args>
-  Ret callPluginApi(const std::string& name, Args&&... args)
+  Ret callExportedApi(const std::string& name, Args&&... args)
   {
-    auto func = getPluginApi<Ret(Args...)>(name);
+    auto func = getExportedApi<Ret(Args...)>(name);
     return func(std::forward<Args>(args)...);
   }
 
@@ -2290,6 +2293,78 @@ public:
     }
   }
 
+  bool unloadSingleModule(const std::string& pluginName)
+  {
+    std::lock_guard<std::mutex> lock(_loadModulesMutex);
+    auto it = _loadedModules.find(pluginName);
+    if (it != _loadedModules.end())
+    {
+      auto& pluginPtr = it->second;
+      if (pluginPtr)
+      {
+        try
+        {
+          pluginPtr->onUnload();
+          for (auto& apiName : pluginPtr->_apiExports)
+          {
+            unexportApi(apiName);
+          }
+          _loadedModules.erase(it); // unique_ptr will delete
+          unloadPlugin(pluginName);
+          LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
+          return true;
+        }
+        catch (const std::exception& e)
+        {
+          LOG_ERROR("Failed to unload plugin: " + pluginName + " - " + e.what());
+        }
+      }
+    }
+    else
+    {
+      LOG_ERROR("Plugin not found: " + pluginName);
+    }
+    return false;
+  }
+
+  bool reloadModule(const std::string& pluginName)
+  {
+    return unloadSingleModule(pluginName) &&
+           loadSingleModule(pluginName);
+  }
+
+  bool unloadAllModules()
+  {
+    std::lock_guard<std::mutex> lock(_loadModulesMutex);
+    bool success = true;
+    for (auto it = _loadedModules.begin(); it != _loadedModules.end(); )
+    {
+      const std::string& name = it->first;
+      auto& pluginPtr = it->second;
+      if (pluginPtr)
+      {
+        try
+        {
+          pluginPtr->onUnload();
+          for (auto& apiName : pluginPtr->_apiExports)
+          {
+            unexportApi(apiName);
+          }
+          unloadPlugin(name);
+          LOG_INFO("Plugin " + name + " unloaded successfully.");
+        }
+        catch (const std::exception& e)
+        {
+          LOG_ERROR("Failed to unload plugin: " + name + " - " + e.what());
+          success = false;
+        }
+      }
+      it = _loadedModules.erase(it); // unique_ptr will delete
+    }
+    _loadedModules.clear();
+    return success;
+  }
+
 protected:
   /// \brief Retrieves the global instance of the service.
   static std::unique_ptr<IoraService>& instancePtr()
@@ -2310,6 +2385,7 @@ protected:
 
   bool loadSingleModule(const std::filesystem::directory_entry& entry)
   {
+    std::lock_guard<std::mutex> lock(_loadModulesMutex);
     try
     {
       std::string pluginName = entry.path().filename().string();
@@ -2319,10 +2395,14 @@ protected:
       // Resolve and call the exported loadModule function
       using LoadModuleFunc = Plugin* (*) (iora::IoraService*);
       auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
-      Plugin* pluginInstance = loadModule(this);
+      std::unique_ptr<Plugin> pluginInstance(loadModule(this));
       if (pluginInstance)
       {
-        _loadedModules.push_back(pluginInstance);
+        pluginInstance->_name = pluginName; // Set the plugin name
+        pluginInstance->_path = entry.path().string(); // Set the plugin path
+        pluginInstance->onLoad(this);
+        _loadedModules.insert({pluginName, std::move(pluginInstance)});
+        LOG_INFO("Plugin " + pluginName + " loaded successfully.");
       }
       else
       {
@@ -2369,6 +2449,19 @@ protected:
       }
     }
     LOG_INFO("Module loading complete.");
+  }
+
+  /// \brief Unregisters a plugin API by name.
+  /// Throws std::runtime_error if the API is not found.
+  void unexportApi(const std::string& name)
+  {
+    std::lock_guard<std::mutex> lock(_apiMutex);
+    auto it = _apiExports.find(name);
+    if (it == _apiExports.end())
+    {
+      throw std::runtime_error("Plugin API not found: " + name);
+    }
+    _apiExports.erase(it);
   }
 
   /// \brief Parses command-line arguments and stores CLI overrides in _config.
@@ -2683,7 +2776,7 @@ private:
   std::condition_variable _terminationCv;
   bool _terminated = false;
   // Track loaded plugin instances for proper onUnload notification
-  std::vector<Plugin*> _loadedModules;
+  std::unordered_map<std::string, std::unique_ptr<Plugin>> _loadedModules;
   std::unique_ptr<http::WebhookServer> _webhookServer;
   std::unique_ptr<state::ConcreteStateStore> _stateStore;
   std::unique_ptr<util::ExpiringCache<std::string, std::string>> _cache;
@@ -2692,7 +2785,8 @@ private:
   std::string _modulesPath;
   /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads
-  std::unordered_map<std::string, std::any> _pluginApis;
+  std::unordered_map<std::string, std::any> _apiExports;
+  std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
 
@@ -2791,9 +2885,8 @@ using IoraPlugin = IoraService::Plugin;
   {                                                                            \
     try                                                                        \
     {                                                                          \
-      static PluginType instance(service);                                     \
-      instance.onLoad(service);                                                \
-      return &instance;                                                        \
+      PluginType* instance = new PluginType(service);                                     \
+      return instance;                                                        \
     }                                                                          \
     catch (const std::exception& e)                                            \
     {                                                                          \
