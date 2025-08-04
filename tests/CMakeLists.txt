@@ -29,6 +29,14 @@ include_directories(${CPR_INCLUDE_DIR})
 add_executable(all_tests all_tests.cpp)
 target_link_libraries(all_tests PRIVATE nlohmann_json Catch2WithMain iora_lib cpr::cpr)
 
+# Ensure all_tests has SSL and httplib support
+find_package(OpenSSL REQUIRED)
+set(CPP_HTTPLIB_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cpp_httplib-src")
+target_compile_definitions(all_tests PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_include_directories(all_tests PRIVATE ${CPP_HTTPLIB_INCLUDE_DIR})
+target_link_libraries(all_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+
+
 # Build test plugins for dynamic loading tests
 add_subdirectory(plugins)
 
