@@ -878,7 +878,11 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   {
     pluginPath = "iora/build/tests/plugins/testplugin.so";
   }
-  INFO(std::string("Checked plugin path: ") + pluginPath);
+  if (!std::filesystem::exists(pluginPath))
+  {
+    pluginPath = "/workspace/iora/build/tests/plugins/testplugin.so";
+  }
+  INFO(std::string("Checked plugin path: ") + pluginPath + ", cwd: " + std::filesystem::current_path().string());
   REQUIRE(std::filesystem::exists(pluginPath));
 
   REQUIRE(svc.loadSingleModule(pluginPath));
