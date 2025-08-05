@@ -561,6 +561,33 @@ namespace config
       return get<std::string>(key);
     }
 
+    /// \brief Gets an array of strings from the configuration.
+    /// \param key Dotted key path to the array in the TOML config.
+    /// \return std::optional<std::vector<std::string>> containing all string elements, or std::nullopt if not found.
+    /// \throws std::runtime_error if the key is an array but any element is not a string.
+    std::optional<std::vector<std::string>> getStringArray(const std::string& key) const
+    {
+      auto node = _table.at_path(key);
+      if (!node)
+      {
+        return std::nullopt;
+      }
+      if (!node.is_array())
+      {
+        return std::nullopt;
+      }
+      std::vector<std::string> result;
+      for (const auto& elem : *node.as_array())
+      {
+        if (!elem.is_string())
+        {
+          throw std::runtime_error("ConfigLoader: Array element at '" + key + "' is not a string");
+        }
+        result.push_back(elem.value<std::string>().value());
+      }
+      return result;
+    }
+
   private:
     std::string _filename;
     toml::table _table;
@@ -2030,6 +2057,7 @@ public:
     struct ModulesConfig
     {
       std::optional<std::string> directory;
+      std::optional<std::vector<std::string>> modules;
     } modules;
     struct StateConfig
     {
@@ -2393,7 +2421,7 @@ protected:
     try
     {
       std::string pluginName = entry.path().filename().string();
-      LOG_INFO("Loading plugin: " + pluginName);
+      LOG_INFO("Loading module: " + pluginName);
       loadPlugin(pluginName, entry.path().string());
 
       // Resolve and call the exported loadModule function
@@ -2406,17 +2434,17 @@ protected:
         pluginInstance->_path = entry.path().string(); // Set the plugin path
         pluginInstance->onLoad(this);
         _loadedModules.insert({pluginName, std::move(pluginInstance)});
-        LOG_INFO("Plugin " + pluginName + " loaded successfully.");
+        LOG_INFO("Module " + pluginName + " loaded successfully.");
       }
       else
       {
-        LOG_ERROR("Plugin " + pluginName + " did not return a valid instance.");
+        LOG_ERROR("Module " + pluginName + " did not return a valid instance.");
         return false;
       }
     }
     catch (const std::exception& e)
     {
-      LOG_ERROR("Failed to load plugin: " + entry.path().string() + " - " +
+      LOG_ERROR("Failed to load module: " + entry.path().string() + " - " +
                 e.what());
       return false;
     }
@@ -2442,14 +2470,34 @@ protected:
       LOG_ERROR("Modules path is not a directory: " + _modulesPath);
       return;
     }
-    const std::vector<std::string> supportedExtensions = {".so", ".dll"};
-    for (const auto& entry : std::filesystem::directory_iterator(modulesPath))
+
+    if (_config.modules.modules.has_value() && !_config.modules.modules->empty())
     {
-      if (entry.is_regular_file() &&
-          std::find(supportedExtensions.begin(), supportedExtensions.end(),
-                    entry.path().extension()) != supportedExtensions.end())
+      for (const auto& moduleName : *_config.modules.modules)
       {
-        loadSingleModule(entry);
+        std::filesystem::path modulePath = modulesPath / moduleName;
+        if (std::filesystem::exists(modulePath) && std::filesystem::is_regular_file(modulePath))
+        {
+          loadSingleModule(modulePath.string());
+        }
+        else
+        {
+          LOG_ERROR("Module not found: " + modulePath.string());
+        }
+      }
+      return;
+    }
+    else
+    {
+      const std::vector<std::string> supportedExtensions = {".so", ".dll"};
+      for (const auto& entry : std::filesystem::directory_iterator(modulesPath))
+      {
+        if (entry.is_regular_file() &&
+            std::find(supportedExtensions.begin(), supportedExtensions.end(),
+                      entry.path().extension()) != supportedExtensions.end())
+        {
+          loadSingleModule(entry);
+        }
       }
     }
     LOG_INFO("Module loading complete.");
@@ -2561,6 +2609,13 @@ protected:
         if (auto modulesDirOpt = _configLoader->getString("iora.modules.directory"))
         {
           _config.modules.directory = *modulesDirOpt;
+        }
+      }
+      if (!_config.modules.modules.has_value())
+      {
+        if (auto modulesOpt = _configLoader->getStringArray("iora.modules.modules"))
+        {
+          _config.modules.modules = *modulesOpt;
         }
       }
       if (!_config.state.file.has_value())

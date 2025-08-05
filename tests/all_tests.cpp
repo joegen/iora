@@ -1244,3 +1244,64 @@ TEST_CASE("IoraService::init(Config) initializes service from Config struct", "[
     }
   }
 }
+
+TEST_CASE("ConfigLoader extended functionality", "[config][ConfigLoader]")
+{
+  // Write a temporary TOML config file
+  const std::string cfgFile = "test_config_extended.toml";
+  {
+    std::ofstream out(cfgFile);
+    out << "[section]\n";
+    out << "int_val = 42\n";
+    out << "bool_val = true\n";
+    out << "str_val = 'hello'\n";
+    out << "str_array = ['a', 'b', 'c']\n";
+    out << "[other]\n";
+    out << "float_val = 3.14\n";
+  }
+
+  iora::config::ConfigLoader loader(cfgFile);
+
+  SECTION("getStringArray returns string vector if all elements are strings")
+  {
+    // Write a TOML array of strings
+    const std::string arrFile = "test_config_array.toml";
+    {
+      std::ofstream out(arrFile);
+      out << "[section]\n";
+      out << "str_array = ['a', 'b', 'c']\n";
+    }
+    iora::config::ConfigLoader arrLoader(arrFile);
+    arrLoader.reload();
+    auto result = arrLoader.getStringArray("section.str_array");
+    REQUIRE(result.has_value());
+    REQUIRE(result->size() == 3);
+    REQUIRE((*result)[0] == "a");
+    REQUIRE((*result)[1] == "b");
+    REQUIRE((*result)[2] == "c");
+    std::filesystem::remove(arrFile);
+  }
+
+  SECTION("getStringArray returns std::nullopt if key is missing")
+  {
+    loader.reload();
+    auto result = loader.getStringArray("section.missing_array");
+    REQUIRE_FALSE(result.has_value());
+  }
+
+  SECTION("getStringArray throws if any element is not a string")
+  {
+    const std::string badArrFile = "test_config_badarray.toml";
+    {
+      std::ofstream out(badArrFile);
+      out << "[section]\n";
+      out << "mixed_array = ['x', 42, 'y']\n";
+    }
+    iora::config::ConfigLoader badArrLoader(badArrFile);
+    badArrLoader.reload();
+    REQUIRE_THROWS_AS(badArrLoader.getStringArray("section.mixed_array"), std::runtime_error);
+    std::filesystem::remove(badArrFile);
+  }
+  // Clean up
+  std::filesystem::remove(cfgFile);
+}
