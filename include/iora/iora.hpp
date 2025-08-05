@@ -908,17 +908,21 @@ namespace state
       static std::thread t;
       return t;
     }
-    static std::atomic<bool>& stopFlushThread()
-    {
-      static std::atomic<bool> b{false};
-      return b;
-    }
     static std::chrono::milliseconds& flushInterval()
     {
       static std::chrono::milliseconds ms{2000};
       return ms;
     }
-
+    static std::condition_variable& terminationCv()
+    {
+      static std::condition_variable cv;
+      return cv;
+    }
+    static std::mutex& terminateCvMutex()
+    {
+      static std::mutex m;
+      return m;
+    }
     static void setFlushInterval(std::chrono::milliseconds interval)
     {
       flushInterval() = interval;
@@ -950,9 +954,7 @@ namespace state
       registry().insert(this);
       if (registry().size() == 1)
       {
-        stopFlushThread() = false;
         flushThread() = std::thread(flushThreadFunc);
-        flushThread().detach();
       }
     }
 
@@ -962,17 +964,29 @@ namespace state
       registry().erase(this);
       if (registry().empty())
       {
-        stopFlushThread() = true;
+        LOG_INFO("No more stores registered, stopping flush thread");
+        terminationCv().notify_all();
+        if (flushThread().joinable())
+        {
+          flushThread().join();
+        }
+        flushThread() = std::thread(); // Reset thread
+        LOG_INFO("Flush thread stopped");
       }
     }
 
     static void flushThreadFunc()
     {
-      while (!stopFlushThread())
+      while (true)
       {
-        std::this_thread::sleep_for(flushInterval());
-
-        std::lock_guard<std::mutex> lock(registryMutex());
+        {
+          std::unique_lock<std::mutex> lock(terminateCvMutex());
+          if (terminationCv().wait_for(lock, flushInterval()) != std::cv_status::timeout)
+          {
+            // Notified to exit
+            break;
+          }
+        }
         for (auto* store : registry())
         {
           store->tryFlushIfDirty();

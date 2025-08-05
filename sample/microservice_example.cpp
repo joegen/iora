@@ -55,6 +55,7 @@ int main(int argc, char** argv)
     {
       LOG_ERROR("Environment variable OPENAI_API_KEY is not set.");
       std::cerr << "Error: OPENAI_API_KEY is required but not set." << std::endl;
+      iora::IoraService::shutdown();
       std::exit(EXIT_FAILURE);
     }
   }
