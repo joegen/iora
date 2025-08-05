@@ -1,64 +1,81 @@
 cmake_minimum_required(VERSION 3.14)
-project(iora LANGUAGES CXX)
-
-# Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Enable FetchContent
-include(FetchContent)
-
-# Dependencies
-
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.2
-)
-FetchContent_Declare(
-    cpp_httplib
-    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-    GIT_TAG v0.10.8
-)
-FetchContent_Declare(
-    cpr
-    GIT_REPOSITORY https://github.com/libcpr/cpr.git
-    GIT_TAG 1.10.0
-)
-FetchContent_Declare(
-    tomlplusplus
-    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-    GIT_TAG v3.3.0
-)
-FetchContent_Declare(
-    subprocess
-    GIT_REPOSITORY https://github.com/arun11299/cpp-subprocess.git
-    GIT_TAG master
-)
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG v3.4.0
-    GIT_SHALLOW TRUE
+project(iora 
+    VERSION 1.0.0
+    DESCRIPTION "Modern C++17 single-header microservice foundation library"
+    LANGUAGES CXX
 )
 
-FetchContent_MakeAvailable(nlohmann_json cpp_httplib cpr tomlplusplus subprocess Catch2)
+# Set default build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
-# Add include directories for subprocess
-include_directories(${subprocess_SOURCE_DIR}/cpp-subprocess)
-include_directories(${catch2_SOURCE_DIR}/include)
-include_directories(${catch2_SOURCE_DIR}/src)
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# Include our modular CMake files
+include(cmake/Dependencies.cmake)
+include(cmake/IoraTargets.cmake)
 
-# Define iora_lib target
-add_library(iora_lib INTERFACE)
-target_include_directories(iora_lib INTERFACE ${CMAKE_SOURCE_DIR}/include)
+# Configure all dependencies with system library detection
+configure_iora_dependencies()
 
+# Create the main iora_lib interface library
+create_iora_lib()
+
+# Enable testing support
+include(CTest)
+enable_testing()
 
 # Add subdirectories
 add_subdirectory(tests)
-# Add the sample microservice application as a subdirectory
 add_subdirectory(sample)
 
-# Add a custom target for `make check` to run the all_tests executable
-add_custom_target(check COMMAND all_tests DEPENDS all_tests)
+# Add a custom target for `make check` to run all tests
+add_custom_target(check 
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS all_tests
+    COMMENT "Running all tests with CTest"
+)
+
+# Installation configuration
+include(GNUInstallDirs)
+
+# Install the header files
+install(DIRECTORY include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    FILES_MATCHING PATTERN "*.hpp"
+)
+
+# Install the iora_lib target
+install(TARGETS iora_lib
+    EXPORT IoraTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+# Export the targets
+install(EXPORT IoraTargets
+    FILE IoraTargets.cmake
+    NAMESPACE Iora::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Iora
+)
+
+# Create and install the config file
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/IoraConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/IoraConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/IoraConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Iora
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/IoraConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/IoraConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Iora
+)
