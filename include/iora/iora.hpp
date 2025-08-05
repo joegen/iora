@@ -2139,12 +2139,16 @@ public:
   {
     IoraService& svc = instance();
     svc.parseConfig(argc, argv);
-#ifdef IORA_TEST
-    // In test mode, destroy the singleton after command line parsing to ensure correct destruction order
-    destroyInstance();
-#endif
     return svc;
   }
+
+  static void init(const Config& config)
+  {
+    IoraService& svc = instance();
+    svc._config = config;
+    svc.applyConfig();
+  }
+
 
   /// \brief Accessor for the webhook server.
   const std::unique_ptr<http::WebhookServer>& webhookServer() const{ return _webhookServer; }

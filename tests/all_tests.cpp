@@ -1207,3 +1207,40 @@ TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
   server.stop();
   // No cleanup: PEM files are persistent for all test runs
 }
+
+TEST_CASE("IoraService::init(Config) initializes service from Config struct", "[iora][IoraService][config]")
+{
+  // Prepare a Config struct with custom settings
+  iora::IoraService::Config config;
+  config.server.port = 8150;
+  config.state.file = std::string("ioraservice_configobj_state.json");
+  config.log.file = std::string("ioraservice_configobj_log");
+  config.log.level = std::string("info");
+  config.log.async = false;
+  config.log.retentionDays = 1;
+  config.log.timeFormat = std::string("%Y%m%d");
+
+  // Call the static init(Config&) method
+  iora::IoraService::init(config);
+  iora::IoraService& svc = iora::IoraService::instance();
+  AutoServiceShutdown autoShutdown(svc);
+
+  // Check that the service is running and config is applied
+  REQUIRE(svc.webhookServer() != nullptr);
+  REQUIRE(svc.jsonFileStore() != nullptr);
+  svc.jsonFileStore()->set("cfgobjKey", "cfgobjValue");
+  REQUIRE(svc.jsonFileStore()->get("cfgobjKey").value() == "cfgobjValue");
+  svc.jsonFileStore()->flush();
+  REQUIRE(std::filesystem::exists("ioraservice_configobj_state.json"));
+
+  // Clean up generated files
+  for (const auto& file : std::filesystem::directory_iterator("."))
+  {
+    std::string name = file.path().string();
+    if (name.find("ioraservice_configobj_log") != std::string::npos ||
+        name.find("ioraservice_configobj_state.json") != std::string::npos)
+    {
+      std::filesystem::remove(file.path());
+    }
+  }
+}
