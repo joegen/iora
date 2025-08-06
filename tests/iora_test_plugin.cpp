@@ -1,0 +1,84 @@
+#include "iora/iora.hpp"
+#include "catch2/catch_test_macros.hpp"
+#include <fstream>
+
+TEST_CASE("Dynamic loading of testplugin shared library")
+{
+  const char* args[] = {"program",
+                        "--port",
+                        "8130",
+                        "--state-file",
+                        "ioraservice_plugin_state.json",
+                        "--log-file",
+                        "ioraservice_plugin_log"};
+  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
+  iora::IoraService& svc =
+      iora::IoraService::init(argc, const_cast<char**>(args));
+  AutoServiceShutdown autoShutdown(svc);
+
+  auto pluginPathOpt = findPlugin("testplugin.so");
+  INFO("Plugin path search result: " +
+       (pluginPathOpt ? *pluginPathOpt : "<not found>"));
+  REQUIRE(pluginPathOpt);
+  REQUIRE(svc.loadSingleModule(*pluginPathOpt));
+
+  SECTION("callExportedApi: add")
+  {
+    int sum = svc.callExportedApi<int, int, int>("testplugin.add", 2, 3);
+    REQUIRE(sum == 5);
+  }
+
+  SECTION("callExportedApi: greet")
+  {
+    std::string greet = svc.callExportedApi<std::string, const std::string&>(
+        "testplugin.greet", "World");
+    REQUIRE(greet == "Hello, World!");
+  }
+
+  SECTION("callExportedApi: toggleLoaded and isLoaded")
+  {
+    bool loaded1 = svc.callExportedApi<bool>("testplugin.isLoaded");
+    bool toggled = svc.callExportedApi<bool>("testplugin.toggleLoaded");
+    bool loaded2 = svc.callExportedApi<bool>("testplugin.isLoaded");
+    REQUIRE(loaded1 == true);
+    REQUIRE(toggled == false);
+    REQUIRE(loaded2 == false);
+  }
+
+  SECTION("getExportedApi: add")
+  {
+    auto addApi = svc.getExportedApi<int(int, int)>("testplugin.add");
+    REQUIRE(addApi(10, 20) == 30);
+  }
+
+  SECTION("getExportedApi: greet")
+  {
+    auto greetApi =
+        svc.getExportedApi<std::string(const std::string&)>("testplugin.greet");
+    REQUIRE(greetApi("Iora") == "Hello, Iora!");
+  }
+
+  SECTION("Plugin reload: unload and reload shared library")
+  {
+    REQUIRE(svc.unloadSingleModule("testplugin.so"));
+
+    bool threw = false;
+    try
+    {
+      (void) svc.callExportedApi<int, int, int>("testplugin.add", 1, 1);
+    }
+    catch (...)
+    {
+      threw = true;
+    }
+    REQUIRE(threw);
+
+    REQUIRE(svc.loadSingleModule(*pluginPathOpt));
+    REQUIRE(svc.callExportedApi<int, int, int>("testplugin.add", 7, 8) == 15);
+    REQUIRE(svc.callExportedApi<std::string, const std::string&>(
+                "testplugin.greet", "Reloaded") == "Hello, Reloaded!");
+  }
+
+  removeFilesContainingAny(
+      {"ioraservice_plugin_log", "ioraservice_plugin_state.json"});
+}

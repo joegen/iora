@@ -35,7 +35,7 @@ add_subdirectory(sample)
 # Add a custom target for `make check` to run all tests
 add_custom_target(check 
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS all_tests
+    DEPENDS iora_test
     COMMENT "Running all tests with CTest"
 )
 
