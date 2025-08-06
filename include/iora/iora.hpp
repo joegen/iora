@@ -1604,56 +1604,111 @@ namespace http
   class HttpClient
   {
   public:
-    /// \brief Performs a GET request with optional headers.
+   /// \brief TLS configuration for HTTPS requests.
+    struct TlsConfig
+    {
+      std::string caFile;
+      std::string clientCertFile;
+      std::string clientKeyFile;
+      bool verifyPeer = true;
+    };
+
+    /// \brief Performs a GET request with optional headers. Detects scheme and applies TLS config for HTTPS.
     json::Json get(const std::string& url,
                    const std::map<std::string, std::string>& headers = {},
                    int retries = 0) const
     {
-      return retry(
-          [&]()
-          {
-            return cpr::Get(cpr::Url{url},
-                            cpr::Header{headers.begin(), headers.end()});
-          },
-          retries);
+      bool isHttps = url.find("https://") == 0;
+      if (isHttps)
+      {
+        auto ssl = getValidatedSslOptions();
+        return retry(
+            [&]()
+            {
+              return cpr::Get(cpr::Url{url},
+                              cpr::Header{headers.begin(), headers.end()},
+                              ssl);
+            },
+            retries);
+      }
+      else
+      {
+        return retry(
+            [&]()
+            {
+              return cpr::Get(cpr::Url{url},
+                              cpr::Header{headers.begin(), headers.end()});
+            },
+            retries);
+      }
     }
 
-    /// \brief Performs a POST request with JSON payload.
+    /// \brief Performs a POST request with JSON payload. Detects scheme and applies TLS config for HTTPS.
     json::Json postJson(const std::string& url, const json::Json& body,
                         const std::map<std::string, std::string>& headers = {},
                         int retries = 0) const
     {
       auto allHeaders = headers;
       allHeaders.emplace("Content-Type", "application/json");
-
-      return retry(
-          [&]()
-          {
-            return cpr::Post(cpr::Url{url}, cpr::Body{body.dump()},
-                             cpr::Header{allHeaders.begin(), allHeaders.end()});
-          },
-          retries);
+      bool isHttps = url.find("https://") == 0;
+      if (isHttps)
+      {
+        auto ssl = getValidatedSslOptions();
+        return retry(
+            [&]()
+            {
+              return cpr::Post(cpr::Url{url}, cpr::Body{body.dump()},
+                               cpr::Header{allHeaders.begin(), allHeaders.end()},
+                               ssl);
+            },
+            retries);
+      }
+      else
+      {
+        return retry(
+            [&]()
+            {
+              return cpr::Post(cpr::Url{url}, cpr::Body{body.dump()},
+                               cpr::Header{allHeaders.begin(), allHeaders.end()});
+            },
+            retries);
+      }
     }
 
-    /// \brief Performs a POST request with multipart form-data.
+    /// \brief Performs a POST request with multipart form-data. Detects scheme and applies TLS config for HTTPS.
     json::Json
     postSingleFile(const std::string& url, const std::string& fileFieldName,
                    const std::string& filePath,
                    const std::map<std::string, std::string>& headers = {},
                    int retries = 0) const
     {
-      // Only support a single file part due to cpr::Multipart limitations
       cpr::Multipart multipart{
           cpr::Part{fileFieldName, filePath, "application/octet-stream"}};
-
-      return retry(
-          [&]()
-          {
-            return cpr::Post(cpr::Url{url}, multipart,
-                             cpr::Header{headers.begin(), headers.end()});
-          },
-          retries);
+      bool isHttps = url.find("https://") == 0;
+      if (isHttps)
+      {
+        auto ssl = getValidatedSslOptions();
+        return retry(
+            [&]()
+            {
+              return cpr::Post(cpr::Url{url}, multipart,
+                               cpr::Header{headers.begin(), headers.end()},
+                               ssl);
+            },
+            retries);
+      }
+      else
+      {
+        return retry(
+            [&]()
+            {
+              return cpr::Post(cpr::Url{url}, multipart,
+                               cpr::Header{headers.begin(), headers.end()});
+            },
+            retries);
+      }
     }
+
 
     /// \brief Performs a DELETE request.
     json::Json
@@ -1661,13 +1716,29 @@ namespace http
                   const std::map<std::string, std::string>& headers = {},
                   int retries = 0) const
     {
-      return retry(
-          [&]()
-          {
-            return cpr::Delete(cpr::Url{url},
-                               cpr::Header{headers.begin(), headers.end()});
-          },
-          retries);
+      bool isHttps = url.find("https://") == 0;
+      if (isHttps)
+      {
+        auto ssl = getValidatedSslOptions();
+        return retry(
+            [&]()
+            {
+              return cpr::Delete(cpr::Url{url},
+                               cpr::Header{headers.begin(), headers.end()},
+                               ssl);
+            },
+            retries);
+      }
+      else
+      {
+        return retry(
+            [&]()
+            {
+              return cpr::Delete(cpr::Url{url},
+                                cpr::Header{headers.begin(), headers.end()});
+            },
+            retries);
+          }
     }
 
     /// \brief Performs a POST request asynchronously using std::future.
@@ -1687,10 +1758,22 @@ namespace http
                     const std::function<void(const std::string&)>& onChunk,
                     int retries = 0) const
     {
-      cpr::Response response =
-          cpr::Post(cpr::Url{url}, cpr::Body{body.dump()},
-                    cpr::Header{headers.begin(), headers.end()},
-                    cpr::Header{{"Accept", "text/event-stream"}});
+      cpr::Response response;
+      bool isHttps = url.find("https://") == 0;
+      if (isHttps)
+      {
+        auto ssl = getValidatedSslOptions();
+        response = cpr::Post(cpr::Url{url}, cpr::Body{body.dump()},
+                             cpr::Header{headers.begin(), headers.end()},
+                             cpr::Header{{"Accept", "text/event-stream"}},
+                             ssl);
+      }
+      else
+      {
+        response = cpr::Post(cpr::Url{url}, cpr::Body{body.dump()},
+                      cpr::Header{headers.begin(), headers.end()},
+                      cpr::Header{{"Accept", "text/event-stream"}});
+      }
 
       std::istringstream stream(response.text);
       std::string line;
@@ -1739,6 +1822,14 @@ namespace http
                               1.5); // Estimated ~1.5 tokens per word
     }
 
+    /// \brief Sets the TLS configuration for HTTPS requests.
+    void setTlsConfig(const TlsConfig& config)
+    {
+      std::lock_guard<std::mutex> lock(_tlsMutex);
+      _tlsConfig = config;
+    }
+
+
   private:
     template <typename Callable>
     json::Json retry(Callable&& action, int retries) const
@@ -1764,6 +1855,48 @@ namespace http
         attempt++;
       }
     }
+
+    /// \brief Validates TLS config and constructs cpr::SslOptions. Throws if invalid.
+    cpr::SslOptions getValidatedSslOptions() const
+    {
+      std::lock_guard<std::mutex> lock(_tlsMutex);
+      namespace fs = std::filesystem;
+      if (_tlsConfig.verifyPeer && _tlsConfig.caFile.empty())
+      {
+        throw std::runtime_error("TLS: CA file must be set for peer verification");
+      }
+      if (!_tlsConfig.clientCertFile.empty() && !fs::exists(_tlsConfig.clientCertFile))
+      {
+        throw std::runtime_error("TLS: clientCertFile does not exist");
+      }
+      if (!_tlsConfig.clientKeyFile.empty() && !fs::exists(_tlsConfig.clientKeyFile))
+      {
+        throw std::runtime_error("TLS: clientKeyFile does not exist");
+      }
+      if (_tlsConfig.verifyPeer && !_tlsConfig.caFile.empty() && !fs::exists(_tlsConfig.caFile))
+      {
+        throw std::runtime_error("TLS: caFile does not exist");
+      }
+      cpr::SslOptions ssl;
+      if (!_tlsConfig.caFile.empty())
+      {
+        ssl.ca_info = _tlsConfig.caFile;
+      }
+      if (!_tlsConfig.clientCertFile.empty())
+      {
+        ssl.cert_file = _tlsConfig.clientCertFile;
+      }
+      if (!_tlsConfig.clientKeyFile.empty())
+      {
+        ssl.key_file = _tlsConfig.clientKeyFile;
+      }
+      // If CPR supports verify, set it:
+      ssl.verify_peer = _tlsConfig.verifyPeer;
+      return ssl;
+    }
+
+    mutable std::mutex _tlsMutex;
+    TlsConfig _tlsConfig;
   };
 
   /// \brief Lightweight, testable HTTP webhook server for handling REST and

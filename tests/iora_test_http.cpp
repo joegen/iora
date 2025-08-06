@@ -120,14 +120,20 @@ TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
 
   SECTION("HTTPS GET returns valid JSON over TLS")
   {
-    cpr::Session session;
-    session.SetUrl(cpr::Url{"https://localhost:8443/tls-test"});
-    session.SetVerifySsl(false); // self-signed cert
-    auto response = session.Get();
-
-    REQUIRE(response.status_code == 200);
-    auto json = iora::http::HttpClient::parseJsonOrThrow(response);
-    REQUIRE(json["tls"] == true);
+    iora::http::HttpClient client;
+    // Accept self-signed cert for test
+    iora::http::HttpClient::TlsConfig tlsCfg;
+    tlsCfg.verifyPeer = false;
+    client.setTlsConfig(tlsCfg);
+    try
+    {
+      auto res = client.get("https://localhost:8443/tls-test");
+      REQUIRE(res["tls"] == true);
+    }
+    catch (const std::exception& ex)
+    {
+      FAIL(std::string("Exception: ") + ex.what());
+    }
   }
 
   server.stop();

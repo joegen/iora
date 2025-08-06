@@ -151,7 +151,8 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
   }
 
   svc.jsonFileStore()->set("cliKey", "cliValue");
-  REQUIRE(std::filesystem::exists("ioraservice_cli_override_state.json"));
+  std::this_thread::sleep_for(svc.jsonFileStore()->flushInterval() + std::chrono::milliseconds(100));
+  REQUIRE(std::filesystem::exists("ioraservice_cli_override_state.json")); // Not guaranteed since flushing the store is done using a background thread
 
   LOG_ERROR("CLI override log test");
   iora::log::Logger::shutdown();
