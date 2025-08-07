@@ -9,13 +9,13 @@ TEST_CASE("EventQueue processes valid events", "[EventQueue]")
   std::atomic<int> counter{0};
 
   queue.onEventId("testId",
-                  [&](const iora::json::Json& event)
+                  [&](const iora::core::Json& event)
                   {
                     REQUIRE(event["eventId"] == "testId");
                     counter++;
                   });
 
-  iora::json::Json validEvent = {{"eventId", "testId"},
+  iora::core::Json validEvent = {{"eventId", "testId"},
                                  {"eventName", "testEvent"}};
   queue.push(validEvent);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -27,9 +27,9 @@ TEST_CASE("EventQueue drops invalid events", "[EventQueue]")
   iora::util::EventQueue queue(2);
   std::atomic<int> counter{0};
 
-  queue.onEventId("testId", [&](const iora::json::Json&) { counter++; });
+  queue.onEventId("testId", [&](const iora::core::Json&) { counter++; });
 
-  iora::json::Json invalidEvent = {{"eventName", "testEvent"}};
+  iora::core::Json invalidEvent = {{"eventName", "testEvent"}};
   queue.push(invalidEvent);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   REQUIRE(counter == 0);
@@ -42,14 +42,14 @@ TEST_CASE("EventQueue matches eventName with glob patterns", "[EventQueue]")
 
   queue.onEventNameMatches(
       "^test.*",
-      [&](const iora::json::Json& event)
+      [&](const iora::core::Json& event)
       {
         REQUIRE(event["eventName"].get<std::string>().find("test") == 0);
         counter++;
       });
 
-  iora::json::Json matching = {{"eventId", "id1"}, {"eventName", "testEvent"}};
-  iora::json::Json nonMatching = {{"eventId", "id2"},
+  iora::core::Json matching = {{"eventId", "id1"}, {"eventName", "testEvent"}};
+  iora::core::Json nonMatching = {{"eventId", "id2"},
                                   {"eventName", "otherEvent"}};
 
   queue.push(matching);
@@ -64,14 +64,14 @@ TEST_CASE("EventQueue matches eventName exactly", "[EventQueue]")
   std::atomic<int> counter{0};
 
   queue.onEventName("testEvent",
-                    [&](const iora::json::Json& event)
+                    [&](const iora::core::Json& event)
                     {
                       REQUIRE(event["eventName"] == "testEvent");
                       counter++;
                     });
 
-  iora::json::Json match = {{"eventId", "id1"}, {"eventName", "testEvent"}};
-  iora::json::Json noMatch = {{"eventId", "id2"}, {"eventName", "otherEvent"}};
+  iora::core::Json match = {{"eventId", "id1"}, {"eventName", "testEvent"}};
+  iora::core::Json noMatch = {{"eventId", "id2"}, {"eventName", "otherEvent"}};
 
   queue.push(match);
   queue.push(noMatch);
@@ -83,7 +83,7 @@ TEST_CASE("EventQueue handles concurrent pushes and handlers", "[EventQueue]")
 {
   iora::util::EventQueue queue(4);
   std::atomic<int> counter{0};
-  queue.onEventId("testId", [&](const iora::json::Json&) { counter++; });
+  queue.onEventId("testId", [&](const iora::core::Json&) { counter++; });
 
   std::vector<std::thread> threads;
   for (int i = 0; i < 10; ++i)
@@ -91,7 +91,7 @@ TEST_CASE("EventQueue handles concurrent pushes and handlers", "[EventQueue]")
     threads.emplace_back(
         [&queue]()
         {
-          iora::json::Json event = {{"eventId", "testId"},
+          iora::core::Json event = {{"eventId", "testId"},
                                     {"eventName", "testEvent"}};
           queue.push(event);
         });
@@ -111,7 +111,7 @@ TEST_CASE("EventQueue shuts down gracefully", "[EventQueue]")
   iora::util::EventQueue queue(2);
   std::atomic<int> counter{0};
 
-  queue.onEventId("testId", [&](const iora::json::Json&) { counter++; });
+  queue.onEventId("testId", [&](const iora::core::Json&) { counter++; });
   queue.push({{"eventId", "testId"}, {"eventName", "testEvent"}});
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));

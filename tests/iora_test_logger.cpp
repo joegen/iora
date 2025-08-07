@@ -6,16 +6,16 @@ TEST_CASE("Logger Basic Levels", "[logger][levels]")
 {
   removeFilesMatchingPrefix("testlog.");
 
-  iora::log::Logger::init(iora::log::Logger::Level::Trace, "testlog", false);
+  iora::core::Logger::init(iora::core::Logger::Level::Trace, "testlog", false);
   LOG_TRACE("Trace message");
   LOG_DEBUG("Debug message");
   LOG_INFO("Info message");
   LOG_WARN("Warn message");
   LOG_ERROR("Error message");
   LOG_FATAL("Fatal message");
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
 
-  std::string logFile = "testlog." + iora::log::Logger::currentDate() + ".log";
+  std::string logFile = "testlog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >= 6);
@@ -24,13 +24,13 @@ TEST_CASE("Logger Basic Levels", "[logger][levels]")
 
 TEST_CASE("Logger Stream Logging", "[logger][stream]")
 {
-  iora::log::Logger::init(iora::log::Logger::Level::Info, "streamlog", false);
-  iora::log::Logger << iora::log::Logger::Level::Info
-                    << "Stream log test: " << 123 << iora::log::Logger::endl;
-  iora::log::Logger::shutdown();
+  iora::core::Logger::init(iora::core::Logger::Level::Info, "streamlog", false);
+  iora::core::Logger << iora::core::Logger::Level::Info
+                    << "Stream log test: " << 123 << iora::core::Logger::endl;
+  iora::core::Logger::shutdown();
 
   std::string logFile =
-      "streamlog." + iora::log::Logger::currentDate() + ".log";
+      "streamlog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
 
@@ -52,15 +52,15 @@ TEST_CASE("Logger Async Logging", "[logger][async]")
 {
   removeFilesMatchingPrefix("asynclog.");
 
-  iora::log::Logger::init(iora::log::Logger::Level::Info, "asynclog", true);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, "asynclog", true);
   for (int i = 0; i < 100; ++i)
   {
-    iora::log::Logger << iora::log::Logger::Level::Info << "Async message " << i
-                      << iora::log::Logger::endl;
+    iora::core::Logger << iora::core::Logger::Level::Info << "Async message " << i
+                      << iora::core::Logger::endl;
   }
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
 
-  std::string logFile = "asynclog." + iora::log::Logger::currentDate() + ".log";
+  std::string logFile = "asynclog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >= 100);
@@ -71,7 +71,7 @@ TEST_CASE("Logger Thread Safety", "[logger][threaded]")
 {
   removeFilesMatchingPrefix("threadlog.");
 
-  iora::log::Logger::init(iora::log::Logger::Level::Info, "threadlog", true);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, "threadlog", true);
   const int threads = 10;
   const int messagesPerThread = 50;
   std::vector<std::thread> workers;
@@ -83,9 +83,9 @@ TEST_CASE("Logger Thread Safety", "[logger][threaded]")
         {
           for (int j = 0; j < messagesPerThread; ++j)
           {
-            iora::log::Logger << iora::log::Logger::Level::Info << "Thread "
+            iora::core::Logger << iora::core::Logger::Level::Info << "Thread "
                               << i << " message " << j
-                              << iora::log::Logger::endl;
+                              << iora::core::Logger::endl;
           }
         });
   }
@@ -93,10 +93,10 @@ TEST_CASE("Logger Thread Safety", "[logger][threaded]")
   {
     t.join();
   }
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
 
   std::string logFile =
-      "threadlog." + iora::log::Logger::currentDate() + ".log";
+      "threadlog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >=
@@ -109,10 +109,10 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
   const std::string base = "rotate_test";
   const int retention = 1;
 
-  iora::log::Logger::init(iora::log::Logger::Level::Info, base, false,
+  iora::core::Logger::init(iora::core::Logger::Level::Info, base, false,
                           retention);
   LOG_INFO("Rotation start");
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
 
   std::string oldFile = base + ".2000-01-01.log";
   std::ofstream fakeOld(oldFile);
@@ -122,10 +122,10 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
       oldFile,
       std::filesystem::file_time_type::clock::now() - std::chrono::hours(25));
 
-  iora::log::Logger::init(iora::log::Logger::Level::Info, base, false,
+  iora::core::Logger::init(iora::core::Logger::Level::Info, base, false,
                           retention);
   LOG_INFO("Trigger rotation");
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
 
   REQUIRE_FALSE(std::filesystem::exists(oldFile));
   removeFilesMatchingPrefix("rotate_test.");

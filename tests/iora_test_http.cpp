@@ -3,21 +3,21 @@
 
 TEST_CASE("HttpClient and WebhookServer integration tests")
 {
-  iora::http::WebhookServer server;
+  iora::network::WebhookServer server;
   server.setPort(8081);
 
   server.onJsonPost("/test-post-json",
-                    [](const iora::json::Json& input) -> iora::json::Json {
+                    [](const iora::core::Json& input) -> iora::core::Json {
                       return {{"echo", input}};
                     });
 
   server.onJsonPost("/test-async",
-                    [](const iora::json::Json& input) -> iora::json::Json {
+                    [](const iora::core::Json& input) -> iora::core::Json {
                       return {{"async", true}, {"received", input}};
                     });
 
   server.onJsonGet("/test-get",
-                   [](const iora::json::Json&) -> iora::json::Json {
+                   [](const iora::core::Json&) -> iora::core::Json {
                      return {{"status", "ok"}};
                    });
 
@@ -34,7 +34,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
   server.start();
   std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-  iora::http::HttpClient client;
+  iora::network::HttpClient client;
 
   SECTION("GET request returns valid JSON")
   {
@@ -51,15 +51,15 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
 
   SECTION("POST JSON request with payload")
   {
-    iora::json::Json payload = {{"message", "hello"}};
+    iora::core::Json payload = {{"message", "hello"}};
     auto res = client.postJson("http://localhost:8081/test-post-json", payload);
     REQUIRE(res["echo"]["message"] == "hello");
   }
 
   SECTION("Async POST JSON returns future")
   {
-    iora::json::Json payload = {{"async_test", 1}};
-    std::future<iora::json::Json> future =
+    iora::core::Json payload = {{"async_test", 1}};
+    std::future<iora::core::Json> future =
         client.postJsonAsync("http://localhost:8081/test-async", payload);
     auto res = future.get();
     REQUIRE(res["async"] == true);
@@ -68,7 +68,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
 
   SECTION("Streamed POST returns line chunks")
   {
-    iora::json::Json payload = {{}};
+    iora::core::Json payload = {{}};
     std::vector<std::string> chunks;
     client.postStream("http://localhost:8081/test-stream", payload, {},
                       [&](const std::string& line)
@@ -101,17 +101,17 @@ TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
     return;
   }
 
-  iora::http::WebhookServer server;
+  iora::network::WebhookServer server;
   server.setPort(8443);
 
-  iora::http::WebhookServer::TlsConfig tlsCfg;
+  iora::network::WebhookServer::TlsConfig tlsCfg;
   tlsCfg.certFile = certFile;
   tlsCfg.keyFile = keyFile;
   tlsCfg.requireClientCert = false;
 
   REQUIRE_NOTHROW(server.enableTls(tlsCfg));
 
-  server.onJsonGet("/tls-test", [](const iora::json::Json&) -> iora::json::Json {
+  server.onJsonGet("/tls-test", [](const iora::core::Json&) -> iora::core::Json {
     return {{"tls", true}};
   });
 
@@ -120,9 +120,9 @@ TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
 
   SECTION("HTTPS GET returns valid JSON over TLS")
   {
-    iora::http::HttpClient client;
+    iora::network::HttpClient client;
     // Accept self-signed cert for test
-    iora::http::HttpClient::TlsConfig tlsCfg;
+    iora::network::HttpClient::TlsConfig tlsCfg;
     tlsCfg.verifyPeer = false;
     client.setTlsConfig(tlsCfg);
     try

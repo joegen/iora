@@ -15,7 +15,7 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
     out << "float_val = 3.14\n";
   }
 
-  iora::config::ConfigLoader loader(cfgFile);
+  iora::core::ConfigLoader loader(cfgFile);
 
   SECTION("Reload and load returns table")
   {
@@ -55,7 +55,7 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
 
   SECTION("load throws on missing file")
   {
-    iora::config::ConfigLoader badLoader("does_not_exist.toml");
+    iora::core::ConfigLoader badLoader("does_not_exist.toml");
     REQUIRE_THROWS_AS(badLoader.load(), std::runtime_error);
   }
 
@@ -76,7 +76,7 @@ TEST_CASE("ConfigLoader extended functionality", "[config][ConfigLoader]")
     out << "float_val = 3.14\n";
   }
 
-  iora::config::ConfigLoader loader(cfgFile);
+  iora::core::ConfigLoader loader(cfgFile);
 
   SECTION("getStringArray returns string vector if all elements are strings")
   {
@@ -85,7 +85,7 @@ TEST_CASE("ConfigLoader extended functionality", "[config][ConfigLoader]")
       std::ofstream out(arrFile);
       out << "[section]\nstr_array = ['a', 'b', 'c']\n";
     }
-    iora::config::ConfigLoader arrLoader(arrFile);
+    iora::core::ConfigLoader arrLoader(arrFile);
     arrLoader.reload();
     auto result = arrLoader.getStringArray("section.str_array");
     REQUIRE(result.has_value());
@@ -110,7 +110,7 @@ TEST_CASE("ConfigLoader extended functionality", "[config][ConfigLoader]")
       std::ofstream out(badArrFile);
       out << "[section]\nmixed_array = ['x', 42, 'y']\n";
     }
-    iora::config::ConfigLoader badArrLoader(badArrFile);
+    iora::core::ConfigLoader badArrLoader(badArrFile);
     badArrLoader.reload();
     REQUIRE_THROWS_AS(badArrLoader.getStringArray("section.mixed_array"),
                       std::runtime_error);

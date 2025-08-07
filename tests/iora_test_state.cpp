@@ -6,7 +6,7 @@
 TEST_CASE("JsonFileStore basic operations", "[state][JsonFileStore]")
 {
   const std::string testFile = "test_store.json";
-  iora::state::JsonFileStore store(testFile);
+  iora::storage::JsonFileStore store(testFile);
 
   SECTION("Set and Get")
   {
@@ -26,7 +26,7 @@ TEST_CASE("JsonFileStore basic operations", "[state][JsonFileStore]")
 
 TEST_CASE("ConcreteStateStore basic operations", "[state][ConcreteStateStore]")
 {
-  iora::state::ConcreteStateStore store;
+  iora::storage::ConcreteStateStore store;
 
   SECTION("Set and Get (case-insensitive)")
   {

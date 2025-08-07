@@ -1,6 +1,6 @@
 # Iora
 
-**Iora** is a modern **C++17 single-header microservice foundation library** designed for lightweight, readable, and modular code. It provides components for HTTP services, webhook handling, shell execution, configuration, caching, and pluggable state storage — making it a solid base for event-driven, embedded, or general-purpose applications.
+**Iora** is a modern **C++17 header-only microservice foundation library** designed for lightweight, readable, and modular code. It provides components for HTTP services, webhook handling, shell execution, configuration, caching, and pluggable state storage — making it a solid base for event-driven, embedded, or general-purpose applications.
 
 ---
 
@@ -23,16 +23,17 @@ While originally built to support projects in AI and VoIP, `iora` is designed to
 
 ## ✨ Features
 
-- **http::HttpClient** – Wraps `cpr` to call JSON REST APIs.
-- **http::WebhookServer** – Wraps `cpp-httplib` to handle POST webhooks.
-- **shell::ShellRunner** – Executes Linux shell commands and captures stdout.
+- **network::HttpClient** – Wraps `cpr` to call JSON REST APIs.
+- **network::WebhookServer** – Wraps `cpp-httplib` to handle POST webhooks.
+- **system::ShellRunner** – Executes Linux shell commands and captures stdout.
 - **state::StateStore** – Abstract KV store with disk-backed implementation using `nlohmann::json`.
-- **config::ConfigLoader** – Loads TOML files using `toml++`.
+- **core::ConfigLoader** – Loads TOML files using `toml++`.
+- **core::Logger** – Static class with levels (debug/info/warn/error).
 - **util::CliParser** – Parses key:value or JSON CLI output.
 - **util::ExpiringCache<K,V>** – TTL-based thread-safe cache.
 - **util::CaselessMap** – Case-insensitive `unordered_map`.
-- **log::Logger** – Static class with levels (debug/info/warn/error).
 - **util::EventQueue** – Thread-safe event queue for dispatching JSON events to registered handlers.
+- **iora::IoraService** - A modular C++17 class for orchestrating event-driven microservices and dynamically loading plugins at runtime.
 
 ---
 
@@ -227,7 +228,7 @@ To enable plugin loading, specify the directory containing your plugins:
 
 ### Logging and Error Handling
 
-- Plugin initialization errors are logged using the `iora::log::Logger`.
+- Plugin initialization errors are logged using the `iora::core::Logger`.
 - If a plugin fails to load, it will be skipped, and the system will continue loading other plugins.
 
 ---

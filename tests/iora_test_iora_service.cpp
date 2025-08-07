@@ -37,7 +37,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
   }
 
   {
-    std::unique_ptr<iora::state::JsonFileStore> tmp =
+    std::unique_ptr<iora::storage::JsonFileStore> tmp =
         svc.makeJsonFileStore("ioraservice_factory_state.json");
     tmp->set("altKey", "altValue");
     REQUIRE(tmp->get("altKey").value() == "altValue");
@@ -52,7 +52,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
   }
 
   svc.webhookServer()->onJsonGet("/basic",
-                                 [](const iora::json::Json&) -> iora::json::Json
+                                 [](const iora::core::Json&) -> iora::core::Json
                                  {
                                    return {{"ok", true}};
                                  });
@@ -87,7 +87,7 @@ TEST_CASE("IoraService configuration file override",
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
   svc.webhookServer()->onJsonGet("/cfg",
-                                 [](const iora::json::Json&) -> iora::json::Json
+                                 [](const iora::core::Json&) -> iora::core::Json
                                  {
                                    return {{"cfg", true}};
                                  });
@@ -102,9 +102,9 @@ TEST_CASE("IoraService configuration file override",
   REQUIRE(std::filesystem::exists("ioraservice_cfg_state.json"));
 
   LOG_DEBUG("Configuration override test message");
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
   std::string logFile =
-      "ioraservice_cfg_log." + iora::log::Logger::currentDate() + ".log";
+      "ioraservice_cfg_log." + iora::core::Logger::currentDate() + ".log";
   REQUIRE(std::filesystem::exists(logFile));
 
   removeFilesContainingAny(
@@ -139,7 +139,7 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
   svc.webhookServer()->onJsonGet("/cli",
-                                 [](const iora::json::Json&) -> iora::json::Json
+                                 [](const iora::core::Json&) -> iora::core::Json
                                  {
                                    return {{"cli", true}};
                                  });
@@ -155,9 +155,9 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
   REQUIRE(std::filesystem::exists("ioraservice_cli_override_state.json")); // Not guaranteed since flushing the store is done using a background thread
 
   LOG_ERROR("CLI override log test");
-  iora::log::Logger::shutdown();
+  iora::core::Logger::shutdown();
   std::string logFile = "ioraservice_cli_override_log." +
-                        iora::log::Logger::currentDate() + ".log";
+                        iora::core::Logger::currentDate() + ".log";
   REQUIRE(std::filesystem::exists(logFile));
 
   removeFilesContainingAny({"ioraservice_cli_override_log",
@@ -182,7 +182,7 @@ TEST_CASE("IoraService concurrent HTTP clients",
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
   svc.webhookServer()->onJsonGet("/ping",
-                                 [](const iora::json::Json&) -> iora::json::Json
+                                 [](const iora::core::Json&) -> iora::core::Json
                                  {
                                    return {{"pong", true}};
                                  });
@@ -238,7 +238,7 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
   std::atomic<int> nameCounter{0};
   svc.onEventName("fluentEvent")
       .handle(
-          [&](const iora::json::Json& event)
+          [&](const iora::core::Json& event)
           {
             REQUIRE(event["eventName"] == "fluentEvent");
             nameCounter++;
@@ -247,7 +247,7 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
   std::atomic<int> patternCounter{0};
   svc.onEventNameMatches("^fluent.*")
       .handle(
-          [&](const iora::json::Json& event)
+          [&](const iora::core::Json& event)
           {
             REQUIRE(event["eventName"].get<std::string>().find("fluent") == 0);
             patternCounter++;
@@ -283,7 +283,7 @@ TEST_CASE("IoraService integrates EventQueue",
   std::atomic<int> counter{0};
   svc.onEvent("testEventId")
       .handle(
-          [&](const iora::json::Json& event)
+          [&](const iora::core::Json& event)
           {
             REQUIRE(event["eventId"] == "testEventId");
             counter++;
