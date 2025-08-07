@@ -46,6 +46,12 @@ public:
     service->exportApi(*this, "kvstore.getBatch", [this](const std::vector<std::string>& keys) -> std::unordered_map<std::string, std::vector<std::uint8_t>> {
       return _store->getBatch(keys);
     });
+    service->exportApi(*this, "kvstore.getString", [this](const std::string& key) -> std::optional<std::string> {
+      return _store->getString(key);
+    });
+    service->exportApi(*this, "kvstore.setString", [this](const std::string& key, const std::string& value) -> void {
+      _store->setString(key, value);
+    });
   }
 
   void onUnload() override

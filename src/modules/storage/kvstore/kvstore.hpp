@@ -82,6 +82,21 @@ public:
     }
   }
 
+  void setString(const std::string& key, const std::string& value)
+  {
+    set(key, std::vector<std::uint8_t>(value.begin(), value.end()));
+  }
+
+  std::optional<std::string> getString(const std::string& key)
+  {
+    auto binary = get(key);
+    if (binary.has_value())
+    {
+      return std::string(binary->begin(), binary->end());
+    }
+    return std::nullopt;
+  }
+
   void set(const std::string& key, const std::vector<std::uint8_t>& value)
   {
     if (key.empty())
