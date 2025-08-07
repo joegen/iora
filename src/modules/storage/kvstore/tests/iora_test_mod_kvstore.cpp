@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <atomic>
 #include <mutex>
+#include "iora/iora.hpp"
+#include <dlfcn.h>
 
 namespace {
 std::vector<uint8_t> randomBytes(size_t n) {
@@ -656,3 +658,46 @@ TEST_CASE("KVStore handles shutdown and cleanup", "[kvstore][cleanup][shutdown]"
   std::remove(file.c_str());
   std::remove((file+".log").c_str());
 }
+
+
+TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvstore][plugin][api][integration]")
+{
+  const char* args[] = {"program",
+                        "--port", "8131",
+                        "--state-file", "ioraservice_kvstore_state.json",
+                        "--log-file", "ioraservice_kvstore_log"};
+  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
+  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService::AutoServiceShutdown autoShutdown(svc);
+
+  auto pluginPathOpt = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_kvstore.so";
+  std::cout << "Plugin path: " << pluginPathOpt << std::endl;
+  REQUIRE(std::filesystem::exists(pluginPathOpt));
+  REQUIRE(svc.loadSingleModule(pluginPathOpt));
+
+
+  SECTION("callExportedApi: set/get")
+  {
+    std::string key = "plugin_key";
+    std::vector<uint8_t> value = {42, 43, 44};
+    svc.callExportedApi<void, const std::string&, const std::vector<uint8_t>&>("kvstore.set", key, value);
+    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string&>("kvstore.get", key);
+    REQUIRE(got.has_value());
+    REQUIRE(got.value() == value);
+  }
+
+  SECTION("Plugin reload: unload and reload shared library, data persists")
+  {
+    std::string key = "reload_key";
+    std::vector<uint8_t> value = {99, 100, 101};
+    svc.callExportedApi<void, const std::string&, const std::vector<uint8_t>&>("kvstore.set", key, value);
+    REQUIRE(svc.unloadSingleModule("mod_kvstore.so"));
+    REQUIRE(svc.loadSingleModule(pluginPathOpt));
+    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string&>("kvstore.get", key);
+    REQUIRE(got.has_value());
+    REQUIRE(got.value() == value);
+  }
+
+  iora::util::removeFilesContainingAny({"ioraservice_kvstore_log", "ioraservice_kvstore_state.json", "test_kvstore_plugin_api.bin", "test_kvstore_plugin_api.bin.log"});
+}
+

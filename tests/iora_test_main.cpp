@@ -9,64 +9,7 @@
 #include <fstream>
 #include <dlfcn.h>
 
-namespace
-{
-
-void removeFilesMatchingPrefix(const std::string& prefix)
-{
-  for (const auto& file : std::filesystem::directory_iterator("."))
-  {
-    if (file.path().string().find(prefix) != std::string::npos)
-    {
-      std::filesystem::remove(file.path());
-    }
-  }
-}
-
-void removeFilesContainingAny(const std::vector<std::string>& fragments)
-{
-  for (const auto& file : std::filesystem::directory_iterator("."))
-  {
-    std::string name = file.path().string();
-    for (const auto& fragment : fragments)
-    {
-      if (name.find(fragment) != std::string::npos)
-      {
-        std::filesystem::remove(file.path());
-        break;
-      }
-    }
-  }
-}
-
-std::optional<std::string> findPlugin(const std::string& filename)
-{
-  std::vector<std::string> paths = {"tests/plugins/", "build/tests/plugins/",
-                                    "iora/build/tests/plugins/",
-                                    "/workspace/iora/build/tests/plugins/"};
-
-  for (const auto& dir : paths)
-  {
-    std::string full = dir + filename;
-    if (std::filesystem::exists(full))
-    {
-      return full;
-    }
-  }
-  return std::nullopt;
-}
-
-class AutoServiceShutdown
-{
-public:
-  explicit AutoServiceShutdown(iora::IoraService& service) : _svc(service) {}
-  ~AutoServiceShutdown() { _svc.shutdown(); }
-
-private:
-  iora::IoraService& _svc;
-};
-
-} // namespace
+namespace { using AutoServiceShutdown = iora::IoraService::AutoServiceShutdown; } // namespace
 
 #include "iora_test_http.cpp"
 #include "iora_test_logger.cpp"

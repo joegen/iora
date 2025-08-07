@@ -9,6 +9,7 @@
 #include "util/event_queue.hpp"
 #include "util/plugin_loader.hpp"
 #include "util/tokenizer.hpp"
+#include "util/filesystem.hpp"
 #include "storage/concrete_state_store.hpp"
 #include "storage/json_file_store.hpp"
 #include "system/shell_runner.hpp"
@@ -214,6 +215,17 @@ public:
     std::string _name;                    // Plugin name for identification
     std::string _path;                    // Path to the plugin library
     friend class IoraService; // Allow IoraService to access private members
+  };
+
+  /// \brief RAII wrapper to automatically shutdown the IoraService
+  class AutoServiceShutdown
+  {
+  public:
+    explicit AutoServiceShutdown(iora::IoraService& service) : _svc(service) {}
+    ~AutoServiceShutdown() { _svc.shutdown(); }
+
+  private:
+    iora::IoraService& _svc;
   };
 
   /// \brief Initialises the singleton with command‑line arguments.

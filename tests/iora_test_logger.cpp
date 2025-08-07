@@ -4,7 +4,7 @@
 
 TEST_CASE("Logger Basic Levels", "[logger][levels]")
 {
-  removeFilesMatchingPrefix("testlog.");
+  iora::util::removeFilesMatchingPrefix("testlog.");
 
   iora::core::Logger::init(iora::core::Logger::Level::Trace, "testlog", false);
   LOG_TRACE("Trace message");
@@ -19,7 +19,7 @@ TEST_CASE("Logger Basic Levels", "[logger][levels]")
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >= 6);
-  removeFilesMatchingPrefix("testlog.");
+  iora::util::removeFilesMatchingPrefix("testlog.");
 }
 
 TEST_CASE("Logger Stream Logging", "[logger][stream]")
@@ -45,12 +45,12 @@ TEST_CASE("Logger Stream Logging", "[logger][stream]")
     }
   }
   REQUIRE(found);
-  removeFilesMatchingPrefix("streamlog.");
+  iora::util::removeFilesMatchingPrefix("streamlog.");
 }
 
 TEST_CASE("Logger Async Logging", "[logger][async]")
 {
-  removeFilesMatchingPrefix("asynclog.");
+  iora::util::removeFilesMatchingPrefix("asynclog.");
 
   iora::core::Logger::init(iora::core::Logger::Level::Info, "asynclog", true);
   for (int i = 0; i < 100; ++i)
@@ -64,12 +64,12 @@ TEST_CASE("Logger Async Logging", "[logger][async]")
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >= 100);
-  removeFilesMatchingPrefix("asynclog.");
+  iora::util::removeFilesMatchingPrefix("asynclog.");
 }
 
 TEST_CASE("Logger Thread Safety", "[logger][threaded]")
 {
-  removeFilesMatchingPrefix("threadlog.");
+  iora::util::removeFilesMatchingPrefix("threadlog.");
 
   iora::core::Logger::init(iora::core::Logger::Level::Info, "threadlog", true);
   const int threads = 10;
@@ -101,7 +101,7 @@ TEST_CASE("Logger Thread Safety", "[logger][threaded]")
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >=
           threads * messagesPerThread);
-  removeFilesMatchingPrefix("threadlog.");
+  iora::util::removeFilesMatchingPrefix("threadlog.");
 }
 
 TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
@@ -128,5 +128,5 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
   iora::core::Logger::shutdown();
 
   REQUIRE_FALSE(std::filesystem::exists(oldFile));
-  removeFilesMatchingPrefix("rotate_test.");
+  iora::util::removeFilesMatchingPrefix("rotate_test.");
 }

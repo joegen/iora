@@ -65,7 +65,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
     REQUIRE(res["ok"] == true);
   }
 
-  removeFilesContainingAny(
+  iora::util::removeFilesContainingAny(
       {"ioraservice_basic_log", "ioraservice_basic_state.json"});
 }
 
@@ -109,7 +109,7 @@ TEST_CASE("IoraService configuration file override",
       "ioraservice_cfg_log." + iora::core::Logger::currentDate() + ".log";
   REQUIRE(std::filesystem::exists(logFile));
 
-  removeFilesContainingAny(
+  iora::util::removeFilesContainingAny(
       {"ioraservice_cfg_log", "ioraservice_cfg_state.json", cfg});
 }
 
@@ -162,7 +162,7 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
                         iora::core::Logger::currentDate() + ".log";
   REQUIRE(std::filesystem::exists(logFile));
 
-  removeFilesContainingAny({"ioraservice_cli_override_log",
+  iora::util::removeFilesContainingAny({"ioraservice_cli_override_log",
                             "ioraservice_cli_state.json",
                             "ioraservice_cli_override_state.json", cfg});
 }
@@ -220,7 +220,7 @@ TEST_CASE("IoraService concurrent HTTP clients",
   }
   REQUIRE(successCount.load() == threadCount);
 
-  removeFilesContainingAny(
+  iora::util::removeFilesContainingAny(
       {"ioraservice_concurrency_log", "ioraservice_concurrency_state.json"});
 }
 
@@ -267,7 +267,7 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
   REQUIRE(nameCounter == 1);
   REQUIRE(patternCounter == 2);
 
-  removeFilesContainingAny({"ioraservice_fluent_eventqueue_log",
+  iora::util::removeFilesContainingAny({"ioraservice_fluent_eventqueue_log",
                             "ioraservice_fluent_eventqueue_state.json"});
 }
 
@@ -299,6 +299,6 @@ TEST_CASE("IoraService integrates EventQueue",
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   REQUIRE(counter == 1);
 
-  removeFilesContainingAny(
+  iora::util::removeFilesContainingAny(
       {"ioraservice_eventqueue_log", "ioraservice_eventqueue_state.json"});
 }

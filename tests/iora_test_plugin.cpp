@@ -16,11 +16,10 @@ TEST_CASE("Dynamic loading of testplugin shared library")
       iora::IoraService::init(argc, const_cast<char**>(args));
   AutoServiceShutdown autoShutdown(svc);
 
-  auto pluginPathOpt = findPlugin("testplugin.so");
-  INFO("Plugin path search result: " +
-       (pluginPathOpt ? *pluginPathOpt : "<not found>"));
-  REQUIRE(pluginPathOpt);
-  REQUIRE(svc.loadSingleModule(*pluginPathOpt));
+  auto pluginPathOpt = iora::util::getExecutableDir() + "/plugins/testplugin.so";
+  std::cout << "Plugin path: " << pluginPathOpt << std::endl;
+  REQUIRE(std::filesystem::exists(pluginPathOpt));
+  REQUIRE(svc.loadSingleModule(pluginPathOpt));
 
   SECTION("callExportedApi: add")
   {
@@ -73,12 +72,12 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     }
     REQUIRE(threw);
 
-    REQUIRE(svc.loadSingleModule(*pluginPathOpt));
+    REQUIRE(svc.loadSingleModule(pluginPathOpt));
     REQUIRE(svc.callExportedApi<int, int, int>("testplugin.add", 7, 8) == 15);
     REQUIRE(svc.callExportedApi<std::string, const std::string&>(
                 "testplugin.greet", "Reloaded") == "Hello, Reloaded!");
   }
 
-  removeFilesContainingAny(
+  iora::util::removeFilesContainingAny(
       {"ioraservice_plugin_log", "ioraservice_plugin_state.json"});
 }
