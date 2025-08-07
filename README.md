@@ -26,7 +26,7 @@ While originally built to support projects in AI and VoIP, `iora` is designed to
 - **network::HttpClient** – Wraps `cpr` to call JSON REST APIs.
 - **network::WebhookServer** – Wraps `cpp-httplib` to handle POST webhooks.
 - **system::ShellRunner** – Executes Linux shell commands and captures stdout.
-- **state::StateStore** – Abstract KV store with disk-backed implementation using `nlohmann::json`.
+- **storage::JsonFileStore** – Abstract KV store with disk-backed implementation using `nlohmann::json`.
 - **core::ConfigLoader** – Loads TOML files using `toml++`.
 - **core::Logger** – Static class with levels (debug/info/warn/error).
 - **core::ThreadPool** - A dynamic, exception-safe thread pool for running tasks concurrently.

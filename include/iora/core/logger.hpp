@@ -82,11 +82,15 @@ namespace core {
       {
         rotateLogFileIfNeeded();
         const std::string& entry = data.queue.front();
-        std::cout << entry;
+
         if (data.fileStream)
         {
           (*data.fileStream) << entry;
           data.fileStream->flush();
+        }
+        else
+        {
+          std::cout << entry;
         }
         data.queue.pop();
       }
@@ -170,11 +174,15 @@ namespace core {
       {
         std::lock_guard<std::mutex> lock(data.mutex);
         rotateLogFileIfNeeded();
-        std::cout << output;
+        
         if (data.fileStream)
         {
           (*data.fileStream) << output;
           data.fileStream->flush();
+        }
+        else
+        {
+          std::cout << output;
         }
       }
     }
@@ -235,11 +243,15 @@ namespace core {
         {
           rotateLogFileIfNeeded();
           const std::string& entry = data.queue.front();
-          std::cout << entry;
+          
           if (data.fileStream)
           {
             (*data.fileStream) << entry;
             data.fileStream->flush();
+          }
+          else
+          {
+            std::cout << entry;
           }
           data.queue.pop();
         }
