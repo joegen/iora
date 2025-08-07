@@ -3,6 +3,7 @@
 #include "core/json.hpp"
 #include "core/logger.hpp"
 #include "core/config_loader.hpp"
+#include "core/thread_pool.hpp"
 #include "util/safe_json_parser.hpp"
 #include "util/expiring_cache.hpp"
 #include "util/event_queue.hpp"

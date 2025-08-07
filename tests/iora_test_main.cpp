@@ -75,3 +75,4 @@ private:
 #include "iora_test_config_loader.cpp"
 #include "iora_test_plugin.cpp"
 #include "iora_test_state.cpp"
+#include "iora_test_threadpool.cpp"

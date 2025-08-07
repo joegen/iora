@@ -29,7 +29,7 @@ While originally built to support projects in AI and VoIP, `iora` is designed to
 - **state::StateStore** – Abstract KV store with disk-backed implementation using `nlohmann::json`.
 - **core::ConfigLoader** – Loads TOML files using `toml++`.
 - **core::Logger** – Static class with levels (debug/info/warn/error).
-- **util::CliParser** – Parses key:value or JSON CLI output.
+- **core::ThreadPool** - A dynamic, exception-safe thread pool for running tasks concurrently.
 - **util::ExpiringCache<K,V>** – TTL-based thread-safe cache.
 - **util::CaselessMap** – Case-insensitive `unordered_map`.
 - **util::EventQueue** – Thread-safe event queue for dispatching JSON events to registered handlers.

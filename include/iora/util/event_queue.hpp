@@ -12,6 +12,7 @@
 #include <regex>
 
 #include "iora/core/json.hpp"
+#include "iora/core/thread_pool.hpp"
 
 namespace iora {
 namespace util {

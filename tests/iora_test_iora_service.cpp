@@ -10,7 +10,9 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
                         "--state-file",
                         "ioraservice_basic_state.json",
                         "--log-file",
-                        "ioraservice_basic_log"};
+                        "ioraservice_basic_log",
+                        "--log-level",
+                        "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
@@ -174,7 +176,9 @@ TEST_CASE("IoraService concurrent HTTP clients",
                         "--state-file",
                         "ioraservice_concurrency_state.json",
                         "--log-file",
-                        "ioraservice_concurrency_log"};
+                        "ioraservice_concurrency_log",
+                        "--log-level",
+                        "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
@@ -229,7 +233,9 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
                         "--state-file",
                         "ioraservice_fluent_eventqueue_state.json",
                         "--log-file",
-                        "ioraservice_fluent_eventqueue_log"};
+                        "ioraservice_fluent_eventqueue_log",
+                        "--log-level",
+                        "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
   iora::IoraService& svc =
       iora::IoraService::init(argc, const_cast<char**>(args));
