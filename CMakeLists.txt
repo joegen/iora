@@ -31,6 +31,7 @@ enable_testing()
 # Add subdirectories
 add_subdirectory(tests)
 add_subdirectory(sample)
+add_subdirectory(src)
 
 # Add a custom target for `make check` to run all tests
 add_custom_target(check 
