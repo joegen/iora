@@ -26,7 +26,6 @@
 
 namespace iora {
 
-  #define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
 
 /// \brief Singleton entry point for the Iora library, managing all core
 /// components and providing factory methods for utilities and plugins.
@@ -818,7 +817,11 @@ protected:
     {
       if (!_configLoader)
       {
-        _configLoader = std::make_unique<core::ConfigLoader>(configFile.value_or(IORA_DEFAULT_CONFIG_FILE_PATH));
+        std::string defaultConfigFile; 
+        #ifdef IORA_DEFAULT_CONFIG_FILE_PATH
+        defaultConfigFile = IORA_DEFAULT_CONFIG_FILE_PATH;
+        #endif
+        _configLoader = std::make_unique<core::ConfigLoader>(configFile.value_or(defaultConfigFile));
       }
       _configLoader->reload();
       if (!_config.server.port.has_value())

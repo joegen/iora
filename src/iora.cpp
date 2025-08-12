@@ -4,6 +4,8 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
+#define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
+
 #include <iora/iora.hpp>
 
 int main(int argc, char** argv)

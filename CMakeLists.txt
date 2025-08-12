@@ -49,16 +49,6 @@ install(DIRECTORY include/
     FILES_MATCHING PATTERN "*.hpp"
 )
 
-# Install the main iora application binary
-install(TARGETS iora
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-
-# Install plugins to /usr/local/lib/iora/modules
-install(TARGETS mod_kvstore
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/iora/modules
-)
-
 # Install configuration file to /etc (absolute path to avoid /usr/local/etc)
 install(CODE "
     set(config_file \"${CMAKE_INSTALL_PREFIX}/etc/iora.conf.d/iora.cfg\")

@@ -6,4 +6,10 @@ configure_iora_target(iora
     ENABLE_TIKTOKEN
 )
 
+# Install the main iora application binary
+install(TARGETS iora
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
 add_subdirectory(modules/storage/kvstore)
+add_subdirectory(modules/endpoints/jsonrpc_server)
