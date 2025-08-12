@@ -60,10 +60,14 @@ install(TARGETS mod_kvstore
 )
 
 # Install configuration file to /etc (absolute path to avoid /usr/local/etc)
-install(FILES src/config/iora.cfg.in
-    DESTINATION /etc/iora.conf.d
-    RENAME iora.cfg
-)
+install(CODE "
+    set(config_file \"${CMAKE_INSTALL_PREFIX}/etc/iora.conf.d/iora.cfg\")
+    if(NOT EXISTS \"\${config_file}\")
+        file(INSTALL DESTINATION \"${CMAKE_INSTALL_PREFIX}/etc/iora.conf.d\" TYPE FILE FILES \"${CMAKE_CURRENT_SOURCE_DIR}/src/config/iora.cfg.in\" RENAME iora.cfg)
+    else()
+        message(STATUS \"Skipping install of iora.cfg: already exists at \${config_file}\")
+    endif()
+")
 
 # Install the iora_lib target
 install(TARGETS iora_lib
