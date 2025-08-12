@@ -57,6 +57,40 @@ While originally built to support projects in AI and VoIP, `iora` is designed to
 
 ---
 
+## 📦 Installation
+
+After building, you can install Iora system-wide:
+
+```bash
+sudo cmake --install build
+```
+
+This installs:
+
+- **Binary**: `iora` application → `/usr/local/bin/iora`
+- **Headers**: Include files → `/usr/local/include/iora/`
+- **Plugins**: Module libraries → `/usr/local/lib/iora/modules/`
+- **Configuration**: Default config → `/etc/iora.conf.d/iora.cfg`
+
+### Installation Paths
+
+The configuration file defines several important paths where components store or locate files:
+
+- **Log files**: `/var/log/iora/` (configurable via `iora.log.file`)
+- **State storage**: `/etc/iora.conf.d/iora_state.json` (configurable via `iora.state.file`)
+- **TLS certificates**: `/etc/iora.conf.d/tls/` (server.crt, server.key, ca.crt)
+- **Module storage**: `/var/lib/iora/` (for plugin data like kvstore.bin)
+- **Plugin directory**: `/usr/local/lib/iora/modules/` (configurable via `iora.modules.directory`)
+
+After installation, you may need to create required directories and set appropriate permissions:
+
+```bash
+sudo mkdir -p /var/log/iora /var/lib/iora /etc/iora.conf.d/tls
+sudo chown -R $(whoami) /var/log/iora /var/lib/iora
+```
+
+---
+
 ## ✅ Run Tests
 
 1. Build the project (if not already built):

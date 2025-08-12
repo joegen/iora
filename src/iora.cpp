@@ -8,16 +8,27 @@
 
 int main(int argc, char** argv)
 {
-  iora::IoraService& svc = iora::IoraService::init(argc, argv);
+  try 
+  {
+    // Initialize the IoraService with command-line arguments
+    iora::IoraService& svc = iora::IoraService::init(argc, argv);
 
-  std::signal(SIGINT, 
-    [](int) 
-    {
-      iora::IoraService::instance().terminate();
-    }
-  );
+    std::signal(SIGINT, 
+      [](int) 
+      {
+        iora::IoraService::instance().terminate();
+      }
+    );
+    
+    svc.waitForTermination();
+  }
+  catch (const std::exception& ex)
+  {
+    std::cerr << "Error initializing IoraService: " << ex.what() << std::endl;
+    iora::IoraService::shutdown();
+    return EXIT_FAILURE;
+  }
   
-  svc.waitForTermination();
   iora::IoraService::shutdown();
   return 0;
 }

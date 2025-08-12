@@ -23,16 +23,16 @@ public:
     {
       throw std::runtime_error("KVStorePlugin: configLoader is not available");
     }
-    // Read config keys with prefix iora.kvstore.
-    std::string path = loader->getString("iora.kvstore.path").value_or("kvstore.bin");
+    // Read config keys with prefix iora.modules.kvstore.
+    std::string path = loader->getString("iora.modules.kvstore.path").value_or("kvstore.bin");
     KVStoreConfig config;
-    if (auto v = loader->getInt("iora.kvstore.max_log_size"))
+    if (auto v = loader->getInt("iora.modules.kvstore.max_log_size"))
       config.maxLogSizeBytes = static_cast<uint32_t>(*v);
-    if (auto v = loader->getInt("iora.kvstore.max_cache_size"))
+    if (auto v = loader->getInt("iora.modules.kvstore.max_cache_size"))
       config.maxCacheSize = static_cast<uint32_t>(*v);
-    if (auto v = loader->getBool("iora.kvstore.background_compaction"))
+    if (auto v = loader->getBool("iora.modules.kvstore.background_compaction"))
       config.enableBackgroundCompaction = *v;
-    if (auto v = loader->getInt("iora.kvstore.compaction_interval_ms"))
+    if (auto v = loader->getInt("iora.modules.kvstore.compaction_interval_ms"))
       config.compactionInterval = std::chrono::milliseconds(*v);
     _store = std::make_unique<KVStore>(path, config);
   }

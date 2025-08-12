@@ -1,0 +1,37 @@
+# HTTP server configuration
+[iora.server]
+port = 8080 # Port on which the WebhookServer listens
+
+
+[iora.server.tls]
+cert_file = "/etc/iora.conf.d/tls/server.crt"          # Path to the TLS certificate file
+key_file = "/etc/iora.conf.d/tls/server.key"            # Path to the TLS key file
+ca_file = "/etc/iora.conf.d/tls/ca.crt"                # Path to the CA certificate file
+require_client_cert = false  # Whether to require client certificates
+
+# Persistent state configuration
+[iora.state]
+file = "/etc/iora.conf.d/iora_state.json"                   # Path to the file used by JsonFileStore
+
+
+# Logging configuration
+[iora.log]
+level = "debug"                   # trace, debug, info, warning, error, fatal
+file  = "/var/log/iora/iora"          # base name; rotated daily
+async = true                     # asynchronous logging
+retention_days = 7               # days to keep old logs
+time_format = "%Y-%m-%d %H:%M:%S"  # timestamp format
+
+# Module configuration
+[iora.modules]
+# List of modules to load, e.g., ["module1", "module2"]
+directory = "/usr/local/lib/iora/modules"           # Directory containing module files
+modules = ["mod_kvstore.so"] # List of modules to load
+
+# Configuration for the mod_kvstore module
+[iora.modules.mod_kvstore]
+path = "/var/lib/iora/kvstore.bin"  # Path to the KVStore
+max_log_size = 1000000              # Maximum size of the log file in bytes
+max_cache_size = 1000000            # Maximum size of the cache in bytes
+background_compaction = true         # Enable background compaction
+compaction_interval_ms = 60000       # Compaction interval in milliseconds

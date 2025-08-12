@@ -26,6 +26,8 @@
 
 namespace iora {
 
+  #define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
+
 /// \brief Singleton entry point for the Iora library, managing all core
 /// components and providing factory methods for utilities and plugins.
 class IoraService : private util::PluginManager
@@ -781,18 +783,42 @@ protected:
         else if (val == "false" || val == "0" || val == "no")
           _config.server.tls.requireClientCert = false;
       }
+      else if (arg == "--help" || arg == "-h")
+      {
+        printCliHelp();
+        exit(0);
+      }
       // Unrecognised arguments are ignored.
     }
   }
 
+  void printCliHelp()
+  {
+    std::cout << "Usage: iora [options]\n"
+          << "Options:\n"
+          << "  -p, --port <port>                Set server port (default: 8080)\n"
+          << "  -c, --config <file>              Load configuration from file (default: /etc/iora.conf.d/iora.cfg)\n"
+          << "  -s, --state-file <file>          Set state file path (default: state.json)\n"
+          << "  -l, --log-level <level>          Set log level (default: info)\n"
+          << "  -f, --log-file <file>            Set log file path (default: none)\n"
+          << "  -m, --modules <directory>        Set modules directory\n"
+          << "      --log-async                  Enable asynchronous logging (default: false)\n"
+          << "      --log-retention <days>       Set log retention days (default: 7)\n"
+          << "      --log-time-format <format>   Set log time format (default: %Y-%m-%d %H:%M:%S)\n"
+          << "      --tls-cert <file>            TLS certificate file\n"
+          << "      --tls-key <file>             TLS key file\n"
+          << "      --tls-ca <file>              TLS CA file\n"
+          << "      --tls-require-client-cert    Require client certificate for TLS (default: false)\n";
+  }
+
   /// \brief Loads TOML configuration and updates _config with file values.
-  void parseTomlConfig()
+  void parseTomlConfig(std::optional<std::string> configFile = std::nullopt)
   {
     try
     {
       if (!_configLoader)
       {
-        _configLoader = std::make_unique<core::ConfigLoader>("config.toml");
+        _configLoader = std::make_unique<core::ConfigLoader>(configFile.value_or(IORA_DEFAULT_CONFIG_FILE_PATH));
       }
       _configLoader->reload();
       if (!_config.server.port.has_value())
