@@ -93,6 +93,7 @@ public:
     } server;
     struct ModulesConfig
     {
+      std::optional<bool> autoLoad;
       std::optional<std::string> directory;
       std::optional<std::vector<std::string>> modules;
     } modules;
@@ -382,6 +383,18 @@ public:
     {
       throw std::runtime_error("API signature mismatch for: " + name);
     }
+  }
+
+  /// \brief Retrieves the names of all exported APIs.
+  std::vector<std::string> getExportedApiNames() const
+  {
+    std::lock_guard<std::mutex> lock(_apiMutex);
+    std::vector<std::string> names;
+    for (const auto& kv : _apiExports)
+    {
+      names.push_back(kv.first);
+    }
+    return names;
   }
 
   /// \brief Calls a registered plugin API by name with arguments.
@@ -746,6 +759,17 @@ protected:
       {
         _config.modules.directory = argv[++i];
       }
+      else if ((arg == "--modules-auto-load") && i + 1 < argc)
+      {
+        std::string val = argv[++i];
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        if (val == "true" || val == "1" || val == "yes")
+          _config.modules.autoLoad = true;
+        else if (val == "false" || val == "0" || val == "no")
+          _config.modules.autoLoad = false;
+      }
       else if (arg == "--log-async" && i + 1 < argc)
       {
         std::string val = argv[++i];
@@ -838,6 +862,7 @@ protected:
           << "  -l, --log-level <level>          Set log level (default: info)\n"
           << "  -f, --log-file <file>            Set log file path (default: none)\n"
           << "  -m, --modules <directory>        Set modules directory\n"
+          << "      --modules-auto-load          Enable automatic loading of modules (default: true)\n"
           << "      --log-async                  Enable asynchronous logging (default: false)\n"
           << "      --log-retention <days>       Set log retention days (default: 7)\n"
           << "      --log-time-format <format>   Set log time format (default: %Y-%m-%d %H:%M:%S)\n"
@@ -886,6 +911,13 @@ protected:
                 _configLoader->getStringArray("iora.modules.modules"))
         {
           _config.modules.modules = *modulesOpt;
+        }
+      }
+      if (!_config.modules.autoLoad.has_value())
+      {
+        if (auto autoLoadOpt = _configLoader->getBool("iora.modules.auto_load"))
+        {
+          _config.modules.autoLoad = *autoLoadOpt;
         }
       }
       if (!_config.state.file.has_value())
@@ -1141,8 +1173,16 @@ protected:
     // Expiring cache
     _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(std::chrono::minutes(1)); // Default flush interval of 1 minute
 
-    LOG_INFO("applyConfig: Loading modules");
-    loadModules();
+    if (_config.modules.autoLoad.value_or(true))
+    {
+      LOG_INFO("applyConfig: Auto-loading modules is enabled");
+      loadModules();
+    }
+    else
+    {
+      LOG_INFO("applyConfig: Auto-loading modules is disabled");
+    }
+
     LOG_INFO("applyConfig: Configuration applied");
 
     // Start the webhook server
@@ -1185,8 +1225,8 @@ private:
   /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads
   std::unordered_map<std::string, std::any> _apiExports;
-  std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
-  std::mutex _apiMutex;
+  mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
+  mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
 
   /// \brief Holds the merged configuration (CLI, TOML, defaults).

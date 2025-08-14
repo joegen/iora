@@ -685,12 +685,12 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
   SECTION("Plugin API: register and call methods")
   {
     // Register a test method via plugin API
-    auto handler = [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+    auto handler = [](const iora::core::Json& params) -> iora::core::Json
     {
       return iora::core::Json{{"echo", params}};
     };
     
-    svc.callExportedApi<void, const std::string&, MethodHandler>("jsonrpc.register", "plugin_test", handler);
+    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "plugin_test", handler);
     
     // Check if method was registered
     auto hasMethod = svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "plugin_test");
@@ -704,11 +704,11 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
   SECTION("Plugin API: unregister methods")
   {
     // Register method
-    auto handler = [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+    auto handler = [](const iora::core::Json& params) -> iora::core::Json
     {
       return params;
     };
-    svc.callExportedApi<void, const std::string&, MethodHandler>("jsonrpc.register", "temp_method", handler);
+    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "temp_method", handler);
     REQUIRE(svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "temp_method"));
     
     // Unregister method
@@ -719,16 +719,16 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
 
   SECTION("Plugin API: method registration with options")
   {
-    auto handler = [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+    auto handler = [](const iora::core::Json& params) -> iora::core::Json
     {
       return iora::core::Json{{"auth_required", true}};
     };
     
-    MethodOptions opts;
-    opts.requireAuth = true;
-    opts.maxRequestSize = 1024;
+    iora::core::Json opts;
+    opts["requireAuth"] = true;
+    opts["maxRequestSize"] = 1024;
     
-    svc.callExportedApi<void, const std::string&, MethodHandler, const MethodOptions&>(
+    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&>(
       "jsonrpc.registerWithOptions", "auth_method", handler, opts);
     
     REQUIRE(svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "auth_method"));
@@ -739,16 +739,16 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
     // Reset stats
     svc.callExportedApi<void>("jsonrpc.resetStats");
     
-    // Get initial stats
-    const auto& stats = svc.callExportedApi<const ServerStats&>("jsonrpc.getStats");
-    stats.totalRequests.load();
+    // Get initial stats  
+    auto statsJson = svc.callExportedApi<iora::core::Json>("jsonrpc.getStats");
+    REQUIRE(statsJson["totalRequests"].get<std::uint64_t>() == 0);
     
     // Register and simulate some activity (this would normally be done via HTTP requests)
-    auto handler = [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+    auto handler = [](const iora::core::Json& params) -> iora::core::Json
     {
       return params;
     };
-    svc.callExportedApi<void, const std::string&, MethodHandler>("jsonrpc.register", "stats_test", handler);
+    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "stats_test", handler);
     
     // Note: HTTP request testing would require starting the webhook server,
     // which is beyond the scope of unit tests. The stats functionality

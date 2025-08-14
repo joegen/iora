@@ -35,6 +35,10 @@ While originally built to support projects in AI and VoIP, `iora` is designed to
 - **util::EventQueue** – Thread-safe event queue for dispatching JSON events to registered handlers.
 - **iora::IoraService** - A modular C++17 class for orchestrating event-driven microservices and dynamically loading plugins at runtime.
 
+### Module System
+
+- **JSON-RPC Server Module** - A JSON-RPC 2.0 compliant server that can be dynamically loaded as a plugin. Provides method registration, request handling, and statistics via a clean API that only exposes public types.
+
 ---
 
 ## 🛠️ Build Instructions
@@ -264,6 +268,60 @@ To enable plugin loading, specify the directory containing your plugins:
 
 - Plugin initialization errors are logged using the `iora::core::Logger`.
 - If a plugin fails to load, it will be skipped, and the system will continue loading other plugins.
+
+### JSON-RPC Server Module
+
+The JSON-RPC Server module provides a JSON-RPC 2.0 compliant server that can be dynamically loaded as a plugin. It exposes the following API methods via `IoraService::exportApi`:
+
+#### API Methods
+
+- `jsonrpc.version()` → `std::uint32_t` - Returns the JSON-RPC server version
+- `jsonrpc.register(methodName, handler)` → `void` - Registers a method handler
+  - `methodName`: `const std::string&` - Name of the JSON-RPC method
+  - `handler`: `std::function<iora::core::Json(const iora::core::Json&)>` - Handler function that takes JSON params and returns JSON result
+- `jsonrpc.registerWithOptions(methodName, handler, options)` → `void` - Registers a method handler with options
+  - `methodName`: `const std::string&` - Name of the JSON-RPC method  
+  - `handler`: `std::function<iora::core::Json(const iora::core::Json&)>` - Handler function
+  - `options`: `const iora::core::Json&` - Options object with optional fields:
+    - `requireAuth`: `bool` - Whether authentication is required
+    - `timeout`: `int` - Timeout in milliseconds  
+    - `maxRequestSize`: `int` - Maximum request size in bytes
+- `jsonrpc.unregister(methodName)` → `bool` - Unregisters a method
+- `jsonrpc.has(methodName)` → `bool` - Checks if a method is registered
+- `jsonrpc.getMethods()` → `std::vector<std::string>` - Returns list of registered method names
+- `jsonrpc.getStats()` → `iora::core::Json` - Returns server statistics as JSON object with fields:
+  - `totalRequests`: Total number of requests processed
+  - `successfulRequests`: Number of successful requests
+  - `failedRequests`: Number of failed requests
+  - `timeoutRequests`: Number of timed out requests
+  - `batchRequests`: Number of batch requests
+  - `notificationRequests`: Number of notification requests
+- `jsonrpc.resetStats()` → `void` - Resets all statistics counters
+
+#### Usage Example
+
+```cpp
+// Load the JSON-RPC server module
+auto& service = iora::IoraService::instance();
+service.loadSingleModule("/path/to/mod_jsonrpc_server.so");
+
+// Register a simple echo method
+auto echoHandler = [](const iora::core::Json& params) -> iora::core::Json {
+    return params; // Echo back the parameters
+};
+service.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>(
+    "jsonrpc.register", "echo", echoHandler);
+
+// Register a method with options
+auto authHandler = [](const iora::core::Json& params) -> iora::core::Json {
+    return iora::core::Json{{"authenticated", true}};
+};
+iora::core::Json options;
+options["requireAuth"] = true;
+options["timeout"] = 5000;
+service.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&>(
+    "jsonrpc.registerWithOptions", "secure_method", authHandler, options);
+```
 
 ---
 

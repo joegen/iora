@@ -56,13 +56,16 @@ int main()
 ### 3. Make RPC Calls
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Simple method call
 iora::core::Json params = {{"name", "World"}};
-std::vector<std::pair<std::string, std::string>> headers;
+Headers headers;
 
 auto result = svc.callExportedApi<iora::core::Json, 
   const std::string&, const std::string&, const iora::core::Json&, 
-  const std::vector<std::pair<std::string, std::string>>&>(
+  const Headers&>(
   "jsonrpc.client.call", "http://api.example.com/rpc", "hello", params, headers);
 
 std::cout << "Response: " << result.dump() << std::endl;
@@ -79,62 +82,93 @@ The plugin exports the following APIs via `IoraService::callExportedApi`:
 | `jsonrpc.client.version` | `std::uint32_t()` | Get plugin version |
 | `jsonrpc.client.call` | `iora::core::Json(endpoint, method, params, headers)` | Synchronous RPC call |
 | `jsonrpc.client.notify` | `void(endpoint, method, params, headers)` | Send notification (no response) |
-| `jsonrpc.client.callBatch` | `std::vector<iora::core::Json>(endpoint, items, headers)` | Batch RPC calls |
+| `jsonrpc.client.callBatch` | `std::vector<iora::core::Json>(endpoint, items, headers)` | Batch RPC calls (items is JSON array) |
 | `jsonrpc.client.callAsync` | `std::string(endpoint, method, params, headers)` | Async RPC call (returns job ID) |
-| `jsonrpc.client.callBatchAsync` | `std::string(endpoint, items, headers)` | Async batch calls (returns job ID) |
+| `jsonrpc.client.callBatchAsync` | `std::string(endpoint, items, headers)` | Async batch calls (returns job ID, items is JSON array) |
 | `jsonrpc.client.result` | `iora::core::Json(jobId)` | Get async operation result |
-| `jsonrpc.client.getStats` | `const ClientStats&()` | Get client statistics |
+| `jsonrpc.client.getStats` | `iora::core::Json()` | Get client statistics as JSON object |
 | `jsonrpc.client.resetStats` | `void()` | Reset client statistics |
 | `jsonrpc.client.purgeIdle` | `std::size_t()` | Remove idle connections |
 
-### Batch Item Structure
+### Batch Item Format
 
-```cpp
-// Batch request item
-struct BatchItem
+Batch items are provided as a JSON array, where each item is an object with the following structure:
+
+```json
 {
-  std::string method;
-  iora::core::Json params;
-  std::optional<std::uint64_t> id; // None for notifications
-  
-  // Constructor for regular request
-  BatchItem(std::string method, iora::core::Json params, std::uint64_t id);
-  
-  // Constructor for notification
-  BatchItem(std::string method, iora::core::Json params);
-};
+  "method": "method_name",    // Required: RPC method name
+  "params": {...},            // Optional: method parameters (defaults to {})
+  "id": 123                   // Optional: request ID (omit for notifications)
+}
+```
+
+**Examples:**
+```json
+[
+  {
+    "method": "add",
+    "params": {"a": 1, "b": 2},
+    "id": 1
+  },
+  {
+    "method": "multiply", 
+    "params": {"a": 3, "b": 4},
+    "id": 2
+  },
+  {
+    "method": "log_event",
+    "params": {"event": "batch_test"}
+    // No "id" field = notification
+  }
+]
 ```
 
 ### Client Statistics
 
-```cpp
-struct ClientStats
+Statistics are returned as a JSON object with the following fields:
+
+```json
 {
-  std::atomic<std::uint64_t> totalRequests;
-  std::atomic<std::uint64_t> successfulRequests;
-  std::atomic<std::uint64_t> failedRequests;
-  std::atomic<std::uint64_t> timeoutRequests;
-  std::atomic<std::uint64_t> retriedRequests;
-  std::atomic<std::uint64_t> batchRequests;
-  std::atomic<std::uint64_t> notificationRequests;
-  std::atomic<std::uint64_t> poolExhaustions;
-  std::atomic<std::uint64_t> connectionsCreated;
-  std::atomic<std::uint64_t> connectionsEvicted;
-};
+  "totalRequests": 1500,
+  "successfulRequests": 1420,
+  "failedRequests": 80,
+  "timeoutRequests": 15,
+  "retriedRequests": 95,
+  "batchRequests": 25,
+  "notificationRequests": 200,
+  "poolExhaustions": 3,
+  "connectionsCreated": 12,
+  "connectionsEvicted": 8
+}
 ```
+
+**Field Descriptions:**
+- `totalRequests`: Total number of requests made
+- `successfulRequests`: Requests that completed successfully  
+- `failedRequests`: Requests that failed with errors
+- `timeoutRequests`: Requests that exceeded timeout
+- `retriedRequests`: Requests that were retried
+- `batchRequests`: Number of batch requests sent
+- `notificationRequests`: Number of notifications sent
+- `poolExhaustions`: Times connection pool was full
+- `connectionsCreated`: Total connections created
+- `connectionsEvicted`: Connections removed from pools
 
 ## Usage Examples
 
 ### Basic RPC Calls
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Simple RPC call
 iora::core::Json params = {{"message", "Hello, World!"}};
-std::vector<std::pair<std::string, std::string>> headers;
+Headers headers;
 
 auto result = svc.callExportedApi<iora::core::Json, 
   const std::string&, const std::string&, const iora::core::Json&, 
-  const std::vector<std::pair<std::string, std::string>>&>(
+  const Headers&>(
   "jsonrpc.client.call", "http://localhost:8080/rpc", "echo", params, headers);
 
 std::cout << "Echo result: " << result.dump() << std::endl;
@@ -143,32 +177,49 @@ std::cout << "Echo result: " << result.dump() << std::endl;
 ### Notifications
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Send notification (no response expected)
 iora::core::Json params = {{"event", "user_login"}, {"user_id", 12345}};
-std::vector<std::pair<std::string, std::string>> headers;
+Headers headers;
 
 svc.callExportedApi<void, 
   const std::string&, const std::string&, const iora::core::Json&, 
-  const std::vector<std::pair<std::string, std::string>>&>(
+  const Headers&>(
   "jsonrpc.client.notify", "http://localhost:8080/rpc", "log_event", params, headers);
 ```
 
 ### Batch Processing
 
 ```cpp
-// Create batch items
-std::vector<iora::modules::jsonrpc::BatchItem> items = {
-  iora::modules::jsonrpc::BatchItem("add", iora::core::Json{{"a", 1}, {"b", 2}}, 1),
-  iora::modules::jsonrpc::BatchItem("multiply", iora::core::Json{{"a", 3}, {"b", 4}}, 2),
-  iora::modules::jsonrpc::BatchItem("log_event", iora::core::Json{{"event", "batch_test"}}) // Notification
-};
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
 
-std::vector<std::pair<std::string, std::string>> headers;
+// Create batch items as JSON array
+iora::core::Json batchItems = iora::core::Json::array();
+batchItems.push_back({
+  {"method", "add"},
+  {"params", {{"a", 1}, {"b", 2}}},
+  {"id", 1}
+});
+batchItems.push_back({
+  {"method", "multiply"},
+  {"params", {{"a", 3}, {"b", 4}}},
+  {"id", 2}  
+});
+batchItems.push_back({
+  {"method", "log_event"},
+  {"params", {{"event", "batch_test"}}}
+  // No "id" field = notification
+});
+
+Headers headers;
 
 auto results = svc.callExportedApi<std::vector<iora::core::Json>, 
-  const std::string&, const std::vector<iora::modules::jsonrpc::BatchItem>&, 
-  const std::vector<std::pair<std::string, std::string>>&>(
-  "jsonrpc.client.callBatch", "http://localhost:8080/rpc", items, headers);
+  const std::string&, const iora::core::Json&, 
+  const Headers&>(
+  "jsonrpc.client.callBatch", "http://localhost:8080/rpc", batchItems, headers);
 
 // results[0] = {"result": 3}
 // results[1] = {"result": 12} 
@@ -178,13 +229,16 @@ auto results = svc.callExportedApi<std::vector<iora::core::Json>,
 ### Async Operations
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Start async operation
 iora::core::Json params = {{"url", "https://example.com/data"}};
-std::vector<std::pair<std::string, std::string>> headers;
+Headers headers;
 
 std::string jobId = svc.callExportedApi<std::string, 
   const std::string&, const std::string&, const iora::core::Json&, 
-  const std::vector<std::pair<std::string, std::string>>&>(
+  const Headers&>(
   "jsonrpc.client.callAsync", "http://localhost:8080/rpc", "fetch_data", params, headers);
 
 // Poll for result
@@ -209,18 +263,17 @@ while (true) {
 
 ```cpp
 // Get current statistics
-const auto& stats = svc.callExportedApi<const iora::modules::jsonrpc::ClientStats&>(
-  "jsonrpc.client.getStats");
+auto statsJson = svc.callExportedApi<iora::core::Json>("jsonrpc.client.getStats");
 
-std::cout << "Total requests: " << stats.totalRequests << std::endl;
-std::cout << "Successful: " << stats.successfulRequests << std::endl;
-std::cout << "Failed: " << stats.failedRequests << std::endl;
-std::cout << "Retried: " << stats.retriedRequests << std::endl;
-std::cout << "Batch requests: " << stats.batchRequests << std::endl;
-std::cout << "Notifications: " << stats.notificationRequests << std::endl;
-std::cout << "Pool exhaustions: " << stats.poolExhaustions << std::endl;
-std::cout << "Connections created: " << stats.connectionsCreated << std::endl;
-std::cout << "Connections evicted: " << stats.connectionsEvicted << std::endl;
+std::cout << "Total requests: " << statsJson["totalRequests"] << std::endl;
+std::cout << "Successful: " << statsJson["successfulRequests"] << std::endl;
+std::cout << "Failed: " << statsJson["failedRequests"] << std::endl;
+std::cout << "Retried: " << statsJson["retriedRequests"] << std::endl;
+std::cout << "Batch requests: " << statsJson["batchRequests"] << std::endl;
+std::cout << "Notifications: " << statsJson["notificationRequests"] << std::endl;
+std::cout << "Pool exhaustions: " << statsJson["poolExhaustions"] << std::endl;
+std::cout << "Connections created: " << statsJson["connectionsCreated"] << std::endl;
+std::cout << "Connections evicted: " << statsJson["connectionsEvicted"] << std::endl;
 
 // Reset statistics
 svc.callExportedApi<void>("jsonrpc.client.resetStats");
@@ -233,8 +286,11 @@ std::cout << "Evicted " << evicted << " idle connections" << std::endl;
 ### Custom Headers and Authentication
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Add custom headers (e.g., for authentication)
-std::vector<std::pair<std::string, std::string>> headers = {
+Headers headers = {
   {"Authorization", "Bearer your-token-here"},
   {"X-Client-Version", "1.0.0"}
 };
@@ -243,34 +299,37 @@ iora::core::Json params = {{"user_id", 12345}};
 
 auto result = svc.callExportedApi<iora::core::Json, 
   const std::string&, const std::string&, const iora::core::Json&, 
-  const std::vector<std::pair<std::string, std::string>>&>(
+  const Headers&>(
   "jsonrpc.client.call", "https://secure-api.example.com/rpc", "get_user_data", params, headers);
 ```
 
 ### Error Handling
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 try {
   iora::core::Json params = {{"invalid", "params"}};
-  std::vector<std::pair<std::string, std::string>> headers;
+  Headers headers;
   
   auto result = svc.callExportedApi<iora::core::Json, 
     const std::string&, const std::string&, const iora::core::Json&, 
-    const std::vector<std::pair<std::string, std::string>>&>(
+    const Headers&>(
     "jsonrpc.client.call", "http://localhost:8080/rpc", "validate_params", params, headers);
 }
-catch (const iora::modules::jsonrpc::RemoteError& e) {
+catch (const iora::modules::connectors::RemoteError& e) {
   // JSON-RPC protocol error from server
   std::cout << "JSON-RPC error " << e.code() << ": " << e.message() << std::endl;
   if (!e.data().is_null()) {
     std::cout << "Error data: " << e.data().dump() << std::endl;
   }
 }
-catch (const iora::modules::jsonrpc::PoolExhaustedError& e) {
+catch (const iora::modules::connectors::PoolExhaustedError& e) {
   // No available connections
   std::cout << "Connection pool exhausted: " << e.what() << std::endl;
 }
-catch (const iora::modules::jsonrpc::JsonRpcError& e) {
+catch (const iora::modules::connectors::JsonRpcError& e) {
   // General JSON-RPC client error
   std::cout << "JSON-RPC client error: " << e.what() << std::endl;
 }
@@ -404,12 +463,12 @@ Use batch requests for multiple operations to reduce network overhead:
 // call("div", {a:8, b:2})
 
 // Use batch:
-std::vector<BatchItem> items = {
-  BatchItem("add", {{"a", 1}, {"b", 2}}, 1),
-  BatchItem("mul", {{"a", 3}, {"b", 4}}, 2),
-  BatchItem("div", {{"a", 8}, {"b", 2}}, 3)
+iora::core::Json batchItems = {
+  {{"method", "add"}, {"params", {{"a", 1}, {"b", 2}}}, {"id", 1}},
+  {{"method", "mul"}, {"params", {{"a", 3}, {"b", 4}}}, {"id", 2}},
+  {{"method", "div"}, {"params", {{"a", 8}, {"b", 2}}}, {"id", 3}}
 };
-auto results = callBatch(endpoint, items, headers);
+auto results = callBatch(endpoint, batchItems, headers);
 ```
 
 ### Async Operations
@@ -494,6 +553,9 @@ The client is fully compatible with the JSON-RPC server module and follows JSON-
 The client module is designed to work seamlessly with the JSON-RPC server module:
 
 ```cpp
+// Type aliases for better readability
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Start server
 svc.loadSingleModule("mod_jsonrpc_server.so");
 
@@ -504,7 +566,9 @@ svc.callExportedApi<void>("jsonrpc.register", "hello", handler);
 svc.loadSingleModule("mod_jsonrpc_client.so");
 
 // Make calls to server
-auto result = svc.callExportedApi<iora::core::Json>("jsonrpc.client.call", 
+auto result = svc.callExportedApi<iora::core::Json, 
+  const std::string&, const std::string&, const iora::core::Json&, 
+  const Headers&>("jsonrpc.client.call", 
   "http://localhost:8080/rpc", "hello", params, headers);
 ```
 

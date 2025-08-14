@@ -27,11 +27,11 @@
 //
 //  - "jsonrpc.client.callBatch"
 //      -> std::vector<iora::core::Json>(const std::string& endpoint,
+//                                       const iora::core::Json& items,
 //                                       const
-//                                       std::vector<iora::modules::connectors::BatchItem>&
-//                                       items, const
 //                                       std::vector<std::pair<std::string,std::string>>&
 //                                       headers)
+//     items is a JSON array of objects with {method, params, id?}
 //
 //  - "jsonrpc.client.callAsync"
 //      -> std::string(const std::string& endpoint,
@@ -43,10 +43,10 @@
 //
 //  - "jsonrpc.client.callBatchAsync"
 //      -> std::string(const std::string& endpoint,
-//                     const std::vector<iora::modules::connectors::BatchItem>&
-//                     items, const
-//                     std::vector<std::pair<std::string,std::string>>& headers)
+//                     const iora::core::Json& items,
+//                     const std::vector<std::pair<std::string,std::string>>& headers)
 //     returns a jobId; poll with "jsonrpc.client.result"
+//     items is a JSON array of objects with {method, params, id?}
 //
 //  - "jsonrpc.client.result"
 //      -> iora::core::Json(const std::string& jobId)
@@ -55,7 +55,8 @@
 //              or {"done":false}
 //
 //  - "jsonrpc.client.getStats"
-//      -> const iora::modules::connectors::ClientStats&()
+//      -> iora::core::Json()
+//     returns stats as JSON object with counters
 //
 //  - "jsonrpc.client.resetStats"
 //      -> void()
@@ -332,15 +333,39 @@ public:
     service->exportApi(
         *this, "jsonrpc.client.callBatch",
         [this](const std::string& endpoint,
-               const std::vector<iora::modules::connectors::BatchItem>& items,
+               const iora::core::Json& itemsJson,
                const std::vector<std::pair<std::string, std::string>>& headers)
             -> std::vector<iora::core::Json>
-        { return _client->callBatch(endpoint, items, headers); });
+        {
+          // Convert JSON array to BatchItem vector
+          std::vector<iora::modules::connectors::BatchItem> items;
+          if (!itemsJson.is_array()) {
+            throw std::invalid_argument("Batch items must be a JSON array");
+          }
+          
+          for (const auto& item : itemsJson) {
+            if (!item.is_object() || !item.contains("method")) {
+              throw std::invalid_argument("Each batch item must be an object with 'method' field");
+            }
+            
+            std::string method = item["method"].get<std::string>();
+            iora::core::Json params = item.value("params", iora::core::Json::object());
+            
+            if (item.contains("id")) {
+              std::uint64_t id = item["id"].get<std::uint64_t>();
+              items.emplace_back(std::move(method), std::move(params), id);
+            } else {
+              items.emplace_back(std::move(method), std::move(params));
+            }
+          }
+          
+          return _client->callBatch(endpoint, items, headers);
+        });
 
     service->exportApi(
         *this, "jsonrpc.client.callBatchAsync",
         [this](const std::string& endpoint,
-               const std::vector<iora::modules::connectors::BatchItem>& items,
+               const iora::core::Json& itemsJson,
                const std::vector<std::pair<std::string, std::string>>& headers)
             -> std::string
         {
@@ -381,10 +406,32 @@ public:
 
           // Submit batch request to thread pool
           _externalPool->enqueue(
-              [this, endpoint, items, headers, onSuccess, onError]()
+              [this, endpoint, itemsJson, headers, onSuccess, onError]()
               {
                 try
                 {
+                  // Convert JSON array to BatchItem vector inside the thread
+                  std::vector<iora::modules::connectors::BatchItem> items;
+                  if (!itemsJson.is_array()) {
+                    throw std::invalid_argument("Batch items must be a JSON array");
+                  }
+                  
+                  for (const auto& item : itemsJson) {
+                    if (!item.is_object() || !item.contains("method")) {
+                      throw std::invalid_argument("Each batch item must be an object with 'method' field");
+                    }
+                    
+                    std::string method = item["method"].get<std::string>();
+                    iora::core::Json params = item.value("params", iora::core::Json::object());
+                    
+                    if (item.contains("id")) {
+                      std::uint64_t id = item["id"].get<std::uint64_t>();
+                      items.emplace_back(std::move(method), std::move(params), id);
+                    } else {
+                      items.emplace_back(std::move(method), std::move(params));
+                    }
+                  }
+                  
                   auto results = _client->callBatch(endpoint, items, headers);
                   onSuccess(results);
                 }
@@ -410,8 +457,22 @@ public:
                        });
 
     service->exportApi(*this, "jsonrpc.client.getStats",
-                       [this]() -> const iora::modules::connectors::ClientStats&
-                       { return _client->getStats(); });
+                       [this]() -> iora::core::Json
+                       {
+                         const auto& stats = _client->getStats();
+                         return iora::core::Json{
+                           {"totalRequests", stats.totalRequests.load()},
+                           {"successfulRequests", stats.successfulRequests.load()},
+                           {"failedRequests", stats.failedRequests.load()},
+                           {"timeoutRequests", stats.timeoutRequests.load()},
+                           {"retriedRequests", stats.retriedRequests.load()},
+                           {"batchRequests", stats.batchRequests.load()},
+                           {"notificationRequests", stats.notificationRequests.load()},
+                           {"poolExhaustions", stats.poolExhaustions.load()},
+                           {"connectionsCreated", stats.connectionsCreated.load()},
+                           {"connectionsEvicted", stats.connectionsEvicted.load()}
+                         };
+                       });
 
     service->exportApi(*this, "jsonrpc.client.resetStats",
                        [this]() -> void { _client->resetStats(); });
