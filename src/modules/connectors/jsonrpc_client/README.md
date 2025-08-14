@@ -318,24 +318,23 @@ try {
     const Headers&>(
     "jsonrpc.client.call", "http://localhost:8080/rpc", "validate_params", params, headers);
 }
-catch (const iora::modules::connectors::RemoteError& e) {
-  // JSON-RPC protocol error from server
-  std::cout << "JSON-RPC error " << e.code() << ": " << e.message() << std::endl;
-  if (!e.data().is_null()) {
-    std::cout << "Error data: " << e.data().dump() << std::endl;
+catch (const std::runtime_error& e) {
+  // JSON-RPC errors, connection errors, timeouts, etc.
+  std::string error_msg = e.what();
+  
+  if (error_msg.find("JSON-RPC remote error") != std::string::npos) {
+    std::cout << "Server returned an error: " << error_msg << std::endl;
+  } else if (error_msg.find("Connection pool") != std::string::npos) {
+    std::cout << "Connection pool issue: " << error_msg << std::endl;
+  } else if (error_msg.find("timeout") != std::string::npos) {
+    std::cout << "Request timeout: " << error_msg << std::endl;
+  } else {
+    std::cout << "Client error: " << error_msg << std::endl;
   }
 }
-catch (const iora::modules::connectors::PoolExhaustedError& e) {
-  // No available connections
-  std::cout << "Connection pool exhausted: " << e.what() << std::endl;
-}
-catch (const iora::modules::connectors::JsonRpcError& e) {
-  // General JSON-RPC client error
-  std::cout << "JSON-RPC client error: " << e.what() << std::endl;
-}
 catch (const std::exception& e) {
-  // Other errors (network, timeout, etc.)
-  std::cout << "Error: " << e.what() << std::endl;
+  // Other errors (network, parsing, etc.)
+  std::cout << "Unexpected error: " << e.what() << std::endl;
 }
 ```
 
@@ -397,15 +396,18 @@ clientKeyPath = "/path/to/client.key" # Client private key for mTLS
 
 ## Error Handling
 
-The client provides comprehensive error handling with specific exception types:
+The client provides comprehensive error handling through standard C++ exceptions:
 
-### Exception Hierarchy
+### Public API Error Handling
+
+Since the client module uses the public IoraService API, all errors are communicated through standard C++ exceptions:
 
 ```cpp
-std::runtime_error
-└── JsonRpcError                    // Base JSON-RPC client error
-    ├── PoolExhaustedError         // Connection pool exhausted
-    └── RemoteError               // JSON-RPC error from server
+std::runtime_error                  // All client errors inherit from this
+├── Connection errors              // Network failures, timeouts, DNS errors
+├── JSON-RPC protocol errors      // Server returned JSON-RPC error responses  
+├── Pool exhaustion errors        // No available HTTP connections
+└── Request validation errors     // Invalid parameters or malformed requests
 ```
 
 ### Standard JSON-RPC Errors
@@ -427,18 +429,26 @@ std::runtime_error
 
 ### Error Response Format
 
-Remote errors preserve the JSON-RPC error structure:
+JSON-RPC server errors are communicated through exception messages that include the error details:
 
 ```cpp
 try {
-  // RPC call that fails
+  // RPC call that fails on server
 }
-catch (const iora::modules::jsonrpc::RemoteError& e) {
-  std::cout << "Code: " << e.code() << std::endl;        // -32602
-  std::cout << "Message: " << e.message() << std::endl;  // "Invalid params"
-  std::cout << "Data: " << e.data().dump() << std::endl; // Additional error data
+catch (const std::runtime_error& e) {
+  std::string error_msg = e.what();
+  
+  // Example error message formats:
+  // "JSON-RPC remote error: (-32602) Invalid params: Parameter 'name' is required"
+  // "JSON-RPC remote error: (-32601) Method not found: 'unknown_method' is not registered"
+  // "Connection pool exhausted: No available HTTP connections for endpoint: http://..."
+  // "Request timeout: Operation timed out after 30000ms"
+  
+  std::cout << "Client error: " << error_msg << std::endl;
 }
 ```
+
+**Note**: The public API uses standard exception messages rather than exposing internal error objects, keeping the interface simple while preserving all necessary error information.
 
 ## Performance Optimization
 

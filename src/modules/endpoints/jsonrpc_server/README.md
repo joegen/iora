@@ -53,10 +53,13 @@ int main()
 ### 3. Register Methods
 
 ```cpp
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+
 // Simple method registration
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
+svc.callExportedApi<void, const std::string&, JsonHandler>(
   "jsonrpc.register", "hello", 
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+  [](const iora::core::Json& params) -> iora::core::Json
   {
     std::string name = params.value("name", "World");
     return iora::core::Json{{"message", "Hello, " + name + "!"}};
@@ -73,71 +76,75 @@ The plugin exports the following APIs via `IoraService::callExportedApi`:
 | API | Signature | Description |
 |-----|-----------|-------------|
 | `jsonrpc.version` | `std::uint32_t()` | Get plugin version |
-| `jsonrpc.register` | `void(const std::string&, MethodHandler)` | Register a method handler |
-| `jsonrpc.registerWithOptions` | `void(const std::string&, MethodHandler, MethodOptions)` | Register method with options |
+| `jsonrpc.register` | `void(const std::string&, std::function<iora::core::Json(const iora::core::Json&)>)` | Register a method handler |
+| `jsonrpc.registerWithOptions` | `void(const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&)` | Register method with options (options as JSON) |
 | `jsonrpc.unregister` | `bool(const std::string&)` | Unregister a method |
 | `jsonrpc.has` | `bool(const std::string&)` | Check if method exists |
 | `jsonrpc.getMethods` | `std::vector<std::string>()` | Get list of registered methods |
-| `jsonrpc.getStats` | `const ServerStats&()` | Get server statistics |
+| `jsonrpc.getStats` | `iora::core::Json()` | Get server statistics as JSON object |
 | `jsonrpc.resetStats` | `void()` | Reset server statistics |
 
 ### Method Handler Signature
 
 ```cpp
-using MethodHandler = std::function<iora::core::Json(const iora::core::Json&, RpcContext&)>;
+// Public method handler signature (used in API calls)
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
 ```
 
 Method handlers receive:
 - `params`: JSON parameters from the request
-- `ctx`: Request context with service access and metadata
 
 Method handlers should:
 - Return a JSON result on success
 - Throw `std::invalid_argument` for invalid parameters (becomes `-32602` error)
 - Throw other exceptions for internal errors (becomes `-32603` error)
 
+**Note**: The internal implementation may use additional context parameters, but the public API only exposes the simplified JSON-to-JSON signature.
+
 ### Method Options
 
-```cpp
-struct MethodOptions
+Method options are passed as JSON objects with the following structure:
+
+```json
 {
-  bool requireAuth = false;                       // Require authentication
-  std::chrono::milliseconds timeout{5000};       // Request timeout
-  std::size_t maxRequestSize = 1024 * 1024;      // Max request size (1MB)
-  MethodPreHook preHook;                          // Pre-execution hook
-  MethodPostHook postHook;                        // Post-execution hook
+  "requireAuth": false,        // Require authentication (default: false)
+  "timeout": 5000,            // Request timeout in milliseconds (default: 5000) 
+  "maxRequestSize": 1048576   // Max request size in bytes (default: 1MB)
+}
+```
+
+Example in C++:
+```cpp
+iora::core::Json options = {
+  {"requireAuth", true},
+  {"timeout", 10000},
+  {"maxRequestSize", 2048576}
 };
 ```
 
-### Request Context
+### Request Processing
 
-```cpp
-class RpcContext
-{
-public:
-  IoraService& service() const;                   // Access to IoraService
-  const std::optional<std::string>& authSubject() const; // Authenticated user
-  const RequestMetadata& metadata() const;       // Request metadata
-};
+The server handles request context, authentication, and metadata internally. Method handlers receive only the JSON parameters and return JSON responses. The internal implementation manages:
 
-struct RequestMetadata
-{
-  std::chrono::steady_clock::time_point startTime; // Request start time
-  std::string clientId;                           // Client identifier
-  std::string method;                             // Method name
-  std::size_t requestSize;                        // Request body size
-};
-```
+- **Authentication**: Validated based on method options and HTTP headers
+- **Request Metadata**: Timing, client identification, and request size tracking  
+- **Service Integration**: Access to IoraService features like state store and logging
+- **Error Handling**: Automatic conversion of exceptions to JSON-RPC error responses
+
+This design keeps the public API simple while providing full functionality internally.
 
 ## Usage Examples
 
 ### Basic Method Registration
 
 ```cpp
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+
 // Register a simple echo method
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
+svc.callExportedApi<void, const std::string&, JsonHandler>(
   "jsonrpc.register", "echo",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+  [](const iora::core::Json& params) -> iora::core::Json
   {
     return params; // Echo back the parameters
   }
@@ -147,63 +154,69 @@ svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHand
 ### Method with Authentication
 
 ```cpp
-// Register method that requires authentication
-iora::modules::jsonrpc::MethodOptions opts;
-opts.requireAuth = true;
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
 
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler, const iora::modules::jsonrpc::MethodOptions&>(
+// Register method that requires authentication
+iora::core::Json options = {
+  {"requireAuth", true},
+  {"timeout", 10000}
+};
+
+svc.callExportedApi<void, const std::string&, JsonHandler, const iora::core::Json&>(
   "jsonrpc.registerWithOptions", "secure_method",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+  [](const iora::core::Json& params) -> iora::core::Json
   {
     // This handler will only be called if authentication is present
+    // Authentication details are handled internally by the server
     return iora::core::Json{
-      {"user", ctx.authSubject().value()},
-      {"data", "sensitive information"}
+      {"message", "Access granted to secure data"},
+      {"data", "sensitive information"},
+      {"timestamp", std::time(nullptr)}
     };
   },
-  opts
+  options
 );
 ```
 
-### Method with Hooks
+### Method with Custom Options
 
 ```cpp
-iora::modules::jsonrpc::MethodOptions opts;
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
 
-// Pre-execution hook for logging
-opts.preHook = [](const std::string& method, const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx)
-{
-  ctx.service().logger().info("Executing method: {} with {} parameters", method, params.size());
+// Register method with custom timeout and authentication
+iora::core::Json options = {
+  {"requireAuth", false},
+  {"timeout", 15000},        // 15 second timeout for slow operations
+  {"maxRequestSize", 2097152} // 2MB max request size
 };
 
-// Post-execution hook for metrics
-opts.postHook = [](const std::string& method, const iora::core::Json& params, 
-                  const iora::core::Json& result, iora::modules::jsonrpc::RpcContext& ctx)
-{
-  auto duration = std::chrono::steady_clock::now() - ctx.metadata().startTime;
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-  ctx.service().logger().debug("Method {} completed in {}ms", method, ms.count());
-};
-
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler, const iora::modules::jsonrpc::MethodOptions&>(
-  "jsonrpc.registerWithOptions", "monitored_method",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+svc.callExportedApi<void, const std::string&, JsonHandler, const iora::core::Json&>(
+  "jsonrpc.registerWithOptions", "slow_method",
+  [](const iora::core::Json& params) -> iora::core::Json
   {
-    // Simulate some work
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return iora::core::Json{{"status", "completed"}};
+    // Simulate some work - the timeout setting allows for longer processing
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    return iora::core::Json{
+      {"status", "completed"},
+      {"processing_time", "1000ms"}
+    };
   },
-  opts
+  options
 );
 ```
 
 ### Calculator Service Example
 
 ```cpp
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+
 // Register mathematical operations
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
+svc.callExportedApi<void, const std::string&, JsonHandler>(
   "jsonrpc.register", "add",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+  [](const iora::core::Json& params) -> iora::core::Json
   {
     if (!params.contains("a") || !params.contains("b"))
     {
@@ -216,9 +229,9 @@ svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHand
   }
 );
 
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
+svc.callExportedApi<void, const std::string&, JsonHandler>(
   "jsonrpc.register", "multiply",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+  [](const iora::core::Json& params) -> iora::core::Json
   {
     double a = params.value("a", 1.0);
     double b = params.value("b", 1.0);
@@ -227,50 +240,66 @@ svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHand
 );
 ```
 
-### File Operations with Service Integration
+### Data Processing Example
 
 ```cpp
-// Register file operations that use IoraService features
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
-  "jsonrpc.register", "save_data",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+
+// Register data validation method
+svc.callExportedApi<void, const std::string&, JsonHandler>(
+  "jsonrpc.register", "validate_user",
+  [](const iora::core::Json& params) -> iora::core::Json
   {
-    std::string key = params.value("key", "");
-    if (key.empty())
+    // Validate required fields
+    if (!params.contains("username") || !params.contains("email"))
     {
-      throw std::invalid_argument("Key parameter is required");
+      throw std::invalid_argument("Both 'username' and 'email' are required");
     }
     
-    // Use IoraService state store
-    ctx.service().stateStore().set(key, params["data"]);
+    std::string username = params["username"].get<std::string>();
+    std::string email = params["email"].get<std::string>();
+    
+    // Perform validation
+    bool validUsername = !username.empty() && username.length() >= 3;
+    bool validEmail = email.find('@') != std::string::npos;
     
     return iora::core::Json{
-      {"success", true},
-      {"key", key},
+      {"valid", validUsername && validEmail},
+      {"username_valid", validUsername},
+      {"email_valid", validEmail},
       {"timestamp", std::time(nullptr)}
     };
   }
 );
 
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
-  "jsonrpc.register", "load_data",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+// Register data transformation method
+svc.callExportedApi<void, const std::string&, JsonHandler>(
+  "jsonrpc.register", "format_text",
+  [](const iora::core::Json& params) -> iora::core::Json
   {
-    std::string key = params.value("key", "");
-    if (key.empty())
+    std::string text = params.value("text", "");
+    std::string format = params.value("format", "upper");
+    
+    if (text.empty())
     {
-      throw std::invalid_argument("Key parameter is required");
+      throw std::invalid_argument("Text parameter is required");
     }
     
-    auto data = ctx.service().stateStore().get(key);
-    if (!data.has_value())
+    std::string result = text;
+    if (format == "upper")
     {
-      return iora::core::Json{{"found", false}};
+      std::transform(result.begin(), result.end(), result.begin(), ::toupper);
+    }
+    else if (format == "lower")
+    {
+      std::transform(result.begin(), result.end(), result.begin(), ::tolower);
     }
     
     return iora::core::Json{
-      {"found", true},
-      {"data", data.value()}
+      {"original", text},
+      {"formatted", result},
+      {"format_applied", format}
     };
   }
 );
@@ -406,17 +435,28 @@ The server returns JSON-RPC 2.0 compliant error responses:
 Access server statistics through the plugin API:
 
 ```cpp
-// Get current statistics
-const auto& stats = svc.callExportedApi<const iora::modules::jsonrpc::ServerStats&>("jsonrpc.getStats");
+// Get current statistics as JSON
+auto stats = svc.callExportedApi<iora::core::Json>("jsonrpc.getStats");
 
-std::cout << "Total requests: " << stats.totalRequests << std::endl;
-std::cout << "Successful: " << stats.successfulRequests << std::endl;
-std::cout << "Failed: " << stats.failedRequests << std::endl;
-std::cout << "Batch requests: " << stats.batchRequests << std::endl;
-std::cout << "Notifications: " << stats.notificationRequests << std::endl;
+std::cout << "Total requests: " << stats["totalRequests"] << std::endl;
+std::cout << "Successful: " << stats["successfulRequests"] << std::endl;
+std::cout << "Failed: " << stats["failedRequests"] << std::endl;
+std::cout << "Batch requests: " << stats["batchRequests"] << std::endl;
+std::cout << "Notifications: " << stats["notificationRequests"] << std::endl;
+std::cout << "Timeout requests: " << stats["timeoutRequests"] << std::endl;
 
 // Reset statistics
 svc.callExportedApi<void>("jsonrpc.resetStats");
+
+// Example statistics JSON format:
+// {
+//   "totalRequests": 1500,
+//   "successfulRequests": 1420,
+//   "failedRequests": 80,
+//   "timeoutRequests": 15,
+//   "batchRequests": 25,
+//   "notificationRequests": 200
+// }
 ```
 
 ## Testing
@@ -448,15 +488,18 @@ Test categories include:
 ### Method Implementation
 
 1. **Validate Parameters**: Always validate required parameters and throw `std::invalid_argument` for invalid input
-2. **Use Context**: Leverage the `RpcContext` to access IoraService features
-3. **Handle Exceptions**: Let exceptions bubble up for proper JSON-RPC error responses
-4. **Return Structured Data**: Use JSON objects for complex return values
+2. **Handle Exceptions**: Let exceptions bubble up for proper JSON-RPC error responses  
+3. **Return Structured Data**: Use JSON objects for complex return values
+4. **Keep Logic Simple**: Method handlers should focus on business logic, not service integration
 
 ```cpp
+// Type alias for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+
 // Good: Proper validation and error handling
-svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHandler>(
-  "jsonrpc.register", "user_create",
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+svc.callExportedApi<void, const std::string&, JsonHandler>(
+  "jsonrpc.register", "user_validate",
+  [](const iora::core::Json& params) -> iora::core::Json
   {
     // Validate required parameters
     if (!params.contains("username") || !params.contains("email"))
@@ -473,15 +516,16 @@ svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHand
       throw std::invalid_argument("Invalid username or email format");
     }
     
-    // Use service features
-    std::string userId = generateUserId();
-    ctx.service().stateStore().set("user:" + userId, params);
+    // Perform validation logic
+    bool usernameValid = username.length() >= 3 && username.length() <= 20;
+    bool emailValid = email.length() > 5 && email.find('@') != std::string::npos;
     
     // Return structured result
     return iora::core::Json{
-      {"success", true},
-      {"userId", userId},
-      {"created", std::time(nullptr)}
+      {"valid", usernameValid && emailValid},
+      {"username_valid", usernameValid},
+      {"email_valid", emailValid},
+      {"timestamp", std::time(nullptr)}
     };
   }
 );
@@ -544,18 +588,22 @@ This will log all incoming requests, responses, and processing details.
 The server module is designed to work seamlessly with the JSON-RPC client module:
 
 ```cpp
+// Type aliases for better readability
+using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+using Headers = std::vector<std::pair<std::string, std::string>>;
+
 // Start server with methods
 svc.loadSingleModule("mod_jsonrpc_server.so");
-svc.callExportedApi<void>("jsonrpc.register", "hello", 
-  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json {
+svc.callExportedApi<void, const std::string&, JsonHandler>("jsonrpc.register", "hello", 
+  [](const iora::core::Json& params) -> iora::core::Json {
     return iora::core::Json{{"message", "Hello, " + params.value("name", "World") + "!"}};
   });
 
 // Load client and make calls
 svc.loadSingleModule("mod_jsonrpc_client.so");
-auto result = svc.callExportedApi<iora::core::Json>("jsonrpc.client.call", 
-  "http://localhost:8080/rpc", "hello", iora::core::Json{{"name", "Alice"}}, 
-  std::vector<std::pair<std::string, std::string>>());
+auto result = svc.callExportedApi<iora::core::Json, const std::string&, const std::string&, const iora::core::Json&, const Headers&>(
+  "jsonrpc.client.call", "http://localhost:8080/rpc", "hello", 
+  iora::core::Json{{"name", "Alice"}}, Headers{});
 ```
 
 ## Wire Protocol Compatibility
