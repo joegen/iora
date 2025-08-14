@@ -13,3 +13,4 @@ install(TARGETS iora
 
 add_subdirectory(modules/storage/kvstore)
 add_subdirectory(modules/endpoints/jsonrpc_server)
+add_subdirectory(modules/connectors/jsonrpc_client)

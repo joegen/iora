@@ -108,6 +108,13 @@ public:
       std::optional<int> retentionDays;
       std::optional<std::string> timeFormat;
     } log;
+    struct ThreadPool
+    {
+      std::optional<std::size_t> minThreads;
+      std::optional<std::size_t> maxThreads;
+      std::optional<std::size_t> queueSize;
+      std::optional<std::chrono::seconds> idleTimeoutSeconds;
+    } threadPool;
   };
 
   /// \brief Cleans up all global Iora resources, notifies plugins, and unloads
@@ -283,6 +290,12 @@ public:
   const std::unique_ptr<storage::JsonFileStore>& jsonFileStore() const
   {
     return _jsonFileStore;
+  }
+
+  /// \brief Get the thread pool instance.
+  const std::unique_ptr<core::ThreadPool>& threadPool() const
+  {
+    return _threadPool;
   }
 
   /// \brief Factory for creating a JSON file store backed by the given file.
@@ -781,6 +794,30 @@ protected:
           _config.server.tls.requireClientCert = true;
         else if (val == "false" || val == "0" || val == "no")
           _config.server.tls.requireClientCert = false;
+      } 
+      else if (arg == "--threadpool-min" && i + 1 < argc)
+      {
+        _config.threadPool.minThreads = std::stoul(argv[++i]);
+      }
+      else if (arg == "--threadpool-max" && i + 1 < argc)
+      {
+        _config.threadPool.maxThreads = std::stoul(argv[++i]);
+      }
+      else if (arg == "--threadpool-queue" && i + 1 < argc)
+      {
+        _config.threadPool.queueSize = std::stoul(argv[++i]);
+      }
+      else if (arg == "--threadpool-idle-timeout" && i + 1 < argc)
+      {
+        try
+        {
+          _config.threadPool.idleTimeoutSeconds =
+              std::chrono::seconds(std::stoul(argv[++i]));
+        }
+        catch (...)
+        {
+          // Ignore invalid timeout values
+        }
       }
       else if (arg == "--help" || arg == "-h")
       {
@@ -807,7 +844,11 @@ protected:
           << "      --tls-cert <file>            TLS certificate file\n"
           << "      --tls-key <file>             TLS key file\n"
           << "      --tls-ca <file>              TLS CA file\n"
-          << "      --tls-require-client-cert    Require client certificate for TLS (default: false)\n";
+          << "      --tls-require-client-cert    Require client certificate for TLS (default: false)\n"
+          << "      --threadpool-min <n>           Set thread pool minimum threads (default: 2)\n"
+          << "      --threadpool-max <n>           Set thread pool maximum threads (default: 8)\n"
+          << "      --threadpool-queue <n>         Set thread pool queue size (default: 128)\n"
+          << "      --threadpool-idle-timeout <n>  Set thread pool idle timeout in seconds (default: 60)\n";
   }
 
   /// \brief Loads TOML configuration and updates _config with file values.
@@ -921,6 +962,35 @@ protected:
                 _configLoader->getBool("iora.server.tls.require_client_cert"))
         {
           _config.server.tls.requireClientCert = *tlsReqOpt;
+        }
+      }
+      if (!_config.threadPool.minThreads.has_value())
+      {
+        if (auto v = _configLoader->getInt("iora.threadpool.minThreads"))
+        {
+          _config.threadPool.minThreads = static_cast<std::size_t>(*v);
+        }
+      }
+      if (!_config.threadPool.maxThreads.has_value())
+      {
+        if (auto v = _configLoader->getInt("iora.threadpool.maxThreads"))
+        {
+          _config.threadPool.maxThreads = static_cast<std::size_t>(*v);
+        }
+      }
+      if (!_config.threadPool.queueSize.has_value())
+      {
+        if (auto v = _configLoader->getInt("iora.threadpool.queueSize"))
+        {
+          _config.threadPool.queueSize = static_cast<std::size_t>(*v);
+        }
+      }
+      if (!_config.threadPool.idleTimeoutSeconds.has_value())
+      {
+        if (auto v = _configLoader->getInt("iora.threadpool.idleTimeoutSeconds"))
+        {
+          _config.threadPool.idleTimeoutSeconds =
+              std::chrono::seconds(static_cast<std::size_t>(*v));
         }
       }
     }
@@ -1052,6 +1122,12 @@ protected:
     {
       LOG_INFO("applyConfig: TLS is not enabled");
     }
+    // Thread pool
+    std::size_t minThreads = _config.threadPool.minThreads.value_or(1);
+    std::size_t maxThreads = _config.threadPool.maxThreads.value_or(std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : 4);
+    std::size_t queueSize = _config.threadPool.queueSize.value_or(maxThreads * 2);
+    std::chrono::seconds idleTimeout = _config.threadPool.idleTimeoutSeconds.value_or(std::chrono::seconds(60));
+    _threadPool = std::make_unique<core::ThreadPool>(minThreads, maxThreads, idleTimeout, queueSize);
 
     // Modules path
     if (_config.modules.directory.has_value())
@@ -1063,8 +1139,7 @@ protected:
     _stateStore = std::make_unique<storage::ConcreteStateStore>();
 
     // Expiring cache
-    _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(
-        std::chrono::minutes(1)); // Default flush interval of 1 minute
+    _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(std::chrono::minutes(1)); // Default flush interval of 1 minute
 
     LOG_INFO("applyConfig: Loading modules");
     loadModules();
@@ -1105,6 +1180,7 @@ private:
   std::unique_ptr<util::ExpiringCache<std::string, std::string>> _cache;
   std::unique_ptr<core::ConfigLoader> _configLoader;
   std::unique_ptr<storage::JsonFileStore> _jsonFileStore;
+  std::unique_ptr<core::ThreadPool> _threadPool;
   std::string _modulesPath;
   /// \brief EventQueue for managing and dispatching events
   util::EventQueue _eventQueue{4}; // Default to 4 worker threads

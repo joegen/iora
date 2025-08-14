@@ -57,21 +57,21 @@ public:
     {
       try
       {
-        if (auto v = loader->getBool("iora.modules.jsonrpc.enabled"))
+        if (auto v = loader->getBool("iora.modules.jsonrpc_server.enabled"))
           _enabled = *v;
-        if (auto v = loader->getString("iora.modules.jsonrpc.path"))
+        if (auto v = loader->getString("iora.modules.jsonrpc_server.path"))
           _path = *v;
-        if (auto v = loader->getInt("iora.modules.jsonrpc.maxRequestBytes"))
+        if (auto v = loader->getInt("iora.modules.jsonrpc_server.maxRequestBytes"))
           _maxRequestBytes = static_cast<std::size_t>(*v);
-        if (auto v = loader->getInt("iora.modules.jsonrpc.maxBatchItems"))
+        if (auto v = loader->getInt("iora.modules.jsonrpc_server.maxBatchItems"))
           _maxBatchItems = static_cast<std::size_t>(*v);
-        if (auto v = loader->getBool("iora.modules.jsonrpc.requireAuth"))
+        if (auto v = loader->getBool("iora.modules.jsonrpc_server.requireAuth"))
           _requireAuth = *v;
-        if (auto v = loader->getInt("iora.modules.jsonrpc.timeoutMs"))
+        if (auto v = loader->getInt("iora.modules.jsonrpc_server.timeoutMs"))
           _timeoutMs = *v;
-        if (auto v = loader->getBool("iora.modules.jsonrpc.logRequests"))
+        if (auto v = loader->getBool("iora.modules.jsonrpc_server.logRequests"))
           _logRequests = *v;
-        if (auto v = loader->getBool("iora.modules.jsonrpc.enableMetrics"))
+        if (auto v = loader->getBool("iora.modules.jsonrpc_server.enableMetrics"))
           _enableMetrics = *v;
         
         iora::core::Logger::info("JSON-RPC server plugin configured: path=" + _path + ", auth=" + 

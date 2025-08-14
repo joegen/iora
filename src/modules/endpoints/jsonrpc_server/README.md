@@ -338,7 +338,7 @@ curl -X POST http://localhost:8080/rpc \
 Configure the JSON-RPC server in your TOML configuration file:
 
 ```toml
-[modules.jsonrpc]
+[modules.jsonrpc_server]
 enabled = true
 path = "/rpc"                    # HTTP endpoint path
 maxRequestBytes = 1048576        # Max request size (1MB)
@@ -530,7 +530,7 @@ svc.callExportedApi<void, const std::string&, iora::modules::jsonrpc::MethodHand
 Enable detailed logging to troubleshoot issues:
 
 ```toml
-[modules.jsonrpc]
+[modules.jsonrpc_server]
 logRequests = true
 
 [logging]
@@ -538,6 +538,35 @@ level = "debug"
 ```
 
 This will log all incoming requests, responses, and processing details.
+
+## Integration with Client Module
+
+The server module is designed to work seamlessly with the JSON-RPC client module:
+
+```cpp
+// Start server with methods
+svc.loadSingleModule("mod_jsonrpc_server.so");
+svc.callExportedApi<void>("jsonrpc.register", "hello", 
+  [](const iora::core::Json& params, iora::modules::jsonrpc::RpcContext& ctx) -> iora::core::Json {
+    return iora::core::Json{{"message", "Hello, " + params.value("name", "World") + "!"}};
+  });
+
+// Load client and make calls
+svc.loadSingleModule("mod_jsonrpc_client.so");
+auto result = svc.callExportedApi<iora::core::Json>("jsonrpc.client.call", 
+  "http://localhost:8080/rpc", "hello", iora::core::Json{{"name", "Alice"}}, 
+  std::vector<std::pair<std::string, std::string>>());
+```
+
+## Wire Protocol Compatibility
+
+The server is fully compatible with the JSON-RPC client module and follows JSON-RPC 2.0 specification:
+
+- **Request Processing**: Proper JSON-RPC 2.0 request validation
+- **Parameter Handling**: Correct handling of optional parameters
+- **Batch Processing**: Efficient batch request/response handling
+- **Notifications**: Proper notification processing (no response)
+- **Error Responses**: Standard JSON-RPC error objects
 
 ## License
 
