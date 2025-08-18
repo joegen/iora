@@ -5,8 +5,7 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #include "../jsonrpc_server.hpp"
-#include <catch2/catch_test_macros.hpp>
-#include <catch2/catch_session.hpp>
+#include <catch2/catch.hpp>
 #include <random>
 #include <string>
 #include <vector>
@@ -51,37 +50,41 @@ iora::IoraService& createTestService()
 }
 
 /// \brief Test method handler that echoes parameters
-iora::core::Json echoHandler(const iora::core::Json& params, RpcContext& ctx)
+iora::parsers::Json echoHandler(const iora::parsers::Json& params, RpcContext& ctx)
 {
   return params;
 }
 
 /// \brief Test method handler that throws invalid_argument
-iora::core::Json invalidParamsHandler(const iora::core::Json& params, RpcContext& ctx)
+iora::parsers::Json invalidParamsHandler(const iora::parsers::Json& params, RpcContext& ctx)
 {
   throw std::invalid_argument("Invalid parameters provided");
 }
 
 /// \brief Test method handler that throws runtime_error
-iora::core::Json internalErrorHandler(const iora::core::Json& params, RpcContext& ctx)
+iora::parsers::Json internalErrorHandler(const iora::parsers::Json& params, RpcContext& ctx)
 {
   throw std::runtime_error("Internal processing error");
 }
 
 /// \brief Test method handler that requires authentication
-iora::core::Json authRequiredHandler(const iora::core::Json& params, RpcContext& ctx)
+iora::parsers::Json authRequiredHandler(const iora::parsers::Json& params, RpcContext& ctx)
 {
   if (!ctx.authSubject().has_value())
   {
     throw std::invalid_argument("Authentication required");
   }
-  return iora::core::Json{{"user", ctx.authSubject().value()}};
+  auto result = iora::parsers::Json::object();
+  result["user"] = ctx.authSubject().value();
+  return result;
 }
 
 /// \brief Test method handler with pre/post hooks
-iora::core::Json hookedHandler(const iora::core::Json& params, RpcContext& ctx)
+iora::parsers::Json hookedHandler(const iora::parsers::Json& params, RpcContext& ctx)
 {
-  return iora::core::Json{{"processed", true}};
+  auto result = iora::parsers::Json::object();
+  result["processed"] = true;
+  return result;
 }
 
 } // anonymous namespace
@@ -98,7 +101,7 @@ TEST_CASE("JsonRpcServer basic method registration", "[jsonrpc][basic]")
     
     auto methods = server.getMethodNames();
     REQUIRE(methods.size() == 1);
-    REQUIRE(methods[0] == "test");
+    REQUIRE(methods[static_cast<std::size_t>(0)] == "test");
   }
   
   SECTION("Unregister method")
@@ -137,12 +140,12 @@ TEST_CASE("JsonRpcServer method options", "[jsonrpc][options]")
     std::atomic<int> postHookCalls{0};
     
     MethodOptions opts;
-    opts.preHook = [&preHookCalls](const std::string& method, const iora::core::Json& params, RpcContext& ctx)
+    opts.preHook = [&preHookCalls](const std::string& method, const iora::parsers::Json& params, RpcContext& ctx)
     {
       preHookCalls++;
     };
-    opts.postHook = [&postHookCalls](const std::string& method, const iora::core::Json& params, 
-                                    const iora::core::Json& result, RpcContext& ctx)
+    opts.postHook = [&postHookCalls](const std::string& method, const iora::parsers::Json& params, 
+                                    const iora::parsers::Json& result, RpcContext& ctx)
     {
       postHookCalls++;
     };
@@ -172,7 +175,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   SECTION("Empty request body")
   {
     std::string response = server.handleRequest("", ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp["jsonrpc"] == "2.0");
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
@@ -181,7 +184,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   SECTION("Invalid JSON")
   {
     std::string response = server.handleRequest("{invalid json", ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp["jsonrpc"] == "2.0");
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::ParseError));
@@ -191,7 +194,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   {
     std::string request = R"({"method":"echo","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -200,7 +203,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   {
     std::string request = R"({"jsonrpc":"1.0","method":"echo","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -209,7 +212,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   {
     std::string request = R"({"jsonrpc":"2.0","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -218,7 +221,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   {
     std::string request = R"({"jsonrpc":"2.0","method":"","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -227,7 +230,7 @@ TEST_CASE("JsonRpcServer request validation", "[jsonrpc][validation]")
   {
     std::string request = R"({"jsonrpc":"2.0","method":123,"params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -247,7 +250,7 @@ TEST_CASE("JsonRpcServer single request handling", "[jsonrpc][single]")
     std::string response = server.handleRequest(request, ctx);
     
     REQUIRE_FALSE(response.empty());
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp["jsonrpc"] == "2.0");
     REQUIRE(resp["id"] == 1);
     REQUIRE(resp.contains("result"));
@@ -266,7 +269,7 @@ TEST_CASE("JsonRpcServer single request handling", "[jsonrpc][single]")
     std::string request = R"({"jsonrpc":"2.0","method":"nonexistent","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::MethodNotFound));
     REQUIRE(resp["id"] == 1);
@@ -291,12 +294,12 @@ TEST_CASE("JsonRpcServer batch request handling", "[jsonrpc][batch]")
     std::string response = server.handleRequest(request, ctx);
     
     REQUIRE_FALSE(response.empty());
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.is_array());
     REQUIRE(resp.size() == 2);
     
-    REQUIRE(resp[0]["id"] == 1);
-    REQUIRE(resp[0]["result"]["value"] == 1);
+    REQUIRE(resp[static_cast<std::size_t>(0)]["id"] == 1);
+    REQUIRE(resp[static_cast<std::size_t>(0)]["result"]["value"] == 1);
     REQUIRE(resp[1]["id"] == 2);
     REQUIRE(resp[1]["result"]["value"] == 2);
   }
@@ -306,7 +309,7 @@ TEST_CASE("JsonRpcServer batch request handling", "[jsonrpc][batch]")
     std::string request = R"([])";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -322,7 +325,7 @@ TEST_CASE("JsonRpcServer batch request handling", "[jsonrpc][batch]")
     request += "]";
     
     std::string response = server.handleRequest(request, ctx);
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidRequest));
   }
@@ -335,12 +338,12 @@ TEST_CASE("JsonRpcServer batch request handling", "[jsonrpc][batch]")
     ])";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.is_array());
     REQUIRE(resp.size() == 2);
     
-    REQUIRE(resp[0]["id"] == 1);
-    REQUIRE(resp[0].contains("result"));
+    REQUIRE(resp[static_cast<std::size_t>(0)]["id"] == 1);
+    REQUIRE(resp[static_cast<std::size_t>(0)].contains("result"));
     REQUIRE(resp[1]["id"] == 2);
     REQUIRE(resp[1].contains("error"));
     REQUIRE(resp[1]["error"]["code"] == static_cast<int>(ErrorCode::InvalidParams));
@@ -371,7 +374,7 @@ TEST_CASE("JsonRpcServer error handling", "[jsonrpc][errors]")
     std::string request = R"({"jsonrpc":"2.0","method":"invalid_params","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InvalidParams));
     REQUIRE(resp["id"] == 1);
@@ -382,7 +385,7 @@ TEST_CASE("JsonRpcServer error handling", "[jsonrpc][errors]")
     std::string request = R"({"jsonrpc":"2.0","method":"internal_error","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("error"));
     REQUIRE(resp["error"]["code"] == static_cast<int>(ErrorCode::InternalError));
     REQUIRE(resp["id"] == 1);
@@ -451,9 +454,9 @@ TEST_CASE("JsonRpcServer context functionality", "[jsonrpc][context]")
   JsonRpcServer server;
   
   // Handler that uses context information
-  server.registerMethod("context_test", [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+  server.registerMethod("context_test", [](const iora::parsers::Json& params, RpcContext& ctx) -> iora::parsers::Json
   {
-    iora::core::Json result;
+    iora::parsers::Json result;
     result["hasAuth"] = ctx.authSubject().has_value();
     if (ctx.authSubject().has_value())
     {
@@ -475,7 +478,7 @@ TEST_CASE("JsonRpcServer context functionality", "[jsonrpc][context]")
     std::string request = R"({"jsonrpc":"2.0","method":"context_test","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("result"));
     REQUIRE(resp["result"]["hasAuth"] == false);
     REQUIRE(resp["result"]["method"] == "context_test");
@@ -490,7 +493,7 @@ TEST_CASE("JsonRpcServer context functionality", "[jsonrpc][context]")
     std::string request = R"({"jsonrpc":"2.0","method":"context_test","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp.contains("result"));
     REQUIRE(resp["result"]["hasAuth"] == true);
     REQUIRE(resp["result"]["authSubject"] == "test_user");
@@ -503,11 +506,13 @@ TEST_CASE("JsonRpcServer concurrency", "[jsonrpc][concurrency]")
   
   // Thread-safe counter for testing
   std::atomic<int> counter{0};
-  server.registerMethod("increment", [&counter](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+  server.registerMethod("increment", [&counter](const iora::parsers::Json& params, RpcContext& ctx) -> iora::parsers::Json
   {
     int value = ++counter;
     std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Simulate some work
-    return iora::core::Json{{"value", value}};
+    auto result = iora::parsers::Json::object();
+    result["value"] = value;
+    return result;
   });
   
   auto& service = createTestService();
@@ -534,7 +539,7 @@ TEST_CASE("JsonRpcServer concurrency", "[jsonrpc][concurrency]")
           {
             try
             {
-              iora::core::Json resp = iora::core::Json::parse(response);
+              iora::parsers::Json resp = iora::parsers::Json::parseString(response);
               if (resp.contains("result") && resp["result"].contains("value"))
               {
                 results[t * requestsPerThread + r] = true;
@@ -570,9 +575,11 @@ TEST_CASE("JsonRpcServer method replacement", "[jsonrpc][replacement]")
   JsonRpcServer server;
   
   // Original handler
-  server.registerMethod("test", [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+  server.registerMethod("test", [](const iora::parsers::Json& params, RpcContext& ctx) -> iora::parsers::Json
   {
-    return iora::core::Json{{"version", 1}};
+    auto result = iora::parsers::Json::object();
+    result["version"] = 1;
+    return result;
   });
   
   auto& service = createTestService();
@@ -584,18 +591,20 @@ TEST_CASE("JsonRpcServer method replacement", "[jsonrpc][replacement]")
     std::string request = R"({"jsonrpc":"2.0","method":"test","params":{},"id":1})";
     std::string response = server.handleRequest(request, ctx);
     
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp["result"]["version"] == 1);
     
     // Replace with new handler
-    server.registerMethod("test", [](const iora::core::Json& params, RpcContext& ctx) -> iora::core::Json
+    server.registerMethod("test", [](const iora::parsers::Json& params, RpcContext& ctx) -> iora::parsers::Json
     {
-      return iora::core::Json{{"version", 2}};
+      auto result = iora::parsers::Json::object();
+      result["version"] = 2;
+      return result;
     });
     
     // Test new handler
     response = server.handleRequest(request, ctx);
-    resp = iora::core::Json::parse(response);
+    resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp["result"]["version"] == 2);
   }
 }
@@ -614,7 +623,7 @@ TEST_CASE("JsonRpcServer edge cases", "[jsonrpc][edge]")
     std::string response = server.handleRequest(request, ctx);
     
     REQUIRE_FALSE(response.empty());
-    iora::core::Json resp = iora::core::Json::parse(response);
+    iora::parsers::Json resp = iora::parsers::Json::parseString(response);
     REQUIRE(resp["id"].is_null());
   }
   
@@ -623,13 +632,13 @@ TEST_CASE("JsonRpcServer edge cases", "[jsonrpc][edge]")
     // String id
     std::string request1 = R"({"jsonrpc":"2.0","method":"echo","params":{},"id":"test"})";
     std::string response1 = server.handleRequest(request1, ctx);
-    iora::core::Json resp1 = iora::core::Json::parse(response1);
+    iora::parsers::Json resp1 = iora::parsers::Json::parseString(response1);
     REQUIRE(resp1["id"] == "test");
     
     // Number id
     std::string request2 = R"({"jsonrpc":"2.0","method":"echo","params":{},"id":42})";
     std::string response2 = server.handleRequest(request2, ctx);
-    iora::core::Json resp2 = iora::core::Json::parse(response2);
+    iora::parsers::Json resp2 = iora::parsers::Json::parseString(response2);
     REQUIRE(resp2["id"] == 42);
   }
   
@@ -638,20 +647,20 @@ TEST_CASE("JsonRpcServer edge cases", "[jsonrpc][edge]")
     // Array params
     std::string request1 = R"({"jsonrpc":"2.0","method":"echo","params":[1,2,3],"id":1})";
     std::string response1 = server.handleRequest(request1, ctx);
-    iora::core::Json resp1 = iora::core::Json::parse(response1);
+    iora::parsers::Json resp1 = iora::parsers::Json::parseString(response1);
     REQUIRE(resp1["result"].is_array());
-    REQUIRE(resp1["result"][0] == 1);
+    REQUIRE(resp1["result"][static_cast<std::size_t>(0)] == 1);
     
     // Object params
     std::string request2 = R"({"jsonrpc":"2.0","method":"echo","params":{"key":"value"},"id":2})";
     std::string response2 = server.handleRequest(request2, ctx);
-    iora::core::Json resp2 = iora::core::Json::parse(response2);
+    iora::parsers::Json resp2 = iora::parsers::Json::parseString(response2);
     REQUIRE(resp2["result"]["key"] == "value");
     
     // No params
     std::string request3 = R"({"jsonrpc":"2.0","method":"echo","id":3})";
     std::string response3 = server.handleRequest(request3, ctx);
-    iora::core::Json resp3 = iora::core::Json::parse(response3);
+    iora::parsers::Json resp3 = iora::parsers::Json::parseString(response3);
     REQUIRE(resp3["result"].is_object());
     REQUIRE(resp3["result"].empty());
   }
@@ -685,12 +694,14 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
   SECTION("Plugin API: register and call methods")
   {
     // Register a test method via plugin API
-    auto handler = [](const iora::core::Json& params) -> iora::core::Json
+    auto handler = [](const iora::parsers::Json& params) -> iora::parsers::Json
     {
-      return iora::core::Json{{"echo", params}};
+      auto result = iora::parsers::Json::object();
+      result["echo"] = params;
+      return result;
     };
     
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "plugin_test", handler);
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "plugin_test", handler);
     
     // Check if method was registered
     auto hasMethod = svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "plugin_test");
@@ -704,11 +715,11 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
   SECTION("Plugin API: unregister methods")
   {
     // Register method
-    auto handler = [](const iora::core::Json& params) -> iora::core::Json
+    auto handler = [](const iora::parsers::Json& params) -> iora::parsers::Json
     {
       return params;
     };
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "temp_method", handler);
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "temp_method", handler);
     REQUIRE(svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "temp_method"));
     
     // Unregister method
@@ -719,16 +730,18 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
 
   SECTION("Plugin API: method registration with options")
   {
-    auto handler = [](const iora::core::Json& params) -> iora::core::Json
+    auto handler = [](const iora::parsers::Json& params) -> iora::parsers::Json
     {
-      return iora::core::Json{{"auth_required", true}};
+      auto result = iora::parsers::Json::object();
+      result["auth_required"] = true;
+      return result;
     };
     
-    iora::core::Json opts;
+    iora::parsers::Json opts;
     opts["requireAuth"] = true;
     opts["maxRequestSize"] = 1024;
     
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&>(
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>, const iora::parsers::Json&>(
       "jsonrpc.registerWithOptions", "auth_method", handler, opts);
     
     REQUIRE(svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "auth_method"));
@@ -740,15 +753,15 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
     svc.callExportedApi<void>("jsonrpc.resetStats");
     
     // Get initial stats  
-    auto statsJson = svc.callExportedApi<iora::core::Json>("jsonrpc.getStats");
+    auto statsJson = svc.callExportedApi<iora::parsers::Json>("jsonrpc.getStats");
     REQUIRE(statsJson["totalRequests"].get<std::uint64_t>() == 0);
     
     // Register and simulate some activity (this would normally be done via HTTP requests)
-    auto handler = [](const iora::core::Json& params) -> iora::core::Json
+    auto handler = [](const iora::parsers::Json& params) -> iora::parsers::Json
     {
       return params;
     };
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "stats_test", handler);
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "stats_test", handler);
     
     // Note: HTTP request testing would require starting the webhook server,
     // which is beyond the scope of unit tests. The stats functionality

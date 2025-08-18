@@ -4,17 +4,17 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
-#define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
-
 #include <iora/iora.hpp>
+#include <iostream>
+#include <csignal>
 
 int main(int argc, char** argv)
 {
   try 
   {
     // Initialize the IoraService with command-line arguments
-    iora::IoraService& svc = iora::IoraService::init(argc, argv);
-
+    auto& svc = iora::IoraService::init(argc, argv);
+    
     std::signal(SIGINT, 
       [](int) 
       {
@@ -22,6 +22,7 @@ int main(int argc, char** argv)
       }
     );
     
+    // Wait for termination
     svc.waitForTermination();
   }
   catch (const std::exception& ex)

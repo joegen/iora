@@ -5,7 +5,7 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #include "kvstore.hpp"
-#include <catch2/catch_test_macros.hpp>
+#include <catch2/catch.hpp>
 #include <random>
 #include <string>
 #include <vector>
@@ -673,7 +673,10 @@ TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvs
                         "--state-file", "ioraservice_kvstore_state.json",
                         "--log-file", "ioraservice_kvstore_log"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = iora::IoraService::init(argc, const_cast<char**>(args));
+  
+  // Initialize service with CLI args
+  iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = iora::IoraService::instance();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 
   auto pluginPathOpt = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_kvstore.so";

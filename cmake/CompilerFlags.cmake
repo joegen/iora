@@ -43,20 +43,15 @@ function(set_iora_compiler_flags target_name)
     endif()
 endfunction()
 
-# Function to configure OpenSSL support for a target
+# Function to configure additional OpenSSL support for WebhookServer (cpp-httplib)
 function(configure_openssl_support target_name)
-    find_package(OpenSSL REQUIRED)
-    
-    target_link_libraries(${target_name} PRIVATE 
-        OpenSSL::SSL 
-        OpenSSL::Crypto
-    )
-    
+    # OpenSSL is now linked by default for all targets
+    # This function now only adds cpp-httplib specific definitions
     target_compile_definitions(${target_name} PRIVATE 
         CPPHTTPLIB_OPENSSL_SUPPORT
     )
     
-    message(STATUS "Configured OpenSSL support for ${target_name}")
+    message(STATUS "Configured WebhookServer OpenSSL support for ${target_name}")
 endfunction()
 
 # Function to configure threading support

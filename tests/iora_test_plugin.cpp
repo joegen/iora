@@ -1,9 +1,13 @@
-#include "iora/iora.hpp"
-#include "catch2/catch_test_macros.hpp"
-#include <fstream>
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch.hpp>
+#include "test_helpers.hpp"
+
+using namespace iora::test;
 
 TEST_CASE("Dynamic loading of testplugin shared library")
 {
+  initializeTestLogging();
+
   const char* args[] = {"program",
                         "--port",
                         "8130",
@@ -12,11 +16,11 @@ TEST_CASE("Dynamic loading of testplugin shared library")
                         "--log-file",
                         "ioraservice_plugin_log"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
-  auto pluginPathOpt = iora::util::getExecutableDir() + "/plugins/testplugin.so";
+  auto pluginPathOpt =
+      iora::util::getExecutableDir() + "/plugins/testplugin.so";
   std::cout << "Plugin path: " << pluginPathOpt << std::endl;
   REQUIRE(std::filesystem::exists(pluginPathOpt));
   REQUIRE(svc.loadSingleModule(pluginPathOpt));

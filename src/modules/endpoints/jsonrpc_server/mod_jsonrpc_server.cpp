@@ -7,7 +7,6 @@
 #include "jsonrpc_server.hpp"
 
 #include <cstdint>
-#include <httplib.h>
 #include <chrono>
 #include <thread>
 
@@ -21,12 +20,12 @@ namespace iora
 /// Exposes POST {path} on the service webhookServer and exports the following API
 /// callables via IoraService::exportApi:
 ///   - "jsonrpc.version"       -> std::uint32_t()
-///   - "jsonrpc.register"      -> void(const std::string&, std::function<iora::core::Json(const iora::core::Json&)>)
-///   - "jsonrpc.registerWithOptions" -> void(const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&)
+///   - "jsonrpc.register"      -> void(const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>)
+///   - "jsonrpc.registerWithOptions" -> void(const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>, const iora::parsers::Json&)
 ///   - "jsonrpc.unregister"    -> bool(const std::string&)
 ///   - "jsonrpc.has"           -> bool(const std::string&)
 ///   - "jsonrpc.getMethods"    -> std::vector<std::string>()
-///   - "jsonrpc.getStats"      -> iora::core::Json()
+///   - "jsonrpc.getStats"      -> iora::parsers::Json()
 ///   - "jsonrpc.resetStats"    -> void()
 class JsonRpcServerPlugin : public IoraService::Plugin
 {
@@ -91,17 +90,17 @@ public:
       });
 
     service->exportApi(*this, "jsonrpc.register",
-      [this](const std::string& method, std::function<iora::core::Json(const iora::core::Json&)> handler) -> void
+      [this](const std::string& method, std::function<iora::parsers::Json(const iora::parsers::Json&)> handler) -> void
       {
         _router.registerMethod(method, 
-          [handler](const iora::core::Json& params, modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+          [handler](const iora::parsers::Json& params, modules::jsonrpc::RpcContext& ctx) -> iora::parsers::Json
           {
             return handler(params);
           });
       });
       
     service->exportApi(*this, "jsonrpc.registerWithOptions",
-      [this](const std::string& method, std::function<iora::core::Json(const iora::core::Json&)> handler, const iora::core::Json& optionsJson) -> void
+      [this](const std::string& method, std::function<iora::parsers::Json(const iora::parsers::Json&)> handler, const iora::parsers::Json& optionsJson) -> void
       {
         modules::jsonrpc::MethodOptions options;
         if (optionsJson.contains("requireAuth") && optionsJson["requireAuth"].is_boolean())
@@ -112,7 +111,7 @@ public:
           options.maxRequestSize = optionsJson["maxRequestSize"].get<std::size_t>();
         
         _router.registerMethod(method, 
-          [handler](const iora::core::Json& params, modules::jsonrpc::RpcContext& ctx) -> iora::core::Json
+          [handler](const iora::parsers::Json& params, modules::jsonrpc::RpcContext& ctx) -> iora::parsers::Json
           {
             return handler(params);
           }, options);
@@ -137,17 +136,17 @@ public:
       });
       
     service->exportApi(*this, "jsonrpc.getStats",
-      [this]() -> iora::core::Json
+      [this]() -> iora::parsers::Json
       {
         const auto& stats = _router.getStats();
-        return iora::core::Json{
-          {"totalRequests", stats.totalRequests.load()},
-          {"successfulRequests", stats.successfulRequests.load()},
-          {"failedRequests", stats.failedRequests.load()},
-          {"timeoutRequests", stats.timeoutRequests.load()},
-          {"batchRequests", stats.batchRequests.load()},
-          {"notificationRequests", stats.notificationRequests.load()}
-        };
+        auto statsJson = iora::parsers::Json::object();
+        statsJson["totalRequests"] = stats.totalRequests.load();
+        statsJson["successfulRequests"] = stats.successfulRequests.load();
+        statsJson["failedRequests"] = stats.failedRequests.load();
+        statsJson["timeoutRequests"] = stats.timeoutRequests.load();
+        statsJson["batchRequests"] = stats.batchRequests.load();
+        statsJson["notificationRequests"] = stats.notificationRequests.load();
+        return statsJson;
       });
       
     service->exportApi(*this, "jsonrpc.resetStats",
@@ -159,7 +158,7 @@ public:
 
     // Mount POST {path} directly on the webhookServer.
     service->webhookServer()->onPost(_path,
-      [this](const httplib::Request& req, httplib::Response& res)
+      [this](const iora::network::WebhookServer::Request& req, iora::network::WebhookServer::Response& res)
       {
         this->handlePost(req, res);
       });
@@ -167,13 +166,14 @@ public:
 
 
 private:
-  void handlePost(const httplib::Request& req, httplib::Response& res)
+  void handlePost(const iora::network::WebhookServer::Request& req, iora::network::WebhookServer::Response& res)
   {
+    
     auto startTime = std::chrono::steady_clock::now();
     
     if (_logRequests)
     {
-      iora::core::Logger::debug("JSON-RPC request from " + req.remote_addr + ": " + std::to_string(req.body.size()) + " bytes");
+      iora::core::Logger::debug("JSON-RPC request: " + std::to_string(req.body.size()) + " bytes");
     }
     
     // Set CORS headers if needed
@@ -182,7 +182,7 @@ private:
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
     
     // Handle preflight OPTIONS request
-    if (req.method == "OPTIONS")
+    if (req.method == iora::network::HttpMethod::OPTIONS)
     {
       res.status = 200;
       return;
@@ -257,7 +257,7 @@ private:
     modules::jsonrpc::RpcContext ctx{IoraService::instance(), subject};
     
     // Set client metadata
-    ctx.metadata().clientId = req.remote_addr;
+    ctx.metadata().clientId = "unknown"; // TODO: Add remote address to WebhookServer::Request
 
     try
     {

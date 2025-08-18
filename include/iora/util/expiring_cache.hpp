@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 
@@ -11,12 +12,15 @@
 #include <thread>
 #include <unordered_map>
 #include <optional>
+#include "iora/core/logger.hpp"
 
-namespace iora {
-namespace util {
+namespace iora
+{
+namespace util
+{
   // Forward declaration for friend accessor
   template <typename K, typename V> struct ExpiringCacheTestAccessor;
-  
+
   /// \brief Thread-safe expiring cache with time-to-live (TTL) and automatic
   /// purging of stale entries.
   template <typename K, typename V> class ExpiringCache
@@ -24,16 +28,21 @@ namespace util {
   public:
     ExpiringCache() : _ttl(std::chrono::seconds(60)), _stop(false)
     {
+      iora::core::Logger::info(
+          "ExpiringCache: Initializing with default TTL of 60 seconds");
       startPurgeThread();
     }
 
     explicit ExpiringCache(std::chrono::seconds ttl) : _ttl(ttl), _stop(false)
     {
+      iora::core::Logger::info("ExpiringCache: Initializing with TTL of " +
+                               std::to_string(ttl.count()) + " seconds");
       startPurgeThread();
     }
 
     ~ExpiringCache()
     {
+      iora::core::Logger::debug("ExpiringCache: Starting shutdown process");
       {
         std::lock_guard<std::mutex> lock(_mutex);
         _stop = true;
@@ -42,6 +51,7 @@ namespace util {
       {
         _purgeThread.join();
       }
+      iora::core::Logger::debug("ExpiringCache: Shutdown completed");
     }
 
     /// \brief Sets a key-value pair in the cache.
@@ -51,7 +61,12 @@ namespace util {
       auto expiration = std::chrono::steady_clock::now() +
                         (customTtl.count() > 0 ? customTtl : _ttl);
       std::lock_guard<std::mutex> lock(_mutex);
+      bool isUpdate = _cache.find(key) != _cache.end();
       _cache[key] = {value, expiration};
+      iora::core::Logger::debug(
+          std::string("ExpiringCache: ") + (isUpdate ? "Updated" : "Added") +
+          " cache entry (total entries: " + std::to_string(_cache.size()) +
+          ")");
     }
 
     /// \brief Gets a value by key from the cache.
@@ -59,10 +74,23 @@ namespace util {
     {
       std::lock_guard<std::mutex> lock(_mutex);
       auto it = _cache.find(key);
-      if (it != _cache.end() &&
-          it->second.expiration > std::chrono::steady_clock::now())
+      if (it != _cache.end())
       {
-        return it->second.value;
+        if (it->second.expiration > std::chrono::steady_clock::now())
+        {
+          iora::core::Logger::debug("ExpiringCache: Cache hit for key");
+          return it->second.value;
+        }
+        else
+        {
+          iora::core::Logger::debug(
+              "ExpiringCache: Cache miss - entry expired for key");
+          _cache.erase(it); // Remove expired entry
+        }
+      }
+      else
+      {
+        iora::core::Logger::debug("ExpiringCache: Cache miss - key not found");
       }
       return std::nullopt;
     }
@@ -71,7 +99,19 @@ namespace util {
     void remove(const K& key)
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      _cache.erase(key);
+      auto it = _cache.find(key);
+      if (it != _cache.end())
+      {
+        _cache.erase(it);
+        iora::core::Logger::debug(
+            "ExpiringCache: Removed cache entry (remaining entries: " +
+            std::to_string(_cache.size()) + ")");
+      }
+      else
+      {
+        iora::core::Logger::debug(
+            "ExpiringCache: Attempted to remove non-existent key");
+      }
     }
 
     // Friend accessor for unit testing
@@ -92,28 +132,43 @@ namespace util {
 
     void startPurgeThread()
     {
+      iora::core::Logger::debug(
+          "ExpiringCache: Starting background purge thread");
       _purgeThread = std::thread(
           [this]()
           {
+            iora::core::Logger::debug("ExpiringCache: Purge thread running");
             while (true)
             {
+              std::size_t purgedCount = 0;
               {
                 std::lock_guard<std::mutex> lock(_mutex);
                 if (_stop)
                 {
+                  iora::core::Logger::debug(
+                      "ExpiringCache: Purge thread stopping");
                   break;
                 }
                 auto now = std::chrono::steady_clock::now();
+                std::size_t beforeSize = _cache.size();
                 for (auto it = _cache.begin(); it != _cache.end();)
                 {
                   if (it->second.expiration <= now)
                   {
                     it = _cache.erase(it);
+                    purgedCount++;
                   }
                   else
                   {
                     ++it;
                   }
+                }
+                if (purgedCount > 0)
+                {
+                  iora::core::Logger::debug(
+                      "ExpiringCache: Purged " + std::to_string(purgedCount) +
+                      " expired entries (" + std::to_string(beforeSize) +
+                      " -> " + std::to_string(_cache.size()) + ")");
                 }
               }
               std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -131,4 +186,5 @@ namespace util {
       return cache._cache.size();
     }
   };
-} } // namespace iora::util
+} // namespace util
+} // namespace iora

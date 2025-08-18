@@ -1,0 +1,27 @@
+# Sample Iora configuration demonstrating proper plugin usage
+# This shows the correct way to use Iora - as a plugin host rather than
+# having applications initialize IoraService directly.
+
+[server]
+port = 8080
+host = "0.0.0.0"
+
+[logging]
+level = "info"
+file = "microservice.log"
+async_logging = true
+max_size_mb = 10
+max_files = 5
+
+[state]
+file = "microservice_state.json"
+
+[plugins]
+# Load the microservice plugin instead of using a standalone application
+directory = "./build/sample/plugins"
+modules = ["microservice_plugin"]
+
+[app]
+# Application-specific configuration can go here
+name = "Iora Microservice Example"
+version = "1.0.0"

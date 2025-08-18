@@ -18,6 +18,10 @@ public:
   explicit KVStorePlugin(iora::IoraService* service)
     : Plugin(service)
   {
+  }
+
+  void onLoad(iora::IoraService* service) override
+  {
     auto* loader = service->configLoader().get();
     if (!loader)
     {
@@ -35,10 +39,7 @@ public:
     if (auto v = loader->getInt("iora.modules.kvstore.compaction_interval_ms"))
       config.compactionInterval = std::chrono::milliseconds(*v);
     _store = std::make_unique<KVStore>(path, config);
-  }
-
-  void onLoad(iora::IoraService* service) override
-  {
+    
     // Export API: get, set, setBatch, getBatch
     service->exportApi(*this, "kvstore.get", [this](const std::string& key) -> std::optional<std::vector<std::uint8_t>> {
       return _store->get(key);

@@ -39,9 +39,10 @@ add_subdirectory(src)
 # Add a custom target for `make check` to run all tests
 add_custom_target(check 
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS iora_test
-    COMMENT "Running all tests with CTest"
+    COMMENT "Running all individual tests with CTest"
 )
+
+
 
 # Installation configuration
 include(GNUInstallDirs)

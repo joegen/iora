@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 #include <string>
@@ -10,8 +11,10 @@
 #include <filesystem>
 #include <unistd.h> // for readlink
 
-namespace iora {
-namespace util {
+namespace iora
+{
+namespace util
+{
 
   /// \brief Get the path to the currently running executable
   /// \return Full path to the executable as a string
@@ -39,10 +42,13 @@ namespace util {
   }
 
   /// \brief Resolve a relative path against an absolute base path
-  std::string resolveRelativePath(const std::string& base_absolute_path, const std::string& relative_path)
+  std::string resolveRelativePath(const std::string& base_absolute_path,
+                                  const std::string& relative_path)
   {
     // Use std::filesystem to join and normalize the path
-    return std::filesystem::weakly_canonical(std::filesystem::path(base_absolute_path) / relative_path).string();
+    return std::filesystem::weakly_canonical(
+               std::filesystem::path(base_absolute_path) / relative_path)
+        .string();
   }
 
   /// \brief Remove all files in the current directory that match the given

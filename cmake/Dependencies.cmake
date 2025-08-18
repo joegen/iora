@@ -69,15 +69,16 @@ endfunction()
 
 # Configure all dependencies
 function(configure_iora_dependencies)
-    # nlohmann_json
-    find_or_fetch_dependency(
-        NAME nlohmann_json
-        PACKAGE_NAME nlohmann_json
-        TARGET_NAME nlohmann_json::nlohmann_json
-        GIT_REPOSITORY https://github.com/nlohmann/json.git
-        GIT_TAG v3.11.2
-        INCLUDE_DIR NLOHMANN_JSON_INCLUDE_DIR
-    )
+    # nlohmann_json - No longer needed, using built-in json2.hpp
+    # Commented out but kept for reference
+    # find_or_fetch_dependency(
+    #     NAME nlohmann_json
+    #     PACKAGE_NAME nlohmann_json
+    #     TARGET_NAME nlohmann_json::nlohmann_json
+    #     GIT_REPOSITORY https://github.com/nlohmann/json.git
+    #     GIT_TAG v3.11.2
+    #     INCLUDE_DIR NLOHMANN_JSON_INCLUDE_DIR
+    # )
     
     # Catch2 (for testing)
     find_or_fetch_dependency(
@@ -88,84 +89,39 @@ function(configure_iora_dependencies)
         GIT_TAG v3.4.0
         INCLUDE_DIR CATCH2_INCLUDE_DIR
     )
-    
-    # cpp-httplib
-    find_or_fetch_dependency(
-        NAME cpp_httplib
-        PACKAGE_NAME httplib
-        TARGET_NAME httplib::httplib
-        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-        GIT_TAG v0.10.8
-        INCLUDE_DIR CPP_HTTPLIB_INCLUDE_DIR
-    )
-    
-    # cpr - Note: This takes longer to build due to curl dependency (~2-3 minutes)
-    message(STATUS "Configuring cpr (HTTP client library)...")
-    find_or_fetch_dependency(
-        NAME cpr
-        PACKAGE_NAME cpr
-        TARGET_NAME cpr::cpr
-        GIT_REPOSITORY https://github.com/libcpr/cpr.git
-        GIT_TAG 1.10.0
-        INCLUDE_DIR CPR_INCLUDE_DIR
-    )
-    
-    # tomlplusplus
-    find_or_fetch_dependency(
-        NAME tomlplusplus
-        PACKAGE_NAME tomlplusplus
-        TARGET_NAME tomlplusplus::tomlplusplus
-        GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-        GIT_TAG v3.3.0
-        INCLUDE_DIR TOMLPLUSPLUS_INCLUDE_DIR
-    )
-    
-    # cpp-subprocess
-    find_or_fetch_dependency(
-        NAME subprocess
-        PACKAGE_NAME subprocess
-        TARGET_NAME subprocess::subprocess
-        GIT_REPOSITORY https://github.com/arun11299/cpp-subprocess.git
-        GIT_TAG master
-        INCLUDE_DIR SUBPROCESS_INCLUDE_DIR
-    )
-    
-    # Set backwards compatibility include directories for FetchContent builds
-    if(NOT nlohmann_json_FOUND)
-        set(NLOHMANN_JSON_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/nlohmann_json-src/include" PARENT_SCOPE)
+       
+    # OpenSSL - Required for HTTPS support in homegrown HTTP client
+    find_package(OpenSSL REQUIRED)
+    if(OpenSSL_FOUND)
+        message(STATUS "Found OpenSSL: ${OPENSSL_VERSION}")
+    else()
+        message(FATAL_ERROR "OpenSSL is required but not found")
     endif()
+    
+    # tomlplusplus - No longer needed, using minimal built-in parser
+    # Commented out but kept for reference
+    # find_or_fetch_dependency(
+    #     NAME tomlplusplus
+    #     PACKAGE_NAME tomlplusplus
+    #     TARGET_NAME tomlplusplus::tomlplusplus
+    #     GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    #     GIT_TAG v3.3.0
+    #     INCLUDE_DIR TOMLPLUSPLUS_INCLUDE_DIR
+    # )
+
+    # nlohmann_json include dir no longer needed
+    # if(NOT nlohmann_json_FOUND)
+    #     set(NLOHMANN_JSON_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/nlohmann_json-src/include" PARENT_SCOPE)
+    # endif()
     
     if(NOT Catch2_FOUND)
         set(CATCH2_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/catch2-src/include" PARENT_SCOPE)
     endif()
+       
     
-    if(NOT httplib_FOUND)
-        set(CPP_HTTPLIB_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cpp_httplib-src" PARENT_SCOPE)
-    endif()
-    
-    if(NOT cpr_FOUND)
-        set(CPR_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/cpr-src/include" PARENT_SCOPE)
-    endif()
-    
-    if(NOT tomlplusplus_FOUND)
-        set(TOMLPLUSPLUS_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/tomlplusplus-src/include" PARENT_SCOPE)
-    endif()
-    
-    if(NOT subprocess_FOUND)
-        set(SUBPROCESS_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/subprocess-src/cpp-subprocess" PARENT_SCOPE)
-    endif()
-    
-    # Optional tiktoken dependency
-    find_path(TIKTOKEN_INCLUDE_DIR tiktoken/encodings.h)
-    find_library(TIKTOKEN_LIBRARY NAMES tiktoken)
-    
-    if(TIKTOKEN_INCLUDE_DIR AND TIKTOKEN_LIBRARY)
-        message(STATUS "Found tiktoken: ${TIKTOKEN_INCLUDE_DIR}, ${TIKTOKEN_LIBRARY}")
-        set(TIKTOKEN_FOUND TRUE PARENT_SCOPE)
-        set(TIKTOKEN_INCLUDE_DIR ${TIKTOKEN_INCLUDE_DIR} PARENT_SCOPE)
-        set(TIKTOKEN_LIBRARY ${TIKTOKEN_LIBRARY} PARENT_SCOPE)
-    else()
-        message(STATUS "tiktoken not found: Tokenizer will use fallback mode.")
-        set(TIKTOKEN_FOUND FALSE PARENT_SCOPE)
-    endif()
+    # tomlplusplus include dir no longer needed
+    # if(NOT tomlplusplus_FOUND)
+    #     set(TOMLPLUSPLUS_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/tomlplusplus-src/include" PARENT_SCOPE)
+    # endif()
+
 endfunction()

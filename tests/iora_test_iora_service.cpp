@@ -1,6 +1,14 @@
-#include "iora/iora.hpp"
-#include "catch2/catch_test_macros.hpp"
-#include <fstream>
+// Copyright (c) 2025 Joegen Baclor
+// SPDX-License-Identifier: MPL-2.0
+//
+// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
+// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch.hpp>
+#include "test_helpers.hpp"
+
+using namespace iora::test;
 
 TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 {
@@ -14,8 +22,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
                         "--log-level",
                         "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
   svc.stateStore()->set("foo", "bar");
@@ -53,16 +60,21 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
     REQUIRE(&c1 != &c2);
   }
 
-  svc.webhookServer()->onJsonGet("/basic",
-                                 [](const iora::core::Json&) -> iora::core::Json
-                                 {
-                                   return {{"ok", true}};
-                                 });
+  svc.webhookServer()->onJsonGet(
+      "/basic",
+      [](const iora::parsers::Json&) -> iora::parsers::Json
+      {
+        auto obj = iora::parsers::Json::object();
+        obj["ok"] = true;
+        return obj;
+      });
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   {
     auto client = svc.makeHttpClient();
     auto res = client.get("http://localhost:8110/basic");
-    REQUIRE(res["ok"] == true);
+    REQUIRE(res.success());
+    auto json = iora::network::HttpClient::parseJsonOrThrow(res);
+    REQUIRE(json["ok"] == true);
   }
 
   iora::util::removeFilesContainingAny(
@@ -83,25 +95,30 @@ TEST_CASE("IoraService configuration file override",
 
   const char* args[] = {"program", "--config", cfg.c_str()};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  svc.webhookServer()->onJsonGet("/cfg",
-                                 [](const iora::core::Json&) -> iora::core::Json
-                                 {
-                                   return {{"cfg", true}};
-                                 });
+  svc.webhookServer()->onJsonGet(
+      "/cfg",
+      [](const iora::parsers::Json&) -> iora::parsers::Json
+      {
+        auto obj = iora::parsers::Json::object();
+        obj["cfg"] = true;
+        return obj;
+      });
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     auto client = svc.makeHttpClient();
     auto res = client.get("http://localhost:8111/cfg");
-    REQUIRE(res["cfg"] == true);
+    REQUIRE(res.success());
+    auto json = iora::network::HttpClient::parseJsonOrThrow(res);
+    REQUIRE(json["cfg"] == true);
   }
 
   svc.jsonFileStore()->set("cfgKey", "cfgValue");
-  //REQUIRE(std::filesystem::exists("ioraservice_cfg_state.json")); // this is not guaranteed. The file is created by a background thread.
+  // REQUIRE(std::filesystem::exists("ioraservice_cfg_state.json")); // this is
+  // not guaranteed. The file is created by a background thread.
 
   LOG_DEBUG("Configuration override test message");
   iora::core::Logger::shutdown();
@@ -135,26 +152,34 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
                         "--log-level",
                         "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  svc.webhookServer()->onJsonGet("/cli",
-                                 [](const iora::core::Json&) -> iora::core::Json
-                                 {
-                                   return {{"cli", true}};
-                                 });
+  svc.webhookServer()->onJsonGet(
+      "/cli",
+      [](const iora::parsers::Json&) -> iora::parsers::Json
+      {
+        auto obj = iora::parsers::Json::object();
+        obj["cli"] = true;
+        return obj;
+      });
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     auto client = svc.makeHttpClient();
     auto res = client.get("http://localhost:8123/cli");
-    REQUIRE(res["cli"] == true);
+    REQUIRE(res.success());
+    auto json = iora::network::HttpClient::parseJsonOrThrow(res);
+    REQUIRE(json["cli"] == true);
   }
 
   svc.jsonFileStore()->set("cliKey", "cliValue");
-  std::this_thread::sleep_for(svc.jsonFileStore()->flushInterval() + std::chrono::milliseconds(100));
-  REQUIRE(std::filesystem::exists("ioraservice_cli_override_state.json")); // Not guaranteed since flushing the store is done using a background thread
+  std::this_thread::sleep_for(svc.jsonFileStore()->flushInterval() +
+                              std::chrono::milliseconds(100));
+  REQUIRE(std::filesystem::exists(
+      "ioraservice_cli_override_state.json")); // Not guaranteed since flushing
+                                               // the store is done using a
+                                               // background thread
 
   LOG_ERROR("CLI override log test");
   iora::core::Logger::shutdown();
@@ -162,9 +187,9 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
                         iora::core::Logger::currentDate() + ".log";
   REQUIRE(std::filesystem::exists(logFile));
 
-  iora::util::removeFilesContainingAny({"ioraservice_cli_override_log",
-                            "ioraservice_cli_state.json",
-                            "ioraservice_cli_override_state.json", cfg});
+  iora::util::removeFilesContainingAny(
+      {"ioraservice_cli_override_log", "ioraservice_cli_state.json",
+       "ioraservice_cli_override_state.json", cfg});
 }
 
 TEST_CASE("IoraService concurrent HTTP clients",
@@ -180,16 +205,18 @@ TEST_CASE("IoraService concurrent HTTP clients",
                         "--log-level",
                         "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  svc.webhookServer()->onJsonGet("/ping",
-                                 [](const iora::core::Json&) -> iora::core::Json
-                                 {
-                                   return {{"pong", true}};
-                                 });
+  svc.webhookServer()->onJsonGet(
+      "/ping",
+      [](const iora::parsers::Json&) -> iora::parsers::Json
+      {
+        auto obj = iora::parsers::Json::object();
+        obj["pong"] = true;
+        return obj;
+      });
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   const int threadCount = 5;
@@ -204,9 +231,13 @@ TEST_CASE("IoraService concurrent HTTP clients",
           try
           {
             auto res = client.get("http://localhost:8113/ping");
-            if (res["pong"] == true)
+            if (res.success())
             {
-              successCount.fetch_add(1);
+              auto json = iora::network::HttpClient::parseJsonOrThrow(res);
+              if (json["pong"] == true)
+              {
+                successCount.fetch_add(1);
+              }
             }
           }
           catch (...)
@@ -237,14 +268,13 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
                         "--log-level",
                         "error"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
   std::atomic<int> nameCounter{0};
   svc.onEventName("fluentEvent")
       .handle(
-          [&](const iora::core::Json& event)
+          [&](const iora::parsers::Json& event)
           {
             REQUIRE(event["eventName"] == "fluentEvent");
             nameCounter++;
@@ -253,22 +283,32 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
   std::atomic<int> patternCounter{0};
   svc.onEventNameMatches("^fluent.*")
       .handle(
-          [&](const iora::core::Json& event)
+          [&](const iora::parsers::Json& event)
           {
             REQUIRE(event["eventName"].get<std::string>().find("fluent") == 0);
             patternCounter++;
           });
 
-  svc.pushEvent({{"eventId", "id1"}, {"eventName", "fluentEvent"}});
-  svc.pushEvent({{"eventId", "id2"}, {"eventName", "fluentPattern"}});
-  svc.pushEvent({{"eventId", "id3"}, {"eventName", "otherEvent"}});
+  auto event1 = iora::parsers::Json::object();
+  event1["eventId"] = "id1";
+  event1["eventName"] = "fluentEvent";
+  svc.pushEvent(event1);
+  auto event2 = iora::parsers::Json::object();
+  event2["eventId"] = "id2";
+  event2["eventName"] = "fluentPattern";
+  svc.pushEvent(event2);
+  auto event3 = iora::parsers::Json::object();
+  event3["eventId"] = "id3";
+  event3["eventName"] = "otherEvent";
+  svc.pushEvent(event3);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   REQUIRE(nameCounter == 1);
   REQUIRE(patternCounter == 2);
 
-  iora::util::removeFilesContainingAny({"ioraservice_fluent_eventqueue_log",
-                            "ioraservice_fluent_eventqueue_state.json"});
+  iora::util::removeFilesContainingAny(
+      {"ioraservice_fluent_eventqueue_log",
+       "ioraservice_fluent_eventqueue_state.json"});
 }
 
 TEST_CASE("IoraService integrates EventQueue",
@@ -282,20 +322,22 @@ TEST_CASE("IoraService integrates EventQueue",
                         "--log-file",
                         "ioraservice_eventqueue_log"};
   int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc =
-      iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService& svc = initServiceFromArgs(argc, args);
   AutoServiceShutdown autoShutdown(svc);
 
   std::atomic<int> counter{0};
   svc.onEvent("testEventId")
       .handle(
-          [&](const iora::core::Json& event)
+          [&](const iora::parsers::Json& event)
           {
             REQUIRE(event["eventId"] == "testEventId");
             counter++;
           });
 
-  svc.pushEvent({{"eventId", "testEventId"}, {"eventName", "testEventName"}});
+  auto testEvent = iora::parsers::Json::object();
+  testEvent["eventId"] = "testEventId";
+  testEvent["eventName"] = "testEventName";
+  svc.pushEvent(testEvent);
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   REQUIRE(counter == 1);
 

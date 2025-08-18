@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //
 // Real integration test that loads both JSON-RPC server and client modules
-
-#include <catch2/catch_test_macros.hpp>
-#include <catch2/catch_session.hpp>
+#define CATCH_CONFIG_RUNNER
+#include <catch2/catch.hpp>
 #include "iora/iora.hpp"
 #include <iostream>
 #include <thread>
@@ -19,7 +18,7 @@ namespace
 {
 
 // Type aliases for common API signatures to improve readability
-using JsonHandler = std::function<iora::core::Json(const iora::core::Json&)>;
+using JsonHandler = std::function<iora::parsers::Json(const iora::parsers::Json&)>;
 using Headers = std::vector<std::pair<std::string, std::string>>;
 
 /// \brief Helper function to create a test IoraService instance
@@ -34,14 +33,7 @@ iora::IoraService& createTestService()
     config.log.level = "info";
     config.modules.autoLoad = false; // we will be loading modules manually
 
-    try
-    {
-      iora::IoraService::shutdown(); // Ensure clean state
-    }
-    catch (...)
-    {
-      // Ignore shutdown errors if already shutdown
-    }
+    // Note: Service shutdown is handled by AutoServiceShutdown RAII wrapper
 
     iora::IoraService::init(config);
     initialized = true;
@@ -53,7 +45,21 @@ iora::IoraService& createTestService()
 
 TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
 {
-  auto& svc = iora::IoraService::instance();
+  auto& svc = createTestService();
+  
+  // Load JSON-RPC server module first (using same pattern as server tests)
+  auto serverPluginPath = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../../../endpoints/jsonrpc_server/") + "/mod_jsonrpc_server.so";
+  REQUIRE(std::filesystem::exists(serverPluginPath));
+  REQUIRE(svc.loadSingleModule(serverPluginPath));
+  
+  // Load JSON-RPC client module (current module's directory)  
+  auto clientPluginPath = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_jsonrpc_client.so";
+  REQUIRE(std::filesystem::exists(clientPluginPath));
+  REQUIRE(svc.loadSingleModule(clientPluginPath));
+  
+  // Allow some time for the HTTP server to start listening
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  
   SECTION("Enumerate and test all exported JSON-RPC APIs")
   {
     // Print all exported APIs
@@ -71,12 +77,12 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     std::cout << "✓ Server version: " << serverVersion << std::endl;
 
     // jsonrpc.register
-    JsonHandler echoHandler = [](const core::Json& params) -> core::Json
+    JsonHandler echoHandler = [](const parsers::Json& params) -> parsers::Json
     {
       std::cout << "Server: echo handler called with: " << params.dump() << std::endl;
       return params;
     };
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>(
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>(
       "jsonrpc.register", "echo", std::move(echoHandler));
     std::cout << "✓ Registered 'echo' method on server" << std::endl;
 
@@ -91,7 +97,7 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     std::cout << "✓ Server getMethods includes 'echo'" << std::endl;
 
     // jsonrpc.getStats
-    auto stats = svc.callExportedApi<core::Json>("jsonrpc.getStats");
+    auto stats = svc.callExportedApi<parsers::Json>("jsonrpc.getStats");
     std::cout << "✓ Server stats: " << stats.dump() << std::endl;
 
     // jsonrpc.resetStats
@@ -115,13 +121,14 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
 
     // Prepare dummy endpoint and params
     const std::string serverUrl = "http://localhost:8135/rpc";
-    core::Json params = {{"test", "value"}};
+    auto params = parsers::Json::object();
+    params["test"] = "value";
     Headers headers;
 
     // jsonrpc.client.call (should fail gracefully if server not running)
     try
     {
-      auto result = svc.callExportedApi<core::Json, const std::string&, const std::string&, const core::Json&, const Headers&>(
+      auto result = svc.callExportedApi<parsers::Json, const std::string&, const std::string&, const parsers::Json&, const Headers&>(
         "jsonrpc.client.call", serverUrl, "echo", params, headers);
       std::cout << "✓ Client call result: " << result.dump() << std::endl;
     }
@@ -133,7 +140,7 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     // jsonrpc.client.notify
     try
     {
-      svc.callExportedApi<void, const std::string&, const std::string&, const core::Json&, const Headers&>(
+      svc.callExportedApi<void, const std::string&, const std::string&, const parsers::Json&, const Headers&>(
         "jsonrpc.client.notify", serverUrl, "echo", params, headers);
       std::cout << "✓ Client notify sent" << std::endl;
     }
@@ -145,10 +152,10 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     // jsonrpc.client.callAsync
     try
     {
-      auto jobId = svc.callExportedApi<std::string, const std::string&, const std::string&, const core::Json&, const Headers&>(
+      auto jobId = svc.callExportedApi<std::string, const std::string&, const std::string&, const parsers::Json&, const Headers&>(
         "jsonrpc.client.callAsync", serverUrl, "echo", params, headers);
       std::cout << "✓ Client callAsync jobId: " << jobId << std::endl;
-      auto asyncResult = svc.callExportedApi<core::Json, const std::string&>("jsonrpc.client.result", jobId);
+      auto asyncResult = svc.callExportedApi<parsers::Json, const std::string&>("jsonrpc.client.result", jobId);
       std::cout << "✓ Client callAsync result: " << asyncResult.dump() << std::endl;
     }
     catch (const std::exception& e)
@@ -186,7 +193,7 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     // jsonrpc.client.getStats (previously leaked internal ClientStats&)
     try
     {
-      auto clientStats = svc.callExportedApi<core::Json>("jsonrpc.client.getStats");
+      auto clientStats = svc.callExportedApi<parsers::Json>("jsonrpc.client.getStats");
       REQUIRE(clientStats.is_object());
       REQUIRE(clientStats.contains("totalRequests"));
       REQUIRE(clientStats.contains("successfulRequests"));
@@ -209,24 +216,30 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     try
     {
       // Create batch request using new JSON format
-      core::Json batchItems = core::Json::array();
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"msg", "batch1"}}},
-        {"id", 1}
-      });
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"msg", "batch2"}}},
-        {"id", 2}
-      });
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"msg", "notification"}}}
-        // No "id" field = notification
-      });
+      parsers::Json batchItems = parsers::Json::array();
+      auto item1 = parsers::Json::object();
+      item1["method"] = "echo";
+      auto params1 = parsers::Json::object();
+      params1["msg"] = "batch1";
+      item1["params"] = params1;
+      item1["id"] = 1;
+      batchItems.push_back(item1);
+      auto item2 = parsers::Json::object();
+      item2["method"] = "echo";
+      auto params2 = parsers::Json::object();
+      params2["msg"] = "batch2";
+      item2["params"] = params2;
+      item2["id"] = 2;
+      batchItems.push_back(item2);
+      auto item3 = parsers::Json::object();
+      item3["method"] = "echo";
+      auto params3 = parsers::Json::object();
+      params3["msg"] = "notification";
+      item3["params"] = params3;
+      // No "id" field = notification
+      batchItems.push_back(item3);
 
-      auto batchResults = svc.callExportedApi<std::vector<core::Json>, const std::string&, const core::Json&, const Headers&>(
+      auto batchResults = svc.callExportedApi<std::vector<parsers::Json>, const std::string&, const parsers::Json&, const Headers&>(
         "jsonrpc.client.callBatch", serverUrl, batchItems, headers);
       
       std::cout << "✓ Client callBatch completed with " << batchResults.size() << " results" << std::endl;
@@ -251,29 +264,33 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
     try
     {
       // Create batch request using new JSON format
-      core::Json batchItems = core::Json::array();
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"async", "batch1"}}},
-        {"id", 10}
-      });
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"async", "batch2"}}},
-        {"id", 20}
-      });
+      parsers::Json batchItems = parsers::Json::array();
+      auto asyncItem1 = parsers::Json::object();
+      asyncItem1["method"] = "echo";
+      auto asyncParams1 = parsers::Json::object();
+      asyncParams1["async"] = "batch1";
+      asyncItem1["params"] = asyncParams1;
+      asyncItem1["id"] = 10;
+      batchItems.push_back(asyncItem1);
+      auto asyncItem2 = parsers::Json::object();
+      asyncItem2["method"] = "echo";
+      auto asyncParams2 = parsers::Json::object();
+      asyncParams2["async"] = "batch2";
+      asyncItem2["params"] = asyncParams2;
+      asyncItem2["id"] = 20;
+      batchItems.push_back(asyncItem2);
 
-      auto asyncBatchJobId = svc.callExportedApi<std::string, const std::string&, const iora::core::Json&, const Headers&>("jsonrpc.client.callBatchAsync", serverUrl, batchItems, headers);
+      auto asyncBatchJobId = svc.callExportedApi<std::string, const std::string&, const iora::parsers::Json&, const Headers&>("jsonrpc.client.callBatchAsync", serverUrl, batchItems, headers);
       
       std::cout << "✓ Client callBatchAsync jobId: " << asyncBatchJobId << std::endl;
       
       // Poll for result
       for (int attempts = 0; attempts < 5; ++attempts)
       {
-        auto asyncBatchResult = svc.callExportedApi<iora::core::Json, const std::string&>("jsonrpc.client.result", asyncBatchJobId);
+        auto asyncBatchResult = svc.callExportedApi<iora::parsers::Json, const std::string&>("jsonrpc.client.result", asyncBatchJobId);
         std::cout << "  Batch async result (attempt " << (attempts + 1) << "): " << asyncBatchResult.dump() << std::endl;
         
-        if (asyncBatchResult.value("done", false))
+        if (asyncBatchResult.contains("done") ? asyncBatchResult["done"].get<bool>() : false)
         {
           break;
         }
@@ -299,19 +316,22 @@ TEST_CASE("Server Method Registration with Options", "[integration][server][opti
   SECTION("Test jsonrpc.registerWithOptions with various configurations")
   {
     // Test method handler that requires authentication
-    auto authHandler = [](const core::Json& params) -> core::Json
+    auto authHandler = [](const parsers::Json& params) -> parsers::Json
     {
-      return core::Json{{"authenticated", true}, {"params", params}};
+      auto result = parsers::Json::object();
+      result["authenticated"] = true;
+      result["params"] = params;
+      return result;
     };
     
     // Register method with options using new JSON format
-    core::Json options = {
+    parsers::Json options = {
       {"requireAuth", true},
       {"timeout", 5000},
       {"maxRequestSize", 1024}
     };
     
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&>("jsonrpc.registerWithOptions", "secure_method", std::move(authHandler), options);
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>, const iora::parsers::Json&>("jsonrpc.registerWithOptions", "secure_method", std::move(authHandler), options);
     
     // Verify method was registered
     bool hasSecureMethod = svc.callExportedApi<bool, const std::string&>("jsonrpc.has", "secure_method");
@@ -324,7 +344,7 @@ TEST_CASE("Server Method Registration with Options", "[integration][server][opti
     std::cout << "✓ getMethods includes 'secure_method'" << std::endl;
     
     // Test multiple method registrations
-    auto mathAddHandler = [](const core::Json& params) -> core::Json
+    auto mathAddHandler = [](const parsers::Json& params) -> parsers::Json
     {
       if (!params.contains("a") || !params.contains("b"))
       {
@@ -332,12 +352,14 @@ TEST_CASE("Server Method Registration with Options", "[integration][server][opti
       }
       int a = params["a"].get<int>();
       int b = params["b"].get<int>();
-      return core::Json{{"result", a + b}};
+      auto result = parsers::Json::object();
+      result["result"] = a + b;
+      return result;
     };
     
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "math.add", std::move(mathAddHandler));
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "math.add", std::move(mathAddHandler));
     
-    auto mathMultiplyHandler = [](const core::Json& params) -> core::Json
+    auto mathMultiplyHandler = [](const parsers::Json& params) -> parsers::Json
     {
       if (!params.contains("a") || !params.contains("b"))
       {
@@ -345,10 +367,12 @@ TEST_CASE("Server Method Registration with Options", "[integration][server][opti
       }
       int a = params["a"].get<int>();
       int b = params["b"].get<int>();
-      return core::Json{{"result", a * b}};
+      auto result = parsers::Json::object();
+      result["result"] = a * b;
+      return result;
     };
     
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "math.multiply", std::move(mathMultiplyHandler));
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "math.multiply", std::move(mathMultiplyHandler));
     
     // Verify all methods are registered
     auto updatedMethods = svc.callExportedApi<std::vector<std::string>>("jsonrpc.getMethods");
@@ -364,7 +388,7 @@ TEST_CASE("Server Method Registration with Options", "[integration][server][opti
     }
     
     // Test server statistics after registrations
-    auto serverStats = svc.callExportedApi<iora::core::Json>("jsonrpc.getStats");
+    auto serverStats = svc.callExportedApi<iora::parsers::Json>("jsonrpc.getStats");
     std::cout << "✓ Server stats after registrations: " << serverStats.dump() << std::endl;
     
     // Cleanup - unregister all test methods
@@ -386,11 +410,11 @@ TEST_CASE("Error Handling and Edge Cases", "[integration][errors]")
     // Test batch with invalid JSON structure
     try
     {
-      core::Json invalidBatchItems = "not an array";  // Invalid - should be array
+      parsers::Json invalidBatchItems = "not an array";  // Invalid - should be array
       const std::string serverUrl = "http://localhost:8135/rpc";
       Headers headers;
       
-      auto results = svc.callExportedApi<std::vector<iora::core::Json>, const std::string&, const iora::core::Json&, const Headers&>("jsonrpc.client.callBatch", serverUrl, invalidBatchItems, headers);
+      auto results = svc.callExportedApi<std::vector<iora::parsers::Json>, const std::string&, const iora::parsers::Json&, const Headers&>("jsonrpc.client.callBatch", serverUrl, invalidBatchItems, headers);
       
       // Should not reach here
       REQUIRE(false);
@@ -403,17 +427,19 @@ TEST_CASE("Error Handling and Edge Cases", "[integration][errors]")
     // Test batch with missing method field
     try
     {
-      core::Json invalidBatchItems = core::Json::array();
-      invalidBatchItems.push_back({
-        {"params", {{"a", 1}}},
-        {"id", 1}
-        // Missing "method" field
-      });
+      parsers::Json invalidBatchItems = parsers::Json::array();
+      auto invalidItem = parsers::Json::object();
+      auto params = parsers::Json::object();
+      params["a"] = 1;
+      invalidItem["params"] = params;
+      invalidItem["id"] = 1;
+      // Missing "method" field
+      invalidBatchItems.push_back(invalidItem);
       
       const std::string serverUrl = "http://localhost:8135/rpc";
       Headers headers;
       
-      auto results = svc.callExportedApi<std::vector<iora::core::Json>, const std::string&, const iora::core::Json&, const Headers&>("jsonrpc.client.callBatch", serverUrl, invalidBatchItems, headers);
+      auto results = svc.callExportedApi<std::vector<iora::parsers::Json>, const std::string&, const iora::parsers::Json&, const Headers&>("jsonrpc.client.callBatch", serverUrl, invalidBatchItems, headers);
       
       // Should not reach here
       REQUIRE(false);
@@ -426,7 +452,7 @@ TEST_CASE("Error Handling and Edge Cases", "[integration][errors]")
     // Test client statistics validation
     try
     {
-      auto stats = svc.callExportedApi<iora::core::Json>("jsonrpc.client.getStats");
+      auto stats = svc.callExportedApi<iora::parsers::Json>("jsonrpc.client.getStats");
       
       // Verify all required fields are present and are numbers
       REQUIRE(stats.contains("totalRequests"));
@@ -446,7 +472,7 @@ TEST_CASE("Error Handling and Edge Cases", "[integration][errors]")
     // Test async result polling for non-existent job
     try
     {
-      auto result = svc.callExportedApi<iora::core::Json, const std::string&>("jsonrpc.client.result", "non-existent-job-id");
+      auto result = svc.callExportedApi<iora::parsers::Json, const std::string&>("jsonrpc.client.result", "non-existent-job-id");
       
       REQUIRE(result.is_object());
       REQUIRE(result.contains("done"));
@@ -468,13 +494,13 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
   SECTION("Test full client-server communication with running server")
   {
     // Register test methods on the server
-    auto echoHandler = [](const core::Json& params) -> core::Json
+    auto echoHandler = [](const parsers::Json& params) -> parsers::Json
     {
       std::cout << "Server: echo called with " << params.dump() << std::endl;
       return params;
     };
     
-    auto addHandler = [](const core::Json& params) -> core::Json
+    auto addHandler = [](const parsers::Json& params) -> parsers::Json
     {
       if (!params.contains("a") || !params.contains("b"))
       {
@@ -482,12 +508,14 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
       }
       int a = params["a"].get<int>();
       int b = params["b"].get<int>();
-      return core::Json{{"sum", a + b}};
+      auto result = parsers::Json::object();
+      result["sum"] = a + b;
+      return result;
     };
     
     // Register methods
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "echo", std::move(echoHandler));
-    svc.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>("jsonrpc.register", "add", std::move(addHandler));
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "echo", std::move(echoHandler));
+    svc.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>("jsonrpc.register", "add", std::move(addHandler));
     
     std::cout << "✓ Registered echo and add methods on server" << std::endl;
     
@@ -501,8 +529,9 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
     // Test direct RPC calls
     try
     {
-      core::Json echoParams = {{"message", "Hello from client!"}};
-      auto echoResult = svc.callExportedApi<iora::core::Json, const std::string&, const std::string&, const iora::core::Json&, const Headers&>("jsonrpc.client.call", serverUrl, "echo", echoParams, headers);
+      auto echoParams = parsers::Json::object();
+      echoParams["message"] = "Hello from client!";
+      auto echoResult = svc.callExportedApi<iora::parsers::Json, const std::string&, const std::string&, const iora::parsers::Json&, const Headers&>("jsonrpc.client.call", serverUrl, "echo", echoParams, headers);
       
       REQUIRE(echoResult.contains("message"));
       REQUIRE(echoResult["message"] == "Hello from client!");
@@ -516,24 +545,31 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
     // Test batch operations with running server
     try
     {
-      core::Json batchItems = core::Json::array();
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"msg", "batch echo test"}}},
-        {"id", 1}
-      });
-      batchItems.push_back({
-        {"method", "add"},
-        {"params", {{"a", 10}, {"b", 20}}},
-        {"id", 2}
-      });
-      batchItems.push_back({
-        {"method", "echo"},
-        {"params", {{"notification", true}}}
-        // No id = notification
-      });
+      parsers::Json batchItems = parsers::Json::array();
+      auto batchItem1 = parsers::Json::object();
+      batchItem1["method"] = "echo";
+      auto batchParams1 = parsers::Json::object();
+      batchParams1["msg"] = "batch echo test";
+      batchItem1["params"] = batchParams1;
+      batchItem1["id"] = 1;
+      batchItems.push_back(batchItem1);
+      auto batchItem2 = parsers::Json::object();
+      batchItem2["method"] = "add";
+      auto batchParams2 = parsers::Json::object();
+      batchParams2["a"] = 10;
+      batchParams2["b"] = 20;
+      batchItem2["params"] = batchParams2;
+      batchItem2["id"] = 2;
+      batchItems.push_back(batchItem2);
+      auto batchItem3 = parsers::Json::object();
+      batchItem3["method"] = "echo";
+      auto batchParams3 = parsers::Json::object();
+      batchParams3["notification"] = true;
+      batchItem3["params"] = batchParams3;
+      // No id = notification
+      batchItems.push_back(batchItem3);
       
-      auto batchResults = svc.callExportedApi<std::vector<core::Json>, const std::string&, const core::Json&, const Headers&>(
+      auto batchResults = svc.callExportedApi<std::vector<parsers::Json>, const std::string&, const parsers::Json&, const Headers&>(
         "jsonrpc.client.callBatch", serverUrl, batchItems, headers);
       
       std::cout << "✓ Batch RPC call successful with " << batchResults.size() << " results:" << std::endl;
@@ -585,8 +621,9 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
     // Test async operations with real server
     try
     {
-      core::Json asyncParams = {{"async_test", "value"}};
-      auto jobId = svc.callExportedApi<std::string, const std::string&, const std::string&, const iora::core::Json&, const Headers&>("jsonrpc.client.callAsync", serverUrl, "echo", asyncParams, headers);
+      auto asyncParams = parsers::Json::object();
+      asyncParams["async_test"] = "value";
+      auto jobId = svc.callExportedApi<std::string, const std::string&, const std::string&, const iora::parsers::Json&, const Headers&>("jsonrpc.client.callAsync", serverUrl, "echo", asyncParams, headers);
       
       std::cout << "✓ Async RPC call initiated with jobId: " << jobId << std::endl;
       
@@ -594,11 +631,11 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
       bool completed = false;
       for (int attempt = 0; attempt < 10 && !completed; ++attempt)
       {
-        auto result = svc.callExportedApi<iora::core::Json, const std::string&>("jsonrpc.client.result", jobId);
+        auto result = svc.callExportedApi<iora::parsers::Json, const std::string&>("jsonrpc.client.result", jobId);
         
         std::cout << "  Async poll attempt " << (attempt + 1) << ": " << result.dump() << std::endl;
         
-        if (result.value("done", false))
+        if ((result.contains("done") ? result["done"].get<bool>() : false))
         {
           completed = true;
           if (result.contains("result"))
@@ -640,8 +677,8 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
     // Test client and server statistics after real operations
     try
     {
-      auto clientStats = svc.callExportedApi<iora::core::Json>("jsonrpc.client.getStats");
-      auto serverStats = svc.callExportedApi<iora::core::Json>("jsonrpc.getStats");
+      auto clientStats = svc.callExportedApi<iora::parsers::Json>("jsonrpc.client.getStats");
+      auto serverStats = svc.callExportedApi<iora::parsers::Json>("jsonrpc.getStats");
       
       std::cout << "✓ Final client statistics: " << clientStats.dump() << std::endl;
       std::cout << "✓ Final server statistics: " << serverStats.dump() << std::endl;
@@ -661,6 +698,104 @@ TEST_CASE("Full Client-Server Communication", "[integration][communication][full
     
     std::cout << "✓ Full client-server communication test completed" << std::endl;
   }
+}
+
+TEST_CASE("HTTP Client Connection Timeout Test", "[integration][timeout]")
+{
+  auto& svc = createTestService();
+  
+  // Load only the client module for this test (no server)
+  // Note: Plugin may already be loaded from main(), handle gracefully
+  auto clientPluginPath = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_jsonrpc_client.so";
+  REQUIRE(std::filesystem::exists(clientPluginPath));
+  
+  // Try to load the client plugin, but don't fail if it's already loaded
+  try
+  {
+    svc.loadSingleModule(clientPluginPath);
+  }
+  catch (const std::exception& e)
+  {
+    // Plugin likely already loaded from main() - that's OK for this test
+    std::string error = e.what();
+    if (error.find("already loaded") == std::string::npos)
+    {
+      // Re-throw if it's not the "already loaded" error
+      throw;
+    }
+  }
+  
+  SECTION("Client should timeout when connecting to unavailable server")
+  {
+    // Test connecting to a non-existent server port (use IP to avoid DNS issues)
+    const std::string unavailableServerUrl = "http://127.0.0.1:9999/rpc"; // Port 9999 should be unavailable
+    auto params = parsers::Json::object();
+    params["test"] = "timeout";
+    Headers headers;
+    
+    auto startTime = std::chrono::steady_clock::now();
+    
+    try
+    {
+      // This should timeout, not hang indefinitely
+      auto result = svc.callExportedApi<parsers::Json, const std::string&, const std::string&, const parsers::Json&, const Headers&>(
+        "jsonrpc.client.call", unavailableServerUrl, "test", params, headers);
+      
+      // If we get here, the test failed - we should have gotten an exception
+      REQUIRE(false);
+    }
+    catch (const std::exception& e)
+    {
+      auto endTime = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
+      
+      std::cout << "✓ Client correctly threw exception after " << elapsed.count() << " seconds: " << e.what() << std::endl;
+      
+      // Verify that it timed out in a reasonable time (should be less than 30 seconds)
+      REQUIRE(elapsed.count() < 30);
+      
+      // Verify the exception message indicates a timeout or connection failure
+      std::string errorMsg = e.what();
+      bool isTimeoutError = (errorMsg.find("timeout") != std::string::npos) ||
+                           (errorMsg.find("connection") != std::string::npos) ||
+                           (errorMsg.find("connect") != std::string::npos) ||
+                           (errorMsg.find("failed") != std::string::npos) ||
+                           (errorMsg.find("callback") != std::string::npos);
+      REQUIRE(isTimeoutError);
+    }
+  }
+  
+  SECTION("Client should handle invalid URLs gracefully")
+  {
+    const std::string invalidUrl = "not-a-valid-url";
+    auto params = parsers::Json::object();
+    params["test"] = "invalid";
+    Headers headers;
+    
+    try
+    {
+      auto result = svc.callExportedApi<parsers::Json, const std::string&, const std::string&, const parsers::Json&, const Headers&>(
+        "jsonrpc.client.call", invalidUrl, "test", params, headers);
+      
+      // Should not reach here
+      REQUIRE(false);
+    }
+    catch (const std::exception& e)
+    {
+      std::cout << "✓ Client correctly rejected invalid URL: " << e.what() << std::endl;
+      
+      // Should contain some indication that the URL is invalid
+      std::string errorMsg = e.what();
+      bool isUrlError = (errorMsg.find("URL") != std::string::npos) ||
+                       (errorMsg.find("url") != std::string::npos) ||
+                       (errorMsg.find("format") != std::string::npos) ||
+                       (errorMsg.find("Invalid") != std::string::npos);
+      REQUIRE(isUrlError);
+    }
+  }
+  
+  // Cleanup
+  util::removeFilesContainingAny({"jsonrpc_client_test"});
 }
 
 int main(int argc, char* argv[])

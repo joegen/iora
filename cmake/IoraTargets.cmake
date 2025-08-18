@@ -16,6 +16,7 @@ function(create_iora_lib)
     message(STATUS "Created iora_lib interface library")
 endfunction()
 
+
 # Function to configure a target with common Iora dependencies
 function(configure_iora_target target_name)
     set(options ENABLE_OPENSSL ENABLE_TIKTOKEN)
@@ -33,20 +34,16 @@ function(configure_iora_target target_name)
     # Link with iora_lib
     target_link_libraries(${target_name} PRIVATE iora_lib)
     
-    # Add common dependencies
+    # Add common dependencies (removed nlohmann_json - using built-in json2.hpp)
     target_link_libraries(${target_name} PRIVATE 
-        nlohmann_json::nlohmann_json
-        cpr::cpr
+        OpenSSL::SSL OpenSSL::Crypto
     )
     
     # Add include directories for fetched dependencies (backwards compatibility)
-    if(NLOHMANN_JSON_INCLUDE_DIR)
-        target_include_directories(${target_name} PRIVATE ${NLOHMANN_JSON_INCLUDE_DIR})
-    endif()
+    # if(NLOHMANN_JSON_INCLUDE_DIR)
+    #     target_include_directories(${target_name} PRIVATE ${NLOHMANN_JSON_INCLUDE_DIR})
+    # endif()
     
-    if(CPR_INCLUDE_DIR)
-        target_include_directories(${target_name} PRIVATE ${CPR_INCLUDE_DIR})
-    endif()
     
     if(CPP_HTTPLIB_INCLUDE_DIR)
         target_include_directories(${target_name} PRIVATE ${CPP_HTTPLIB_INCLUDE_DIR})
@@ -77,6 +74,7 @@ function(configure_iora_target target_name)
     if(CONFIG_LINK_LIBRARIES)
         target_link_libraries(${target_name} PRIVATE ${CONFIG_LINK_LIBRARIES})
     endif()
+    
     
     # Add custom include directories
     if(CONFIG_INCLUDE_DIRECTORIES)

@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 
@@ -10,10 +11,12 @@
 #include <stdexcept>
 #include <optional>
 #include <vector>
-#include <toml++/toml.h>
+#include <iora/parsers/minimal_toml.hpp>
 
-namespace iora {
-namespace core {
+namespace iora
+{
+namespace core
+{
   /// \brief Loads and parses TOML configuration files for the application.
   class ConfigLoader
   {
@@ -26,17 +29,17 @@ namespace core {
     {
       try
       {
-        _table = toml::parse_file(_filename);
+        _table = parsers::toml::parse_file(_filename);
         return true;
       }
       catch (...)
       {
-        _table = toml::table{};
+        _table = parsers::toml::table{};
         return false;
       }
     }
 
-    const toml::table& load()
+    const parsers::toml::table& load()
     {
       if (_table.empty())
       {
@@ -50,7 +53,7 @@ namespace core {
     }
 
     /// \brief Gets the full configuration table.
-    const toml::table& table() const { return _table; }
+    const parsers::toml::table& table() const { return _table; }
 
     /// \brief Gets a typed value from the configuration.
     /// \tparam T Must be a TOML native type (int64_t, double, bool,
@@ -63,7 +66,7 @@ namespace core {
       {
         if (auto val = node.as<T>())
         {
-          return val->get();
+          return val;
         }
       }
       return std::nullopt;
@@ -107,19 +110,23 @@ namespace core {
       std::vector<std::string> result;
       for (const auto& elem : *node.as_array())
       {
-        if (!elem.is_string())
+        if (auto* strVal = std::get_if<std::string>(&elem))
+        {
+          result.push_back(*strVal);
+        }
+        else
         {
           throw std::runtime_error("ConfigLoader: Array element at '" + key +
                                    "' is not a string");
         }
-        result.push_back(elem.value<std::string>().value());
       }
       return result;
     }
 
   private:
     std::string _filename;
-    toml::table _table;
+    parsers::toml::table _table;
   };
 
-} } // namespace iora::core
+} // namespace core
+} // namespace iora

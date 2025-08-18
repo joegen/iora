@@ -1,12 +1,15 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 
-#include "core/json.hpp"
+#include <any>
+#include <cassert>
+#include "parsers/json.hpp"
 #include "core/logger.hpp"
 #include "core/config_loader.hpp"
 #include "core/thread_pool.hpp"
@@ -14,7 +17,6 @@
 #include "util/expiring_cache.hpp"
 #include "util/event_queue.hpp"
 #include "util/plugin_loader.hpp"
-#include "util/tokenizer.hpp"
 #include "util/filesystem.hpp"
 #include "storage/concrete_state_store.hpp"
 #include "storage/json_file_store.hpp"
@@ -22,10 +24,10 @@
 #include "network/http_client.hpp"
 #include "network/webhook_server.hpp"
 
+#define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
 
-
-namespace iora {
-
+namespace iora
+{
 
 /// \brief Singleton entry point for the Iora library, managing all core
 /// components and providing factory methods for utilities and plugins.
@@ -58,7 +60,7 @@ public:
     {
       // Log but don't throw from destructor
       core::Logger::error("IoraService destructor error: " +
-                         std::string(e.what()));
+                          std::string(e.what()));
     }
     catch (...)
     {
@@ -116,6 +118,9 @@ public:
       std::optional<std::size_t> queueSize;
       std::optional<std::chrono::seconds> idleTimeoutSeconds;
     } threadPool;
+
+    // Configuration file path (used for CLI parsing)
+    std::optional<std::string> configFile;
   };
 
   /// \brief Cleans up all global Iora resources, notifies plugins, and unloads
@@ -172,7 +177,7 @@ public:
       try
       {
         core::Logger::error("IoraService shutdown error: " +
-                           std::string(e.what()));
+                            std::string(e.what()));
       }
       catch (...)
       {
@@ -237,24 +242,23 @@ public:
   {
   public:
     explicit AutoServiceShutdown(iora::IoraService& service) : _svc(service) {}
-    ~AutoServiceShutdown() { _svc.shutdown(); }
+    ~AutoServiceShutdown() { IoraService::shutdown(); }
 
   private:
     iora::IoraService& _svc;
   };
 
   /// \brief Initialises the singleton with command‑line arguments.
-  ///        Supported options: `--port/-p`, `--config/-c`, `--state-file/-s`,
-  ///        `--log-level/-l`, `--log-file/-f`, `--log-async`,
-  ///        `--log-retention`, and `--log-time-format`.
-  ///        CLI values always override the configuration file.
   static IoraService& init(int argc, char** argv)
   {
     IoraService& svc = instance();
-    svc.parseConfig(argc, argv);
+    svc.parseCliArgs(argc, argv);
+    svc.parseTomlConfig(svc._config.configFile);
+    svc.applyConfig();
     return svc;
   }
 
+  /// \brief Initialises the singleton with a configuration object.
   static void init(const Config& config)
   {
     IoraService& svc = instance();
@@ -303,19 +307,38 @@ public:
   std::unique_ptr<storage::JsonFileStore>
   makeJsonFileStore(const std::string& filename) const
   {
+    core::Logger::info("IoraService: Creating JSON file store for file: " +
+                       filename);
     return std::make_unique<storage::JsonFileStore>(filename);
   }
 
   /// \brief Factory for creating a new stateless HTTP client.
-  network::HttpClient makeHttpClient() const { return network::HttpClient{}; }
+  network::HttpClient makeHttpClient() const
+  {
+    core::Logger::debug("IoraService: Creating new HTTP client instance");
+    return network::HttpClient{};
+  }
 
   /// \brief Push an event to the EventQueue
-  void pushEvent(const core::Json& event) { _eventQueue.push(event); }
+  void pushEvent(const parsers::Json& event)
+  {
+    std::string eventId = event.contains("eventId")
+                              ? event["eventId"].get<std::string>()
+                              : "<unknown>";
+    std::string eventName = event.contains("eventName")
+                                ? event["eventName"].get<std::string>()
+                                : "<unknown>";
+    core::Logger::debug("IoraService: Pushing event (id=" + eventId +
+                        ", name=" + eventName + ") to event queue");
+    _eventQueue.push(event);
+  }
 
   /// \brief Register a handler for an event by its ID
   void registerEventHandlerById(const std::string& eventId,
                                 util::EventQueue::Handler handler)
   {
+    core::Logger::info("IoraService: Registering event handler for event ID: " +
+                       eventId);
     _eventQueue.onEventId(eventId, std::move(handler));
   }
 
@@ -323,6 +346,8 @@ public:
   void registerEventHandlerByName(const std::string& eventName,
                                   util::EventQueue::Handler handler)
   {
+    core::Logger::info(
+        "IoraService: Registering event handler for event name: " + eventName);
     _eventQueue.onEventName(eventName, std::move(handler));
   }
 
@@ -335,12 +360,18 @@ public:
   {
     if (name.empty())
     {
+      core::Logger::error(
+          "IoraService::exportApi() - Plugin API name cannot be empty");
       throw std::invalid_argument("Plugin API name cannot be empty");
     }
     if (_apiExports.find(name) != _apiExports.end())
     {
+      core::Logger::error(
+          "IoraService::exportApi() - Plugin API already registered: " + name);
       throw std::runtime_error("Plugin API already registered: " + name);
     }
+    core::Logger::info("IoraService::exportApi() - Registering plugin API: " +
+                       name + " for plugin: " + plugin._name);
     std::lock_guard<std::mutex> lock(_apiMutex);
     using func_type = std::decay_t<Func>;
     using signature = decltype(&func_type::operator());
@@ -403,6 +434,8 @@ public:
   template <typename Ret, typename... Args>
   Ret callExportedApi(const std::string& name, Args&&... args)
   {
+    core::Logger::debug(
+        "IoraService::callExportedApi() - Calling plugin API: " + name);
     auto func = getExportedApi<Ret(Args...)>(name);
     return func(std::forward<Args>(args)...);
   }
@@ -481,7 +514,7 @@ public:
             unexportApi(apiName);
           }
           _loadedModules.erase(it); // unique_ptr will delete
-          unloadPlugin(pluginName);
+          PluginManager::unloadPlugin(pluginName);
           LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
           return true;
         }
@@ -521,7 +554,7 @@ public:
           {
             unexportApi(apiName);
           }
-          unloadPlugin(name);
+          PluginManager::unloadPlugin(name);
           LOG_INFO("Plugin " + name + " unloaded successfully.");
         }
         catch (const std::exception& e)
@@ -637,7 +670,16 @@ protected:
       {
         pluginInstance->_name = pluginName;            // Set the plugin name
         pluginInstance->_path = entry.path().string(); // Set the plugin path
-        pluginInstance->onLoad(this);
+        try
+        {
+          pluginInstance->onLoad(this);
+        }
+        catch (const std::exception& e)
+        {
+          LOG_ERROR("Exception while calling onLoad for module " + pluginName +
+                    ": " + e.what());
+        }
+
         _loadedModules.insert({pluginName, std::move(pluginInstance)});
         LOG_INFO("Module " + pluginName + " loaded successfully.");
       }
@@ -723,315 +765,6 @@ protected:
     _apiExports.erase(it);
   }
 
-  /// \brief Parses command-line arguments and stores CLI overrides in _config.
-  void parseCliArgs(int argc, char** argv)
-  {
-    for (int i = 1; i < argc; ++i)
-    {
-      std::string arg = argv[i];
-      if ((arg == "-p" || arg == "--port") && i + 1 < argc)
-      {
-        try
-        {
-          _config.server.port = std::stoi(argv[++i]);
-        }
-        catch (...)
-        {
-        }
-      }
-      else if ((arg == "-c" || arg == "--config") && i + 1 < argc)
-      {
-        _configLoader = std::make_unique<core::ConfigLoader>(argv[++i]);
-      }
-      else if ((arg == "-s" || arg == "--state-file") && i + 1 < argc)
-      {
-        _config.state.file = argv[++i];
-      }
-      else if ((arg == "-l" || arg == "--log-level") && i + 1 < argc)
-      {
-        _config.log.level = argv[++i];
-      }
-      else if ((arg == "-f" || arg == "--log-file") && i + 1 < argc)
-      {
-        _config.log.file = argv[++i];
-      }
-      else if ((arg == "-m" || arg == "--modules") && i + 1 < argc)
-      {
-        _config.modules.directory = argv[++i];
-      }
-      else if ((arg == "--modules-auto-load") && i + 1 < argc)
-      {
-        std::string val = argv[++i];
-        std::transform(val.begin(), val.end(), val.begin(),
-                       [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
-        if (val == "true" || val == "1" || val == "yes")
-          _config.modules.autoLoad = true;
-        else if (val == "false" || val == "0" || val == "no")
-          _config.modules.autoLoad = false;
-      }
-      else if (arg == "--log-async" && i + 1 < argc)
-      {
-        std::string val = argv[++i];
-        std::transform(val.begin(), val.end(), val.begin(),
-                       [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
-        if (val == "true" || val == "1" || val == "yes")
-          _config.log.async = true;
-        else if (val == "false" || val == "0" || val == "no")
-          _config.log.async = false;
-      }
-      else if (arg == "--log-retention" && i + 1 < argc)
-      {
-        try
-        {
-          _config.log.retentionDays = std::stoi(argv[++i]);
-        }
-        catch (...)
-        {
-        }
-      }
-      else if (arg == "--log-time-format" && i + 1 < argc)
-      {
-        _config.log.timeFormat = argv[++i];
-      }
-      // TLS CLI
-      else if (arg == "--tls-cert" && i + 1 < argc)
-      {
-        _config.server.tls.certFile = argv[++i];
-      }
-      else if (arg == "--tls-key" && i + 1 < argc)
-      {
-        _config.server.tls.keyFile = argv[++i];
-      }
-      else if (arg == "--tls-ca" && i + 1 < argc)
-      {
-        _config.server.tls.caFile = argv[++i];
-      }
-      else if (arg == "--tls-require-client-cert" && i + 1 < argc)
-      {
-        std::string val = argv[++i];
-        std::transform(val.begin(), val.end(), val.begin(),
-                       [](unsigned char c)
-                       { return static_cast<char>(std::tolower(c)); });
-        if (val == "true" || val == "1" || val == "yes")
-          _config.server.tls.requireClientCert = true;
-        else if (val == "false" || val == "0" || val == "no")
-          _config.server.tls.requireClientCert = false;
-      } 
-      else if (arg == "--threadpool-min" && i + 1 < argc)
-      {
-        _config.threadPool.minThreads = std::stoul(argv[++i]);
-      }
-      else if (arg == "--threadpool-max" && i + 1 < argc)
-      {
-        _config.threadPool.maxThreads = std::stoul(argv[++i]);
-      }
-      else if (arg == "--threadpool-queue" && i + 1 < argc)
-      {
-        _config.threadPool.queueSize = std::stoul(argv[++i]);
-      }
-      else if (arg == "--threadpool-idle-timeout" && i + 1 < argc)
-      {
-        try
-        {
-          _config.threadPool.idleTimeoutSeconds =
-              std::chrono::seconds(std::stoul(argv[++i]));
-        }
-        catch (...)
-        {
-          // Ignore invalid timeout values
-        }
-      }
-      else if (arg == "--help" || arg == "-h")
-      {
-        printCliHelp();
-        exit(0);
-      }
-      // Unrecognised arguments are ignored.
-    }
-  }
-
-  void printCliHelp()
-  {
-    std::cout << "Usage: iora [options]\n"
-          << "Options:\n"
-          << "  -p, --port <port>                Set server port (default: 8080)\n"
-          << "  -c, --config <file>              Load configuration from file (default: /etc/iora.conf.d/iora.cfg)\n"
-          << "  -s, --state-file <file>          Set state file path (default: state.json)\n"
-          << "  -l, --log-level <level>          Set log level (default: info)\n"
-          << "  -f, --log-file <file>            Set log file path (default: none)\n"
-          << "  -m, --modules <directory>        Set modules directory\n"
-          << "      --modules-auto-load          Enable automatic loading of modules (default: true)\n"
-          << "      --log-async                  Enable asynchronous logging (default: false)\n"
-          << "      --log-retention <days>       Set log retention days (default: 7)\n"
-          << "      --log-time-format <format>   Set log time format (default: %Y-%m-%d %H:%M:%S)\n"
-          << "      --tls-cert <file>            TLS certificate file\n"
-          << "      --tls-key <file>             TLS key file\n"
-          << "      --tls-ca <file>              TLS CA file\n"
-          << "      --tls-require-client-cert    Require client certificate for TLS (default: false)\n"
-          << "      --threadpool-min <n>           Set thread pool minimum threads (default: 2)\n"
-          << "      --threadpool-max <n>           Set thread pool maximum threads (default: 8)\n"
-          << "      --threadpool-queue <n>         Set thread pool queue size (default: 128)\n"
-          << "      --threadpool-idle-timeout <n>  Set thread pool idle timeout in seconds (default: 60)\n";
-  }
-
-  /// \brief Loads TOML configuration and updates _config with file values.
-  void parseTomlConfig(std::optional<std::string> configFile = std::nullopt)
-  {
-    try
-    {
-      if (!_configLoader)
-      {
-        std::string defaultConfigFile; 
-        #ifdef IORA_DEFAULT_CONFIG_FILE_PATH
-        defaultConfigFile = IORA_DEFAULT_CONFIG_FILE_PATH;
-        #endif
-        _configLoader = std::make_unique<core::ConfigLoader>(configFile.value_or(defaultConfigFile));
-      }
-      _configLoader->reload();
-      if (!_config.server.port.has_value())
-      {
-        if (auto portOpt = _configLoader->getInt("iora.server.port"))
-        {
-          _config.server.port = static_cast<int>(*portOpt);
-        }
-      }
-      if (!_config.modules.directory.has_value())
-      {
-        if (auto modulesDirOpt =
-                _configLoader->getString("iora.modules.directory"))
-        {
-          _config.modules.directory = *modulesDirOpt;
-        }
-      }
-      if (!_config.modules.modules.has_value())
-      {
-        if (auto modulesOpt =
-                _configLoader->getStringArray("iora.modules.modules"))
-        {
-          _config.modules.modules = *modulesOpt;
-        }
-      }
-      if (!_config.modules.autoLoad.has_value())
-      {
-        if (auto autoLoadOpt = _configLoader->getBool("iora.modules.auto_load"))
-        {
-          _config.modules.autoLoad = *autoLoadOpt;
-        }
-      }
-      if (!_config.state.file.has_value())
-      {
-        if (auto stateFileOpt = _configLoader->getString("iora.state.file"))
-        {
-          _config.state.file = *stateFileOpt;
-        }
-      }
-      if (!_config.log.level.has_value())
-      {
-        if (auto logLevelOpt = _configLoader->getString("iora.log.level"))
-        {
-          _config.log.level = *logLevelOpt;
-        }
-      }
-      if (!_config.log.file.has_value())
-      {
-        if (auto logFileOpt = _configLoader->getString("iora.log.file"))
-        {
-          _config.log.file = *logFileOpt;
-        }
-      }
-      if (!_config.log.async.has_value())
-      {
-        if (auto logAsyncOpt = _configLoader->getBool("iora.log.async"))
-        {
-          _config.log.async = *logAsyncOpt;
-        }
-      }
-      if (!_config.log.retentionDays.has_value())
-      {
-        if (auto logRetentionOpt =
-                _configLoader->getInt("iora.log.retention_days"))
-        {
-          _config.log.retentionDays = static_cast<int>(*logRetentionOpt);
-        }
-      }
-      if (!_config.log.timeFormat.has_value())
-      {
-        if (auto logTimeFormatOpt =
-                _configLoader->getString("iora.log.time_format"))
-        {
-          _config.log.timeFormat = *logTimeFormatOpt;
-        }
-      }
-      // TLS config from TOML
-      if (!_config.server.tls.certFile.has_value())
-      {
-        if (auto tlsCertOpt =
-                _configLoader->getString("iora.server.tls.cert_file"))
-        {
-          _config.server.tls.certFile = *tlsCertOpt;
-        }
-      }
-      if (!_config.server.tls.keyFile.has_value())
-      {
-        if (auto tlsKeyOpt =
-                _configLoader->getString("iora.server.tls.key_file"))
-        {
-          _config.server.tls.keyFile = *tlsKeyOpt;
-        }
-      }
-      if (!_config.server.tls.caFile.has_value())
-      {
-        if (auto tlsCaOpt = _configLoader->getString("iora.server.tls.ca_file"))
-        {
-          _config.server.tls.caFile = *tlsCaOpt;
-        }
-      }
-      if (!_config.server.tls.requireClientCert.has_value())
-      {
-        if (auto tlsReqOpt =
-                _configLoader->getBool("iora.server.tls.require_client_cert"))
-        {
-          _config.server.tls.requireClientCert = *tlsReqOpt;
-        }
-      }
-      if (!_config.threadPool.minThreads.has_value())
-      {
-        if (auto v = _configLoader->getInt("iora.threadpool.minThreads"))
-        {
-          _config.threadPool.minThreads = static_cast<std::size_t>(*v);
-        }
-      }
-      if (!_config.threadPool.maxThreads.has_value())
-      {
-        if (auto v = _configLoader->getInt("iora.threadpool.maxThreads"))
-        {
-          _config.threadPool.maxThreads = static_cast<std::size_t>(*v);
-        }
-      }
-      if (!_config.threadPool.queueSize.has_value())
-      {
-        if (auto v = _configLoader->getInt("iora.threadpool.queueSize"))
-        {
-          _config.threadPool.queueSize = static_cast<std::size_t>(*v);
-        }
-      }
-      if (!_config.threadPool.idleTimeoutSeconds.has_value())
-      {
-        if (auto v = _configLoader->getInt("iora.threadpool.idleTimeoutSeconds"))
-        {
-          _config.threadPool.idleTimeoutSeconds =
-              std::chrono::seconds(static_cast<std::size_t>(*v));
-        }
-      }
-    }
-    catch (...)
-    {
-      // Ignore errors and keep defaults.
-    }
-  }
-
   /// \brief Applies the merged configuration in _config to the service.
   void applyConfig()
   {
@@ -1078,9 +811,17 @@ protected:
         _config.log.retentionDays.value_or(DEFAULT_LOG_RETENTION);
     std::string logTimeFormat =
         _config.log.timeFormat.value_or(DEFAULT_LOG_TIME_FORMAT);
-    core::Logger::init(toLevel(logLevel), logFile, logAsync, logRetention,
-                      logTimeFormat);
-    LOG_INFO("applyConfig: Logger initialized");
+    try
+    {
+      core::Logger::init(toLevel(logLevel), logFile, logAsync, logRetention,
+                         logTimeFormat);
+      LOG_INFO("applyConfig: Logger initialized");
+    }
+    catch (const std::exception& e)
+    {
+      LOG_WARN(
+          "applyConfig: Logger already initialized, skipping: " << e.what());
+    }
 
     // Log config values for diagnostics (now logger is ready)
     LOG_INFO(
@@ -1154,12 +895,44 @@ protected:
     {
       LOG_INFO("applyConfig: TLS is not enabled");
     }
+
+    // Start the webhook server
+    LOG_INFO("applyConfig: Starting webhook server on port: " << port);
+    try
+    {
+      _webhookServer->start();
+      LOG_INFO("applyConfig: Webhook server started successfully");
+    }
+    catch (const std::exception& e)
+    {
+      LOG_ERROR("applyConfig: Failed to start webhook server: " << e.what());
+      throw;
+    }
+
     // Thread pool
     std::size_t minThreads = _config.threadPool.minThreads.value_or(1);
-    std::size_t maxThreads = _config.threadPool.maxThreads.value_or(std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : 4);
-    std::size_t queueSize = _config.threadPool.queueSize.value_or(maxThreads * 2);
-    std::chrono::seconds idleTimeout = _config.threadPool.idleTimeoutSeconds.value_or(std::chrono::seconds(60));
-    _threadPool = std::make_unique<core::ThreadPool>(minThreads, maxThreads, idleTimeout, queueSize);
+    std::size_t maxThreads = _config.threadPool.maxThreads.value_or(
+        std::thread::hardware_concurrency() > 0
+            ? std::thread::hardware_concurrency()
+            : 4);
+    std::size_t queueSize =
+        _config.threadPool.queueSize.value_or(maxThreads * 2);
+    std::chrono::seconds idleTimeout =
+        _config.threadPool.idleTimeoutSeconds.value_or(
+            std::chrono::seconds(60));
+    _threadPool = std::make_unique<core::ThreadPool>(minThreads, maxThreads,
+                                                     idleTimeout, queueSize);
+
+    // Config Loader
+    if (!_configLoader)
+    {
+      std::string defaultConfigFile;
+#ifdef IORA_DEFAULT_CONFIG_FILE_PATH
+      defaultConfigFile = IORA_DEFAULT_CONFIG_FILE_PATH;
+#endif
+      std::string configFile = _config.configFile.value_or(defaultConfigFile);
+      _configLoader = std::make_unique<core::ConfigLoader>(configFile);
+    }
 
     // Modules path
     if (_config.modules.directory.has_value())
@@ -1171,7 +944,8 @@ protected:
     _stateStore = std::make_unique<storage::ConcreteStateStore>();
 
     // Expiring cache
-    _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(std::chrono::minutes(1)); // Default flush interval of 1 minute
+    _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(
+        std::chrono::minutes(1)); // Default flush interval of 1 minute
 
     if (_config.modules.autoLoad.value_or(true))
     {
@@ -1186,29 +960,340 @@ protected:
     LOG_INFO("applyConfig: Configuration applied");
 
     // Start the webhook server
-    try
-    {
-      _webhookServer->start();
-    }
-    catch (const std::exception& ex)
-    {
-      LOG_ERROR("applyConfig: Failed to start webhook server: " +
-                std::string(ex.what()));
-      throw;
-    }
 
     _isRunning = true;
   }
 
-  /// \brief Parses CLI args, loads TOML config, and applies merged config.
-  void parseConfig(int argc, char** argv)
+private:
+  /// \brief Parse command-line arguments into the internal _config
+  void parseCliArgs(int argc, char** argv)
   {
-    parseCliArgs(argc, argv);
-    parseTomlConfig();
-    applyConfig();
+    for (int i = 1; i < argc; ++i)
+    {
+      std::string arg = argv[i];
+      if ((arg == "-p" || arg == "--port") && i + 1 < argc)
+      {
+        try
+        {
+          _config.server.port = std::stoi(argv[++i]);
+        }
+        catch (const std::exception& e)
+        {
+          throw std::runtime_error("Invalid port number: " +
+                                   std::string(argv[i]));
+        }
+      }
+      else if ((arg == "-c" || arg == "--config") && i + 1 < argc)
+      {
+        _config.configFile = argv[++i];
+      }
+      else if ((arg == "-s" || arg == "--state-file") && i + 1 < argc)
+      {
+        _config.state.file = argv[++i];
+      }
+      else if ((arg == "-l" || arg == "--log-level") && i + 1 < argc)
+      {
+        _config.log.level = argv[++i];
+      }
+      else if ((arg == "-f" || arg == "--log-file") && i + 1 < argc)
+      {
+        _config.log.file = argv[++i];
+      }
+      else if (arg == "--log-async")
+      {
+        _config.log.async = true;
+      }
+      else if (arg == "--log-retention" && i + 1 < argc)
+      {
+        try
+        {
+          _config.log.retentionDays = std::stoi(argv[++i]);
+        }
+        catch (const std::exception& e)
+        {
+          throw std::runtime_error("Invalid log retention days: " +
+                                   std::string(argv[i]));
+        }
+      }
+      else if (arg == "--log-time-format" && i + 1 < argc)
+      {
+        _config.log.timeFormat = argv[++i];
+      }
+      else if (arg == "--modules-dir" && i + 1 < argc)
+      {
+        _config.modules.directory = argv[++i];
+      }
+      else if (arg == "--modules-auto-load")
+      {
+        _config.modules.autoLoad = true;
+      }
+      else if (arg == "--tls-cert" && i + 1 < argc)
+      {
+        _config.server.tls.certFile = argv[++i];
+      }
+      else if (arg == "--tls-key" && i + 1 < argc)
+      {
+        _config.server.tls.keyFile = argv[++i];
+      }
+      else if (arg == "--tls-ca" && i + 1 < argc)
+      {
+        _config.server.tls.caFile = argv[++i];
+      }
+      else if (arg == "--tls-require-client-cert")
+      {
+        _config.server.tls.requireClientCert = true;
+      }
+      else if (arg == "--threadpool-min" && i + 1 < argc)
+      {
+        try
+        {
+          _config.threadPool.minThreads =
+              static_cast<std::size_t>(std::stoi(argv[++i]));
+        }
+        catch (const std::exception& e)
+        {
+          throw std::runtime_error("Invalid threadpool min threads: " +
+                                   std::string(argv[i]));
+        }
+      }
+      else if (arg == "--threadpool-max" && i + 1 < argc)
+      {
+        try
+        {
+          _config.threadPool.maxThreads =
+              static_cast<std::size_t>(std::stoi(argv[++i]));
+        }
+        catch (const std::exception& e)
+        {
+          throw std::runtime_error("Invalid threadpool max threads: " +
+                                   std::string(argv[i]));
+        }
+      }
+      else if (arg == "--threadpool-queue" && i + 1 < argc)
+      {
+        try
+        {
+          _config.threadPool.queueSize =
+              static_cast<std::size_t>(std::stoi(argv[++i]));
+        }
+        catch (const std::exception& e)
+        {
+          throw std::runtime_error("Invalid threadpool queue size: " +
+                                   std::string(argv[i]));
+        }
+      }
+      else if (arg == "--threadpool-idle-timeout" && i + 1 < argc)
+      {
+        try
+        {
+          _config.threadPool.idleTimeoutSeconds =
+              std::chrono::seconds(std::stoi(argv[++i]));
+        }
+        catch (const std::exception& e)
+        {
+          throw std::runtime_error("Invalid threadpool idle timeout: " +
+                                   std::string(argv[i]));
+        }
+      }
+      else if (arg == "-h" || arg == "--help")
+      {
+        printHelp();
+        std::exit(0);
+      }
+      else if (arg.length() > 0 && arg[0] == '-')
+      {
+        throw std::runtime_error("Unknown option: " + arg);
+      }
+    }
   }
 
-private:
+  /// \brief Parse TOML configuration file
+  void parseTomlConfig(std::optional<std::string> configFile = std::nullopt)
+  {
+    try
+    {
+      if (!_configLoader)
+      {
+        std::string defaultConfigFile;
+#ifdef IORA_DEFAULT_CONFIG_FILE_PATH
+        defaultConfigFile = IORA_DEFAULT_CONFIG_FILE_PATH;
+#endif
+        _configLoader = std::make_unique<core::ConfigLoader>(
+            configFile.value_or(defaultConfigFile));
+      }
+      _configLoader->reload();
+      if (!_config.server.port.has_value())
+      {
+        if (auto portOpt = _configLoader->getInt("iora.server.port"))
+        {
+          _config.server.port = static_cast<int>(*portOpt);
+        }
+      }
+      if (!_config.state.file.has_value())
+      {
+        if (auto stateFileOpt = _configLoader->getString("iora.state.file"))
+        {
+          _config.state.file = *stateFileOpt;
+        }
+      }
+      if (!_config.log.level.has_value())
+      {
+        if (auto logLevelOpt = _configLoader->getString("iora.log.level"))
+        {
+          _config.log.level = *logLevelOpt;
+        }
+      }
+      if (!_config.log.file.has_value())
+      {
+        if (auto logFileOpt = _configLoader->getString("iora.log.file"))
+        {
+          _config.log.file = *logFileOpt;
+        }
+      }
+      if (!_config.log.async.has_value())
+      {
+        if (auto logAsyncOpt = _configLoader->getBool("iora.log.async"))
+        {
+          _config.log.async = *logAsyncOpt;
+        }
+      }
+      if (!_config.log.retentionDays.has_value())
+      {
+        if (auto retentionOpt = _configLoader->getInt("iora.log.retentionDays"))
+        {
+          _config.log.retentionDays = static_cast<int>(*retentionOpt);
+        }
+      }
+      if (!_config.log.timeFormat.has_value())
+      {
+        if (auto timeFormatOpt =
+                _configLoader->getString("iora.log.timeFormat"))
+        {
+          _config.log.timeFormat = *timeFormatOpt;
+        }
+      }
+      if (!_config.modules.directory.has_value())
+      {
+        if (auto modulesDirOpt =
+                _configLoader->getString("iora.modules.directory"))
+        {
+          _config.modules.directory = *modulesDirOpt;
+        }
+      }
+      if (!_config.modules.autoLoad.has_value())
+      {
+        if (auto autoLoadOpt = _configLoader->getBool("iora.modules.autoLoad"))
+        {
+          _config.modules.autoLoad = *autoLoadOpt;
+        }
+      }
+      if (!_config.server.tls.certFile.has_value())
+      {
+        if (auto certFileOpt =
+                _configLoader->getString("iora.server.tls.certFile"))
+        {
+          _config.server.tls.certFile = *certFileOpt;
+        }
+      }
+      if (!_config.server.tls.keyFile.has_value())
+      {
+        if (auto keyFileOpt =
+                _configLoader->getString("iora.server.tls.keyFile"))
+        {
+          _config.server.tls.keyFile = *keyFileOpt;
+        }
+      }
+      if (!_config.server.tls.caFile.has_value())
+      {
+        if (auto caFileOpt = _configLoader->getString("iora.server.tls.caFile"))
+        {
+          _config.server.tls.caFile = *caFileOpt;
+        }
+      }
+      if (!_config.server.tls.requireClientCert.has_value())
+      {
+        if (auto requireClientCertOpt =
+                _configLoader->getBool("iora.server.tls.requireClientCert"))
+        {
+          _config.server.tls.requireClientCert = *requireClientCertOpt;
+        }
+      }
+      if (!_config.threadPool.minThreads.has_value())
+      {
+        if (auto minThreadsOpt =
+                _configLoader->getInt("iora.threadPool.minThreads"))
+        {
+          _config.threadPool.minThreads =
+              static_cast<std::size_t>(*minThreadsOpt);
+        }
+      }
+      if (!_config.threadPool.maxThreads.has_value())
+      {
+        if (auto maxThreadsOpt =
+                _configLoader->getInt("iora.threadPool.maxThreads"))
+        {
+          _config.threadPool.maxThreads =
+              static_cast<std::size_t>(*maxThreadsOpt);
+        }
+      }
+      if (!_config.threadPool.queueSize.has_value())
+      {
+        if (auto queueSizeOpt =
+                _configLoader->getInt("iora.threadPool.queueSize"))
+        {
+          _config.threadPool.queueSize =
+              static_cast<std::size_t>(*queueSizeOpt);
+        }
+      }
+      if (!_config.threadPool.idleTimeoutSeconds.has_value())
+      {
+        if (auto idleTimeoutOpt =
+                _configLoader->getInt("iora.threadPool.idleTimeoutSeconds"))
+        {
+          _config.threadPool.idleTimeoutSeconds =
+              std::chrono::seconds(*idleTimeoutOpt);
+        }
+      }
+    }
+    catch (const std::exception& e)
+    {
+      core::Logger::warning("Failed to load TOML config: " +
+                            std::string(e.what()));
+    }
+  }
+
+  /// \brief Print help message
+  static void printHelp()
+  {
+    std::cout
+        << "Iora Service Options:\n"
+        << "  -h, --help                       Show this help message\n"
+        << "  -c, --config <file>              Configuration file path\n"
+        << "  -p, --port <port>                Server port (default: 8080)\n"
+        << "  -s, --state-file <file>          State persistence file\n"
+        << "  -l, --log-level <level>          Log level (trace, debug, info, "
+           "warning, error, fatal)\n"
+        << "  -f, --log-file <file>            Log file path\n"
+        << "      --log-async                  Enable async logging\n"
+        << "      --log-retention <days>       Log retention in days\n"
+        << "      --log-time-format <format>   Log timestamp format\n"
+        << "      --modules-dir <dir>          Modules directory\n"
+        << "      --modules-auto-load          Auto-load modules\n"
+        << "      --tls-cert <file>            TLS certificate file\n"
+        << "      --tls-key <file>             TLS key file\n"
+        << "      --tls-ca <file>              TLS CA file\n"
+        << "      --tls-require-client-cert    Require client certificate for "
+           "TLS (default: false)\n"
+        << "      --threadpool-min <n>           Set thread pool minimum "
+           "threads (default: 2)\n"
+        << "      --threadpool-max <n>           Set thread pool maximum "
+           "threads (default: 8)\n"
+        << "      --threadpool-queue <n>         Set thread pool queue size "
+           "(default: 128)\n"
+        << "      --threadpool-idle-timeout <n>  Set thread pool idle timeout "
+           "in seconds (default: 60)\n";
+  }
+
   // For main thread blocking/termination
   std::mutex _terminationMutex;
   std::condition_variable _terminationCv;
@@ -1329,8 +1414,8 @@ using IoraPlugin = IoraService::Plugin;
     }                                                                          \
     catch (const std::exception& e)                                            \
     {                                                                          \
-      iora::core::Logger::error("Plugin initialization failed: " +              \
-                               std::string(e.what()));                         \
+      iora::core::Logger::error("Plugin initialization failed: " +             \
+                                std::string(e.what()));                        \
       return nullptr;                                                          \
     }                                                                          \
   }

@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 
@@ -20,9 +21,11 @@
 #include <atomic>
 #include <memory>
 
-namespace iora {
+namespace iora
+{
 // Namespace log
-namespace core {
+namespace core
+{
 
   // Forward declaration
   class LoggerStream;
@@ -180,7 +183,7 @@ namespace core {
       {
         std::lock_guard<std::mutex> lock(data.mutex);
         rotateLogFileIfNeeded();
-        
+
         if (data.fileStream)
         {
           (*data.fileStream) << output;
@@ -249,7 +252,7 @@ namespace core {
         {
           rotateLogFileIfNeeded();
           const std::string& entry = data.queue.front();
-          
+
           if (data.fileStream)
           {
             (*data.fileStream) << entry;
@@ -507,8 +510,9 @@ namespace core {
 #define LOG_WITH_LEVEL(level, msg)                                             \
   do                                                                           \
   {                                                                            \
-    iora::core::Logger << iora::core::Logger::Level::level << LOG_CONTEXT_PREFIX \
-                      << msg << iora::core::Logger::endl;                       \
+    iora::core::Logger << iora::core::Logger::Level::level                     \
+                       << LOG_CONTEXT_PREFIX << msg                            \
+                       << iora::core::Logger::endl;                            \
   } while (0)
 
 #define LOG_TRACE(msg) LOG_WITH_LEVEL(Trace, msg)
@@ -522,4 +526,5 @@ namespace core {
   {
     return LoggerStream(level);
   }
-} } // namespace iora::core
+} // namespace core
+} // namespace iora

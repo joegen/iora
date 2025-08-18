@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 #include <iostream>
@@ -13,16 +14,16 @@
 #include <memory>
 #include <map>
 
-
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dlfcn.h>
 #endif
 
-
-namespace iora {
-namespace util {
+namespace iora
+{
+namespace util
+{
 
   /// \brief Cross-platform dynamic library loader for plugins.
   class PluginLoader
@@ -165,4 +166,5 @@ namespace util {
     mutable std::mutex _mutex; // Protects access to _plugins
   };
 
-} } // namespace iora::util
+} // namespace util
+} // namespace iora

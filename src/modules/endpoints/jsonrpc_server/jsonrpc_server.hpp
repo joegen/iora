@@ -107,11 +107,11 @@ private:
 };
 
 /// \brief Method handler signature: takes params JSON and context, returns result JSON (or throws).
-using MethodHandler = std::function<iora::core::Json(const iora::core::Json&, RpcContext&)>;
+using MethodHandler = std::function<iora::parsers::Json(const iora::parsers::Json&, RpcContext&)>;
 
 /// \brief Optional method pre/post hooks.
-using MethodPreHook = std::function<void(const std::string&, const iora::core::Json&, RpcContext&)>;
-using MethodPostHook = std::function<void(const std::string&, const iora::core::Json&, const iora::core::Json&, RpcContext&)>;
+using MethodPreHook = std::function<void(const std::string&, const iora::parsers::Json&, RpcContext&)>;
+using MethodPostHook = std::function<void(const std::string&, const iora::parsers::Json&, const iora::parsers::Json&, RpcContext&)>;
 
 /// \brief Method registration options.
 struct MethodOptions
@@ -228,10 +228,10 @@ public:
       _stats.failedRequests++;
       return makeError(nullptr, ErrorCode::InvalidRequest, "Empty request body").dump();
     }
-    iora::core::Json in;
+    iora::parsers::Json in;
     try
     {
-      in = iora::core::Json::parse(body);
+      in = iora::parsers::Json::parseString(body);
     }
     catch (const std::exception& e)
     {
@@ -262,13 +262,13 @@ public:
         return makeError(nullptr, ErrorCode::InvalidRequest, errorMsg).dump();
       }
 
-      iora::core::Json out = iora::core::Json::array();
+      iora::parsers::Json out = iora::parsers::Json::array();
       std::size_t successCount = 0;
       std::size_t errorCount = 0;
       
       for (const auto& item : in)
       {
-        iora::core::Json r = handleSingle(item, ctx);
+        iora::parsers::Json r = handleSingle(item, ctx);
         if (!r.is_null())
         {
           if (r.contains("error"))
@@ -295,7 +295,7 @@ public:
       return out.empty() ? std::string{} : out.dump();
     }
 
-    iora::core::Json r = handleSingle(in, ctx);
+    iora::parsers::Json r = handleSingle(in, ctx);
     
     if (!r.is_null())
     {
@@ -313,9 +313,9 @@ public:
   }
 
 private:
-  iora::core::Json handleSingle(const iora::core::Json& req, RpcContext& ctx)
+  iora::parsers::Json handleSingle(const iora::parsers::Json& req, RpcContext& ctx)
   {
-    const iora::core::Json id = req.contains("id") ? req["id"] : iora::core::Json();
+    const iora::parsers::Json id = req.contains("id") ? req["id"] : iora::parsers::Json();
 
     // Validate request structure
     if (!req.is_object())
@@ -323,7 +323,7 @@ private:
       return makeError(id, ErrorCode::InvalidRequest, "Request must be a JSON object");
     }
     
-    if (req.value("jsonrpc", "") != "2.0")
+    if ((req.contains("jsonrpc") ? req["jsonrpc"].get<std::string>() : "") != "2.0")
     {
       return makeError(id, ErrorCode::InvalidRequest, "Missing or invalid jsonrpc version");
     }
@@ -343,7 +343,7 @@ private:
     // Store method name in context
     ctx.metadata().method = method;
 
-    iora::core::Json params = req.value("params", iora::core::Json::object());
+    iora::parsers::Json params = req.contains("params") ? req["params"] : iora::parsers::Json::object();
     
     bool isNotif = isNotification(req);
     if (isNotif)
@@ -391,7 +391,7 @@ private:
       }
       
       // Execute the method handler
-      iora::core::Json result = handler(params, ctx);
+      iora::parsers::Json result = handler(params, ctx);
       
       // Execute post-hook if available
       if (options.postHook)
@@ -401,14 +401,14 @@ private:
       
       if (isNotif)
       {
-        return iora::core::Json(); // no response for notifications
+        return iora::parsers::Json(); // no response for notifications
       }
       
-      return iora::core::Json{
-        {"jsonrpc", "2.0"},
-        {"result", std::move(result)},
-        {"id", id.is_null() ? nullptr : id}
-      };
+      auto response = iora::parsers::Json::object();
+      response["jsonrpc"] = "2.0";
+      response["result"] = std::move(result);
+      response["id"] = id.is_null() ? nullptr : id;
+      return response;
     }
     catch (const std::invalid_argument& e)
     {
@@ -426,32 +426,31 @@ private:
     }
   }
 
-  iora::core::Json makeError(const iora::core::Json& id, ErrorCode code, const std::string& message)
+  iora::parsers::Json makeError(const iora::parsers::Json& id, ErrorCode code, const std::string& message)
   {
-    return makeError(id, code, message, iora::core::Json());
+    return makeError(id, code, message, iora::parsers::Json());
   }
   
-  iora::core::Json makeError(const iora::core::Json& id, ErrorCode code, 
-                            const std::string& message, const iora::core::Json& data)
+  iora::parsers::Json makeError(const iora::parsers::Json& id, ErrorCode code, 
+                            const std::string& message, const iora::parsers::Json& data)
   {
-    iora::core::Json error = {
-      {"code", static_cast<int>(code)},
-      {"message", message}
-    };
+    auto error = iora::parsers::Json::object();
+    error["code"] = static_cast<int>(code);
+    error["message"] = message;
     
     if (!data.is_null())
     {
       error["data"] = data;
     }
     
-    return iora::core::Json{
-      {"jsonrpc", "2.0"},
-      {"error", std::move(error)},
-      {"id", id.is_null() ? nullptr : id}
-    };
+    auto response = iora::parsers::Json::object();
+    response["jsonrpc"] = "2.0";
+    response["error"] = std::move(error);
+    response["id"] = id.is_null() ? nullptr : id;
+    return response;
   }
 
-  bool isNotification(const iora::core::Json& req) const
+  bool isNotification(const iora::parsers::Json& req) const
   {
     return !req.contains("id");
   }

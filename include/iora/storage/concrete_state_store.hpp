@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 #include <unordered_map>
@@ -12,10 +13,12 @@
 #include <algorithm>
 #include <functional>
 #include <optional>
+#include "iora/core/logger.hpp"
 
-
-namespace iora {
-namespace storage {
+namespace iora
+{
+namespace storage
+{
 
   /// \brief In-memory key-value store for string data with basic get/set
   /// operations.
@@ -47,7 +50,12 @@ namespace storage {
     void set(const std::string& key, const std::string& value)
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      bool isUpdate = _store.find(key) != _store.end();
       _store[key] = value;
+      iora::core::Logger::debug(
+          std::string("ConcreteStateStore: ") +
+          (isUpdate ? "Updated" : "Added") + " key '" + key +
+          "' (total keys: " + std::to_string(_store.size()) + ")");
     }
 
     /// \brief Gets a value by key from the store.
@@ -57,8 +65,13 @@ namespace storage {
       auto it = _store.find(key);
       if (it != _store.end())
       {
+        iora::core::Logger::debug(
+            "ConcreteStateStore: Retrieved value for key '" + key +
+            "' (length: " + std::to_string(it->second.length()) + " chars)");
         return it->second;
       }
+      iora::core::Logger::debug("ConcreteStateStore: Key '" + key +
+                                "' not found");
       return std::nullopt;
     }
 
@@ -66,7 +79,20 @@ namespace storage {
     bool remove(const std::string& key)
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      return _store.erase(key) > 0;
+      auto result = _store.erase(key) > 0;
+      if (result)
+      {
+        iora::core::Logger::debug(
+            "ConcreteStateStore: Removed key '" + key +
+            "' (remaining keys: " + std::to_string(_store.size()) + ")");
+      }
+      else
+      {
+        iora::core::Logger::debug(
+            "ConcreteStateStore: Attempted to remove non-existent key '" + key +
+            "'");
+      }
+      return result;
     }
 
     /// \brief Checks if a key exists in the store.
@@ -115,6 +141,9 @@ namespace storage {
           result.push_back(key);
         }
       }
+      iora::core::Logger::debug("ConcreteStateStore: Found " +
+                                std::to_string(result.size()) +
+                                " keys with prefix '" + prefix + "'");
       return result;
     }
 
@@ -130,6 +159,10 @@ namespace storage {
           result.push_back(key);
         }
       }
+      iora::core::Logger::debug("ConcreteStateStore: Found " +
+                                std::to_string(result.size()) +
+                                " keys with matching value (length: " +
+                                std::to_string(value.length()) + " chars)");
       return result;
     }
 
@@ -141,11 +174,23 @@ namespace storage {
       std::vector<std::string> result;
       for (const auto& [key, _] : _store)
       {
-        if (matcher(key))
+        try
         {
-          result.push_back(key);
+          if (matcher(key))
+          {
+            result.push_back(key);
+          }
+        }
+        catch (const std::exception& e)
+        {
+          iora::core::Logger::error(
+              "ConcreteStateStore: Matcher function threw exception for key '" +
+              key + "': " + e.what());
         }
       }
+      iora::core::Logger::debug("ConcreteStateStore: Found " +
+                                std::to_string(result.size()) +
+                                " keys matching custom criteria");
       return result;
     }
 
@@ -156,4 +201,5 @@ namespace storage {
         _store;
   };
 
-} } // namespace iora::state
+} // namespace storage
+} // namespace iora

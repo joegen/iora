@@ -53,7 +53,7 @@ public:
 class RemoteError : public JsonRpcError
 {
 public:
-  RemoteError(int code, const std::string& message, iora::core::Json data)
+  RemoteError(int code, const std::string& message, iora::parsers::Json data)
     : JsonRpcError("JSON-RPC remote error: (" + std::to_string(code) +
                     ") " + message),
       _code(code),
@@ -66,12 +66,12 @@ public:
 
   const std::string& message() const noexcept { return _message; }
 
-  const iora::core::Json& data() const noexcept { return _data; }
+  const iora::parsers::Json& data() const noexcept { return _data; }
 
 private:
   int _code;
   std::string _message;
-  iora::core::Json _data;
+  iora::parsers::Json _data;
 };
 
 /// \brief JSON-RPC client configuration.
@@ -170,15 +170,15 @@ struct ClientStats
 struct BatchItem
 {
   std::string method;
-  iora::core::Json params;
+  iora::parsers::Json params;
   std::optional<std::uint64_t> id; // None for notifications
 
-  BatchItem(std::string method, iora::core::Json params)
+  BatchItem(std::string method, iora::parsers::Json params)
     : method(std::move(method)), params(std::move(params))
   {
   }
 
-  BatchItem(std::string method, iora::core::Json params, std::uint64_t id)
+  BatchItem(std::string method, iora::parsers::Json params, std::uint64_t id)
     : method(std::move(method)), params(std::move(params)), id(id)
   {
   }
@@ -442,9 +442,9 @@ public:
     }
   }
 
-  iora::core::Json
+  iora::parsers::Json
   call(const std::string& endpoint, const std::string& method,
-        const iora::core::Json& params = iora::core::Json::object(),
+        const iora::parsers::Json& params = iora::parsers::Json::object(),
         const std::vector<std::pair<std::string, std::string>>& headers = {})
   {
     _stats.totalRequests++;
@@ -452,9 +452,9 @@ public:
     try
     {
       auto lease = acquire_(endpoint);
-      iora::core::Json req =
+      iora::parsers::Json req =
           makeRequestEnvelope_(method, params, nextId_());
-      iora::core::Json resp = sendJsonWithRetries_(
+      iora::parsers::Json resp = sendJsonWithRetries_(
           lease.client(), endpoint, req, mergeHeaders_(headers));
       _stats.successfulRequests++;
       return parseResponseOrThrow_(std::move(resp));
@@ -474,7 +474,7 @@ public:
 
   void notify(
       const std::string& endpoint, const std::string& method,
-      const iora::core::Json& params = iora::core::Json::object(),
+      const iora::parsers::Json& params = iora::parsers::Json::object(),
       const std::vector<std::pair<std::string, std::string>>& headers = {})
   {
     _stats.totalRequests++;
@@ -483,7 +483,7 @@ public:
     try
     {
       auto lease = acquire_(endpoint);
-      iora::core::Json req = makeNotificationEnvelope_(method, params);
+      iora::parsers::Json req = makeNotificationEnvelope_(method, params);
       (void) sendJsonWithRetries_(lease.client(), endpoint, req,
                                   mergeHeaders_(headers));
       _stats.successfulRequests++;
@@ -501,9 +501,9 @@ public:
     }
   }
 
-  std::future<iora::core::Json> callAsync(
+  std::future<iora::parsers::Json> callAsync(
       const std::string& endpoint, const std::string& method,
-      const iora::core::Json& params = iora::core::Json::object(),
+      const iora::parsers::Json& params = iora::parsers::Json::object(),
       const std::vector<std::pair<std::string, std::string>>& headers = {})
   {
     auto self = this;
@@ -513,9 +513,9 @@ public:
 
   void
   callAsync(const std::string& endpoint, const std::string& method,
-            const iora::core::Json& params,
+            const iora::parsers::Json& params,
             const std::vector<std::pair<std::string, std::string>>& headers,
-            std::function<void(iora::core::Json)> onSuccess,
+            std::function<void(iora::parsers::Json)> onSuccess,
             std::function<void(std::exception_ptr)> onError)
   {
     // Use only copyable captures, no mutable, so operator() is const
@@ -543,7 +543,7 @@ public:
         });
   }
 
-  std::vector<iora::core::Json> callBatch(
+  std::vector<iora::parsers::Json> callBatch(
       const std::string& endpoint, const std::vector<BatchItem>& items,
       const std::vector<std::pair<std::string, std::string>>& headers = {})
   {
@@ -556,7 +556,7 @@ public:
     _stats.totalRequests++;
 
     auto lease = acquire_(endpoint);
-    iora::core::Json batchReq = iora::core::Json::array();
+    iora::parsers::Json batchReq = iora::parsers::Json::array();
 
     for (const auto& item : items)
     {
@@ -575,7 +575,7 @@ public:
 
     try
     {
-      iora::core::Json batchResp = sendJson_(
+      iora::parsers::Json batchResp = sendJson_(
           lease.client(), endpoint, batchReq, mergeHeaders_(headers));
       _stats.successfulRequests++;
       return parseBatchResponseOrThrow_(std::move(batchResp), items);
@@ -587,7 +587,7 @@ public:
     }
   }
 
-  std::future<std::vector<iora::core::Json>> callBatchAsync(
+  std::future<std::vector<iora::parsers::Json>> callBatchAsync(
       const std::string& endpoint, const std::vector<BatchItem>& items,
       const std::vector<std::pair<std::string, std::string>>& headers = {})
   {
@@ -815,11 +815,11 @@ private:
     return false;
   }
 
-  static iora::core::Json
+  static iora::parsers::Json
   makeRequestEnvelope_(const std::string& method,
-                        const iora::core::Json& params, std::uint64_t id)
+                        const iora::parsers::Json& params, std::uint64_t id)
   {
-    iora::core::Json j;
+    iora::parsers::Json j;
     j["jsonrpc"] = "2.0";
     j["method"] = method;
     // Only include params if not null and not empty object (for wire
@@ -832,11 +832,11 @@ private:
     return j;
   }
 
-  static iora::core::Json
+  static iora::parsers::Json
   makeNotificationEnvelope_(const std::string& method,
-                            const iora::core::Json& params)
+                            const iora::parsers::Json& params)
   {
-    iora::core::Json j;
+    iora::parsers::Json j;
     j["jsonrpc"] = "2.0";
     j["method"] = method;
     // Only include params if not null and not empty object (for wire
@@ -894,7 +894,7 @@ private:
     return true;
   }
 
-  static iora::core::Json parseResponseOrThrow_(iora::core::Json resp)
+  static iora::parsers::Json parseResponseOrThrow_(iora::parsers::Json resp)
   {
     if (resp.is_object())
     {
@@ -902,10 +902,10 @@ private:
       if (obj.contains("error"))
       {
         const auto& err = obj["error"];
-        int code = err.value("code", -32000);
+        int code = err.contains("code") ? err["code"].get<int>() : -32000;
         std::string message =
-            err.value("message", std::string{"Unknown error"});
-        iora::core::Json data = err.value("data", iora::core::Json{});
+            err.contains("message") ? err["message"].get<std::string>() : std::string{"Unknown error"};
+        iora::parsers::Json data = err.contains("data") ? err["data"] : iora::parsers::Json(nullptr);
         throw RemoteError(code, message, std::move(data));
       }
       if (obj.contains("result"))
@@ -924,21 +924,34 @@ private:
   std::unique_ptr<iora::network::HttpClient>
   makeHttpClient_(const std::string& endpoint)
   {
-    auto cli = _config.httpClientFactory(endpoint);
-    if (!cli)
-    {
-      throw JsonRpcError("httpClientFactory returned null");
+    // Use a future to make HTTP client construction timeout-aware
+    // This prevents hanging if there are transport layer conflicts
+    auto clientFuture = std::async(std::launch::async, [this, &endpoint]() {
+      auto cli = _config.httpClientFactory(endpoint);
+      if (!cli)
+      {
+        throw JsonRpcError("httpClientFactory returned null");
+      }
+      if (_config.httpClientConfigurer)
+      {
+        _config.httpClientConfigurer(endpoint, *cli);
+      }
+      return cli;
+    });
+    
+    // Wait for client creation with timeout (30 seconds should be more than enough)
+    auto status = clientFuture.wait_for(std::chrono::seconds(30));
+    if (status == std::future_status::timeout) {
+      throw JsonRpcError("HTTP client creation timed out - likely transport layer conflict");
     }
-    if (_config.httpClientConfigurer)
-    {
-      _config.httpClientConfigurer(endpoint, *cli);
-    }
+    
+    auto cli = clientFuture.get();
     return cli;
   }
 
-  iora::core::Json
+  iora::parsers::Json
   sendJson_(iora::network::HttpClient& http, const std::string& url,
-            const iora::core::Json& payload,
+            const iora::parsers::Json& payload,
             const std::vector<std::pair<std::string, std::string>>& headers)
   {
     // Convert vector to map for HttpClient
@@ -947,13 +960,13 @@ private:
     {
       headerMap[kv.first] = kv.second;
     }
-    return http.postJson(url, payload, headerMap,
-                          _config.requestTimeout.count());
+    auto response = http.postJson(url, payload, headerMap, 0); // No retries at HTTP level - retries handled by JSON-RPC client
+    return iora::network::HttpClient::parseJsonOrThrow(response);
   }
 
-  iora::core::Json sendJsonWithRetries_(
+  iora::parsers::Json sendJsonWithRetries_(
       iora::network::HttpClient& http, const std::string& url,
-      const iora::core::Json& payload,
+      const iora::parsers::Json& payload,
       const std::vector<std::pair<std::string, std::string>>& headers)
   {
     std::size_t attempts = 0;
@@ -989,8 +1002,8 @@ private:
     }
   }
 
-  std::vector<iora::core::Json>
-  parseBatchResponseOrThrow_(iora::core::Json batchResp,
+  std::vector<iora::parsers::Json>
+  parseBatchResponseOrThrow_(iora::parsers::Json batchResp,
                               const std::vector<BatchItem>& originalItems)
   {
     if (!batchResp.is_array())
@@ -998,11 +1011,11 @@ private:
       throw JsonRpcError("Batch response must be an array");
     }
 
-    std::vector<iora::core::Json> results;
+    std::vector<iora::parsers::Json> results;
     results.reserve(originalItems.size());
 
     // Create map of id -> response for efficient lookup
-    std::unordered_map<std::uint64_t, iora::core::Json> responseMap;
+    std::unordered_map<std::uint64_t, iora::parsers::Json> responseMap;
     for (const auto& respItem : batchResp)
     {
       if (respItem.contains("id") && !respItem["id"].is_null())
@@ -1031,7 +1044,7 @@ private:
       else
       {
         // Notification - no response expected
-        results.push_back(iora::core::Json());
+        results.push_back(iora::parsers::Json());
       }
     }
 

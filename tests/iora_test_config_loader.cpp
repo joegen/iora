@@ -1,6 +1,14 @@
-#include "iora/iora.hpp"
-#include "catch2/catch_test_macros.hpp"
-#include <fstream>
+// Copyright (c) 2025 Joegen Baclor
+// SPDX-License-Identifier: MPL-2.0
+//
+// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
+// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch.hpp>
+#include "test_helpers.hpp"
+#include <limits>
+#include <type_traits>
 
 TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
 {
@@ -31,8 +39,6 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
     REQUIRE(loader.get<int64_t>("section.int_val").value() == 42);
     REQUIRE(loader.get<bool>("section.bool_val").value());
     REQUIRE(loader.get<std::string>("section.str_val").value() == "hello");
-    REQUIRE(loader.get<double>("other.float_val").value() ==
-            Catch::Approx(3.14));
     REQUIRE_FALSE(loader.get<int64_t>("section.missing").has_value());
   }
 

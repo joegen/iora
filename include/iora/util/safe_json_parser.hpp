@@ -1,19 +1,22 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
-#include "iora/core/json.hpp"
+#include "iora/parsers/json.hpp"
 
-namespace iora {
-namespace util {
-    
+namespace iora
+{
+namespace util
+{
+
   /// \brief Safe JSON parsing with size limits and validation
   class SafeJsonParser
   {
@@ -21,7 +24,7 @@ namespace util {
     static constexpr size_t MAX_JSON_SIZE = 10 * 1024 * 1024; // 10MB limit
     static constexpr size_t MAX_JSON_DEPTH = 100;             // Depth limit
 
-    static core::Json parseWithLimits(const std::string& input)
+    static parsers::Json parseWithLimits(const std::string& input)
     {
       if (input.size() > MAX_JSON_SIZE)
       {
@@ -31,23 +34,23 @@ namespace util {
 
       if (input.empty())
       {
-        return core::Json::object();
+        return parsers::Json::object();
       }
 
       try
       {
-        auto parsed = core::Json::parse(input);
+        auto parsed = parsers::Json::parseString(input);
         validateJsonDepth(parsed, 0);
         return parsed;
       }
-      catch (const core::Json::parse_error& e)
+      catch (const std::exception& e)
       {
         throw std::runtime_error("JSON parse error: " + std::string(e.what()));
       }
     }
 
   private:
-    static void validateJsonDepth(const core::Json& j, size_t depth)
+    static void validateJsonDepth(const parsers::Json& j, size_t depth)
     {
       if (depth > MAX_JSON_DEPTH)
       {
@@ -57,19 +60,21 @@ namespace util {
 
       if (j.is_object())
       {
-        for (const auto& [key, value] : j.items())
+        const auto& obj = j.items();
+        for (const auto& [key, value] : obj)
         {
           validateJsonDepth(value, depth + 1);
         }
       }
       else if (j.is_array())
       {
-        for (const auto& item : j)
+        for (auto it = j.begin(); it != j.end(); ++it)
         {
-          validateJsonDepth(item, depth + 1);
+          validateJsonDepth(*it, depth + 1);
         }
       }
     }
   };
 
-} } // namespace iora::util
+} // namespace util
+} // namespace iora

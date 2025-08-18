@@ -1,8 +1,9 @@
 // Copyright (c) 2025 Joegen Baclor
 // SPDX-License-Identifier: MPL-2.0
 //
-// This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
-// See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
+// This file is part of Iora, which is licensed under the Mozilla Public
+// License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
+// details.
 
 #pragma once
 #include <fstream>
@@ -10,11 +11,13 @@
 #include <set>
 #include <thread>
 #include <condition_variable>
-#include "iora/core/json.hpp"
+#include "iora/parsers/json.hpp"
 #include "iora/core/logger.hpp"
 
-namespace iora {
-namespace storage {
+namespace iora
+{
+namespace storage
+{
 
   /// \brief Thread-safe key-value store backed by a JSON file with background
   /// flushing and persistence.
@@ -25,21 +28,31 @@ namespace storage {
     explicit JsonFileStore(std::string filename)
       : _filename(std::move(filename)), _dirty(false)
     {
+      iora::core::Logger::info("JsonFileStore: Initializing with file: " +
+                               _filename);
       std::ifstream file(_filename);
       if (file)
       {
         try
         {
           file >> _store;
+          iora::core::Logger::info("JsonFileStore: Loaded existing data with " +
+                                   std::to_string(_store.size()) +
+                                   " keys from: " + _filename);
         }
-        catch (...)
+        catch (const std::exception& e)
         {
-          _store = core::Json::object();
+          iora::core::Logger::error(
+              "JsonFileStore: Failed to parse JSON from " + _filename + ": " +
+              e.what() + " - starting with empty store");
+          _store = parsers::Json::object();
         }
       }
       else
       {
-        _store = core::Json::object();
+        iora::core::Logger::info("JsonFileStore: File " + _filename +
+                                 " does not exist, starting with empty store");
+        _store = parsers::Json::object();
       }
 
       registerStore();
@@ -48,24 +61,39 @@ namespace storage {
     /// \brief Destructor unregisters the store
     ~JsonFileStore()
     {
+      iora::core::Logger::debug("JsonFileStore: Destructor called for " +
+                                _filename);
       unregisterStore();
       flush();
+      iora::core::Logger::debug("JsonFileStore: Cleanup completed for " +
+                                _filename);
     }
 
     /// \brief Set a key to a value and mark store dirty
     template <typename T> void set(const std::string& key, const T& value)
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      bool isUpdate = _store.contains(key);
       _store[key] = value;
       _dirty = true;
+      iora::core::Logger::debug(
+          std::string("JsonFileStore: ") + (isUpdate ? "Updated" : "Added") +
+          " key '" + key + "' in " + _filename +
+          " (total keys: " + std::to_string(_store.size()) + ")");
     }
 
     /// \brief Specialization for std::string
     void set(const std::string& key, const std::string& value)
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      bool isUpdate = _store.contains(key);
       _store[key] = value;
       _dirty = true;
+      iora::core::Logger::debug(
+          std::string("JsonFileStore: ") + (isUpdate ? "Updated" : "Added") +
+          " string key '" + key + "' in " + _filename +
+          " (value length: " + std::to_string(value.length()) +
+          " chars, total keys: " + std::to_string(_store.size()) + ")");
     }
 
     /// \brief Get a value from the store
@@ -77,13 +105,20 @@ namespace storage {
         try
         {
           auto val = _store[key].get<T>();
+          iora::core::Logger::debug("JsonFileStore: Retrieved value for key '" +
+                                    key + "' from " + _filename);
           return val;
         }
-        catch (...)
+        catch (const std::exception& e)
         {
+          iora::core::Logger::error(
+              "JsonFileStore: Type conversion failed for key '" + key +
+              "' in " + _filename + ": " + e.what());
           return std::nullopt;
         }
       }
+      iora::core::Logger::debug("JsonFileStore: Key '" + key +
+                                "' not found in " + _filename);
       return std::nullopt;
     }
 
@@ -96,13 +131,22 @@ namespace storage {
         try
         {
           auto val = _store[key].get<std::string>();
+          iora::core::Logger::debug(
+              "JsonFileStore: Retrieved string value for key '" + key +
+              "' from " + _filename +
+              " (length: " + std::to_string(val.length()) + " chars)");
           return val;
         }
-        catch (...)
+        catch (const std::exception& e)
         {
+          iora::core::Logger::error(
+              "JsonFileStore: String conversion failed for key '" + key +
+              "' in " + _filename + ": " + e.what());
           return std::nullopt;
         }
       }
+      iora::core::Logger::debug("JsonFileStore: String key '" + key +
+                                "' not found in " + _filename);
       return std::nullopt;
     }
 
@@ -110,16 +154,42 @@ namespace storage {
     void remove(const std::string& key)
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      _store.erase(key);
-      _dirty = true;
+      auto it = _store.find(key);
+      if (it != _store.endObject())
+      {
+        _store.erase(it);
+        _dirty = true;
+        iora::core::Logger::debug(
+            "JsonFileStore: Removed key '" + key + "' from " + _filename +
+            " (remaining keys: " + std::to_string(_store.size()) + ")");
+      }
+      else
+      {
+        iora::core::Logger::debug(
+            "JsonFileStore: Attempted to remove non-existent key '" + key +
+            "' from " + _filename);
+      }
     }
 
     /// \brief Immediately write the store to disk
     void flush()
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      saveToFile();
-      _dirty = false;
+      if (_dirty)
+      {
+        iora::core::Logger::debug("JsonFileStore: Flushing " +
+                                  std::to_string(_store.size()) + " keys to " +
+                                  _filename);
+        saveToFile();
+        _dirty = false;
+        iora::core::Logger::debug("JsonFileStore: Flush completed for " +
+                                  _filename);
+      }
+      else
+      {
+        iora::core::Logger::debug("JsonFileStore: No changes to flush for " +
+                                  _filename);
+      }
     }
 
     /// \brief Configure the background flush interval (in milliseconds)
@@ -161,10 +231,27 @@ namespace storage {
   private:
     void saveToFile() const
     {
-      std::ofstream file(_filename);
-      if (file)
+      try
       {
-        file << _store.dump(2);
+        std::ofstream file(_filename);
+        if (file)
+        {
+          std::string jsonData = _store.dump(2);
+          file << jsonData;
+          iora::core::Logger::debug("JsonFileStore: Wrote " +
+                                    std::to_string(jsonData.length()) +
+                                    " bytes to " + _filename);
+        }
+        else
+        {
+          iora::core::Logger::error("JsonFileStore: Failed to open " +
+                                    _filename + " for writing");
+        }
+      }
+      catch (const std::exception& e)
+      {
+        iora::core::Logger::error("JsonFileStore: Failed to write to " +
+                                  _filename + ": " + e.what());
       }
     }
 
@@ -173,6 +260,8 @@ namespace storage {
       std::lock_guard<std::mutex> lock(_mutex);
       if (_dirty)
       {
+        iora::core::Logger::debug(
+            "JsonFileStore: Background flush triggered for " + _filename);
         saveToFile();
         _dirty = false;
       }
@@ -211,7 +300,8 @@ namespace storage {
       {
         {
           std::unique_lock<std::mutex> lock(terminateCvMutex());
-          if (terminationCv().wait_for(lock, flushInterval()) != std::cv_status::timeout)
+          if (terminationCv().wait_for(lock, flushInterval()) !=
+              std::cv_status::timeout)
           {
             // Notified to exit
             break;
@@ -226,9 +316,10 @@ namespace storage {
 
     const std::string _filename;
     mutable std::mutex _mutex;
-    core::Json _store;
+    parsers::Json _store;
     bool _dirty;
     // All statics are now function-local for safe destruction order
   };
 
-} } // namespace iora::state
+} // namespace storage
+} // namespace iora

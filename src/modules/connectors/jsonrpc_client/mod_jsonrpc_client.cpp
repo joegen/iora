@@ -12,9 +12,9 @@
 //      -> std::uint32_t()
 //
 //  - "jsonrpc.client.call"
-//      -> iora::core::Json(const std::string& endpoint,
+//      -> iora::parsers::Json(const std::string& endpoint,
 //                          const std::string& method,
-//                          const iora::core::Json& params,
+//                          const iora::parsers::Json& params,
 //                          const
 //                          std::vector<std::pair<std::string,std::string>>&
 //                          headers)
@@ -22,12 +22,12 @@
 //  - "jsonrpc.client.notify"
 //      -> void(const std::string& endpoint,
 //              const std::string& method,
-//              const iora::core::Json& params,
+//              const iora::parsers::Json& params,
 //              const std::vector<std::pair<std::string,std::string>>& headers)
 //
 //  - "jsonrpc.client.callBatch"
-//      -> std::vector<iora::core::Json>(const std::string& endpoint,
-//                                       const iora::core::Json& items,
+//      -> std::vector<iora::parsers::Json>(const std::string& endpoint,
+//                                       const iora::parsers::Json& items,
 //                                       const
 //                                       std::vector<std::pair<std::string,std::string>>&
 //                                       headers)
@@ -36,26 +36,26 @@
 //  - "jsonrpc.client.callAsync"
 //      -> std::string(const std::string& endpoint,
 //                     const std::string& method,
-//                     const iora::core::Json& params,
+//                     const iora::parsers::Json& params,
 //                     const std::vector<std::pair<std::string,std::string>>&
 //                     headers)
 //     returns a jobId; poll with "jsonrpc.client.result"
 //
 //  - "jsonrpc.client.callBatchAsync"
 //      -> std::string(const std::string& endpoint,
-//                     const iora::core::Json& items,
+//                     const iora::parsers::Json& items,
 //                     const std::vector<std::pair<std::string,std::string>>& headers)
 //     returns a jobId; poll with "jsonrpc.client.result"
 //     items is a JSON array of objects with {method, params, id?}
 //
 //  - "jsonrpc.client.result"
-//      -> iora::core::Json(const std::string& jobId)
+//      -> iora::parsers::Json(const std::string& jobId)
 //     returns: {"done":true,"result":<JSON>} or
 //     {"done":true,"error":{code,message,data}}
 //              or {"done":false}
 //
 //  - "jsonrpc.client.getStats"
-//      -> iora::core::Json()
+//      -> iora::parsers::Json()
 //     returns stats as JSON object with counters
 //
 //  - "jsonrpc.client.resetStats"
@@ -268,9 +268,9 @@ public:
     service->exportApi(
         *this, "jsonrpc.client.call",
         [this](const std::string& endpoint, const std::string& method,
-               const iora::core::Json& params,
+               const iora::parsers::Json& params,
                const std::vector<std::pair<std::string, std::string>>& headers)
-            -> iora::core::Json
+            -> iora::parsers::Json
         {
           // Direct call - let exceptions propagate for proper error handling
           return _client->call(endpoint, method, params, headers);
@@ -279,31 +279,34 @@ public:
     service->exportApi(
         *this, "jsonrpc.client.notify",
         [this](const std::string& endpoint, const std::string& method,
-               const iora::core::Json& params,
+               const iora::parsers::Json& params,
                const std::vector<std::pair<std::string, std::string>>& headers)
             -> void { _client->notify(endpoint, method, params, headers); });
 
     service->exportApi(
         *this, "jsonrpc.client.callAsync",
         [this](const std::string& endpoint, const std::string& method,
-               const iora::core::Json& params,
+               const iora::parsers::Json& params,
                const std::vector<std::pair<std::string, std::string>>& headers)
             -> std::string
         {
           const std::string jobId = nextJobId_();
 
           // Lambdas must be copyable/movable for thread pool
-          auto onSuccess = [this, jobId](iora::core::Json result)
+          auto onSuccess = [this, jobId](iora::parsers::Json result)
           {
             std::lock_guard<std::mutex> lock(_jobsMutex);
-            _jobs[jobId] =
-                iora::core::Json{{"done", true}, {"result", std::move(result)}};
+            auto jobResult = iora::parsers::Json::object();
+            jobResult["done"] = true;
+            jobResult["result"] = std::move(result);
+            _jobs[jobId] = jobResult;
           };
           auto onError = [this, jobId](std::exception_ptr ep)
           {
-            iora::core::Json err = {{"code", -32000},
-                                    {"message", "Unknown error"},
-                                    {"data", nullptr}};
+            auto err = iora::parsers::Json::object();
+            err["code"] = -32000;
+            err["message"] = "Unknown error";
+            err["data"] = nullptr;
             try
             {
               if (ep)
@@ -321,8 +324,10 @@ public:
             }
 
             std::lock_guard<std::mutex> lock(_jobsMutex);
-            _jobs[jobId] =
-                iora::core::Json{{"done", true}, {"error", std::move(err)}};
+            auto jobError = iora::parsers::Json::object();
+            jobError["done"] = true;
+            jobError["error"] = std::move(err);
+            _jobs[jobId] = jobError;
           };
 
           _client->callAsync(endpoint, method, params, headers,
@@ -333,9 +338,9 @@ public:
     service->exportApi(
         *this, "jsonrpc.client.callBatch",
         [this](const std::string& endpoint,
-               const iora::core::Json& itemsJson,
+               const iora::parsers::Json& itemsJson,
                const std::vector<std::pair<std::string, std::string>>& headers)
-            -> std::vector<iora::core::Json>
+            -> std::vector<iora::parsers::Json>
         {
           // Convert JSON array to BatchItem vector
           std::vector<iora::modules::connectors::BatchItem> items;
@@ -349,7 +354,7 @@ public:
             }
             
             std::string method = item["method"].get<std::string>();
-            iora::core::Json params = item.value("params", iora::core::Json::object());
+            iora::parsers::Json params = item.contains("params") ? item["params"] : iora::parsers::Json::object();
             
             if (item.contains("id")) {
               std::uint64_t id = item["id"].get<std::uint64_t>();
@@ -365,24 +370,27 @@ public:
     service->exportApi(
         *this, "jsonrpc.client.callBatchAsync",
         [this](const std::string& endpoint,
-               const iora::core::Json& itemsJson,
+               const iora::parsers::Json& itemsJson,
                const std::vector<std::pair<std::string, std::string>>& headers)
             -> std::string
         {
           const std::string jobId = nextJobId_();
 
-          auto onSuccess = [this, jobId](std::vector<iora::core::Json> results)
+          auto onSuccess = [this, jobId](std::vector<iora::parsers::Json> results)
           {
             std::lock_guard<std::mutex> lock(_jobsMutex);
-            _jobs[jobId] = iora::core::Json{
-                {"done", true}, {"result", iora::core::Json(results)}};
+            auto jobResult = iora::parsers::Json::object();
+            jobResult["done"] = true;
+            jobResult["result"] = iora::parsers::Json(results);
+            _jobs[jobId] = jobResult;
           };
 
           auto onError = [this, jobId](std::exception_ptr ep)
           {
-            iora::core::Json err = {{"code", -32000},
-                                    {"message", "Unknown error"},
-                                    {"data", nullptr}};
+            auto err = iora::parsers::Json::object();
+            err["code"] = -32000;
+            err["message"] = "Unknown error";
+            err["data"] = nullptr;
             try
             {
               if (ep)
@@ -400,8 +408,10 @@ public:
             }
 
             std::lock_guard<std::mutex> lock(_jobsMutex);
-            _jobs[jobId] =
-                iora::core::Json{{"done", true}, {"error", std::move(err)}};
+            auto jobError = iora::parsers::Json::object();
+            jobError["done"] = true;
+            jobError["error"] = std::move(err);
+            _jobs[jobId] = jobError;
           };
 
           // Submit batch request to thread pool
@@ -422,7 +432,7 @@ public:
                     }
                     
                     std::string method = item["method"].get<std::string>();
-                    iora::core::Json params = item.value("params", iora::core::Json::object());
+                    iora::parsers::Json params = item.contains("params") ? item["params"] : iora::parsers::Json::object();
                     
                     if (item.contains("id")) {
                       std::uint64_t id = item["id"].get<std::uint64_t>();
@@ -445,33 +455,35 @@ public:
         });
 
     service->exportApi(*this, "jsonrpc.client.result",
-                       [this](const std::string& jobId) -> iora::core::Json
+                       [this](const std::string& jobId) -> iora::parsers::Json
                        {
                          std::lock_guard<std::mutex> lock(_jobsMutex);
                          auto it = _jobs.find(jobId);
                          if (it == _jobs.end())
                          {
-                           return iora::core::Json{{"done", false}};
+                           auto result = iora::parsers::Json::object();
+                           result["done"] = false;
+                           return result;
                          }
                          return it->second;
                        });
 
     service->exportApi(*this, "jsonrpc.client.getStats",
-                       [this]() -> iora::core::Json
+                       [this]() -> iora::parsers::Json
                        {
                          const auto& stats = _client->getStats();
-                         return iora::core::Json{
-                           {"totalRequests", stats.totalRequests.load()},
-                           {"successfulRequests", stats.successfulRequests.load()},
-                           {"failedRequests", stats.failedRequests.load()},
-                           {"timeoutRequests", stats.timeoutRequests.load()},
-                           {"retriedRequests", stats.retriedRequests.load()},
-                           {"batchRequests", stats.batchRequests.load()},
-                           {"notificationRequests", stats.notificationRequests.load()},
-                           {"poolExhaustions", stats.poolExhaustions.load()},
-                           {"connectionsCreated", stats.connectionsCreated.load()},
-                           {"connectionsEvicted", stats.connectionsEvicted.load()}
-                         };
+                         auto statsJson = iora::parsers::Json::object();
+                         statsJson["totalRequests"] = stats.totalRequests.load();
+                         statsJson["successfulRequests"] = stats.successfulRequests.load();
+                         statsJson["failedRequests"] = stats.failedRequests.load();
+                         statsJson["timeoutRequests"] = stats.timeoutRequests.load();
+                         statsJson["retriedRequests"] = stats.retriedRequests.load();
+                         statsJson["batchRequests"] = stats.batchRequests.load();
+                         statsJson["notificationRequests"] = stats.notificationRequests.load();
+                         statsJson["poolExhaustions"] = stats.poolExhaustions.load();
+                         statsJson["connectionsCreated"] = stats.connectionsCreated.load();
+                         statsJson["connectionsEvicted"] = stats.connectionsEvicted.load();
+                         return statsJson;
                        });
 
     service->exportApi(*this, "jsonrpc.client.resetStats",
@@ -563,7 +575,7 @@ private:
 
   std::atomic<std::uint64_t> _jobIdCounter;
   std::mutex _jobsMutex;
-  std::unordered_map<std::string, iora::core::Json> _jobs;
+  std::unordered_map<std::string, iora::parsers::Json> _jobs;
 
   // ThreadPool: prefer service-owned; fall back to a small internal pool if
   // missing.
