@@ -80,13 +80,13 @@ function(configure_iora_dependencies)
     #     INCLUDE_DIR NLOHMANN_JSON_INCLUDE_DIR
     # )
     
-    # Catch2 (for testing)
+    # Catch2 (for testing) - Using v2 for compatibility
     find_or_fetch_dependency(
         NAME Catch2
         PACKAGE_NAME Catch2
         TARGET_NAME Catch2::Catch2WithMain
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG v3.4.0
+        GIT_TAG v2.13.10
         INCLUDE_DIR CATCH2_INCLUDE_DIR
     )
        

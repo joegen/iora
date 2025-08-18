@@ -1,41 +1,25 @@
 # NOTICE: Third-Party Attributions for Iora
 
-This project includes third-party code licensed under the MIT License:
+This project includes third-party software with the following licenses:
 
 ---
 
-**cpr** – A modern C++ HTTP client library  
-https://github.com/libcpr/cpr  
-Copyright (c) 2015-present Tim Stack  
-License: MIT
+**OpenSSL** – Cryptography and SSL/TLS Toolkit  
+https://www.openssl.org/  
+Copyright (c) 1998-2024 The OpenSSL Project  
+Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson  
+License: Apache License 2.0 and OpenSSL License (dual-licensed)
+
+OpenSSL is used for HTTPS support and cryptographic operations.
 
 ---
 
-**cpp-httplib** – A C++11 single-header HTTP/HTTPS server and client  
-https://github.com/yhirose/cpp-httplib  
-Copyright (c) 2020 Yuji Hirose  
-License: MIT
+**Catch2** – A modern, C++-native test framework  
+https://github.com/catchorg/Catch2  
+Copyright (c) 2010-2023 Two Blue Cubes Ltd.  
+License: Boost Software License 1.0
 
----
-
-**nlohmann/json** – JSON for Modern C++  
-https://github.com/nlohmann/json  
-Copyright (c) 2013-2023 Niels Lohmann  
-License: MIT
-
----
-
-**toml++** – TOML parser for C++  
-https://github.com/marzer/tomlplusplus  
-Copyright (c) 2019–2024 Mark Gillard  
-License: MIT
-
----
-
-**tiktoken-cpp** – Byte pair encoding tokenizer for OpenAI models  
-https://github.com/gh-markt/tiktoken  
-Copyright (c) 2023 gh-markt  
-License: MIT
+Catch2 v2.13.10 is used for unit testing.
 
 ---
 
