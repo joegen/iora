@@ -26,7 +26,6 @@
 #include "iora/core/thread_pool.hpp"
 #include "iora/network/unified_shared_transport.hpp"
 #include "iora/parsers/http_message.hpp"
-#include "iora/util/safe_json_parser.hpp"
 
 namespace iora
 {
@@ -41,6 +40,7 @@ namespace network
     /// \brief Configuration constants
     static constexpr std::size_t MAX_PENDING_REQUESTS =
         1000; // Maximum queued requests
+    static constexpr std::size_t DEFAULT_MAX_JSON_SIZE = 10 * 1024 * 1024; // 10MB default
 
     /// \brief Explicitly delete copy/move constructors and assignment operators
     WebhookServer(const WebhookServer&) = delete;
@@ -55,6 +55,13 @@ namespace network
       std::string keyFile;
       std::string caFile;
       bool requireClientCert = false;
+    };
+
+    /// \brief JSON parsing configuration
+    struct JsonConfig
+    {
+      std::size_t maxPayloadSize = DEFAULT_MAX_JSON_SIZE;  // Maximum JSON payload size in bytes
+      parsers::ParseLimits parseLimits;  // JSON parsing limits (depth, array size, etc.)
     };
 
     /// \brief HTTP request wrapper to maintain API compatibility
@@ -152,6 +159,7 @@ namespace network
     WebhookServer()
       : _port(DEFAULT_PORT),
         _shutdown(false),
+        _jsonConfig{},
         _threadPool(2, 8, std::chrono::seconds(30))
     {
     }
@@ -182,6 +190,20 @@ namespace network
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _port = port;
+    }
+
+    /// \brief Sets the JSON parsing configuration
+    void setJsonConfig(const JsonConfig& config)
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _jsonConfig = config;
+    }
+
+    /// \brief Gets the current JSON parsing configuration
+    JsonConfig getJsonConfig() const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      return _jsonConfig;
     }
 
     /// \brief Get a ShutdownChecker for use in handlers
@@ -314,14 +336,24 @@ namespace network
     void onJsonGet(const std::string& endpoint, JsonHandler handler)
     {
       onGet(endpoint,
-            [handler](const Request& req, Response& res)
+            [this, handler](const Request& req, Response& res)
             {
               try
               {
-                parsers::Json requestJson =
-                    req.body.empty()
-                        ? parsers::Json::object()
-                        : util::SafeJsonParser::parseWithLimits(req.body);
+                parsers::Json requestJson;
+                if (req.body.empty()) {
+                  requestJson = parsers::Json::object();
+                } else {
+                  if (req.body.size() > _jsonConfig.maxPayloadSize) {
+                    throw std::runtime_error("JSON payload exceeds maximum size limit of " +
+                                           std::to_string(_jsonConfig.maxPayloadSize) + " bytes");
+                  }
+                  auto result = parsers::Json::parse(req.body, _jsonConfig.parseLimits);
+                  if (!result.ok) {
+                    throw std::runtime_error("JSON parse error: " + result.error.message);
+                  }
+                  requestJson = std::move(result.value);
+                }
                 parsers::Json responseJson = handler(requestJson);
                 res.set_content(responseJson.dump(), "application/json");
               }
@@ -347,12 +379,19 @@ namespace network
     void onJsonPost(const std::string& endpoint, JsonHandler handler)
     {
       onPost(endpoint,
-             [handler](const Request& req, Response& res)
+             [this, handler](const Request& req, Response& res)
              {
                try
                {
-                 parsers::Json requestJson =
-                     util::SafeJsonParser::parseWithLimits(req.body);
+                 if (req.body.size() > _jsonConfig.maxPayloadSize) {
+                   throw std::runtime_error("JSON payload exceeds maximum size limit of " +
+                                          std::to_string(_jsonConfig.maxPayloadSize) + " bytes");
+                 }
+                 auto result = parsers::Json::parse(req.body, _jsonConfig.parseLimits);
+                 if (!result.ok) {
+                   throw std::runtime_error("JSON parse error: " + result.error.message);
+                 }
+                 parsers::Json requestJson = std::move(result.value);
                  parsers::Json responseJson = handler(requestJson);
                  res.set_content(responseJson.dump(), "application/json");
                }
@@ -1345,6 +1384,7 @@ namespace network
     std::unique_ptr<UnifiedSharedTransport> _transport;
     ListenerId _listenerId{0};
     std::atomic<bool> _shutdown;
+    JsonConfig _jsonConfig;
 
     // Thread pool for processing requests
     core::ThreadPool _threadPool;

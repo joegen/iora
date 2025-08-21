@@ -21,6 +21,7 @@ set(INDIVIDUAL_TESTS
     iora_test_dns_client
     iora_test_timer
     iora_test_json_parser
+    iora_test_xml_parser
 )
 
 # Function to create individual test executables

@@ -65,6 +65,13 @@ namespace network
       bool success() const { return statusCode >= 200 && statusCode < 300; }
     };
 
+    /// \brief JSON parsing configuration
+    struct JsonConfig
+    {
+      std::size_t maxPayloadSize = 10 * 1024 * 1024;  // Maximum JSON payload size in bytes (10MB default)
+      parsers::ParseLimits parseLimits;  // JSON parsing limits (depth, array size, etc.)
+    };
+
     /// \brief Configuration for HTTP client
     struct Config
     {
@@ -75,6 +82,7 @@ namespace network
       std::string userAgent;
       bool reuseConnections;
       std::chrono::seconds connectionIdleTimeout;
+      JsonConfig jsonConfig;  // JSON parsing configuration
 
       Config()
         : connectTimeout(2000),
@@ -83,7 +91,8 @@ namespace network
           followRedirects(true),
           userAgent("Iora-HttpClient/1.0"),
           reuseConnections(true),
-          connectionIdleTimeout(300)
+          connectionIdleTimeout(300),
+          jsonConfig{}
       {
       }
 
@@ -318,8 +327,16 @@ namespace network
       return performRequest("POST", url, body.str(), multipartHeaders, retries);
     }
 
-    /// \brief Parse JSON response or throw on error
+    /// \brief Parse JSON response or throw on error (with default config)
     static parsers::Json parseJsonOrThrow(const Response& response)
+    {
+      JsonConfig defaultConfig;
+      return parseJsonOrThrow(response, defaultConfig);
+    }
+
+    /// \brief Parse JSON response or throw on error (with custom config)
+    static parsers::Json parseJsonOrThrow(const Response& response,
+                                         const JsonConfig& jsonConfig)
     {
       if (!response.success())
       {
@@ -327,14 +344,18 @@ namespace network
                                  std::to_string(response.statusCode));
       }
 
-      try
+      if (response.body.size() > jsonConfig.maxPayloadSize)
       {
-        return util::SafeJsonParser::parseWithLimits(response.body);
+        throw std::runtime_error("JSON response exceeds maximum size limit of " +
+                                std::to_string(jsonConfig.maxPayloadSize) + " bytes");
       }
-      catch (const std::exception& e)
+
+      auto result = parsers::Json::parse(response.body, jsonConfig.parseLimits);
+      if (!result.ok)
       {
-        throw std::runtime_error("Invalid JSON: " + std::string(e.what()));
+        throw std::runtime_error("JSON parse error: " + result.error.message);
       }
+      return std::move(result.value);
     }
 
     /// \brief Cleanup connections and resources

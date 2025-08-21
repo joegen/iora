@@ -10,7 +10,7 @@
 
 TEST_CASE("EventQueue processes valid events", "[EventQueue]")
 {
-  iora::util::EventQueue queue(2);
+  iora::core::EventQueue queue(2);
   std::atomic<int> counter{0};
 
   queue.onEventId("testId",
@@ -30,7 +30,7 @@ TEST_CASE("EventQueue processes valid events", "[EventQueue]")
 
 TEST_CASE("EventQueue drops invalid events", "[EventQueue]")
 {
-  iora::util::EventQueue queue(2);
+  iora::core::EventQueue queue(2);
   std::atomic<int> counter{0};
 
   queue.onEventId("testId", [&](const iora::parsers::Json&) { counter++; });
@@ -44,7 +44,7 @@ TEST_CASE("EventQueue drops invalid events", "[EventQueue]")
 
 TEST_CASE("EventQueue matches eventName with glob patterns", "[EventQueue]")
 {
-  iora::util::EventQueue queue(2);
+  iora::core::EventQueue queue(2);
   std::atomic<int> counter{0};
 
   queue.onEventNameMatches(
@@ -70,7 +70,7 @@ TEST_CASE("EventQueue matches eventName with glob patterns", "[EventQueue]")
 
 TEST_CASE("EventQueue matches eventName exactly", "[EventQueue]")
 {
-  iora::util::EventQueue queue(2);
+  iora::core::EventQueue queue(2);
   std::atomic<int> counter{0};
 
   queue.onEventName("testEvent",
@@ -95,7 +95,7 @@ TEST_CASE("EventQueue matches eventName exactly", "[EventQueue]")
 
 TEST_CASE("EventQueue handles concurrent pushes and handlers", "[EventQueue]")
 {
-  iora::util::EventQueue queue(4);
+  iora::core::EventQueue queue(4);
   std::atomic<int> counter{0};
   queue.onEventId("testId", [&](const iora::parsers::Json&) { counter++; });
 
@@ -123,7 +123,7 @@ TEST_CASE("EventQueue handles concurrent pushes and handlers", "[EventQueue]")
 
 TEST_CASE("EventQueue shuts down gracefully", "[EventQueue]")
 {
-  iora::util::EventQueue queue(2);
+  iora::core::EventQueue queue(2);
   std::atomic<int> counter{0};
 
   queue.onEventId("testId", [&](const iora::parsers::Json&) { counter++; });

@@ -10,13 +10,13 @@
 #include <any>
 #include <cassert>
 #include "parsers/json.hpp"
+#include "parsers/xml.hpp"
 #include "core/logger.hpp"
 #include "core/config_loader.hpp"
 #include "core/thread_pool.hpp"
-#include "util/safe_json_parser.hpp"
 #include "util/expiring_cache.hpp"
-#include "util/event_queue.hpp"
-#include "util/plugin_loader.hpp"
+#include "core/event_queue.hpp"
+#include "core/plugin_loader.hpp"
 #include "util/filesystem.hpp"
 #include "storage/concrete_state_store.hpp"
 #include "storage/json_file_store.hpp"
@@ -31,7 +31,7 @@ namespace iora
 
 /// \brief Singleton entry point for the Iora library, managing all core
 /// components and providing factory methods for utilities and plugins.
-class IoraService : private util::PluginManager
+class IoraService : private core::PluginManager
 {
 public:
   /// \brief Deleted copy constructor and assignment operator.
@@ -335,7 +335,7 @@ public:
 
   /// \brief Register a handler for an event by its ID
   void registerEventHandlerById(const std::string& eventId,
-                                util::EventQueue::Handler handler)
+                                core::EventQueue::Handler handler)
   {
     core::Logger::info("IoraService: Registering event handler for event ID: " +
                        eventId);
@@ -344,7 +344,7 @@ public:
 
   /// \brief Register a handler for an event by its name
   void registerEventHandlerByName(const std::string& eventName,
-                                  util::EventQueue::Handler handler)
+                                  core::EventQueue::Handler handler)
   {
     core::Logger::info(
         "IoraService: Registering event handler for event name: " + eventName);
@@ -352,7 +352,7 @@ public:
   }
 
   /// \brief Provides access to the EventQueue for managing events.
-  util::EventQueue& eventQueue() { return _eventQueue; }
+  core::EventQueue& eventQueue() { return _eventQueue; }
 
   /// \brief Registers a plugin API function that can be called by plugins.
   template <typename Func>
@@ -1308,7 +1308,7 @@ private:
   std::unique_ptr<core::ThreadPool> _threadPool;
   std::string _modulesPath;
   /// \brief EventQueue for managing and dispatching events
-  util::EventQueue _eventQueue{4}; // Default to 4 worker threads
+  core::EventQueue _eventQueue{4}; // Default to 4 worker threads
   std::unordered_map<std::string, std::any> _apiExports;
   mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   mutable std::mutex _apiMutex;
@@ -1346,13 +1346,13 @@ public:
     NAME_MATCHES
   };
 
-  EventBuilder(util::EventQueue& queue, const std::string& eventId,
+  EventBuilder(core::EventQueue& queue, const std::string& eventId,
                EventType type)
     : _queue(queue), _eventId(eventId), _eventType(type)
   {
   }
 
-  void handle(const util::EventQueue::Handler& handler)
+  void handle(const core::EventQueue::Handler& handler)
   {
     if (_eventType == EventType::NAME)
     {
@@ -1373,7 +1373,7 @@ public:
   }
 
 private:
-  util::EventQueue& _queue;
+  core::EventQueue& _queue;
   std::string _eventId;
   EventType _eventType = EventType::ID; // Default to ID type
 };
