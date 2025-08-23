@@ -107,6 +107,13 @@ namespace network
     {
       std::lock_guard<std::mutex> lock(mutex_);
       maxPoolSize_ = size;
+      
+      // Trim existing pool if it exceeds the new max size
+      while (available_.size() > maxPoolSize_)
+      {
+        available_.pop_back();
+        destroyed_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
 
     void clear()

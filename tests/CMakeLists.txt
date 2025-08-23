@@ -14,6 +14,7 @@ set(INDIVIDUAL_TESTS
     iora_test_webhook_transport
     iora_test_shared_udp
     iora_test_shared_tcp
+    iora_test_shared_transport_timers
     iora_test_unified_tcp_udp
     iora_test_transport_improvements
     iora_test_batch_processor

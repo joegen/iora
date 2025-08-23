@@ -54,6 +54,7 @@
 #include <openssl/err.h>
 #include "transport_types.hpp"
 #include "iora/core/logger.hpp"
+#include "iora/core/timer.hpp"
 
 namespace iora
 {
@@ -79,11 +80,12 @@ namespace network
 
       std::chrono::seconds idleTimeout{600};
       std::chrono::seconds maxConnAge{std::chrono::seconds::zero()};
-      std::chrono::seconds handshakeTimeout{30};
-      std::chrono::seconds gcInterval{5};
-      // NEW: Safety-net timers (0 = disabled)
-      std::chrono::seconds connectTimeout{30};
-      std::chrono::seconds writeStallTimeout{0};
+      // High-resolution timers (milliseconds precision)
+      std::chrono::milliseconds handshakeTimeout{30000};
+      std::chrono::milliseconds connectTimeout{30000};
+      std::chrono::milliseconds writeStallTimeout{0};
+      std::chrono::seconds gcInterval{5}; // Keep for legacy cleanup
+      bool enableHighResolutionTimers{true}; // Enable TimerService integration
 
       bool useEdgeTriggered{true};
       bool enableTcpNoDelay{true};
@@ -142,6 +144,15 @@ namespace network
     {
       // Ensure OpenSSL is initialized once per process
       std::call_once(_sslGlobalInitFlag, initSslGlobal);
+      
+      // Initialize high-resolution timer service if enabled
+      if (_cfg.enableHighResolutionTimers)
+      {
+        _timerConfig.limits.maxConcurrentTimers = 10000;
+        _timerConfig.enableStatistics = true;
+        _timerConfig.threadName = "SharedTransportTimer";
+        _timerService = std::make_unique<iora::core::TimerService>(_timerConfig);
+      }
     }
 
     /// \brief Destructor; calls stop() if needed.
@@ -424,6 +435,7 @@ namespace network
       ::timerfd_settime(_timerFd, 0, &its, nullptr);
     }
 
+
     void cleanupStartFail()
     {
       if (_timerFd >= 0)
@@ -637,7 +649,134 @@ namespace network
       bool connectPending{false};
       MonoTime connectStart{};
       MonoTime lastWriteProgress{};
+      // High-resolution timer IDs (0 = not scheduled)
+      std::uint64_t connectTimeoutId{0};
+      std::uint64_t handshakeTimeoutId{0};
+      std::uint64_t writeStallTimeoutId{0};
     };
+
+    // ===== High-resolution timer helpers (after Session struct) =====
+    
+    void scheduleConnectTimeout(Session* s)
+    {
+      if (!_timerService || _cfg.connectTimeout.count() == 0 || s->connectTimeoutId != 0)
+      {
+        return;
+      }
+      
+      s->connectTimeoutId = _timerService->scheduleAfter(
+          _cfg.connectTimeout,
+          [this, sid = s->id]()
+          {
+            handleConnectTimeout(sid);
+          });
+    }
+    
+    void scheduleHandshakeTimeout(Session* s)
+    {
+      if (!_timerService || _cfg.handshakeTimeout.count() == 0 || s->handshakeTimeoutId != 0)
+      {
+        return;
+      }
+      
+      s->handshakeTimeoutId = _timerService->scheduleAfter(
+          _cfg.handshakeTimeout,
+          [this, sid = s->id]()
+          {
+            handleHandshakeTimeout(sid);
+          });
+    }
+    
+    void scheduleWriteStallTimeout(Session* s)
+    {
+      if (!_timerService || _cfg.writeStallTimeout.count() == 0 || s->writeStallTimeoutId != 0)
+      {
+        return;
+      }
+      
+      s->writeStallTimeoutId = _timerService->scheduleAfter(
+          _cfg.writeStallTimeout,
+          [this, sid = s->id]()
+          {
+            handleWriteStallTimeout(sid);
+          });
+    }
+    
+    void cancelConnectTimeout(Session* s)
+    {
+      if (_timerService && s->connectTimeoutId != 0)
+      {
+        _timerService->cancel(s->connectTimeoutId);
+        s->connectTimeoutId = 0;
+      }
+    }
+    
+    void cancelHandshakeTimeout(Session* s)
+    {
+      if (_timerService && s->handshakeTimeoutId != 0)
+      {
+        _timerService->cancel(s->handshakeTimeoutId);
+        s->handshakeTimeoutId = 0;
+      }
+    }
+    
+    void cancelWriteStallTimeout(Session* s)
+    {
+      if (_timerService && s->writeStallTimeoutId != 0)
+      {
+        _timerService->cancel(s->writeStallTimeoutId);
+        s->writeStallTimeoutId = 0;
+      }
+    }
+    
+    void cancelAllTimers(Session* s)
+    {
+      cancelConnectTimeout(s);
+      cancelHandshakeTimeout(s);
+      cancelWriteStallTimeout(s);
+    }
+    
+    void handleConnectTimeout(SessionId sid)
+    {
+      auto it = _sessions.find(sid);
+      if (it != _sessions.end())
+      {
+        auto* s = it->second.get();
+        s->connectTimeoutId = 0; // Mark as expired
+        if (s->connectPending)
+        {
+          closeNow(s, TransportError::Timeout, "Connect timeout", 0);
+        }
+      }
+    }
+    
+    void handleHandshakeTimeout(SessionId sid)
+    {
+      auto it = _sessions.find(sid);
+      if (it != _sessions.end())
+      {
+        auto* s = it->second.get();
+        s->handshakeTimeoutId = 0; // Mark as expired
+        if (s->tlsState == TlsState::Handshake)
+        {
+          closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", 0);
+        }
+      }
+    }
+    
+    void handleWriteStallTimeout(SessionId sid)
+    {
+      auto it = _sessions.find(sid);
+      if (it != _sessions.end())
+      {
+        auto* s = it->second.get();
+        s->writeStallTimeoutId = 0; // Mark as expired
+        if (!s->wq.empty())
+        {
+          closeNow(s, TransportError::Timeout, "Write stall timeout", 0);
+        }
+      }
+    }
 
     struct Listener
     {
@@ -956,6 +1095,7 @@ namespace network
           ::SSL_set_accept_state(s->ssl);
           s->tlsState = TlsState::Handshake;
           s->tlsStart = MonoClock::now();
+          scheduleHandshakeTimeout(s.get());
         }
 
         _sessions.emplace(sid, std::move(s));
@@ -1168,6 +1308,7 @@ namespace network
       s->lastWriteProgress = s->created;
       s->connectPending = true;
       s->connectStart = MonoClock::now();
+      scheduleConnectTimeout(s.get());
 
       if (chosen)
       {
@@ -1193,6 +1334,7 @@ namespace network
         ::SSL_set_connect_state(s->ssl);
         s->tlsState = TlsState::Handshake;
         s->tlsStart = MonoClock::now();
+        scheduleHandshakeTimeout(s.get());
       }
 
       _sessions.emplace(s->id, std::move(s));
@@ -1247,6 +1389,7 @@ namespace network
           }
           s->connectPending = false;
           s->lastWriteProgress = MonoClock::now();
+          cancelConnectTimeout(s);
           updateInterest(s);
         }
       }
@@ -1274,8 +1417,9 @@ namespace network
 
     bool driveHandshake(Session* s)
     {
-      if (_cfg.handshakeTimeout.count() > 0 &&
-          (MonoClock::now() - s->tlsStart) > _cfg.handshakeTimeout)
+      // Only check timeout here if high-resolution timers are not available
+      if (!_timerService && _cfg.handshakeTimeout.count() > 0 &&
+          (MonoClock::now() - s->tlsStart) > std::chrono::duration_cast<std::chrono::seconds>(_cfg.handshakeTimeout))
       {
         closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", 0);
         return false;
@@ -1286,6 +1430,7 @@ namespace network
       {
         s->tlsState = TlsState::Open;
         _atomicStats.tlsHandshakes++;
+        cancelHandshakeTimeout(s);
 
         {
           std::lock_guard<std::mutex> g(_cbMutex);
@@ -1297,6 +1442,7 @@ namespace network
         }
         s->connectPending = false;
         s->lastWriteProgress = MonoClock::now();
+        cancelConnectTimeout(s);
         updateInterest(s);
 
         // BUGFIX: Immediately check for pending data after TLS handshake
@@ -1443,6 +1589,7 @@ namespace network
       if (s->wq.empty())
       {
         s->wantWrite = false;
+        cancelWriteStallTimeout(s);
         updateInterest(s);
       }
     }
@@ -1514,6 +1661,11 @@ namespace network
       }
 
       s->wq.emplace_back(std::move(sr.payload));
+      if (s->wq.size() == 1)
+      {
+        // First item in queue - schedule write stall timeout
+        scheduleWriteStallTimeout(s);
+      }
       if (s->wq.size() > _cfg.maxWriteQueue)
       {
         _atomicStats.backpressureCloses++;
@@ -1542,6 +1694,7 @@ namespace network
       core::Logger::debug("Transport: closeNow called for session " +
                           std::to_string(s->id) + ", reason: " + msg);
       s->closed = true;
+      cancelAllTimers(s);
 
       delEpoll(s->fd);
       ::close(s->fd);
@@ -1629,28 +1782,32 @@ namespace network
           continue;
         }
 
-        if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake &&
-            _cfg.handshakeTimeout.count() > 0 &&
-            (now - s->tlsStart) > _cfg.handshakeTimeout)
+        // Use high-resolution timers if available, otherwise fall back to GC-based timeout checking
+        if (!_timerService)
         {
-          toClose.push_back(s->id);
-          continue;
-        }
+          if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake &&
+              _cfg.handshakeTimeout.count() > 0 &&
+              (now - s->tlsStart) > std::chrono::duration_cast<std::chrono::seconds>(_cfg.handshakeTimeout))
+          {
+            toClose.push_back(s->id);
+            continue;
+          }
 
-        // Safety-net: connect timeout
-        if (_cfg.connectTimeout.count() > 0 && s->connectPending &&
-            (now - s->connectStart) > _cfg.connectTimeout)
-        {
-          toClose.push_back(s->id);
-          continue;
-        }
+          // Safety-net: connect timeout
+          if (_cfg.connectTimeout.count() > 0 && s->connectPending &&
+              (now - s->connectStart) > std::chrono::duration_cast<std::chrono::seconds>(_cfg.connectTimeout))
+          {
+            toClose.push_back(s->id);
+            continue;
+          }
 
-        // Safety-net: write stall with queued data
-        if (_cfg.writeStallTimeout.count() > 0 && !s->wq.empty() &&
-            (now - s->lastWriteProgress) > _cfg.writeStallTimeout)
-        {
-          toClose.push_back(s->id);
-          continue;
+          // Safety-net: write stall with queued data
+          if (_cfg.writeStallTimeout.count() > 0 && !s->wq.empty() &&
+              (now - s->lastWriteProgress) > std::chrono::duration_cast<std::chrono::seconds>(_cfg.writeStallTimeout))
+          {
+            toClose.push_back(s->id);
+            continue;
+          }
         }
       }
 
@@ -1912,6 +2069,10 @@ namespace network
     // Sticky fatal (for start/init failures)
     mutable std::mutex _fatalMx;
     mutable IoResult _lastFatal{IoResult::success()};
+
+    // High-resolution timer service
+    std::unique_ptr<iora::core::TimerService> _timerService;
+    iora::core::TimerServiceConfig _timerConfig;
 
     // Static SSL initialization coordination
     static std::once_flag _sslGlobalInitFlag;
