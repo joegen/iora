@@ -40,19 +40,68 @@ inline void initializeTestLogging()
 /// \brief Type alias for automatic service shutdown
 using AutoServiceShutdown = iora::IoraService::AutoServiceShutdown;
 
-/// \brief Helper function to create IoraService from CLI-style arguments
+/// \brief Helper function to create IoraService from CLI-style arguments (DEPRECATED)
+/// Use initServiceFromConfig() with Config objects instead
 inline iora::IoraService& initServiceFromArgs(int argc, const char* args[])
 {
-  return iora::IoraService::init(argc, const_cast<char**>(args));
+  // Convert argc/argv to Config object
+  iora::IoraService::Config config;
+  
+  for (int i = 1; i < argc; i++) {
+    std::string arg = args[i];
+    
+    if (arg == "--port" && i + 1 < argc) {
+      config.server.port = std::stoi(args[i + 1]);
+      i++; // Skip the value
+    }
+    else if (arg == "--state-file" && i + 1 < argc) {
+      config.state.file = args[i + 1];
+      i++; // Skip the value
+    }
+    else if (arg == "--log-file" && i + 1 < argc) {
+      config.log.file = args[i + 1];
+      i++; // Skip the value
+    }
+    else if (arg == "--log-level" && i + 1 < argc) {
+      config.log.level = args[i + 1];
+      i++; // Skip the value
+    }
+    else if (arg == "--config" && i + 1 < argc) {
+      config.configFile = args[i + 1];
+      i++; // Skip the value
+    }
+  }
+  
+  iora::IoraService::init(config);
+  return iora::IoraService::instance();
+}
+
+/// \brief Helper function to create IoraService from Config object
+inline void initServiceFromConfig(const iora::IoraService::Config& config)
+{
+  iora::IoraService::init(config);
 }
 
 /// \brief Helper to create a basic test IoraService configuration
-inline iora::IoraService::Config createTestConfig(int port = 8080)
+inline iora::IoraService::Config createTestConfig(int port = 8080, 
+                                                   const std::string& logFile = "", 
+                                                   const std::string& stateFile = "",
+                                                   const std::string& logLevel = "debug")
 {
   iora::IoraService::Config config;
   config.server.port = port;
-  config.log.level = "debug";
-  config.log.file = "test_" + std::to_string(port);
+  config.log.level = logLevel;
+  
+  if (!logFile.empty()) {
+    config.log.file = logFile;
+  } else {
+    config.log.file = "test_" + std::to_string(port);
+  }
+  
+  if (!stateFile.empty()) {
+    config.state.file = stateFile;
+  }
+  
   return config;
 }
 

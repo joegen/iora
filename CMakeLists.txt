@@ -27,20 +27,29 @@ configure_iora_dependencies()
 # Create the main iora_lib interface library
 create_iora_lib()
 
-# Enable testing support
-include(CTest)
-enable_testing()
+# Optional: Build tests (disabled by default for external project integration)
+option(BUILD_TESTS "Build test executables" ON)
+if(BUILD_TESTS)
+    # Enable testing support
+    include(CTest)
+    enable_testing()
+    add_subdirectory(tests)
+    
+    # Add a custom target for `make check` to run all tests
+    add_custom_target(check 
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+        COMMENT "Running all individual tests with CTest"
+    )
+endif()
 
-# Add subdirectories
-add_subdirectory(tests)
-add_subdirectory(sample)
+# Optional: Build samples (disabled by default for external project integration)
+option(BUILD_SAMPLES "Build sample programs" ON)
+if(BUILD_SAMPLES)
+    add_subdirectory(sample)
+endif()
+
+# Always build the main source
 add_subdirectory(src)
-
-# Add a custom target for `make check` to run all tests
-add_custom_target(check 
-    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    COMMENT "Running all individual tests with CTest"
-)
 
 
 

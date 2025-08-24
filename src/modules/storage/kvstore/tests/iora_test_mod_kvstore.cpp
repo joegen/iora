@@ -668,14 +668,14 @@ TEST_CASE("KVStore handles shutdown and cleanup", "[kvstore][cleanup][shutdown]"
 
 TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvstore][plugin][api][integration]")
 {
-  const char* args[] = {"program",
-                        "--port", "8131",
-                        "--state-file", "ioraservice_kvstore_state.json",
-                        "--log-file", "ioraservice_kvstore_log"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  
+  // Setup IoraService config
+  iora::IoraService::Config config;
+  config.server.port = 8131;
+  config.state.file = "ioraservice_kvstore_state.json";
+  config.log.file = "ioraservice_kvstore_log";
+
   // Initialize service with CLI args
-  iora::IoraService::init(argc, const_cast<char**>(args));
+  iora::IoraService::init(config);
   iora::IoraService& svc = iora::IoraService::instance();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 

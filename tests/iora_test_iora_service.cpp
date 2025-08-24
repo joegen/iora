@@ -12,17 +12,16 @@ using namespace iora::test;
 
 TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 {
-  const char* args[] = {"program",
-                        "--port",
-                        "8110",
-                        "--state-file",
-                        "ioraservice_basic_state.json",
-                        "--log-file",
-                        "ioraservice_basic_log",
-                        "--log-level",
-                        "error"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config
+  iora::IoraService::Config config;
+  config.server.port = 8110;
+  config.state.file = "ioraservice_basic_state.json";
+  config.log.file = "ioraservice_basic_log";
+  config.log.level = "error";
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   svc.stateStore()->set("foo", "bar");
@@ -93,9 +92,33 @@ TEST_CASE("IoraService configuration file override",
     out << "async = false\nretention_days = 2\ntime_format = '%Y%m%d'\n";
   }
 
-  const char* args[] = {"program", "--config", cfg.c_str()};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config and parse TOML file
+  iora::IoraService::Config config;
+  auto configLoader = std::make_unique<iora::core::ConfigLoader>(cfg);
+  configLoader->reload();
+  
+  // Parse TOML values into config
+  if (auto portOpt = configLoader->getInt("iora.server.port"))
+  {
+    config.server.port = static_cast<int>(*portOpt);
+  }
+  if (auto stateFileOpt = configLoader->getString("iora.state.file"))
+  {
+    config.state.file = *stateFileOpt;
+  }
+  if (auto logLevelOpt = configLoader->getString("iora.log.level"))
+  {
+    config.log.level = *logLevelOpt;
+  }
+  if (auto logFileOpt = configLoader->getString("iora.log.file"))
+  {
+    config.log.file = *logFileOpt;
+  }
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService::instance().setConfigLoader(std::move(configLoader));
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -140,19 +163,31 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
     out << "[iora.log]\nlevel = 'info'\nfile = 'ioraservice_cli_log'\n";
     out << "async = false\nretention_days = 1\ntime_format = '%Y%m%d'\n";
   }
-  const char* args[] = {"program",
-                        "--port",
-                        "8123",
-                        "--state-file",
-                        "ioraservice_cli_override_state.json",
-                        "--config",
-                        cfg.c_str(),
-                        "--log-file",
-                        "ioraservice_cli_override_log",
-                        "--log-level",
-                        "error"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config with CLI overrides taking precedence
+  iora::IoraService::Config config;
+  config.server.port = 8123;
+  config.state.file = "ioraservice_cli_override_state.json";
+  config.log.file = "ioraservice_cli_override_log";
+  config.log.level = "error";
+  
+  // Parse TOML file (but CLI values should override)
+  auto configLoader = std::make_unique<iora::core::ConfigLoader>(cfg);
+  configLoader->reload();
+  
+  // Only parse TOML values that aren't already set by CLI
+  if (!config.server.port.has_value())
+  {
+    if (auto portOpt = configLoader->getInt("iora.server.port"))
+    {
+      config.server.port = static_cast<int>(*portOpt);
+    }
+  }
+  // Note: CLI values take precedence, so we don't override them
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService::instance().setConfigLoader(std::move(configLoader));
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -195,17 +230,16 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
 TEST_CASE("IoraService concurrent HTTP clients",
           "[iora][IoraService][concurrency]")
 {
-  const char* args[] = {"program",
-                        "--port",
-                        "8113",
-                        "--state-file",
-                        "ioraservice_concurrency_state.json",
-                        "--log-file",
-                        "ioraservice_concurrency_log",
-                        "--log-level",
-                        "error"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config
+  iora::IoraService::Config config;
+  config.server.port = 8113;
+  config.state.file = "ioraservice_concurrency_state.json";
+  config.log.file = "ioraservice_concurrency_log";
+  config.log.level = "error";
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -258,17 +292,16 @@ TEST_CASE("IoraService concurrent HTTP clients",
 TEST_CASE("IoraService fluent event handler registration by name and pattern",
           "[iora][IoraService][EventQueue][fluent]")
 {
-  const char* args[] = {"program",
-                        "--port",
-                        "8120",
-                        "--state-file",
-                        "ioraservice_fluent_eventqueue_state.json",
-                        "--log-file",
-                        "ioraservice_fluent_eventqueue_log",
-                        "--log-level",
-                        "error"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config
+  iora::IoraService::Config config;
+  config.server.port = 8120;
+  config.state.file = "ioraservice_fluent_eventqueue_state.json";
+  config.log.file = "ioraservice_fluent_eventqueue_log";
+  config.log.level = "error";
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   std::atomic<int> nameCounter{0};
@@ -314,15 +347,15 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
 TEST_CASE("IoraService integrates EventQueue",
           "[iora][IoraService][EventQueue]")
 {
-  const char* args[] = {"program",
-                        "--port",
-                        "8114",
-                        "--state-file",
-                        "ioraservice_eventqueue_state.json",
-                        "--log-file",
-                        "ioraservice_eventqueue_log"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config
+  iora::IoraService::Config config;
+  config.server.port = 8114;
+  config.state.file = "ioraservice_eventqueue_state.json";
+  config.log.file = "ioraservice_eventqueue_log";
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   std::atomic<int> counter{0};

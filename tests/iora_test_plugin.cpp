@@ -8,15 +8,15 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 {
   initializeTestLogging();
 
-  const char* args[] = {"program",
-                        "--port",
-                        "8130",
-                        "--state-file",
-                        "ioraservice_plugin_state.json",
-                        "--log-file",
-                        "ioraservice_plugin_log"};
-  int argc = static_cast<int>(sizeof(args) / sizeof(args[0]));
-  iora::IoraService& svc = initServiceFromArgs(argc, args);
+  // Setup IoraService config
+  iora::IoraService::Config config;
+  config.server.port = 8130;
+  config.state.file = "ioraservice_plugin_state.json";
+  config.log.file = "ioraservice_plugin_log";
+
+  // Initialize service with config
+  iora::IoraService::init(config);
+  iora::IoraService& svc = iora::IoraService::instance();
   AutoServiceShutdown autoShutdown(svc);
 
   auto pluginPathOpt =
