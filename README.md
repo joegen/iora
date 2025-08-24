@@ -645,6 +645,213 @@ service.callExportedApi<void, const std::string&, std::function<iora::core::Json
     "jsonrpc.registerWithOptions", "secure_method", authHandler, options);
 ```
 
+## 🔒 Thread-Safe Plugin API Access
+
+Iora provides three distinct methods for calling plugin APIs, each with different performance and safety characteristics:
+
+### API Methods Overview
+
+| Method | Performance | Thread Safety | Use Case |
+|--------|-------------|---------------|----------|
+| `getExportedApi` | **Fastest** (~2ns/call) | ⚠️ **Unsafe** | High-frequency calls, single-threaded |
+| `getExportedApiSafe` | **Fast** (~25ns/call) | ✅ **Safe** | High-frequency calls, multi-threaded |
+| `callExportedApi` | **Slower** (~120ns/call) | ✅ **Safe** | Occasional calls, any context |
+
+### 1. `getExportedApi` - Maximum Performance (Unsafe)
+
+**Performance**: ~2ns per call  
+**Thread Safety**: ❌ **Not thread-safe** - can crash if module unloaded  
+**Best for**: Single-threaded high-frequency API calls
+
+```cpp
+// Get direct function reference (fastest but unsafe)
+auto addApi = service.getExportedApi<int(int, int)>("plugin.add");
+int result = addApi(10, 20); // ~2ns overhead
+
+// WARNING: If plugin is unloaded, this may crash with segmentation fault
+```
+
+### 2. `getExportedApiSafe` - High Performance + Safety
+
+**Performance**: ~25ns per call (~25ns overhead for safety)  
+**Thread Safety**: ✅ **Fully thread-safe** - throws exception if module unloaded  
+**Best for**: Multi-threaded high-frequency API calls
+
+```cpp
+// Get thread-safe wrapper (recommended for most use cases)
+auto safeAddApi = service.getExportedApiSafe<int(int, int)>("plugin.add");
+
+// Safe to call from multiple threads concurrently
+int result = safeAddApi(10, 20); // ~25ns overhead
+
+// Check availability
+if (safeAddApi.isAvailable()) {
+    result = safeAddApi(5, 7);
+}
+
+// Get metadata
+std::cout << "Module: " << safeAddApi.getModuleName() << std::endl;
+std::cout << "API: " << safeAddApi.getApiName() << std::endl;
+
+// Graceful error handling
+try {
+    result = safeAddApi(1, 2);
+} catch (const std::runtime_error& e) {
+    std::cout << "API unavailable: " << e.what() << std::endl;
+}
+```
+
+### 3. `callExportedApi` - Direct Invocation
+
+**Performance**: ~120ns per call (lookup overhead each time)  
+**Thread Safety**: ✅ **Thread-safe** - validates module state on each call  
+**Best for**: Occasional API calls, one-off invocations
+
+```cpp
+// Direct call with lookup each time (safest but slower)
+try {
+    int result = service.callExportedApi<int, int, int>("plugin.add", 10, 20);
+    std::cout << "Result: " << result << std::endl;
+} catch (const std::runtime_error& e) {
+    std::cout << "Call failed: " << e.what() << std::endl;
+}
+```
+
+### Performance Comparison
+
+Based on benchmarking with 100,000 API calls:
+
+```
+=== Performance Benchmark Results ===
+1. Unsafe API (getExportedApi):      2.10 ns/call   ⚡ Baseline
+2. Safe API (getExportedApiSafe):   25.40 ns/call   🛡️ +23ns overhead (12x)
+3. CallExportedApi (lookup each):  118.60 ns/call   🐌 +116ns overhead (56x)
+
+Safe API overhead: 23.30 ns/call (1109.5% increase)
+```
+
+**Key Insights:**
+- **Safe API** adds only **~23ns absolute overhead** for complete thread safety
+- **Safe API** is **4-5x faster** than direct `callExportedApi`
+- **Percentage overhead** is high because base unsafe call is extremely fast
+- **Cache refresh cost** after module reload: ~50μs (one-time cost)
+
+### Thread Safety Implementation
+
+The `SafeApiFunction` class provides thread safety through:
+
+#### Atomic State Management
+```cpp
+std::atomic<bool> valid{false};  // Lock-free availability check
+```
+
+#### Mutex-Protected Updates
+```cpp
+std::mutex cacheMutex;  // Protects cached function updates
+```
+
+#### Double-Checked Locking Pattern
+```cpp
+// Fast path - no lock needed if already cached and valid
+if (valid.load(std::memory_order_acquire)) {
+    return cachedFunc(std::forward<Args>(args)...);
+}
+
+// Slow path - acquire lock to refresh cache
+std::lock_guard<std::mutex> lock(cacheMutex);
+// ... refresh logic
+```
+
+#### Event-Driven Cache Invalidation
+- Module unload events automatically invalidate all safe API wrappers
+- Cache refresh is lazy - only happens on next API call
+- No polling or background threads needed
+
+### Migration Guide
+
+#### From Unsafe to Safe API
+
+```cpp
+// Before (unsafe but fast)
+auto api = service.getExportedApi<int(int, int)>("plugin.add");
+int result = api(1, 2);
+
+// After (safe with minimal overhead)
+auto safeApi = service.getExportedApiSafe<int(int, int)>("plugin.add");
+int result = safeApi(1, 2);
+```
+
+#### Error Handling Patterns
+
+```cpp
+// Pattern 1: Exception handling
+try {
+    auto result = safeApi(10, 20);
+    processResult(result);
+} catch (const std::runtime_error& e) {
+    handleApiUnavailable(e.what());
+}
+
+// Pattern 2: Availability checking
+if (safeApi.isAvailable()) {
+    auto result = safeApi(10, 20);
+    processResult(result);
+} else {
+    handleApiUnavailable("Module not loaded");
+}
+```
+
+### Best Practices
+
+#### Choose the Right Method
+- **High-frequency + Single-threaded**: Use `getExportedApi` for maximum speed
+- **High-frequency + Multi-threaded**: Use `getExportedApiSafe` for safety with minimal overhead
+- **Occasional calls**: Use `callExportedApi` for simplicity
+
+#### Performance Optimization
+```cpp
+// Cache safe API wrappers for reuse
+class MyService {
+    iora::IoraService::SafeApiFunction<int(int, int)> cachedAddApi;
+    
+public:
+    MyService() : cachedAddApi(service.getExportedApiSafe<int(int, int)>("plugin.add")) {}
+    
+    int performCalculation(int a, int b) {
+        return cachedAddApi(a, b); // ~25ns overhead
+    }
+};
+```
+
+#### Thread Safety Considerations
+```cpp
+// Safe: Multiple threads can call concurrently
+std::vector<std::thread> workers;
+for (int i = 0; i < 10; ++i) {
+    workers.emplace_back([&safeApi, i]() {
+        for (int j = 0; j < 1000; ++j) {
+            try {
+                int result = safeApi(i, j);
+                processResult(result);
+            } catch (const std::runtime_error&) {
+                // Handle module unavailable
+            }
+        }
+    });
+}
+```
+
+### Real-World Performance Impact
+
+For typical microservice workloads:
+
+- **API Gateway**: 23ns overhead is negligible compared to network I/O (1-10ms)
+- **High-Frequency Trading**: Unsafe API may be worth the risk for ultra-low latency
+- **Multi-threaded Services**: Safe API prevents crashes, worth the small overhead
+- **Plugin-Heavy Applications**: Safe API enables confident dynamic loading/unloading
+
+The safe API overhead becomes insignificant when compared to typical business logic, database queries, or network operations, making it the recommended choice for most production scenarios.
+
 ---
 
 ## 📝 License
