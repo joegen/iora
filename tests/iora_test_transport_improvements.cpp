@@ -83,13 +83,14 @@ TEST_CASE("ObjectPool basic functionality", "[pool][basic]")
     auto obj1 = pool.acquire();
     auto obj2 = pool.acquire();
     
-    // Release both - only one should be kept
+    // Release both - only one should be kept in pool, one destroyed due to size limit
     pool.release(std::move(obj1));
     pool.release(std::move(obj2));
     
     auto stats = pool.getStats();
     REQUIRE(stats.available == 1);
-    REQUIRE(stats.totalDestroyed == 1);
+    // Expect 2 destroyed: 1 from setMaxPoolSize trimming + 1 from release overflow
+    REQUIRE(stats.totalDestroyed == 2);
   }
 }
 

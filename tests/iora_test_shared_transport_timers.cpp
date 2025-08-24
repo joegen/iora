@@ -110,6 +110,7 @@ TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][time
       connectionFailed = true;
       lastErrorMessage = res.message;
       lastErrorCode = res.code;
+      std::cout << "Connection failed: " << res.message << " (code " << static_cast<int>(res.code) << ")\n";
     }
   };
   
@@ -118,6 +119,7 @@ TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][time
     connectionFailed = true;
     lastErrorMessage = res.message;
     lastErrorCode = res.code;
+    std::cout << "Connection closed: " << res.message << " (code " << static_cast<int>(res.code) << ")\n";
   };
   
   transport.setCallbacks(cbs);
@@ -140,7 +142,8 @@ TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][time
   
   // Should timeout much faster than the old default of 30 seconds
   REQUIRE((connectionFailed || connected));
-  REQUIRE(elapsed < 2000ms); // Should be much faster than 2 seconds
+  REQUIRE(elapsed < 500ms); // Should be much faster than 5 seconds
+  REQUIRE(lastErrorCode == TransportError::Timeout);
   
   transport.stop();
 }

@@ -306,8 +306,8 @@ namespace network
       }
       else
       {
-        // Default response for other domains
-        result.ipv4.push_back("127.0.0.1");
+        // Unknown domains should return NXDOMAIN, not fallback IPs
+        throw std::runtime_error("DNS: no such domain");
       }
 
       // Cache result

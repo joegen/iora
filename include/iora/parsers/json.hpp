@@ -1154,7 +1154,7 @@ namespace parsers
           result += "\\t";
           break;
         default:
-          if (c >= 0 && c < 32)
+          if (static_cast<unsigned char>(c) < 32)
           {
             result += "\\u";
             char buf[5];
