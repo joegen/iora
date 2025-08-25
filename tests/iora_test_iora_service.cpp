@@ -143,7 +143,7 @@ TEST_CASE("IoraService configuration file override",
   // REQUIRE(std::filesystem::exists("ioraservice_cfg_state.json")); // this is
   // not guaranteed. The file is created by a background thread.
 
-  LOG_DEBUG("Configuration override test message");
+  IORA_LOG_DEBUG("Configuration override test message");
   iora::core::Logger::shutdown();
   std::string logFile =
       "ioraservice_cfg_log." + iora::core::Logger::currentDate() + ".log";
@@ -216,7 +216,7 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
                                                // the store is done using a
                                                // background thread
 
-  LOG_ERROR("CLI override log test");
+  IORA_LOG_ERROR("CLI override log test");
   iora::core::Logger::shutdown();
   std::string logFile = "ioraservice_cli_override_log." +
                         iora::core::Logger::currentDate() + ".log";

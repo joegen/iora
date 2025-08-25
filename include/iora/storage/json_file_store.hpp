@@ -283,14 +283,14 @@ namespace storage
       registry().erase(this);
       if (registry().empty())
       {
-        LOG_INFO("No more stores registered, stopping flush thread");
+        IORA_LOG_INFO("No more stores registered, stopping flush thread");
         terminationCv().notify_all();
         if (flushThread().joinable())
         {
           flushThread().join();
         }
         flushThread() = std::thread(); // Reset thread
-        LOG_INFO("Flush thread stopped");
+        IORA_LOG_INFO("Flush thread stopped");
       }
     }
 

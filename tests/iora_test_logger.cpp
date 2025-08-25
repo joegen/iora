@@ -13,12 +13,12 @@ TEST_CASE("Logger Basic Levels", "[logger][levels]")
   iora::util::removeFilesMatchingPrefix("testlog.");
 
   iora::core::Logger::init(iora::core::Logger::Level::Trace, "testlog", false);
-  LOG_TRACE("Trace message");
-  LOG_DEBUG("Debug message");
-  LOG_INFO("Info message");
-  LOG_WARN("Warn message");
-  LOG_ERROR("Error message");
-  LOG_FATAL("Fatal message");
+  IORA_LOG_TRACE("Trace message");
+  IORA_LOG_DEBUG("Debug message");
+  IORA_LOG_INFO("Info message");
+  IORA_LOG_WARN("Warn message");
+  IORA_LOG_ERROR("Error message");
+  IORA_LOG_FATAL("Fatal message");
   iora::core::Logger::shutdown();
 
   std::string logFile = "testlog." + iora::core::Logger::currentDate() + ".log";
@@ -118,7 +118,7 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
 
   iora::core::Logger::init(iora::core::Logger::Level::Info, base, false,
                            retention);
-  LOG_INFO("Rotation start");
+  IORA_LOG_INFO("Rotation start");
   iora::core::Logger::shutdown();
 
   std::string oldFile = base + ".2000-01-01.log";
@@ -131,7 +131,7 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
 
   iora::core::Logger::init(iora::core::Logger::Level::Info, base, false,
                            retention);
-  LOG_INFO("Trigger rotation");
+  IORA_LOG_INFO("Trigger rotation");
   iora::core::Logger::shutdown();
 
   REQUIRE_FALSE(std::filesystem::exists(oldFile));

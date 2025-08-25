@@ -456,14 +456,14 @@ namespace iora
         // Validate path to prevent directory traversal attacks
         if (!validateModulePath(modulePath))
         {
-          LOG_ERROR("Invalid or unsafe module path: " + modulePath);
+          IORA_LOG_ERROR("Invalid or unsafe module path: " + modulePath);
           return false;
         }
 
         std::filesystem::path entry(modulePath);
         if (!std::filesystem::exists(entry) || !std::filesystem::is_regular_file(entry))
         {
-          LOG_ERROR("Module path does not exist or is not a file: " + modulePath);
+          IORA_LOG_ERROR("Module path does not exist or is not a file: " + modulePath);
           return false;
         }
 
@@ -472,7 +472,7 @@ namespace iora
         const std::vector<std::string> allowedExtensions = {".so", ".dll", ".dylib"};
         if (std::find(allowedExtensions.begin(), allowedExtensions.end(), extension) == allowedExtensions.end())
         {
-          LOG_ERROR("Module has unsupported file extension: " + modulePath);
+          IORA_LOG_ERROR("Module has unsupported file extension: " + modulePath);
           return false;
         }
 
@@ -480,7 +480,7 @@ namespace iora
       }
       catch (const std::exception& e)
       {
-        LOG_ERROR("Failed to load module: " + modulePath + " - " + e.what());
+        IORA_LOG_ERROR("Failed to load module: " + modulePath + " - " + e.what());
         return false;
       }
     }
@@ -503,7 +503,7 @@ namespace iora
             }
             _loadedModules.erase(it);  // unique_ptr will delete
             PluginManager::unloadPlugin(pluginName);
-            LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
+            IORA_LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
 
             // Emit module unloaded event
             auto event = parsers::Json::object();
@@ -516,13 +516,13 @@ namespace iora
           }
           catch (const std::exception& e)
           {
-            LOG_ERROR("Failed to unload plugin: " + pluginName + " - " + e.what());
+            IORA_LOG_ERROR("Failed to unload plugin: " + pluginName + " - " + e.what());
           }
         }
       }
       else
       {
-        LOG_ERROR("Plugin not found: " + pluginName);
+        IORA_LOG_ERROR("Plugin not found: " + pluginName);
       }
       return false;
     }
@@ -557,11 +557,11 @@ namespace iora
               unexportApi(apiName);
             }
             PluginManager::unloadPlugin(name);
-            LOG_INFO("Plugin " + name + " unloaded successfully.");
+            IORA_LOG_INFO("Plugin " + name + " unloaded successfully.");
           }
           catch (const std::exception& e)
           {
-            LOG_ERROR("Failed to unload plugin: " + name + " - " + e.what());
+            IORA_LOG_ERROR("Failed to unload plugin: " + name + " - " + e.what());
             success = false;
           }
         }
@@ -663,7 +663,7 @@ namespace iora
       try
       {
         std::string pluginName = entry.path().filename().string();
-        LOG_INFO("Loading module: " + pluginName);
+        IORA_LOG_INFO("Loading module: " + pluginName);
         loadPlugin(pluginName, entry.path().string());
 
         // Resolve and call the exported loadModule function
@@ -680,11 +680,11 @@ namespace iora
           }
           catch (const std::exception& e)
           {
-            LOG_ERROR("Exception while calling onLoad for module " + pluginName + ": " + e.what());
+            IORA_LOG_ERROR("Exception while calling onLoad for module " + pluginName + ": " + e.what());
           }
 
           _loadedModules.insert({pluginName, std::move(pluginInstance)});
-          LOG_INFO("Module " + pluginName + " loaded successfully.");
+          IORA_LOG_INFO("Module " + pluginName + " loaded successfully.");
 
           // Emit module loaded event
           auto event = parsers::Json::object();
@@ -696,13 +696,13 @@ namespace iora
         }
         else
         {
-          LOG_ERROR("Module " + pluginName + " did not return a valid instance.");
+          IORA_LOG_ERROR("Module " + pluginName + " did not return a valid instance.");
           return false;
         }
       }
       catch (const std::exception& e)
       {
-        LOG_ERROR("Failed to load module: " + entry.path().string() + " - " + e.what());
+        IORA_LOG_ERROR("Failed to load module: " + entry.path().string() + " - " + e.what());
         return false;
       }
       return true;
@@ -712,19 +712,19 @@ namespace iora
     {
       if (_modulesPath.empty())
       {
-        LOG_INFO("No modules specified, skipping plugin loading.");
+        IORA_LOG_INFO("No modules specified, skipping plugin loading.");
         return;
       }
-      LOG_INFO("Loading modules from: " + _modulesPath);
+      IORA_LOG_INFO("Loading modules from: " + _modulesPath);
       std::filesystem::path modulesPath(_modulesPath);
       if (!std::filesystem::exists(modulesPath))
       {
-        LOG_ERROR("Modules path does not exist: " + _modulesPath);
+        IORA_LOG_ERROR("Modules path does not exist: " + _modulesPath);
         return;
       }
       if (!std::filesystem::is_directory(modulesPath))
       {
-        LOG_ERROR("Modules path is not a directory: " + _modulesPath);
+        IORA_LOG_ERROR("Modules path is not a directory: " + _modulesPath);
         return;
       }
 
@@ -739,7 +739,7 @@ namespace iora
           }
           else
           {
-            LOG_ERROR("Module not found: " + modulePath.string());
+            IORA_LOG_ERROR("Module not found: " + modulePath.string());
           }
         }
         return;
@@ -756,7 +756,7 @@ namespace iora
           }
         }
       }
-      LOG_INFO("Module loading complete.");
+      IORA_LOG_INFO("Module loading complete.");
     }
 
     /// \brief Unregisters a plugin API by name.
@@ -777,7 +777,7 @@ namespace iora
     {
       if (_isRunning)
       {
-        LOG_ERROR("applyConfig: Cannot apply config while service is running");
+        IORA_LOG_ERROR("applyConfig: Cannot apply config while service is running");
         throw std::runtime_error("Cannot apply config while service is running");
       }
       // Fill in defaults for any unset config values
@@ -828,45 +828,45 @@ namespace iora
       try
       {
         core::Logger::init(toLevel(logLevel), logFile, logAsync, logRetention, logTimeFormat);
-        LOG_INFO("applyConfig: Logger initialized");
+        IORA_LOG_INFO("applyConfig: Logger initialized");
       }
       catch (const std::exception& e)
       {
-        LOG_WARN("applyConfig: Logger already initialized, skipping: " << e.what());
+        IORA_LOG_WARN("applyConfig: Logger already initialized, skipping: " << e.what());
       }
 
       // Log config values for diagnostics (now logger is ready)
-      LOG_INFO("applyConfig: state.file = " << _config.state.file.value_or("<unset>"));
-      LOG_INFO("applyConfig: log.level = " << _config.log.level.value_or("<unset>"));
-      LOG_INFO("applyConfig: log.file = " << _config.log.file.value_or("<unset>"));
-      LOG_INFO("applyConfig: log.async = "
+      IORA_LOG_INFO("applyConfig: state.file = " << _config.state.file.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: log.level = " << _config.log.level.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: log.file = " << _config.log.file.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: log.async = "
                << (_config.log.async.has_value() ? (_config.log.async.value() ? "true" : "false") : "<unset>"));
-      LOG_INFO("applyConfig: log.retentionDays = " << (_config.log.retentionDays.has_value()
+      IORA_LOG_INFO("applyConfig: log.retentionDays = " << (_config.log.retentionDays.has_value()
                                                            ? std::to_string(_config.log.retentionDays.value())
                                                            : "<unset>"));
-      LOG_INFO("applyConfig: log.timeFormat = " << _config.log.timeFormat.value_or("<unset>"));
-      LOG_INFO("applyConfig: server.port = "
+      IORA_LOG_INFO("applyConfig: log.timeFormat = " << _config.log.timeFormat.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: server.port = "
                << (_config.server.port.has_value() ? std::to_string(_config.server.port.value()) : "<unset>"));
-      LOG_INFO("applyConfig: server.tls.certFile = " << _config.server.tls.certFile.value_or("<unset>"));
-      LOG_INFO("applyConfig: server.tls.keyFile = " << _config.server.tls.keyFile.value_or("<unset>"));
-      LOG_INFO("applyConfig: server.tls.caFile = " << _config.server.tls.caFile.value_or("<unset>"));
-      LOG_INFO("applyConfig: server.tls.requireClientCert = "
+      IORA_LOG_INFO("applyConfig: server.tls.certFile = " << _config.server.tls.certFile.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: server.tls.keyFile = " << _config.server.tls.keyFile.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: server.tls.caFile = " << _config.server.tls.caFile.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: server.tls.requireClientCert = "
                << (_config.server.tls.requireClientCert.has_value()
                        ? (_config.server.tls.requireClientCert.value() ? "true" : "false")
                        : "<unset>"));
-      LOG_INFO("applyConfig: modules.directory = " << _config.modules.directory.value_or("<unset>"));
+      IORA_LOG_INFO("applyConfig: modules.directory = " << _config.modules.directory.value_or("<unset>"));
 
       // State file
       std::string stateFile = _config.state.file.value_or(DEFAULT_STATE_FILE);
-      LOG_INFO("applyConfig: Creating JsonFileStore at: " << stateFile);
+      IORA_LOG_INFO("applyConfig: Creating JsonFileStore at: " << stateFile);
       _jsonFileStore = std::make_unique<storage::JsonFileStore>(stateFile);
       assert(_jsonFileStore && "_jsonFileStore must be initialized after config");
-      LOG_INFO("applyConfig: JsonFileStore created at: " << stateFile);
+      IORA_LOG_INFO("applyConfig: JsonFileStore created at: " << stateFile);
 
       // Webhook Server
       _webhookServer = std::make_unique<network::WebhookServer>();
       auto port = _config.server.port.value_or(DEFAULT_PORT);
-      LOG_INFO("applyConfig: Setting webhook server port to: " << port);
+      IORA_LOG_INFO("applyConfig: Setting webhook server port to: " << port);
       _webhookServer->setPort(port);
 
       // TLS
@@ -874,31 +874,31 @@ namespace iora
                     _config.server.tls.caFile.has_value() || _config.server.tls.requireClientCert.value_or(false);
       if (hasTls)
       {
-        LOG_INFO("applyConfig: TLS is enabled");
+        IORA_LOG_INFO("applyConfig: TLS is enabled");
         network::WebhookServer::TlsConfig tlsCfg;
         tlsCfg.certFile = _config.server.tls.certFile.value_or("");
         tlsCfg.keyFile = _config.server.tls.keyFile.value_or("");
         tlsCfg.caFile = _config.server.tls.caFile.value_or("");
         tlsCfg.requireClientCert = _config.server.tls.requireClientCert.value_or(false);
-        LOG_INFO("applyConfig: Enabling TLS with certFile=" + tlsCfg.certFile + ", keyFile=" + tlsCfg.keyFile +
+        IORA_LOG_INFO("applyConfig: Enabling TLS with certFile=" + tlsCfg.certFile + ", keyFile=" + tlsCfg.keyFile +
                  ", caFile=" + tlsCfg.caFile + ", requireClientCert=" + (tlsCfg.requireClientCert ? "true" : "false"));
         _webhookServer->enableTls(tlsCfg);
       }
       else
       {
-        LOG_INFO("applyConfig: TLS is not enabled");
+        IORA_LOG_INFO("applyConfig: TLS is not enabled");
       }
 
       // Start the webhook server
-      LOG_INFO("applyConfig: Starting webhook server on port: " << port);
+      IORA_LOG_INFO("applyConfig: Starting webhook server on port: " << port);
       try
       {
         _webhookServer->start();
-        LOG_INFO("applyConfig: Webhook server started successfully");
+        IORA_LOG_INFO("applyConfig: Webhook server started successfully");
       }
       catch (const std::exception& e)
       {
-        LOG_ERROR("applyConfig: Failed to start webhook server: " << e.what());
+        IORA_LOG_ERROR("applyConfig: Failed to start webhook server: " << e.what());
         throw;
       }
 
@@ -936,15 +936,15 @@ namespace iora
 
       if (_config.modules.autoLoad.value_or(true))
       {
-        LOG_INFO("applyConfig: Auto-loading modules is enabled");
+        IORA_LOG_INFO("applyConfig: Auto-loading modules is enabled");
         loadModules();
       }
       else
       {
-        LOG_INFO("applyConfig: Auto-loading modules is disabled");
+        IORA_LOG_INFO("applyConfig: Auto-loading modules is disabled");
       }
 
-      LOG_INFO("applyConfig: Configuration applied");
+      IORA_LOG_INFO("applyConfig: Configuration applied");
 
       // Start the webhook server
 

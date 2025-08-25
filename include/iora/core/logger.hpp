@@ -504,23 +504,23 @@ namespace core
 
   inline LoggerProxy Logger;
 
-#define LOG_CONTEXT_PREFIX                                                     \
+#define IORA_LOG_CONTEXT_PREFIX                                                     \
   "[" << __FILE__ << ":" << __LINE__ << " " << __func__ << "] "
 
-#define LOG_WITH_LEVEL(level, msg)                                             \
+#define IORA_LOG_WITH_LEVEL(level, msg)                                             \
   do                                                                           \
   {                                                                            \
     iora::core::Logger << iora::core::Logger::Level::level                     \
-                       << LOG_CONTEXT_PREFIX << msg                            \
+                       << IORA_LOG_CONTEXT_PREFIX << msg                            \
                        << iora::core::Logger::endl;                            \
   } while (0)
 
-#define LOG_TRACE(msg) LOG_WITH_LEVEL(Trace, msg)
-#define LOG_DEBUG(msg) LOG_WITH_LEVEL(Debug, msg)
-#define LOG_INFO(msg) LOG_WITH_LEVEL(Info, msg)
-#define LOG_WARN(msg) LOG_WITH_LEVEL(Warning, msg)
-#define LOG_ERROR(msg) LOG_WITH_LEVEL(Error, msg)
-#define LOG_FATAL(msg) LOG_WITH_LEVEL(Fatal, msg)
+#define IORA_LOG_TRACE(msg) IORA_LOG_WITH_LEVEL(Trace, msg)
+#define IORA_LOG_DEBUG(msg) IORA_LOG_WITH_LEVEL(Debug, msg)
+#define IORA_LOG_INFO(msg) IORA_LOG_WITH_LEVEL(Info, msg)
+#define IORA_LOG_WARN(msg) IORA_LOG_WITH_LEVEL(Warning, msg)
+#define IORA_LOG_ERROR(msg) IORA_LOG_WITH_LEVEL(Error, msg)
+#define IORA_LOG_FATAL(msg) IORA_LOG_WITH_LEVEL(Fatal, msg)
 
   inline LoggerStream Logger::stream(Logger::Level level)
   {

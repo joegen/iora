@@ -65,7 +65,7 @@
       {
         config.configFile = argv[++i];
         configLoader = std::make_unique<iora::core::ConfigLoader>(config.configFile.value());
-        LOG_INFO("Using config file: " + config.configFile.value());
+        IORA_LOG_INFO("Using config file: " + config.configFile.value());
       }
       else if ((arg == "-s" || arg == "--state-file") && i + 1 < argc)
       {
@@ -199,7 +199,7 @@
         defaultConfigFile = IORA_DEFAULT_CONFIG_FILE_PATH;
 #endif
         configLoader = std::make_unique<iora::core::ConfigLoader>(defaultConfigFile);
-        LOG_INFO("Using default config file: " + defaultConfigFile);
+        IORA_LOG_INFO("Using default config file: " + defaultConfigFile);
       }
       configLoader->reload();
       if (!config.server.port.has_value())

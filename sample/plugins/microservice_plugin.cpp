@@ -49,11 +49,11 @@ public:
       {
         std::string token = envToken;
         svc->jsonFileStore()->set("apiToken", token);
-        LOG_INFO("Stored OpenAI API token from environment variable");
+        IORA_LOG_INFO("Stored OpenAI API token from environment variable");
       }
       else
       {
-        LOG_ERROR("Environment variable OPENAI_API_KEY is not set.");
+        IORA_LOG_ERROR("Environment variable OPENAI_API_KEY is not set.");
         // Plugin can't function without API key, but we don't exit - just log
         // error
         return;
@@ -137,12 +137,12 @@ public:
           return {{"status", "pending"}};
         });
 
-    LOG_INFO("Microservice plugin loaded successfully");
+    IORA_LOG_INFO("Microservice plugin loaded successfully");
   }
 
   void onUnload() override
   {
-    LOG_INFO("Microservice plugin unloading...");
+    IORA_LOG_INFO("Microservice plugin unloading...");
 
     // Clear results map
     {
