@@ -38,7 +38,7 @@ iora::IoraService& createTestService()
     iora::IoraService::init(config);
     initialized = true;
   }
-  return iora::IoraService::instance();
+  return iora::IoraService::instanceRef();
 }
 
 } // anonymous namespace
@@ -311,7 +311,7 @@ TEST_CASE("JSON-RPC Client-Server Integration", "[integration][basic]")
 
 TEST_CASE("Server Method Registration with Options", "[integration][server][options]")
 {
-  auto& svc = iora::IoraService::instance();
+  auto& svc = iora::IoraService::instanceRef();
   
   SECTION("Test jsonrpc.registerWithOptions with various configurations")
   {
@@ -403,7 +403,7 @@ TEST_CASE("Server Method Registration with Options", "[integration][server][opti
 
 TEST_CASE("Error Handling and Edge Cases", "[integration][errors]")
 {
-  auto& svc = iora::IoraService::instance();
+  auto& svc = iora::IoraService::instanceRef();
   
   SECTION("Test various error conditions")
   {
@@ -489,7 +489,7 @@ TEST_CASE("Error Handling and Edge Cases", "[integration][errors]")
 
 TEST_CASE("Full Client-Server Communication", "[integration][communication][full]")
 {
-  auto& svc = iora::IoraService::instance();
+  auto& svc = iora::IoraService::instanceRef();
   
   SECTION("Test full client-server communication with running server")
   {

@@ -1,4 +1,4 @@
-#define CATCH_CONFIG_MAIN
+#define CATCH_CONFIG_RUNNER
 #include <catch2/catch.hpp>
 #include <chrono>
 #include <iomanip>
@@ -6,20 +6,20 @@
 
 using namespace iora::test;
 
+// Global service instance for all tests
+static iora::IoraService* globalSvc = nullptr;
+
+// Helper function to get service instance
+iora::IoraService& getTestService() {
+  if (!globalSvc) {
+    throw std::runtime_error("Test service not initialized");
+  }
+  return *globalSvc;
+}
+
 TEST_CASE("Dynamic loading of testplugin shared library")
 {
-  initializeTestLogging();
-
-  // Setup IoraService config
-  iora::IoraService::Config config;
-  config.server.port = 8130;
-  config.state.file = "ioraservice_plugin_state.json";
-  config.log.file = "ioraservice_plugin_log";
-
-  // Initialize service with config
-  iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
-  AutoServiceShutdown autoShutdown(svc);
+  iora::IoraService& svc = getTestService();
 
   auto pluginPathOpt = iora::util::getExecutableDir() + "/plugins/testplugin.so";
   std::cout << "Plugin path: " << pluginPathOpt << std::endl;
@@ -63,14 +63,14 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   SECTION("getExportedApiSafe: basic functionality")
   {
     auto safeAddApi = svc.getExportedApiSafe<int(int, int)>("testplugin.add");
-    REQUIRE(safeAddApi(5, 7) == 12);
-    REQUIRE(safeAddApi.isAvailable() == true);
-    REQUIRE(safeAddApi.getModuleName() == "testplugin.so");  // Should be full filename
-    REQUIRE(safeAddApi.getApiName() == "testplugin.add");
+    REQUIRE((*safeAddApi)(5, 7) == 12);
+    REQUIRE(safeAddApi->isAvailable() == true);
+    REQUIRE(safeAddApi->getModuleName() == "testplugin.so");  // Should be full filename
+    REQUIRE(safeAddApi->getApiName() == "testplugin.add");
 
     auto safeGreetApi = svc.getExportedApiSafe<std::string(const std::string&)>("testplugin.greet");
-    REQUIRE(safeGreetApi("SafeAPI") == "Hello, SafeAPI!");
-    REQUIRE(safeGreetApi.isAvailable() == true);
+    REQUIRE((*safeGreetApi)("SafeAPI") == "Hello, SafeAPI!");
+    REQUIRE(safeGreetApi->isAvailable() == true);
   }
 
   SECTION("getExportedApiSafe: handles module unloading gracefully")
@@ -80,9 +80,9 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto safeGreetApi = svc.getExportedApiSafe<std::string(const std::string&)>("testplugin.greet");
 
     // Test that they work initially
-    REQUIRE(safeAddApi(3, 4) == 7);
-    REQUIRE(safeGreetApi("Test") == "Hello, Test!");
-    REQUIRE(safeAddApi.isAvailable() == true);
+    REQUIRE((*safeAddApi)(3, 4) == 7);
+    REQUIRE((*safeGreetApi)("Test") == "Hello, Test!");
+    REQUIRE(safeAddApi->isAvailable() == true);
 
     // Unload the module
     REQUIRE(svc.unloadSingleModule("testplugin.so"));
@@ -91,8 +91,8 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Safe API should now report module as unavailable
-    REQUIRE(safeAddApi.isAvailable() == false);
-    REQUIRE(safeGreetApi.isAvailable() == false);
+    REQUIRE(safeAddApi->isAvailable() == false);
+    REQUIRE(safeGreetApi->isAvailable() == false);
 
     // Calling the safe APIs should throw proper exceptions instead of crashing
     bool addThrew = false;
@@ -101,7 +101,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
     try
     {
-      safeAddApi(1, 1);
+      (*safeAddApi)(1, 1);
     }
     catch (const std::runtime_error& e)
     {
@@ -111,7 +111,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
     try
     {
-      safeGreetApi("Test");
+      (*safeGreetApi)("Test");
     }
     catch (const std::runtime_error& e)
     {
@@ -130,10 +130,10 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     // Wait a bit for event processing
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    REQUIRE(safeAddApi.isAvailable() == true);
-    REQUIRE(safeGreetApi.isAvailable() == true);
-    REQUIRE(safeAddApi(10, 15) == 25);
-    REQUIRE(safeGreetApi("Reloaded") == "Hello, Reloaded!");
+    REQUIRE(safeAddApi->isAvailable() == true);
+    REQUIRE(safeGreetApi->isAvailable() == true);
+    REQUIRE((*safeAddApi)(10, 15) == 25);
+    REQUIRE((*safeGreetApi)("Reloaded") == "Hello, Reloaded!");
   }
 
   SECTION("Plugin reload: unload and reload shared library")
@@ -164,7 +164,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
     // Both should work initially
     REQUIRE(unsafeAdd(1, 2) == 3);
-    REQUIRE(safeAdd(1, 2) == 3);
+    REQUIRE((*safeAdd)(1, 2) == 3);
 
     // Unload module
     REQUIRE(svc.unloadSingleModule("testplugin.so"));
@@ -174,7 +174,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     bool safeThrew = false;
     try
     {
-      safeAdd(1, 2);
+      (*safeAdd)(1, 2);
     }
     catch (const std::runtime_error& e)
     {
@@ -191,7 +191,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     // Reload and verify safe API works again
     REQUIRE(svc.loadSingleModule(pluginPathOpt));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    REQUIRE(safeAdd(5, 6) == 11);
+    REQUIRE((*safeAdd)(5, 6) == 11);
   }
 
   SECTION("Thread safety test: concurrent API calls during module unload/reload")
@@ -220,7 +220,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
             {
               try
               {
-                int result = safeAddApi(i, j);
+                int result = (*safeAddApi)(i, j);
                 if (result == i + j)
                 {
                   successCount.fetch_add(1);
@@ -289,7 +289,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
     // Warm up all APIs to ensure caches are populated
     unsafeAddApi(1, 1);
-    safeAddApi(1, 1);
+    (*safeAddApi)(1, 1);
     svc.callExportedApi<int, int, int>("testplugin.add", 1, 1);
 
     // Benchmark 1: Unsafe API (raw std::function)
@@ -306,7 +306,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto safeStart = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < numCalls; ++i)
     {
-      volatile int result = safeAddApi(i % 100, (i + 1) % 100);
+      volatile int result = (*safeAddApi)(i % 100, (i + 1) % 100);
       (void)result;  // Prevent optimization
     }
     auto safeEnd = std::chrono::high_resolution_clock::now();
@@ -354,7 +354,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto safeAddApi = svc.getExportedApiSafe<int(int, int)>("testplugin.add");
 
     // Warm up
-    safeAddApi(1, 1);
+    (*safeAddApi)(1, 1);
 
     // Measure cache refresh cost (first call after invalidation)
     std::vector<double> refreshTimes;
@@ -368,7 +368,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
       // Measure first call after reload (cache miss)
       auto start = std::chrono::high_resolution_clock::now();
-      volatile int result = safeAddApi(i, i + 1);
+      volatile int result = (*safeAddApi)(i, i + 1);
       auto end = std::chrono::high_resolution_clock::now();
       (void)result;
 
@@ -393,5 +393,34 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     REQUIRE(avgRefreshNs < 50000.0);  // Less than 50μs for cache refresh
   }
 
+  // Clean up between sections by unloading modules instead of shutting down service
+  svc.unloadAllModules();
+}
+
+int main(int argc, char* argv[])
+{
+  Catch::Session session;
+  
+  // Initialize test logging
+  initializeTestLogging();
+
+  // Setup IoraService config - initialize once for all tests
+  iora::IoraService::Config config;
+  config.server.port = 8130;
+  config.state.file = "ioraservice_plugin_state.json";
+  config.log.file = "ioraservice_plugin_log";
+  config.modules.autoLoad = false;
+
+  // Initialize service once
+  iora::IoraService::init(config);
+  globalSvc = &iora::IoraService::instanceRef();
+
+  // Run all tests
+  int result = session.run(argc, argv);
+
+  // Final cleanup
+  globalSvc->shutdown();
   iora::util::removeFilesContainingAny({"ioraservice_plugin_log", "ioraservice_plugin_state.json"});
+
+  return result;
 }

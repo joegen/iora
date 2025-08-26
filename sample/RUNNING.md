@@ -10,7 +10,7 @@ The microservice exposes a simple HTTP API via the embedded `WebhookServer` and 
 
 This application exercises all major components of `IoraService`:
 
-- **Singleton and configuration**: Initialised once via `IoraService::init()`, reading `config.toml` and overriding values with command‑line flags.
+- **Singleton and configuration**: Initialised once via `IoraService::init()` with a Config object, reading configuration from `config.toml`.
 - **HTTP server**: Registers JSON endpoints (e.g., `/summarise`) using `webhookServer().onJson()` to handle POST requests.
 - **HTTP client**: Uses `makeHttpClient()` to POST requests to the LLM API and parse JSON responses.
 - **Cache**: Caches summaries keyed by a hash of the input text via `cache().set()`/`get()`, expiring them after a configurable TTL.

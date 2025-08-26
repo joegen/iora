@@ -8,7 +8,7 @@ The `microservice_plugin.cpp` demonstrates how to build a text summarization mic
 
 ### Key Differences from Standalone Applications
 
-**❌ INCORRECT (deprecated):**
+**❌ INCORRECT:**
 ```cpp
 // Don't do this - initializing IoraService in your application
 auto& svc = iora::IoraService::init(argc, argv);

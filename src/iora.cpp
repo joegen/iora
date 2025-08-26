@@ -353,7 +353,7 @@ int main(int argc, char** argv)
     parseCliArgs(argc, argv, config, configLoader);
     parseTomlConfig(config, configLoader);
 
-    iora::IoraService::instance().setConfigLoader(std::move(configLoader));
+    iora::IoraService::instanceRef().setConfigLoader(std::move(configLoader));
 
     // Initialize the IoraService with command-line arguments
     iora::IoraService::init(config);
@@ -361,12 +361,12 @@ int main(int argc, char** argv)
     std::signal(SIGINT, 
       [](int) 
       {
-        iora::IoraService::instance().terminate();
+        iora::IoraService::instanceRef().terminate();
       }
     );
     
     // Wait for termination
-    iora::IoraService::instance().waitForTermination();
+    iora::IoraService::instanceRef().waitForTermination();
   }
   catch (const std::exception& ex)
   {

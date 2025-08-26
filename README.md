@@ -2,6 +2,51 @@
 
 **Iora** is a modern **C++17 application framework for high-performance networked applications** with **ZERO external dependencies** (except OpenSSL for TLS). Designed for production environments, it provides a unified transport layer, advanced networking capabilities, dynamic plugin system, and comprehensive tooling — making it ideal for distributed systems, API gateways, real-time applications, and beyond.
 
+## 📖 Table of Contents
+
+- [🐦 What's In The Name?](#-whats-in-the-name)
+- [🎯 Why Choose Iora?](#-why-choose-iora)
+- [🎯 Zero External Dependencies](#-zero-external-dependencies)
+- [✨ Core Features](#-core-features)
+- [🚀 High-Performance JSON Parser](#-high-performance-json-parser)
+- [🔧 Production-Ready XML Parser](#-production-ready-xml-parser)
+- [⏱️ High-Performance Timer System](#️-high-performance-timer-system)
+  - [Advanced Timer Components](#-advanced-timer-components)
+  - [Comprehensive Statistics & Monitoring](#-comprehensive-statistics--monitoring)
+  - [Usage Examples](#-usage-examples)
+  - [Performance Characteristics](#-performance-characteristics)
+- [🌐 Unified Network Transport System](#-unified-network-transport-system)
+  - [Core Architecture](#-core-architecture)
+  - [Transport Capabilities](#️-transport-capabilities)
+  - [Comprehensive Statistics](#-comprehensive-statistics)
+  - [Advanced Features](#-advanced-features)
+  - [Protocol Support](#️-protocol-support)
+- [🛡️ Circuit Breaker & Health Monitoring](#️-circuit-breaker--health-monitoring)
+  - [Circuit Breaker System](#-circuit-breaker-system)
+  - [Connection Health Monitoring](#-connection-health-monitoring)
+  - [Production Integration](#-production-integration)
+  - [Best Practices](#-best-practices)
+- [🌍 Advanced DNS Resolution System](#-advanced-dns-resolution-system)
+  - [Supported DNS Record Types](#-supported-dns-record-types)
+  - [DnsClientHybrid - Advanced DNS Client](#-dnsclienthybrid---advanced-dns-client)
+  - [DNS Record Structures](#-dns-record-structures)
+  - [Key Features](#-key-features)
+- [🔌 Available Plugins](#-available-plugins)
+- [🛠️ Build Instructions](#️-build-instructions)
+- [📦 Installation](#-installation)
+- [✅ Run Tests](#-run-tests)
+- [🚀 Sample Microservice Plugin](#-sample-microservice-plugin)
+- [🔗 Linking to Iora](#-linking-to-iora)
+- [🔌 Plugin Support](#-plugin-support)
+  - [How It Works](#how-it-works)
+  - [Example Plugin](#example-plugin)
+  - [Plugin Dependency System](#plugin-dependency-system)
+  - [Configuration](#configuration)
+  - [Logging and Error Handling](#logging-and-error-handling)
+  - [JSON-RPC Server Module](#json-rpc-server-module)
+- [🔒 Thread-Safe Plugin API Access](#-thread-safe-plugin-api-access)
+- [📝 License](#-license)
+
 ---
 
 ## 🐦 What's In The Name?
@@ -234,93 +279,1076 @@ std::cout << "Item ID: " << item->getAttribute("id") << std::endl;
 
 ## ⏱️ High-Performance Timer System
 
-Iora includes a **sophisticated timer service** designed for high-throughput microservices that need precise timing and scheduling capabilities:
+Iora includes a **sophisticated timer service** designed for high-throughput microservices that need precise timing and scheduling capabilities with enterprise-grade reliability and monitoring.
 
-### ⚡ **Core Features**
-- **High-resolution timers** — Microsecond precision with steady clock guarantees
-- **Scalable architecture** — Single-threaded event loop per service, pool support for load distribution
-- **Perfect forwarding** — Zero-copy handler support for move-only types
-- **Periodic timers** — Repeating timers with automatic rescheduling
-- **Cancellation support** — Cancel any timer before execution
-- **Thread-safe** — All operations are thread-safe by design
+### ⚡ **Core Architecture**
+- **Linux-Optimized** — Built on timerfd, epoll, and eventfd for maximum performance
+- **High-Resolution** — Microsecond precision with steady clock guarantees  
+- **Thread-Safe** — All operations are thread-safe by design with lock-free paths
+- **Scalable** — Handle millions of concurrent timers efficiently
+- **Exception-Safe** — Comprehensive error handling with configurable policies
 
-### 🎯 **Advanced Capabilities**
-- **TimerServicePool** — Distribute timers across multiple threads for massive scale
-- **Statistics tracking** — Monitor timer performance and execution metrics
-- **Error handling** — Configurable error handlers with exception safety
-- **ASIO compatibility** — Drop-in replacement for boost::asio timers
-- **Memory efficient** — Object pooling and smart pointer management
+### 🛠️ **Advanced Timer Components**
 
-### 📊 **Performance Characteristics**
-- **Millions of timers** — Handle millions of concurrent timers efficiently
-- **Low latency** — Sub-millisecond scheduling overhead
-- **Predictable behavior** — No allocation in hot paths
-- **Work stealing** — Automatic load balancing in pool mode
+#### **TimerService - Single-Threaded High Performance**
+```cpp
+class TimerService {
+public:
+    // Configuration for fine-tuning behavior
+    struct Config {
+        std::uint32_t maxConcurrentTimers{100000};     // Resource limits
+        std::string threadName{"TimerService"};         // Thread identification
+        bool enableStatistics{false};                  // Performance monitoring
+        std::chrono::microseconds resolutionHint{1000}; // Timer resolution
+        ErrorHandlerFunc errorHandler;                  // Custom error handling
+        int threadPriority{0};                         // Thread priority (-20 to 19)
+    };
+    
+    // High-performance timer scheduling
+    template<typename Rep, typename Period, typename Handler>
+    TimerId scheduleAfter(std::chrono::duration<Rep, Period> delay, Handler&& handler);
+    
+    template<typename Rep, typename Period, typename Handler>
+    TimerId schedulePeriodic(std::chrono::duration<Rep, Period> interval, Handler&& handler);
+    
+    // Advanced scheduling with absolute time
+    template<typename Clock, typename Duration, typename Handler>
+    TimerId scheduleAt(std::chrono::time_point<Clock, Duration> timePoint, Handler&& handler);
+    
+    // Timer management
+    bool cancel(TimerId id);
+    bool reschedule(TimerId id, std::chrono::microseconds newDelay);
+    
+    // Performance monitoring
+    const TimerStats& getStats() const;
+    void resetStats();
+};
+```
+
+#### **TimerServicePool - Distributed Load Balancing**
+```cpp
+class TimerServicePool {
+public:
+    // Create pool with multiple timer threads
+    TimerServicePool(std::size_t numThreads, const TimerService::Config& config = {});
+    
+    // Get service for round-robin distribution
+    TimerService& getService();
+    
+    // Get specific service by index
+    TimerService& getService(std::size_t index);
+    
+    // Pool-wide operations
+    void start();
+    void stop();
+    void waitForStop();
+    
+    // Aggregate statistics across all services
+    TimerStats getAggregateStats() const;
+    
+    // Load balancing information
+    std::vector<std::size_t> getServiceLoads() const;
+    TimerService& getLeastLoadedService();
+};
+```
+
+#### **SteadyTimer - ASIO-Compatible Interface**
+```cpp
+class SteadyTimer {
+public:
+    explicit SteadyTimer(TimerService& service);
+    
+    // ASIO-style async operations
+    template<typename Rep, typename Period>
+    void expiresAfter(std::chrono::duration<Rep, Period> duration);
+    
+    template<typename Clock, typename Duration>
+    void expiresAt(std::chrono::time_point<Clock, Duration> timePoint);
+    
+    template<typename WaitHandler>
+    void asyncWait(WaitHandler&& handler);
+    
+    // Synchronous wait operations
+    void wait();
+    std::error_code wait(std::error_code& ec);
+    
+    // Timer management
+    std::size_t cancel();
+    std::size_t cancel(std::error_code& ec);
+    
+    // Time remaining
+    std::chrono::microseconds timeRemaining() const;
+    bool hasExpired() const;
+};
+```
+
+### 📊 **Comprehensive Statistics & Monitoring**
+
+```cpp
+struct TimerStats {
+    // Basic counters
+    std::atomic<std::uint64_t> timersScheduled{0};      // Total scheduled
+    std::atomic<std::uint64_t> timersCanceled{0};       // Canceled before execution
+    std::atomic<std::uint64_t> timersExecuted{0};       // Successfully executed
+    std::atomic<std::uint64_t> timersExpired{0};        // Expired (timeout)
+    std::atomic<std::uint64_t> periodicTimersActive{0}; // Active periodic timers
+    
+    // Error tracking
+    std::atomic<std::uint64_t> exceptionsSwallowed{0};  // Handler exceptions caught
+    std::atomic<std::uint64_t> systemErrors{0};         // System call failures
+    
+    // Performance metrics
+    std::atomic<std::uint64_t> heapOperations{0};       // Priority queue operations
+    std::atomic<std::uint64_t> epollWaits{0};           // Event loop iterations
+    std::atomic<std::uint64_t> eventfdWakeups{0};       // Cross-thread wakeups
+    std::atomic<std::uint64_t> timerfdTriggers{0};      // Timer file descriptor events
+    
+    // Handler execution timing
+    std::atomic<std::uint64_t> totalHandlerExecutionTimeNs{0};
+    std::atomic<std::uint64_t> maxHandlerExecutionTimeNs{0};
+    std::atomic<std::uint64_t> avgHandlerExecutionTimeNs{0};
+    
+    std::chrono::steady_clock::time_point startTime;
+};
+```
+
+### 🚀 **Usage Examples**
+
+#### **Basic Timer Operations**
+```cpp
+#include "iora/iora.hpp"
+using namespace iora::core;
+
+// Create timer service with monitoring enabled
+TimerService::Config config;
+config.enableStatistics = true;
+config.maxConcurrentTimers = 50000;
+config.threadName = "AppTimers";
+
+TimerService service(config);
+
+// Schedule one-shot timer
+auto oneShot = service.scheduleAfter(std::chrono::seconds(5), []() {
+    std::cout << "One-shot timer fired!" << std::endl;
+});
+
+// Schedule periodic timer
+auto periodic = service.schedulePeriodic(std::chrono::milliseconds(100), []() {
+    std::cout << "Periodic tick" << std::endl;
+});
+
+// Schedule at absolute time
+auto tomorrow = std::chrono::steady_clock::now() + std::chrono::hours(24);
+auto absolute = service.scheduleAt(tomorrow, []() {
+    std::cout << "Daily maintenance task" << std::endl;
+});
+
+// Cancel timers
+service.cancel(oneShot);
+service.cancel(periodic);
+```
+
+#### **High-Throughput Timer Pool**
+```cpp
+// Create pool with 8 worker threads
+TimerServicePool pool(8, config);
+pool.start();
+
+// Distribute timers across the pool
+for (int i = 0; i < 1000000; ++i) {
+    auto& service = pool.getService(); // Round-robin assignment
+    service.scheduleAfter(std::chrono::milliseconds(i % 10000), [i]() {
+        processTask(i);
+    });
+}
+
+// Monitor pool performance
+auto stats = pool.getAggregateStats();
+auto loads = pool.getServiceLoads();
+
+std::cout << "Total timers scheduled: " << stats.timersScheduled << std::endl;
+std::cout << "Average handler time: " << stats.avgHandlerExecutionTimeNs << "ns" << std::endl;
+std::cout << "Service loads: ";
+for (auto load : loads) {
+    std::cout << load << " ";
+}
+std::cout << std::endl;
+```
+
+#### **ASIO-Compatible Interface**
+```cpp
+// Create ASIO-style timer
+SteadyTimer timer(service);
+
+// Async wait with callback
+timer.expiresAfter(std::chrono::seconds(2));
+timer.asyncWait([](std::error_code ec) {
+    if (!ec) {
+        std::cout << "ASIO-style timer completed!" << std::endl;
+    } else {
+        std::cout << "Timer was canceled: " << ec.message() << std::endl;
+    }
+});
+
+// Synchronous wait
+SteadyTimer syncTimer(service);
+syncTimer.expiresAfter(std::chrono::milliseconds(500));
+syncTimer.wait(); // Blocks until timer expires
+std::cout << "Sync timer completed!" << std::endl;
+
+// Check time remaining
+auto remaining = syncTimer.timeRemaining();
+std::cout << "Time remaining: " << remaining.count() << "μs" << std::endl;
+```
+
+#### **Error Handling & Resource Management**
+```cpp
+// Custom error handler
+auto errorHandler = [](TimerError error, const std::string& message, int errno_val) {
+    std::cerr << "Timer error [" << static_cast<int>(error) << "]: " 
+              << message << std::endl;
+    if (error == TimerError::ResourceExhausted) {
+        // Implement backpressure or cleanup logic
+        cleanupExpiredTimers();
+    }
+};
+
+TimerService::Config config;
+config.errorHandler = errorHandler;
+config.maxConcurrentTimers = 10000; // Set reasonable limits
+
+TimerService service(config);
+
+// Handle timer exceptions
+try {
+    auto id = service.scheduleAfter(std::chrono::microseconds(1), []() {
+        throw std::runtime_error("Handler failed!");
+    });
+} catch (const TimerException& e) {
+    std::cout << "Timer error: " << e.what() 
+              << " [code: " << static_cast<int>(e.code()) << "]" << std::endl;
+}
+```
+
+#### **Performance Monitoring & Tuning**
+```cpp
+// Monitor timer service performance
+void monitorTimerPerformance(const TimerService& service) {
+    const auto& stats = service.getStats();
+    auto runtime = std::chrono::steady_clock::now() - stats.startTime;
+    auto runtimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(runtime).count();
+    
+    std::cout << "=== Timer Service Performance Report ===" << std::endl;
+    std::cout << "Runtime: " << runtimeSeconds << " seconds" << std::endl;
+    std::cout << "Timers scheduled: " << stats.timersScheduled << std::endl;
+    std::cout << "Timers executed: " << stats.timersExecuted << std::endl;
+    std::cout << "Timers canceled: " << stats.timersCanceled << std::endl;
+    std::cout << "Active periodic timers: " << stats.periodicTimersActive << std::endl;
+    
+    if (stats.timersExecuted > 0) {
+        auto avgHandlerTime = stats.avgHandlerExecutionTimeNs.load();
+        auto maxHandlerTime = stats.maxHandlerExecutionTimeNs.load();
+        
+        std::cout << "Average handler time: " << (avgHandlerTime / 1000.0) << "μs" << std::endl;
+        std::cout << "Max handler time: " << (maxHandlerTime / 1000.0) << "μs" << std::endl;
+    }
+    
+    std::cout << "System errors: " << stats.systemErrors << std::endl;
+    std::cout << "Handler exceptions: " << stats.exceptionsSwallowed << std::endl;
+    std::cout << "Heap operations: " << stats.heapOperations << std::endl;
+}
+```
+
+### 🎯 **Performance Characteristics**
+- **Ultra-Low Latency** — Sub-millisecond scheduling overhead
+- **High Throughput** — Millions of timers per second
+- **Memory Efficient** — Zero allocation in timer execution hot path
+- **CPU Efficient** — Event-driven architecture with minimal system calls
+- **Predictable** — Bounded execution time with resource limits
+- **Scalable** — Linear scaling with CPU cores in pool mode
+
+### 🏗️ **Architecture Benefits**
+- **No External Dependencies** — Pure C++17 implementation with Linux system calls
+- **Production Ready** — Used in high-frequency trading and real-time systems
+- **Exception Safe** — Comprehensive error handling with recovery strategies
+- **Resource Controlled** — Configurable limits prevent resource exhaustion
+- **Monitoring Ready** — Built-in statistics for observability and debugging
+
+---
+
+## 🌐 Unified Network Transport System
+
+Iora's **UnifiedSharedTransport** provides a sophisticated, high-performance transport layer that abstracts TCP, TLS, and UDP protocols behind a single unified interface. Built for production environments requiring both high throughput and low latency.
+
+### ⚡ **Core Architecture**
+
+- **Protocol Agnostic** — Single API for TCP, TLS, and UDP operations
+- **Hybrid Sync/Async** — Both blocking and non-blocking I/O patterns
+- **Linux Optimized** — Built on epoll, eventfd, and timerfd for maximum performance
+- **Thread-Safe** — Concurrent operations with operation queueing
+- **Connection Management** — Automatic lifecycle management with health monitoring
+
+### 🛡️ **Transport Capabilities**
+
+Each transport exposes its capabilities through a capability system:
+
+```cpp
+enum class Capability : std::uint32_t {
+    None = 0,
+    HasTls = 1 << 0,                    // TLS/SSL support
+    IsConnectionOriented = 1 << 1,      // TCP-style connections
+    HasConnectViaListener = 1 << 2,     // Server-side connections
+    SupportsKeepalive = 1 << 3,         // Connection keep-alive
+    SupportsBatchSend = 1 << 4,         // Batched send operations
+    SupportsSyncOperations = 1 << 5,    // Blocking operations
+    SupportsReadModes = 1 << 6          // Exclusive read modes
+};
+```
+
+### 📊 **Comprehensive Statistics**
+
+The transport layer provides detailed operational metrics:
+
+```cpp
+struct UnifiedStats {
+    std::uint64_t accepted{0};          // Connections accepted
+    std::uint64_t connected{0};         // Outbound connections made
+    std::uint64_t closed{0};            // Connections closed
+    std::uint64_t errors{0};            // Error count
+    std::uint64_t tlsHandshakes{0};     // TLS handshakes completed
+    std::uint64_t tlsFailures{0};       // TLS handshake failures
+    std::uint64_t bytesIn{0};           // Bytes received
+    std::uint64_t bytesOut{0};          // Bytes sent
+    std::uint64_t backpressureCloses{0}; // Connections closed due to backpressure
+    std::size_t sessionsCurrent{0};     // Active sessions
+    std::size_t sessionsPeak{0};        // Peak concurrent sessions
+};
+```
 
 ### 🔧 **Usage Examples**
 
 ```cpp
 #include "iora/iora.hpp"
-using namespace iora::core;
+using namespace iora::network;
 
-// Create a timer service with custom configuration
-auto config = TimerConfigBuilder()
-    .enableStatistics(true)
-    .maxConcurrentTimers(10000)
-    .threadName("MyTimers")
-    .build();
+// Create unified transport for TCP
+auto transport = UnifiedSharedTransport::createTcp();
 
-TimerService service(config);
-
-// Schedule a one-shot timer
-service.scheduleAfter(std::chrono::seconds(5), []() {
-    std::cout << "Timer fired after 5 seconds!" << std::endl;
-});
-
-// Schedule a periodic timer
-auto periodicId = service.schedulePeriodic(std::chrono::seconds(1), []() {
-    std::cout << "Tick every second" << std::endl;
-});
-
-// Cancel a timer
-service.cancel(periodicId);
-
-// Use move-only handlers
-auto resource = std::make_unique<MyResource>();
-service.scheduleAfter(100ms, [r = std::move(resource)]() {
-    r->process(); // Resource moved into timer
-});
-
-// Pool for high-throughput scenarios
-TimerServicePool pool(4, config); // 4 timer threads
-for (int i = 0; i < 100000; ++i) {
-    pool.getService().scheduleAfter(1s, [i]() {
-        processTask(i);
+// Server: Listen for connections
+transport->listen("0.0.0.0", 8080, 
+    [](SessionId sessionId, const std::string& data) {
+        // Handle incoming data
+        std::cout << "Received: " << data << std::endl;
     });
+
+// Client: Connect and send data
+auto sessionId = transport->connect("127.0.0.1", 8080);
+transport->send(sessionId, "Hello, Server!");
+
+// Check transport capabilities
+auto caps = transport->getCapabilities();
+if (any(caps & Capability::HasTls)) {
+    std::cout << "TLS support available" << std::endl;
 }
 
-// ASIO-compatible interface
-SteadyTimer timer(service);
-timer.expiresAfter(std::chrono::seconds(2));
-timer.asyncWait([](bool canceled) {
-    if (!canceled) {
-        std::cout << "ASIO-style timer fired!" << std::endl;
+// Monitor performance
+auto stats = transport->getStats();
+std::cout << "Active sessions: " << stats.sessionsCurrent << std::endl;
+std::cout << "Bytes transferred: " << stats.bytesIn + stats.bytesOut << std::endl;
+```
+
+### 🚀 **Advanced Features**
+
+#### **Exclusive Read Modes**
+Control how data is processed to prevent race conditions:
+```cpp
+transport->setExclusiveReadMode(sessionId, true);
+// Only one thread processes data for this session
+```
+
+#### **Batch Operations**
+Optimize throughput with batched sends:
+```cpp
+if (any(caps & Capability::SupportsBatchSend)) {
+    std::vector<std::pair<SessionId, std::string>> batch = {
+        {session1, "Message 1"},
+        {session2, "Message 2"},
+        {session3, "Message 3"}
+    };
+    transport->sendBatch(batch);
+}
+```
+
+#### **Connection Health Monitoring**
+Monitor connection health with automatic recovery:
+```cpp
+transport->setHealthCheckInterval(std::chrono::seconds(30));
+transport->onConnectionHealthChanged([](SessionId id, bool healthy) {
+    if (!healthy) {
+        std::cout << "Session " << id << " is unhealthy" << std::endl;
+    }
+});
+```
+
+### 🏗️ **Protocol Support**
+
+#### **TCP Transport**
+```cpp
+auto tcpTransport = UnifiedSharedTransport::createTcp();
+// Full-duplex, reliable, connection-oriented
+```
+
+#### **TLS Transport**
+```cpp
+TlsConfig tlsConfig;
+tlsConfig.certFile = "/path/to/cert.pem";
+tlsConfig.keyFile = "/path/to/key.pem";
+auto tlsTransport = UnifiedSharedTransport::createTls(tlsConfig);
+// TCP with TLS encryption
+```
+
+#### **UDP Transport**
+```cpp
+auto udpTransport = UnifiedSharedTransport::createUdp();
+// Connectionless, fast, best-effort delivery
+```
+
+### 🎯 **Performance Characteristics**
+
+- **High Throughput** — Optimized for millions of concurrent connections
+- **Low Latency** — Sub-millisecond response times with proper tuning
+- **Memory Efficient** — Connection pooling and buffer reuse
+- **CPU Efficient** — Event-driven architecture minimizes context switches
+- **Scalable** — Linear performance scaling with CPU cores
+
+---
+
+## 🛡️ Circuit Breaker & Health Monitoring
+
+Iora provides enterprise-grade **Circuit Breaker** and **Connection Health** systems to prevent cascade failures and ensure system resilience in production environments.
+
+### 🔥 **Circuit Breaker System**
+
+The circuit breaker pattern prevents calls to failing services, allowing them time to recover while protecting your application from cascade failures.
+
+#### **States & Transitions**
+
+```
+┌─────────────┐    Failure Rate     ┌─────────────┐
+│   CLOSED    │ ───────────────────▶ │    OPEN     │
+│  (Normal)   │   Exceeds Threshold  │ (Failing)   │
+└─────┬───────┘                      └──────┬──────┘
+      │                                     │
+      │ Success                             │ Timeout
+      │ Threshold                           │ Expires
+      │ Reached                             ▼
+┌─────▼───────┐                      ┌─────────────┐
+│   CLOSED    │ ◄──────────────────── │  HALF-OPEN  │
+│             │    Recovery Test      │  (Testing)  │
+└─────────────┘      Passes          └─────────────┘
+```
+
+#### **Configuration Options**
+
+```cpp
+struct CircuitBreakerConfig {
+    int failureThreshold{5};              // Failures to trigger open state
+    std::chrono::seconds timeout{60};     // Wait time before testing recovery
+    int successThreshold{3};              // Successes needed to close circuit
+    std::chrono::seconds statisticsWindow{300}; // Window for failure rate calculation
+    double failureRateThreshold{0.5};     // Failure rate (0.0-1.0) to trigger open
+    int minimumRequests{10};               // Minimum requests before considering rate
+};
+```
+
+#### **Usage Examples**
+
+```cpp
+#include "iora/iora.hpp"
+using namespace iora::network;
+
+// Create circuit breaker with custom config
+CircuitBreakerConfig config;
+config.failureThreshold = 10;
+config.timeout = std::chrono::seconds(30);
+config.successThreshold = 5;
+config.failureRateThreshold = 0.6;  // 60% failure rate
+
+CircuitBreaker breaker(config);
+
+// Use circuit breaker to protect service calls
+auto callExternalService = [&]() -> bool {
+    if (!breaker.allowRequest()) {
+        std::cout << "Circuit breaker is OPEN - failing fast" << std::endl;
+        return false;
+    }
+    
+    try {
+        // Make your service call
+        bool success = makeHttpRequest("https://api.example.com/data");
+        
+        if (success) {
+            breaker.recordSuccess();
+            return true;
+        } else {
+            breaker.recordFailure();
+            return false;
+        }
+    } catch (const std::exception& e) {
+        breaker.recordFailure();
+        std::cout << "Service call failed: " << e.what() << std::endl;
+        return false;
+    }
+};
+
+// Monitor circuit breaker state
+auto state = breaker.getState();
+switch (state) {
+    case CircuitBreakerState::Closed:
+        std::cout << "Circuit breaker: Normal operation" << std::endl;
+        break;
+    case CircuitBreakerState::Open:
+        std::cout << "Circuit breaker: Failing fast, service unavailable" << std::endl;
+        break;
+    case CircuitBreakerState::HalfOpen:
+        std::cout << "Circuit breaker: Testing service recovery" << std::endl;
+        break;
+}
+```
+
+#### **CircuitBreakerManager for Multiple Services**
+
+```cpp
+class CircuitBreakerManager {
+public:
+    // Get or create circuit breaker for a service
+    CircuitBreaker& getBreaker(const std::string& serviceName,
+                              const CircuitBreakerConfig& config = {});
+    
+    // Check if any service is failing
+    bool hasOpenCircuits() const;
+    
+    // Get statistics for all circuit breakers
+    std::map<std::string, CircuitBreakerStats> getStats() const;
+};
+
+// Usage
+CircuitBreakerManager manager;
+
+auto& userService = manager.getBreaker("user-service");
+auto& paymentService = manager.getBreaker("payment-service");
+auto& inventoryService = manager.getBreaker("inventory-service");
+
+// Each service has independent circuit breaker protection
+```
+
+### 💗 **Connection Health Monitoring**
+
+The health monitoring system continuously tracks connection health and provides early warning of degraded performance.
+
+#### **Health States**
+
+```cpp
+enum class HealthState {
+    Healthy,    // Normal operation
+    Warning,    // Minor issues detected
+    Degraded,   // Performance issues
+    Critical,   // Major issues
+    Unhealthy   // Connection should be avoided
+};
+```
+
+#### **HealthMonitor Features**
+
+```cpp
+class HealthMonitor {
+public:
+    struct Config {
+        std::chrono::seconds heartbeatInterval{30};      // Health check frequency
+        std::chrono::seconds degradedThreshold{5};       // Time before marking degraded
+        std::chrono::seconds unhealthyThreshold{15};     // Time before marking unhealthy
+        double successRateThreshold{0.95};              // Success rate for healthy state
+        int consecutiveFailuresThreshold{3};             // Failures before degraded
+        int healthCheckTimeoutMs{5000};                  // Health check timeout
+    };
+    
+    // Monitor connection health
+    void startMonitoring(SessionId sessionId);
+    void stopMonitoring(SessionId sessionId);
+    
+    // Get current health state
+    HealthState getHealthState(SessionId sessionId) const;
+    
+    // Register health change callbacks
+    void onHealthChanged(std::function<void(SessionId, HealthState, HealthState)> callback);
+    
+    // Force health check
+    void checkHealth(SessionId sessionId);
+    
+    // Get health statistics
+    struct HealthStats {
+        std::chrono::steady_clock::time_point lastCheck;
+        std::chrono::milliseconds avgResponseTime{0};
+        double successRate{0.0};
+        int consecutiveFailures{0};
+        int totalChecks{0};
+    };
+    
+    HealthStats getHealthStats(SessionId sessionId) const;
+};
+```
+
+#### **Usage Example**
+
+```cpp
+// Create health monitor
+HealthMonitor::Config healthConfig;
+healthConfig.heartbeatInterval = std::chrono::seconds(15);
+healthConfig.degradedThreshold = std::chrono::seconds(3);
+healthConfig.successRateThreshold = 0.9;  // 90% success rate
+
+HealthMonitor monitor(healthConfig);
+
+// Monitor connections
+auto sessionId = transport->connect("api.service.com", 443);
+monitor.startMonitoring(sessionId);
+
+// React to health changes
+monitor.onHealthChanged([](SessionId id, HealthState old, HealthState current) {
+    switch (current) {
+        case HealthState::Healthy:
+            std::cout << "Session " << id << " recovered to healthy" << std::endl;
+            break;
+        case HealthState::Warning:
+            std::cout << "Session " << id << " showing warning signs" << std::endl;
+            break;
+        case HealthState::Degraded:
+            std::cout << "Session " << id << " performance degraded" << std::endl;
+            break;
+        case HealthState::Critical:
+            std::cout << "Session " << id << " in critical state" << std::endl;
+            break;
+        case HealthState::Unhealthy:
+            std::cout << "Session " << id << " is unhealthy, consider reconnection" << std::endl;
+            // Potentially trigger reconnection logic
+            transport->disconnect(id);
+            break;
     }
 });
 
-// Monitor performance
-const auto& stats = service.getStats();
-std::cout << "Timers scheduled: " << stats.timersScheduled << std::endl;
-std::cout << "Timers executed: " << stats.timersExecuted << std::endl;
-std::cout << "Average latency: " << stats.avgSchedulingLatency << "μs" << std::endl;
+// Get health statistics
+auto stats = monitor.getHealthStats(sessionId);
+std::cout << "Average response time: " << stats.avgResponseTime.count() << "ms" << std::endl;
+std::cout << "Success rate: " << (stats.successRate * 100) << "%" << std::endl;
 ```
 
+### 🏭 **Production Integration**
+
+#### **Combined with HttpClient**
+
+```cpp
+// HttpClient with circuit breaker and health monitoring
+class ResilientHttpClient {
+    CircuitBreakerManager circuitBreakers_;
+    HealthMonitor healthMonitor_;
+    iora::network::HttpClient httpClient_;
+    
+public:
+    std::optional<HttpResponse> get(const std::string& url) {
+        auto& breaker = circuitBreakers_.getBreaker(extractDomain(url));
+        
+        if (!breaker.allowRequest()) {
+            return std::nullopt;  // Circuit breaker open
+        }
+        
+        try {
+            auto response = httpClient_.get(url);
+            breaker.recordSuccess();
+            return response;
+        } catch (const std::exception&) {
+            breaker.recordFailure();
+            return std::nullopt;
+        }
+    }
+};
+```
+
+### 🎯 **Best Practices**
+
+1. **Circuit Breaker Configuration**
+   - Start with conservative thresholds and adjust based on your service SLAs
+   - Use shorter timeouts for non-critical services
+   - Monitor failure rates and adjust thresholds accordingly
+
+2. **Health Monitoring**
+   - Set heartbeat intervals based on your service's expected response times
+   - Use health state changes to trigger automatic remediation
+   - Combine with load balancing to route traffic away from unhealthy endpoints
+
+3. **Integration Patterns**
+   - Use circuit breakers at service boundaries
+   - Implement graceful degradation when circuits are open
+   - Log circuit breaker state changes for monitoring and alerting
+
+---
+
+## 🌍 Advanced DNS Resolution System
+
+Iora provides a **comprehensive DNS resolution system** with support for all major record types, intelligent caching, and both synchronous and asynchronous APIs. Built for production environments requiring reliable and fast DNS operations.
+
+### 📋 **Supported DNS Record Types**
+
+```cpp
+enum class DnsType : std::uint16_t {
+    A = 1,        // IPv4 address records
+    NS = 2,       // Name server records
+    CNAME = 5,    // Canonical name records
+    SOA = 6,      // Start of authority records
+    PTR = 12,     // Pointer records (reverse DNS)
+    MX = 15,      // Mail exchange records
+    TXT = 16,     // Text records
+    AAAA = 28,    // IPv6 address records
+    SRV = 33,     // Service location records
+    NAPTR = 35    // Naming Authority Pointer records
+};
+```
+
+### ⚡ **DnsClientHybrid - Advanced DNS Client**
+
+```cpp
+class DnsClientHybrid {
+public:
+    struct Config {
+        std::vector<std::string> servers{"8.8.8.8", "1.1.1.1"};  // DNS servers
+        std::chrono::seconds timeout{5};                          // Query timeout
+        std::chrono::seconds cacheTimeout{300};                   // Cache TTL
+        std::size_t maxCacheSize{10000};                         // Cache entry limit
+        bool enableCache{true};                                  // Cache enable/disable
+        int retryCount{3};                                       // Query retry attempts
+    };
+    
+    explicit DnsClientHybrid(const Config& config = {});
+    
+    // === Synchronous DNS Resolution ===
+    
+    // A/AAAA records - IP address resolution
+    std::vector<std::string> resolveA(const std::string& hostname);
+    std::vector<std::string> resolveAAAA(const std::string& hostname);
+    std::vector<std::string> resolveHost(const std::string& hostname); // A + AAAA
+    
+    // Service records
+    std::vector<SrvRecord> resolveSrv(const std::string& service);
+    std::vector<MxRecord> resolveMx(const std::string& domain);
+    
+    // Text and pointer records
+    std::vector<std::string> resolveTxt(const std::string& domain);
+    std::vector<std::string> resolvePtr(const std::string& ipAddress);
+    
+    // Advanced records
+    std::vector<NaptrRecord> resolveNaptr(const std::string& domain);
+    std::vector<std::string> resolveCname(const std::string& hostname);
+    
+    // === Asynchronous DNS Resolution ===
+    
+    template<typename Callback>
+    void resolveAAsync(const std::string& hostname, Callback&& callback);
+    
+    template<typename Callback>
+    void resolveAAAAAsync(const std::string& hostname, Callback&& callback);
+    
+    template<typename Callback>
+    void resolveHostAsync(const std::string& hostname, Callback&& callback);
+    
+    template<typename Callback>
+    void resolveSrvAsync(const std::string& service, Callback&& callback);
+    
+    // === Cache Management ===
+    void clearCache();
+    void clearCache(const std::string& hostname);
+    std::size_t getCacheSize() const;
+    
+    // === Statistics ===
+    struct DnsStats {
+        std::uint64_t totalQueries{0};
+        std::uint64_t cacheHits{0};
+        std::uint64_t cacheMisses{0};
+        std::uint64_t timeouts{0};
+        std::uint64_t errors{0};
+        double cacheHitRatio{0.0};
+    };
+    
+    DnsStats getStats() const;
+    void resetStats();
+};
+```
+
+### 📊 **DNS Record Structures**
+
+```cpp
+// Service record (SRV)
+struct SrvRecord {
+    std::uint16_t priority;
+    std::uint16_t weight;
+    std::uint16_t port;
+    std::string target;
+};
+
+// Mail exchange record (MX)
+struct MxRecord {
+    std::uint16_t priority;
+    std::string exchange;
+};
+
+// NAPTR record for advanced routing
+struct NaptrRecord {
+    std::uint16_t order;
+    std::uint16_t preference;
+    std::string flags;
+    std::string service;
+    std::string regexp;
+    std::string replacement;
+};
+
+// Generic DNS record for advanced queries
+struct DnsRecord {
+    std::string name;
+    DnsType type;
+    std::uint32_t ttl;
+    std::vector<std::uint8_t> data;
+    std::string textRepresentation;
+};
+```
+
+### 🚀 **Usage Examples**
+
+#### **Basic DNS Resolution**
+```cpp
+#include "iora/iora.hpp"
+using namespace iora::network;
+
+// Create DNS client with custom configuration
+DnsClientHybrid::Config config;
+config.servers = {"8.8.8.8", "1.1.1.1", "208.67.222.222"};  // Google, Cloudflare, OpenDNS
+config.timeout = std::chrono::seconds(3);
+config.cacheTimeout = std::chrono::seconds(600);  // 10 minutes
+config.retryCount = 2;
+
+DnsClientHybrid dns(config);
+
+// Resolve IPv4 addresses
+auto ipv4Addresses = dns.resolveA("www.example.com");
+for (const auto& ip : ipv4Addresses) {
+    std::cout << "IPv4: " << ip << std::endl;
+}
+
+// Resolve IPv6 addresses
+auto ipv6Addresses = dns.resolveAAAA("www.example.com");
+for (const auto& ip : ipv6Addresses) {
+    std::cout << "IPv6: " << ip << std::endl;
+}
+
+// Resolve both IPv4 and IPv6
+auto allAddresses = dns.resolveHost("www.example.com");
+for (const auto& ip : allAddresses) {
+    std::cout << "IP: " << ip << std::endl;
+}
+```
+
+#### **Service Discovery with SRV Records**
+```cpp
+// Resolve SIP service endpoints
+auto srpRecords = dns.resolveSrv("_sip._tcp.example.com");
+for (const auto& srv : srpRecords) {
+    std::cout << "SIP server: " << srv.target 
+              << ":" << srv.port 
+              << " (priority: " << srv.priority 
+              << ", weight: " << srv.weight << ")" << std::endl;
+}
+
+// Resolve mail servers
+auto mxRecords = dns.resolveMx("example.com");
+std::sort(mxRecords.begin(), mxRecords.end(), 
+          [](const MxRecord& a, const MxRecord& b) {
+              return a.priority < b.priority;  // Lower priority = higher preference
+          });
+
+for (const auto& mx : mxRecords) {
+    std::cout << "Mail server: " << mx.exchange 
+              << " (priority: " << mx.priority << ")" << std::endl;
+}
+```
+
+#### **Advanced DNS Queries**
+```cpp
+// Text record lookup (often used for domain verification, SPF, etc.)
+auto txtRecords = dns.resolveTxt("example.com");
+for (const auto& txt : txtRecords) {
+    std::cout << "TXT: " << txt << std::endl;
+}
+
+// Reverse DNS lookup
+auto ptrRecords = dns.resolvePtr("8.8.8.8");
+for (const auto& ptr : ptrRecords) {
+    std::cout << "PTR: " << ptr << std::endl;  // Should show "dns.google."
+}
+
+// NAPTR records for advanced routing (e.g., SIP, email routing)
+auto naptrRecords = dns.resolveNaptr("example.com");
+for (const auto& naptr : naptrRecords) {
+    std::cout << "NAPTR: order=" << naptr.order 
+              << " pref=" << naptr.preference
+              << " flags=" << naptr.flags
+              << " service=" << naptr.service
+              << " regexp=" << naptr.regexp
+              << " replacement=" << naptr.replacement << std::endl;
+}
+
+// CNAME resolution
+auto cnameRecords = dns.resolveCname("www.example.com");
+for (const auto& cname : cnameRecords) {
+    std::cout << "CNAME: " << cname << std::endl;
+}
+```
+
+#### **Asynchronous DNS Resolution**
+```cpp
+// Async A record resolution
+dns.resolveAAsync("www.example.com", [](const std::vector<std::string>& addresses) {
+    std::cout << "Async A resolution completed:" << std::endl;
+    for (const auto& ip : addresses) {
+        std::cout << "  IPv4: " << ip << std::endl;
+    }
+});
+
+// Async host resolution with error handling
+dns.resolveHostAsync("www.example.com", 
+    [](const std::vector<std::string>& addresses) {
+        if (addresses.empty()) {
+            std::cout << "No addresses found" << std::endl;
+        } else {
+            std::cout << "Found " << addresses.size() << " addresses:" << std::endl;
+            for (const auto& ip : addresses) {
+                std::cout << "  IP: " << ip << std::endl;
+            }
+        }
+    });
+
+// Async SRV resolution
+dns.resolveSrvAsync("_sip._tcp.example.com", 
+    [](const std::vector<SrvRecord>& records) {
+        std::cout << "SRV resolution completed, found " 
+                  << records.size() << " records:" << std::endl;
+        for (const auto& srv : records) {
+            std::cout << "  " << srv.target << ":" << srv.port 
+                      << " (pri: " << srv.priority 
+                      << ", weight: " << srv.weight << ")" << std::endl;
+        }
+    });
+```
+
+#### **Cache Management & Performance Monitoring**
+```cpp
+// Monitor DNS performance
+auto stats = dns.getStats();
+std::cout << "=== DNS Performance Statistics ===" << std::endl;
+std::cout << "Total queries: " << stats.totalQueries << std::endl;
+std::cout << "Cache hits: " << stats.cacheHits << std::endl;
+std::cout << "Cache misses: " << stats.cacheMisses << std::endl;
+std::cout << "Cache hit ratio: " << (stats.cacheHitRatio * 100) << "%" << std::endl;
+std::cout << "Timeouts: " << stats.timeouts << std::endl;
+std::cout << "Errors: " << stats.errors << std::endl;
+
+// Cache management
+std::cout << "Current cache size: " << dns.getCacheSize() << " entries" << std::endl;
+
+// Clear specific domain from cache
+dns.clearCache("www.example.com");
+
+// Clear entire cache
+dns.clearCache();
+
+// Reset statistics
+dns.resetStats();
+```
+
+#### **Production DNS Client with Fallback**
+```cpp
+class ProductionDnsResolver {
+private:
+    DnsClientHybrid primaryDns_;
+    DnsClientHybrid fallbackDns_;
+    
+public:
+    ProductionDnsResolver() {
+        // Primary DNS with public resolvers
+        DnsClientHybrid::Config primaryConfig;
+        primaryConfig.servers = {"8.8.8.8", "1.1.1.1", "208.67.222.222"};
+        primaryConfig.timeout = std::chrono::seconds(2);
+        primaryConfig.retryCount = 2;
+        primaryDns_ = DnsClientHybrid(primaryConfig);
+        
+        // Fallback DNS with different servers
+        DnsClientHybrid::Config fallbackConfig;
+        fallbackConfig.servers = {"9.9.9.9", "149.112.112.112"}; // Quad9
+        fallbackConfig.timeout = std::chrono::seconds(5);
+        fallbackConfig.retryCount = 3;
+        fallbackDns_ = DnsClientHybrid(fallbackConfig);
+    }
+    
+    std::vector<std::string> resolveWithFallback(const std::string& hostname) {
+        try {
+            auto result = primaryDns_.resolveHost(hostname);
+            if (!result.empty()) {
+                return result;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "Primary DNS failed: " << e.what() 
+                      << ", trying fallback..." << std::endl;
+        }
+        
+        // Try fallback DNS
+        try {
+            return fallbackDns_.resolveHost(hostname);
+        } catch (const std::exception& e) {
+            std::cout << "Fallback DNS also failed: " << e.what() << std::endl;
+            return {};
+        }
+    }
+};
+```
+
+### 🎯 **Key Features**
+
+#### **TTL-Aware Caching**
+- Respects DNS record TTL values for cache expiration
+- Configurable cache timeout for custom cache policies
+- Memory-efficient cache with size limits
+- Per-domain cache invalidation
+
+#### **Multi-Server Support**
+- Automatic failover between DNS servers
+- Configurable retry logic with exponential backoff
+- Round-robin server selection for load distribution
+- Server health monitoring and automatic recovery
+
+#### **Performance Optimization**
+- Concurrent query processing for multiple domains
+- Intelligent cache preloading for frequently accessed domains
+- Connection pooling for DNS server connections
+- Query deduplication to prevent redundant requests
+
+#### **Production Features**
+- Comprehensive error handling with detailed error codes
+- Request timeout management with configurable limits
+- Statistics collection for monitoring and debugging
+- Thread-safe operations for concurrent access
+
 ### 🏗️ **Architecture Benefits**
-- **No external dependencies** — Pure C++17 implementation
-- **Header-only option** — Can be used standalone
-- **Tested at scale** — Battle-tested with millions of timers
-- **Production ready** — Used in high-frequency trading systems
-- **Graceful shutdown** — Proper cleanup of all pending timers
+- **Zero External Dependencies** — Built on Iora's transport layer
+- **High Performance** — Sub-millisecond cache lookup times
+- **Reliability** — Multi-server failover and retry logic
+- **Scalability** — Efficient caching reduces DNS server load
+- **Observability** — Built-in statistics for monitoring and alerting
 
 ---
 
@@ -543,7 +1571,7 @@ Iora now supports a dynamic plugin system, allowing you to extend its functional
 
 1. **Plugin Interface**: All plugins must inherit from `IoraService::Plugin` and implement the `onLoad` and `onUnload` methods.
 2. **Plugin Declaration**: Use the `IORA_DECLARE_PLUGIN` macro to define the `loadModule` function required for dynamic loading.
-3. **Dynamic Loading**: Plugins are loaded from a specified directory at runtime. The directory can be configured via the `--modules` command-line argument or the configuration file.
+3. **Dynamic Loading**: Plugins are loaded from a specified directory at runtime. The directory can be configured via the configuration file.
 
 ### Example Plugin
 
@@ -571,24 +1599,127 @@ public:
 IORA_DECLARE_PLUGIN(MyPlugin);
 ```
 
+### Plugin Dependency System
+
+Iora provides a sophisticated dependency management system that ensures plugins are loaded in the correct order and are notified when their dependencies become available or unavailable.
+
+#### Declaring Dependencies
+
+Plugins can declare dependencies on other plugins using the `require()` method in their `onLoad()` function:
+
+```cpp
+class DependentPlugin : public iora::IoraService::Plugin
+{
+public:
+  explicit DependentPlugin(iora::IoraService* service) : Plugin(service) {}
+
+  void onLoad(iora::IoraService* service) override
+  {
+    // Require that BasePlugin is loaded first
+    require("baseplugin.so");
+    
+    // Export APIs and initialization logic
+  }
+
+  void onUnload() override
+  {
+    // Cleanup logic
+  }
+};
+```
+
+#### Dependency Loading Behavior
+
+- **Automatic Validation**: When a plugin calls `require()`, the system checks if the required plugin is already loaded
+- **Strict Enforcement**: If a required dependency is not loaded, the plugin load will fail with a descriptive error
+- **Load Order**: Dependencies must be loaded **before** the plugins that require them
+- **Manual Loading**: The system does **not** automatically load dependencies - they must be explicitly loaded via TOML configuration in the correct order
+
+#### Dependency Notifications
+
+Plugins can receive notifications when their dependencies are loaded or unloaded by implementing these optional callback methods:
+
+```cpp
+class DependentPlugin : public iora::IoraService::Plugin
+{
+public:
+  void onDependencyLoaded(const std::string& moduleName) override
+  {
+    if (moduleName == "baseplugin.so") {
+      // React to dependency becoming available
+      _basePluginAvailable = true;
+    }
+  }
+
+  void onDependencyUnloaded(const std::string& moduleName) override
+  {
+    if (moduleName == "baseplugin.so") {
+      // React to dependency becoming unavailable
+      _basePluginAvailable = false;
+    }
+  }
+
+private:
+  bool _basePluginAvailable = false;
+};
+```
+
+#### Thread-Safe Dependency Tracking
+
+The dependency system is fully thread-safe and handles:
+
+- **Concurrent API Access**: Multiple threads can safely call plugin APIs while modules are being loaded/unloaded
+- **Dependency Notifications**: All dependent plugins receive notifications when their dependencies change state
+- **Graceful Cleanup**: When a plugin is unloaded, all dependent plugins are notified before the unload completes
+
+#### Best Practices
+
+1. **Declare All Dependencies**: Always call `require()` for every plugin your plugin depends on
+2. **Handle Unavailable Dependencies**: Use `onDependencyUnloaded()` to gracefully handle when dependencies become unavailable
+3. **Load Order in Configuration**: Ensure your TOML configuration loads plugins in dependency order:
+
+```toml
+[modules]
+directory = "/path/to/plugins"
+modules = [
+    "baseplugin.so",      # Load foundation plugins first
+    "dependentplugin.so", # Then plugins that depend on them
+    "chainedplugin.so"    # Finally plugins with chained dependencies
+]
+```
+
+4. **Error Handling**: Implement proper error handling for dependency failures:
+
+```cpp
+void onLoad(iora::IoraService* service) override
+{
+  try {
+    require("criticalservice.so");
+  } catch (const std::runtime_error& e) {
+    IORA_LOG_ERROR("Failed to load critical dependency: " + std::string(e.what()));
+    throw; // Re-throw to fail plugin load
+  }
+}
+```
+
 ### Configuration
 
-To enable plugin loading, specify the directory containing your plugins:
-
-- **Command-line**: Use the `--modules` argument:
-  ```bash
-  ./iora --modules /path/to/plugins
-  ```
+To enable plugin loading, specify the directory containing your plugins in your configuration:
 
 - **Configuration File**: Add the following to your TOML configuration:
   ```toml
   [modules]
   directory = "/path/to/plugins"
+  modules = [
+    "baseplugin.so",
+    "dependentplugin.so"
+  ]
   ```
 
 ### Logging and Error Handling
 
 - Plugin initialization errors are logged using the `iora::core::Logger`.
+- Dependency failures result in detailed error messages indicating which dependencies are missing.
 - If a plugin fails to load, it will be skipped, and the system will continue loading other plugins.
 
 ### JSON-RPC Server Module
@@ -600,18 +1731,18 @@ The JSON-RPC Server module provides a JSON-RPC 2.0 compliant server that can be 
 - `jsonrpc.version()` → `std::uint32_t` - Returns the JSON-RPC server version
 - `jsonrpc.register(methodName, handler)` → `void` - Registers a method handler
   - `methodName`: `const std::string&` - Name of the JSON-RPC method
-  - `handler`: `std::function<iora::core::Json(const iora::core::Json&)>` - Handler function that takes JSON params and returns JSON result
+  - `handler`: `std::function<iora::parsers::Json(const iora::parsers::Json&)>` - Handler function that takes JSON params and returns JSON result
 - `jsonrpc.registerWithOptions(methodName, handler, options)` → `void` - Registers a method handler with options
   - `methodName`: `const std::string&` - Name of the JSON-RPC method  
-  - `handler`: `std::function<iora::core::Json(const iora::core::Json&)>` - Handler function
-  - `options`: `const iora::core::Json&` - Options object with optional fields:
+  - `handler`: `std::function<iora::parsers::Json(const iora::parsers::Json&)>` - Handler function
+  - `options`: `const iora::parsers::Json&` - Options object with optional fields:
     - `requireAuth`: `bool` - Whether authentication is required
     - `timeout`: `int` - Timeout in milliseconds  
     - `maxRequestSize`: `int` - Maximum request size in bytes
 - `jsonrpc.unregister(methodName)` → `bool` - Unregisters a method
 - `jsonrpc.has(methodName)` → `bool` - Checks if a method is registered
 - `jsonrpc.getMethods()` → `std::vector<std::string>` - Returns list of registered method names
-- `jsonrpc.getStats()` → `iora::core::Json` - Returns server statistics as JSON object with fields:
+- `jsonrpc.getStats()` → `iora::parsers::Json` - Returns server statistics as JSON object with fields:
   - `totalRequests`: Total number of requests processed
   - `successfulRequests`: Number of successful requests
   - `failedRequests`: Number of failed requests
@@ -623,25 +1754,32 @@ The JSON-RPC Server module provides a JSON-RPC 2.0 compliant server that can be 
 #### Usage Example
 
 ```cpp
-// Load the JSON-RPC server module
-auto& service = iora::IoraService::instance();
+// Initialize IoraService with configuration
+iora::IoraService::Config config;
+config.server.port = 8080;
+config.modules.directory = "/path/to/plugins";
+config.modules.autoLoad = false;
+iora::IoraService::init(config);
+
+// Get service instance and load the JSON-RPC server module
+auto& service = iora::IoraService::instanceRef();
 service.loadSingleModule("/path/to/mod_jsonrpc_server.so");
 
 // Register a simple echo method
-auto echoHandler = [](const iora::core::Json& params) -> iora::core::Json {
+auto echoHandler = [](const iora::parsers::Json& params) -> iora::parsers::Json {
     return params; // Echo back the parameters
 };
-service.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>>(
+service.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>(
     "jsonrpc.register", "echo", echoHandler);
 
 // Register a method with options
-auto authHandler = [](const iora::core::Json& params) -> iora::core::Json {
-    return iora::core::Json{{"authenticated", true}};
+auto authHandler = [](const iora::parsers::Json& params) -> iora::parsers::Json {
+    return iora::parsers::Json::object({{"authenticated", true}});
 };
-iora::core::Json options;
+iora::parsers::Json options = iora::parsers::Json::object();
 options["requireAuth"] = true;
 options["timeout"] = 5000;
-service.callExportedApi<void, const std::string&, std::function<iora::core::Json(const iora::core::Json&)>, const iora::core::Json&>(
+service.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>, const iora::parsers::Json&>(
     "jsonrpc.registerWithOptions", "secure_method", authHandler, options);
 ```
 
@@ -675,6 +1813,7 @@ int result = addApi(10, 20); // ~2ns overhead
 
 **Performance**: ~25ns per call (~25ns overhead for safety)  
 **Thread Safety**: ✅ **Fully thread-safe** - throws exception if module unloaded  
+**Memory Safety**: ✅ **Memory-safe** - uses shared_ptr and weak_ptr to prevent dangling pointers  
 **Best for**: Multi-threaded high-frequency API calls
 
 ```cpp
@@ -682,23 +1821,37 @@ int result = addApi(10, 20); // ~2ns overhead
 auto safeAddApi = service.getExportedApiSafe<int(int, int)>("plugin.add");
 
 // Safe to call from multiple threads concurrently
-int result = safeAddApi(10, 20); // ~25ns overhead
+int result = (*safeAddApi)(10, 20); // ~25ns overhead
 
 // Check availability
-if (safeAddApi.isAvailable()) {
-    result = safeAddApi(5, 7);
+if (safeAddApi->isAvailable()) {
+    result = (*safeAddApi)(5, 7);
 }
 
 // Get metadata
-std::cout << "Module: " << safeAddApi.getModuleName() << std::endl;
-std::cout << "API: " << safeAddApi.getApiName() << std::endl;
+std::cout << "Module: " << safeAddApi->getModuleName() << std::endl;
+std::cout << "API: " << safeAddApi->getApiName() << std::endl;
 
 // Graceful error handling
 try {
-    result = safeAddApi(1, 2);
+    result = (*safeAddApi)(1, 2);
 } catch (const std::runtime_error& e) {
     std::cout << "API unavailable: " << e.what() << std::endl;
 }
+
+// Store for long-term use - shared_ptr ensures proper cleanup
+class MyService {
+    std::shared_ptr<iora::IoraService::SafeApiFunction<int(int, int)>> cachedApi_;
+    
+public:
+    MyService(iora::IoraService& service) {
+        cachedApi_ = service.getExportedApiSafe<int(int, int)>("plugin.add");
+    }
+    
+    int calculate(int a, int b) {
+        return (*cachedApi_)(a, b); // Memory-safe even if module reloads
+    }
+};
 ```
 
 ### 3. `callExportedApi` - Direct Invocation
@@ -778,7 +1931,7 @@ int result = api(1, 2);
 
 // After (safe with minimal overhead)
 auto safeApi = service.getExportedApiSafe<int(int, int)>("plugin.add");
-int result = safeApi(1, 2);
+int result = (*safeApi)(1, 2);
 ```
 
 #### Error Handling Patterns
@@ -786,15 +1939,15 @@ int result = safeApi(1, 2);
 ```cpp
 // Pattern 1: Exception handling
 try {
-    auto result = safeApi(10, 20);
+    auto result = (*safeApi)(10, 20);
     processResult(result);
 } catch (const std::runtime_error& e) {
     handleApiUnavailable(e.what());
 }
 
 // Pattern 2: Availability checking
-if (safeApi.isAvailable()) {
-    auto result = safeApi(10, 20);
+if (safeApi->isAvailable()) {
+    auto result = (*safeApi)(10, 20);
     processResult(result);
 } else {
     handleApiUnavailable("Module not loaded");
@@ -812,13 +1965,15 @@ if (safeApi.isAvailable()) {
 ```cpp
 // Cache safe API wrappers for reuse
 class MyService {
-    iora::IoraService::SafeApiFunction<int(int, int)> cachedAddApi;
+    std::shared_ptr<iora::IoraService::SafeApiFunction<int(int, int)>> cachedAddApi;
     
 public:
-    MyService() : cachedAddApi(service.getExportedApiSafe<int(int, int)>("plugin.add")) {}
+    MyService(iora::IoraService& service) {
+        cachedAddApi = service.getExportedApiSafe<int(int, int)>("plugin.add");
+    }
     
     int performCalculation(int a, int b) {
-        return cachedAddApi(a, b); // ~25ns overhead
+        return (*cachedAddApi)(a, b); // ~25ns overhead, memory-safe
     }
 };
 ```
@@ -827,11 +1982,13 @@ public:
 ```cpp
 // Safe: Multiple threads can call concurrently
 std::vector<std::thread> workers;
+auto safeApi = service.getExportedApiSafe<int(int, int)>("plugin.add");
+
 for (int i = 0; i < 10; ++i) {
-    workers.emplace_back([&safeApi, i]() {
+    workers.emplace_back([safeApi, i]() {  // Capture shared_ptr by value
         for (int j = 0; j < 1000; ++j) {
             try {
-                int result = safeApi(i, j);
+                int result = (*safeApi)(i, j);
                 processResult(result);
             } catch (const std::runtime_error&) {
                 // Handle module unavailable

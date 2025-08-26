@@ -73,7 +73,7 @@ inline iora::IoraService& initServiceFromArgs(int argc, const char* args[])
   }
   
   iora::IoraService::init(config);
-  return iora::IoraService::instance();
+  return iora::IoraService::instanceRef();
 }
 
 /// \brief Helper function to create IoraService from Config object

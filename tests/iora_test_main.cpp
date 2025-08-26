@@ -56,7 +56,7 @@ inline iora::IoraService& initServiceFromArgs(int argc, const char* args[])
   }
   
   iora::IoraService::init(config);
-  return iora::IoraService::instance();
+  return iora::IoraService::instanceRef();
 }
 
 #include "iora_test_http.cpp"

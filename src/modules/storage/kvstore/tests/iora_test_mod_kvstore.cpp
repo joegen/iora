@@ -749,7 +749,7 @@ TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvs
 
   // Initialize service with CLI args
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 
   auto pluginPathOpt = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_kvstore.so";

@@ -10,6 +10,7 @@ set(INDIVIDUAL_TESTS
     iora_test_state
     iora_test_threadpool
     iora_test_plugin
+    iora_test_plugin_dependencies
     iora_test_http
     iora_test_webhook_transport
     iora_test_shared_udp
@@ -23,6 +24,8 @@ set(INDIVIDUAL_TESTS
     iora_test_timer
     iora_test_json_parser
     iora_test_xml_parser
+    debug_chained_test
+    simple_chained_test
 )
 
 # Function to create individual test executables

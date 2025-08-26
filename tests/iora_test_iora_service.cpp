@@ -21,7 +21,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 
   // Initialize service with config
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   AutoServiceShutdown autoShutdown(svc);
 
   svc.stateStore()->set("foo", "bar");
@@ -117,8 +117,8 @@ TEST_CASE("IoraService configuration file override",
 
   // Initialize service with config
   iora::IoraService::init(config);
-  iora::IoraService::instance().setConfigLoader(std::move(configLoader));
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService::instanceRef().setConfigLoader(std::move(configLoader));
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -186,8 +186,8 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
 
   // Initialize service with config
   iora::IoraService::init(config);
-  iora::IoraService::instance().setConfigLoader(std::move(configLoader));
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService::instanceRef().setConfigLoader(std::move(configLoader));
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -239,7 +239,7 @@ TEST_CASE("IoraService concurrent HTTP clients",
 
   // Initialize service with config
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   AutoServiceShutdown autoShutdown(svc);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -301,7 +301,7 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
 
   // Initialize service with config
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   AutoServiceShutdown autoShutdown(svc);
 
   std::atomic<int> nameCounter{0};
@@ -355,7 +355,7 @@ TEST_CASE("IoraService integrates EventQueue",
 
   // Initialize service with config
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   AutoServiceShutdown autoShutdown(svc);
 
   std::atomic<int> counter{0};

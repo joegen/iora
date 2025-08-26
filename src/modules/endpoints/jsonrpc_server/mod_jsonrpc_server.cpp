@@ -254,7 +254,7 @@ private:
       }
     }
 
-    modules::jsonrpc::RpcContext ctx{IoraService::instance(), subject};
+    modules::jsonrpc::RpcContext ctx{IoraService::instanceRef(), subject};
     
     // Set client metadata
     ctx.metadata().clientId = "unknown"; // TODO: Add remote address to WebhookServer::Request

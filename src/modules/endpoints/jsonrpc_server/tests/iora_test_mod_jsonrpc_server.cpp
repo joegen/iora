@@ -46,7 +46,7 @@ iora::IoraService& createTestService()
     iora::IoraService::init(config);
     initialized = true;
   }
-  return iora::IoraService::instance();
+  return iora::IoraService::instanceRef();
 }
 
 /// \brief Test method handler that echoes parameters
@@ -678,7 +678,7 @@ TEST_CASE("JsonRpcServerPlugin basic functionality", "[jsonrpc][plugin][basic]")
   
   iora::IoraService::shutdown(); // Ensure clean state
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 
   auto pluginPath = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_jsonrpc_server.so";
@@ -781,7 +781,7 @@ TEST_CASE("JsonRpcServerPlugin configuration", "[jsonrpc][plugin][config]")
   
   iora::IoraService::shutdown(); // Ensure clean state
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instance();
+  iora::IoraService& svc = iora::IoraService::instanceRef();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 
   auto pluginPath = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_jsonrpc_server.so";
