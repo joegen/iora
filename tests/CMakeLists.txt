@@ -32,6 +32,11 @@ function(create_individual_test test_name)
         SOURCES ${test_name}.cpp
     )
     
+    # Add compile definition for test resource directory
+    target_compile_definitions(${test_name} PRIVATE
+        IORA_TEST_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    
     # Add the test to CTest
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()

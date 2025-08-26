@@ -223,6 +223,11 @@ namespace storage
       static std::mutex m;
       return m;
     }
+    static std::atomic<bool>& shouldExit()
+    {
+      static std::atomic<bool> flag{false};
+      return flag;
+    }
     static void setFlushInterval(std::chrono::milliseconds interval)
     {
       flushInterval() = interval;
@@ -273,6 +278,7 @@ namespace storage
       registry().insert(this);
       if (registry().size() == 1)
       {
+        shouldExit() = false;
         flushThread() = std::thread(flushThreadFunc);
       }
     }
@@ -284,6 +290,7 @@ namespace storage
       if (registry().empty())
       {
         IORA_LOG_INFO("No more stores registered, stopping flush thread");
+        shouldExit() = true;
         terminationCv().notify_all();
         if (flushThread().joinable())
         {
@@ -296,19 +303,45 @@ namespace storage
 
     static void flushThreadFunc()
     {
-      while (true)
+      while (!shouldExit())
       {
         {
           std::unique_lock<std::mutex> lock(terminateCvMutex());
           if (terminationCv().wait_for(lock, flushInterval()) !=
               std::cv_status::timeout)
           {
-            // Notified to exit
-            break;
+            // Notified - check if we should exit
+            if (shouldExit())
+            {
+              break;
+            }
           }
         }
-        for (auto* store : registry())
+        
+        // Check again after waking up
+        if (shouldExit())
         {
+          break;
+        }
+        
+        // Copy the registry under lock to avoid race conditions
+        std::set<JsonFileStore*> storesToFlush;
+        {
+          std::lock_guard<std::mutex> lock(registryMutex());
+          if (shouldExit())
+          {
+            break;
+          }
+          storesToFlush = registry();
+        }
+        
+        // Now iterate over the copy without holding the registry lock
+        for (auto* store : storesToFlush)
+        {
+          if (shouldExit())
+          {
+            break;
+          }
           store->tryFlushIfDirty();
         }
       }

@@ -297,7 +297,7 @@ TEST_CASE("HTTP Client BSD Socket Timeout Tests", "[http][timeout][bsd]")
 
   SECTION("Test 3: Connection refused - bogus port")
   {
-    uint16_t bogusPort = 19999; // Unlikely to be in use
+    uint16_t bogusPort = 49999; // Unlikely to be in use
     HttpClient client;
 
     auto startTime = std::chrono::steady_clock::now();
@@ -339,9 +339,9 @@ TEST_CASE("HTTPS Client BSD Socket Timeout Tests with TLS",
   using namespace iora::network;
 
   const std::string certFile =
-      "/workspace/iora/tests/tls-certs/test_tls_cert.pem";
+      std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   const std::string keyFile =
-      "/workspace/iora/tests/tls-certs/test_tls_key.pem";
+      std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
 
   if (!std::filesystem::exists(certFile) || !std::filesystem::exists(keyFile))
   {
@@ -621,9 +621,9 @@ constexpr const char* TEST_KEY_PATH =
 TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
 {
   const std::string certFile =
-      "/workspace/iora/tests/tls-certs/test_tls_cert.pem";
+      std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   const std::string keyFile =
-      "/workspace/iora/tests/tls-certs/test_tls_key.pem";
+      std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
 
   if (!std::filesystem::exists(certFile) || !std::filesystem::exists(keyFile))
   {
