@@ -31,6 +31,11 @@
   - [DnsClientHybrid - Advanced DNS Client](#-dnsclienthybrid---advanced-dns-client)
   - [DNS Record Structures](#-dns-record-structures)
   - [Key Features](#-key-features)
+- [🌐 HTTP Client & Server](#-http-client--server)
+  - [HttpClient - Advanced HTTP Client](#httpclient---advanced-http-client)
+  - [WebhookServer - Production HTTP Server](#webhookserver---production-http-server)
+  - [Configuration & TLS Support](#configuration--tls-support)
+  - [Usage Examples](#usage-examples)
 - [🔌 Available Plugins](#-available-plugins)
 - [🛠️ Build Instructions](#️-build-instructions)
 - [📦 Installation](#-installation)
@@ -1349,6 +1354,406 @@ public:
 - **Reliability** — Multi-server failover and retry logic
 - **Scalability** — Efficient caching reduces DNS server load
 - **Observability** — Built-in statistics for monitoring and alerting
+
+---
+
+## 🌐 HTTP Client & Server
+
+Iora provides production-ready HTTP client and server implementations with **zero external dependencies** (except OpenSSL for TLS). Built on the unified transport layer, they offer advanced features including connection pooling, TLS support, JSON handling, and comprehensive error management.
+
+### HttpClient - Advanced HTTP Client
+
+The `HttpClient` provides a powerful, thread-safe HTTP client with connection pooling, automatic retries, and built-in JSON support.
+
+#### 🎯 **Core Features**
+- **Connection Pooling** — Automatic connection reuse and lifecycle management
+- **TLS/HTTPS Support** — Full certificate validation and client certificate support
+- **Built-in JSON Support** — Direct JSON request/response handling with Iora's parser
+- **Automatic Retries** — Configurable retry logic with exponential backoff
+- **DNS Integration** — Uses Iora's advanced DNS client for domain resolution
+- **Thread Safety** — Concurrent requests from multiple threads
+- **Timeout Management** — Separate connect and request timeouts
+- **Header Management** — Full HTTP header support with custom user agents
+
+#### 📊 **Configuration Options**
+
+```cpp
+iora::network::HttpClient::Config config;
+config.connectTimeout = std::chrono::milliseconds(2000);  // Connection timeout
+config.requestTimeout = std::chrono::milliseconds(5000);  // Request timeout  
+config.maxRedirects = 5;                                  // Maximum redirects to follow
+config.followRedirects = true;                            // Enable redirect following
+config.userAgent = "MyApp/1.0";                          // Custom user agent
+config.reuseConnections = true;                           // Enable connection pooling
+config.connectionIdleTimeout = std::chrono::seconds(300); // Idle connection timeout
+
+// JSON parsing limits
+config.jsonConfig.maxPayloadSize = 50 * 1024 * 1024;     // 50MB max JSON payload
+config.jsonConfig.parseLimits.maxDepth = 64;             // Maximum nesting depth
+
+auto client = iora::network::HttpClient(config);
+```
+
+#### 🚀 **Usage Examples**
+
+**Basic HTTP Requests:**
+```cpp
+#include "iora/iora.hpp"
+
+// Create client with default configuration
+auto client = iora::IoraService::instanceRef().makeHttpClient();
+
+// Simple GET request
+auto response = client.get("https://api.example.com/users");
+if (response.success()) {
+    std::cout << "Response: " << response.body << std::endl;
+    std::cout << "Status: " << response.statusCode << std::endl;
+}
+
+// POST request with JSON data
+iora::parsers::Json requestData = iora::parsers::Json::object({
+    {"name", "John Doe"},
+    {"email", "john@example.com"}
+});
+
+auto postResponse = client.postJson("https://api.example.com/users", requestData);
+if (postResponse.success()) {
+    std::cout << "User created successfully!" << std::endl;
+}
+
+// Custom headers
+std::map<std::string, std::string> headers = {
+    {"Authorization", "Bearer token123"},
+    {"X-API-Version", "v1"}
+};
+
+auto authResponse = client.get("https://api.example.com/protected", headers);
+```
+
+**Advanced Usage with TLS:**
+```cpp
+// Configure TLS for client certificates
+iora::network::HttpClient::TlsConfig tlsConfig;
+tlsConfig.caFile = "/path/to/ca-cert.pem";
+tlsConfig.clientCertFile = "/path/to/client-cert.pem"; 
+tlsConfig.clientKeyFile = "/path/to/client-key.pem";
+tlsConfig.verifyPeer = true;
+
+client.setTlsConfig(tlsConfig);
+
+// Secure request with client certificate
+auto secureResponse = client.get("https://secure-api.example.com/data");
+```
+
+**Error Handling and Retries:**
+```cpp
+try {
+    // Request with automatic retries
+    auto response = client.get("https://unreliable-api.example.com/data", {}, 3);
+    
+    if (!response.success()) {
+        std::cerr << "Request failed with status: " << response.statusCode 
+                  << " - " << response.statusText << std::endl;
+    }
+} catch (const std::exception& e) {
+    std::cerr << "HTTP request error: " << e.what() << std::endl;
+}
+```
+
+### WebhookServer - Production HTTP Server
+
+The `WebhookServer` provides a lightweight, production-ready HTTP server optimized for webhook handling and JSON APIs.
+
+#### 🎯 **Core Features**
+- **JSON-First Design** — Built-in JSON request/response handling
+- **TLS/HTTPS Support** — Full SSL/TLS encryption with certificate management
+- **Thread Pool Architecture** — Efficient request handling with configurable thread pools
+- **Graceful Shutdown** — Proper cleanup and connection termination
+- **Request Routing** — Path-based routing with parameter extraction
+- **Security Features** — Request size limits and parsing controls
+- **Production Ready** — Comprehensive error handling and logging
+
+#### 🔧 **Server Configuration**
+
+```cpp
+auto& service = iora::IoraService::instanceRef();
+auto& server = *service.webhookServer();
+
+// Basic server setup
+server.setPort(8080);
+
+// Configure JSON parsing limits
+iora::network::WebhookServer::JsonConfig jsonConfig;
+jsonConfig.maxPayloadSize = 10 * 1024 * 1024;  // 10MB max payload
+jsonConfig.parseLimits.maxDepth = 32;          // Maximum JSON nesting
+server.setJsonConfig(jsonConfig);
+
+// Enable TLS/HTTPS
+iora::network::WebhookServer::TlsConfig tlsConfig;
+tlsConfig.certFile = "/path/to/server-cert.pem";
+tlsConfig.keyFile = "/path/to/server-key.pem";
+tlsConfig.requireClientCert = false;  // Optional client certificates
+server.enableTls(tlsConfig);
+```
+
+#### 🚀 **Usage Examples**
+
+**JSON API Endpoints:**
+```cpp
+#include "iora/iora.hpp"
+
+auto& service = iora::IoraService::instanceRef();
+
+// Register JSON endpoints using fluent API
+service.on("/api/users")
+    .handleJson([](const iora::parsers::Json& request) -> iora::parsers::Json {
+        // Handle user creation
+        std::string name = request["name"].get<std::string>();
+        std::string email = request["email"].get<std::string>();
+        
+        // Process user registration...
+        
+        return iora::parsers::Json::object({
+            {"status", "success"},
+            {"userId", 12345},
+            {"message", "User created successfully"}
+        });
+    });
+
+service.on("/api/users/{id}")
+    .handleJson([](const iora::parsers::Json& request) -> iora::parsers::Json {
+        // Handle user lookup by ID
+        // ID is available in request parameters
+        return iora::parsers::Json::object({
+            {"userId", 123},
+            {"name", "John Doe"},
+            {"email", "john@example.com"}
+        });
+    });
+```
+
+**Traditional HTTP Handlers:**
+```cpp
+auto& server = *service.webhookServer();
+
+// GET endpoint with custom response
+server.onGet("/health", [](const auto& req, auto& res) {
+    res.set_content("OK", "text/plain");
+    res.status = 200;
+});
+
+// POST endpoint with form data
+server.onPost("/webhook", [](const auto& req, auto& res) {
+    std::cout << "Received webhook: " << req.body << std::endl;
+    
+    // Access headers
+    std::string contentType = req.get_header_value("Content-Type");
+    
+    // Set response
+    res.set_content("{\"received\": true}", "application/json");
+    res.status = 200;
+});
+
+// DELETE endpoint
+server.onDelete("/api/users/{id}", [](const auto& req, auto& res) {
+    // Handle user deletion
+    res.status = 204; // No Content
+});
+```
+
+**Advanced Error Handling:**
+```cpp
+service.on("/api/process")
+    .handleJson([&server](const iora::parsers::Json& request) -> iora::parsers::Json {
+        auto shutdownChecker = server.getShutdownChecker();
+        
+        // Long-running operation with shutdown awareness
+        while (processingWork()) {
+            if (shutdownChecker.isShuttingDown()) {
+                throw std::runtime_error("Server is shutting down");
+            }
+            // Continue processing...
+        }
+        
+        return iora::parsers::Json::object({{"result", "completed"}});
+    });
+```
+
+### Configuration & TLS Support
+
+#### 🔐 **TLS/HTTPS Configuration**
+
+Both HttpClient and WebhookServer support comprehensive TLS configuration:
+
+**Client TLS Configuration:**
+```cpp
+iora::network::HttpClient::TlsConfig clientTls;
+clientTls.caFile = "/etc/ssl/certs/ca-bundle.pem";     // CA certificate bundle
+clientTls.clientCertFile = "/etc/ssl/client.pem";      // Client certificate (optional)
+clientTls.clientKeyFile = "/etc/ssl/client-key.pem";   // Client private key (optional)
+clientTls.verifyPeer = true;                           // Verify server certificate
+
+client.setTlsConfig(clientTls);
+```
+
+**Server TLS Configuration:**
+```cpp
+iora::network::WebhookServer::TlsConfig serverTls;
+serverTls.certFile = "/etc/ssl/server-cert.pem";       // Server certificate
+serverTls.keyFile = "/etc/ssl/server-key.pem";         // Server private key
+serverTls.caFile = "/etc/ssl/ca-cert.pem";             // CA for client verification (optional)
+serverTls.requireClientCert = false;                   // Require client certificates
+
+server.enableTls(serverTls);
+```
+
+#### ⚙️ **Production Deployment**
+
+**IoraService Integration:**
+```cpp
+// Initialize Iora service with HTTP configuration
+iora::IoraService::Config config;
+config.server.port = 8443;                             // HTTPS port
+config.server.tls.certFile = "/etc/ssl/server.pem";
+config.server.tls.keyFile = "/etc/ssl/server-key.pem";
+
+iora::IoraService::init(config);
+
+// Server is automatically configured and started
+auto& service = iora::IoraService::instanceRef();
+
+// Register your endpoints
+service.on("/api/webhook").handleJson(yourHandler);
+
+// Service handles server lifecycle automatically
+```
+
+#### 🔧 **Performance Tuning**
+
+```cpp
+// Optimize HTTP client for high-throughput scenarios
+iora::network::HttpClient::Config highPerfConfig;
+highPerfConfig.connectTimeout = std::chrono::milliseconds(500);    // Fast connects
+highPerfConfig.requestTimeout = std::chrono::milliseconds(2000);   // Quick requests
+highPerfConfig.reuseConnections = true;                            // Essential for performance
+highPerfConfig.connectionIdleTimeout = std::chrono::seconds(60);   // Keep connections alive
+
+// Optimize JSON parsing for large payloads
+highPerfConfig.jsonConfig.maxPayloadSize = 100 * 1024 * 1024;     // 100MB max
+highPerfConfig.jsonConfig.parseLimits.maxDepth = 16;              // Reasonable nesting
+
+auto client = iora::network::HttpClient(highPerfConfig);
+```
+
+### Usage Examples
+
+#### 🔄 **Complete Webhook Processing Pipeline**
+
+```cpp
+#include "iora/iora.hpp"
+
+class WebhookProcessor {
+private:
+    iora::network::HttpClient httpClient_;
+    
+public:
+    void setupEndpoints() {
+        auto& service = iora::IoraService::instanceRef();
+        
+        // Receive webhook, process, and forward
+        service.on("/webhook/github")
+            .handleJson([this](const iora::parsers::Json& payload) -> iora::parsers::Json {
+                try {
+                    // Validate webhook signature (production requirement)
+                    if (!validateSignature(payload)) {
+                        throw std::runtime_error("Invalid signature");
+                    }
+                    
+                    // Process the webhook
+                    processGitHubEvent(payload);
+                    
+                    // Forward to downstream services
+                    forwardToServices(payload);
+                    
+                    return iora::parsers::Json::object({
+                        {"status", "processed"},
+                        {"timestamp", getCurrentTimestamp()}
+                    });
+                } catch (const std::exception& e) {
+                    IORA_LOG_ERROR("Webhook processing failed: " << e.what());
+                    throw; // Will return 500 error automatically
+                }
+            });
+    }
+    
+private:
+    void forwardToServices(const iora::parsers::Json& payload) {
+        // Forward to multiple downstream services
+        std::vector<std::string> endpoints = {
+            "https://service1.internal/webhook",
+            "https://service2.internal/webhook"
+        };
+        
+        for (const auto& endpoint : endpoints) {
+            try {
+                auto response = httpClient_.postJson(endpoint, payload, {
+                    {"Content-Type", "application/json"},
+                    {"X-Forwarded-From", "iora-webhook-processor"}
+                }, 2); // 2 retries
+                
+                if (!response.success()) {
+                    IORA_LOG_WARN("Failed to forward to " << endpoint 
+                                 << ": " << response.statusCode);
+                }
+            } catch (const std::exception& e) {
+                IORA_LOG_ERROR("Forward error to " << endpoint << ": " << e.what());
+            }
+        }
+    }
+};
+```
+
+#### 🔄 **HTTP Client with Circuit Breaker**
+
+```cpp
+#include "iora/iora.hpp"
+
+class ResilientApiClient {
+private:
+    iora::network::HttpClient client_;
+    iora::util::CircuitBreaker circuitBreaker_;
+    
+public:
+    ResilientApiClient() 
+        : circuitBreaker_("external-api", 5, std::chrono::minutes(1)) {
+        
+        // Configure client for resilience
+        iora::network::HttpClient::Config config;
+        config.requestTimeout = std::chrono::milliseconds(3000);
+        config.maxRedirects = 3;
+        config.reuseConnections = true;
+        
+        client_ = iora::network::HttpClient(config);
+    }
+    
+    iora::parsers::Json fetchUserData(const std::string& userId) {
+        return circuitBreaker_.execute<iora::parsers::Json>([&]() {
+            auto response = client_.get(
+                "https://api.external.com/users/" + userId,
+                {{"Authorization", "Bearer " + getApiToken()}},
+                2  // 2 retries
+            );
+            
+            if (!response.success()) {
+                throw std::runtime_error("API request failed: " + 
+                                       std::to_string(response.statusCode));
+            }
+            
+            return iora::parsers::Json::parse(response.body);
+        });
+    }
+};
+```
 
 ---
 

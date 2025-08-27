@@ -3,6 +3,7 @@
 # List of individual test files (without extensions)
 set(INDIVIDUAL_TESTS
     iora_test_logger
+    iora_test_external_logger
     iora_test_event_queue
     iora_test_expiring_cache
     iora_test_iora_service

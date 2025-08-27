@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <memory>
+#include <functional>
 
 namespace iora
 {
@@ -44,6 +45,10 @@ namespace core
       Error,
       Fatal
     };
+
+    /// \brief External log handler function type
+    /// Takes log level, formatted message, and original message without timestamp/level prefix
+    using ExternalHandler = std::function<void(Level level, const std::string& formattedMessage, const std::string& rawMessage)>;
 
     struct Endl
     {
@@ -86,6 +91,25 @@ namespace core
     {
       auto& data = getData();
       std::unique_lock<std::mutex> lock(data.mutex);
+      
+      // Flush external handler queue first
+      while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler)
+      {
+        auto [level, rawMessage] = data.rawQueue.front();
+        data.rawQueue.pop();
+        
+        // Format the message for external handler
+        std::ostringstream oss;
+        oss << "[" << timestamp() << "] "
+            << "[" << levelToString(level) << "] " << rawMessage << std::endl;
+        std::string formattedMessage = oss.str();
+        
+        // Temporarily unlock to call external handler
+        lock.unlock();
+        data.externalHandler(level, formattedMessage, rawMessage);
+        lock.lock();
+      }
+      
       // Always flush queue for both sync and async modes
       while (!data.queue.empty())
       {
@@ -133,6 +157,34 @@ namespace core
       data.minLevel = level;
     }
 
+    /// \brief Register an external log handler
+    /// When an external handler is registered, file logging and console output are disabled
+    /// \param handler The external handler function to register
+    static void setExternalHandler(ExternalHandler handler)
+    {
+      auto& data = getData();
+      std::lock_guard<std::mutex> lock(data.mutex);
+      data.externalHandler = std::move(handler);
+      data.useExternalHandler = true;
+      
+      // Close file stream when external handler is active
+      if (data.fileStream && data.fileStream->is_open())
+      {
+        data.fileStream->close();
+        data.fileStream.reset();
+      }
+    }
+
+    /// \brief Remove external log handler and restore normal logging
+    static void clearExternalHandler()
+    {
+      auto& data = getData();
+      std::lock_guard<std::mutex> lock(data.mutex);
+      data.externalHandler = nullptr;
+      data.useExternalHandler = false;
+      // File logging will be restored on next log call via rotateLogFileIfNeeded
+    }
+
     static void trace(const std::string& message)
     {
       log(Level::Trace, message);
@@ -175,23 +227,38 @@ namespace core
       {
         {
           std::lock_guard<std::mutex> lock(data.mutex);
-          data.queue.push(std::move(output));
+          if (data.useExternalHandler)
+          {
+            data.rawQueue.push({level, message});
+          }
+          else
+          {
+            data.queue.push(std::move(output));
+          }
         }
         data.cv.notify_one();
       }
       else
       {
         std::lock_guard<std::mutex> lock(data.mutex);
-        rotateLogFileIfNeeded();
-
-        if (data.fileStream)
+        
+        if (data.useExternalHandler && data.externalHandler)
         {
-          (*data.fileStream) << output;
-          data.fileStream->flush();
+          data.externalHandler(level, output, message);
         }
         else
         {
-          std::cout << output;
+          rotateLogFileIfNeeded();
+
+          if (data.fileStream)
+          {
+            (*data.fileStream) << output;
+            data.fileStream->flush();
+          }
+          else
+          {
+            std::cout << output;
+          }
         }
       }
     }
@@ -204,6 +271,7 @@ namespace core
       std::mutex mutex;
       std::condition_variable cv;
       std::queue<std::string> queue;
+      std::queue<std::pair<Level, std::string>> rawQueue; // For external handlers
       std::thread workerThread;
       std::atomic<bool> exit{false};
       bool asyncMode = false;
@@ -213,6 +281,8 @@ namespace core
       std::string currentLogDate;
       int retentionDays = 7;
       std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
+      ExternalHandler externalHandler;
+      bool useExternalHandler = false;
 
       ~LoggerData()
       {
@@ -246,8 +316,27 @@ namespace core
       {
         std::unique_lock<std::mutex> lock(data.mutex);
         data.cv.wait(lock,
-                     [&data] { return !data.queue.empty() || data.exit; });
+                     [&data] { return !data.queue.empty() || !data.rawQueue.empty() || data.exit; });
 
+        // Process external handler queue
+        while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler)
+        {
+          auto [level, rawMessage] = data.rawQueue.front();
+          data.rawQueue.pop();
+          
+          // Format the message for external handler
+          std::ostringstream oss;
+          oss << "[" << timestamp() << "] "
+              << "[" << levelToString(level) << "] " << rawMessage << std::endl;
+          std::string formattedMessage = oss.str();
+          
+          // Temporarily unlock to call external handler
+          lock.unlock();
+          data.externalHandler(level, formattedMessage, rawMessage);
+          lock.lock();
+        }
+
+        // Process normal logging queue
         while (!data.queue.empty())
         {
           rotateLogFileIfNeeded();
@@ -302,9 +391,9 @@ namespace core
     static void rotateLogFileIfNeeded()
     {
       auto& data = getData();
-      if (data.logBasePath.empty())
+      if (data.logBasePath.empty() || data.useExternalHandler)
       {
-        // No log file path specified, skip file logging
+        // No log file path specified or external handler is active, skip file logging
         return;
       }
 
