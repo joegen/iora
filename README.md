@@ -1875,15 +1875,78 @@ sudo chown -R $(whoami) /var/log/iora /var/lib/iora
 
 ## ✅ Run Tests
 
-1. Build the project (if not already built):
-   ```bash
-   cmake --build build
-   ```
+### Test Organization
 
-2. Run all tests:
-   ```bash
-   make check
-   ```
+Tests are organized by namespace into logical groups that mirror the `include/iora/` directory structure:
+
+- **NETWORK**: Transport, DNS, HTTP, WebSocket (13 tests)
+- **CORE**: Logging, threading, timers (6 tests) 
+- **PARSERS**: JSON and XML parsing (2 tests)
+- **SERVICE**: Plugin system and main framework (4 tests)
+- **STORAGE**: Persistent storage (1 test)
+- **UTIL**: Caching and utilities (1 test)
+- **DEBUG**: Debug and helper tests (2 tests)
+
+### Selective Test Compilation
+
+By default, no tests are built to speed up compilation. Enable specific test groups using CMake options:
+
+```bash
+# Build only network tests
+cmake -S . -B build -DIORA_BUILD_NETWORK_TESTS=ON
+cmake --build build
+
+# Build only core tests  
+cmake -S . -B build -DIORA_BUILD_CORE_TESTS=ON
+cmake --build build
+
+# Build all test groups
+cmake -S . -B build -DIORA_BUILD_ALL_TESTS=ON
+cmake --build build
+```
+
+Available test group options:
+- `IORA_BUILD_NETWORK_TESTS` - Transport and networking tests
+- `IORA_BUILD_CORE_TESTS` - Core functionality tests
+- `IORA_BUILD_PARSERS_TESTS` - JSON/XML parser tests
+- `IORA_BUILD_SERVICE_TESTS` - Plugin system tests
+- `IORA_BUILD_STORAGE_TESTS` - Persistent storage tests
+- `IORA_BUILD_UTIL_TESTS` - Utility tests
+- `IORA_BUILD_DEBUG_TESTS` - Debug helper tests
+- `IORA_BUILD_ALL_TESTS` - Enable all test groups
+
+### Running Tests
+
+Use CTest to run the compiled tests:
+
+```bash
+# Run all built tests
+ctest --test-dir build
+
+# Run specific test namespace
+ctest --test-dir build -R "network::"
+ctest --test-dir build -R "core::"
+ctest --test-dir build -R "parsers::"
+
+# Run with verbose output
+ctest --test-dir build --verbose
+
+# Run specific test by name
+ctest --test-dir build -R "iora_test_shared_udp"
+```
+
+Alternatively, use the namespace-specific make targets:
+
+```bash
+# Run all network tests
+make test_network
+
+# Run all core tests  
+make test_core
+
+# Run all parsers tests
+make test_parsers
+```
 
 ---
 
