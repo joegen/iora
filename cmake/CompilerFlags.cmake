@@ -11,6 +11,7 @@ function(set_iora_compiler_flags target_name)
             -Wall
             -Wextra
             -Wpedantic
+            -Werror                           # Treat warnings as errors
             -Wno-unused-parameter
             -Wno-missing-field-initializers
         )
@@ -28,6 +29,7 @@ function(set_iora_compiler_flags target_name)
     elseif(MSVC)
         target_compile_options(${target_name} PRIVATE
             /W4
+            /WX                               # Treat warnings as errors
             /permissive-
         )
         

@@ -12,4 +12,7 @@ install(TARGETS mod_jsonrpc_server
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/iora/modules
 )
 
-add_subdirectory(tests)
+# Only build module tests if service tests are enabled
+if(IORA_BUILD_SERVICE_TESTS OR IORA_BUILD_ALL_TESTS)
+    add_subdirectory(tests)
+endif()

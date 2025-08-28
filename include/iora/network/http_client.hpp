@@ -151,7 +151,7 @@ namespace network
     mutable std::unordered_map<std::string, SessionId> _connections;
     mutable std::unordered_map<SessionId, std::chrono::steady_clock::time_point>
         _connectionLastUsed;
-    mutable HybridTransport::ConnectCallback _connectCallback;
+    mutable SyncAsyncTransport::ConnectCallback _connectCallback;
 
     /// \brief URL parsing structure
     struct ParsedUrl

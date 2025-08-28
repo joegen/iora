@@ -190,7 +190,7 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
   REQUIRE(stats1.bytesOut == 0);
   REQUIRE(stats1.sessionsCurrent == 0);
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
   
   REQUIRE(f.waitFor(f.connected));
@@ -317,7 +317,7 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
   REQUIRE(f.tx.start());
 
   auto port = testnet::getFreePortUDP();
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
   
   REQUIRE(f.waitFor(f.connected));
@@ -397,7 +397,7 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
   
   REQUIRE(f.waitFor(f.connected));
@@ -413,10 +413,11 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   // GC timer might not be properly armed, so we just check that sessions exist
   std::this_thread::sleep_for(3000ms);
 
-  auto stats2 = f.tx.stats();
+  (void)f.tx.stats();
   // Note: GC timer implementation might not be working in tests
   // Just verify basic functionality
-  REQUIRE(stats2.sessionsCurrent >= 0);  // Sessions might be cleaned up
+  // sessionsCurrent is unsigned, so >= 0 check is always true
+  REQUIRE(true);  // Sessions might be cleaned up
   
   f.tx.stop();
 }
@@ -431,7 +432,7 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
   
   REQUIRE(f.waitFor(f.connected));
@@ -453,10 +454,11 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   // After max age, sessions might be closed
   std::this_thread::sleep_for(1000ms);
 
-  auto stats2 = f.tx.stats();
+  (void)f.tx.stats();
   // Note: GC timer implementation might not be working in tests
   // Just verify basic functionality
-  REQUIRE(stats2.sessionsCurrent >= 0);  // Sessions might be cleaned up
+  // sessionsCurrent is unsigned, so >= 0 check is always true
+  REQUIRE(true);  // Sessions might be cleaned up
   
   f.tx.stop();
 }
@@ -470,7 +472,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   
   // Create a server that doesn't echo (to cause backpressure)
   SharedUdpTransport::Config cfg2{};
@@ -486,7 +488,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   
   REQUIRE(tx2.start());
   auto port2 = testnet::getFreePortUDP();
-  ListenerId lid2 = tx2.addListener("127.0.0.1", port2, TlsMode::None);
+  (void)tx2.addListener("127.0.0.1", port2, TlsMode::None);
 
   SessionId cs = f.tx.connect("127.0.0.1", port2, TlsMode::None);
   REQUIRE(f.waitFor(f.connected));
@@ -500,7 +502,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
 
   std::this_thread::sleep_for(100ms);
 
-  auto stats = f.tx.stats();
+  (void)f.tx.stats();
   // Should have some backpressure events if queue filled
   // Note: UDP might not actually trigger backpressure easily
   
@@ -542,7 +544,7 @@ TEST_CASE("UDP large data transfer", "[udp][large]")
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
   
   REQUIRE(f.waitFor(f.connected));
@@ -619,7 +621,7 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
     REQUIRE(f.tx.start());
     
     auto port = testnet::getFreePortUDP();
-    ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+    (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
     
     REQUIRE(f.waitFor(f.connected));
@@ -639,7 +641,7 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
     REQUIRE(f.tx.start());
     
     auto port = testnet::getFreePortUDP();
-    ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+    (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
     
     REQUIRE(f.waitFor(f.connected));
@@ -706,7 +708,7 @@ TEST_CASE("UDP session limits", "[udp][limits]")
   REQUIRE(f.tx.start());
   
   auto port = testnet::getFreePortUDP();
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   
   // Create 2 connections
   std::vector<SessionId> clients;
@@ -752,7 +754,7 @@ TEST_CASE("UDP socket buffer configuration", "[udp][socket]")
   REQUIRE(f.tx.start());
   
   auto port = testnet::getFreePortUDP();
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
   
   REQUIRE(f.waitFor(f.connected));

@@ -21,6 +21,13 @@
   - [Comprehensive Statistics](#-comprehensive-statistics)
   - [Advanced Features](#-advanced-features)
   - [Protocol Support](#️-protocol-support)
+- [🏗️ Transport Architecture & Relationships](#️-transport-architecture--relationships)
+  - [Architectural Overview](#-architectural-overview)
+  - [Component Relationships](#-component-relationships)
+  - [Key Design Patterns](#-key-design-patterns)
+  - [Choosing the Right Abstraction Level](#-choosing-the-right-abstraction-level)
+  - [Usage Examples](#-usage-examples)
+  - [Architecture Benefits](#️-architecture-benefits)
 - [🛡️ Circuit Breaker & Health Monitoring](#️-circuit-breaker--health-monitoring)
   - [Circuit Breaker System](#-circuit-breaker-system)
   - [Connection Health Monitoring](#-connection-health-monitoring)
@@ -725,6 +732,211 @@ auto udpTransport = UnifiedSharedTransport::createUdp();
 - **Memory Efficient** — Connection pooling and buffer reuse
 - **CPU Efficient** — Event-driven architecture minimizes context switches
 - **Scalable** — Linear performance scaling with CPU cores
+
+---
+
+## 🏗️ Transport Architecture & Relationships
+
+Iora's transport system follows a **layered architecture** that provides maximum flexibility while maintaining high performance. Understanding these relationships helps you choose the right abstraction level for your application needs.
+
+### **🔧 Architectural Overview**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    APPLICATION LAYER                        │
+├─────────────────────────────────────────────────────────────┤
+│         UnifiedSharedTransport (High-Level Facade)         │
+├─────────────────────────────────────────────────────────────┤
+│            SyncAsyncTransport (Sync/Async Wrapper)         │
+├─────────────────────────────────────────────────────────────┤
+│    SharedTransport (TCP/TLS)    │  SharedUdpTransport (UDP) │
+│         (Base Protocols)        │       (Base Protocols)   │
+├─────────────────────────────────────────────────────────────┤
+│                  Linux epoll/eventfd/timerfd               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### **🎯 Component Relationships**
+
+#### **1. Base Transport Layer**
+The foundation providing raw protocol implementations:
+
+**`SharedTransport`** - TCP/TLS Transport
+- **Purpose**: High-performance TCP and TLS transport with epoll-based I/O
+- **Features**: Single I/O thread, async operations, built-in TLS via OpenSSL
+- **Usage**: Direct use for async-only TCP/TLS applications
+- **Location**: `include/iora/network/shared_transport.hpp`
+
+**`SharedUdpTransport`** - UDP Transport  
+- **Purpose**: UDP transport with session concept for API consistency
+- **Features**: Same epoll architecture as TCP, connectionless but tracked
+- **Usage**: Direct use for async-only UDP applications
+- **Location**: `include/iora/network/shared_transport_udp.hpp`
+
+#### **2. Synchronization Layer**
+Adds blocking operations on top of async transports:
+
+**`SyncAsyncTransport`** - Sync/Async Wrapper
+- **Purpose**: Provides **synchronous operations** on top of async transports
+- **Features**:
+  - Exclusive read modes (prevent sync/async conflicts)
+  - Cancellable operations without closing connections
+  - Connection health monitoring
+  - Thread-safe synchronous operations with queueing
+- **Design Pattern**: **Composition** - wraps any `ITransportBase` implementation
+- **Usage**: When you need both sync and async operations on same transport
+- **Location**: `include/iora/network/sync_async_transport.hpp`
+
+#### **3. Adapter Layer**
+Normalizes different protocols behind common interfaces:
+
+**`TcpTlsTransportAdapter`** & **`UdpTransportAdapter`**
+- **Purpose**: Implement common `ITransport` interface for protocol-specific transports
+- **Design Pattern**: **Adapter Pattern** - makes different transports look identical
+- **Usage**: Internal - used by UnifiedSharedTransport for protocol abstraction
+
+#### **4. Unified Layer**
+Single high-level API for protocol-agnostic applications:
+
+**`UnifiedSharedTransport`** - Protocol-Agnostic Facade
+- **Purpose**: Single API for both TCP and UDP with sync/async support
+- **Features**:
+  - Protocol selection (TCP/UDP) at configuration time
+  - Unified configuration combining all layer settings
+  - Built on SyncAsyncTransport for dual-mode operations
+- **Design Pattern**: **Facade Pattern** - hides complexity of multiple transport layers
+- **Usage**: Recommended for most applications requiring protocol flexibility
+- **Location**: `include/iora/network/unified_shared_transport.hpp`
+
+### **🔗 Key Design Patterns**
+
+#### **Composition Over Inheritance**
+Each layer **contains** rather than **extends** lower layers:
+```cpp
+// UnifiedSharedTransport contains SyncAsyncTransport
+std::unique_ptr<SyncAsyncTransport> _hybrid;
+
+// SyncAsyncTransport contains base transport  
+std::unique_ptr<ITransportBase> _transport;
+
+// Adapters contain protocol-specific implementations
+SharedTransport _impl;  // in TcpTlsTransportAdapter
+SharedUdpTransport _impl;  // in UdpTransportAdapter
+```
+
+#### **Strategy Pattern**
+Protocol selection is configurable at runtime:
+```cpp
+enum class Protocol { TCP, UDP };
+
+UnifiedSharedTransport::Config config;
+config.protocol = Protocol::TCP;  // or Protocol::UDP
+auto transport = std::make_unique<UnifiedSharedTransport>(config);
+```
+
+### **🎯 Choosing the Right Abstraction Level**
+
+#### **When to Use Each Layer**
+
+| Layer | Use When | Example Use Cases |
+|-------|----------|-------------------|
+| **Base** (`SharedTransport`/`SharedUdpTransport`) | You need maximum performance and only async operations | High-frequency trading, real-time data feeds |
+| **Sync/Async** (`SyncAsyncTransport`) | You need both sync and async operations on same connection | HTTP servers, database proxies |
+| **Unified** (`UnifiedSharedTransport`) | You want protocol abstraction and flexible configuration | Microservices, API gateways |
+
+#### **Performance vs Convenience Trade-offs**
+
+```
+Raw Performance    ←  →  Convenience & Features
+Base Transport     ←  →  Unified Transport
+Async Only        ←  →  Sync + Async
+Single Protocol   ←  →  Multi-Protocol
+Manual Setup      ←  →  Unified Config
+```
+
+### **🚀 Usage Examples**
+
+#### **Base Layer - Maximum Performance**
+```cpp
+#include "iora/network/shared_transport.hpp"
+
+// Direct use of base transport for async-only TCP
+SharedTransport transport;
+transport.setCallbacks({
+    .onData = [](SessionId sid, const uint8_t* data, size_t len, const IoResult& result) {
+        // Handle incoming data asynchronously
+    }
+});
+transport.start();
+auto sessionId = transport.connect("api.service.com", 443, TlsMode::Client);
+```
+
+#### **Sync/Async Layer - Dual Operations**
+```cpp
+#include "iora/network/sync_async_transport.hpp"
+
+// Wrap base transport to add synchronous operations
+auto baseTransport = std::make_unique<SharedTransport>(config);
+SyncAsyncTransport syncAsyncTransport(std::move(baseTransport));
+
+// Use both sync and async operations
+syncAsyncTransport.start();
+auto sid = syncAsyncTransport.connect("service.com", 80, TlsMode::None);
+
+// Async send
+syncAsyncTransport.sendAsync(sid, "GET /", [](SessionId, const SyncResult& result) {
+    // Handle async completion
+});
+
+// Sync receive  
+std::vector<uint8_t> buffer(1024);
+auto result = syncAsyncTransport.receiveSync(sid, buffer.data(), buffer.size(), 
+                                           std::chrono::seconds(5));
+```
+
+#### **Unified Layer - Protocol Abstraction**  
+```cpp
+#include "iora/network/unified_shared_transport.hpp"
+
+// High-level transport supporting both TCP and UDP
+UnifiedSharedTransport::Config config;
+config.protocol = UnifiedSharedTransport::Protocol::TCP;
+config.connectTimeout = std::chrono::seconds(5);
+
+auto transport = std::make_unique<UnifiedSharedTransport>(config);
+
+// Protocol-agnostic operations
+transport->start();
+auto sid = transport->connect("api.example.com", 443, TlsMode::Client);
+
+// Can switch between sync and async modes per session
+transport->setReadMode(sid, ReadMode::Synchronous);
+transport->sendAsync(sid, "request data", [](auto, auto) { /* callback */ });
+```
+
+### **🏗️ Architecture Benefits**
+
+#### **Flexibility**
+- Choose the abstraction level that matches your performance/convenience needs
+- Mix different layers in same application for different use cases
+- Easy migration between layers as requirements change
+
+#### **Maintainability**
+- Clear separation of concerns between layers
+- Each layer can evolve independently
+- Testable components with well-defined interfaces
+
+#### **Performance**
+- Zero-cost abstractions where possible
+- Pay only for features you use
+- Direct access to high-performance base transports when needed
+
+#### **Safety**
+- Synchronization layer prevents sync/async conflicts
+- Health monitoring and connection lifecycle management
+- Graceful error handling and recovery at each layer
+
+This layered architecture ensures that whether you're building a high-frequency trading system requiring maximum performance or a flexible microservice needing protocol abstraction, Iora provides the right tool for the job.
 
 ---
 

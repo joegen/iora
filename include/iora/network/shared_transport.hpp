@@ -62,7 +62,7 @@ namespace network
 {
 
   // Forward declaration - BasicTransportStats is defined in
-  // hybrid_transport.hpp
+  // sync_async_transport.hpp
   struct BasicTransportStats;
 
   /// \brief Shared TCP/TLS transport (single-threaded epoll loop).

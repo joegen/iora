@@ -10,8 +10,8 @@
 #error "Linux-only (epoll/eventfd/timerfd)"
 #endif
 
-/// \file hybrid_transport.hpp
-/// \brief Hybrid synchronous/asynchronous transport wrapper for SIP and similar
+/// \file sync_async_transport.hpp
+/// \brief Synchronous/asynchronous transport wrapper for SIP and similar
 /// protocols \details
 ///   - Provides both sync and async operations on the same connection
 ///   - Exclusive read modes prevent simultaneous sync/async read conflicts
@@ -61,7 +61,7 @@ namespace network
     std::size_t sessionsCurrent{0};
   };
 
-  /// \brief Base transport interface for HybridTransport
+  /// \brief Base transport interface for SyncAsyncTransport
   /// \note Minimal interface to avoid circular dependencies
   class ITransportBase
   {
@@ -279,8 +279,8 @@ namespace network
     }
   };
 
-  /// \brief Hybrid transport providing both sync and async operations
-  class HybridTransport
+  /// \brief Synchronous/asynchronous transport providing both sync and async operations
+  class SyncAsyncTransport
   {
   public:
     using DataCallback = std::function<void(SessionId, const std::uint8_t*,
@@ -292,7 +292,7 @@ namespace network
     using SendCompleteCallback =
         std::function<void(SessionId, const SyncResult&)>;
 
-    /// \brief Configuration for hybrid transport
+    /// \brief Configuration for sync/async transport
     struct Config
     {
       std::size_t maxPendingSyncOps{
@@ -313,25 +313,25 @@ namespace network
     };
 
     /// \brief Construct with underlying transport and default configuration
-    explicit HybridTransport(std::unique_ptr<ITransportBase> transport)
+    explicit SyncAsyncTransport(std::unique_ptr<ITransportBase> transport)
       : _transport(std::move(transport)), _config(Config::defaultConfig())
     {
       setupInternalCallbacks();
     }
 
     /// \brief Construct with underlying transport and configuration
-    HybridTransport(std::unique_ptr<ITransportBase> transport,
+    SyncAsyncTransport(std::unique_ptr<ITransportBase> transport,
                     const Config& config)
       : _transport(std::move(transport)), _config(config)
     {
       setupInternalCallbacks();
     }
 
-    ~HybridTransport() { stop(); }
+    ~SyncAsyncTransport() { stop(); }
 
     // Disable copy/move
-    HybridTransport(const HybridTransport&) = delete;
-    HybridTransport& operator=(const HybridTransport&) = delete;
+    SyncAsyncTransport(const SyncAsyncTransport&) = delete;
+    SyncAsyncTransport& operator=(const SyncAsyncTransport&) = delete;
 
     /// \brief Start the transport
     bool start()
@@ -355,13 +355,13 @@ namespace network
     /// \brief Stop the transport
     void stop()
     {
-      iora::core::Logger::debug("HybridTransport::stop() - Starting");
+      iora::core::Logger::debug("SyncAsyncTransport::stop() - Starting");
       {
         std::lock_guard<std::mutex> lock(_mutex);
         if (!_running)
         {
           iora::core::Logger::debug(
-              "HybridTransport::stop() - Already stopped");
+              "SyncAsyncTransport::stop() - Already stopped");
           return;
         }
         _running = false;
@@ -369,23 +369,23 @@ namespace network
       }
 
       iora::core::Logger::debug(
-          "HybridTransport::stop() - Cancelling all operations");
+          "SyncAsyncTransport::stop() - Cancelling all operations");
       // Cancel all pending operations
       cancelAllOperations();
 
       if (_processingThread.joinable())
       {
         iora::core::Logger::debug(
-            "HybridTransport::stop() - Joining processing thread");
+            "SyncAsyncTransport::stop() - Joining processing thread");
         _processingThread.join();
         iora::core::Logger::debug(
-            "HybridTransport::stop() - Processing thread joined");
+            "SyncAsyncTransport::stop() - Processing thread joined");
       }
 
       iora::core::Logger::debug(
-          "HybridTransport::stop() - Stopping underlying transport");
+          "SyncAsyncTransport::stop() - Stopping underlying transport");
       _transport->stop();
-      iora::core::Logger::debug("HybridTransport::stop() - Completed");
+      iora::core::Logger::debug("SyncAsyncTransport::stop() - Completed");
     }
 
     // ===== Read Mode Management =====
@@ -509,7 +509,7 @@ namespace network
         timeout = _config.defaultTimeout;
       }
 
-      core::Logger::debug("HybridTransport: sendSync starting for session " +
+      core::Logger::debug("SyncAsyncTransport: sendSync starting for session " +
                           std::to_string(sid) + ", len=" + std::to_string(len) +
                           ", timeout=" + std::to_string(timeout.count()) +
                           "ms");
@@ -545,14 +545,14 @@ namespace network
       if (!completed)
       {
         operation->cancelled = true;
-        core::Logger::debug("HybridTransport: sendSync timed out for session " +
+        core::Logger::debug("SyncAsyncTransport: sendSync timed out for session " +
                             std::to_string(sid));
         return SyncResult::timeout();
       }
 
       updateHealth(sid, operation->result.ok, len, true);
 
-      core::Logger::debug("HybridTransport: sendSync completed for session " +
+      core::Logger::debug("SyncAsyncTransport: sendSync completed for session " +
                           std::to_string(sid) + ", success=" +
                           (operation->result.ok ? "true" : "false") +
                           ", error=" + operation->result.errorMessage);
@@ -671,7 +671,7 @@ namespace network
       if (session.closed.load())
       {
         core::Logger::debug(
-            "HybridTransport: receiveSync detected closed session " +
+            "SyncAsyncTransport: receiveSync detected closed session " +
             std::to_string(sid));
         return SyncResult::failure(TransportError::PeerClosed,
                                    "Session closed during receive");
@@ -1000,7 +1000,7 @@ namespace network
       _transport->setCloseCallback(
           [this](SessionId sid, const IoResult& result)
           {
-            core::Logger::debug("HybridTransport: Close callback for session " +
+            core::Logger::debug("SyncAsyncTransport: Close callback for session " +
                                 std::to_string(sid));
             // Clean up session state
             {
@@ -1009,7 +1009,7 @@ namespace network
               if (it != _sessions.end())
               {
                 core::Logger::debug(
-                    "HybridTransport: Waking " +
+                    "SyncAsyncTransport: Waking " +
                     std::to_string(it->second.pendingSyncOps.size()) +
                     " pending sync operations");
 

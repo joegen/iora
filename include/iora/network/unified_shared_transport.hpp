@@ -13,7 +13,7 @@
 /// \file unified_shared_transport.hpp
 /// \brief Unified transport facade providing both sync and async operations for
 /// TCP/UDP \details
-///   - Built on top of HybridTransport for sync/async capabilities
+///   - Built on top of SyncAsyncTransport for sync/async capabilities
 ///   - Normalizes TCP/TLS and UDP transports behind a single interface
 ///   - Provides exclusive read modes, cancellation, and health monitoring
 ///   - Thread-safe with operation queueing
@@ -27,7 +27,7 @@
 #include <string>
 #include <variant>
 
-#include "hybrid_transport.hpp"
+#include "sync_async_transport.hpp"
 #include "shared_transport.hpp"
 #include "shared_transport_udp.hpp"
 
@@ -57,9 +57,9 @@ namespace network
     SupportsKeepalive = 1u << 3,
     SupportsBatchSend = 1u << 4,
     SupportsSyncOperations =
-        1u << 5, // All transports now support this via HybridTransport
+        1u << 5, // All transports now support this via SyncAsyncTransport
     SupportsReadModes =
-        1u << 6 // All transports now support this via HybridTransport
+        1u << 6 // All transports now support this via SyncAsyncTransport
   };
 
   inline constexpr Capability operator|(Capability a, Capability b)
@@ -647,7 +647,7 @@ namespace network
     /// \brief Check if transport is running
     bool isRunning() const { return _hybrid != nullptr; }
 
-    // ===== Read Mode Management (via HybridTransport) =====
+    // ===== Read Mode Management (via SyncAsyncTransport) =====
 
     /// \brief Set the read mode for a session (exclusive access)
     bool setReadMode(SessionId sid, ReadMode mode)
@@ -661,10 +661,10 @@ namespace network
       return _hybrid->getReadMode(sid);
     }
 
-    // ===== Async Operations (via HybridTransport) =====
+    // ===== Async Operations (via SyncAsyncTransport) =====
 
     /// \brief Set async data callback (only works in Async read mode)
-    bool setDataCallback(SessionId sid, HybridTransport::DataCallback cb)
+    bool setDataCallback(SessionId sid, SyncAsyncTransport::DataCallback cb)
     {
       return _hybrid->setDataCallback(sid, cb);
     }
@@ -677,31 +677,31 @@ namespace network
     }
 
     /// \brief Set async connect callback
-    void setConnectCallback(HybridTransport::ConnectCallback cb)
+    void setConnectCallback(SyncAsyncTransport::ConnectCallback cb)
     {
       _hybrid->setConnectCallback(cb);
     }
 
     /// \brief Set async close callback
-    void setCloseCallback(HybridTransport::CloseCallback cb)
+    void setCloseCallback(SyncAsyncTransport::CloseCallback cb)
     {
       _hybrid->setCloseCallback(cb);
     }
 
     /// \brief Set async error callback
-    void setErrorCallback(HybridTransport::ErrorCallback cb)
+    void setErrorCallback(SyncAsyncTransport::ErrorCallback cb)
     {
       _hybrid->setErrorCallback(cb);
     }
 
     /// \brief Async send with optional completion callback
     void sendAsync(SessionId sid, const void* data, std::size_t len,
-                   HybridTransport::SendCompleteCallback cb = nullptr)
+                   SyncAsyncTransport::SendCompleteCallback cb = nullptr)
     {
       _hybrid->sendAsync(sid, data, len, cb);
     }
 
-    // ===== Sync Operations (via HybridTransport) =====
+    // ===== Sync Operations (via SyncAsyncTransport) =====
 
     /// \brief Synchronous send - blocks until complete or timeout
     SyncResult sendSync(
@@ -772,10 +772,10 @@ namespace network
       }
 
       // Need to access the underlying UDP transport
-      // This is a limitation - HybridTransport doesn't expose this method
-      // We'll need to add it to HybridTransport or use a workaround
+      // This is a limitation - SyncAsyncTransport doesn't expose this method
+      // We'll need to add it to SyncAsyncTransport or use a workaround
       throw UnsupportedOperation(
-          "connectViaListener not yet implemented in HybridTransport");
+          "connectViaListener not yet implemented in SyncAsyncTransport");
     }
 
     /// \brief Close a session
@@ -864,8 +864,8 @@ namespace network
         }
       }
 
-      // Update config - HybridTransport doesn't expose reconfigure yet
-      // This would need to be added to HybridTransport
+      // Update config - SyncAsyncTransport doesn't expose reconfigure yet
+      // This would need to be added to SyncAsyncTransport
     }
 
   private:
@@ -944,21 +944,21 @@ namespace network
       }
 
       // Convert hybrid config
-      HybridTransport::Config hybridConfig;
+      SyncAsyncTransport::Config hybridConfig;
       hybridConfig.maxPendingSyncOps = _config.maxPendingSyncOps;
       hybridConfig.maxSyncReceiveBuffer = _config.maxSyncReceiveBuffer;
       hybridConfig.defaultTimeout = _config.defaultSyncTimeout;
       hybridConfig.allowReadModeSwitch = _config.allowReadModeSwitch;
       hybridConfig.autoHealthMonitoring = _config.autoHealthMonitoring;
 
-      _hybrid = std::make_unique<HybridTransport>(std::move(baseTransport),
+      _hybrid = std::make_unique<SyncAsyncTransport>(std::move(baseTransport),
                                                   hybridConfig);
     }
 
   private:
     Protocol _protocol;
     Config _config;
-    std::unique_ptr<HybridTransport> _hybrid;
+    std::unique_ptr<SyncAsyncTransport> _hybrid;
   };
 
   // Note: SIP convenience functions are now built into the class as static

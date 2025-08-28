@@ -65,8 +65,8 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_dns_client_minimal.cpp")
     list(APPEND NETWORK_TESTS network/iora_test_dns_client_minimal)
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_hybrid_transport.cpp")
-    list(APPEND NETWORK_TESTS network/iora_test_hybrid_transport)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_sync_async_transport.cpp")
+    list(APPEND NETWORK_TESTS network/iora_test_sync_async_transport)
 endif()
 
 # Core namespace tests
@@ -285,5 +285,7 @@ if(IORA_BUILD_DEBUG_TESTS)
     endforeach()
 endif()
 
-# Build test plugins for dynamic loading tests
-add_subdirectory(plugins)
+# Build test plugins for dynamic loading tests (only if service tests enabled)
+if(IORA_BUILD_SERVICE_TESTS)
+    add_subdirectory(plugins)
+endif()

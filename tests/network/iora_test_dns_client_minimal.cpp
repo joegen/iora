@@ -4,8 +4,8 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
-#include <catch2/catch_test_macros.hpp>
-#include <catch2/matchers/catch_matchers_string.hpp>
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch.hpp>
 
 #include "iora/network/dns_client.hpp"
 
@@ -82,10 +82,9 @@ TEST_CASE("DNS client safe lifecycle", "[dns][lifecycle]")
   SECTION("Start and stop safely")
   {
     // Try to start - may fail if network unavailable
-    bool started = false;
     try
     {
-      started = client.start();
+      client.start();
     }
     catch (...)
     {
