@@ -26,6 +26,9 @@ namespace util
   template <typename K, typename V> class ExpiringCache
   {
   public:
+    /// \brief Callback function type for cache evictions
+    using EvictionCallback = std::function<void(const K& key, const V& value)>;
+
     ExpiringCache() : _ttl(std::chrono::seconds(60)), _stop(false)
     {
       iora::core::Logger::info(
@@ -37,6 +40,15 @@ namespace util
     {
       iora::core::Logger::info("ExpiringCache: Initializing with TTL of " +
                                std::to_string(ttl.count()) + " seconds");
+      startPurgeThread();
+    }
+
+    /// \brief Constructor with TTL and eviction callback
+    explicit ExpiringCache(std::chrono::seconds ttl, EvictionCallback callback) 
+      : _ttl(ttl), _stop(false), _evictionCallback(callback)
+    {
+      iora::core::Logger::info("ExpiringCache: Initializing with TTL of " +
+                               std::to_string(ttl.count()) + " seconds and eviction callback");
       startPurgeThread();
     }
 
@@ -85,6 +97,11 @@ namespace util
         {
           iora::core::Logger::debug(
               "ExpiringCache: Cache miss - entry expired for key");
+          // Invoke eviction callback before removing
+          if (_evictionCallback)
+          {
+            _evictionCallback(it->first, it->second.value);
+          }
           _cache.erase(it); // Remove expired entry
         }
       }
@@ -102,6 +119,11 @@ namespace util
       auto it = _cache.find(key);
       if (it != _cache.end())
       {
+        // Invoke eviction callback before removing
+        if (_evictionCallback)
+        {
+          _evictionCallback(it->first, it->second.value);
+        }
         _cache.erase(it);
         iora::core::Logger::debug(
             "ExpiringCache: Removed cache entry (remaining entries: " +
@@ -112,6 +134,14 @@ namespace util
         iora::core::Logger::debug(
             "ExpiringCache: Attempted to remove non-existent key");
       }
+    }
+
+    /// \brief Get current cache size (number of entries)
+    /// \return Current number of entries in cache
+    std::size_t size() const
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      return _cache.size();
     }
 
     // Friend accessor for unit testing
@@ -126,9 +156,10 @@ namespace util
 
     std::unordered_map<K, CacheEntry> _cache;
     std::chrono::seconds _ttl;
-    std::mutex _mutex;
+    mutable std::mutex _mutex;
     std::thread _purgeThread;
     bool _stop;
+    EvictionCallback _evictionCallback;
 
     void startPurgeThread()
     {
@@ -155,6 +186,11 @@ namespace util
                 {
                   if (it->second.expiration <= now)
                   {
+                    // Invoke eviction callback before removing
+                    if (_evictionCallback)
+                    {
+                      _evictionCallback(it->first, it->second.value);
+                    }
                     it = _cache.erase(it);
                     purgedCount++;
                   }

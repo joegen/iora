@@ -9,7 +9,7 @@
 #   cmake -DIORA_BUILD_ALL_TESTS=ON            # All test groups
 #
 # Available test groups:
-#   - NETWORK: Transport, DNS, HTTP, WebSocket (13 tests)
+#   - NETWORK: Transport, DNS comprehensive, HTTP, WebSocket (13 tests)
 #   - CORE: Logging, threading, timers (6 tests)
 #   - PARSERS: JSON and XML parsing (2 tests)
 #   - SERVICE: Plugin system and main framework (4 tests)
@@ -48,7 +48,10 @@ endif()
 set(NETWORK_TESTS
     network/iora_test_batch_integration
     network/iora_test_batch_processor
-    network/iora_test_dns_client
+    network/iora_test_dns_basic
+    network/iora_test_dns_timer_cancellation
+    network/iora_test_dns_async
+    network/iora_test_dns_comprehensive
     network/iora_test_http
     network/iora_test_shared_tcp
     network/iora_test_shared_transport_timers
@@ -59,12 +62,6 @@ set(NETWORK_TESTS
 )
 
 # Additional network tests that might exist
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_dns_client_comprehensive.cpp")
-    list(APPEND NETWORK_TESTS network/iora_test_dns_client_comprehensive)
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_dns_client_minimal.cpp")
-    list(APPEND NETWORK_TESTS network/iora_test_dns_client_minimal)
-endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_sync_async_transport.cpp")
     list(APPEND NETWORK_TESTS network/iora_test_sync_async_transport)
 endif()
@@ -98,7 +95,6 @@ set(STORAGE_TESTS
 # Service/Plugin system tests
 set(SERVICE_TESTS
     service/iora_test_iora_service
-    service/iora_test_main
     service/iora_test_plugin
     service/iora_test_plugin_dependencies
 )
@@ -150,6 +146,9 @@ function(create_individual_test test_path)
     
     # Add tests root directory to include path for helper headers
     target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    
+    # Add iora-sip tests directory for MockDnsServer.hpp
+    target_include_directories(${test_name} PRIVATE ${CMAKE_SOURCE_DIR}/../iora-modules/iora-sip/tests)
     
     # Add the test to CTest with namespace categorization
     get_filename_component(test_dir ${test_path} DIRECTORY)
