@@ -6,28 +6,29 @@
 // details.
 
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "test_helpers.hpp"
+#include <catch2/catch.hpp>
 
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace
 {
-  struct LogCapture
-  {
-    iora::core::Logger::Level level;
-    std::string formattedMessage;
-    std::string rawMessage;
-  };
+struct LogCapture
+{
+  iora::core::Logger::Level level;
+  std::string formattedMessage;
+  std::string rawMessage;
+};
 
-  std::vector<LogCapture> capturedLogs;
+std::vector<LogCapture> capturedLogs;
 
-  void externalLogHandler(iora::core::Logger::Level level, const std::string& formattedMessage, const std::string& rawMessage)
-  {
-    capturedLogs.push_back({level, formattedMessage, rawMessage});
-  }
+void externalLogHandler(iora::core::Logger::Level level, const std::string &formattedMessage,
+                        const std::string &rawMessage)
+{
+  capturedLogs.push_back({level, formattedMessage, rawMessage});
 }
+} // namespace
 
 TEST_CASE("External log handler", "[logger][external]")
 {
@@ -48,7 +49,7 @@ TEST_CASE("External log handler", "[logger][external]")
     iora::core::Logger::flush();
 
     REQUIRE(capturedLogs.size() == 3);
-    
+
     REQUIRE(capturedLogs[0].level == iora::core::Logger::Level::Info);
     REQUIRE(capturedLogs[0].rawMessage == "Test info message");
     REQUIRE(capturedLogs[0].formattedMessage.find("Test info message") != std::string::npos);
@@ -101,14 +102,14 @@ TEST_CASE("External log handler", "[logger][external]")
     std::filesystem::remove(testLogFile); // Clean up any existing file
 
     iora::core::Logger::init(iora::core::Logger::Level::Info, testLogFile);
-    
+
     // Log a message normally (should go to file)
     iora::core::Logger::info("Message before external handler");
     iora::core::Logger::flush();
 
     // Set external handler (should disable file logging)
     iora::core::Logger::setExternalHandler(externalLogHandler);
-    
+
     // Log messages (should go to external handler only)
     iora::core::Logger::info("Message with external handler");
     iora::core::Logger::flush();

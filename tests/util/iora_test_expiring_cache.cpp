@@ -6,8 +6,8 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "test_helpers.hpp"
+#include <catch2/catch.hpp>
 
 TEST_CASE("ExpiringCache basic operations")
 {
@@ -35,10 +35,9 @@ TEST_CASE("ExpiringCache concurrency")
   std::vector<std::thread> threads;
   for (int i = 0; i < 10; ++i)
   {
-    threads.emplace_back([&cache, i]()
-                         { cache.set(i, i * 10, std::chrono::seconds(1)); });
+    threads.emplace_back([&cache, i]() { cache.set(i, i * 10, std::chrono::seconds(1)); });
   }
-  for (auto& t : threads)
+  for (auto &t : threads)
   {
     t.join();
   }

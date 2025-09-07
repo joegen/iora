@@ -4,11 +4,13 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
-#include <dlfcn.h>
+#include "iora/iora.hpp"
+#include "kvstore.hpp"
 #include <atomic>
 #include <catch2/catch.hpp>
 #include <chrono>
 #include <cstdio>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -16,24 +18,22 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "iora/iora.hpp"
-#include "kvstore.hpp"
 
 namespace
 {
-  std::vector<uint8_t> randomBytes(size_t n)
+std::vector<uint8_t> randomBytes(size_t n)
+{
+  std::vector<uint8_t> v(n);
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<> dis(0, 255);
+  for (size_t i = 0; i < n; ++i)
   {
-    std::vector<uint8_t> v(n);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-    for (size_t i = 0; i < n; ++i)
-    {
-      v[i] = static_cast<uint8_t>(dis(gen));
-    }
-    return v;
+    v[i] = static_cast<uint8_t>(dis(gen));
   }
-}  // namespace
+  return v;
+}
+} // namespace
 
 TEST_CASE("KVStore basic set/get/remove", "[kvstore]")
 {
@@ -69,13 +69,13 @@ TEST_CASE("KVStore batch set/get", "[kvstore][batch]")
   }
   store.setBatch(batch);
   auto keys = std::vector<std::string>{};
-  for (const auto& [k, _] : batch)
+  for (const auto &[k, _] : batch)
   {
     keys.push_back(k);
   }
   auto result = store.getBatch(keys);
   REQUIRE(result.size() == batch.size());
-  for (const auto& [k, v] : batch)
+  for (const auto &[k, v] : batch)
   {
     REQUIRE(result[k] == v);
   }
@@ -108,7 +108,7 @@ TEST_CASE("KVStore handles large values and compaction", "[kvstore][large][compa
   std::remove(file.c_str());
   std::remove((file + ".log").c_str());
   KVStoreConfig cfg;
-  cfg.maxLogSizeBytes = 1024 * 10;  // force compaction quickly
+  cfg.maxLogSizeBytes = 1024 * 10; // force compaction quickly
   KVStore store(file, cfg);
 
   std::string key = "big";
@@ -135,7 +135,8 @@ TEST_CASE("KVStore handles invalid operations", "[kvstore][invalid]")
   KVStore store(file);
   REQUIRE_THROWS_AS(store.set("", {1, 2, 3}), KVStoreException);
   REQUIRE_THROWS_AS(store.set(std::string(MAX_KEY_LENGTH + 1, 'x'), {1, 2, 3}), KVStoreException);
-  REQUIRE_THROWS_AS(store.set("ok", std::vector<uint8_t>(MAX_VALUE_LENGTH + 1, 1)), KVStoreException);
+  REQUIRE_THROWS_AS(store.set("ok", std::vector<uint8_t>(MAX_VALUE_LENGTH + 1, 1)),
+                    KVStoreException);
   std::remove(file.c_str());
   std::remove((file + ".log").c_str());
 }
@@ -171,10 +172,10 @@ TEST_CASE("KVStore persistence with mixed operations", "[kvstore][persistence][e
     KVStore store(file);
     store.set("key1", {1, 2, 3});
     store.set("key2", {4, 5, 6});
-    store.remove("key1");  // Remove then re-add
+    store.remove("key1"); // Remove then re-add
     store.set("key1", {7, 8, 9});
     store.set("key3", {10, 11, 12});
-    store.remove("key2");  // Remove permanently
+    store.remove("key2"); // Remove permanently
     store.flush();
   }
 
@@ -228,13 +229,13 @@ TEST_CASE("KVStore handles truncated log file", "[kvstore][corruption][log]")
   // Truncate the log file (simulate corruption)
   {
     std::ofstream logFile(file + ".log", std::ios::binary | std::ios::trunc);
-    logFile.write("corrupt", 7);  // Write invalid data
+    logFile.write("corrupt", 7); // Write invalid data
   }
 
   // Store should recover gracefully
   {
     KVStore store(file);
-    REQUIRE_NOTHROW(store.size());  // Should not crash
+    REQUIRE_NOTHROW(store.size()); // Should not crash
     store.set("recovery_test", {99});
     REQUIRE(store.get("recovery_test").value() == std::vector<uint8_t>({99}));
   }
@@ -252,7 +253,7 @@ TEST_CASE("KVStore handles corrupted snapshot file", "[kvstore][corruption][snap
   // Create a corrupted snapshot file
   {
     std::ofstream corrupt(file, std::ios::binary);
-    corrupt.write("BADMAGIC", 8);  // Invalid magic number
+    corrupt.write("BADMAGIC", 8); // Invalid magic number
   }
 
   // Should throw exception for corrupted snapshot
@@ -270,8 +271,8 @@ TEST_CASE("KVStore compaction reduces file size", "[kvstore][compaction][size]")
   std::remove((file + ".log").c_str());
 
   KVStoreConfig cfg;
-  cfg.maxLogSizeBytes = 1024;              // Small log to force compaction
-  cfg.enableBackgroundCompaction = false;  // Manual control
+  cfg.maxLogSizeBytes = 1024;             // Small log to force compaction
+  cfg.enableBackgroundCompaction = false; // Manual control
 
   std::vector<uint8_t> finalValue;
 
@@ -286,7 +287,7 @@ TEST_CASE("KVStore compaction reduces file size", "[kvstore][compaction][size]")
       store.set(key, data);
       if (i == 9)
       {
-        finalValue = data;  // Remember the final value
+        finalValue = data; // Remember the final value
       }
     }
 
@@ -295,7 +296,7 @@ TEST_CASE("KVStore compaction reduces file size", "[kvstore][compaction][size]")
 
     // Data should still be accessible
     REQUIRE(store.get(key).value() == finalValue);
-  }  // Destructor releases locks
+  } // Destructor releases locks
 
   // Verify log file was reset
   std::error_code ec;
@@ -304,7 +305,7 @@ TEST_CASE("KVStore compaction reduces file size", "[kvstore][compaction][size]")
     auto logSize = std::filesystem::file_size(file + ".log", ec);
     if (!ec)
     {
-      REQUIRE(logSize == 0);  // Should be empty after compaction
+      REQUIRE(logSize == 0); // Should be empty after compaction
     }
   }
 
@@ -344,7 +345,7 @@ TEST_CASE("KVStore compaction preserves all data", "[kvstore][compaction][integr
   store.forceCompact();
 
   // Verify all remaining data is intact
-  for (const auto& [key, expectedValue] : testData)
+  for (const auto &[key, expectedValue] : testData)
   {
     auto actualValue = store.get(key);
     REQUIRE(actualValue.has_value());
@@ -363,15 +364,15 @@ TEST_CASE("KVStore cache eviction with LRU", "[kvstore][cache][lru]")
   std::remove((file + ".log").c_str());
 
   KVStoreConfig cfg;
-  cfg.maxCacheSize = 3;  // Small cache
+  cfg.maxCacheSize = 3; // Small cache
   KVStore store(file, cfg);
 
   // Fill cache beyond capacity
   store.set("a", {1});
   store.set("b", {2});
   store.set("c", {3});
-  store.set("d", {4});  // Should evict oldest
-  store.set("e", {5});  // Should evict next oldest
+  store.set("d", {4}); // Should evict oldest
+  store.set("e", {5}); // Should evict next oldest
 
   // All keys should still be retrievable (from disk if not in cache)
   REQUIRE(store.get("a").value() == std::vector<uint8_t>({1}));
@@ -410,21 +411,21 @@ TEST_CASE("KVStore concurrent read operations", "[kvstore][concurrency][reads]")
   for (int t = 0; t < numThreads; ++t)
   {
     threads.emplace_back(
-        [&store, &successCount, numKeys, t]()
-        {
-          for (int i = t; i < numKeys; i += 4)
-          {  // Interleaved access
-            std::string key = "key_" + std::to_string(i);
-            auto result = store.get(key);
-            if (result.has_value() && result.value()[0] == static_cast<uint8_t>(i))
-            {
-              successCount++;
-            }
+      [&store, &successCount, numKeys, t]()
+      {
+        for (int i = t; i < numKeys; i += 4)
+        { // Interleaved access
+          std::string key = "key_" + std::to_string(i);
+          auto result = store.get(key);
+          if (result.has_value() && result.value()[0] == static_cast<uint8_t>(i))
+          {
+            successCount++;
           }
-        });
+        }
+      });
   }
 
-  for (auto& thread : threads)
+  for (auto &thread : threads)
   {
     thread.join();
   }
@@ -450,67 +451,67 @@ TEST_CASE("KVStore concurrent mixed operations", "[kvstore][concurrency][mixed]"
 
   // Writer thread
   threads.emplace_back(
-      [&store, &operationCount, &errors, &errorMutex]()
+    [&store, &operationCount, &errors, &errorMutex]()
+    {
+      try
       {
-        try
+        for (int i = 0; i < 50; ++i)
         {
-          for (int i = 0; i < 50; ++i)
-          {
-            std::string key = "write_" + std::to_string(i);
-            std::vector<uint8_t> value = randomBytes(10);
-            store.set(key, value);
-            operationCount++;
-          }
+          std::string key = "write_" + std::to_string(i);
+          std::vector<uint8_t> value = randomBytes(10);
+          store.set(key, value);
+          operationCount++;
         }
-        catch (const std::exception& e)
-        {
-          std::lock_guard<std::mutex> lock(errorMutex);
-          errors.push_back(std::string("Writer: ") + e.what());
-        }
-      });
+      }
+      catch (const std::exception &e)
+      {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        errors.push_back(std::string("Writer: ") + e.what());
+      }
+    });
 
   // Reader thread
   threads.emplace_back(
-      [&store, &operationCount, &errors, &errorMutex]()
+    [&store, &operationCount, &errors, &errorMutex]()
+    {
+      try
       {
-        try
+        for (int i = 0; i < 100; ++i)
         {
-          for (int i = 0; i < 100; ++i)
-          {
-            std::string key = "write_" + std::to_string(i % 50);
-            auto result = store.get(key);
-            operationCount++;
-          }
+          std::string key = "write_" + std::to_string(i % 50);
+          auto result = store.get(key);
+          operationCount++;
         }
-        catch (const std::exception& e)
-        {
-          std::lock_guard<std::mutex> lock(errorMutex);
-          errors.push_back(std::string("Reader: ") + e.what());
-        }
-      });
+      }
+      catch (const std::exception &e)
+      {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        errors.push_back(std::string("Reader: ") + e.what());
+      }
+    });
 
   // Deleter thread
   threads.emplace_back(
-      [&store, &operationCount, &errors, &errorMutex]()
+    [&store, &operationCount, &errors, &errorMutex]()
+    {
+      try
       {
-        try
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Let some writes happen first
+        for (int i = 0; i < 25; ++i)
         {
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));  // Let some writes happen first
-          for (int i = 0; i < 25; ++i)
-          {
-            std::string key = "write_" + std::to_string(i * 2);
-            store.remove(key);
-            operationCount++;
-          }
+          std::string key = "write_" + std::to_string(i * 2);
+          store.remove(key);
+          operationCount++;
         }
-        catch (const std::exception& e)
-        {
-          std::lock_guard<std::mutex> lock(errorMutex);
-          errors.push_back(std::string("Deleter: ") + e.what());
-        }
-      });
+      }
+      catch (const std::exception &e)
+      {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        errors.push_back(std::string("Deleter: ") + e.what());
+      }
+    });
 
-  for (auto& thread : threads)
+  for (auto &thread : threads)
   {
     thread.join();
   }
@@ -526,7 +527,7 @@ TEST_CASE("KVStore concurrent mixed operations", "[kvstore][concurrency][mixed]"
 // Exception Safety Tests
 TEST_CASE("KVStore handles write failures gracefully", "[kvstore][exceptions][write]")
 {
-  const std::string file = "/dev/null/impossible_path/test.bin";  // Invalid path
+  const std::string file = "/dev/null/impossible_path/test.bin"; // Invalid path
 
   // Should throw during construction when trying to create log file
   REQUIRE_THROWS_AS(KVStore(file), KVStoreException);
@@ -547,7 +548,7 @@ TEST_CASE("KVStore batch operation rollback on failure", "[kvstore][exceptions][
   std::unordered_map<std::string, std::vector<uint8_t>> batch;
   batch["valid1"] = {4, 5, 6};
   batch["valid2"] = {7, 8, 9};
-  batch[""] = {10, 11, 12};  // Invalid empty key
+  batch[""] = {10, 11, 12}; // Invalid empty key
 
   // Batch should fail and not modify store
   REQUIRE_THROWS_AS(store.setBatch(batch), KVStoreException);
@@ -596,7 +597,7 @@ TEST_CASE("KVStore handles maximum value length", "[kvstore][boundary][value]")
   std::string key = "test";
 
   // Test with large but valid value (smaller than max for practical testing)
-  std::vector<uint8_t> largeValue(1024 * 1024, 42);  // 1MB
+  std::vector<uint8_t> largeValue(1024 * 1024, 42); // 1MB
   REQUIRE_NOTHROW(store.set(key, largeValue));
   REQUIRE(store.get(key).value() == largeValue);
 
@@ -641,7 +642,7 @@ TEST_CASE("KVStore stress test with many entries", "[kvstore][stress][large]")
   std::remove((file + ".log").c_str());
 
   KVStoreConfig cfg;
-  cfg.enableBackgroundCompaction = true;  // Test background compaction
+  cfg.enableBackgroundCompaction = true; // Test background compaction
   KVStore store(file, cfg);
 
   const int numEntries = 1000;
@@ -657,7 +658,7 @@ TEST_CASE("KVStore stress test with many entries", "[kvstore][stress][large]")
   }
 
   // Verify all entries
-  for (const auto& [key, expectedValue] : testData)
+  for (const auto &[key, expectedValue] : testData)
   {
     auto actualValue = store.get(key);
     REQUIRE(actualValue.has_value());
@@ -694,7 +695,7 @@ TEST_CASE("KVStore properly cleans up temporary files", "[kvstore][cleanup][temp
   {
     KVStore store(file);
     store.set("test", {1, 2, 3});
-    store.forceCompact();  // This creates and should clean up temp files
+    store.forceCompact(); // This creates and should clean up temp files
   }
 
   // Temporary file should not exist after compaction
@@ -723,7 +724,7 @@ TEST_CASE("KVStore handles shutdown and cleanup", "[kvstore][cleanup][shutdown]"
 
     // Explicit shutdown
     store.shutdown();
-  }  // Destructor should handle cleanup gracefully
+  } // Destructor should handle cleanup gracefully
 
   // Files should exist (data was persisted)
   bool filesExist = std::filesystem::exists(file) || std::filesystem::exists(file + ".log");
@@ -739,7 +740,8 @@ TEST_CASE("KVStore handles shutdown and cleanup", "[kvstore][cleanup][shutdown]"
   std::remove((file + ".log").c_str());
 }
 
-TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvstore][plugin][api][integration]")
+TEST_CASE("KVStore plugin API set/get via IoraService (full integration)",
+          "[kvstore][plugin][api][integration]")
 {
   // Setup IoraService config
   iora::IoraService::Config config;
@@ -749,10 +751,11 @@ TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvs
 
   // Initialize service with CLI args
   iora::IoraService::init(config);
-  iora::IoraService& svc = iora::IoraService::instanceRef();
+  iora::IoraService &svc = iora::IoraService::instanceRef();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 
-  auto pluginPathOpt = iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_kvstore.so";
+  auto pluginPathOpt =
+    iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_kvstore.so";
   std::cout << "Plugin path: " << pluginPathOpt << std::endl;
   REQUIRE(std::filesystem::exists(pluginPathOpt));
   REQUIRE(svc.loadSingleModule(pluginPathOpt));
@@ -761,8 +764,10 @@ TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvs
   {
     std::string key = "plugin_key";
     std::vector<uint8_t> value = {42, 43, 44};
-    svc.callExportedApi<void, const std::string&, const std::vector<uint8_t>&>("kvstore.set", key, value);
-    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string&>("kvstore.get", key);
+    svc.callExportedApi<void, const std::string &, const std::vector<uint8_t> &>("kvstore.set", key,
+                                                                                 value);
+    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string &>(
+      "kvstore.get", key);
     REQUIRE(got.has_value());
     REQUIRE(got.value() == value);
   }
@@ -771,14 +776,17 @@ TEST_CASE("KVStore plugin API set/get via IoraService (full integration)", "[kvs
   {
     std::string key = "reload_key";
     std::vector<uint8_t> value = {99, 100, 101};
-    svc.callExportedApi<void, const std::string&, const std::vector<uint8_t>&>("kvstore.set", key, value);
+    svc.callExportedApi<void, const std::string &, const std::vector<uint8_t> &>("kvstore.set", key,
+                                                                                 value);
     REQUIRE(svc.unloadSingleModule("mod_kvstore.so"));
     REQUIRE(svc.loadSingleModule(pluginPathOpt));
-    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string&>("kvstore.get", key);
+    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string &>(
+      "kvstore.get", key);
     REQUIRE(got.has_value());
     REQUIRE(got.value() == value);
   }
 
   iora::util::removeFilesContainingAny({"ioraservice_kvstore_log", "ioraservice_kvstore_state.json",
-                                        "test_kvstore_plugin_api.bin", "test_kvstore_plugin_api.bin.log"});
+                                        "test_kvstore_plugin_api.bin",
+                                        "test_kvstore_plugin_api.bin.log"});
 }

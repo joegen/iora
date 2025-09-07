@@ -1,19 +1,19 @@
 #pragma once
 
 #include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <system_error>
-#include <unistd.h>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <netinet/in.h>
 #include <string>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <system_error>
 #include <thread>
+#include <unistd.h>
 
 namespace testnet
 {
@@ -28,10 +28,10 @@ inline std::uint16_t getFreePortTCP()
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = 0;
 
-  REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+  REQUIRE(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
 
   socklen_t len = sizeof(addr);
-  REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+  REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
   std::uint16_t port = ntohs(addr.sin_port);
   ::close(fd);
   return port;
@@ -47,10 +47,10 @@ inline std::uint16_t getFreePortUDP()
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = 0;
 
-  REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+  REQUIRE(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
 
   socklen_t len = sizeof(addr);
-  REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
+  REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
   std::uint16_t port = ntohs(addr.sin_port);
   ::close(fd);
   return port;
@@ -66,8 +66,7 @@ public:
   {
     if (epollFd_ < 0)
     {
-      throw std::system_error(errno, std::system_category(),
-                              "epoll_create1 failed");
+      throw std::system_error(errno, std::system_category(), "epoll_create1 failed");
     }
   }
 
@@ -89,8 +88,7 @@ public:
 
     if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, fd, &ev) < 0)
     {
-      throw std::system_error(errno, std::system_category(),
-                              "epoll_ctl ADD failed");
+      throw std::system_error(errno, std::system_category(), "epoll_ctl ADD failed");
     }
   }
 

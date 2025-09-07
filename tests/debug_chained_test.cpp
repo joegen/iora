@@ -1,7 +1,7 @@
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
-#include "test_helpers.hpp"
 #include "iora/iora.hpp"
+#include "test_helpers.hpp"
+#include <catch2/catch.hpp>
 
 using AutoServiceShutdown = iora::IoraService::AutoServiceShutdown;
 
@@ -23,26 +23,27 @@ TEST_CASE("Debug chained dependencies only", "[debug]")
 
     // Initialize service with config
     iora::IoraService::init(config);
-    iora::IoraService& svc = iora::IoraService::instanceRef();
+    iora::IoraService &svc = iora::IoraService::instanceRef();
     AutoServiceShutdown autoShutdown(svc);
-    
+
     // Load all three plugins in correct order
     REQUIRE(svc.loadSingleModule(basePluginPath));
     REQUIRE(svc.loadSingleModule(dependentPluginPath));
     REQUIRE(svc.loadSingleModule(chainedPluginPath));
-    
+
     // Verify chained plugin can access all dependencies
     std::string chainResult = svc.callExportedApi<std::string>("chainedplugin.useChain");
     REQUIRE(chainResult.find("BasePlugin v1.0") != std::string::npos);
     REQUIRE(chainResult.find("BasePlugin available") != std::string::npos);
-    
+
     // Verify dependency status tracking
     std::string depStatus = svc.callExportedApi<std::string>("chainedplugin.getDependencyStatus");
     REQUIRE(depStatus == "BaseDep: 1, DependentDep: 1");
-    
+
     // Test complex operation using multiple dependencies
     std::string complexResult = svc.callExportedApi<std::string>("chainedplugin.complexOperation");
     REQUIRE(complexResult.find("Complex operation result") != std::string::npos);
-    REQUIRE(complexResult.find("counter: 3") != std::string::npos); // Should be 3 after 2 increments
+    REQUIRE(complexResult.find("counter: 3") !=
+            std::string::npos); // Should be 3 after 2 increments
   }
 }

@@ -29,22 +29,22 @@
 
 #include "iora/iora.hpp"
 #include <atomic>
-#include <unordered_map>
 #include <mutex>
+#include <unordered_map>
 
 class MicroservicePlugin : public iora::IoraService::Plugin
 {
 public:
-  explicit MicroservicePlugin(iora::IoraService* svc) : Plugin(svc) {}
+  explicit MicroservicePlugin(iora::IoraService *svc) : Plugin(svc) {}
 
-  void onLoad(iora::IoraService* svc) override
+  void onLoad(iora::IoraService *svc) override
   {
     // Load API token from persistent store
     auto tokenOpt = svc->jsonFileStore()->get("apiToken");
     if (!tokenOpt)
     {
       // first run: read from environment and persist
-      const char* envToken = std::getenv("OPENAI_API_KEY");
+      const char *envToken = std::getenv("OPENAI_API_KEY");
       if (envToken)
       {
         std::string token = envToken;
@@ -63,79 +63,69 @@ public:
     // Register EventQueue handler for processing summarization requests
     // (fluent)
     svc->onEvent("summarize")
-        .handle(
-            [this, svc](const iora::parsers::Json& input)
-            {
-              std::string requestId = input["requestId"];
-              std::string text = input["text"];
-              int maxTokens = input.contains("max_tokens")
-                                  ? input["max_tokens"].get<int>()
-                                  : 256;
+      .handle(
+        [this, svc](const iora::parsers::Json &input)
+        {
+          std::string requestId = input["requestId"];
+          std::string text = input["text"];
+          int maxTokens = input.contains("max_tokens") ? input["max_tokens"].get<int>() : 256;
 
-              // Build payload for LLM
-              iora::parsers::Json payload = {
-                  {"model", "gpt-3.5-turbo"},
-                  {"messages",
-                   {{{"role", "user"}, {"content", "Summarise: " + text}}}},
-                  {"max_tokens", maxTokens}};
+          // Build payload for LLM
+          iora::parsers::Json payload = {
+            {"model", "gpt-3.5-turbo"},
+            {"messages", {{{"role", "user"}, {"content", "Summarise: " + text}}}},
+            {"max_tokens", maxTokens}};
 
-              // Call LLM provider
-              auto client = svc->makeHttpClient();
-              auto headers = std::map<std::string, std::string>{
-                  {"Authorization",
-                   "Bearer " + svc->jsonFileStore()->get("apiToken").value()},
-                  {"Content-Type", "application/json"}};
+          // Call LLM provider
+          auto client = svc->makeHttpClient();
+          auto headers = std::map<std::string, std::string>{
+            {"Authorization", "Bearer " + svc->jsonFileStore()->get("apiToken").value()},
+            {"Content-Type", "application/json"}};
 
-              auto llmRes =
-                  client.postJson("https://api.openai.com/v1/chat/completions",
-                                  payload, headers);
-              auto llmJson =
-                  iora::network::HttpClient::parseJsonOrThrow(llmRes);
-              std::string summary =
-                  llmJson["choices"][static_cast<std::size_t>(0)]["message"]
-                         ["content"];
+          auto llmRes =
+            client.postJson("https://api.openai.com/v1/chat/completions", payload, headers);
+          auto llmJson = iora::network::HttpClient::parseJsonOrThrow(llmRes);
+          std::string summary =
+            llmJson["choices"][static_cast<std::size_t>(0)]["message"]["content"];
 
-              // Store result in the map
-              {
-                std::lock_guard<std::mutex> lock(_resultsMutex);
-                _results[requestId] = {{"summary", summary}};
-              }
-            });
+          // Store result in the map
+          {
+            std::lock_guard<std::mutex> lock(_resultsMutex);
+            _results[requestId] = {{"summary", summary}};
+          }
+        });
 
     // /summarize endpoint queues requests (fluent)
     svc->on("/summarize")
-        .handleJson(
-            [this, svc](const iora::parsers::Json& input) -> iora::parsers::Json
-            {
-              std::string text = input["text"];
-              int maxTokens = input.contains("max_tokens")
-                                  ? input["max_tokens"].get<int>()
-                                  : 256;
-              std::string requestId =
-                  std::to_string(std::hash<std::string>{}(text));
+      .handleJson(
+        [this, svc](const iora::parsers::Json &input) -> iora::parsers::Json
+        {
+          std::string text = input["text"];
+          int maxTokens = input.contains("max_tokens") ? input["max_tokens"].get<int>() : 256;
+          std::string requestId = std::to_string(std::hash<std::string>{}(text));
 
-              // Queue the request
-              svc->pushEvent({{"eventId", "summarize"},
-                              {"requestId", requestId},
-                              {"text", text},
-                              {"max_tokens", maxTokens}});
+          // Queue the request
+          svc->pushEvent({{"eventId", "summarize"},
+                          {"requestId", requestId},
+                          {"text", text},
+                          {"max_tokens", maxTokens}});
 
-              return {{"status", "processing"}, {"requestId", requestId}};
-            });
+          return {{"status", "processing"}, {"requestId", requestId}};
+        });
 
     // /status endpoint retrieves results (fluent)
     svc->on("/status").handleJson(
-        [this](const iora::parsers::Json& input) -> iora::parsers::Json
-        {
-          std::string requestId = input["requestId"];
+      [this](const iora::parsers::Json &input) -> iora::parsers::Json
+      {
+        std::string requestId = input["requestId"];
 
-          std::lock_guard<std::mutex> lock(_resultsMutex);
-          if (_results.find(requestId) != _results.end())
-          {
-            return _results[requestId];
-          }
-          return {{"status", "pending"}};
-        });
+        std::lock_guard<std::mutex> lock(_resultsMutex);
+        if (_results.find(requestId) != _results.end())
+        {
+          return _results[requestId];
+        }
+        return {{"status", "pending"}};
+      });
 
     IORA_LOG_INFO("Microservice plugin loaded successfully");
   }

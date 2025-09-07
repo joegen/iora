@@ -1,8 +1,8 @@
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "test_helpers.hpp"
-#include <vector>
+#include <catch2/catch.hpp>
 #include <stdexcept>
+#include <vector>
 
 //
 // Basic task execution using fire-and-forget
@@ -46,11 +46,12 @@ TEST_CASE("ThreadPool scales up under load", "[threadpool][scaling]")
 
   for (int i = 0; i < tasks; ++i)
   {
-    pool.enqueue([&completed]()
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      completed.fetch_add(1);
-    });
+    pool.enqueue(
+      [&completed]()
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        completed.fetch_add(1);
+      });
   }
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -67,9 +68,7 @@ TEST_CASE("ThreadPool handles queue overflow", "[threadpool][overflow]")
   pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });
   pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });
 
-  REQUIRE_THROWS_AS(
-      pool.enqueue([]() {}),
-      std::runtime_error);
+  REQUIRE_THROWS_AS(pool.enqueue([]() {}), std::runtime_error);
 }
 
 //
@@ -79,10 +78,7 @@ TEST_CASE("ThreadPool handles exceptions without handler", "[threadpool][excepti
 {
   iora::core::ThreadPool pool;
 
-  pool.enqueue([]()
-  {
-    throw std::runtime_error("oops");
-  });
+  pool.enqueue([]() { throw std::runtime_error("oops"); });
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   SUCCEED("Exception was swallowed safely");
@@ -95,31 +91,33 @@ TEST_CASE("ThreadPool handles exceptions with handler", "[threadpool][exception-
 {
   std::atomic<bool> caught{false};
 
-  iora::core::ThreadPool pool(
-      2, 4, std::chrono::seconds(1), 128,
-      [&caught](std::exception_ptr eptr)
-      {
-        try
-        {
-          if (eptr) std::rethrow_exception(eptr);
-        }
-        catch (const std::runtime_error& e)
-        {
-          if (std::string(e.what()) == "fail") caught = true;
-        }
-      });
+  iora::core::ThreadPool pool(2, 4, std::chrono::seconds(1), 128,
+                              [&caught](std::exception_ptr eptr)
+                              {
+                                try
+                                {
+                                  if (eptr)
+                                    std::rethrow_exception(eptr);
+                                }
+                                catch (const std::runtime_error &e)
+                                {
+                                  if (std::string(e.what()) == "fail")
+                                    caught = true;
+                                }
+                              });
 
-  auto fut = pool.enqueueWithResult([]()
-  {
-    std::cerr << "[TEST] throwing now\n";
-    throw std::runtime_error("fail");
-  });
+  auto fut = pool.enqueueWithResult(
+    []()
+    {
+      std::cerr << "[TEST] throwing now\n";
+      throw std::runtime_error("fail");
+    });
 
   try
   {
     fut.get();
   }
-  catch (const std::runtime_error& e)
+  catch (const std::runtime_error &e)
   {
     if (std::string(e.what()) == "fail")
     {
@@ -129,10 +127,7 @@ TEST_CASE("ThreadPool handles exceptions with handler", "[threadpool][exception-
   REQUIRE(caught);
 
   caught = false; // Reset for next test
-  pool.enqueue([]()
-  {
-    throw std::runtime_error("fail");
-  });
+  pool.enqueue([]() { throw std::runtime_error("fail"); });
 
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (!caught && std::chrono::steady_clock::now() < deadline)
@@ -152,10 +147,7 @@ TEST_CASE("ThreadPool shrinks idle threads", "[threadpool][scaling-down]")
 
   for (int i = 0; i < 4; ++i)
   {
-    pool.enqueue([]()
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    });
+    pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(50)); });
   }
 
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -173,11 +165,12 @@ TEST_CASE("ThreadPool destruction completes pending tasks", "[threadpool][lifecy
     iora::core::ThreadPool pool(2, 4);
     for (int i = 0; i < 5; ++i)
     {
-      pool.enqueue([&completed]()
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        completed++;
-      });
+      pool.enqueue(
+        [&completed]()
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          completed++;
+        });
     }
   }
 
@@ -195,11 +188,12 @@ TEST_CASE("ThreadPool rapid enqueue and shutdown", "[threadpool][race]")
     iora::core::ThreadPool pool(4, 4);
     for (int i = 0; i < 20; ++i)
     {
-      pool.enqueue([&completed]()
-      {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        completed++;
-      });
+      pool.enqueue(
+        [&completed]()
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          completed++;
+        });
     }
     // destructor will be called immediately
   }
@@ -214,9 +208,7 @@ TEST_CASE("ThreadPool propagates exception through future", "[threadpool][future
 {
   iora::core::ThreadPool pool(2);
 
-  auto future = pool.enqueueWithResult([]() -> int {
-    throw std::runtime_error("bad future");
-  });
+  auto future = pool.enqueueWithResult([]() -> int { throw std::runtime_error("bad future"); });
 
   REQUIRE_THROWS_AS(future.get(), std::runtime_error);
 }
@@ -226,214 +218,226 @@ TEST_CASE("ThreadPool backpressure and monitoring", "[threadpool][backpressure]"
   SECTION("getPendingTaskCount works correctly")
   {
     iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1), 3);
-    
+
     REQUIRE(pool.getPendingTaskCount() == 0);
-    
+
     // Add a long-running task to occupy the single thread
     std::atomic<bool> taskStarted{false};
     std::atomic<bool> allowTaskComplete{false};
-    
-    pool.enqueue([&taskStarted, &allowTaskComplete]()
-    {
-      taskStarted = true;
-      while (!allowTaskComplete)
+
+    pool.enqueue(
+      [&taskStarted, &allowTaskComplete]()
       {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    
+        taskStarted = true;
+        while (!allowTaskComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+
     // Wait for the task to start
     while (!taskStarted)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    
+
     // Add tasks to the queue
-    pool.enqueue([]()
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    });
-    pool.enqueue([]()
-    {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    });
-    
+    pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(10)); });
+    pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(10)); });
+
     REQUIRE(pool.getPendingTaskCount() == 2);
-    
+
     // Allow tasks to complete
     allowTaskComplete = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
+
     REQUIRE(pool.getPendingTaskCount() == 0);
   }
-  
+
   SECTION("getQueueUtilization returns correct percentage")
   {
     iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1), 4); // Queue size 4
-    
+
     REQUIRE(pool.getQueueUtilization() == 0.0);
-    
+
     // Block the thread with a task that won't be in the queue (it's being executed)
     std::atomic<bool> taskStarted{false};
     std::atomic<bool> allowComplete{false};
-    pool.enqueue([&taskStarted, &allowComplete]() {
-      taskStarted = true;
-      while (!allowComplete) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    
+    pool.enqueue(
+      [&taskStarted, &allowComplete]()
+      {
+        taskStarted = true;
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+
     // Wait for the blocking task to start (so it's not in the queue)
-    while (!taskStarted) {
+    while (!taskStarted)
+    {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    
+
     // Now the queue should be empty
     REQUIRE(pool.getQueueUtilization() == 0.0);
-    
+
     // Add tasks to fill 50% of queue (2 out of 4)
     pool.enqueue([]() {});
     pool.enqueue([]() {});
-    
+
     REQUIRE(pool.getQueueUtilization() == 50.0);
-    
+
     // Fill to 100% (4 out of 4)
     pool.enqueue([]() {});
     pool.enqueue([]() {});
-    
+
     REQUIRE(pool.getQueueUtilization() == 100.0);
-    
+
     allowComplete = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  
+
   SECTION("isUnderHighLoad detects high queue utilization")
   {
     iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1), 5); // Queue size 5
-    
+
     REQUIRE_FALSE(pool.isUnderHighLoad());
-    
+
     // Block the thread
     std::atomic<bool> allowComplete{false};
-    pool.enqueue([&allowComplete]()
-    {
-      while (!allowComplete)
+    pool.enqueue(
+      [&allowComplete]()
       {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+
     // Add tasks to reach 80% (4 out of 5)
     // These tasks need to block too, otherwise they execute instantly
-    pool.enqueue([&allowComplete]() {
-      while (!allowComplete) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    pool.enqueue([&allowComplete]() {
-      while (!allowComplete) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    pool.enqueue([&allowComplete]() {
-      while (!allowComplete) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    pool.enqueue([&allowComplete]() {
-      while (!allowComplete) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    });
-    
+    pool.enqueue(
+      [&allowComplete]()
+      {
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+    pool.enqueue(
+      [&allowComplete]()
+      {
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+    pool.enqueue(
+      [&allowComplete]()
+      {
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+    pool.enqueue(
+      [&allowComplete]()
+      {
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+
     REQUIRE(pool.isUnderHighLoad());
-    
+
     allowComplete = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  
+
   SECTION("tryEnqueue provides non-blocking backpressure")
   {
     iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1), 2); // Small queue
-    
+
     // Block the single thread
     std::atomic<bool> taskStarted{false};
     std::atomic<bool> allowComplete{false};
-    REQUIRE(pool.tryEnqueue([&taskStarted, &allowComplete]()
-    {
-      taskStarted = true;
-      while (!allowComplete)
+    REQUIRE(pool.tryEnqueue(
+      [&taskStarted, &allowComplete]()
       {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-    }));
-    
+        taskStarted = true;
+        while (!allowComplete)
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      }));
+
     // Wait for the blocking task to start
     while (!taskStarted)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    
+
     // Fill the queue (2 slots)
-    REQUIRE(pool.tryEnqueue([]{}));
-    REQUIRE(pool.tryEnqueue([]{}));
-    
+    REQUIRE(pool.tryEnqueue([] {}));
+    REQUIRE(pool.tryEnqueue([] {}));
+
     // Next enqueue should fail due to backpressure
-    REQUIRE_FALSE(pool.tryEnqueue([]{}));
-    
+    REQUIRE_FALSE(pool.tryEnqueue([] {}));
+
     // Queue should be at capacity
     REQUIRE(pool.getQueueUtilization() == 100.0);
     REQUIRE(pool.getPendingTaskCount() == 2);
-    
+
     allowComplete = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
+
     // After completion, should be able to enqueue again
-    REQUIRE(pool.tryEnqueue([]{}));
+    REQUIRE(pool.tryEnqueue([] {}));
   }
-  
 
   SECTION("thread count monitoring works correctly")
   {
-    iora::core::ThreadPool pool(
-        static_cast<std::size_t>(2),                           // initialSize
-        static_cast<std::size_t>(4),                           // maxSize  
-        std::chrono::milliseconds(1000),                       // idleTimeout
-        static_cast<std::size_t>(10)                           // maxQueueSize
+    iora::core::ThreadPool pool(static_cast<std::size_t>(2),     // initialSize
+                                static_cast<std::size_t>(4),     // maxSize
+                                std::chrono::milliseconds(1000), // idleTimeout
+                                static_cast<std::size_t>(10)     // maxQueueSize
     );
-    
-    REQUIRE(pool.getTotalThreadCount() == 2); // Initial size
+
+    REQUIRE(pool.getTotalThreadCount() == 2);  // Initial size
     REQUIRE(pool.getActiveThreadCount() == 0); // No active tasks
-    
+
     // Add tasks that will cause thread pool to grow
     std::atomic<int> activeTasks{0};
     std::atomic<bool> allowComplete{false};
-    
+
     for (int i = 0; i < 4; ++i)
     {
-      pool.enqueue([&activeTasks, &allowComplete]()
-      {
-        ++activeTasks;
-        while (!allowComplete)
+      pool.enqueue(
+        [&activeTasks, &allowComplete]()
         {
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        --activeTasks;
-      });
+          ++activeTasks;
+          while (!allowComplete)
+          {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          --activeTasks;
+        });
     }
-    
+
     // Wait for tasks to start
     while (activeTasks < 4)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
+
     REQUIRE(pool.getActiveThreadCount() == 4);
     REQUIRE(pool.getTotalThreadCount() >= 4); // Should have grown
-    
+
     allowComplete = true;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
+
     REQUIRE(pool.getActiveThreadCount() == 0);
   }
 }

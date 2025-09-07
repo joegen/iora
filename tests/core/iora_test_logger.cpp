@@ -5,8 +5,8 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "test_helpers.hpp"
+#include <catch2/catch.hpp>
 
 TEST_CASE("Logger Basic Levels", "[logger][levels]")
 {
@@ -31,12 +31,11 @@ TEST_CASE("Logger Basic Levels", "[logger][levels]")
 TEST_CASE("Logger Stream Logging", "[logger][stream]")
 {
   iora::core::Logger::init(iora::core::Logger::Level::Info, "streamlog", false);
-  iora::core::Logger << iora::core::Logger::Level::Info
-                     << "Stream log test: " << 123 << iora::core::Logger::endl;
+  iora::core::Logger << iora::core::Logger::Level::Info << "Stream log test: " << 123
+                     << iora::core::Logger::endl;
   iora::core::Logger::shutdown();
 
-  std::string logFile =
-      "streamlog." + iora::core::Logger::currentDate() + ".log";
+  std::string logFile = "streamlog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
 
@@ -61,13 +60,12 @@ TEST_CASE("Logger Async Logging", "[logger][async]")
   iora::core::Logger::init(iora::core::Logger::Level::Info, "asynclog", true);
   for (int i = 0; i < 100; ++i)
   {
-    iora::core::Logger << iora::core::Logger::Level::Info << "Async message "
-                       << i << iora::core::Logger::endl;
+    iora::core::Logger << iora::core::Logger::Level::Info << "Async message " << i
+                       << iora::core::Logger::endl;
   }
   iora::core::Logger::shutdown();
 
-  std::string logFile =
-      "asynclog." + iora::core::Logger::currentDate() + ".log";
+  std::string logFile = "asynclog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
   REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >= 100);
@@ -86,28 +84,25 @@ TEST_CASE("Logger Thread Safety", "[logger][threaded]")
   for (int i = 0; i < threads; ++i)
   {
     workers.emplace_back(
-        [i]()
+      [i]()
+      {
+        for (int j = 0; j < messagesPerThread; ++j)
         {
-          for (int j = 0; j < messagesPerThread; ++j)
-          {
-            iora::core::Logger << iora::core::Logger::Level::Info << "Thread "
-                               << i << " message " << j
-                               << iora::core::Logger::endl;
-          }
-        });
+          iora::core::Logger << iora::core::Logger::Level::Info << "Thread " << i << " message "
+                             << j << iora::core::Logger::endl;
+        }
+      });
   }
-  for (auto& t : workers)
+  for (auto &t : workers)
   {
     t.join();
   }
   iora::core::Logger::shutdown();
 
-  std::string logFile =
-      "threadlog." + iora::core::Logger::currentDate() + ".log";
+  std::string logFile = "threadlog." + iora::core::Logger::currentDate() + ".log";
   std::ifstream in(logFile);
   REQUIRE(in.is_open());
-  REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >=
-          threads * messagesPerThread);
+  REQUIRE(std::count(std::istreambuf_iterator<char>(in), {}, '\n') >= threads * messagesPerThread);
   iora::util::removeFilesMatchingPrefix("threadlog.");
 }
 
@@ -116,8 +111,7 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
   const std::string base = "rotate_test";
   const int retention = 1;
 
-  iora::core::Logger::init(iora::core::Logger::Level::Info, base, false,
-                           retention);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, base, false, retention);
   IORA_LOG_INFO("Rotation start");
   iora::core::Logger::shutdown();
 
@@ -125,12 +119,10 @@ TEST_CASE("Logger File Rotation and Retention", "[logger][rotation]")
   std::ofstream fakeOld(oldFile);
   fakeOld << "old log" << std::endl;
   fakeOld.close();
-  std::filesystem::last_write_time(
-      oldFile,
-      std::filesystem::file_time_type::clock::now() - std::chrono::hours(25));
+  std::filesystem::last_write_time(oldFile, std::filesystem::file_time_type::clock::now() -
+                                              std::chrono::hours(25));
 
-  iora::core::Logger::init(iora::core::Logger::Level::Info, base, false,
-                           retention);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, base, false, retention);
   IORA_LOG_INFO("Trigger rotation");
   iora::core::Logger::shutdown();
 

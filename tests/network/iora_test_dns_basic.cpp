@@ -20,66 +20,63 @@ using namespace iora::network::dns;
 
 TEST_CASE("DNS Message Basic Functionality", "[dns][basic]")
 {
-    SECTION("DNS question construction")
-    {
-        DnsQuestion q("example.com", DnsType::A, DnsClass::IN);
-        
-        CHECK(q.qname == "example.com");
-        CHECK(q.qtype == DnsType::A);
-        CHECK(q.qclass == DnsClass::IN);
-    }
-    
-    SECTION("DNS resource record construction") 
-    {
-        DnsResourceRecord rr;
-        rr.name = "test.example.com";
-        rr.type = DnsType::A;
-        rr.cls = DnsClass::IN;
-        rr.ttl = 3600;
-        rr.rdlength = 4;
-        rr.rdata = {192, 168, 1, 1}; // 192.168.1.1
-        
-        CHECK(rr.name == "test.example.com");
-        CHECK(rr.type == DnsType::A);
-        CHECK(rr.ttl == 3600);
-        CHECK(rr.rdlength == 4);
-        CHECK(rr.rdata.size() == 4);
-    }
+  SECTION("DNS question construction")
+  {
+    DnsQuestion q("example.com", DnsType::A, DnsClass::IN);
+
+    CHECK(q.qname == "example.com");
+    CHECK(q.qtype == DnsType::A);
+    CHECK(q.qclass == DnsClass::IN);
+  }
+
+  SECTION("DNS resource record construction")
+  {
+    DnsResourceRecord rr;
+    rr.name = "test.example.com";
+    rr.type = DnsType::A;
+    rr.cls = DnsClass::IN;
+    rr.ttl = 3600;
+    rr.rdlength = 4;
+    rr.rdata = {192, 168, 1, 1}; // 192.168.1.1
+
+    CHECK(rr.name == "test.example.com");
+    CHECK(rr.type == DnsType::A);
+    CHECK(rr.ttl == 3600);
+    CHECK(rr.rdlength == 4);
+    CHECK(rr.rdata.size() == 4);
+  }
 }
 
 TEST_CASE("DNS Message Parsing", "[dns][parsing]")
 {
-    SECTION("DNS header parsing")
-    {
-        DnsHeader header;
-        header.id = 0x1234;
-        header.qr = true;    // Response
-        header.aa = true;    // Authoritative answer
-        header.qdcount = 1;
-        header.ancount = 1;
-        header.nscount = 0;
-        header.arcount = 0;
-        
-        CHECK(header.id == 0x1234);
-        CHECK(header.qr == true);
-        CHECK(header.aa == true);
-        CHECK(header.qdcount == 1);
-        CHECK(header.ancount == 1);
-    }
+  SECTION("DNS header parsing")
+  {
+    DnsHeader header;
+    header.id = 0x1234;
+    header.qr = true; // Response
+    header.aa = true; // Authoritative answer
+    header.qdcount = 1;
+    header.ancount = 1;
+    header.nscount = 0;
+    header.arcount = 0;
+
+    CHECK(header.id == 0x1234);
+    CHECK(header.qr == true);
+    CHECK(header.aa == true);
+    CHECK(header.qdcount == 1);
+    CHECK(header.ancount == 1);
+  }
 }
 
 TEST_CASE("DNS Types and Constants", "[dns][types]")
 {
-    SECTION("DNS type enumeration")
-    {
-        CHECK(static_cast<std::uint16_t>(DnsType::A) == 1);
-        CHECK(static_cast<std::uint16_t>(DnsType::AAAA) == 28);
-        CHECK(static_cast<std::uint16_t>(DnsType::SRV) == 33);
-        CHECK(static_cast<std::uint16_t>(DnsType::SOA) == 6);
-    }
-    
-    SECTION("DNS class enumeration")
-    {
-        CHECK(static_cast<std::uint16_t>(DnsClass::IN) == 1);
-    }
+  SECTION("DNS type enumeration")
+  {
+    CHECK(static_cast<std::uint16_t>(DnsType::A) == 1);
+    CHECK(static_cast<std::uint16_t>(DnsType::AAAA) == 28);
+    CHECK(static_cast<std::uint16_t>(DnsType::SRV) == 33);
+    CHECK(static_cast<std::uint16_t>(DnsType::SOA) == 6);
+  }
+
+  SECTION("DNS class enumeration") { CHECK(static_cast<std::uint16_t>(DnsClass::IN) == 1); }
 }

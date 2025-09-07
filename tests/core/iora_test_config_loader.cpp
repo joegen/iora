@@ -5,8 +5,8 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "test_helpers.hpp"
+#include <catch2/catch.hpp>
 #include <limits>
 #include <type_traits>
 
@@ -28,7 +28,7 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
   SECTION("Reload and load returns table")
   {
     REQUIRE(loader.reload());
-    const auto& tbl = loader.load();
+    const auto &tbl = loader.load();
     REQUIRE(tbl.contains("section"));
     REQUIRE(tbl.contains("other"));
   }
@@ -54,7 +54,7 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
   SECTION("table() returns the parsed table")
   {
     loader.reload();
-    const auto& tbl = loader.table();
+    const auto &tbl = loader.table();
     REQUIRE(tbl.contains("section"));
     REQUIRE(tbl.at_path("section.int_val").is_value());
   }
@@ -118,8 +118,7 @@ TEST_CASE("ConfigLoader extended functionality", "[config][ConfigLoader]")
     }
     iora::core::ConfigLoader badArrLoader(badArrFile);
     badArrLoader.reload();
-    REQUIRE_THROWS_AS(badArrLoader.getStringArray("section.mixed_array"),
-                      std::runtime_error);
+    REQUIRE_THROWS_AS(badArrLoader.getStringArray("section.mixed_array"), std::runtime_error);
     std::filesystem::remove(badArrFile);
   }
 

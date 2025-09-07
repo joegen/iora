@@ -1213,7 +1213,7 @@ protected:
   }
 
   /// \brief Registers a dependency relationship assuming the mutex is already held
-  /// \param dependent The module that depends on another module  
+  /// \param dependent The module that depends on another module
   /// \param dependency The module that the dependent module requires
   /// \note PRECONDITION: Caller must hold _loadModulesMutex
   void registerDependencyLocked(const std::string &dependent, const std::string &dependency)
@@ -1228,7 +1228,7 @@ protected:
       assert(false && "registerDependencyLocked called without holding _loadModulesMutex");
     }
 #endif
-    
+
     _dependents[dependency].push_back(dependent);
 
     // Don't use [] operator as it creates entries - use find instead
@@ -1649,7 +1649,7 @@ inline void IoraService::Plugin::require(const std::string &moduleName)
   }
 
   // Register this dependency relationship for tracking
-  // Use locked version since we're called from onLoad() which is called from loadSingleModule() 
+  // Use locked version since we're called from onLoad() which is called from loadSingleModule()
   // which already holds _loadModulesMutex
   _service->registerDependencyLocked(_name, moduleName);
 

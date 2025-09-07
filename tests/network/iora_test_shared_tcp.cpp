@@ -1,12 +1,12 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
-#include "test_helpers.hpp"
 #include "iora/network/shared_transport.hpp"
 #include "iora_test_net_utils.hpp"
-#include <vector>
-#include <map>
+#include "test_helpers.hpp"
 #include <algorithm>
+#include <map>
 #include <numeric>
+#include <vector>
 
 using namespace std::chrono_literals;
 using SharedTransport = iora::network::SharedTransport;
@@ -40,7 +40,7 @@ struct TcpFixture
   std::vector<std::string> errorMessages;
 
   std::mutex callbackMutex;
-  
+
   SessionId serverSid{0};
   SessionId clientSid{0};
   std::string lastErrMsg;
@@ -48,33 +48,40 @@ struct TcpFixture
   TcpFixture()
   {
     SharedTransport::Callbacks cbs{};
-    cbs.onAccept = [&](SessionId sid, const std::string& addr, const IoResult& res)
+    cbs.onAccept = [&](SessionId sid, const std::string &addr, const IoResult &res)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      if (res.ok) {
+      if (res.ok)
+      {
         acceptedSessions.push_back(sid);
-        if (serverSid == 0) serverSid = sid;
+        if (serverSid == 0)
+          serverSid = sid;
       }
       acceptCount++;
     };
-    cbs.onConnect = [&](SessionId sid, const IoResult& res)
+    cbs.onConnect = [&](SessionId sid, const IoResult &res)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      if (res.ok) {
+      if (res.ok)
+      {
         connectedSessions.push_back(sid);
-        if (clientSid == 0) clientSid = sid;
+        if (clientSid == 0)
+          clientSid = sid;
         connectCount++;
-      } else {
+      }
+      else
+      {
         connectFailCount++;
       }
     };
-    cbs.onData = [&](SessionId sid, const std::uint8_t* data, std::size_t n, const IoResult& res)
+    cbs.onData = [&](SessionId sid, const std::uint8_t *data, std::size_t n, const IoResult &res)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      if (res.ok) {
+      if (res.ok)
+      {
         totalBytesReceived += n;
-        sessionData[sid].append(reinterpret_cast<const char*>(data), n);
-        
+        sessionData[sid].append(reinterpret_cast<const char *>(data), n);
+
         // Echo back from server; detect echo on client
         if (sid == serverSid)
         {
@@ -83,26 +90,27 @@ struct TcpFixture
       }
       dataCount++;
     };
-    cbs.onClosed = [&](SessionId sid, const IoResult& res) 
-    { 
+    cbs.onClosed = [&](SessionId sid, const IoResult &res)
+    {
       std::lock_guard<std::mutex> lock(callbackMutex);
       closedSessions.push_back(sid);
       closeCount++;
     };
-    cbs.onError = [&](TransportError err, const std::string& msg) 
-    { 
+    cbs.onError = [&](TransportError err, const std::string &msg)
+    {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      lastErrMsg = msg; 
+      lastErrMsg = msg;
       errorMessages.push_back(msg);
       errorCount++;
     };
     tx.setCallbacks(cbs);
   }
-  
+
   void reset()
   {
     std::lock_guard<std::mutex> lock(callbackMutex);
-    acceptCount = connectCount = connectFailCount = dataCount = closeCount = errorCount = totalBytesReceived = 0;
+    acceptCount = connectCount = connectFailCount = dataCount = closeCount = errorCount =
+      totalBytesReceived = 0;
     serverSid = clientSid = 0;
     acceptedSessions.clear();
     connectedSessions.clear();
@@ -111,11 +119,12 @@ struct TcpFixture
     errorMessages.clear();
     lastErrMsg.clear();
   }
-  
+
   bool waitForCondition(std::function<bool()> condition, std::chrono::milliseconds timeout = 1000ms)
   {
     auto start = std::chrono::steady_clock::now();
-    while (!condition() && (std::chrono::steady_clock::now() - start) < timeout) {
+    while (!condition() && (std::chrono::steady_clock::now() - start) < timeout)
+    {
       std::this_thread::sleep_for(5ms);
     }
     return condition();
@@ -149,7 +158,7 @@ TEST_CASE("TCP loopback echo", "[tcp][echo]")
   REQUIRE(f.acceptedSessions.size() == 1);
   REQUIRE(f.connectedSessions.size() == 1);
 
-  const char* msg = "hello tcp";
+  const char *msg = "hello tcp";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
 
   // Wait for echo data to come back
@@ -187,7 +196,7 @@ TEST_CASE("TCP stats verification", "[tcp][stats]")
   REQUIRE(stats2.sessionsCurrent == 2); // client + server session
   REQUIRE(stats2.sessionsPeak >= 2);
 
-  const char* msg = "test stats";
+  const char *msg = "test stats";
   size_t msgLen = std::strlen(msg);
   REQUIRE(f.tx.send(cs, msg, msgLen));
 
@@ -220,47 +229,57 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
   std::vector<SessionId> clients;
 
   // Connect multiple clients
-  for (size_t i = 0; i < numClients; ++i) {
+  for (size_t i = 0; i < numClients; ++i)
+  {
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
     REQUIRE(cs != 0);
     clients.push_back(cs);
   }
 
-  REQUIRE(f.waitForCondition([&]() { 
-    return f.acceptCount >= numClients && f.connectCount >= numClients; 
-  }));
+  REQUIRE(f.waitForCondition(
+    [&]() { return f.acceptCount >= numClients && f.connectCount >= numClients; }));
 
   REQUIRE(f.acceptedSessions.size() == numClients);
   REQUIRE(f.connectedSessions.size() == numClients);
 
   // Send data from each client
-  for (size_t i = 0; i < numClients; ++i) {
+  for (size_t i = 0; i < numClients; ++i)
+  {
     std::string msg = "client " + std::to_string(i);
     REQUIRE(f.tx.send(clients[i], msg.c_str(), msg.size()));
   }
 
   // Wait for all echoes with extended timeout for multiple connections
-  bool allEchoed = f.waitForCondition([&]() {
-    size_t clientsWithData = 0;
-    for (auto client : clients) {
-      if (f.sessionData[client].size() > 0) clientsWithData++;
-    }
-    return clientsWithData == numClients;
-  });
-  
+  bool allEchoed = f.waitForCondition(
+    [&]()
+    {
+      size_t clientsWithData = 0;
+      for (auto client : clients)
+      {
+        if (f.sessionData[client].size() > 0)
+          clientsWithData++;
+      }
+      return clientsWithData == numClients;
+    });
+
   // If not all echoes received immediately, allow more time for concurrent operations
-  if (!allEchoed) {
+  if (!allEchoed)
+  {
     std::this_thread::sleep_for(300ms);
     size_t clientsWithData = 0;
-    for (auto client : clients) {
-      if (f.sessionData[client].size() > 0) clientsWithData++;
+    for (auto client : clients)
+    {
+      if (f.sessionData[client].size() > 0)
+        clientsWithData++;
     }
     REQUIRE(clientsWithData >= 1); // At least one client should succeed in concurrent scenario
   }
 
   // Verify clients that received data got the correct echo
-  for (size_t i = 0; i < numClients; ++i) {
-    if (f.sessionData[clients[i]].size() > 0) {
+  for (size_t i = 0; i < numClients; ++i)
+  {
+    if (f.sessionData[clients[i]].size() > 0)
+    {
       std::string expected = "client " + std::to_string(i);
       REQUIRE(f.sessionData[clients[i]] == expected);
     }
@@ -306,13 +325,12 @@ TEST_CASE("TCP large data transfer", "[tcp][largedata]")
 
   REQUIRE(f.tx.send(cs, largeData.data(), largeData.size()));
 
-  REQUIRE(f.waitForCondition([&]() { 
-    return f.sessionData[cs].size() == dataSize; 
-  }, 5000ms));
+  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() == dataSize; }, 5000ms));
 
   // Verify data integrity
   REQUIRE(f.sessionData[cs].size() == dataSize);
-  for (size_t i = 0; i < dataSize; ++i) {
+  for (size_t i = 0; i < dataSize; ++i)
+  {
     REQUIRE(static_cast<uint8_t>(f.sessionData[cs][i]) == static_cast<uint8_t>(i));
   }
 
@@ -337,12 +355,11 @@ TEST_CASE("TCP binary data handling", "[tcp][binary]")
   std::vector<uint8_t> binaryData = {0x00, 0x01, 0xFF, 0x7F, 0x80, 0xAB, 0xCD, 0xEF};
   REQUIRE(f.tx.send(cs, binaryData.data(), binaryData.size()));
 
-  REQUIRE(f.waitForCondition([&]() { 
-    return f.sessionData[cs].size() == binaryData.size(); 
-  }));
+  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() == binaryData.size(); }));
 
   // Verify binary data integrity
-  for (size_t i = 0; i < binaryData.size(); ++i) {
+  for (size_t i = 0; i < binaryData.size(); ++i)
+  {
     REQUIRE(static_cast<uint8_t>(f.sessionData[cs][i]) == binaryData[i]);
   }
 
@@ -416,17 +433,17 @@ TEST_CASE("TCP listener management", "[tcp][listeners]")
 {
   TcpFixture f;
   REQUIRE(f.tx.start());
-  
+
   auto port1 = testnet::getFreePortTCP();
   auto port2 = testnet::getFreePortTCP();
 
   // Add multiple listeners
   ListenerId lid1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
   REQUIRE(lid1 != 0);
-  
+
   ListenerId lid2 = f.tx.addListener("127.0.0.1", port2, TlsMode::None);
   REQUIRE(lid2 != 0);
-  
+
   REQUIRE(lid1 != lid2);
 
   // Connect to both listeners
@@ -439,18 +456,18 @@ TEST_CASE("TCP listener management", "[tcp][listeners]")
 
   // Note: removeListener API not available, skip this test part
   // REQUIRE(f.tx.removeListener(lid1));
-  
+
   // Existing connections should still work
   REQUIRE(f.tx.send(cs1, "test1", 5));
   REQUIRE(f.tx.send(cs2, "test2", 5));
 
   // Wait for data with some tolerance for connection timing
-  bool dataReceived = f.waitForCondition([&]() {
-    return f.sessionData[cs1].size() > 0 && f.sessionData[cs2].size() > 0;
-  });
-  
+  bool dataReceived = f.waitForCondition(
+    [&]() { return f.sessionData[cs1].size() > 0 && f.sessionData[cs2].size() > 0; });
+
   // If immediate data transfer fails, allow for connection setup timing
-  if (!dataReceived) {
+  if (!dataReceived)
+  {
     std::this_thread::sleep_for(200ms);
     dataReceived = f.sessionData[cs1].size() > 0 && f.sessionData[cs2].size() > 0;
   }
@@ -474,7 +491,7 @@ TEST_CASE("TCP empty data send", "[tcp][emptydata]")
 
   // Send empty data
   REQUIRE(f.tx.send(cs, nullptr, 0));
-  
+
   std::this_thread::sleep_for(100ms); // Give it time to process
 
   f.tx.stop();
@@ -494,15 +511,14 @@ TEST_CASE("TCP session ID uniqueness", "[tcp][sessionids]")
   std::vector<SessionId> serverIds;
 
   // Create multiple connections
-  for (size_t i = 0; i < numConnections; ++i) {
+  for (size_t i = 0; i < numConnections; ++i)
+  {
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
     REQUIRE(cs != 0);
     clientIds.push_back(cs);
   }
 
-  REQUIRE(f.waitForCondition([&]() { 
-    return f.acceptedSessions.size() >= numConnections; 
-  }));
+  REQUIRE(f.waitForCondition([&]() { return f.acceptedSessions.size() >= numConnections; }));
 
   serverIds = f.acceptedSessions;
 
@@ -532,16 +548,16 @@ TEST_CASE("TCP high frequency small messages", "[tcp][highfreq]")
   size_t totalExpectedBytes = 0;
 
   // Send many small messages rapidly
-  for (size_t i = 0; i < numMessages; ++i) {
+  for (size_t i = 0; i < numMessages; ++i)
+  {
     std::string msg = "msg" + std::to_string(i);
     totalExpectedBytes += msg.size();
     REQUIRE(f.tx.send(cs, msg.c_str(), msg.size()));
   }
 
   // Wait for all data to be echoed back
-  REQUIRE(f.waitForCondition([&]() { 
-    return f.sessionData[cs].size() == totalExpectedBytes; 
-  }, 3000ms));
+  REQUIRE(
+    f.waitForCondition([&]() { return f.sessionData[cs].size() == totalExpectedBytes; }, 3000ms));
 
   // Verify we received all the data
   REQUIRE(f.sessionData[cs].size() == totalExpectedBytes);
@@ -559,7 +575,7 @@ TEST_CASE("TCP duplicate listener error handling", "[tcp][duplicatelistener]")
   REQUIRE(lid1 != 0);
 
   ListenerId lid2 = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid2 != 0);  // API might return valid ID, but binding should fail
+  REQUIRE(lid2 != 0); // API might return valid ID, but binding should fail
 
   // Give time for async bind failures to surface
   std::this_thread::sleep_for(100ms);

@@ -5,17 +5,17 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "iora/parsers/json.hpp"
+#include <atomic>
+#include <catch2/catch.hpp>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <mutex>
 #include <random>
 #include <string>
-#include <vector>
-#include <limits>
-#include <cmath>
-#include <chrono>
 #include <thread>
-#include <atomic>
-#include <mutex>
+#include <vector>
 
 using namespace iora::parsers;
 
@@ -23,7 +23,7 @@ namespace
 {
 
 /// \brief Generate random strings for fuzzing
-std::string generateRandomString(std::mt19937& rng, size_t maxLength = 100)
+std::string generateRandomString(std::mt19937 &rng, size_t maxLength = 100)
 {
   std::uniform_int_distribution<size_t> lengthDist(0, maxLength);
   std::uniform_int_distribution<char> charDist(32, 126); // Printable ASCII
@@ -40,25 +40,25 @@ std::string generateRandomString(std::mt19937& rng, size_t maxLength = 100)
 }
 
 /// \brief Generate random JSON-like strings with varying validity
-std::string generateRandomJsonLike(std::mt19937& rng)
+std::string generateRandomJsonLike(std::mt19937 &rng)
 {
   std::vector<std::string> templates = {
-      R"({"key": "value"})",
-      R"([1, 2, 3])",
-      R"({"nested": {"key": [1, 2, 3]}})",
-      R"(null)",
-      R"(true)",
-      R"(false)",
-      R"(123)",
-      R"(-456.789)",
-      R"("string")",
-      R"({"malformed": })",   // Invalid
-      R"([1, 2, 3,])",        // Invalid trailing comma
-      R"({"key": value})",    // Unquoted value
-      R"({key: "value"})",    // Unquoted key
-      R"({"key": "value")",   // Missing closing brace
-      R"({"key": "value"}})", // Extra closing brace
-      ""                      // Empty string
+    R"({"key": "value"})",
+    R"([1, 2, 3])",
+    R"({"nested": {"key": [1, 2, 3]}})",
+    R"(null)",
+    R"(true)",
+    R"(false)",
+    R"(123)",
+    R"(-456.789)",
+    R"("string")",
+    R"({"malformed": })",   // Invalid
+    R"([1, 2, 3,])",        // Invalid trailing comma
+    R"({"key": value})",    // Unquoted value
+    R"({key: "value"})",    // Unquoted key
+    R"({"key": "value")",   // Missing closing brace
+    R"({"key": "value"}})", // Extra closing brace
+    ""                      // Empty string
   };
 
   std::uniform_int_distribution<size_t> dist(0, templates.size() - 1);
@@ -216,7 +216,7 @@ TEST_CASE("JSON Parser - Object Operations", "[json][objects]")
     obj["c"] = 3;
 
     size_t count = 0;
-    for (const auto& [key, value] : obj.items())
+    for (const auto &[key, value] : obj.items())
     {
       REQUIRE(obj.contains(key));
       count++;
@@ -274,7 +274,7 @@ TEST_CASE("JSON Parser - Array Operations", "[json][arrays]")
     }
 
     size_t index = 0;
-    for (const auto& item : arr)
+    for (const auto &item : arr)
     {
       REQUIRE(item.get<int>() == static_cast<int>(index));
       index++;
@@ -343,30 +343,29 @@ TEST_CASE("JSON Parser - String Parsing", "[json][parsing]")
       REQUIRE(nested["array"].is_array());
       REQUIRE(nested["array"].size() == 3);
       REQUIRE(nested["object"]["nested"].get<bool>() == true);
-      REQUIRE(nested["mixed"][static_cast<std::size_t>(0)]["a"].get<int>() ==
-              1);
+      REQUIRE(nested["mixed"][static_cast<std::size_t>(0)]["a"].get<int>() == 1);
     }
   }
 
   SECTION("Invalid JSON parsing")
   {
     std::vector<std::string> invalidJson = {
-        "",                    // Empty
-        "{",                   // Incomplete object
-        "}",                   // Unexpected closing
-        "[1, 2, 3,]",          // Trailing comma
-        R"({"key": })",        // Missing value
-        R"({key: "value"})",   // Unquoted key
-        R"({"key": value})",   // Unquoted value
-        "undefined",           // Invalid literal
-        "NaN",                 // Invalid number
-        "Infinity",            // Invalid number
-        R"("unclosed string)", // Unclosed string
-        "[1, 2, 3}",           // Mismatched brackets
-        "{1, 2, 3]"            // Mismatched brackets
+      "",                    // Empty
+      "{",                   // Incomplete object
+      "}",                   // Unexpected closing
+      "[1, 2, 3,]",          // Trailing comma
+      R"({"key": })",        // Missing value
+      R"({key: "value"})",   // Unquoted key
+      R"({"key": value})",   // Unquoted value
+      "undefined",           // Invalid literal
+      "NaN",                 // Invalid number
+      "Infinity",            // Invalid number
+      R"("unclosed string)", // Unclosed string
+      "[1, 2, 3}",           // Mismatched brackets
+      "{1, 2, 3]"            // Mismatched brackets
     };
 
-    for (const auto& invalid : invalidJson)
+    for (const auto &invalid : invalidJson)
     {
       REQUIRE_THROWS_AS(Json::parseString(invalid), std::exception);
     }
@@ -417,20 +416,19 @@ TEST_CASE("JSON Parser - Serialization", "[json][serialization]")
 
   SECTION("Round-trip consistency")
   {
-    std::vector<std::string> testCases = {
-        R"(null)",
-        R"(true)",
-        R"(false)",
-        R"(42)",
-        R"(-123.456)",
-        R"("string with spaces")",
-        R"([])",
-        R"({})",
-        R"([1, 2, 3])",
-        R"({"a": 1, "b": 2})",
-        R"({"nested": {"array": [1, 2, {"deep": true}]}})"};
+    std::vector<std::string> testCases = {R"(null)",
+                                          R"(true)",
+                                          R"(false)",
+                                          R"(42)",
+                                          R"(-123.456)",
+                                          R"("string with spaces")",
+                                          R"([])",
+                                          R"({})",
+                                          R"([1, 2, 3])",
+                                          R"({"a": 1, "b": 2})",
+                                          R"({"nested": {"array": [1, 2, {"deep": true}]}})"};
 
-    for (const auto& testCase : testCases)
+    for (const auto &testCase : testCases)
     {
       auto parsed = Json::parseString(testCase);
       auto serialized = parsed.dump();
@@ -441,7 +439,7 @@ TEST_CASE("JSON Parser - Serialization", "[json][serialization]")
       if (parsed.is_object() && reparsed.is_object())
       {
         REQUIRE(parsed.size() == reparsed.size());
-        for (const auto& [key, value] : parsed.items())
+        for (const auto &[key, value] : parsed.items())
         {
           REQUIRE(reparsed.contains(key));
           REQUIRE(reparsed[key].dump() == value.dump());
@@ -456,8 +454,7 @@ TEST_CASE("JSON Parser - Serialization", "[json][serialization]")
   }
 }
 
-TEST_CASE("JSON Parser - Type Conversions and Edge Cases",
-          "[json][conversions]")
+TEST_CASE("JSON Parser - Type Conversions and Edge Cases", "[json][conversions]")
 {
   SECTION("Number precision")
   {
@@ -478,8 +475,7 @@ TEST_CASE("JSON Parser - Type Conversions and Edge Cases",
     std::string serialized = escaped.dump();
     auto parsed = Json::parseString(serialized);
 
-    REQUIRE(parsed.get<std::string>() ==
-            "Line 1\nLine 2\tTab\r\nQuote: \"Hello\"");
+    REQUIRE(parsed.get<std::string>() == "Line 1\nLine 2\tTab\r\nQuote: \"Hello\"");
   }
 
   SECTION("Unicode handling")
@@ -524,8 +520,7 @@ TEST_CASE("JSON Parser - Performance and Memory", "[json][performance]")
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
     REQUIRE(largeObj.size() == 10000);
     REQUIRE(duration.count() < 1000); // Should complete in less than 1 second
@@ -544,8 +539,7 @@ TEST_CASE("JSON Parser - Performance and Memory", "[json][performance]")
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
     REQUIRE(largeArr.size() == 100000);
     REQUIRE(duration.count() < 1000); // Should complete in less than 1 second
@@ -554,7 +548,7 @@ TEST_CASE("JSON Parser - Performance and Memory", "[json][performance]")
   SECTION("Deep nesting")
   {
     Json root = Json::object();
-    Json* current = &root;
+    Json *current = &root;
 
     // Create nested structure 100 levels deep
     for (int i = 0; i < 100; ++i)
@@ -587,7 +581,7 @@ TEST_CASE("JSON Parser - Fuzzing Tests", "[json][fuzzing]")
       {
         Json::parseString(randomStr);
       }
-      catch (const std::exception&)
+      catch (const std::exception &)
       {
         // Expected for invalid JSON
       }
@@ -607,7 +601,7 @@ TEST_CASE("JSON Parser - Fuzzing Tests", "[json][fuzzing]")
         // If parsing succeeded, serialization should work
         REQUIRE_NOTHROW(parsed.dump());
       }
-      catch (const std::exception&)
+      catch (const std::exception &)
       {
         // Expected for invalid JSON
       }
@@ -617,22 +611,22 @@ TEST_CASE("JSON Parser - Fuzzing Tests", "[json][fuzzing]")
   SECTION("Boundary value fuzzing")
   {
     std::vector<std::string> boundaryTests = {
-        std::string(1000000, 'a'),                       // Very long string
-        "\"" + std::string(100000, 'x') + "\"",          // Long JSON string
-        "[" + std::string(10000, '1') + "]",             // Malformed long array
-        "{" + std::string(10000, ' ') + "}",             // Whitespace object
-        std::string(1000, '[') + std::string(1000, ']'), // Deep nesting
-        "null" + std::string(100000, ' '),               // Trailing whitespace
-        std::string(100000, ' ') + "null"                // Leading whitespace
+      std::string(1000000, 'a'),                       // Very long string
+      "\"" + std::string(100000, 'x') + "\"",          // Long JSON string
+      "[" + std::string(10000, '1') + "]",             // Malformed long array
+      "{" + std::string(10000, ' ') + "}",             // Whitespace object
+      std::string(1000, '[') + std::string(1000, ']'), // Deep nesting
+      "null" + std::string(100000, ' '),               // Trailing whitespace
+      std::string(100000, ' ') + "null"                // Leading whitespace
     };
 
-    for (const auto& test : boundaryTests)
+    for (const auto &test : boundaryTests)
     {
       try
       {
         Json::parseString(test);
       }
-      catch (const std::exception&)
+      catch (const std::exception &)
       {
         // Expected for malformed JSON
       }
@@ -653,27 +647,27 @@ TEST_CASE("JSON Parser - Thread Safety", "[json][threading]")
     for (int i = 0; i < 10; ++i)
     {
       threads.emplace_back(
-          [&, i]()
+        [&, i]()
+        {
+          try
           {
-            try
+            for (int j = 0; j < 100; ++j)
             {
-              for (int j = 0; j < 100; ++j)
+              auto parsed = Json::parseString(validJson);
+              if (parsed["thread"].get<std::string>() == "test")
               {
-                auto parsed = Json::parseString(validJson);
-                if (parsed["thread"].get<std::string>() == "test")
-                {
-                  successCount++;
-                }
+                successCount++;
               }
             }
-            catch (...)
-            {
-              failureCount++;
-            }
-          });
+          }
+          catch (...)
+          {
+            failureCount++;
+          }
+        });
     }
 
-    for (auto& thread : threads)
+    for (auto &thread : threads)
     {
       thread.join();
     }
@@ -691,18 +685,17 @@ TEST_CASE("JSON Parser - Thread Safety", "[json][threading]")
     for (int i = 0; i < 5; ++i)
     {
       threads.emplace_back(
-          [&, i]()
+        [&, i]()
+        {
+          for (int j = 0; j < 100; ++j)
           {
-            for (int j = 0; j < 100; ++j)
-            {
-              std::lock_guard<std::mutex> lock(objMutex);
-              sharedObj["thread_" + std::to_string(i) + "_" +
-                        std::to_string(j)] = i * 100 + j;
-            }
-          });
+            std::lock_guard<std::mutex> lock(objMutex);
+            sharedObj["thread_" + std::to_string(i) + "_" + std::to_string(j)] = i * 100 + j;
+          }
+        });
     }
 
-    for (auto& thread : threads)
+    for (auto &thread : threads)
     {
       thread.join();
     }
@@ -716,21 +709,21 @@ TEST_CASE("JSON Parser - Error Recovery", "[json][errors]")
   SECTION("Graceful error handling")
   {
     std::vector<std::pair<std::string, std::string>> errorCases = {
-        {"", "Empty JSON"},
-        {"{", "Incomplete object"},
-        {"[1,2,", "Incomplete array"},
-        {R"({"key": undefined})", "Invalid value"},
-        {"1.2.3", "Invalid number"},
-        {R"("unclosed)", "Unclosed string"}};
+      {"", "Empty JSON"},
+      {"{", "Incomplete object"},
+      {"[1,2,", "Incomplete array"},
+      {R"({"key": undefined})", "Invalid value"},
+      {"1.2.3", "Invalid number"},
+      {R"("unclosed)", "Unclosed string"}};
 
-    for (const auto& [input, description] : errorCases)
+    for (const auto &[input, description] : errorCases)
     {
       bool threwException = false;
       try
       {
         Json::parseString(input);
       }
-      catch (const std::exception& e)
+      catch (const std::exception &e)
       {
         threwException = true;
         // Error message should be meaningful

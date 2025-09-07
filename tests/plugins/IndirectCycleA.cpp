@@ -5,27 +5,20 @@
 class IndirectCycleA : public iora::IoraService::Plugin
 {
 public:
-  explicit IndirectCycleA(iora::IoraService* svc)
-    : Plugin(svc)
-  {
-  }
+  explicit IndirectCycleA(iora::IoraService *svc) : Plugin(svc) {}
 
-  void onLoad(iora::IoraService* svc) override
+  void onLoad(iora::IoraService *svc) override
   {
     // A depends on B (start of A→B→C→A chain)
-    require("indirectcycleb.so");  
+    require("indirectcycleb.so");
 
     svc->exportApi(*this, "indirectcyclea.getValue",
-      [this]() -> std::string
-      { 
-        return "IndirectCycleA loaded";
-      }
-    );
+                   [this]() -> std::string { return "IndirectCycleA loaded"; });
   }
 
   void onUnload() override {}
-  void onDependencyLoaded(const std::string& moduleName) override {}
-  void onDependencyUnloaded(const std::string& moduleName) override {}
+  void onDependencyLoaded(const std::string &moduleName) override {}
+  void onDependencyUnloaded(const std::string &moduleName) override {}
 };
 
 IORA_DECLARE_PLUGIN(IndirectCycleA)

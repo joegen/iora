@@ -1,6 +1,6 @@
 #define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
 #include "test_helpers.hpp"
+#include <catch2/catch.hpp>
 
 TEST_CASE("JsonFileStore basic operations", "[state][JsonFileStore]")
 {
@@ -84,7 +84,7 @@ TEST_CASE("ConcreteStateStore basic operations", "[state][ConcreteStateStore]")
     store.set("apple", "fruit");
     store.set("banana", "fruit");
     store.set("carrot", "vegetable");
-    auto matcher = [](const std::string& k) { return k.find('a') != std::string::npos; };
+    auto matcher = [](const std::string &k) { return k.find('a') != std::string::npos; };
     auto matched = store.findKeysMatching(matcher);
     REQUIRE(matched.size() >= 2);
     REQUIRE(std::find(matched.begin(), matched.end(), "banana") != matched.end());

@@ -6,12 +6,12 @@
 
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
-#include "test_helpers.hpp"
-#include "iora/network/transport_with_batching.hpp"
 #include "iora/network/event_batch_processor.hpp"
+#include "iora/network/transport_with_batching.hpp"
 #include "iora_test_net_utils.hpp"
-#include <thread>
+#include "test_helpers.hpp"
 #include <chrono>
+#include <thread>
 
 using namespace std::chrono_literals;
 using namespace iora::network;
@@ -46,8 +46,7 @@ private:
   uint32_t lastEvents_{0};
 };
 
-TEST_CASE("BatchingTransportWrapper basic functionality",
-          "[batch][integration][basic]")
+TEST_CASE("BatchingTransportWrapper basic functionality", "[batch][integration][basic]")
 {
   BatchProcessingConfig config;
   config.maxBatchSize = 8;
@@ -58,7 +57,7 @@ TEST_CASE("BatchingTransportWrapper basic functionality",
 
   SECTION("Wrapper forwards to base transport")
   {
-    auto& base = wrapper.getBase();
+    auto &base = wrapper.getBase();
     base.processEvent(100, EPOLLIN);
 
     REQUIRE(base.getEventsProcessed() == 1);
@@ -82,8 +81,7 @@ TEST_CASE("BatchingTransportWrapper basic functionality",
   }
 }
 
-TEST_CASE("BatchingTransportWrapper configuration helpers",
-          "[batch][integration][config]")
+TEST_CASE("BatchingTransportWrapper configuration helpers", "[batch][integration][config]")
 {
   SECTION("Server configuration is optimized for throughput")
   {
@@ -129,8 +127,7 @@ TEST_CASE("BatchingTransportWrapper configuration helpers",
   }
 }
 
-TEST_CASE("BatchingTransportWrapper event processing",
-          "[batch][integration][events]")
+TEST_CASE("BatchingTransportWrapper event processing", "[batch][integration][events]")
 {
   EpollHelper epoll;
   EventFdHelper eventFd, timerFd, sessionFd;
@@ -156,8 +153,7 @@ TEST_CASE("BatchingTransportWrapper event processing",
 
     auto onTimerFd = [&timerFdTriggered]() { timerFdTriggered = true; };
 
-    auto sessionHandler =
-        [&sessionEventsProcessed](int /*fd*/, uint32_t /*events*/)
+    auto sessionHandler = [&sessionEventsProcessed](int /*fd*/, uint32_t /*events*/)
     { sessionEventsProcessed++; };
 
     // Signal all FDs
@@ -167,19 +163,18 @@ TEST_CASE("BatchingTransportWrapper event processing",
 
     // Run one batch processing iteration with timeout
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            wrapper.runTransportEventLoop(epoll.fd(), eventFd.fd(),
-                                          timerFd.fd(), onEventFd, onTimerFd,
-                                          sessionHandler);
-          }
-          catch (...)
-          {
-            // Timeout or other errors expected
-          }
-        });
+          wrapper.runTransportEventLoop(epoll.fd(), eventFd.fd(), timerFd.fd(), onEventFd,
+                                        onTimerFd, sessionHandler);
+        }
+        catch (...)
+        {
+          // Timeout or other errors expected
+        }
+      });
 
     processor_thread.join();
 
@@ -193,8 +188,7 @@ TEST_CASE("BatchingTransportWrapper event processing",
   }
 }
 
-TEST_CASE("BatchingTransportWrapper statistics and monitoring",
-          "[batch][integration][stats]")
+TEST_CASE("BatchingTransportWrapper statistics and monitoring", "[batch][integration][stats]")
 {
   BatchingTransportWrapper<MockTransport> wrapper(createBalancedConfig());
 
@@ -225,21 +219,17 @@ TEST_CASE("BatchingTransportWrapper statistics and monitoring",
 class MetricsTrackingWrapper : public BatchingTransportWrapper<MockTransport>
 {
 public:
-  explicit MetricsTrackingWrapper(const BatchProcessingConfig& config)
-    : BatchingTransportWrapper<MockTransport>(config)
+  explicit MetricsTrackingWrapper(const BatchProcessingConfig &config)
+      : BatchingTransportWrapper<MockTransport>(config)
   {
   }
 
   int getBatchesProcessed() const { return batchesProcessed_; }
-  std::chrono::microseconds getTotalProcessingTime() const
-  {
-    return totalProcessingTime_;
-  }
+  std::chrono::microseconds getTotalProcessingTime() const { return totalProcessingTime_; }
   std::size_t getMaxBatchSize() const { return maxBatchSize_; }
 
 protected:
-  void onBatchProcessed(std::size_t batchSize,
-                        std::chrono::microseconds processingTime) override
+  void onBatchProcessed(std::size_t batchSize, std::chrono::microseconds processingTime) override
   {
     batchesProcessed_++;
     totalProcessingTime_ += processingTime;
@@ -269,8 +259,7 @@ TEST_CASE("Custom batch processing metrics", "[batch][integration][metrics]")
   }
 }
 
-TEST_CASE("BatchingTransportWrapper error handling",
-          "[batch][integration][error]")
+TEST_CASE("BatchingTransportWrapper error handling", "[batch][integration][error]")
 {
   BatchingTransportWrapper<MockTransport> wrapper(createBalancedConfig());
 
@@ -281,14 +270,12 @@ TEST_CASE("BatchingTransportWrapper error handling",
     auto onTimerFd = []() {};
 
     // Should handle invalid epoll FD gracefully by throwing
-    REQUIRE_THROWS_AS(wrapper.runTransportEventLoop(-1, 1, 2, onEventFd,
-                                                    onTimerFd, sessionHandler),
+    REQUIRE_THROWS_AS(wrapper.runTransportEventLoop(-1, 1, 2, onEventFd, onTimerFd, sessionHandler),
                       std::system_error);
   }
 }
 
-TEST_CASE("Performance comparison with and without batching",
-          "[batch][integration][performance]")
+TEST_CASE("Performance comparison with and without batching", "[batch][integration][performance]")
 {
   // This test demonstrates the potential benefits of batch processing
   EpollHelper epoll;
@@ -321,7 +308,7 @@ TEST_CASE("Performance comparison with and without batching",
     };
 
     // Signal all event FDs
-    for (auto& eventFd : eventFds)
+    for (auto &eventFd : eventFds)
     {
       eventFd->signal();
     }
@@ -329,25 +316,24 @@ TEST_CASE("Performance comparison with and without batching",
     auto start = std::chrono::high_resolution_clock::now();
 
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            wrapper.runTransportEventLoop(
-                epoll.fd(), -1, -1, // No special FDs
-                []() {}, []() {}, sessionHandler);
-          }
-          catch (...)
-          {
-            // Handle timeouts gracefully
-          }
-        });
+          wrapper.runTransportEventLoop(
+            epoll.fd(), -1, -1, // No special FDs
+            []() {}, []() {}, sessionHandler);
+        }
+        catch (...)
+        {
+          // Handle timeouts gracefully
+        }
+      });
 
     processor_thread.join();
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
     auto stats = wrapper.getBatchingStats();
 
@@ -362,8 +348,7 @@ TEST_CASE("Performance comparison with and without batching",
       // Verify some efficiency gained from batching
       if (stats.totalEvents == numEvents)
       {
-        double eventsPerBatch =
-            static_cast<double>(stats.totalEvents) / stats.totalBatches;
+        double eventsPerBatch = static_cast<double>(stats.totalEvents) / stats.totalBatches;
         REQUIRE(eventsPerBatch >= 1.0); // At least one event per batch
       }
     }

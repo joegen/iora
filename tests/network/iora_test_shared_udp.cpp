@@ -1,9 +1,8 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
-#include "test_helpers.hpp"
 #include "iora/network/shared_transport_udp.hpp"
 #include "iora_test_net_utils.hpp"
-
+#include "test_helpers.hpp"
 
 using namespace std::chrono_literals;
 using SharedUdpTransport = iora::network::SharedUdpTransport;
@@ -43,7 +42,7 @@ struct UdpFixture
   UdpFixture()
   {
     SharedUdpTransport::Callbacks cbs{};
-    cbs.onAccept = [&](SessionId sid, const std::string&, const IoResult& res)
+    cbs.onAccept = [&](SessionId sid, const std::string &, const IoResult &res)
     {
       REQUIRE(res.ok);
       serverSid = sid;
@@ -51,7 +50,7 @@ struct UdpFixture
       acceptCount++;
       acceptedSessions.push_back(sid);
     };
-    cbs.onConnect = [&](SessionId sid, const IoResult& res)
+    cbs.onConnect = [&](SessionId sid, const IoResult &res)
     {
       if (res.ok)
       {
@@ -61,46 +60,49 @@ struct UdpFixture
         connectedSessions.push_back(sid);
       }
     };
-    cbs.onData = [&](SessionId sid, const std::uint8_t* data, std::size_t n, const IoResult& res)
+    cbs.onData = [&](SessionId sid, const std::uint8_t *data, std::size_t n, const IoResult &res)
     {
       REQUIRE(res.ok);
       dataCount++;
       // Echo on server; detect on client
-      if (std::find(acceptedSessions.begin(), acceptedSessions.end(), sid) != acceptedSessions.end())
+      if (std::find(acceptedSessions.begin(), acceptedSessions.end(), sid) !=
+          acceptedSessions.end())
       {
         REQUIRE(tx.send(sid, data, n));
       }
       if (sid == clientSid)
       {
         clientGotEcho = true;
-        lastData = std::string(reinterpret_cast<const char*>(data), n);
+        lastData = std::string(reinterpret_cast<const char *>(data), n);
       }
       {
         std::lock_guard<std::mutex> lock(dataMutex);
-        receivedData.push_back(std::string(reinterpret_cast<const char*>(data), n));
+        receivedData.push_back(std::string(reinterpret_cast<const char *>(data), n));
       }
     };
-    cbs.onClosed = [&](SessionId, const IoResult&) { 
-      anyClosed = true; 
+    cbs.onClosed = [&](SessionId, const IoResult &)
+    {
+      anyClosed = true;
       closeCount++;
     };
-    cbs.onError = [&](TransportError, const std::string& msg) { 
-      lastErrMsg = msg; 
-      errored = true; 
+    cbs.onError = [&](TransportError, const std::string &msg)
+    {
+      lastErrMsg = msg;
+      errored = true;
     };
     tx.setCallbacks(cbs);
   }
 
-  bool waitFor(const std::atomic<bool>& flag, int ms = 1000)
+  bool waitFor(const std::atomic<bool> &flag, int ms = 1000)
   {
-    for (int i = 0; i < ms/5 && !flag.load(); ++i) 
+    for (int i = 0; i < ms / 5 && !flag.load(); ++i)
       std::this_thread::sleep_for(5ms);
     return flag.load();
   }
 
-  bool waitForCount(const std::atomic<int>& counter, int expected, int ms = 1000)
+  bool waitForCount(const std::atomic<int> &counter, int expected, int ms = 1000)
   {
-    for (int i = 0; i < ms/5 && counter.load() < expected; ++i) 
+    for (int i = 0; i < ms / 5 && counter.load() < expected; ++i)
       std::this_thread::sleep_for(5ms);
     return counter.load() >= expected;
   }
@@ -131,7 +133,7 @@ TEST_CASE("UDP loopback echo", "[udp][echo]")
   // In UDP, connected should be immediate, but accepted only happens after first data
   REQUIRE(f.waitFor(f.connected));
 
-  const char* msg = "hello udp";
+  const char *msg = "hello udp";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
 
   // Now wait for both acceptance (from first data) and echo response
@@ -155,7 +157,7 @@ TEST_CASE("UDP rejects TLS mode", "[udp][config]")
   // Should return 0 and error-callback for TLS attempt
   ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::Server);
   REQUIRE(lid == 0);
-  
+
   f.tx.stop();
 }
 
@@ -169,7 +171,7 @@ TEST_CASE("UDP duplicate listener error", "[udp][error]")
   REQUIRE(a != 0);
 
   ListenerId b = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(b != 0);  // Returns a valid ID, but bind will fail async
+  REQUIRE(b != 0); // Returns a valid ID, but bind will fail async
 
   // Give time for async bind error
   std::this_thread::sleep_for(100ms);
@@ -192,21 +194,21 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  
+
   REQUIRE(f.waitFor(f.connected));
-  
-  const char* msg = "test message";
+
+  const char *msg = "test message";
   size_t msgLen = std::strlen(msg);
   REQUIRE(f.tx.send(cs, msg, msgLen));
-  
+
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
 
   auto stats2 = f.tx.stats();
   REQUIRE(stats2.connected == 1);
   REQUIRE(stats2.accepted == 1);
-  REQUIRE(stats2.bytesIn >= msgLen);  // At least the original message
-  REQUIRE(stats2.bytesOut >= msgLen); // At least the echo
+  REQUIRE(stats2.bytesIn >= msgLen);    // At least the original message
+  REQUIRE(stats2.bytesOut >= msgLen);   // At least the echo
   REQUIRE(stats2.sessionsCurrent == 2); // Client and server peer
   REQUIRE(stats2.sessionsPeak >= 2);
 
@@ -232,7 +234,7 @@ TEST_CASE("UDP multiple simultaneous connections", "[udp][multi]")
   // Create multiple clients
   const int numClients = 5;
   std::vector<SessionId> clients;
-  
+
   for (int i = 0; i < numClients; ++i)
   {
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
@@ -276,17 +278,17 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
   SharedUdpTransport::Config cfg2{};
   SharedUdpTransport::TlsConfig tlsCfg2{};
   SharedUdpTransport tx2{cfg2, tlsCfg2, tlsCfg2};
-  
+
   std::atomic<bool> server2Received{false};
   SharedUdpTransport::Callbacks cbs2{};
-  cbs2.onData = [&](SessionId, const std::uint8_t* data, std::size_t n, const IoResult&)
+  cbs2.onData = [&](SessionId, const std::uint8_t *data, std::size_t n, const IoResult &)
   {
-    std::string msg(reinterpret_cast<const char*>(data), n);
+    std::string msg(reinterpret_cast<const char *>(data), n);
     if (msg == "via_test")
       server2Received = true;
   };
   tx2.setCallbacks(cbs2);
-  
+
   REQUIRE(tx2.start());
   ListenerId lid2 = tx2.addListener("127.0.0.1", port2, TlsMode::None);
   REQUIRE(lid2 != 0);
@@ -297,11 +299,11 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
 
   REQUIRE(f.waitFor(f.connected));
 
-  const char* msg = "via_test";
+  const char *msg = "via_test";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
 
   // Wait for server2 to receive
-  for (int i = 0; i < 200 && !server2Received.load(); ++i) 
+  for (int i = 0; i < 200 && !server2Received.load(); ++i)
     std::this_thread::sleep_for(5ms);
   REQUIRE(server2Received.load());
 
@@ -319,7 +321,7 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  
+
   REQUIRE(f.waitFor(f.connected));
 
   // Change configuration
@@ -327,13 +329,13 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
   newCfg.gcInterval = std::chrono::seconds(2);
   newCfg.maxWriteQueue = 20;
   newCfg.ioReadChunk = 128 * 1024;
-  
+
   f.tx.reconfigure(newCfg);
 
   // Verify connection still works after reconfigure
-  const char* msg = "after_reconfig";
+  const char *msg = "after_reconfig";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
-  
+
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
   REQUIRE(f.lastData == msg);
@@ -349,7 +351,7 @@ TEST_CASE("UDP error conditions", "[udp][error]")
   SECTION("send to non-existent session")
   {
     SessionId fakeSid = 9999;
-    const char* msg = "test";
+    const char *msg = "test";
     REQUIRE(f.tx.send(fakeSid, msg, std::strlen(msg))); // Returns true but does nothing
   }
 
@@ -363,10 +365,10 @@ TEST_CASE("UDP error conditions", "[udp][error]")
   {
     SessionId cs = f.tx.connect("not.an.ip.address", 1234, TlsMode::None);
     REQUIRE(cs != 0); // ID allocated
-    
+
     // Wait for connect error callback
     std::this_thread::sleep_for(100ms);
-    
+
     // Connection should have failed
     REQUIRE_FALSE(f.connected.load());
   }
@@ -376,10 +378,10 @@ TEST_CASE("UDP error conditions", "[udp][error]")
     ListenerId fakeLid = 9999;
     SessionId cs = f.tx.connectViaListener(fakeLid, "127.0.0.1", 1234);
     REQUIRE(cs != 0); // ID allocated
-    
+
     // Wait a bit
     std::this_thread::sleep_for(100ms);
-    
+
     // Connection should have failed
     REQUIRE_FALSE(f.connected.load());
   }
@@ -393,16 +395,16 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   f.cfg.idleTimeout = std::chrono::seconds(1);
   f.cfg.gcInterval = std::chrono::seconds(1);
   f.cfg.maxConnAge = std::chrono::seconds(0); // Disabled
-  
+
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  
+
   REQUIRE(f.waitFor(f.connected));
 
-  const char* msg = "test";
+  const char *msg = "test";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.accepted));
 
@@ -417,8 +419,8 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   // Note: GC timer implementation might not be working in tests
   // Just verify basic functionality
   // sessionsCurrent is unsigned, so >= 0 check is always true
-  REQUIRE(true);  // Sessions might be cleaned up
-  
+  REQUIRE(true); // Sessions might be cleaned up
+
   f.tx.stop();
 }
 
@@ -428,16 +430,16 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   f.cfg.idleTimeout = std::chrono::seconds(0); // Disabled
   f.cfg.maxConnAge = std::chrono::seconds(1);
   f.cfg.gcInterval = std::chrono::seconds(1);
-  
+
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  
+
   REQUIRE(f.waitFor(f.connected));
 
-  const char* msg = "test";
+  const char *msg = "test";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.accepted));
 
@@ -458,8 +460,8 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   // Note: GC timer implementation might not be working in tests
   // Just verify basic functionality
   // sessionsCurrent is unsigned, so >= 0 check is always true
-  REQUIRE(true);  // Sessions might be cleaned up
-  
+  REQUIRE(true); // Sessions might be cleaned up
+
   f.tx.stop();
 }
 
@@ -468,24 +470,24 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   UdpFixture f;
   f.cfg.maxWriteQueue = 5;
   f.cfg.closeOnBackpressure = true;
-  
+
   REQUIRE(f.tx.start());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  
+
   // Create a server that doesn't echo (to cause backpressure)
   SharedUdpTransport::Config cfg2{};
   SharedUdpTransport::TlsConfig tlsCfg2{};
   SharedUdpTransport tx2{cfg2, tlsCfg2, tlsCfg2};
-  
+
   SharedUdpTransport::Callbacks cbs2{};
-  cbs2.onData = [&](SessionId, const std::uint8_t*, std::size_t, const IoResult&)
+  cbs2.onData = [&](SessionId, const std::uint8_t *, std::size_t, const IoResult &)
   {
     // Don't echo - just receive
   };
   tx2.setCallbacks(cbs2);
-  
+
   REQUIRE(tx2.start());
   auto port2 = testnet::getFreePortUDP();
   (void)tx2.addListener("127.0.0.1", port2, TlsMode::None);
@@ -505,7 +507,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   (void)f.tx.stats();
   // Should have some backpressure events if queue filled
   // Note: UDP might not actually trigger backpressure easily
-  
+
   f.tx.stop();
   tx2.stop();
 }
@@ -514,12 +516,12 @@ TEST_CASE("UDP IPv6 support", "[udp][ipv6]")
 {
   UdpFixture f;
   REQUIRE(f.tx.start());
-  
+
   auto port = testnet::getFreePortUDP();
 
   // Try IPv6 loopback
   ListenerId lid = f.tx.addListener("::1", port, TlsMode::None);
-  
+
   if (lid != 0) // Only if IPv6 is available
   {
     SessionId cs = f.tx.connect("::1", port, TlsMode::None);
@@ -527,14 +529,14 @@ TEST_CASE("UDP IPv6 support", "[udp][ipv6]")
 
     REQUIRE(f.waitFor(f.connected));
 
-    const char* msg = "ipv6_test";
+    const char *msg = "ipv6_test";
     REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
 
     REQUIRE(f.waitFor(f.accepted));
     REQUIRE(f.waitFor(f.clientGotEcho));
     REQUIRE(f.lastData == msg);
   }
-  
+
   f.tx.stop();
 }
 
@@ -546,16 +548,16 @@ TEST_CASE("UDP large data transfer", "[udp][large]")
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  
+
   REQUIRE(f.waitFor(f.connected));
 
   // Send a message near UDP MTU limit (typically ~1500 bytes for Ethernet)
   std::string largeMsg(1400, 'A');
   largeMsg[0] = 'S';
-  largeMsg[largeMsg.size()-1] = 'E';
-  
+  largeMsg[largeMsg.size() - 1] = 'E';
+
   REQUIRE(f.tx.send(cs, largeMsg.data(), largeMsg.size()));
-  
+
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
   REQUIRE(f.lastData == largeMsg);
@@ -563,7 +565,7 @@ TEST_CASE("UDP large data transfer", "[udp][large]")
   // Verify integrity
   REQUIRE(f.lastData.size() == largeMsg.size());
   REQUIRE(f.lastData[0] == 'S');
-  REQUIRE(f.lastData[f.lastData.size()-1] == 'E');
+  REQUIRE(f.lastData[f.lastData.size() - 1] == 'E');
 
   f.tx.stop();
 }
@@ -572,7 +574,7 @@ TEST_CASE("UDP multiple listeners", "[udp][multi-listener]")
 {
   UdpFixture f;
   REQUIRE(f.tx.start());
-  
+
   auto port1 = testnet::getFreePortUDP();
   auto port2 = testnet::getFreePortUDP();
   auto port3 = testnet::getFreePortUDP();
@@ -580,7 +582,7 @@ TEST_CASE("UDP multiple listeners", "[udp][multi-listener]")
   ListenerId lid1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
   ListenerId lid2 = f.tx.addListener("127.0.0.1", port2, TlsMode::None);
   ListenerId lid3 = f.tx.addListener("127.0.0.1", port3, TlsMode::None);
-  
+
   REQUIRE(lid1 != 0);
   REQUIRE(lid2 != 0);
   REQUIRE(lid3 != 0);
@@ -619,18 +621,18 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
     UdpFixture f;
     f.cfg.useEdgeTriggered = true;
     REQUIRE(f.tx.start());
-    
+
     auto port = testnet::getFreePortUDP();
     (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    
+
     REQUIRE(f.waitFor(f.connected));
-    
-    const char* msg = "edge_test";
+
+    const char *msg = "edge_test";
     REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
     REQUIRE(f.waitFor(f.clientGotEcho));
     REQUIRE(f.lastData == msg);
-    
+
     f.tx.stop();
   }
 
@@ -639,18 +641,18 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
     UdpFixture f;
     f.cfg.useEdgeTriggered = false;
     REQUIRE(f.tx.start());
-    
+
     auto port = testnet::getFreePortUDP();
     (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
     SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    
+
     REQUIRE(f.waitFor(f.connected));
-    
-    const char* msg = "level_test";
+
+    const char *msg = "level_test";
     REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
     REQUIRE(f.waitFor(f.clientGotEcho));
     REQUIRE(f.lastData == msg);
-    
+
     f.tx.stop();
   }
 }
@@ -664,7 +666,7 @@ TEST_CASE("UDP synchronous listener API", "[udp][sync]")
   {
     auto port = testnet::getFreePortUDP();
     auto result = f.tx.addListenerSync("127.0.0.1", port, TlsMode::None);
-    
+
     REQUIRE(result.result.ok);
     REQUIRE(result.id != 0);
     REQUIRE(result.bindAddress == "127.0.0.1:" + std::to_string(port));
@@ -673,14 +675,14 @@ TEST_CASE("UDP synchronous listener API", "[udp][sync]")
   SECTION("duplicate bind fails immediately")
   {
     auto port = testnet::getFreePortUDP();
-    
+
     // First bind should succeed
     auto result1 = f.tx.addListenerSync("127.0.0.1", port, TlsMode::None);
     REQUIRE(result1.result.ok);
-    
+
     // Give time for the first listener to be actually bound
     std::this_thread::sleep_for(50ms);
-    
+
     // Second bind should fail immediately
     auto result2 = f.tx.addListenerSync("127.0.0.1", port, TlsMode::None);
     REQUIRE_FALSE(result2.result.ok);
@@ -692,7 +694,7 @@ TEST_CASE("UDP synchronous listener API", "[udp][sync]")
   {
     auto port = testnet::getFreePortUDP();
     auto result = f.tx.addListenerSync("127.0.0.1", port, TlsMode::Server);
-    
+
     REQUIRE_FALSE(result.result.ok);
     REQUIRE(result.result.code == TransportError::Config);
     REQUIRE(result.id == 0);
@@ -706,10 +708,10 @@ TEST_CASE("UDP session limits", "[udp][limits]")
   UdpFixture f;
   f.cfg.maxSessions = 4; // Set limit to 4 (2 clients + 2 server peers)
   REQUIRE(f.tx.start());
-  
+
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  
+
   // Create 2 connections
   std::vector<SessionId> clients;
   for (int i = 0; i < 2; ++i)
@@ -718,31 +720,31 @@ TEST_CASE("UDP session limits", "[udp][limits]")
     REQUIRE(cs != 0);
     clients.push_back(cs);
   }
-  
+
   REQUIRE(f.waitForCount(f.connectCount, 2));
-  
+
   // Send from both clients to create server peers (should create 2+2=4 sessions total)
   REQUIRE(f.tx.send(clients[0], "test1", 5));
   REQUIRE(f.tx.send(clients[1], "test2", 5));
-  
+
   std::this_thread::sleep_for(100ms);
-  
+
   auto stats = f.tx.stats();
   REQUIRE(stats.sessionsCurrent <= f.cfg.maxSessions);
-  
+
   // Now try to create another client - should still work
   SessionId cs3 = f.tx.connect("127.0.0.1", port, TlsMode::None);
   REQUIRE(cs3 != 0);
-  
+
   // But sending from it should not create a new server peer (would exceed limit)
   REQUIRE(f.tx.send(cs3, "test3", 5));
   std::this_thread::sleep_for(100ms);
-  
+
   auto stats2 = f.tx.stats();
   // Session count should be reasonable (3 clients + up to 2 server peers)
   // The limit applies to preventing new server peer creation
   REQUIRE(stats2.sessionsCurrent <= 6); // Maximum possible: 3 clients + 3 peers
-  
+
   f.tx.stop();
 }
 
@@ -752,18 +754,18 @@ TEST_CASE("UDP socket buffer configuration", "[udp][socket]")
   f.cfg.soRcvBuf = 256 * 1024;
   f.cfg.soSndBuf = 256 * 1024;
   REQUIRE(f.tx.start());
-  
+
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
   SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  
+
   REQUIRE(f.waitFor(f.connected));
-  
+
   // Verify it works with configured buffers
-  const char* msg = "buffer_test";
+  const char *msg = "buffer_test";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.clientGotEcho));
   REQUIRE(f.lastData == msg);
-  
+
   f.tx.stop();
 }

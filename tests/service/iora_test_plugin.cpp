@@ -1,17 +1,19 @@
 #define CATCH_CONFIG_RUNNER
+#include "test_helpers.hpp"
 #include <catch2/catch.hpp>
 #include <chrono>
 #include <iomanip>
-#include "test_helpers.hpp"
 
 using namespace iora::test;
 
 // Global service instance for all tests
-static iora::IoraService* globalSvc = nullptr;
+static iora::IoraService *globalSvc = nullptr;
 
 // Helper function to get service instance
-iora::IoraService& getTestService() {
-  if (!globalSvc) {
+iora::IoraService &getTestService()
+{
+  if (!globalSvc)
+  {
     throw std::runtime_error("Test service not initialized");
   }
   return *globalSvc;
@@ -19,7 +21,7 @@ iora::IoraService& getTestService() {
 
 TEST_CASE("Dynamic loading of testplugin shared library")
 {
-  iora::IoraService& svc = getTestService();
+  iora::IoraService &svc = getTestService();
 
   auto pluginPathOpt = iora::util::getExecutableDir() + "/plugins/testplugin.so";
   std::cout << "Plugin path: " << pluginPathOpt << std::endl;
@@ -34,7 +36,8 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
   SECTION("callExportedApi: greet")
   {
-    std::string greet = svc.callExportedApi<std::string, const std::string&>("testplugin.greet", "World");
+    std::string greet =
+      svc.callExportedApi<std::string, const std::string &>("testplugin.greet", "World");
     REQUIRE(greet == "Hello, World!");
   }
 
@@ -56,7 +59,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
   SECTION("getExportedApi: greet")
   {
-    auto greetApi = svc.getExportedApi<std::string(const std::string&)>("testplugin.greet");
+    auto greetApi = svc.getExportedApi<std::string(const std::string &)>("testplugin.greet");
     REQUIRE(greetApi("Iora") == "Hello, Iora!");
   }
 
@@ -65,10 +68,11 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto safeAddApi = svc.getExportedApiSafe<int(int, int)>("testplugin.add");
     REQUIRE((*safeAddApi)(5, 7) == 12);
     REQUIRE(safeAddApi->isAvailable() == true);
-    REQUIRE(safeAddApi->getModuleName() == "testplugin.so");  // Should be full filename
+    REQUIRE(safeAddApi->getModuleName() == "testplugin.so"); // Should be full filename
     REQUIRE(safeAddApi->getApiName() == "testplugin.add");
 
-    auto safeGreetApi = svc.getExportedApiSafe<std::string(const std::string&)>("testplugin.greet");
+    auto safeGreetApi =
+      svc.getExportedApiSafe<std::string(const std::string &)>("testplugin.greet");
     REQUIRE((*safeGreetApi)("SafeAPI") == "Hello, SafeAPI!");
     REQUIRE(safeGreetApi->isAvailable() == true);
   }
@@ -77,7 +81,8 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   {
     // Create safe API wrappers before unloading
     auto safeAddApi = svc.getExportedApiSafe<int(int, int)>("testplugin.add");
-    auto safeGreetApi = svc.getExportedApiSafe<std::string(const std::string&)>("testplugin.greet");
+    auto safeGreetApi =
+      svc.getExportedApiSafe<std::string(const std::string &)>("testplugin.greet");
 
     // Test that they work initially
     REQUIRE((*safeAddApi)(3, 4) == 7);
@@ -103,7 +108,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     {
       (*safeAddApi)(1, 1);
     }
-    catch (const std::runtime_error& e)
+    catch (const std::runtime_error &e)
     {
       addThrew = true;
       addError = e.what();
@@ -113,7 +118,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     {
       (*safeGreetApi)("Test");
     }
-    catch (const std::runtime_error& e)
+    catch (const std::runtime_error &e)
     {
       greetThrew = true;
       greetError = e.what();
@@ -153,7 +158,8 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
     REQUIRE(svc.loadSingleModule(pluginPathOpt));
     REQUIRE(svc.callExportedApi<int, int, int>("testplugin.add", 7, 8) == 15);
-    REQUIRE(svc.callExportedApi<std::string, const std::string&>("testplugin.greet", "Reloaded") == "Hello, Reloaded!");
+    REQUIRE(svc.callExportedApi<std::string, const std::string &>("testplugin.greet", "Reloaded") ==
+            "Hello, Reloaded!");
   }
 
   SECTION("Comparison: unsafe vs safe API behavior on module unload")
@@ -176,7 +182,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     {
       (*safeAdd)(1, 2);
     }
-    catch (const std::runtime_error& e)
+    catch (const std::runtime_error &e)
     {
       safeThrew = true;
       std::string error = e.what();
@@ -214,32 +220,32 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     for (int i = 0; i < numThreads; ++i)
     {
       threads.emplace_back(
-          [&, i]()
+        [&, i]()
+        {
+          for (int j = 0; j < callsPerThread && !stopTest.load(); ++j)
           {
-            for (int j = 0; j < callsPerThread && !stopTest.load(); ++j)
+            try
             {
-              try
+              int result = (*safeAddApi)(i, j);
+              if (result == i + j)
               {
-                int result = (*safeAddApi)(i, j);
-                if (result == i + j)
-                {
-                  successCount.fetch_add(1);
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                successCount.fetch_add(1);
               }
-              catch (const std::runtime_error& e)
-              {
-                exceptionCount.fetch_add(1);
-                // Expected when module is unloaded
-              }
-              catch (...)
-              {
-                // Unexpected exception - this would indicate a race condition
-                std::cout << "UNEXPECTED EXCEPTION in thread " << i << std::endl;
-                stopTest.store(true);
-              }
+              std::this_thread::sleep_for(std::chrono::microseconds(10));
             }
-          });
+            catch (const std::runtime_error &e)
+            {
+              exceptionCount.fetch_add(1);
+              // Expected when module is unloaded
+            }
+            catch (...)
+            {
+              // Unexpected exception - this would indicate a race condition
+              std::cout << "UNEXPECTED EXCEPTION in thread " << i << std::endl;
+              stopTest.store(true);
+            }
+          }
+        });
     }
 
     // Let threads run for a bit
@@ -261,7 +267,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     stopTest.store(true);
 
     // Wait for all threads to finish
-    for (auto& t : threads)
+    for (auto &t : threads)
     {
       t.join();
     }
@@ -277,7 +283,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     // Verify thread safety: total calls should equal expected maximum
     int expectedMaxCalls = numThreads * callsPerThread;
     int actualCalls = successCount.load() + exceptionCount.load();
-    REQUIRE(actualCalls <= expectedMaxCalls);  // Some threads may exit early due to stopTest
+    REQUIRE(actualCalls <= expectedMaxCalls); // Some threads may exit early due to stopTest
   }
 
   SECTION("Performance benchmark: Safe vs Unsafe vs CallExportedApi")
@@ -285,7 +291,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto unsafeAddApi = svc.getExportedApi<int(int, int)>("testplugin.add");
     auto safeAddApi = svc.getExportedApiSafe<int(int, int)>("testplugin.add");
 
-    const int numCalls = 100000;  // 100k calls for statistically significant results
+    const int numCalls = 100000; // 100k calls for statistically significant results
 
     // Warm up all APIs to ensure caches are populated
     unsafeAddApi(1, 1);
@@ -297,17 +303,18 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     for (int i = 0; i < numCalls; ++i)
     {
       volatile int result = unsafeAddApi(i % 100, (i + 1) % 100);
-      (void)result;  // Prevent optimization
+      (void)result; // Prevent optimization
     }
     auto unsafeEnd = std::chrono::high_resolution_clock::now();
-    auto unsafeDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(unsafeEnd - unsafeStart);
+    auto unsafeDuration =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(unsafeEnd - unsafeStart);
 
     // Benchmark 2: Safe API (cached path - module stays loaded)
     auto safeStart = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < numCalls; ++i)
     {
       volatile int result = (*safeAddApi)(i % 100, (i + 1) % 100);
-      (void)result;  // Prevent optimization
+      (void)result; // Prevent optimization
     }
     auto safeEnd = std::chrono::high_resolution_clock::now();
     auto safeDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(safeEnd - safeStart);
@@ -316,8 +323,9 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     auto callStart = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < numCalls; ++i)
     {
-      volatile int result = svc.callExportedApi<int, int, int>("testplugin.add", i % 100, (i + 1) % 100);
-      (void)result;  // Prevent optimization
+      volatile int result =
+        svc.callExportedApi<int, int, int>("testplugin.add", i % 100, (i + 1) % 100);
+      (void)result; // Prevent optimization
     }
     auto callEnd = std::chrono::high_resolution_clock::now();
     auto callDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(callEnd - callStart);
@@ -332,21 +340,22 @@ TEST_CASE("Dynamic loading of testplugin shared library")
 
     std::cout << "\n=== Performance Benchmark Results ===" << std::endl;
     std::cout << "Test: " << numCalls << " API calls each" << std::endl;
-    std::cout << "1. Unsafe API (getExportedApi):     " << std::fixed << std::setprecision(2) << unsafeNsPerCall
-              << " ns/call" << std::endl;
-    std::cout << "2. Safe API (getExportedApiSafe):   " << std::fixed << std::setprecision(2) << safeNsPerCall
-              << " ns/call" << std::endl;
-    std::cout << "3. CallExportedApi (lookup each):   " << std::fixed << std::setprecision(2) << callNsPerCall
-              << " ns/call" << std::endl;
-    std::cout << "\nSafe API overhead: " << std::fixed << std::setprecision(2) << safeOverheadNs << " ns/call ("
-              << std::fixed << std::setprecision(1) << safeOverheadPercent << "%)" << std::endl;
+    std::cout << "1. Unsafe API (getExportedApi):     " << std::fixed << std::setprecision(2)
+              << unsafeNsPerCall << " ns/call" << std::endl;
+    std::cout << "2. Safe API (getExportedApiSafe):   " << std::fixed << std::setprecision(2)
+              << safeNsPerCall << " ns/call" << std::endl;
+    std::cout << "3. CallExportedApi (lookup each):   " << std::fixed << std::setprecision(2)
+              << callNsPerCall << " ns/call" << std::endl;
+    std::cout << "\nSafe API overhead: " << std::fixed << std::setprecision(2) << safeOverheadNs
+              << " ns/call (" << std::fixed << std::setprecision(1) << safeOverheadPercent << "%)"
+              << std::endl;
 
     // Safe API should be faster than callExportedApi (which does lookup each time)
     REQUIRE(safeNsPerCall < callNsPerCall);
 
     // Performance should be reasonable - safe API overhead should be under 50ns per call
     // The percentage can be high if the base unsafe call is very fast (few nanoseconds)
-    REQUIRE(safeOverheadNs < 50.0);  // Less than 50ns absolute overhead per call
+    REQUIRE(safeOverheadNs < 50.0); // Less than 50ns absolute overhead per call
   }
 
   SECTION("Performance: Safe API cache invalidation cost")
@@ -364,7 +373,7 @@ TEST_CASE("Dynamic loading of testplugin shared library")
       // Force cache invalidation by simulating module reload
       svc.unloadSingleModule("testplugin.so");
       svc.loadSingleModule(pluginPathOpt);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));  // Let events process
+      std::this_thread::sleep_for(std::chrono::milliseconds(1)); // Let events process
 
       // Measure first call after reload (cache miss)
       auto start = std::chrono::high_resolution_clock::now();
@@ -385,22 +394,22 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     avgRefreshNs /= refreshTimes.size();
 
     std::cout << "\n=== Cache Refresh Performance ===" << std::endl;
-    std::cout << "Average cache refresh time: " << std::fixed << std::setprecision(0) << avgRefreshNs << " ns"
-              << std::endl;
+    std::cout << "Average cache refresh time: " << std::fixed << std::setprecision(0)
+              << avgRefreshNs << " ns" << std::endl;
     std::cout << "This cost is only paid on first call after module reload" << std::endl;
 
     // Cache refresh should complete within reasonable time (typically < 10μs)
-    REQUIRE(avgRefreshNs < 50000.0);  // Less than 50μs for cache refresh
+    REQUIRE(avgRefreshNs < 50000.0); // Less than 50μs for cache refresh
   }
 
   // Clean up between sections by unloading modules instead of shutting down service
   svc.unloadAllModules();
 }
 
-int main(int argc, char* argv[])
+int main(int argc, char *argv[])
 {
   Catch::Session session;
-  
+
   // Initialize test logging
   initializeTestLogging();
 

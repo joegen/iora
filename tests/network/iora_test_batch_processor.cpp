@@ -6,9 +6,9 @@
 
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
-#include "test_helpers.hpp"
-#include "iora_test_net_utils.hpp"
 #include "iora/network/event_batch_processor.hpp"
+#include "iora_test_net_utils.hpp"
+#include "test_helpers.hpp"
 
 using namespace std::chrono_literals;
 using namespace iora::network;
@@ -70,17 +70,17 @@ TEST_CASE("EventBatchProcessor with real epoll", "[batch][epoll]")
 
     // Process batch in background thread with short timeout
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            processor.processBatch(epoll.fd(), generalHandler, specialHandler);
-          }
-          catch (...)
-          {
-            // Ignore timeout or other errors for this test
-          }
-        });
+          processor.processBatch(epoll.fd(), generalHandler, specialHandler);
+        }
+        catch (...)
+        {
+          // Ignore timeout or other errors for this test
+        }
+      });
 
     // Wait for processing
     processor_thread.join();
@@ -104,8 +104,7 @@ TEST_CASE("EventBatchProcessor with real epoll", "[batch][epoll]")
 
     auto specialHandler = [](int /*fd*/, uint32_t /*events*/) { return false; };
 
-    auto batchCompleteHandler =
-        [&batchSize](std::size_t size, std::chrono::microseconds /*time*/)
+    auto batchCompleteHandler = [&batchSize](std::size_t size, std::chrono::microseconds /*time*/)
     { batchSize = size; };
 
     // Signal both event fds
@@ -114,18 +113,17 @@ TEST_CASE("EventBatchProcessor with real epoll", "[batch][epoll]")
 
     // Process batch
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            processor.processBatch(epoll.fd(), generalHandler, specialHandler,
-                                   batchCompleteHandler);
-          }
-          catch (...)
-          {
-            // Ignore errors for this test
-          }
-        });
+          processor.processBatch(epoll.fd(), generalHandler, specialHandler, batchCompleteHandler);
+        }
+        catch (...)
+        {
+          // Ignore errors for this test
+        }
+      });
 
     processor_thread.join();
 
@@ -162,8 +160,7 @@ TEST_CASE("EventBatchProcessor special FD handling", "[batch][special]")
 
     auto onEventFd = [&eventFdTriggered]() { eventFdTriggered = true; };
     auto onTimerFd = [&timerFdTriggered]() { timerFdTriggered = true; };
-    auto generalHandler = [&normalFds](int fd, uint32_t /*events*/)
-    { normalFds.push_back(fd); };
+    auto generalHandler = [&normalFds](int fd, uint32_t /*events*/) { normalFds.push_back(fd); };
 
     // Signal all fds
     eventFd.signal();
@@ -171,19 +168,18 @@ TEST_CASE("EventBatchProcessor special FD handling", "[batch][special]")
     normalFd.signal();
 
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            processor.processBatchWithSpecialFDs(epoll.fd(), eventFd.fd(),
-                                                 timerFd.fd(), generalHandler,
-                                                 onEventFd, onTimerFd);
-          }
-          catch (...)
-          {
-            // Ignore timeout
-          }
-        });
+          processor.processBatchWithSpecialFDs(epoll.fd(), eventFd.fd(), timerFd.fd(),
+                                               generalHandler, onEventFd, onTimerFd);
+        }
+        catch (...)
+        {
+          // Ignore timeout
+        }
+      });
 
     processor_thread.join();
 
@@ -247,17 +243,17 @@ TEST_CASE("EventBatchProcessor statistics tracking", "[batch][stats]")
     auto initialStats = processor.getStats();
 
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            processor.processBatch(epoll.fd(), generalHandler, specialHandler);
-          }
-          catch (...)
-          {
-            // Ignore timeouts
-          }
-        });
+          processor.processBatch(epoll.fd(), generalHandler, specialHandler);
+        }
+        catch (...)
+        {
+          // Ignore timeouts
+        }
+      });
 
     processor_thread.join();
 
@@ -274,18 +270,17 @@ TEST_CASE("EventBatchProcessor statistics tracking", "[batch][stats]")
     eventFd.signal();
 
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            processor.processBatch(
-                epoll.fd(), [](int, uint32_t) {},
-                [](int, uint32_t) { return false; });
-          }
-          catch (...)
-          {
-          }
-        });
+          processor.processBatch(
+            epoll.fd(), [](int, uint32_t) {}, [](int, uint32_t) { return false; });
+        }
+        catch (...)
+        {
+        }
+      });
     processor_thread.join();
 
     processor.resetStats();
@@ -340,9 +335,8 @@ TEST_CASE("EventBatchProcessor error conditions", "[batch][error]")
     auto specialHandler = [](int, uint32_t) { return false; };
 
     // Using invalid fd should throw
-    REQUIRE_THROWS_AS(
-        processor.processBatch(-1, generalHandler, specialHandler),
-        std::system_error);
+    REQUIRE_THROWS_AS(processor.processBatch(-1, generalHandler, specialHandler),
+                      std::system_error);
   }
 
   SECTION("Configuration updates work correctly")
@@ -363,8 +357,7 @@ TEST_CASE("EventBatchProcessor error conditions", "[batch][error]")
   }
 }
 
-TEST_CASE("EventBatchProcessor performance characteristics",
-          "[batch][performance]")
+TEST_CASE("EventBatchProcessor performance characteristics", "[batch][performance]")
 {
   EpollHelper epoll;
   std::vector<std::unique_ptr<EventFdHelper>> eventFds;
@@ -400,12 +393,11 @@ TEST_CASE("EventBatchProcessor performance characteristics",
     auto specialHandler = [](int /*fd*/, uint32_t /*events*/) { return false; };
 
     auto batchCompleteHandler =
-        [&batchesProcessed](std::size_t /*size*/,
-                            std::chrono::microseconds /*time*/)
+      [&batchesProcessed](std::size_t /*size*/, std::chrono::microseconds /*time*/)
     { batchesProcessed.fetch_add(1, std::memory_order_relaxed); };
 
     // Signal all event fds
-    for (auto& eventFd : eventFds)
+    for (auto &eventFd : eventFds)
     {
       eventFd->signal();
     }
@@ -413,24 +405,22 @@ TEST_CASE("EventBatchProcessor performance characteristics",
     auto start = std::chrono::high_resolution_clock::now();
 
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        try
         {
-          try
-          {
-            processor.processBatch(epoll.fd(), generalHandler, specialHandler,
-                                   batchCompleteHandler);
-          }
-          catch (...)
-          {
-            // Ignore timeouts
-          }
-        });
+          processor.processBatch(epoll.fd(), generalHandler, specialHandler, batchCompleteHandler);
+        }
+        catch (...)
+        {
+          // Ignore timeouts
+        }
+      });
 
     processor_thread.join();
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
     auto stats = processor.getStats();
 
@@ -451,8 +441,7 @@ TEST_CASE("EventBatchProcessor performance characteristics",
   }
 }
 
-TEST_CASE("EventBatchProcessor concurrency stress test",
-          "[batch][stress][concurrent]")
+TEST_CASE("EventBatchProcessor concurrency stress test", "[batch][stress][concurrent]")
 {
   // This test verifies that the batch processor can handle high event rates
   EpollHelper epoll;
@@ -488,39 +477,38 @@ TEST_CASE("EventBatchProcessor concurrency stress test",
 
     // Start processor thread
     std::thread processor_thread(
-        [&]()
+      [&]()
+      {
+        while (!stopProcessing.load(std::memory_order_relaxed))
         {
-          while (!stopProcessing.load(std::memory_order_relaxed))
+          try
           {
-            try
-            {
-              processor.processBatch(epoll.fd(), generalHandler,
-                                     specialHandler);
-            }
-            catch (...)
-            {
-              // Continue on timeout or other errors
-            }
+            processor.processBatch(epoll.fd(), generalHandler, specialHandler);
           }
-        });
+          catch (...)
+          {
+            // Continue on timeout or other errors
+          }
+        }
+      });
 
     // Start signaling threads
     std::vector<std::thread> signalers;
     for (int i = 0; i < numFds; ++i)
     {
       signalers.emplace_back(
-          [&eventFds, i, signalsPerFd]()
+        [&eventFds, i, signalsPerFd]()
+        {
+          for (int j = 0; j < signalsPerFd; ++j)
           {
-            for (int j = 0; j < signalsPerFd; ++j)
-            {
-              eventFds[i]->signal();
-              std::this_thread::sleep_for(1ms); // Spread out signals
-            }
-          });
+            eventFds[i]->signal();
+            std::this_thread::sleep_for(1ms); // Spread out signals
+          }
+        });
     }
 
     // Wait for signalers to complete
-    for (auto& thread : signalers)
+    for (auto &thread : signalers)
     {
       thread.join();
     }
@@ -535,14 +523,13 @@ TEST_CASE("EventBatchProcessor concurrency stress test",
 
     // Verify we processed some events (exact count depends on timing)
     // If no batches were processed, it might be due to timing or setup issues
-    INFO("Total batches: " << stats.totalBatches
-                           << ", Total events: " << stats.totalEvents);
+    INFO("Total batches: " << stats.totalBatches << ", Total events: " << stats.totalEvents);
     INFO("Total processed: " << totalProcessed.load());
 
     // More lenient check - either batches were processed OR events were handled
     // directly
-    bool hasActivity = (stats.totalBatches > 0) || (stats.totalEvents > 0) ||
-                       (totalProcessed.load() > 0);
+    bool hasActivity =
+      (stats.totalBatches > 0) || (stats.totalEvents > 0) || (totalProcessed.load() > 0);
 
     if (!hasActivity)
     {
@@ -550,8 +537,7 @@ TEST_CASE("EventBatchProcessor concurrency stress test",
       // or system limitations
       WARN("No batch processing activity detected - may be due to test "
            "environment limitations");
-      SUCCEED(
-          "Stress test environment may not support this level of concurrency");
+      SUCCEED("Stress test environment may not support this level of concurrency");
       return;
     }
 

@@ -7,126 +7,116 @@
 
 #pragma once
 
-#include <string>
-#include <stdexcept>
-#include <optional>
-#include <vector>
 #include <iora/parsers/minimal_toml.hpp>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace iora
 {
 namespace core
 {
-  /// \brief Loads and parses TOML configuration files for the application.
-  class ConfigLoader
+/// \brief Loads and parses TOML configuration files for the application.
+class ConfigLoader
+{
+public:
+  /// \brief Constructs and loads a TOML configuration file.
+  explicit ConfigLoader(const std::string &filename) : _filename(filename) {}
+
+  /// \brief Reloads the configuration from disk.
+  bool reload()
   {
-  public:
-    /// \brief Constructs and loads a TOML configuration file.
-    explicit ConfigLoader(const std::string& filename) : _filename(filename) {}
-
-    /// \brief Reloads the configuration from disk.
-    bool reload()
+    try
     {
-      try
+      _table = parsers::toml::parse_file(_filename);
+      return true;
+    }
+    catch (...)
+    {
+      _table = parsers::toml::table{};
+      return false;
+    }
+  }
+
+  const parsers::toml::table &load()
+  {
+    if (_table.empty())
+    {
+      if (!reload())
       {
-        _table = parsers::toml::parse_file(_filename);
-        return true;
-      }
-      catch (...)
-      {
-        _table = parsers::toml::table{};
-        return false;
+        throw std::runtime_error("Failed to load configuration file: " + _filename);
       }
     }
+    return _table;
+  }
 
-    const parsers::toml::table& load()
+  /// \brief Gets the full configuration table.
+  const parsers::toml::table &table() const { return _table; }
+
+  /// \brief Gets a typed value from the configuration.
+  /// \tparam T Must be a TOML native type (int64_t, double, bool,
+  /// std::string, etc.)
+  template <typename T> std::optional<T> get(const std::string &dottedKey) const
+  {
+    auto node = _table.at_path(dottedKey);
+    if (node && node.is_value())
     {
-      if (_table.empty())
+      if (auto val = node.as<T>())
       {
-        if (!reload())
-        {
-          throw std::runtime_error("Failed to load configuration file: " +
-                                   _filename);
-        }
+        return val;
       }
-      return _table;
     }
+    return std::nullopt;
+  }
 
-    /// \brief Gets the full configuration table.
-    const parsers::toml::table& table() const { return _table; }
+  /// \brief Gets an int value from the configuration.
+  std::optional<int64_t> getInt(const std::string &key) const { return get<int64_t>(key); }
 
-    /// \brief Gets a typed value from the configuration.
-    /// \tparam T Must be a TOML native type (int64_t, double, bool,
-    /// std::string, etc.)
-    template <typename T>
-    std::optional<T> get(const std::string& dottedKey) const
+  /// \brief Gets a bool value from the configuration.
+  std::optional<bool> getBool(const std::string &key) const { return get<bool>(key); }
+
+  /// \brief Gets a string value from the configuration.
+  std::optional<std::string> getString(const std::string &key) const
+  {
+    return get<std::string>(key);
+  }
+
+  /// \brief Gets an array of strings from the configuration.
+  /// \param key Dotted key path to the array in the TOML config.
+  /// \return std::optional<std::vector<std::string>> containing all string
+  /// elements, or std::nullopt if not found. \throws std::runtime_error if
+  /// the key is an array but any element is not a string.
+  std::optional<std::vector<std::string>> getStringArray(const std::string &key) const
+  {
+    auto node = _table.at_path(key);
+    if (!node)
     {
-      auto node = _table.at_path(dottedKey);
-      if (node && node.is_value())
-      {
-        if (auto val = node.as<T>())
-        {
-          return val;
-        }
-      }
       return std::nullopt;
     }
-
-    /// \brief Gets an int value from the configuration.
-    std::optional<int64_t> getInt(const std::string& key) const
+    if (!node.is_array())
     {
-      return get<int64_t>(key);
+      return std::nullopt;
     }
-
-    /// \brief Gets a bool value from the configuration.
-    std::optional<bool> getBool(const std::string& key) const
+    std::vector<std::string> result;
+    for (const auto &elem : *node.as_array())
     {
-      return get<bool>(key);
-    }
-
-    /// \brief Gets a string value from the configuration.
-    std::optional<std::string> getString(const std::string& key) const
-    {
-      return get<std::string>(key);
-    }
-
-    /// \brief Gets an array of strings from the configuration.
-    /// \param key Dotted key path to the array in the TOML config.
-    /// \return std::optional<std::vector<std::string>> containing all string
-    /// elements, or std::nullopt if not found. \throws std::runtime_error if
-    /// the key is an array but any element is not a string.
-    std::optional<std::vector<std::string>>
-    getStringArray(const std::string& key) const
-    {
-      auto node = _table.at_path(key);
-      if (!node)
+      if (auto *strVal = std::get_if<std::string>(&elem))
       {
-        return std::nullopt;
+        result.push_back(*strVal);
       }
-      if (!node.is_array())
+      else
       {
-        return std::nullopt;
+        throw std::runtime_error("ConfigLoader: Array element at '" + key + "' is not a string");
       }
-      std::vector<std::string> result;
-      for (const auto& elem : *node.as_array())
-      {
-        if (auto* strVal = std::get_if<std::string>(&elem))
-        {
-          result.push_back(*strVal);
-        }
-        else
-        {
-          throw std::runtime_error("ConfigLoader: Array element at '" + key +
-                                   "' is not a string");
-        }
-      }
-      return result;
     }
+    return result;
+  }
 
-  private:
-    std::string _filename;
-    parsers::toml::table _table;
-  };
+private:
+  std::string _filename;
+  parsers::toml::table _table;
+};
 
 } // namespace core
 } // namespace iora

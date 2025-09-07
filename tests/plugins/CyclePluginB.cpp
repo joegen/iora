@@ -5,22 +5,15 @@
 class CyclePluginB : public iora::IoraService::Plugin
 {
 public:
-  explicit CyclePluginB(iora::IoraService* svc)
-    : Plugin(svc)
-  {
-  }
+  explicit CyclePluginB(iora::IoraService *svc) : Plugin(svc) {}
 
-  void onLoad(iora::IoraService* svc) override
+  void onLoad(iora::IoraService *svc) override
   {
     // This creates the direct cyclical dependency: B depends on A, A already depends on B
-    require("cycleplugina.so");  // B depends on A
+    require("cycleplugina.so"); // B depends on A
 
     svc->exportApi(*this, "cyclepluginb.getValue",
-      [this]() -> std::string
-      { 
-        return "CyclePluginB loaded";
-      }
-    );
+                   [this]() -> std::string { return "CyclePluginB loaded"; });
   }
 
   void onUnload() override
@@ -28,14 +21,14 @@ public:
     // Nothing special to do
   }
 
-  void onDependencyLoaded(const std::string& moduleName) override
+  void onDependencyLoaded(const std::string &moduleName) override
   {
     // Handle dependency load
   }
 
-  void onDependencyUnloaded(const std::string& moduleName) override
+  void onDependencyUnloaded(const std::string &moduleName) override
   {
-    // Handle dependency unload  
+    // Handle dependency unload
   }
 };
 

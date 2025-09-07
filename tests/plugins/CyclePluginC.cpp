@@ -1,26 +1,19 @@
-// File: iora/tests/plugins/CyclePluginC.cpp  
+// File: iora/tests/plugins/CyclePluginC.cpp
 // Plugin C that creates an indirect cycle: A→B→C→A
 #include "iora/iora.hpp"
 
 class CyclePluginC : public iora::IoraService::Plugin
 {
 public:
-  explicit CyclePluginC(iora::IoraService* svc)
-    : Plugin(svc)
-  {
-  }
+  explicit CyclePluginC(iora::IoraService *svc) : Plugin(svc) {}
 
-  void onLoad(iora::IoraService* svc) override
+  void onLoad(iora::IoraService *svc) override
   {
     // This completes the indirect cycle: A→B→C→A
-    require("cycleplugina.so");  // C depends on A (completing the cycle)
+    require("cycleplugina.so"); // C depends on A (completing the cycle)
 
     svc->exportApi(*this, "cyclepluginc.getValue",
-      [this]() -> std::string
-      { 
-        return "CyclePluginC loaded";
-      }
-    );
+                   [this]() -> std::string { return "CyclePluginC loaded"; });
   }
 
   void onUnload() override
@@ -28,14 +21,14 @@ public:
     // Nothing special to do
   }
 
-  void onDependencyLoaded(const std::string& moduleName) override
+  void onDependencyLoaded(const std::string &moduleName) override
   {
     // Handle dependency load
   }
 
-  void onDependencyUnloaded(const std::string& moduleName) override
+  void onDependencyUnloaded(const std::string &moduleName) override
   {
-    // Handle dependency unload  
+    // Handle dependency unload
   }
 };
 
