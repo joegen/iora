@@ -10,7 +10,9 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -436,10 +438,55 @@ struct DnsServer
   DnsServer(const std::string &addr, std::uint16_t p = 53) : address(addr), port(p) {}
 
   /// \brief Parse server string in "address" or "address:port" format
-  /// \param serverStr Server string to parse (e.g., "8.8.8.8" or "8.8.8.8:53")
+  /// \param serverStr Server string to parse (e.g., "8.8.8.8", "8.8.8.8:53", "[::1]:53", "2001:db8::1")
   /// \return DnsServer instance with parsed address and port
   static DnsServer fromString(const std::string &serverStr)
   {
+    // Handle bracketed IPv6 format: [address]:port
+    if (!serverStr.empty() && serverStr.front() == '[')
+    {
+      size_t closeBracket = serverStr.find(']');
+      if (closeBracket != std::string::npos)
+      {
+        std::string ipv6 = serverStr.substr(1, closeBracket - 1);
+        
+        // Check if there's a port after the bracket
+        if (closeBracket + 1 < serverStr.length() && serverStr[closeBracket + 1] == ':')
+        {
+          std::string portStr = serverStr.substr(closeBracket + 2);
+          try
+          {
+            auto serverPort = static_cast<std::uint16_t>(std::stoi(portStr));
+            return DnsServer(ipv6, serverPort);
+          }
+          catch (const std::exception &)
+          {
+            // Invalid port format, use default port
+            return DnsServer(ipv6, 53);
+          }
+        }
+        else
+        {
+          // No port specified after bracket, use default
+          return DnsServer(ipv6, 53);
+        }
+      }
+      else
+      {
+        // Invalid bracket format, treat as plain address
+        return DnsServer(serverStr, 53);
+      }
+    }
+    
+    // Check if this looks like an IPv6 address (contains at least 2 colons)
+    size_t colonCount = std::count(serverStr.begin(), serverStr.end(), ':');
+    if (colonCount >= 2)
+    {
+      // This is likely an IPv6 address without brackets, use default port
+      return DnsServer(serverStr, 53);
+    }
+    
+    // IPv4 format: try to find port after last colon
     size_t colonPos = serverStr.find_last_of(':');
     if (colonPos != std::string::npos)
     {
@@ -499,8 +546,8 @@ struct DnsConfig
   // =============================================================================
 
   /// \brief DNS servers to query with per-server port configuration
-  /// Default: Google DNS (8.8.8.8:53) and Cloudflare DNS (1.1.1.1:53)
-  std::vector<DnsServer> servers{DnsServer("8.8.8.8", 53), DnsServer("1.1.1.1", 53)};
+  /// Default: System-configured DNS servers from /etc/resolv.conf with fallback to Google DNS (8.8.8.8:53) and Cloudflare DNS (1.1.1.1:53)
+  std::vector<DnsServer> servers;
 
   // =============================================================================
   // Timeout Configuration (with clear units and defaults)
@@ -612,8 +659,22 @@ struct DnsConfig
   /// Note: SRV records always take precedence over this policy
   AddressResolutionPolicy addressResolutionPolicy{AddressResolutionPolicy::IPv4First};
 
-  /// \brief Default constructor
-  DnsConfig() = default;
+  /// \brief Default constructor - uses system DNS servers with fallback
+  DnsConfig()
+  {
+    // Try to get system DNS servers first
+    auto systemServers = getSystemDnsServers();
+    
+    if (!systemServers.empty())
+    {
+      servers = std::move(systemServers);
+    }
+    else
+    {
+      // Fallback to hardcoded servers if no system config found
+      servers = {DnsServer("8.8.8.8", 53), DnsServer("1.1.1.1", 53)};
+    }
+  }
 
   /// \brief Backward compatibility constructor with server list and global port
   /// \param serverList List of server addresses (without ports)
@@ -674,6 +735,42 @@ struct DnsConfig
     {
       servers.push_back(DnsServer::fromString(serverStr));
     }
+  }
+
+private:
+  /// \brief Parse system DNS servers from /etc/resolv.conf
+  /// \return Vector of system-configured DNS servers (empty if none found)
+  std::vector<DnsServer> getSystemDnsServers() const
+  {
+    std::vector<DnsServer> systemServers;
+    
+    // Try to read /etc/resolv.conf
+    std::ifstream resolvConf("/etc/resolv.conf");
+    if (resolvConf.is_open())
+    {
+      std::string line;
+      while (std::getline(resolvConf, line))
+      {
+        // Skip comments and empty lines
+        if (line.empty() || line[0] == '#')
+          continue;
+          
+        // Look for nameserver entries
+        std::istringstream iss(line);
+        std::string keyword;
+        if (iss >> keyword && keyword == "nameserver")
+        {
+          std::string server;
+          if (iss >> server)
+          {
+            // Parse server (handles IPv6 brackets if present)
+            systemServers.push_back(DnsServer::fromString(server));
+          }
+        }
+      }
+    }
+    
+    return systemServers;
   }
 };
 
