@@ -2007,10 +2007,10 @@ private:
 };
 
 // Static member definitions
-std::once_flag SharedTransport::_sslGlobalInitFlag;
-std::atomic<int> SharedTransport::debugInstanceCount{0};
+inline std::once_flag SharedTransport::_sslGlobalInitFlag;
+inline std::atomic<int> SharedTransport::debugInstanceCount{0};
 
-void SharedTransport::initSslGlobal()
+inline void SharedTransport::initSslGlobal()
 {
   // Initialize OpenSSL library once per process
   // This prevents deadlocks when multiple transports initialize
