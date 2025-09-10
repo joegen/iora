@@ -18,7 +18,7 @@ namespace util
 
 /// \brief Get the path to the currently running executable
 /// \return Full path to the executable as a string
-std::string getExecutablePath()
+inline std::string getExecutablePath()
 {
   std::vector<char> buf(4096);
   ssize_t len = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
@@ -31,7 +31,7 @@ std::string getExecutablePath()
 }
 
 /// \brief Get the directory of the currently running executable
-std::string getExecutableDir()
+inline std::string getExecutableDir()
 {
   std::string exePath = getExecutablePath();
   if (!exePath.empty())
@@ -42,8 +42,8 @@ std::string getExecutableDir()
 }
 
 /// \brief Resolve a relative path against an absolute base path
-std::string resolveRelativePath(const std::string &base_absolute_path,
-                                const std::string &relative_path)
+inline std::string resolveRelativePath(const std::string &base_absolute_path,
+                                       const std::string &relative_path)
 {
   // Use std::filesystem to join and normalize the path
   return std::filesystem::weakly_canonical(std::filesystem::path(base_absolute_path) /
@@ -53,7 +53,7 @@ std::string resolveRelativePath(const std::string &base_absolute_path,
 
 /// \brief Remove all files in the current directory that match the given
 /// prefix
-void removeFilesMatchingPrefix(const std::string &prefix)
+inline void removeFilesMatchingPrefix(const std::string &prefix)
 {
   for (const auto &file : std::filesystem::directory_iterator("."))
   {
@@ -66,7 +66,7 @@ void removeFilesMatchingPrefix(const std::string &prefix)
 
 /// \brief Remove all files in the current directory that contain any of the
 /// given fragments
-void removeFilesContainingAny(const std::vector<std::string> &fragments)
+inline void removeFilesContainingAny(const std::vector<std::string> &fragments)
 {
   for (const auto &file : std::filesystem::directory_iterator("."))
   {
