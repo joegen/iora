@@ -22,7 +22,7 @@ class ConfigLoader
 {
 public:
   /// \brief Constructs and loads a TOML configuration file.
-  explicit ConfigLoader(const std::string &filename) : _filename(filename) {}
+  explicit ConfigLoader(const std::string &filename) : _filename(filename) { load(); }
 
   /// \brief Reloads the configuration from disk.
   bool reload()

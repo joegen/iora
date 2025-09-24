@@ -1117,9 +1117,9 @@ protected:
     _webhookServer->setPort(port);
 
     // TLS
-    bool hasTls = _config.server.tls.certFile.has_value() ||
-                  _config.server.tls.keyFile.has_value() || _config.server.tls.caFile.has_value() ||
-                  _config.server.tls.requireClientCert.value_or(false);
+    bool hasTls = _config.server.tls.certFile.has_value() &&
+                  _config.server.tls.keyFile.has_value() &&
+                  _config.server.tls.caFile.has_value();
     if (hasTls)
     {
       IORA_LOG_INFO("applyConfig: TLS is enabled");
