@@ -104,6 +104,7 @@ public:
   {
     struct ServerConfig
     {
+      std::optional<std::string> bindAddress;
       std::optional<int> port;
       struct TlsConfig
       {
@@ -1087,6 +1088,8 @@ protected:
                                                 ? std::to_string(_config.log.retentionDays.value())
                                                 : "<unset>"));
     IORA_LOG_INFO("applyConfig: log.timeFormat = " << _config.log.timeFormat.value_or("<unset>"));
+    IORA_LOG_INFO(
+      "applyConfig: server.bindAddress = " << _config.server.bindAddress.value_or("<unset>"));
     IORA_LOG_INFO("applyConfig: server.port = " << (_config.server.port.has_value()
                                                       ? std::to_string(_config.server.port.value())
                                                       : "<unset>"));
@@ -1111,10 +1114,10 @@ protected:
     IORA_LOG_INFO("applyConfig: JsonFileStore created at: " << stateFile);
 
     // Webhook Server
-    _webhookServer = std::make_unique<network::WebhookServer>();
+    std::string bindAddress = _config.server.bindAddress.value_or("0.0.0.0");
     auto port = _config.server.port.value_or(DEFAULT_PORT);
-    IORA_LOG_INFO("applyConfig: Setting webhook server port to: " << port);
-    _webhookServer->setPort(port);
+    _webhookServer = std::make_unique<network::WebhookServer>(bindAddress, port);
+    IORA_LOG_INFO("applyConfig: Setting webhook server to bind on " << bindAddress << ":" << port);
 
     // TLS
     bool hasTls = _config.server.tls.certFile.has_value() &&

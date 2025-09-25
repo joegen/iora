@@ -8,6 +8,7 @@
 #pragma once
 
 #include <iora/parsers/minimal_toml.hpp>
+#include <iora/core/logger.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -22,7 +23,7 @@ class ConfigLoader
 {
 public:
   /// \brief Constructs and loads a TOML configuration file.
-  explicit ConfigLoader(const std::string &filename) : _filename(filename) { load(); }
+  explicit ConfigLoader(const std::string &filename) : _filename(filename), _isLoaded(false) { load(); }
 
   /// \brief Reloads the configuration from disk.
   bool reload()
@@ -45,7 +46,13 @@ public:
     {
       if (!reload())
       {
-        throw std::runtime_error("Failed to load configuration file: " + _filename);
+        // throw std::runtime_error("Failed to load configuration file: " + _filename);
+        IORA_LOG_WARN("ConfigLoader: Failed to load configuration file: " << _filename);
+        _isLoaded = false;
+      }
+      else
+      {
+        _isLoaded = true;
       }
     }
     return _table;
@@ -53,6 +60,9 @@ public:
 
   /// \brief Gets the full configuration table.
   const parsers::toml::table &table() const { return _table; }
+
+  /// \brief Checks if the configuration was loaded successfully.
+  bool isLoaded() const { return _isLoaded; }
 
   /// \brief Gets a typed value from the configuration.
   /// \tparam T Must be a TOML native type (int64_t, double, bool,
@@ -116,6 +126,7 @@ public:
 private:
   std::string _filename;
   parsers::toml::table _table;
+  bool _isLoaded;
 };
 
 } // namespace core

@@ -144,9 +144,9 @@ public:
 
   static constexpr int DEFAULT_PORT = 8080;
 
-  /// \brief Constructs a WebhookServer with the default port.
-  WebhookServer()
-      : _port(DEFAULT_PORT), _shutdown(false), _jsonConfig{},
+  /// \brief Constructs a WebhookServer with the default bind address and port.
+  WebhookServer(const std::string& bindAddress = "0.0.0.0", int port = DEFAULT_PORT)
+      : _bindAddress(bindAddress), _port(port), _shutdown(false), _jsonConfig{},
         _threadPool(2, 8, std::chrono::seconds(30))
   {
   }
@@ -175,6 +175,27 @@ public:
   {
     std::lock_guard<std::mutex> lock(_mutex);
     _port = port;
+  }
+
+  /// \brief Sets the bind address for the server.
+  void setBindAddress(const std::string& bindAddress)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _bindAddress = bindAddress;
+  }
+
+  /// \brief Gets the current port.
+  int getPort() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _port;
+  }
+
+  /// \brief Gets the current bind address.
+  std::string getBindAddress() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _bindAddress;
   }
 
   /// \brief Sets the JSON parsing configuration
@@ -513,9 +534,9 @@ public:
 
       // Add listener
       TlsMode tlsMode = _tlsConfig.has_value() ? TlsMode::Server : TlsMode::None;
-      _listenerId = _transport->addListener("0.0.0.0", _port, tlsMode);
+      _listenerId = _transport->addListener(_bindAddress, _port, tlsMode);
 
-      iora::core::Logger::info("WebhookServer started on port " + std::to_string(_port));
+      iora::core::Logger::info("WebhookServer started on " + _bindAddress + ":" + std::to_string(_port));
     }
     catch (const std::exception &ex)
     {
@@ -1297,6 +1318,7 @@ private:
   mutable std::mutex _mutex;
   mutable std::mutex _sessionMutex;
 
+  std::string _bindAddress;
   int _port;
   std::optional<TlsConfig> _tlsConfig;
   std::unique_ptr<UnifiedSharedTransport> _transport;

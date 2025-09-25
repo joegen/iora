@@ -62,7 +62,8 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
   SECTION("load throws on missing file")
   {
     iora::core::ConfigLoader badLoader("does_not_exist.toml");
-    REQUIRE_THROWS_AS(badLoader.load(), std::runtime_error);
+    badLoader.load();
+    REQUIRE_FALSE(badLoader.isLoaded());
   }
 
   std::filesystem::remove(cfgFile);
