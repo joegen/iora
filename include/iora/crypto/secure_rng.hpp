@@ -15,6 +15,7 @@
 
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 
 namespace iora
@@ -79,6 +80,45 @@ public:
     if (!ok || len != 32U)
     {
       throw std::runtime_error("SecureRng/sha256: EVP_Digest (SHA-256) failed");
+    }
+  }
+
+  /// \brief Compute HMAC-SHA256 of input data with a secret key.
+  ///
+  /// This provides authenticated keyed hashing suitable for temporary GRUU
+  /// generation and other security-sensitive applications where message
+  /// authentication with a shared secret is required.
+  ///
+  /// \param key Secret key for HMAC
+  /// \param data Input data to authenticate
+  /// \param out Output buffer (must be at least 32 bytes)
+  /// \throws std::runtime_error if HMAC computation fails
+  /// \throws std::invalid_argument if key is empty
+  static void hmacSha256(const std::string &key, const std::string &data, unsigned char out[32])
+  {
+    if (key.empty())
+    {
+      throw std::invalid_argument("SecureRng/hmacSha256: key cannot be empty");
+    }
+
+    unsigned int len = 0;
+    unsigned char *result = HMAC(
+      EVP_sha256(),
+      key.data(),
+      static_cast<int>(key.size()),
+      reinterpret_cast<const unsigned char *>(data.data()),
+      data.size(),
+      out,
+      &len);
+
+    if (result == nullptr || len != 32U)
+    {
+      auto error = lastError();
+      std::string msg;
+      msg.reserve(32 + error.size());
+      msg += "SecureRng/hmacSha256: HMAC failed: ";
+      msg += error;
+      throw std::runtime_error(std::move(msg));
     }
   }
 
