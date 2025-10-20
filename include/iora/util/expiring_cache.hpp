@@ -58,6 +58,8 @@ public:
       std::lock_guard<std::mutex> lock(_mutex);
       _stop = true;
     }
+    // P0 FIX: Wake up purge thread immediately instead of waiting for 5-second sleep
+    _stopCondition.notify_one();
     if (_purgeThread.joinable())
     {
       _purgeThread.join();
@@ -153,6 +155,7 @@ private:
   std::thread _purgeThread;
   bool _stop;
   EvictionCallback _evictionCallback;
+  std::condition_variable _stopCondition; // P0 FIX: Wake up purge thread on shutdown
 
   void startPurgeThread()
   {
@@ -163,16 +166,20 @@ private:
         iora::core::Logger::debug("ExpiringCache: Purge thread running");
         while (true)
         {
-          std::size_t purgedCount = 0;
+          // P0 FIX: Wait first, then purge
+          // Use condition variable wait instead of sleep_for for immediate shutdown
           {
-            std::lock_guard<std::mutex> lock(_mutex);
-            if (_stop)
+            std::unique_lock<std::mutex> lock(_mutex);
+            if (_stopCondition.wait_for(lock, std::chrono::seconds(5), [this]() { return _stop; }))
             {
+              // Woken up by shutdown signal
               iora::core::Logger::debug("ExpiringCache: Purge thread stopping");
               break;
             }
+            // Timeout expired, time to purge (mutex still held)
             auto now = std::chrono::steady_clock::now();
             std::size_t beforeSize = _cache.size();
+            std::size_t purgedCount = 0;
             for (auto it = _cache.begin(); it != _cache.end();)
             {
               if (it->second.expiration <= now)
@@ -197,7 +204,7 @@ private:
                                         std::to_string(_cache.size()) + ")");
             }
           }
-          std::this_thread::sleep_for(std::chrono::seconds(5));
+          // Mutex released here, allowing other threads to access cache
         }
       });
   }
