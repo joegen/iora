@@ -221,19 +221,19 @@ private:
 
 inline std::uint16_t DnsMessage::generateQueryId()
 {
-  static std::uniform_int_distribution<std::uint16_t> dist(1, 65535);
+  thread_local std::uniform_int_distribution<std::uint16_t> dist(1, 65535);
   return dist(getRandomGenerator());
 }
 
 inline std::random_device &DnsMessage::getRandomDevice()
 {
-  static std::random_device rd;
+  thread_local std::random_device rd;
   return rd;
 }
 
 inline std::mt19937 &DnsMessage::getRandomGenerator()
 {
-  static std::mt19937 gen(getRandomDevice()());
+  thread_local std::mt19937 gen(getRandomDevice()());
   return gen;
 }
 
