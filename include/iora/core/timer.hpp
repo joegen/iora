@@ -29,6 +29,8 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+#include <iora/common/i_lifecycle_managed.hpp>
+
 namespace iora
 {
 namespace core
@@ -239,7 +241,7 @@ private:
 };
 
 /// \brief Linux epoll-based timer service.
-class TimerService
+class TimerService : public iora::common::ILifecycleManaged
 {
 public:
   using Clock = std::chrono::steady_clock;
@@ -315,6 +317,13 @@ public:
   template <typename Handler> std::uint64_t scheduleAt(TimePoint tp, Handler &&handler)
   {
     static_assert(std::is_invocable_v<Handler>, "Handler must be callable with no arguments");
+
+    // Check if service is accepting new timers
+    if (!_accepting.load(std::memory_order_acquire))
+    {
+      handleError(TimerError::ServiceStopped, "Timer service is draining and not accepting new timers", 0);
+      return 0;
+    }
 
     if (!isValidTimeout(tp))
     {
@@ -426,25 +435,6 @@ public:
     return false;
   }
 
-  /// \brief Stop the service and join the thread.
-  void stop()
-  {
-    bool expected = true;
-    if (_running.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
-    {
-      _logger->info("Stopping timer service");
-      poke();
-
-      if (_thread.joinable())
-      {
-        _thread.join();
-      }
-
-      cleanup();
-      _logger->info("Timer service stopped");
-    }
-  }
-
   /// \brief Get current statistics.
   const TimerStats &getStats() const { return _stats; }
 
@@ -470,6 +460,234 @@ public:
   {
     std::lock_guard<std::mutex> lock(_mutex);
     _logger = std::move(logger);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ILifecycleManaged Interface Implementation
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Start the timer service (Created/Reset → Running)
+  /// @return Result indicating success and new state
+  iora::common::LifecycleResult start() override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // If already running, it's a no-op (idempotent)
+    if (currentState == LifecycleState::Running)
+    {
+      return LifecycleResult(true, LifecycleState::Running, "Already running");
+    }
+
+    // Can only start from Created or Reset state
+    if (currentState != LifecycleState::Created && currentState != LifecycleState::Reset)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only start from Created or Reset state");
+    }
+
+    // If in Created state, already started in constructor
+    if (currentState == LifecycleState::Created)
+    {
+      return LifecycleResult(true, LifecycleState::Running, "Already running");
+    }
+
+    // Reset → Running: restart the service
+    try
+    {
+      initialize();
+      return LifecycleResult(true, LifecycleState::Running, "Timer service started");
+    }
+    catch (const TimerException &e)
+    {
+      return LifecycleResult(false, currentState, std::string("Start failed: ") + e.what());
+    }
+  }
+
+  /// Begin graceful drain (Running → Draining)
+  /// @param timeoutMs Maximum time to wait for in-flight timers (0 = wait indefinitely)
+  /// @return Result with drain statistics
+  iora::common::LifecycleResult drain(std::uint32_t timeoutMs = 30000) override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+    using iora::common::DrainStats;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // Can only drain from Running state
+    if (currentState != LifecycleState::Running)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only drain from Running state");
+    }
+
+    // Transition to Draining and stop accepting new timers
+    _lifecycleState.store(LifecycleState::Draining, std::memory_order_release);
+    _accepting.store(false, std::memory_order_release);
+
+    // Capture initial in-flight count
+    std::uint32_t inFlightAtStart = getInFlightCount();
+
+    _logger->info("Draining timer service, in-flight timers: " + std::to_string(inFlightAtStart));
+
+    // Wait for all in-flight timers to complete
+    int waitMs = 0;
+    const int maxWaitMs = (timeoutMs == 0) ? 3600000 : static_cast<int>(timeoutMs); // 1 hour if 0
+
+    std::uint32_t remaining = inFlightAtStart;
+    bool timedOut = false;
+
+    while (waitMs < maxWaitMs)
+    {
+      remaining = getInFlightCount();
+
+      if (remaining == 0)
+      {
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      waitMs += 10;
+    }
+
+    if (waitMs >= maxWaitMs && remaining > 0)
+    {
+      timedOut = true;
+    }
+
+    std::uint32_t completed = inFlightAtStart - remaining;
+
+    DrainStats stats(inFlightAtStart, remaining, 0, completed);
+
+    std::string message = timedOut
+      ? "Drain timed out with " + std::to_string(remaining) + " timers remaining"
+      : "Drain completed successfully";
+
+    _logger->info(message);
+
+    return LifecycleResult(!timedOut, LifecycleState::Draining, message, stats);
+  }
+
+  /// Stop the timer service (Running/Draining → Stopped)
+  /// @return Result indicating success and new state
+  iora::common::LifecycleResult stop() override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // Can't stop from Stopped or Reset state
+    if (currentState == LifecycleState::Stopped || currentState == LifecycleState::Reset)
+    {
+      return LifecycleResult(false, currentState,
+                             "Cannot stop from Stopped or Reset state");
+    }
+
+    // If in Running state, drain first
+    if (currentState == LifecycleState::Running)
+    {
+      auto drainResult = drain(5000); // 5 second drain timeout
+      if (!drainResult.success)
+      {
+        _logger->warning("Drain failed during stop, forcing shutdown");
+      }
+    }
+
+    // Now transition to Stopped
+    bool expected = true;
+    if (_running.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
+    {
+      _logger->info("Stopping timer service");
+      poke();
+
+      if (_thread.joinable())
+      {
+        _thread.join();
+      }
+
+      cleanup();
+      _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
+      _logger->info("Timer service stopped");
+
+      return LifecycleResult(true, LifecycleState::Stopped, "Timer service stopped");
+    }
+
+    // Already stopped
+    _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
+    return LifecycleResult(true, LifecycleState::Stopped, "Already stopped");
+  }
+
+  /// Reset to clean state (Stopped → Reset)
+  /// @return Result indicating success and new state
+  iora::common::LifecycleResult reset() override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // Can only reset from Stopped state
+    if (currentState != LifecycleState::Stopped)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only reset from Stopped state");
+    }
+
+    // Clear all state
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _records.clear();
+      _periodicTimers.clear();
+      _heap.clear();
+      _nextId = 0;
+    }
+
+    // Reset statistics
+    _stats.reset();
+
+    _lifecycleState.store(LifecycleState::Reset, std::memory_order_release);
+    _logger->info("Timer service reset to clean state");
+
+    return LifecycleResult(true, LifecycleState::Reset, "Timer service reset");
+  }
+
+  /// Get current lifecycle state
+  /// @return Current lifecycle state
+  iora::common::LifecycleState getState() const override
+  {
+    return _lifecycleState.load(std::memory_order_acquire);
+  }
+
+  /// Get in-flight timer count (scheduled + periodic timers)
+  /// @return Number of in-flight timers
+  std::uint32_t getInFlightCount() const override
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    // Count non-canceled timers in _records
+    std::uint32_t activeTimers = 0;
+    for (const auto &pair : _records)
+    {
+      if (!pair.second.canceled)
+      {
+        activeTimers++;
+      }
+    }
+
+    // Count non-canceled periodic timers
+    for (const auto &pair : _periodicTimers)
+    {
+      if (!pair.second.canceled)
+      {
+        activeTimers++;
+      }
+    }
+
+    return activeTimers;
   }
 
 private:
@@ -533,6 +751,10 @@ private:
 
       // Set thread name and priority if configured
       configureThread();
+
+      // Set lifecycle state to Running
+      _accepting.store(true, std::memory_order_release);
+      _lifecycleState.store(iora::common::LifecycleState::Running, std::memory_order_release);
 
       _logger->info("Timer service started successfully");
     }
@@ -964,7 +1186,7 @@ private:
   mutable TimerStats _stats;
 
   // Timer bookkeeping
-  std::mutex _mutex;
+  mutable std::mutex _mutex;
   std::unordered_map<std::uint64_t, Record> _records;
   std::unordered_map<std::uint64_t, PeriodicTimer> _periodicTimers;
   std::vector<HeapItem> _heap;
@@ -976,6 +1198,10 @@ private:
   int _epollFd{-1};
   int _timerFd{-1};
   int _eventFd{-1};
+
+  // Lifecycle management
+  std::atomic<iora::common::LifecycleState> _lifecycleState{iora::common::LifecycleState::Created};
+  std::atomic<bool> _accepting{false};
 };
 
 /// \brief Enhanced ASIO-like timer bound to TimerService.

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include <iora/core/logger.hpp>
+#include <iora/common/i_lifecycle_managed.hpp>
 
 namespace iora
 {
@@ -35,7 +36,9 @@ namespace core
 /// A dynamic thread pool that accepts void or result-returning lambdas with
 /// arbitrary arguments. Threads grow and shrink based on load and idle
 /// timeout. Exceptions in tasks can be reported.
-class ThreadPool
+///
+/// Implements ILifecycleManaged for graceful shutdown and reset capabilities.
+class ThreadPool : public iora::common::ILifecycleManaged
 {
 public:
   // ═══════════════════════════════════════════════════════════════════
@@ -143,6 +146,10 @@ public:
         _maxQueueSize(maxQueueSize), _shutdown(false), _activeThreads(0), _busyThreads(0),
         _onTaskError(std::move(onTaskError)), _shutdownMode(shutdownMode)
   {
+    // Start accepting work and transition to Running state
+    _accepting.store(true, std::memory_order_release);
+    _lifecycleState.store(iora::common::LifecycleState::Running, std::memory_order_release);
+
     for (std::size_t i = 0; i < _initialSize; ++i)
     {
       spawnWorker();
@@ -440,9 +447,231 @@ public:
       });
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // ILifecycleManaged Interface Implementation
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Start the thread pool (Created/Reset → Running)
+  /// @return Result indicating success and new state
+  iora::common::LifecycleResult start() override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // If already running, it's a no-op (idempotent)
+    if (currentState == LifecycleState::Running)
+    {
+      return LifecycleResult(true, LifecycleState::Running, "Already running");
+    }
+
+    // Can only start from Created or Reset state
+    if (currentState != LifecycleState::Created && currentState != LifecycleState::Reset)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only start from Created or Reset state");
+    }
+
+    // If already have threads from constructor, just mark as running
+    if (currentState == LifecycleState::Created)
+    {
+      // Already started in constructor
+      return LifecycleResult(true, LifecycleState::Running, "Already running");
+    }
+
+    // Reset → Running: restart the pool
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _shutdown.store(false, std::memory_order_release);
+    }
+
+    _accepting.store(true, std::memory_order_release);
+    _lifecycleState.store(LifecycleState::Running, std::memory_order_release);
+
+    // Spawn initial threads if needed
+    for (std::size_t i = 0; i < _initialSize; ++i)
+    {
+      spawnWorker();
+    }
+
+    return LifecycleResult(true, LifecycleState::Running, "ThreadPool started");
+  }
+
+  /// Begin graceful drain (Running → Draining)
+  /// @param timeoutMs Maximum time to wait for in-flight work (0 = wait indefinitely)
+  /// @return Result with drain statistics
+  iora::common::LifecycleResult drain(std::uint32_t timeoutMs = 30000) override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+    using iora::common::DrainStats;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // Can only drain from Running state
+    if (currentState != LifecycleState::Running)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only drain from Running state");
+    }
+
+    // Transition to Draining and stop accepting new work
+    _lifecycleState.store(LifecycleState::Draining, std::memory_order_release);
+    _accepting.store(false, std::memory_order_release);
+
+    // Capture initial in-flight count
+    std::uint32_t inFlightAtStart = getInFlightCount();
+
+    // Wait for all in-flight work to complete (using existing shutdown phase 3 logic)
+    int waitMs = 0;
+    const int maxWaitMs = (timeoutMs == 0) ? 3600000 : static_cast<int>(timeoutMs); // 1 hour if 0
+
+    std::uint32_t finalActiveCount = 0;
+    std::uint32_t finalPendingCount = 0;
+    bool timedOut = false;
+
+    while (waitMs < maxWaitMs)
+    {
+      auto activeCount = _activeThreads.load(std::memory_order_acquire);
+      auto pendingCount = getPendingTaskCount();
+
+      if (activeCount == 0 && pendingCount == 0)
+      {
+        finalActiveCount = 0;
+        finalPendingCount = 0;
+        break;
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      waitMs += 50;
+    }
+
+    if (waitMs >= maxWaitMs)
+    {
+      finalActiveCount = _activeThreads.load(std::memory_order_acquire);
+      finalPendingCount = static_cast<std::uint32_t>(getPendingTaskCount());
+      timedOut = true;
+    }
+
+    // Calculate drain statistics
+    std::uint32_t remaining = finalActiveCount + finalPendingCount;
+    std::uint32_t completed = inFlightAtStart - remaining;
+
+    DrainStats stats(inFlightAtStart, remaining, 0, completed);
+
+    if (timedOut)
+    {
+      return LifecycleResult(false, LifecycleState::Draining,
+                             "Drain timed out with " + std::to_string(remaining) +
+                             " tasks remaining", stats);
+    }
+
+    return LifecycleResult(true, LifecycleState::Draining,
+                           "Drain completed, all " + std::to_string(completed) +
+                           " tasks finished", stats);
+  }
+
+  /// Stop the thread pool (Draining → Stopped)
+  /// @return Result indicating success and new state
+  iora::common::LifecycleResult stop() override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // Can stop from Running or Draining state
+    if (currentState != LifecycleState::Running && currentState != LifecycleState::Draining)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only stop from Running or Draining state");
+    }
+
+    // If not already draining, drain first
+    if (currentState == LifecycleState::Running)
+    {
+      auto drainResult = drain();
+      if (!drainResult.success)
+      {
+        return LifecycleResult(false, LifecycleState::Draining,
+                               "Drain failed during stop: " + drainResult.message);
+      }
+    }
+
+    // Call existing shutdown() method to join threads
+    shutdown();
+
+    _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
+
+    return LifecycleResult(true, LifecycleState::Stopped, "ThreadPool stopped");
+  }
+
+  /// Reset to clean state (Stopped → Reset)
+  /// @return Result indicating success and new state
+  iora::common::LifecycleResult reset() override
+  {
+    using iora::common::LifecycleState;
+    using iora::common::LifecycleResult;
+
+    auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    // Can only reset from Stopped state
+    if (currentState != LifecycleState::Stopped)
+    {
+      return LifecycleResult(false, currentState,
+                             "Can only reset from Stopped state");
+    }
+
+    // Clear any remaining tasks
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      while (!_tasks.empty())
+      {
+        _tasks.pop();
+      }
+      _threads.clear();
+    }
+
+    // Reset counters
+    _activeThreads.store(0, std::memory_order_release);
+    _busyThreads.store(0, std::memory_order_release);
+    _threadsCreated.store(0, std::memory_order_release);
+    _threadsStarted.store(0, std::memory_order_release);
+    _threadsExiting.store(0, std::memory_order_release);
+    _threadsExited.store(0, std::memory_order_release);
+    _waitingThreads.store(0, std::memory_order_release);
+
+    _lifecycleState.store(LifecycleState::Reset, std::memory_order_release);
+
+    return LifecycleResult(true, LifecycleState::Reset, "ThreadPool reset");
+  }
+
+  /// Get current lifecycle state
+  /// @return Current lifecycle state
+  iora::common::LifecycleState getState() const override
+  {
+    return _lifecycleState.load(std::memory_order_acquire);
+  }
+
+  /// Get in-flight work count (for monitoring during drain)
+  /// @return Number of tasks in queue + actively executing
+  std::uint32_t getInFlightCount() const override
+  {
+    auto pending = static_cast<std::uint32_t>(getPendingTaskCount());
+    auto active = static_cast<std::uint32_t>(_activeThreads.load(std::memory_order_acquire));
+    return pending + active;
+  }
+
 private:
   void enqueueImpl(std::function<void()> f)
   {
+    // Check if accepting new work (for graceful drain support)
+    if (!_accepting.load(std::memory_order_acquire))
+    {
+      throw std::runtime_error("ThreadPool is draining and not accepting new work");
+    }
+
     bool shouldSpawn = false;
     {
       std::unique_lock<std::mutex> lock(_mutex);
@@ -476,6 +705,12 @@ private:
 
   bool tryEnqueueImpl(std::function<void()> f)
   {
+    // Check if accepting new work (for graceful drain support)
+    if (!_accepting.load(std::memory_order_acquire))
+    {
+      return false; // Draining, reject task
+    }
+
     bool shouldSpawn = false;
     {
       std::unique_lock<std::mutex> lock(_mutex);
@@ -886,6 +1121,12 @@ private:
 
   // Shutdown mode configuration (GRACEFUL shutdown support)
   ShutdownMode _shutdownMode{ShutdownMode::IMMEDIATE};  // Default: backward compatible
+
+  // ═══════════════════════════════════════════════════════════════════
+  // ILifecycleManaged Interface Members
+  // ═══════════════════════════════════════════════════════════════════
+  std::atomic<iora::common::LifecycleState> _lifecycleState{iora::common::LifecycleState::Created};
+  std::atomic<bool> _accepting{false};  // Flag to control acceptance of new work during drain
 };
 
 } // namespace core
