@@ -53,6 +53,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_async
     network/iora_test_dns_comprehensive
     network/iora_test_http
+    network/iora_test_http_client_pool
     network/iora_test_shared_tcp
     network/iora_test_shared_transport_timers
     network/iora_test_shared_udp

@@ -53,6 +53,7 @@
   - [Architecture Benefits](#️-architecture-benefits)
 - [🌐 HTTP Client & Server](#-http-client--server)
   - [HttpClient - Advanced HTTP Client](#httpclient---advanced-http-client)
+  - [HttpClientPool - Connection Pool Manager](#httpclientpool---connection-pool-manager)
   - [WebhookServer - Production HTTP Server](#webhookserver---production-http-server)
   - [Configuration & TLS Support](#configuration--tls-support)
   - [Usage Examples](#usage-examples)
@@ -143,6 +144,7 @@ Iora is **completely self-contained** with all functionality built-in:
 ### 🌐 Network & Transport
 - **UnifiedSharedTransport** — High-performance transport layer with TCP/UDP support
 - **network::HttpClient** — Advanced HTTP client with connection pooling and retry logic
+- **network::HttpClientPool** — Thread-safe HTTP client pool with RAII-based resource management
 - **network::WebhookServer** — Production-grade webhook server with TLS and authentication
 - **network::CircuitBreaker** — Prevent cascade failures with configurable circuit breaking
 - **network::ConnectionHealth** — Real-time connection monitoring and automatic recovery
@@ -1924,6 +1926,268 @@ try {
     std::cerr << "HTTP request error: " << e.what() << std::endl;
 }
 ```
+
+### HttpClientPool - Connection Pool Manager
+
+The `HttpClientPool` provides a thread-safe pool of reusable `HttpClient` instances with automatic lifecycle management through RAII wrappers. Ideal for high-throughput applications requiring concurrent HTTP requests with controlled resource usage.
+
+#### 🎯 **Core Features**
+- **Thread-Safe Pooling** — Multiple threads can safely acquire and return clients
+- **RAII Resource Management** — Clients automatically return to pool when out of scope
+- **Blocking & Non-Blocking Modes** — get(), tryGet(), and timeout-based acquisition
+- **Bounded Resource Control** — Configurable pool size prevents resource exhaustion
+- **Automatic Backpressure** — Pool exhaustion provides natural flow control
+- **Zero Configuration Overhead** — Pre-populated pool ready on construction
+- **Statistics & Monitoring** — Real-time pool utilization and availability metrics
+- **Graceful Shutdown** — Clean teardown with client return tracking
+
+#### 📊 **Configuration Options**
+
+```cpp
+iora::network::HttpClientPool::Config config;
+
+// Pool sizing
+config.poolSize = 20;                                  // Number of clients in pool
+
+// HTTP client settings (applied to all clients)
+config.requestTimeout = std::chrono::seconds(30);      // Request timeout
+config.connectionTimeout = std::chrono::seconds(10);   // Connection timeout
+config.enableKeepAlive = true;                         // HTTP keep-alive
+config.followRedirects = true;                         // Follow redirects
+config.maxRedirects = 5;                               // Max redirect hops
+config.userAgent = "MyApp/2.0";                        // User agent string
+
+// Optional TLS configuration (applied to all clients)
+iora::network::HttpClient::TlsConfig tlsConfig;
+tlsConfig.caFile = "/path/to/ca-cert.pem";
+tlsConfig.verifyPeer = true;
+config.tlsConfig = tlsConfig;
+
+// Custom client factory (optional)
+config.clientFactory = []() {
+    return std::make_unique<iora::network::HttpClient>();
+};
+
+// Custom client configurer (optional)
+config.clientConfigurer = [](iora::network::HttpClient& client) {
+    // Additional per-client configuration
+};
+
+auto pool = iora::network::HttpClientPool(config);
+```
+
+#### 🚀 **Usage Examples**
+
+**Basic Usage with Automatic Return:**
+```cpp
+#include "iora/network/http_client_pool.hpp"
+
+// Create pool with 10 clients
+iora::network::HttpClientPool::Config config;
+config.poolSize = 10;
+config.requestTimeout = std::chrono::seconds(30);
+
+iora::network::HttpClientPool pool(config);
+
+// Get client, use it, automatically returns on scope exit
+{
+    auto client = pool.get();
+    auto response = client.get("https://api.example.com/users");
+
+    if (response.success()) {
+        std::cout << "Users: " << response.body << std::endl;
+    }
+}  // Client automatically returned to pool here
+
+// Pool statistics
+std::cout << "Pool capacity: " << pool.capacity() << std::endl;
+std::cout << "Clients available: " << pool.available() << std::endl;
+std::cout << "Clients in use: " << pool.inUse() << std::endl;
+std::cout << "Utilization: " << pool.utilization() << "%" << std::endl;
+```
+
+**Non-Blocking Acquisition with Backpressure:**
+```cpp
+// Try to get client without blocking
+if (auto client = pool.tryGet()) {
+    auto response = client->post("https://api.example.com/events", eventData);
+} else {
+    // Pool exhausted - apply backpressure
+    std::cerr << "Pool exhausted, dropping request" << std::endl;
+    metrics.incrementDropped();
+}
+```
+
+**Timeout-Based Acquisition:**
+```cpp
+// Wait up to 5 seconds for available client
+if (auto client = pool.get(std::chrono::seconds(5))) {
+    auto response = client->postJson("https://api.example.com/data", jsonPayload);
+    processResponse(response);
+} else {
+    // Timeout - no client available within 5 seconds
+    std::cerr << "Timeout acquiring HTTP client from pool" << std::endl;
+}
+```
+
+**Multi-Threaded Usage:**
+```cpp
+// Multiple worker threads sharing the same pool
+std::vector<std::thread> workers;
+
+for (int i = 0; i < 20; ++i) {
+    workers.emplace_back([&pool, i]() {
+        // Each thread acquires clients from shared pool
+        for (int j = 0; j < 100; ++j) {
+            auto client = pool.get();  // Blocks until client available
+
+            auto response = client.get("https://api.example.com/endpoint/" +
+                                      std::to_string(i * 100 + j));
+
+            if (response.success()) {
+                processData(response.body);
+            }
+        }  // Client returned automatically
+    });
+}
+
+for (auto& t : workers) {
+    t.join();
+}
+
+// All clients returned to pool
+assert(pool.available() == pool.capacity());
+```
+
+**Multiple Requests with Same Client:**
+```cpp
+auto client = pool.get();
+
+// Perform multiple requests with same connection (keep-alive)
+auto users = client.get("https://api.example.com/users");
+auto posts = client.get("https://api.example.com/posts");
+auto comments = client.get("https://api.example.com/comments");
+
+// Process all responses
+processUsers(users.body);
+processPosts(posts.body);
+processComments(comments.body);
+
+// Client returned on scope exit
+```
+
+**Integration with ThreadPool:**
+```cpp
+// Dispatch HTTP requests to thread pool, managed by client pool
+iora::network::HttpClientPool clientPool(poolConfig);
+iora::core::ThreadPool threadPool(8, 16);
+
+for (const auto& url : urls) {
+    threadPool.enqueue([&clientPool, url]() {
+        auto client = clientPool.get();
+        auto response = client.get(url);
+        processResponse(response);
+        // Client automatically returned when lambda completes
+    });
+}
+```
+
+**Graceful Shutdown:**
+```cpp
+// Signal shutdown
+clientPool.close();
+
+// Existing PooledHttpClient instances can still be used
+// New acquisitions will fail
+
+// Wait for in-flight requests to complete
+while (clientPool.inUse() > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+}
+
+std::cout << "All clients returned, safe to shutdown" << std::endl;
+```
+
+#### 🔧 **Advanced Features**
+
+**Pool Monitoring:**
+```cpp
+void monitorPool(const iora::network::HttpClientPool& pool) {
+    std::cout << "=== HTTP Client Pool Status ===" << std::endl;
+    std::cout << "Capacity: " << pool.capacity() << std::endl;
+    std::cout << "Available: " << pool.available() << std::endl;
+    std::cout << "In Use: " << pool.inUse() << std::endl;
+    std::cout << "Utilization: " << std::fixed << std::setprecision(1)
+              << pool.utilization() << "%" << std::endl;
+    std::cout << "Empty: " << (pool.empty() ? "yes" : "no") << std::endl;
+    std::cout << "Full: " << (pool.full() ? "yes" : "no") << std::endl;
+}
+
+// Call periodically for observability
+std::thread monitor([&pool]() {
+    while (!shutdown) {
+        monitorPool(pool);
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+    }
+});
+```
+
+**RAII Semantics:**
+```cpp
+// PooledHttpClient is move-only
+auto client1 = pool.get();
+auto client2 = std::move(client1);  // Transfer ownership
+
+// client1 is now invalid
+assert(!client1.isValid());
+assert(client2.isValid());
+
+// client2 will return to pool on destruction
+```
+
+**Custom Headers and Configuration:**
+```cpp
+iora::network::HttpClientPool::Config config;
+config.poolSize = 5;
+
+// Default headers applied to all pool clients
+config.defaultHeaders = {
+    {"Authorization", "Bearer token123"},
+    {"X-API-Version", "v2"},
+    {"Accept", "application/json"}
+};
+
+iora::network::HttpClientPool pool(config);
+
+auto client = pool.get();
+// All requests inherit default headers
+auto response = client.get("https://api.example.com/data");
+```
+
+#### ⚠️ **Best Practices**
+
+✅ **DO:**
+- Size pool based on expected concurrent request load
+- Use `tryGet()` for backpressure-sensitive applications
+- Monitor pool utilization to detect bottlenecks
+- Keep acquired clients in tight scopes for quick return
+- Use timeout-based acquisition for bounded wait times
+
+❌ **DON'T:**
+- Hold clients longer than necessary (blocks other threads)
+- Ignore `nullopt` returns from `tryGet()` or timeout-based `get()`
+- Access moved-from `PooledHttpClient` instances
+- Create pool with size 0 (throws `std::invalid_argument`)
+- Perform long-running operations while holding a client
+
+#### 📈 **Performance Characteristics**
+
+- **Zero Allocation After Construction** — All clients pre-created
+- **Lock-Free Statistics** — Atomic counters for metrics
+- **Bounded Blocking** — Pool exhaustion provides natural backpressure
+- **Thread-Safe** — Lock-based synchronization via `BlockingQueue`
+- **Connection Reuse** — Keep-alive enabled by default
+- **Efficient Wake-up** — Condition variables for blocked threads
 
 ### WebhookServer - Production HTTP Server
 
