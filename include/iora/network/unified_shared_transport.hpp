@@ -248,6 +248,7 @@ public:
 
   void setCallbacks(const UnifiedCallbacks &cbs) override
   {
+    _callbacks = cbs; // Store for accumulation
     SharedUdpTransport::Callbacks u{};
     u.onAccept = cbs.onAccept;
     u.onConnect = cbs.onConnect;
@@ -328,41 +329,36 @@ public:
     return Capability::HasConnectViaListener | Capability::SupportsBatchSend;
   }
 
-  // ITransportBase callback setters (delegate to setCallbacks)
+  // ITransportBase callback setters (accumulate callbacks instead of replacing)
   void setDataCallback(DataCallback cb) override
   {
-    UnifiedCallbacks cbs;
-    cbs.onData = cb;
-    setCallbacks(cbs);
+    _callbacks.onData = cb;
+    applyCallbacks();
   }
 
   void setAcceptCallback(AcceptCallback cb) override
   {
-    UnifiedCallbacks cbs;
-    cbs.onAccept = [cb](SessionId sid, const std::string &peer, const IoResult &result)
+    _callbacks.onAccept = [cb](SessionId sid, const std::string &peer, const IoResult &result)
     { cb(sid, peer, result); };
-    setCallbacks(cbs);
+    applyCallbacks();
   }
 
   void setConnectCallback(ConnectCallback cb) override
   {
-    UnifiedCallbacks cbs;
-    cbs.onConnect = cb;
-    setCallbacks(cbs);
+    _callbacks.onConnect = cb;
+    applyCallbacks();
   }
 
   void setCloseCallback(CloseCallback cb) override
   {
-    UnifiedCallbacks cbs;
-    cbs.onClosed = cb;
-    setCallbacks(cbs);
+    _callbacks.onClosed = cb;
+    applyCallbacks();
   }
 
   void setErrorCallback(ErrorCallback cb) override
   {
-    UnifiedCallbacks cbs;
-    cbs.onError = cb;
-    setCallbacks(cbs);
+    _callbacks.onError = cb;
+    applyCallbacks();
   }
 
   BasicTransportStats getBasicStats() const override
@@ -383,8 +379,20 @@ public:
   const SharedUdpTransport &impl() const { return _impl; }
 
 private:
+  void applyCallbacks()
+  {
+    SharedUdpTransport::Callbacks u{};
+    u.onAccept = _callbacks.onAccept;
+    u.onConnect = _callbacks.onConnect;
+    u.onData = _callbacks.onData;
+    u.onClosed = _callbacks.onClosed;
+    u.onError = _callbacks.onError;
+    _impl.setCallbacks(u);
+  }
+
   SharedUdpTransport::TlsConfig _dummyTls{};
   SharedUdpTransport _impl;
+  UnifiedCallbacks _callbacks; // Store callbacks to accumulate them
 };
 
 /// \brief Unified transport providing sync/async operations for both TCP and
