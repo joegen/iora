@@ -15,6 +15,13 @@
   - [Comprehensive Statistics & Monitoring](#-comprehensive-statistics--monitoring)
   - [Usage Examples](#-usage-examples)
   - [Performance Characteristics](#-performance-characteristics)
+- [🔄 Thread-Safe Blocking Queue](#-thread-safe-blocking-queue)
+  - [Core Features](#-core-features-2)
+  - [Key Operations](#️-key-operations)
+  - [Use Cases](#-use-cases)
+  - [Advanced Features](#-advanced-features-1)
+  - [Performance Characteristics](#-performance-characteristics-1)
+  - [Best Practices](#-best-practices-1)
 - [🌐 Unified Network Transport System](#-unified-network-transport-system)
   - [Core Architecture](#-core-architecture)
   - [Transport Capabilities](#️-transport-capabilities)
@@ -147,6 +154,7 @@ Iora is **completely self-contained** with all functionality built-in:
 
 ### 🛠️ Development & Operations
 - **core::ThreadPool** — Dynamic, exception-safe thread pool with work stealing
+- **core::BlockingQueue<T>** — Thread-safe bounded queue with blocking operations and timeout support
 - **core::TimerService** — High-performance timer system with microsecond precision
 - **core::Logger** — Structured logging with async I/O and log rotation
 - **core::ConfigLoader** — Hot-reloadable TOML configuration with built-in parser (see [docs](docs/minimal_toml_parser.md))
@@ -591,6 +599,178 @@ void monitorTimerPerformance(const TimerService& service) {
 - **Exception Safe** — Comprehensive error handling with recovery strategies
 - **Resource Controlled** — Configurable limits prevent resource exhaustion
 - **Monitoring Ready** — Built-in statistics for observability and debugging
+
+---
+
+## 🔄 Thread-Safe Blocking Queue
+
+Iora's **BlockingQueue<T>** provides a production-ready, thread-safe bounded queue for multi-producer, multi-consumer scenarios. Designed for high-throughput concurrent systems requiring reliable work distribution and backpressure management.
+
+### ⚡ **Core Features**
+
+- **Blocking Operations** — Producers block when full, consumers block when empty
+- **Timeout Support** — All operations support configurable timeouts
+- **Bounded Capacity** — Enforced maximum size prevents memory exhaustion
+- **No Exceptions on Dequeue** — Returns bool for robust error handling
+- **Move Semantics** — Efficient zero-copy operations for large objects
+- **Graceful Shutdown** — close() wakes all blocked threads for clean teardown
+- **Header-Only** — Single template header with zero dependencies
+
+### 🛠️ **Key Operations**
+
+```cpp
+#include "iora/core/blocking_queue.hpp"
+using namespace iora::core;
+
+// Create queue with capacity of 100 items
+BlockingQueue<WorkItem> queue(100);
+
+// Producer thread - blocking enqueue
+WorkItem item{42, "data"};
+if (queue.queue(item)) {
+    // Item successfully queued
+}
+
+// Consumer thread - blocking dequeue
+WorkItem result;
+if (queue.dequeue(result)) {
+    // Process result
+}
+
+// Non-blocking operations
+if (queue.tryQueue(item)) {
+    // Queued without blocking
+}
+
+if (queue.tryDequeue(result)) {
+    // Dequeued without blocking
+}
+
+// Timeout-based operations
+if (queue.dequeue(result, std::chrono::seconds(5))) {
+    // Got item within 5 seconds
+} else {
+    // Timeout or queue closed
+}
+
+// Graceful shutdown
+queue.close();  // Wakes all waiting threads
+```
+
+### 🎯 **Use Cases**
+
+#### **Producer-Consumer Pattern**
+```cpp
+// Multiple producers
+std::vector<std::thread> producers;
+for (int i = 0; i < 4; ++i) {
+    producers.emplace_back([&queue, i]() {
+        for (int j = 0; j < 1000; ++j) {
+            WorkItem item{i, j};
+            queue.queue(std::move(item));
+        }
+    });
+}
+
+// Multiple consumers
+std::vector<std::thread> consumers;
+for (int i = 0; i < 4; ++i) {
+    consumers.emplace_back([&queue]() {
+        WorkItem item;
+        while (queue.dequeue(item, std::chrono::seconds(1))) {
+            processWork(item);
+        }
+    });
+}
+```
+
+#### **Backpressure Handling**
+```cpp
+// Try to enqueue with immediate failure on full queue
+if (!queue.tryQueue(item)) {
+    // Queue full - apply backpressure
+    metrics.incrementDropped();
+    logWarning("Queue full, dropping item");
+}
+
+// Or with timeout-based backpressure
+if (!queue.tryQueue(item, std::chrono::milliseconds(100))) {
+    // Couldn't enqueue within 100ms - system overloaded
+    sendServiceUnavailable();
+}
+```
+
+#### **Work Distribution with ThreadPool**
+```cpp
+BlockingQueue<Task> taskQueue(1000);
+ThreadPool workers(8, 16);
+
+// Dispatcher thread
+std::thread dispatcher([&]() {
+    Task task;
+    while (taskQueue.dequeue(task)) {
+        workers.enqueue([t = std::move(task)]() {
+            t.execute();
+        });
+    }
+});
+
+// Producers add work to queue
+taskQueue.queue(Task{"job1"});
+taskQueue.queue(Task{"job2"});
+```
+
+### 🔧 **Advanced Features**
+
+- **Capacity Management**: `size()`, `empty()`, `full()`, `capacity()`
+- **Close Semantics**: Existing items can be dequeued after `close()`
+- **FIFO Ordering**: Guaranteed first-in-first-out ordering
+- **Type Safety**: Template-based, works with any movable or copyable type
+- **Thread Safety**: All operations are fully thread-safe
+- **Zero Allocation**: No dynamic allocation after construction
+
+### 📊 **Performance Characteristics**
+
+- **Lock-Free Waiting**: Uses condition variables for efficient thread synchronization
+- **Minimal Contention**: Separate locks for not-empty and not-full conditions
+- **Cache-Friendly**: Uses std::deque for optimal cache performance
+- **Move-Optimized**: Leverages move semantics to avoid copies
+
+### ⚠️ **Best Practices**
+
+```cpp
+// ✅ Good: Check return values
+WorkItem item;
+if (queue.dequeue(item)) {
+    process(item);
+} else {
+    // Queue closed and empty
+}
+
+// ✅ Good: Use timeouts for robustness
+if (queue.dequeue(item, std::chrono::seconds(30))) {
+    process(item);
+} else {
+    // Handle timeout
+}
+
+// ✅ Good: Graceful shutdown
+queue.close();  // Signal shutdown
+// Drain remaining items
+while (queue.tryDequeue(item)) {
+    process(item);
+}
+
+// ❌ Bad: Ignoring return values
+queue.dequeue(item);  // May fail if closed!
+process(item);  // Undefined behavior
+
+// ❌ Bad: Infinite blocking without shutdown handling
+while (true) {
+    queue.dequeue(item);  // Will hang if queue closed and empty
+    process(item);
+}
+```
 
 ---
 

@@ -68,6 +68,7 @@ endif()
 
 # Core namespace tests
 set(CORE_TESTS
+    core/iora_test_blocking_queue
     core/iora_test_config_loader
     core/iora_test_event_queue
     core/iora_test_external_logger
