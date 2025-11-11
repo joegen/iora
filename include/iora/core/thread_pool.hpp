@@ -798,7 +798,8 @@ private:
               // P0-CRITICAL FIX: Idle timeout - worker just exits without touching _threads map
               // The destructor will handle cleanup (join/detach) to prevent race condition
               // REMOVED: it->second.detach() and _threads.erase(it) - caused heap corruption
-              if (_threads.size() > _initialSize && _workerScaling)
+              std::size_t workerCount = _threadsCreated.load(std::memory_order_acquire) - _threadsExited.load(std::memory_order_acquire);
+              if (workerCount > _initialSize && _workerScaling)
               {
                 VALIDATE_CANARY();
                 // Worker thread exits cleanly - destructor will clean up _threads map entry
@@ -1106,7 +1107,7 @@ private:
   const std::size_t _maxSize;
   const std::chrono::milliseconds _idleTimeout;
   const std::size_t _maxQueueSize;
-  bool _workerScaling { false };
+  bool _workerScaling { true };
 
   std::atomic<bool> _shutdown;
   std::atomic<std::size_t> _activeThreads; // Threads actively executing tasks
