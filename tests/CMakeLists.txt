@@ -75,6 +75,7 @@ set(CORE_TESTS
     core/iora_test_external_logger
     core/iora_test_logger
     core/iora_test_threadpool
+    core/iora_test_threadpool_cleanup
     core/iora_test_threadpool_lifecycle
     core/iora_test_timer
     core/iora_test_timer_lifecycle

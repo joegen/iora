@@ -831,10 +831,26 @@ private:
                 if (claimedExitSlot)
                 {
                   VALIDATE_CANARY();
-                  // Worker thread exits cleanly - destructor will clean up _threads map entry
+                  // Worker thread exits cleanly - clean up _threads map entry
                   // NOTE: Removed std::cerr trace - std::cerr uses TLS and causes
                   // "double free or corruption (!prev)" during pthread TLS cleanup
                   // _threadsExited already incremented by CAS above
+
+                  // Clean up our entry in the _threads map
+                  // We already hold _mutex from the unique_lock above
+                  auto myId = std::this_thread::get_id();
+                  auto it = _threads.find(myId);
+                  if (it != _threads.end())
+                  {
+                    // Detach the thread so it can exit without being joined
+                    // This is safe - a thread can detach itself
+                    if (it->second.joinable())
+                    {
+                      it->second.detach();
+                    }
+                    _threads.erase(it);
+                  }
+
                   return;
                 }
               }
