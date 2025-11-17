@@ -640,7 +640,6 @@ public:
     _busyThreads.store(0, std::memory_order_release);
     _threadsCreated.store(0, std::memory_order_release);
     _threadsStarted.store(0, std::memory_order_release);
-    _threadsExiting.store(0, std::memory_order_release);
     _threadsExited.store(0, std::memory_order_release);
     _waitingThreads.store(0, std::memory_order_release);
 
@@ -798,16 +797,46 @@ private:
               // P0-CRITICAL FIX: Idle timeout - worker just exits without touching _threads map
               // The destructor will handle cleanup (join/detach) to prevent race condition
               // REMOVED: it->second.detach() and _threads.erase(it) - caused heap corruption
-              std::size_t workerCount = _threadsCreated.load(std::memory_order_acquire) - _threadsExited.load(std::memory_order_acquire);
-              if (workerCount > _initialSize && _workerScaling)
+
+              // Use atomic CAS to safely claim exit slot - prevents race where multiple
+              // threads simultaneously decide to exit and drop below _initialSize
+              if (_workerScaling)
               {
-                VALIDATE_CANARY();
-                // Worker thread exits cleanly - destructor will clean up _threads map entry
-                // NOTE: Removed std::cerr trace - std::cerr uses TLS and causes
-                // "double free or corruption (!prev)" during pthread TLS cleanup
-                _threadsExiting.fetch_add(1, std::memory_order_relaxed);
-                _threadsExited.fetch_add(1, std::memory_order_relaxed);
-                return;
+                int currentExited = _threadsExited.load(std::memory_order_acquire);
+                bool claimedExitSlot = false;
+
+                while (true)
+                {
+                  std::size_t workerCount = static_cast<std::size_t>(
+                    _threadsCreated.load(std::memory_order_acquire) - currentExited);
+                  if (workerCount <= _initialSize)
+                  {
+                    // Would drop to or below minimum - don't exit
+                    break;
+                  }
+                  // Try to atomically claim this exit slot
+                  // If another thread beats us, currentExited is updated and we retry
+                  if (_threadsExited.compare_exchange_weak(
+                        currentExited,
+                        currentExited + 1,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+                  {
+                    claimedExitSlot = true;
+                    break;
+                  }
+                  // CAS failed - currentExited has been updated, loop will recalculate
+                }
+
+                if (claimedExitSlot)
+                {
+                  VALIDATE_CANARY();
+                  // Worker thread exits cleanly - destructor will clean up _threads map entry
+                  // NOTE: Removed std::cerr trace - std::cerr uses TLS and causes
+                  // "double free or corruption (!prev)" during pthread TLS cleanup
+                  // _threadsExited already incremented by CAS above
+                  return;
+                }
               }
               continue;
             }
@@ -818,7 +847,6 @@ private:
               VALIDATE_CANARY();
               // NOTE: Removed std::cerr trace - std::cerr uses TLS and causes
               // "double free or corruption (!prev)" during pthread TLS cleanup
-              _threadsExiting.fetch_add(1, std::memory_order_relaxed);
               _threadsExited.fetch_add(1, std::memory_order_relaxed);
               return;
             }
@@ -1116,7 +1144,6 @@ private:
   // Lambda corruption detection - thread lifecycle tracking
   std::atomic<int> _threadsCreated{0};   // Total threads spawned
   std::atomic<int> _threadsStarted{0};   // Total threads that began executing
-  std::atomic<int> _threadsExiting{0};   // Total threads about to return
   std::atomic<int> _threadsExited{0};    // Total threads that returned from lambda
   std::atomic<int> _waitingThreads{0};   // Number of threads currently blocked on condition_variable
 
