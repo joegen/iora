@@ -720,3 +720,153 @@ TEST_CASE("HttpClientPool edge cases", "[http_client_pool][edge]")
     REQUIRE(pool.available() == pool.capacity());
   }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: High Concurrency - 1000 Connections
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("HttpClientPool 1000 concurrent connections with 200 OK", "[http_client_pool][high_concurrency]")
+{
+  HttpClientPoolTestFixture fixture;
+
+  HttpClientPool::Config config;
+  config.poolSize = 100; // Pool size for optimal concurrency
+  config.requestTimeout = std::chrono::seconds(5);
+  config.connectionTimeout = std::chrono::seconds(2); // Adequate timeout for high concurrency
+  HttpClientPool pool(config);
+
+  SECTION("1000 connections complete with 200 OK within 10 seconds")
+  {
+    const int totalConnections = 1000;
+    const int numThreads = 100; // Number of worker threads
+    const int connectionsPerThread = totalConnections / numThreads;
+
+    std::atomic<int> successCount{0};
+    std::atomic<int> failureCount{0};
+    std::atomic<int> non200Count{0};
+    std::atomic<int> exceptionCount{0};
+    std::mutex exceptionMutex;
+    std::vector<std::string> exceptionMessages;
+
+    // Start timing
+    auto startTime = std::chrono::steady_clock::now();
+
+    // Launch worker threads
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+
+    for (int i = 0; i < numThreads; ++i)
+    {
+      threads.emplace_back(
+        [&, threadId = i]()
+        {
+          for (int j = 0; j < connectionsPerThread; ++j)
+          {
+            bool requestSucceeded = false;
+            int retries = 0;
+            const int maxRetries = 3;
+
+            while (!requestSucceeded && retries < maxRetries)
+            {
+              try
+              {
+                auto client = pool.get();
+                if (!client.isValid())
+                {
+                  failureCount++;
+                  break;
+                }
+
+                auto response = client.get("http://localhost:8082/test-get");
+
+                if (response.success())
+                {
+                  if (response.statusCode == 200)
+                  {
+                    successCount++;
+                    requestSucceeded = true;
+                  }
+                  else
+                  {
+                    non200Count++;
+                    requestSucceeded = true;
+                  }
+                }
+                else
+                {
+                  failureCount++;
+                  requestSucceeded = true;
+                }
+              }
+              catch (const std::exception &e)
+              {
+                std::string errMsg(e.what());
+                // Retry on localhost connection timeout (transient under high concurrency)
+                if (errMsg.find("Localhost connection taking too long") != std::string::npos && retries < maxRetries - 1)
+                {
+                  retries++;
+                  continue;
+                }
+
+                exceptionCount++;
+                std::lock_guard<std::mutex> lock(exceptionMutex);
+                if (exceptionMessages.size() < 10)
+                {
+                  exceptionMessages.push_back(e.what());
+                }
+                requestSucceeded = true; // Exit retry loop
+              }
+              catch (...)
+              {
+                exceptionCount++;
+                std::lock_guard<std::mutex> lock(exceptionMutex);
+                if (exceptionMessages.size() < 10)
+                {
+                  exceptionMessages.push_back("Unknown exception");
+                }
+                requestSucceeded = true; // Exit retry loop
+              }
+            }
+          }
+        });
+    }
+
+    // Wait for all threads to complete
+    for (auto &t : threads)
+    {
+      t.join();
+    }
+
+    // Calculate elapsed time
+    auto endTime = std::chrono::steady_clock::now();
+    auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime).count();
+
+    // Print diagnostic info if there are failures
+    int totalProcessed = successCount.load() + failureCount.load() + non200Count.load() + exceptionCount.load();
+
+    std::cout << "=== Test Results ===" << std::endl;
+    std::cout << "Success: " << successCount.load() << std::endl;
+    std::cout << "Failures: " << failureCount.load() << std::endl;
+    std::cout << "Non-200: " << non200Count.load() << std::endl;
+    std::cout << "Exceptions: " << exceptionCount.load() << std::endl;
+    std::cout << "Total Processed: " << totalProcessed << " / " << totalConnections << std::endl;
+    std::cout << "Elapsed: " << elapsedSeconds << " seconds" << std::endl;
+    if (!exceptionMessages.empty())
+    {
+      std::cout << "Exception samples:" << std::endl;
+      for (const auto &msg : exceptionMessages)
+      {
+        std::cout << "  - " << msg << std::endl;
+      }
+    }
+    std::cout << "===================" << std::endl;
+
+    // Assertions
+    REQUIRE(successCount.load() == totalConnections);
+    REQUIRE(failureCount.load() == 0);
+    REQUIRE(non200Count.load() == 0);
+    REQUIRE(exceptionCount.load() == 0);
+    REQUIRE(elapsedSeconds <= 10);
+    REQUIRE(pool.available() == pool.capacity()); // All clients returned to pool
+  }
+}
