@@ -301,12 +301,15 @@ public:
     {
       return true;
     }
+    IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() called for sid=" << sid << ", size=" << n);
     ByteBuffer b(n);
     std::memcpy(b.data(), data, n);
     SendReq sr;
     sr.sid = sid;
     sr.payload = std::move(b);
-    return enqueue(Command::send(std::move(sr)));
+    bool result = enqueue(Command::send(std::move(sr)));
+    IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() enqueue " << (result ? "succeeded" : "failed") << " for sid=" << sid);
+    return result;
   }
 
   /// \brief Close a session (idempotent). onClosed will fire.
@@ -358,6 +361,14 @@ public:
   {
     std::lock_guard<std::mutex> g(_fatalMx);
     return _lastFatal;
+  }
+
+  /// \brief Get I/O thread ID for deadlock detection
+  /// \return Thread ID of the I/O event loop thread, or default-constructed ID if not running
+  /// \note Used by SyncAsyncTransport to detect when sendSync() is called from I/O thread context
+  std::thread::id getIoThreadId() const
+  {
+    return _loop.get_id();
   }
 
 private:
@@ -1296,6 +1307,33 @@ private:
     tg->isListener = false;
     tg->sess = _sessions[cr.sid].get();
     _fdTags.emplace(cfd, std::move(tg));
+
+    // DEFENSE-IN-DEPTH: Check if socket is already writable (handles immediate connects)
+    // This prevents edge-triggered epoll from missing the initial EPOLLOUT event
+    // when the TCP handshake completes before the first epoll_wait()
+    // Only do this for non-TLS connections; TLS needs handshake to complete first
+    if (cr.tls == TlsMode::None)
+    {
+      int err = 0;
+      socklen_t el = sizeof(err);
+      if (::getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+      {
+        IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] Socket is already writable for sid=" << cr.sid
+                       << ", firing connect callback immediately");
+        // Socket is already writable - connection completed immediately
+        // Manually trigger the connect callback
+        std::lock_guard<std::mutex> g(_cbMutex);
+        if (_cbs.onConnect)
+        {
+          _atomicStats.connected++;
+          _cbs.onConnect(cr.sid, IoResult::success());
+        }
+        _sessions[cr.sid]->connectPending = false;
+        _sessions[cr.sid]->lastWriteProgress = MonoClock::now();
+        cancelConnectTimeout(_sessions[cr.sid].get());
+      }
+    }
+
     return true;
   }
 
@@ -1306,19 +1344,29 @@ private:
       return;
     }
 
+    IORA_LOG_DEBUG("[EPOLL-EVENT] onSession called for sid=" << s->id
+                   << ", events=0x" << std::hex << events << std::dec
+                   << ", connectPending=" << s->connectPending
+                   << ", tlsMode=" << static_cast<int>(s->tlsMode));
+
     if (events & EPOLLOUT)
     {
+      IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT detected for sid=" << s->id
+                     << ", checking for connection errors");
       int err = 0;
       socklen_t el = sizeof(err);
       if (::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0)
       {
+        IORA_LOG_DEBUG("[EPOLL-EVENT] Connection error detected: " << std::strerror(err));
         closeNow(s, TransportError::Connect, std::strerror(err), 0);
         return;
       }
+      IORA_LOG_DEBUG("[EPOLL-EVENT] No connection errors detected");
     }
 
     if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake)
     {
+      IORA_LOG_DEBUG("[EPOLL-EVENT] TLS handshake in progress for sid=" << s->id);
       if (!driveHandshake(s))
       {
         return;
@@ -1326,18 +1374,32 @@ private:
     }
     else
     {
+      IORA_LOG_DEBUG("[EPOLL-EVENT] Not in TLS handshake, checking EPOLLOUT for connect callback");
       if (events & EPOLLOUT)
       {
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onConnect)
+        IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT is set, connectPending=" << s->connectPending);
+        if (s->connectPending)
         {
-          _atomicStats.connected++;
-          _cbs.onConnect(s->id, IoResult::success());
+          IORA_LOG_DEBUG("[EPOLL-EVENT] Firing connect callback for sid=" << s->id);
+          std::lock_guard<std::mutex> g(_cbMutex);
+          if (_cbs.onConnect)
+          {
+            _atomicStats.connected++;
+            _cbs.onConnect(s->id, IoResult::success());
+          }
+          s->connectPending = false;
+          s->lastWriteProgress = MonoClock::now();
+          cancelConnectTimeout(s);
+          updateInterest(s);
         }
-        s->connectPending = false;
-        s->lastWriteProgress = MonoClock::now();
-        cancelConnectTimeout(s);
-        updateInterest(s);
+        else
+        {
+          IORA_LOG_DEBUG("[EPOLL-EVENT] connectPending is false, skipping connect callback");
+        }
+      }
+      else
+      {
+        IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT not set in events mask");
       }
     }
 
@@ -1446,10 +1508,12 @@ private:
       else
       {
         n = ::recv(s->fd, buf.data(), (int)buf.size(), 0);
+        IORA_LOG_DEBUG("[RECV] recv() called for sid=" << s->id << ", returned n=" << n << ", errno=" << errno);
         if (n < 0)
         {
           if (errno == EAGAIN || errno == EWOULDBLOCK)
           {
+            IORA_LOG_DEBUG("[RECV] EAGAIN/EWOULDBLOCK for sid=" << s->id << ", breaking from read loop");
             break;
           }
           closeNow(s, TransportError::Socket, lastErr(), 0);
@@ -1471,7 +1535,12 @@ private:
         std::lock_guard<std::mutex> g(_cbMutex);
         if (_cbs.onData)
         {
+          IORA_LOG_DEBUG("[RECV] Calling onData callback for sid=" << s->id << ", bytes=" << n);
           _cbs.onData(s->id, buf.data(), (std::size_t)n, IoResult::success());
+        }
+        else
+        {
+          IORA_LOG_WARN("[RECV] onData callback is NULL for sid=" << s->id << ", dropping " << n << " bytes");
         }
       }
       else
@@ -1543,7 +1612,10 @@ private:
     std::uint32_t ev = EPOLLIN;
     if (_cfg.useEdgeTriggered)
       ev |= EPOLLET;
-    if (s->wantWrite || !s->wq.empty() || s->tlsState == TlsState::Handshake)
+    // CRITICAL FIX: Keep EPOLLOUT registered while connection is pending
+    // This ensures we receive the EPOLLOUT event when TCP handshake completes,
+    // even in edge-triggered mode where events can be missed if we unregister too early
+    if (s->wantWrite || !s->wq.empty() || s->tlsState == TlsState::Handshake || s->connectPending)
     {
       ev |= EPOLLOUT;
     }
@@ -1552,23 +1624,32 @@ private:
 
   void doSend(SendReq &&sr)
   {
+    IORA_LOG_DEBUG("[IO-THREAD] doSend() called for sid=" << sr.sid << ", payload size=" << sr.payload.size());
+
     auto it = _sessions.find(sr.sid);
     if (it == _sessions.end())
     {
+      IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " not found");
       return;
     }
     Session *s = it->second.get();
     if (s->closed)
     {
+      IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " is closed");
       return;
     }
+
+    IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " wq.size=" << s->wq.size()
+                  << ", tlsMode=" << (int)s->tlsMode << ", fd=" << s->fd);
 
     if (s->wq.empty())
     {
       int n = 0;
       if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
       {
+        IORA_LOG_DEBUG("[IO-THREAD] About to call SSL_write for sid=" << sr.sid << ", size=" << sr.payload.size());
         n = ::SSL_write(s->ssl, sr.payload.data(), (int)sr.payload.size());
+        IORA_LOG_DEBUG("[IO-THREAD] SSL_write returned " << n << " for sid=" << sr.sid);
         if (n > 0)
         {
           _atomicStats.bytesOut += n;
@@ -1582,9 +1663,11 @@ private:
           unsigned long e = ::ERR_get_error();
           char msg[256];
           ::ERR_error_string_n(e, msg, sizeof(msg));
+          IORA_LOG_DEBUG("[IO-THREAD] SSL error for sid=" << sr.sid << ", error=" << msg);
           closeNow(s, TransportError::TLSIO, msg, (int)e);
           return;
         }
+        IORA_LOG_DEBUG("[IO-THREAD] SSL_write would block for sid=" << sr.sid << ", queuing data");
       }
       else
       {
@@ -1594,16 +1677,26 @@ private:
           _atomicStats.bytesOut += n;
           s->lastActivity = MonoClock::now();
           s->lastWriteProgress = MonoClock::now();
+
+          // Check if partial write occurred
+          if (static_cast<size_t>(n) < sr.payload.size())
+          {
+            IORA_LOG_WARN("[IO-THREAD] PARTIAL WRITE for sid=" << sr.sid << ": sent " << n
+                         << " of " << sr.payload.size() << " bytes");
+          }
           return;
         }
         if (!(errno == EAGAIN || errno == EWOULDBLOCK))
         {
+          IORA_LOG_DEBUG("[IO-THREAD] Socket error for sid=" << sr.sid << ", errno=" << errno << ", msg=" << lastErr());
           closeNow(s, TransportError::Socket, lastErr(), 0);
           return;
         }
+        IORA_LOG_DEBUG("[IO-THREAD] send() would block (EAGAIN/EWOULDBLOCK) for sid=" << sr.sid << ", queuing data");
       }
     }
 
+    IORA_LOG_DEBUG("[IO-THREAD] Queueing data for sid=" << sr.sid << ", current wq.size=" << s->wq.size());
     s->wq.emplace_back(std::move(sr.payload));
     if (s->wq.size() == 1)
     {
@@ -1615,16 +1708,19 @@ private:
       _atomicStats.backpressureCloses++;
       if (_cfg.closeOnBackpressure)
       {
+        IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", closing connection");
         closeNow(s, TransportError::WriteBackpressure, "write queue overflow", 0);
         return;
       }
       else
       {
+        IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", dropping oldest");
         s->wq.pop_front();
       }
     }
     s->wantWrite = true;
     updateInterest(s);
+    IORA_LOG_DEBUG("[IO-THREAD] doSend() completed for sid=" << sr.sid << ", final wq.size=" << s->wq.size());
   }
 
   void closeNow(Session *s, TransportError why, const std::string &msg, int tlsErr)
@@ -1633,8 +1729,7 @@ private:
     {
       return;
     }
-    core::Logger::debug("Transport: closeNow called for session " + std::to_string(s->id) +
-                        ", reason: " + msg);
+    IORA_LOG_DEBUG("[IO-THREAD] closeNow called for session " << s->id << ", reason: " << msg);
     s->closed = true;
     cancelAllTimers(s);
 

@@ -1,0 +1,2341 @@
+Start testing: Sep 25 20:02 AWST
+----------------------------------------------------------
+1/32 Testing: network::iora_test_batch_integration
+1/32 Test: network::iora_test_batch_integration
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_batch_integration"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_batch_integration" start time: Sep 25 20:02 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (40 assertions in 7 test cases)
+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_batch_integration" end time: Sep 25 20:02 AWST
+"network::iora_test_batch_integration" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/32 Testing: network::iora_test_batch_processor
+2/32 Test: network::iora_test_batch_processor
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_batch_processor"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_batch_processor" start time: Sep 25 20:02 AWST
+Output:
+----------------------------------------------------------
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+iora_test_batch_processor is a Catch v2.13.10 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+EventBatchProcessor concurrency stress test
+  Handles high event rate
+-------------------------------------------------------------------------------
+/workspace/karoo_sbc/libs/iora/tests/network/iora_test_batch_processor.cpp:468
+...............................................................................
+
+/workspace/karoo_sbc/libs/iora/tests/network/iora_test_batch_processor.cpp:538: warning:
+  No batch processing activity detected - may be due to test environment
+  limitations
+
+===============================================================================
+All tests passed (37 assertions in 9 test cases)
+
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_batch_processor" end time: Sep 25 20:02 AWST
+"network::iora_test_batch_processor" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/32 Testing: network::iora_test_dns_basic
+3/32 Test: network::iora_test_dns_basic
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_dns_basic"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_dns_basic" start time: Sep 25 20:02 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (18 assertions in 3 test cases)
+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_dns_basic" end time: Sep 25 20:02 AWST
+"network::iora_test_dns_basic" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/32 Testing: network::iora_test_dns_timer_cancellation
+4/32 Test: network::iora_test_dns_timer_cancellation
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_dns_timer_cancellation"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_dns_timer_cancellation" start time: Sep 25 20:02 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:02:34] [INFO] Timer service loop started
+[2025-09-25 20:02:34] [INFO] Timer service started successfully
+[2025-09-25 20:02:34] [INFO] Stopping timer service
+[2025-09-25 20:02:34] [INFO] Timer service loop finished
+[2025-09-25 20:02:34] [INFO] Timer service stopped
+[2025-09-25 20:02:34] [INFO] Timer service started successfully
+[2025-09-25 20:02:34] [INFO] Stopping timer service
+[2025-09-25 20:02:34] [INFO] Timer service loop started
+[2025-09-25 20:02:34] [INFO] Timer service loop finished
+[2025-09-25 20:02:34] [INFO] Timer service stopped
+[2025-09-25 20:02:34] [INFO] Timer service started successfully
+[2025-09-25 20:02:34] [INFO] Timer service loop started
+[2025-09-25 20:02:34] [INFO] Stopping timer service
+[2025-09-25 20:02:34] [INFO] Timer service loop finished
+[2025-09-25 20:02:34] [INFO] Timer service stopped
+===============================================================================
+All tests passed (5 assertions in 1 test case)
+
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_dns_timer_cancellation" end time: Sep 25 20:02 AWST
+"network::iora_test_dns_timer_cancellation" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/32 Testing: network::iora_test_dns_async
+5/32 Test: network::iora_test_dns_async
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_dns_async"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_dns_async" start time: Sep 25 20:02 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (12 assertions in 2 test cases)
+
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_dns_async" end time: Sep 25 20:02 AWST
+"network::iora_test_dns_async" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/32 Testing: network::iora_test_dns_comprehensive
+6/32 Test: network::iora_test_dns_comprehensive
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_dns_comprehensive"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_dns_comprehensive" start time: Sep 25 20:02 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:02:34.194] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:34] [INFO] Timer service started successfully
+[2025-09-25 20:02:34] [INFO] Timer service loop started
+[2025-09-25 20:02:34] [INFO] Timer service started successfully
+[2025-09-25 20:02:34] [INFO] Timer service loop started
+[2025-09-25 20:02:34.595] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:34.596] [INFO] DNS sending UDP query: ID=55771 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:39.295] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:39] [INFO] Timer service started successfully
+[2025-09-25 20:02:39] [INFO] Timer service started successfully
+[2025-09-25 20:02:39] [INFO] Timer service loop started
+[2025-09-25 20:02:39] [INFO] Timer service loop started
+[2025-09-25 20:02:39.696] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:39.696] [INFO] DNS sending UDP query: ID=18983 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:44.396] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:44] [INFO] Timer service loop started
+[2025-09-25 20:02:44] [INFO] Timer service started successfully
+[2025-09-25 20:02:44] [INFO] Timer service started successfully
+[2025-09-25 20:02:44] [INFO] Timer service loop started
+[2025-09-25 20:02:44.797] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:44.797] [INFO] DNS sending UDP query: ID=45021 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:49.496] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:49] [INFO] Timer service started successfully
+[2025-09-25 20:02:49] [INFO] Timer service started successfully
+[2025-09-25 20:02:49] [INFO] Timer service loop started
+[2025-09-25 20:02:49] [INFO] Timer service loop started
+[2025-09-25 20:02:49.898] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:49.898] [INFO] DNS sending UDP query: ID=9186 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:54.597] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:54] [INFO] Timer service started successfully
+[2025-09-25 20:02:54] [INFO] Timer service loop started
+[2025-09-25 20:02:54] [INFO] Timer service started successfully
+[2025-09-25 20:02:54] [INFO] Timer service loop started
+[2025-09-25 20:02:55.006] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.006] [INFO] DNS sending UDP query: ID=14144 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.006] [INFO] DNS query completed with NXDOMAIN: ID=14144 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:02:55.007] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.007] [INFO] DNS sending UDP query: ID=6101 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.007] [INFO] DNS query completed with NXDOMAIN: ID=6101 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:02:55.007] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.007] [INFO] DNS sending UDP query: ID=132 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.007] [INFO] DNS query completed with NXDOMAIN: ID=132 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:02:55.007] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.007] [INFO] DNS sending UDP query: ID=60083 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.008] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.008] [INFO] DNS sending UDP query: ID=48216 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.008] [INFO] DNS query completed with NXDOMAIN: ID=48216 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:02:55.008] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.008] [INFO] DNS sending UDP query: ID=49890 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.008] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.008] [INFO] DNS sending UDP query: ID=14948 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.008] [INFO] DNS query completed with NXDOMAIN: ID=14948 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:02:55.008] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.008] [INFO] DNS sending UDP query: ID=13797 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.009] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:02:55.009] [INFO] DNS sending UDP query: ID=12707 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:02:55.009] [INFO] DNS query completed with NXDOMAIN: ID=12707 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:02:55.009] [INFO] DNS fresh service resolution completed for domain: example.com duration=2ms targets=2 success=true
+[2025-09-25 20:02:59.697] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59.698] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59.698] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59.698] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service started successfully
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+[2025-09-25 20:02:59] [INFO] Timer service loop started
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+iora_test_dns_comprehensive is a Catch v2.13.10 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+DNS UDP Truncation and TCP Fallback
+  TC bit triggers TCP fallback
+-------------------------------------------------------------------------------
+/workspace/karoo_sbc/libs/iora/tests/network/iora_test_dns_comprehensive.cpp:314
+...............................................................................
+
+/workspace/karoo_sbc/libs/iora/tests/network/iora_test_dns_comprehensive.cpp:353: warning:
+  UDP Truncation → TCP fallback test requires wire-mode MockDnsServer
+
+[2025-09-25 20:03:04.799] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:04] [INFO] Timer service started successfully
+[2025-09-25 20:03:04] [INFO] Timer service loop started
+[2025-09-25 20:03:04] [INFO] Timer service started successfully
+[2025-09-25 20:03:04] [INFO] Timer service loop started
+-------------------------------------------------------------------------------
+DNS TCP Fragmentation Reassembly
+  TCP response fragmentation handling
+-------------------------------------------------------------------------------
+/workspace/karoo_sbc/libs/iora/tests/network/iora_test_dns_comprehensive.cpp:362
+...............................................................................
+
+/workspace/karoo_sbc/libs/iora/tests/network/iora_test_dns_comprehensive.cpp:372: warning:
+  TCP fragmentation test requires enhanced MockDnsServer
+
+[2025-09-25 20:03:09.899] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:09] [INFO] Timer service started successfully
+[2025-09-25 20:03:09] [INFO] Timer service started successfully
+[2025-09-25 20:03:09] [INFO] Timer service loop started
+[2025-09-25 20:03:09] [INFO] Timer service loop started
+[2025-09-25 20:03:10.300] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:10.300] [INFO] DNS sending UDP query: ID=63422 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:15.000] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:15] [INFO] Timer service started successfully
+[2025-09-25 20:03:15] [INFO] Timer service started successfully
+[2025-09-25 20:03:15] [INFO] Timer service loop started
+[2025-09-25 20:03:15] [INFO] Timer service loop started
+[2025-09-25 20:03:15.401] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:15.401] [INFO] DNS sending UDP query: ID=57164 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:15.402] [INFO] DNS query completed with NXDOMAIN: ID=57164 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:03:20.101] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:20] [INFO] Timer service started successfully
+[2025-09-25 20:03:20] [INFO] Timer service started successfully
+[2025-09-25 20:03:20] [INFO] Timer service loop started
+[2025-09-25 20:03:20] [INFO] Timer service loop started
+[2025-09-25 20:03:20.501] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:20.501] [INFO] DNS sending UDP query: ID=64425 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:25.201] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:25] [INFO] Timer service started successfully
+[2025-09-25 20:03:25] [INFO] Timer service loop started
+[2025-09-25 20:03:25] [INFO] Timer service started successfully
+[2025-09-25 20:03:25] [INFO] Timer service loop started
+[2025-09-25 20:03:25] [INFO] Timer service started successfully
+[2025-09-25 20:03:25.602] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:25.602] [INFO] DNS sending UDP query: ID=16386 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:25] [INFO] Timer service loop started
+[2025-09-25 20:03:25.803] [WARN] DNS query completion for unknown query: ID=16386 server=127.0.0.1:15353
+[2025-09-25 20:03:30.301] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:30] [INFO] Timer service loop started
+[2025-09-25 20:03:30] [INFO] Timer service started successfully
+[2025-09-25 20:03:30] [INFO] Timer service started successfully
+[2025-09-25 20:03:30] [INFO] Timer service loop started
+[2025-09-25 20:03:30.702] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:30.702] [INFO] DNS sending UDP query: ID=24773 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:30.702] [INFO] DNS query completed with NXDOMAIN: ID=24773 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:03:35.401] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:35] [INFO] Timer service started successfully
+[2025-09-25 20:03:35] [INFO] Timer service started successfully
+[2025-09-25 20:03:35] [INFO] Timer service loop started
+[2025-09-25 20:03:35] [INFO] Timer service loop started
+[2025-09-25 20:03:35.803] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:35.803] [INFO] DNS sending UDP query: ID=22029 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:35.803] [INFO] DNS query completed with server error: ID=22029 server=127.0.0.1:15353 duration=0ms retries=0 rcode=SERVFAIL
+[2025-09-25 20:03:40.502] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:40] [INFO] Timer service started successfully
+[2025-09-25 20:03:40] [INFO] Timer service started successfully
+[2025-09-25 20:03:40] [INFO] Timer service loop started
+[2025-09-25 20:03:40] [INFO] Timer service loop started
+[2025-09-25 20:03:40.903] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:40] [INFO] Timer service started successfully
+[2025-09-25 20:03:40] [INFO] Timer service started successfully
+[2025-09-25 20:03:40] [INFO] Timer service loop started
+[2025-09-25 20:03:40] [INFO] Timer service loop started
+[2025-09-25 20:03:45.602] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:45] [INFO] Timer service started successfully
+[2025-09-25 20:03:45] [INFO] Timer service started successfully
+[2025-09-25 20:03:45] [INFO] Timer service loop started
+[2025-09-25 20:03:45] [INFO] Timer service loop started
+[2025-09-25 20:03:46.003] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:46.003] [INFO] DNS sending UDP query: ID=9716 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:51.020] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:51] [INFO] Timer service started successfully
+[2025-09-25 20:03:51] [INFO] Timer service loop started
+[2025-09-25 20:03:51] [INFO] Timer service started successfully
+[2025-09-25 20:03:51] [INFO] Timer service loop started
+[2025-09-25 20:03:51.421] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:51.421] [INFO] DNS sending UDP query: ID=32404 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:51.521] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:51] [INFO] Timer service started successfully
+[2025-09-25 20:03:51] [INFO] Timer service started successfully
+[2025-09-25 20:03:51] [INFO] Timer service loop started
+[2025-09-25 20:03:51] [INFO] Timer service loop started
+[2025-09-25 20:03:51.922] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:51.922] [INFO] DNS sending UDP query: ID=38464 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:52.421] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:52.421] [INFO] DNS sending UDP query: ID=49778 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:52.421] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:52.421] [INFO] DNS sending UDP query: ID=3894 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:52.421] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:52.421] [INFO] DNS sending UDP query: ID=683 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:52.421] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:52.421] [INFO] DNS sending UDP query: ID=8675 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:53.421] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:53.421] [INFO] DNS sending UDP query: ID=46519 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:53.422] [INFO] DNS query completed with NXDOMAIN: ID=46519 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:03:53.422] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:53.422] [INFO] DNS sending UDP query: ID=65005 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:03:53.422] [INFO] DNS query completed with NXDOMAIN: ID=65005 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:03:53.422] [INFO] DNS async fresh service resolution completed for domain: slow-service.example.com duration=2000ms targets=1 success=true
+[2025-09-25 20:03:56.622] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:03:56] [INFO] Timer service started successfully
+[2025-09-25 20:03:56] [INFO] Timer service started successfully
+[2025-09-25 20:03:56] [INFO] Timer service loop started
+[2025-09-25 20:03:56] [INFO] Timer service loop started
+[2025-09-25 20:03:57.022] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:03:57.022] [INFO] DNS sending UDP query: ID=2482 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:01.721] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:01] [INFO] Timer service started successfully
+[2025-09-25 20:04:01] [INFO] Timer service started successfully
+[2025-09-25 20:04:01] [INFO] Timer service loop started
+[2025-09-25 20:04:01] [INFO] Timer service loop started
+[2025-09-25 20:04:02.122] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.122] [INFO] DNS sending UDP query: ID=42787 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.122] [INFO] DNS query completed with NXDOMAIN: ID=42787 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:04:02.122] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.122] [INFO] DNS sending UDP query: ID=5578 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.122] [INFO] DNS query completed with NXDOMAIN: ID=5578 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:04:02.122] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.122] [INFO] DNS sending UDP query: ID=5355 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.122] [INFO] DNS query completed with NXDOMAIN: ID=5355 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:04:02.122] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.122] [INFO] DNS sending UDP query: ID=49496 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.122] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.122] [INFO] DNS sending UDP query: ID=49482 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.122] [INFO] DNS query completed with NXDOMAIN: ID=49482 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:04:02.122] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.122] [INFO] DNS sending UDP query: ID=23366 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.123] [INFO] DNS getNextServer: selected server=127.0.0.1:15353 (index=0 of 1 servers)
+[2025-09-25 20:04:02.123] [INFO] DNS sending UDP query: ID=13680 server=127.0.0.1:15353 retry=0
+[2025-09-25 20:04:02.123] [INFO] DNS query completed with NXDOMAIN: ID=13680 server=127.0.0.1:15353 duration=0ms retries=0 rcode=NXDOMAIN
+[2025-09-25 20:04:02.123] [INFO] DNS fresh service resolution completed for domain: service.example.com duration=1ms targets=1 success=true
+===============================================================================
+All tests passed (70 assertions in 13 test cases)
+
+<end of output>
+Test time =  92.64 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_dns_comprehensive" end time: Sep 25 20:04 AWST
+"network::iora_test_dns_comprehensive" time elapsed: 00:01:32
+----------------------------------------------------------
+
+7/32 Testing: network::iora_test_http
+7/32 Test: network::iora_test_http
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_http"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_http" start time: Sep 25 20:04 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:04:06] [INFO] Timer service started successfully
+[2025-09-25 20:04:06.829] [INFO] WebhookServer started on 0.0.0.0:8081
+[2025-09-25 20:04:06] [INFO] Timer service loop started
+[2025-09-25 20:04:07] [INFO] Timer service started successfully
+[2025-09-25 20:04:07] [INFO] Timer service loop started
+[2025-09-25 20:04:07.843] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:07] [INFO] Timer service started successfully
+[2025-09-25 20:04:07] [INFO] Timer service loop started
+[2025-09-25 20:04:07] [INFO] Timer service started successfully
+[2025-09-25 20:04:07] [INFO] Timer service loop started
+[2025-09-25 20:04:07.844] [INFO] HttpClient: GET http://localhost:8081/test-get (body size: 0 bytes)
+[2025-09-25 20:04:07.845] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:54160 (session 1)
+[2025-09-25 20:04:07.846] [INFO] WebhookServer: GET /test-get from 127.0.0.1:54160 (session 1, body size: 0 bytes)
+[2025-09-25 20:04:07.846] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:54160 (session 1, 128 bytes)
+[2025-09-25 20:04:07.846] [INFO] HttpClient: Received 200 response from http://localhost:8081/test-get (body size: 15 bytes)
+[2025-09-25 20:04:07.946] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:54160 (session 1)
+[2025-09-25 20:04:07] [INFO] Stopping timer service
+[2025-09-25 20:04:07] [INFO] Timer service loop finished
+[2025-09-25 20:04:07] [INFO] Timer service stopped
+[2025-09-25 20:04:12] [INFO] Stopping timer service
+[2025-09-25 20:04:12] [INFO] Timer service loop finished
+[2025-09-25 20:04:12] [INFO] Timer service stopped
+[2025-09-25 20:04:12] [INFO] Timer service started successfully
+[2025-09-25 20:04:12] [INFO] Timer service loop started
+[2025-09-25 20:04:12.895] [INFO] WebhookServer started on 0.0.0.0:8081
+[2025-09-25 20:04:13] [INFO] Timer service started successfully
+[2025-09-25 20:04:13] [INFO] Timer service loop started
+[2025-09-25 20:04:13.909] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:13] [INFO] Timer service started successfully
+[2025-09-25 20:04:13] [INFO] Timer service started successfully
+[2025-09-25 20:04:13.910] [INFO] HttpClient: POST http://localhost:8081/test-post-json (body size: 19 bytes)
+[2025-09-25 20:04:13] [INFO] Timer service loop started
+[2025-09-25 20:04:13] [INFO] Timer service loop started
+[2025-09-25 20:04:13.911] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:54164 (session 1)
+[2025-09-25 20:04:13.913] [INFO] WebhookServer: POST /test-post-json from 127.0.0.1:54164 (session 1, body size: 19 bytes)
+[2025-09-25 20:04:13.913] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:54164 (session 1, 141 bytes)
+[2025-09-25 20:04:13.913] [INFO] HttpClient: Received 200 response from http://localhost:8081/test-post-json (body size: 28 bytes)
+[2025-09-25 20:04:14.007] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:54164 (session 1)
+[2025-09-25 20:04:14] [INFO] Stopping timer service
+[2025-09-25 20:04:14] [INFO] Timer service loop finished
+[2025-09-25 20:04:14] [INFO] Timer service stopped
+[2025-09-25 20:04:18] [INFO] Stopping timer service
+[2025-09-25 20:04:18] [INFO] Timer service loop finished
+[2025-09-25 20:04:18] [INFO] Timer service stopped
+[2025-09-25 20:04:18] [INFO] Timer service started successfully
+[2025-09-25 20:04:18.961] [INFO] WebhookServer started on 0.0.0.0:8081
+[2025-09-25 20:04:18] [INFO] Timer service loop started
+[2025-09-25 20:04:19] [INFO] Timer service started successfully
+[2025-09-25 20:04:19] [INFO] Timer service loop started
+[2025-09-25 20:04:19.977] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:19] [INFO] Timer service loop started
+[2025-09-25 20:04:19] [INFO] Timer service started successfully
+[2025-09-25 20:04:19] [INFO] Timer service started successfully
+[2025-09-25 20:04:19] [INFO] Timer service loop started
+[2025-09-25 20:04:19.977] [INFO] HttpClient: POST http://localhost:8081/test-async (body size: 16 bytes)
+[2025-09-25 20:04:19.978] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:54776 (session 1)
+[2025-09-25 20:04:19.979] [INFO] WebhookServer: POST /test-async from 127.0.0.1:54776 (session 1, body size: 16 bytes)
+[2025-09-25 20:04:19.979] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:54776 (session 1, 155 bytes)
+[2025-09-25 20:04:19.979] [INFO] HttpClient: Received 200 response from http://localhost:8081/test-async (body size: 42 bytes)
+[2025-09-25 20:04:20.064] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:54776 (session 1)
+[2025-09-25 20:04:20] [INFO] Stopping timer service
+[2025-09-25 20:04:20] [INFO] Timer service loop finished
+[2025-09-25 20:04:20] [INFO] Timer service stopped
+[2025-09-25 20:04:24] [INFO] Stopping timer service
+[2025-09-25 20:04:24] [INFO] Timer service loop finished
+[2025-09-25 20:04:24] [INFO] Timer service stopped
+[2025-09-25 20:04:25] [INFO] Timer service started successfully
+[2025-09-25 20:04:25.028] [INFO] WebhookServer started on 0.0.0.0:8081
+[2025-09-25 20:04:25] [INFO] Timer service loop started
+[2025-09-25 20:04:26] [INFO] Timer service started successfully
+[2025-09-25 20:04:26.040] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:26] [INFO] Timer service started successfully
+[2025-09-25 20:04:26] [INFO] Timer service loop started
+[2025-09-25 20:04:26] [INFO] Timer service loop started
+[2025-09-25 20:04:26] [INFO] Timer service started successfully
+[2025-09-25 20:04:26] [INFO] Timer service loop started
+[2025-09-25 20:04:26.063] [INFO] HttpClient: POST http://localhost:8081/test-stream (body size: 2 bytes)
+[2025-09-25 20:04:26.063] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:42362 (session 1)
+[2025-09-25 20:04:26.064] [INFO] WebhookServer: POST /test-stream from 127.0.0.1:42362 (session 1, body size: 2 bytes)
+[2025-09-25 20:04:26.064] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:42362 (session 1, 173 bytes)
+[2025-09-25 20:04:26.065] [INFO] HttpClient: Received 200 response from http://localhost:8081/test-stream (body size: 59 bytes)
+[2025-09-25 20:04:26.142] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:42362 (session 1)
+[2025-09-25 20:04:26] [INFO] Stopping timer service
+[2025-09-25 20:04:26] [INFO] Timer service loop finished
+[2025-09-25 20:04:26] [INFO] Timer service stopped
+[2025-09-25 20:04:31] [INFO] Stopping timer service
+[2025-09-25 20:04:31] [INFO] Timer service loop finished
+[2025-09-25 20:04:31] [INFO] Timer service stopped
+[2025-09-25 20:04:31] [INFO] Timer service started successfully
+[2025-09-25 20:04:31.202] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:31] [INFO] Timer service started successfully
+[2025-09-25 20:04:31] [INFO] Timer service started successfully
+[2025-09-25 20:04:31.202] [INFO] HttpClient: GET http://127.0.0.1:18901/test (body size: 0 bytes)
+[2025-09-25 20:04:31] [INFO] Timer service loop started
+[2025-09-25 20:04:31] [INFO] Timer service loop started
+[2025-09-25 20:04:31] [INFO] Timer service loop started
+[2025-09-25 20:04:33.204] [ERROR] HttpClient: Request to http://127.0.0.1:18901/test failed after 1 attempts: HTTP response timeout
+[2025-09-25 20:04:46] [INFO] Stopping timer service
+[2025-09-25 20:04:46] [INFO] Timer service loop finished
+[2025-09-25 20:04:46] [INFO] Timer service stopped
+[2025-09-25 20:04:46] [INFO] Timer service started successfully
+[2025-09-25 20:04:46] [INFO] Timer service loop started
+[2025-09-25 20:04:46.315] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:46] [INFO] Timer service started successfully
+[2025-09-25 20:04:46] [INFO] Timer service loop started
+[2025-09-25 20:04:46] [INFO] Timer service started successfully
+[2025-09-25 20:04:46.315] [INFO] HttpClient: GET http://127.0.0.1:18902/test (body size: 0 bytes)
+[2025-09-25 20:04:46] [INFO] Timer service loop started
+[2025-09-25 20:04:46.323] [ERROR] HttpClient: Request to http://127.0.0.1:18902/test failed after 1 attempts: Connection closed before receiving complete HTTP response
+[2025-09-25 20:04:51] [INFO] Stopping timer service
+[2025-09-25 20:04:51] [INFO] Timer service loop finished
+[2025-09-25 20:04:51] [INFO] Timer service stopped
+[2025-09-25 20:04:51] [INFO] Timer service started successfully
+[2025-09-25 20:04:51] [INFO] Timer service loop started
+[2025-09-25 20:04:51.328] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:51] [INFO] Timer service loop started
+[2025-09-25 20:04:51] [INFO] Timer service started successfully
+[2025-09-25 20:04:51] [INFO] Timer service started successfully
+[2025-09-25 20:04:51] [INFO] Timer service loop started
+[2025-09-25 20:04:51.329] [INFO] HttpClient: GET http://127.0.0.1:49999/test (body size: 0 bytes)
+[2025-09-25 20:04:51.380] [ERROR] HttpClient: Request to http://127.0.0.1:49999/test failed after 1 attempts: Localhost connection taking too long - should fail immediately. Waited 51ms
+[2025-09-25 20:04:56] [INFO] Stopping timer service
+[2025-09-25 20:04:56] [INFO] Timer service loop finished
+[2025-09-25 20:04:56] [INFO] Timer service stopped
+[2025-09-25 20:04:56] [INFO] Timer service started successfully
+[2025-09-25 20:04:56.431] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:04:56] [INFO] Timer service started successfully
+[2025-09-25 20:04:56] [INFO] Timer service started successfully
+[2025-09-25 20:04:56.431] [INFO] HttpClient: GET https://127.0.0.1:18911/test (body size: 0 bytes)
+[2025-09-25 20:04:56] [INFO] Timer service loop started
+[2025-09-25 20:04:56] [INFO] Timer service loop started
+[2025-09-25 20:04:56] [INFO] Timer service loop started
+[2025-09-25 20:04:58.424] [ERROR] HttpClient: Request to https://127.0.0.1:18911/test failed after 1 attempts: HTTP response timeout
+[2025-09-25 20:05:11] [INFO] Stopping timer service
+[2025-09-25 20:05:11] [INFO] Timer service loop finished
+[2025-09-25 20:05:11] [INFO] Timer service stopped
+[2025-09-25 20:05:11] [INFO] Timer service started successfully
+[2025-09-25 20:05:11.523] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:11] [INFO] Timer service started successfully
+[2025-09-25 20:05:11] [INFO] Timer service started successfully
+[2025-09-25 20:05:11.524] [INFO] HttpClient: GET https://127.0.0.1:18912/test (body size: 0 bytes)
+[2025-09-25 20:05:11] [INFO] Timer service loop started
+[2025-09-25 20:05:11] [INFO] Timer service loop started
+[2025-09-25 20:05:11] [INFO] Timer service loop started
+[2025-09-25 20:05:11.526] [ERROR] HttpClient: Request to https://127.0.0.1:18912/test failed after 1 attempts: Connection failed to 127.0.0.1:18912 (Session does not exist (closed))
+[2025-09-25 20:05:16] [INFO] Stopping timer service
+[2025-09-25 20:05:16] [INFO] Timer service loop finished
+[2025-09-25 20:05:16] [INFO] Timer service stopped
+[2025-09-25 20:05:16] [INFO] Timer service started successfully
+[2025-09-25 20:05:16.524] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:16] [INFO] Timer service started successfully
+[2025-09-25 20:05:16] [INFO] Timer service loop started
+[2025-09-25 20:05:16] [INFO] Timer service loop started
+[2025-09-25 20:05:16] [INFO] Timer service started successfully
+[2025-09-25 20:05:16.535] [INFO] HttpClient: GET https://127.0.0.1:19998/test (body size: 0 bytes)
+[2025-09-25 20:05:16] [INFO] Timer service loop started
+[2025-09-25 20:05:16.586] [ERROR] HttpClient: Request to https://127.0.0.1:19998/test failed after 1 attempts: Localhost connection taking too long - should fail immediately. Waited 50ms
+[2025-09-25 20:05:21] [INFO] Stopping timer service
+[2025-09-25 20:05:21] [INFO] Timer service loop finished
+[2025-09-25 20:05:21] [INFO] Timer service stopped
+[2025-09-25 20:05:21.525] [INFO] WebhookServer: TLS configuration validated successfully
+[2025-09-25 20:05:21] [INFO] Timer service started successfully
+[2025-09-25 20:05:21.526] [INFO] WebhookServer started on 0.0.0.0:8443
+[2025-09-25 20:05:21] [INFO] Timer service loop started
+[2025-09-25 20:05:23] [INFO] Timer service started successfully
+[2025-09-25 20:05:23] [INFO] Timer service loop started
+[2025-09-25 20:05:23.026] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:23] [INFO] Timer service started successfully
+[2025-09-25 20:05:23] [INFO] Timer service started successfully
+[2025-09-25 20:05:23.027] [INFO] HttpClient: GET https://localhost:8443/tls-test (body size: 0 bytes)
+[2025-09-25 20:05:23] [INFO] Timer service loop started
+[2025-09-25 20:05:23] [INFO] Timer service loop started
+[2025-09-25 20:05:23.027] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:56950 (session 1)
+[2025-09-25 20:05:23.028] [INFO] WebhookServer: GET /tls-test from 127.0.0.1:56950 (session 1, body size: 0 bytes)
+[2025-09-25 20:05:23.028] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:56950 (session 1, 125 bytes)
+[2025-09-25 20:05:23.028] [INFO] HttpClient: Received 200 response from https://localhost:8443/tls-test (body size: 12 bytes)
+[2025-09-25 20:05:23.029] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:56950 (session 1)
+[2025-09-25 20:05:28] [INFO] Stopping timer service
+[2025-09-25 20:05:28] [INFO] Timer service loop finished
+[2025-09-25 20:05:28] [INFO] Timer service stopped
+[2025-09-25 20:05:28] [INFO] Stopping timer service
+[2025-09-25 20:05:28] [INFO] Timer service loop finished
+[2025-09-25 20:05:28] [INFO] Timer service stopped
+===============================================================================
+All tests passed (35 assertions in 4 test cases)
+
+<end of output>
+Test time =  81.37 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_http" end time: Sep 25 20:05 AWST
+"network::iora_test_http" time elapsed: 00:01:21
+----------------------------------------------------------
+
+8/32 Testing: network::iora_test_shared_tcp
+8/32 Test: network::iora_test_shared_tcp
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_shared_tcp"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_shared_tcp" start time: Sep 25 20:05 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:05:28] [INFO] Timer service started successfully
+[2025-09-25 20:05:28] [INFO] Timer service loop started
+[2025-09-25 20:05:28] [INFO] Stopping timer service
+[2025-09-25 20:05:28] [INFO] Timer service loop finished
+[2025-09-25 20:05:28] [INFO] Timer service stopped
+[2025-09-25 20:05:28] [INFO] Timer service started successfully
+[2025-09-25 20:05:28] [INFO] Timer service loop started
+[2025-09-25 20:05:28] [INFO] Stopping timer service
+[2025-09-25 20:05:28] [INFO] Timer service loop finished
+[2025-09-25 20:05:28] [INFO] Timer service stopped
+[2025-09-25 20:05:28] [INFO] Timer service started successfully
+[2025-09-25 20:05:28] [INFO] Timer service loop started
+[2025-09-25 20:05:28] [INFO] Stopping timer service
+[2025-09-25 20:05:28] [INFO] Timer service loop finished
+[2025-09-25 20:05:28] [INFO] Timer service stopped
+[2025-09-25 20:05:28] [INFO] Timer service started successfully
+[2025-09-25 20:05:28] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:29] [INFO] Stopping timer service
+[2025-09-25 20:05:29] [INFO] Timer service loop finished
+[2025-09-25 20:05:29] [INFO] Timer service stopped
+[2025-09-25 20:05:29] [INFO] Timer service started successfully
+[2025-09-25 20:05:29] [INFO] Timer service loop started
+[2025-09-25 20:05:30] [INFO] Stopping timer service
+[2025-09-25 20:05:30] [INFO] Timer service loop finished
+[2025-09-25 20:05:30] [INFO] Timer service stopped
+[2025-09-25 20:05:30] [INFO] Timer service started successfully
+[2025-09-25 20:05:30] [INFO] Timer service loop started
+[2025-09-25 20:05:30] [INFO] Stopping timer service
+[2025-09-25 20:05:30] [INFO] Timer service loop finished
+[2025-09-25 20:05:30] [INFO] Timer service stopped
+[2025-09-25 20:05:30] [INFO] Timer service started successfully
+[2025-09-25 20:05:30] [INFO] Timer service loop started
+[2025-09-25 20:05:30] [INFO] Stopping timer service
+[2025-09-25 20:05:30] [INFO] Timer service loop finished
+[2025-09-25 20:05:30] [INFO] Timer service stopped
+[2025-09-25 20:05:30] [INFO] Timer service started successfully
+[2025-09-25 20:05:30] [INFO] Timer service loop started
+[2025-09-25 20:05:30] [INFO] Stopping timer service
+[2025-09-25 20:05:30] [INFO] Timer service loop finished
+[2025-09-25 20:05:30] [INFO] Timer service stopped
+[2025-09-25 20:05:30] [INFO] Timer service started successfully
+[2025-09-25 20:05:30] [INFO] Timer service loop started
+[2025-09-25 20:05:31] [INFO] Stopping timer service
+[2025-09-25 20:05:31] [INFO] Timer service loop finished
+[2025-09-25 20:05:31] [INFO] Timer service stopped
+[2025-09-25 20:05:31] [INFO] Timer service started successfully
+[2025-09-25 20:05:31] [INFO] Timer service loop started
+[2025-09-25 20:05:31] [INFO] Stopping timer service
+[2025-09-25 20:05:31] [INFO] Timer service loop finished
+[2025-09-25 20:05:31] [INFO] Timer service stopped
+===============================================================================
+All tests passed (65806 assertions in 16 test cases)
+
+<end of output>
+Test time =   2.93 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_shared_tcp" end time: Sep 25 20:05 AWST
+"network::iora_test_shared_tcp" time elapsed: 00:00:02
+----------------------------------------------------------
+
+9/32 Testing: network::iora_test_shared_transport_timers
+9/32 Test: network::iora_test_shared_transport_timers
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_shared_transport_timers"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_shared_transport_timers" start time: Sep 25 20:05 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:05:31] [INFO] Timer service started successfully
+[2025-09-25 20:05:31] [INFO] Timer service loop started
+[2025-09-25 20:05:31] [INFO] Stopping timer service
+[2025-09-25 20:05:31] [INFO] Timer service loop finished
+[2025-09-25 20:05:31] [INFO] Timer service stopped
+[2025-09-25 20:05:31] [INFO] Timer service started successfully
+[2025-09-25 20:05:31] [INFO] Timer service loop started
+[2025-09-25 20:05:31] [INFO] Stopping timer service
+[2025-09-25 20:05:31] [INFO] Timer service loop finished
+[2025-09-25 20:05:31] [INFO] Timer service stopped
+[2025-09-25 20:05:31] [INFO] Timer service started successfully
+[2025-09-25 20:05:31] [INFO] Timer service loop started
+Connection failed: Connect timeout (code 14)
+[2025-09-25 20:05:31] [INFO] Stopping timer service
+[2025-09-25 20:05:31] [INFO] Timer service loop finished
+[2025-09-25 20:05:31] [INFO] Timer service stopped
+===============================================================================
+All tests passed (20 assertions in 4 test cases)
+
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_shared_transport_timers" end time: Sep 25 20:05 AWST
+"network::iora_test_shared_transport_timers" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/32 Testing: network::iora_test_shared_udp
+10/32 Test: network::iora_test_shared_udp
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_shared_udp"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_shared_udp" start time: Sep 25 20:05 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (331 assertions in 19 test cases)
+
+<end of output>
+Test time =   6.31 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_shared_udp" end time: Sep 25 20:05 AWST
+"network::iora_test_shared_udp" time elapsed: 00:00:06
+----------------------------------------------------------
+
+11/32 Testing: network::iora_test_transport_improvements
+11/32 Test: network::iora_test_transport_improvements
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_transport_improvements"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_transport_improvements" start time: Sep 25 20:05 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (83 assertions in 10 test cases)
+
+<end of output>
+Test time =   9.14 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_transport_improvements" end time: Sep 25 20:05 AWST
+"network::iora_test_transport_improvements" time elapsed: 00:00:09
+----------------------------------------------------------
+
+12/32 Testing: network::iora_test_unified_tcp_udp
+12/32 Test: network::iora_test_unified_tcp_udp
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_unified_tcp_udp"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_unified_tcp_udp" start time: Sep 25 20:05 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:05:46] [INFO] Timer service started successfully
+[2025-09-25 20:05:46] [INFO] Timer service loop started
+[2025-09-25 20:05:46] [INFO] Stopping timer service
+[2025-09-25 20:05:46] [INFO] Timer service loop finished
+[2025-09-25 20:05:46] [INFO] Timer service stopped
+[2025-09-25 20:05:46] [INFO] Timer service started successfully
+[2025-09-25 20:05:46] [INFO] Timer service loop started
+[2025-09-25 20:05:46] [INFO] Stopping timer service
+[2025-09-25 20:05:46] [INFO] Timer service loop finished
+[2025-09-25 20:05:46] [INFO] Timer service stopped
+[2025-09-25 20:05:46] [INFO] Timer service started successfully
+[2025-09-25 20:05:46] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+===============================================================================
+All tests passed (8544 assertions in 13 test cases)
+
+<end of output>
+Test time =   0.74 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_unified_tcp_udp" end time: Sep 25 20:05 AWST
+"network::iora_test_unified_tcp_udp" time elapsed: 00:00:00
+----------------------------------------------------------
+
+13/32 Testing: network::iora_test_webhook_transport
+13/32 Test: network::iora_test_webhook_transport
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_webhook_transport"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_webhook_transport" start time: Sep 25 20:05 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.422] [INFO] WebhookServer started on 0.0.0.0:8082
+[2025-09-25 20:05:47] [INFO] Stopping timer service
+[2025-09-25 20:05:47] [INFO] Timer service loop finished
+[2025-09-25 20:05:47] [INFO] Timer service stopped
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.679] [INFO] WebhookServer started on 0.0.0.0:8083
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.825] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.826] [INFO] HttpClient: GET http://localhost:8083/count (body size: 0 bytes)
+[2025-09-25 20:05:47.826] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:33262 (session 1)
+[2025-09-25 20:05:47.827] [INFO] WebhookServer: GET /count from 127.0.0.1:33262 (session 1, body size: 0 bytes)
+[2025-09-25 20:05:47.827] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:33262 (session 1, 107 bytes)
+[2025-09-25 20:05:47.828] [INFO] HttpClient: Received 200 response from http://localhost:8083/count (body size: 1 bytes)
+[2025-09-25 20:05:47.828] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:33262 (session 1)
+[2025-09-25 20:05:47.833] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47.833] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.851] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47.851] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47.852] [INFO] HttpClient: GET http://localhost:8083/count (body size: 0 bytes)
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.852] [INFO] HttpClient: GET http://localhost:8083/count (body size: 0 bytes)
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.852] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:33276 (session 2)
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47] [INFO] Timer service started successfully
+[2025-09-25 20:05:47.852] [INFO] HttpClient: GET http://localhost:8083/count (body size: 0 bytes)
+[2025-09-25 20:05:47] [INFO] Timer service loop started
+[2025-09-25 20:05:47.852] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:33290 (session 3)
+[2025-09-25 20:05:47.852] [INFO] HttpClient: GET http://localhost:8083/count (body size: 0 bytes)
+[2025-09-25 20:05:47.852] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:33292 (session 4)
+[2025-09-25 20:05:47.852] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:33300 (session 5)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: GET /count from 127.0.0.1:33276 (session 2, body size: 0 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:33276 (session 2, 107 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: GET /count from 127.0.0.1:33290 (session 3, body size: 0 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:33290 (session 3, 107 bytes)
+[2025-09-25 20:05:47.853] [INFO] HttpClient: Received 200 response from http://localhost:8083/count (body size: 1 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: GET /count from 127.0.0.1:33300 (session 5, body size: 0 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:33300 (session 5, 107 bytes)
+[2025-09-25 20:05:47.853] [INFO] HttpClient: Received 200 response from http://localhost:8083/count (body size: 1 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: GET /count from 127.0.0.1:33292 (session 4, body size: 0 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:33292 (session 4, 107 bytes)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:33276 (session 2)
+[2025-09-25 20:05:47.853] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:33290 (session 3)
+[2025-09-25 20:05:47.854] [INFO] HttpClient: Received 200 response from http://localhost:8083/count (body size: 1 bytes)
+[2025-09-25 20:05:47.854] [INFO] HttpClient: Received 200 response from http://localhost:8083/count (body size: 1 bytes)
+[2025-09-25 20:05:47.854] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:33300 (session 5)
+[2025-09-25 20:05:47.854] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:33292 (session 4)
+[2025-09-25 20:05:52] [INFO] Stopping timer service
+[2025-09-25 20:05:52] [INFO] Timer service loop finished
+[2025-09-25 20:05:52] [INFO] Timer service stopped
+[2025-09-25 20:05:52] [INFO] Stopping timer service
+[2025-09-25 20:05:52] [INFO] Timer service loop finished
+[2025-09-25 20:05:52] [INFO] Timer service stopped
+[2025-09-25 20:05:52] [INFO] Stopping timer service
+[2025-09-25 20:05:52] [INFO] Timer service loop finished
+[2025-09-25 20:05:52] [INFO] Timer service stopped
+[2025-09-25 20:05:52] [INFO] Stopping timer service
+[2025-09-25 20:05:52] [INFO] Timer service loop finished
+[2025-09-25 20:05:52] [INFO] Timer service stopped
+[2025-09-25 20:05:52] [INFO] Stopping timer service
+[2025-09-25 20:05:52] [INFO] Timer service loop finished
+[2025-09-25 20:05:52] [INFO] Timer service stopped
+[2025-09-25 20:05:52] [INFO] Stopping timer service
+[2025-09-25 20:05:52] [INFO] Timer service loop finished
+[2025-09-25 20:05:52] [INFO] Timer service stopped
+[2025-09-25 20:05:53] [INFO] Timer service started successfully
+[2025-09-25 20:05:53.041] [INFO] WebhookServer started on 0.0.0.0:8084
+[2025-09-25 20:05:53] [INFO] Timer service loop started
+[2025-09-25 20:05:53] [INFO] Timer service started successfully
+[2025-09-25 20:05:53] [INFO] Timer service loop started
+[2025-09-25 20:05:53.160] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:53] [INFO] Timer service started successfully
+[2025-09-25 20:05:53] [INFO] Timer service loop started
+[2025-09-25 20:05:53] [INFO] Timer service started successfully
+[2025-09-25 20:05:53] [INFO] Timer service loop started
+[2025-09-25 20:05:53.160] [INFO] HttpClient: POST http://localhost:8084/large (body size: 65536 bytes)
+[2025-09-25 20:05:53.161] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:53774 (session 1)
+[2025-09-25 20:05:53.163] [INFO] WebhookServer: POST /large from 127.0.0.1:53774 (session 1, body size: 65536 bytes)
+[2025-09-25 20:05:53.163] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:53774 (session 1, 127 bytes)
+[2025-09-25 20:05:53.163] [INFO] HttpClient: Received 200 response from http://localhost:8084/large (body size: 20 bytes)
+[2025-09-25 20:05:53.241] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:53774 (session 1)
+[2025-09-25 20:05:53] [INFO] Stopping timer service
+[2025-09-25 20:05:53] [INFO] Timer service loop finished
+[2025-09-25 20:05:53] [INFO] Timer service stopped
+[2025-09-25 20:05:58] [INFO] Stopping timer service
+[2025-09-25 20:05:58] [INFO] Timer service loop finished
+[2025-09-25 20:05:58] [INFO] Timer service stopped
+[2025-09-25 20:05:58] [INFO] Timer service started successfully
+[2025-09-25 20:05:58] [INFO] Timer service loop started
+[2025-09-25 20:05:58.209] [INFO] WebhookServer started on 0.0.0.0:8085
+[2025-09-25 20:05:58] [INFO] Timer service started successfully
+[2025-09-25 20:05:58] [INFO] Timer service loop started
+[2025-09-25 20:05:58.325] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:05:58] [INFO] Timer service started successfully
+[2025-09-25 20:05:58] [INFO] Timer service started successfully
+[2025-09-25 20:05:58.326] [INFO] HttpClient: GET http://localhost:8085/params?foo=bar&test=123&empty= (body size: 0 bytes)
+[2025-09-25 20:05:58] [INFO] Timer service loop started
+[2025-09-25 20:05:58] [INFO] Timer service loop started
+[2025-09-25 20:05:58.327] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:51054 (session 1)
+[2025-09-25 20:05:58.328] [INFO] WebhookServer: GET /params?foo=bar&test=123&empty= from 127.0.0.1:51054 (session 1, body size: 0 bytes)
+[2025-09-25 20:05:58.328] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:51054 (session 1, 150 bytes)
+[2025-09-25 20:05:58.328] [INFO] HttpClient: Received 200 response from http://localhost:8085/params?foo=bar&test=123&empty= (body size: 37 bytes)
+[2025-09-25 20:05:58.410] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:51054 (session 1)
+[2025-09-25 20:05:58] [INFO] Stopping timer service
+[2025-09-25 20:05:58] [INFO] Timer service loop finished
+[2025-09-25 20:05:58] [INFO] Timer service stopped
+[2025-09-25 20:06:03] [INFO] Stopping timer service
+[2025-09-25 20:06:03] [INFO] Timer service loop finished
+[2025-09-25 20:06:03] [INFO] Timer service stopped
+[2025-09-25 20:06:03] [INFO] Timer service started successfully
+[2025-09-25 20:06:03.377] [INFO] WebhookServer started on 0.0.0.0:8086
+[2025-09-25 20:06:03] [INFO] Timer service loop started
+[2025-09-25 20:06:03] [INFO] Timer service started successfully
+[2025-09-25 20:06:03] [INFO] Timer service loop started
+[2025-09-25 20:06:03.489] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:03] [INFO] Timer service loop started
+[2025-09-25 20:06:03] [INFO] Timer service started successfully
+[2025-09-25 20:06:03] [INFO] Timer service started successfully
+[2025-09-25 20:06:03] [INFO] Timer service loop started
+[2025-09-25 20:06:03.489] [INFO] HttpClient: GET http://localhost:8086/ping (body size: 0 bytes)
+[2025-09-25 20:06:03.490] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:55556 (session 1)
+[2025-09-25 20:06:03.491] [INFO] WebhookServer: GET /ping from 127.0.0.1:55556 (session 1, body size: 0 bytes)
+[2025-09-25 20:06:03.491] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:55556 (session 1, 110 bytes)
+[2025-09-25 20:06:03.491] [INFO] HttpClient: Received 200 response from http://localhost:8086/ping (body size: 4 bytes)
+[2025-09-25 20:06:03.491] [INFO] HttpClient: GET http://localhost:8086/ping (body size: 0 bytes)
+[2025-09-25 20:06:03.491] [INFO] WebhookServer: GET /ping from 127.0.0.1:55556 (session 1, body size: 0 bytes)
+[2025-09-25 20:06:03.491] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:55556 (session 1, 110 bytes)
+[2025-09-25 20:06:03.491] [INFO] HttpClient: Received 200 response from http://localhost:8086/ping (body size: 4 bytes)
+[2025-09-25 20:06:03.491] [INFO] HttpClient: GET http://localhost:8086/ping (body size: 0 bytes)
+[2025-09-25 20:06:03.492] [INFO] WebhookServer: GET /ping from 127.0.0.1:55556 (session 1, body size: 0 bytes)
+[2025-09-25 20:06:03.492] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:55556 (session 1, 110 bytes)
+[2025-09-25 20:06:03.492] [INFO] HttpClient: Received 200 response from http://localhost:8086/ping (body size: 4 bytes)
+[2025-09-25 20:06:03.578] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:55556 (session 1)
+[2025-09-25 20:06:03] [INFO] Stopping timer service
+[2025-09-25 20:06:03] [INFO] Timer service loop finished
+[2025-09-25 20:06:03] [INFO] Timer service stopped
+[2025-09-25 20:06:08] [INFO] Stopping timer service
+[2025-09-25 20:06:08] [INFO] Timer service loop finished
+[2025-09-25 20:06:08] [INFO] Timer service stopped
+[2025-09-25 20:06:08] [INFO] Timer service started successfully
+[2025-09-25 20:06:08.540] [INFO] WebhookServer started on 0.0.0.0:8087
+[2025-09-25 20:06:08] [INFO] Timer service loop started
+[2025-09-25 20:06:08] [INFO] Timer service started successfully
+[2025-09-25 20:06:08] [INFO] Timer service loop started
+[2025-09-25 20:06:08.653] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:08] [INFO] Timer service started successfully
+[2025-09-25 20:06:08] [INFO] Timer service loop started
+[2025-09-25 20:06:08] [INFO] Timer service started successfully
+[2025-09-25 20:06:08] [INFO] Timer service loop started
+[2025-09-25 20:06:08.673] [INFO] HttpClient: GET http://localhost:8087/headers (body size: 0 bytes)
+[2025-09-25 20:06:08.674] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:41156 (session 1)
+[2025-09-25 20:06:08.675] [INFO] WebhookServer: GET /headers from 127.0.0.1:41156 (session 1, body size: 0 bytes)
+[2025-09-25 20:06:08.675] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:41156 (session 1, 135 bytes)
+[2025-09-25 20:06:08.675] [INFO] HttpClient: Received 200 response from http://localhost:8087/headers (body size: 2 bytes)
+[2025-09-25 20:06:08.749] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:41156 (session 1)
+[2025-09-25 20:06:08] [INFO] Stopping timer service
+[2025-09-25 20:06:08] [INFO] Timer service loop finished
+[2025-09-25 20:06:08] [INFO] Timer service stopped
+[2025-09-25 20:06:13] [INFO] Stopping timer service
+[2025-09-25 20:06:13] [INFO] Timer service loop finished
+[2025-09-25 20:06:13] [INFO] Timer service stopped
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.704] [INFO] WebhookServer started on 0.0.0.0:8088
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.853] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.853] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.853] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48778 (session 1)
+[2025-09-25 20:06:13.855] [INFO] WebhookServer: POST /slow from 127.0.0.1:48778 (session 1, body size: 9 bytes)
+[2025-09-25 20:06:13.889] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.891] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.891] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48786 (session 2)
+[2025-09-25 20:06:13.892] [INFO] WebhookServer: POST /slow from 127.0.0.1:48786 (session 2, body size: 9 bytes)
+[2025-09-25 20:06:13.895] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.896] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.896] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48802 (session 3)
+[2025-09-25 20:06:13.898] [INFO] WebhookServer: POST /slow from 127.0.0.1:48802 (session 3, body size: 9 bytes)
+[2025-09-25 20:06:13.906] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48778 (session 1, 115 bytes)
+[2025-09-25 20:06:13.906] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48786 (session 2, 115 bytes)
+[2025-09-25 20:06:13.906] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48802 (session 3, 115 bytes)
+[2025-09-25 20:06:13.906] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.906] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48778 (session 1)
+[2025-09-25 20:06:13.906] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.906] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.906] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48786 (session 2)
+[2025-09-25 20:06:13.906] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48802 (session 3)
+[2025-09-25 20:06:13.909] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.909] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.909] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48814 (session 4)
+[2025-09-25 20:06:13.911] [INFO] WebhookServer: POST /slow from 127.0.0.1:48814 (session 4, body size: 9 bytes)
+[2025-09-25 20:06:13.911] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48814 (session 4, 115 bytes)
+[2025-09-25 20:06:13.911] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.911] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48814 (session 4)
+[2025-09-25 20:06:13.913] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.913] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.914] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48820 (session 5)
+[2025-09-25 20:06:13.915] [INFO] WebhookServer: POST /slow from 127.0.0.1:48820 (session 5, body size: 9 bytes)
+[2025-09-25 20:06:13.915] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48820 (session 5, 115 bytes)
+[2025-09-25 20:06:13.915] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.915] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48820 (session 5)
+[2025-09-25 20:06:13.920] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.920] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.920] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48824 (session 6)
+[2025-09-25 20:06:13.921] [INFO] WebhookServer: POST /slow from 127.0.0.1:48824 (session 6, body size: 9 bytes)
+[2025-09-25 20:06:13.921] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48824 (session 6, 115 bytes)
+[2025-09-25 20:06:13.921] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.922] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48824 (session 6)
+[2025-09-25 20:06:13.926] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.961] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13.961] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.962] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48838 (session 7)
+[2025-09-25 20:06:13.962] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.962] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.962] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48848 (session 8)
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.962] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13.962] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.962] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48860 (session 9)
+[2025-09-25 20:06:13] [INFO] Timer service started successfully
+[2025-09-25 20:06:13] [INFO] Timer service loop started
+[2025-09-25 20:06:13.962] [INFO] HttpClient: POST http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: POST /slow from 127.0.0.1:48838 (session 7, body size: 9 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48838 (session 7, 115 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: Accepted HTTP connection from 127.0.0.1:48874 (session 10)
+[2025-09-25 20:06:13.963] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48838 (session 7)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: POST /slow from 127.0.0.1:48848 (session 8, body size: 9 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48848 (session 8, 115 bytes)
+[2025-09-25 20:06:13.963] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48848 (session 8)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: POST /slow from 127.0.0.1:48860 (session 9, body size: 9 bytes)
+[2025-09-25 20:06:13.963] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48860 (session 9, 115 bytes)
+[2025-09-25 20:06:13.964] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.964] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48860 (session 9)
+[2025-09-25 20:06:13.964] [INFO] WebhookServer: POST /slow from 127.0.0.1:48874 (session 10, body size: 9 bytes)
+[2025-09-25 20:06:13.964] [INFO] WebhookServer: Sending 200 response to 127.0.0.1:48874 (session 10, 115 bytes)
+[2025-09-25 20:06:13.964] [INFO] HttpClient: Received 200 response from http://localhost:8088/slow (body size: 9 bytes)
+[2025-09-25 20:06:13.964] [INFO] WebhookServer: HTTP connection closed from 127.0.0.1:48874 (session 10)
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:18] [INFO] Stopping timer service
+[2025-09-25 20:06:18] [INFO] Timer service loop finished
+[2025-09-25 20:06:18] [INFO] Timer service stopped
+[2025-09-25 20:06:19] [INFO] Stopping timer service
+[2025-09-25 20:06:19] [INFO] Timer service loop finished
+[2025-09-25 20:06:19] [INFO] Timer service stopped
+===============================================================================
+All tests passed (35 assertions in 1 test case)
+
+<end of output>
+Test time =  31.70 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_webhook_transport" end time: Sep 25 20:06 AWST
+"network::iora_test_webhook_transport" time elapsed: 00:00:31
+----------------------------------------------------------
+
+14/32 Testing: network::iora_test_sync_async_transport
+14/32 Test: network::iora_test_sync_async_transport
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_sync_async_transport"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"network::iora_test_sync_async_transport" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+No tests ran
+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"network::iora_test_sync_async_transport" end time: Sep 25 20:06 AWST
+"network::iora_test_sync_async_transport" time elapsed: 00:00:00
+----------------------------------------------------------
+
+15/32 Testing: core::iora_test_config_loader
+15/32 Test: core::iora_test_config_loader
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_config_loader"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"core::iora_test_config_loader" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:06:19.121] [WARN] [/workspace/karoo_sbc/libs/iora/include/iora/core/config_loader.hpp:50 load] ConfigLoader: Failed to load configuration file: does_not_exist.toml
+[2025-09-25 20:06:19.121] [WARN] [/workspace/karoo_sbc/libs/iora/include/iora/core/config_loader.hpp:50 load] ConfigLoader: Failed to load configuration file: does_not_exist.toml
+===============================================================================
+All tests passed (21 assertions in 2 test cases)
+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"core::iora_test_config_loader" end time: Sep 25 20:06 AWST
+"core::iora_test_config_loader" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/32 Testing: core::iora_test_event_queue
+16/32 Test: core::iora_test_event_queue
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_event_queue"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"core::iora_test_event_queue" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:06:19.123] [INFO] EventQueue: Initializing with 2 worker threads
+[2025-09-25 20:06:19.123] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:19.123] [INFO] EventQueue: Registered handler for event ID: testId (total handlers for this ID: 1)
+[2025-09-25 20:06:19.223] [INFO] EventQueue: Initializing with 2 worker threads
+[2025-09-25 20:06:19.223] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:19.223] [INFO] EventQueue: Registered handler for event ID: testId (total handlers for this ID: 1)
+[2025-09-25 20:06:19.223] [ERROR] EventQueue: Dropping invalid event - missing eventId or eventName fields
+[2025-09-25 20:06:19.323] [INFO] EventQueue: Initializing with 2 worker threads
+[2025-09-25 20:06:19.323] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:19.323] [INFO] EventQueue: Registered pattern handler for event name pattern: ^test.*
+[2025-09-25 20:06:19.424] [INFO] EventQueue: Initializing with 2 worker threads
+[2025-09-25 20:06:19.424] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:19.424] [INFO] EventQueue: Registered handler for event name: testEvent (total handlers for this name: 1)
+[2025-09-25 20:06:19.524] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:06:19.524] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:19.524] [INFO] EventQueue: Registered handler for event ID: testId (total handlers for this ID: 1)
+[2025-09-25 20:06:19.625] [INFO] EventQueue: Initializing with 2 worker threads
+[2025-09-25 20:06:19.625] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:19.625] [INFO] EventQueue: Registered handler for event ID: testId (total handlers for this ID: 1)
+===============================================================================
+All tests passed (9 assertions in 6 test cases)
+
+<end of output>
+Test time =   0.60 sec
+----------------------------------------------------------
+Test Passed.
+"core::iora_test_event_queue" end time: Sep 25 20:06 AWST
+"core::iora_test_event_queue" time elapsed: 00:00:00
+----------------------------------------------------------
+
+17/32 Testing: core::iora_test_external_logger
+17/32 Test: core::iora_test_external_logger
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_external_logger"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"core::iora_test_external_logger" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (16 assertions in 1 test case)
+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"core::iora_test_external_logger" end time: Sep 25 20:06 AWST
+"core::iora_test_external_logger" time elapsed: 00:00:00
+----------------------------------------------------------
+
+18/32 Testing: core::iora_test_logger
+18/32 Test: core::iora_test_logger
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_logger"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"core::iora_test_logger" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (9 assertions in 5 test cases)
+
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"core::iora_test_logger" end time: Sep 25 20:06 AWST
+"core::iora_test_logger" time elapsed: 00:00:00
+----------------------------------------------------------
+
+19/32 Testing: core::iora_test_threadpool
+19/32 Test: core::iora_test_threadpool
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_threadpool"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"core::iora_test_threadpool" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[ThreadPool] Unhandled exception in void task
+[TEST] throwing now
+===============================================================================
+All tests passed (32 assertions in 11 test cases)
+
+<end of output>
+Test time =   2.48 sec
+----------------------------------------------------------
+Test Passed.
+"core::iora_test_threadpool" end time: Sep 25 20:06 AWST
+"core::iora_test_threadpool" time elapsed: 00:00:02
+----------------------------------------------------------
+
+20/32 Testing: core::iora_test_timer
+20/32 Test: core::iora_test_timer
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_timer"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"core::iora_test_timer" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [ERROR] Timer handler threw exception (error: 4)
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:22] [INFO] Stopping timer service
+[2025-09-25 20:06:22] [INFO] Timer service loop finished
+[2025-09-25 20:06:22] [INFO] Timer service stopped
+[2025-09-25 20:06:22] [INFO] Timer service started successfully
+[2025-09-25 20:06:22] [INFO] Timer service loop started
+[2025-09-25 20:06:23] [INFO] Stopping timer service
+[2025-09-25 20:06:23] [INFO] Timer service loop finished
+[2025-09-25 20:06:23] [INFO] Timer service stopped
+[2025-09-25 20:06:23] [INFO] Timer service started successfully
+[2025-09-25 20:06:23] [INFO] Timer service loop started
+[2025-09-25 20:06:23] [INFO] Timer service started successfully
+[2025-09-25 20:06:23] [INFO] Timer service started successfully
+[2025-09-25 20:06:23] [INFO] Timer service pool created with 3 services
+[2025-09-25 20:06:23] [INFO] Timer service loop started
+[2025-09-25 20:06:23] [INFO] Timer service loop started
+[2025-09-25 20:06:23] [INFO] Stopping timer service pool
+[2025-09-25 20:06:23] [INFO] Stopping timer service
+[2025-09-25 20:06:23] [INFO] Timer service loop finished
+[2025-09-25 20:06:23] [INFO] Timer service stopped
+[2025-09-25 20:06:23] [INFO] Stopping timer service
+[2025-09-25 20:06:23] [INFO] Timer service loop finished
+[2025-09-25 20:06:23] [INFO] Timer service stopped
+[2025-09-25 20:06:23] [INFO] Stopping timer service
+[2025-09-25 20:06:23] [INFO] Timer service loop finished
+[2025-09-25 20:06:23] [INFO] Timer service stopped
+[2025-09-25 20:06:23] [INFO] Timer service pool stopped
+[2025-09-25 20:06:23] [INFO] Timer service started successfully
+[2025-09-25 20:06:23] [INFO] Timer service loop started
+[2025-09-25 20:06:23] [INFO] Stopping timer service
+[2025-09-25 20:06:23] [INFO] Timer service loop finished
+[2025-09-25 20:06:23] [INFO] Timer service stopped
+[2025-09-25 20:06:23] [INFO] Timer service started successfully
+[2025-09-25 20:06:23] [INFO] Timer service loop started
+[2025-09-25 20:06:23] [INFO] Stopping timer service
+[2025-09-25 20:06:23] [INFO] Timer service loop finished
+[2025-09-25 20:06:23] [INFO] Timer service stopped
+===============================================================================
+All tests passed (38 assertions in 8 test cases)
+
+<end of output>
+Test time =   0.99 sec
+----------------------------------------------------------
+Test Passed.
+"core::iora_test_timer" end time: Sep 25 20:06 AWST
+"core::iora_test_timer" time elapsed: 00:00:00
+----------------------------------------------------------
+
+21/32 Testing: parsers::iora_test_json_parser
+21/32 Test: parsers::iora_test_json_parser
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_json_parser"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"parsers::iora_test_json_parser" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (443 assertions in 11 test cases)
+
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"parsers::iora_test_json_parser" end time: Sep 25 20:06 AWST
+"parsers::iora_test_json_parser" time elapsed: 00:00:00
+----------------------------------------------------------
+
+22/32 Testing: parsers::iora_test_xml_parser
+22/32 Test: parsers::iora_test_xml_parser
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_xml_parser"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"parsers::iora_test_xml_parser" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+===============================================================================
+All tests passed (264 assertions in 11 test cases)
+
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"parsers::iora_test_xml_parser" end time: Sep 25 20:06 AWST
+"parsers::iora_test_xml_parser" time elapsed: 00:00:00
+----------------------------------------------------------
+
+23/32 Testing: util::iora_test_expiring_cache
+23/32 Test: util::iora_test_expiring_cache
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_expiring_cache"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"util::iora_test_expiring_cache" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:06:23.237] [INFO] ExpiringCache: Initializing with default TTL of 60 seconds
+[2025-09-25 20:06:28.229] [INFO] ExpiringCache: Initializing with default TTL of 60 seconds
+[2025-09-25 20:06:33.229] [INFO] ExpiringCache: Initializing with default TTL of 60 seconds
+[2025-09-25 20:06:38.229] [INFO] ExpiringCache: Initializing with default TTL of 60 seconds
+===============================================================================
+All tests passed (18 assertions in 4 test cases)
+
+<end of output>
+Test time =  25.00 sec
+----------------------------------------------------------
+Test Passed.
+"util::iora_test_expiring_cache" end time: Sep 25 20:06 AWST
+"util::iora_test_expiring_cache" time elapsed: 00:00:25
+----------------------------------------------------------
+
+24/32 Testing: storage::iora_test_state
+24/32 Test: storage::iora_test_state
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_state"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"storage::iora_test_state" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:06:48.232] [INFO] JsonFileStore: Initializing with file: test_store.json
+[2025-09-25 20:06:48.233] [INFO] JsonFileStore: Loaded existing data with 1 keys from: test_store.json
+[2025-09-25 20:06:48.233] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/storage/json_file_store.hpp:267 unregisterStore] No more stores registered, stopping flush thread
+[2025-09-25 20:06:48.234] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/storage/json_file_store.hpp:275 unregisterStore] Flush thread stopped
+[2025-09-25 20:06:48.234] [INFO] JsonFileStore: Initializing with file: test_store.json
+[2025-09-25 20:06:48.234] [INFO] JsonFileStore: Loaded existing data with 1 keys from: test_store.json
+[2025-09-25 20:06:48.234] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/storage/json_file_store.hpp:267 unregisterStore] No more stores registered, stopping flush thread
+[2025-09-25 20:06:48.234] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/storage/json_file_store.hpp:275 unregisterStore] Flush thread stopped
+===============================================================================
+All tests passed (22 assertions in 2 test cases)
+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"storage::iora_test_state" end time: Sep 25 20:06 AWST
+"storage::iora_test_state" time elapsed: 00:00:00
+----------------------------------------------------------
+
+25/32 Testing: service::iora_test_iora_service
+25/32 Test: service::iora_test_iora_service
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_iora_service"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"service::iora_test_iora_service" start time: Sep 25 20:06 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:06:48.236] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:06:48.237] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:06:48] [INFO] Timer service started successfully
+[2025-09-25 20:06:48] [INFO] Timer service loop started
+[2025-09-25 20:06:50] [INFO] Timer service started successfully
+[2025-09-25 20:06:50] [INFO] Timer service loop started
+[2025-09-25 20:06:50] [INFO] Timer service started successfully
+[2025-09-25 20:06:50] [INFO] Timer service loop started
+[2025-09-25 20:06:50] [INFO] Timer service started successfully
+[2025-09-25 20:06:50] [INFO] Timer service loop started
+[2025-09-25 20:06:55] [INFO] Stopping timer service
+[2025-09-25 20:06:55] [INFO] Timer service loop finished
+[2025-09-25 20:06:55] [INFO] Timer service stopped
+[2025-09-25 20:06:55] [INFO] Stopping timer service
+[2025-09-25 20:06:55] [INFO] Timer service loop finished
+[2025-09-25 20:06:55] [INFO] Timer service stopped
+[2025-09-25 20:06:58] [INFO] Timer service started successfully
+[2025-09-25 20:06:58] [INFO] Timer service loop started
+[2025-09-25 20:06:58] [INFO] Timer service started successfully
+[2025-09-25 20:06:58] [INFO] Timer service loop started
+[2025-09-25 20:06:58] [INFO] Timer service started successfully
+[2025-09-25 20:06:58] [INFO] Timer service started successfully
+[2025-09-25 20:06:58] [INFO] Timer service loop started
+[2025-09-25 20:06:58] [INFO] Timer service loop started
+[2025-09-25 20:07:03] [INFO] Stopping timer service
+[2025-09-25 20:07:03] [INFO] Timer service loop finished
+[2025-09-25 20:07:03] [INFO] Timer service stopped
+[2025-09-25 20:07:03] [INFO] Stopping timer service
+[2025-09-25 20:07:03] [INFO] Timer service loop finished
+[2025-09-25 20:07:03] [INFO] Timer service stopped
+[2025-09-25 20:07:08] [INFO] Timer service started successfully
+[2025-09-25 20:07:08] [INFO] Timer service loop started
+[2025-09-25 20:07:08] [INFO] Timer service started successfully
+[2025-09-25 20:07:08] [INFO] Timer service loop started
+[2025-09-25 20:07:08] [INFO] Timer service loop started
+[2025-09-25 20:07:08] [INFO] Timer service started successfully
+[2025-09-25 20:07:08] [INFO] Timer service started successfully
+[2025-09-25 20:07:08] [INFO] Timer service loop started
+[2025-09-25 20:07:13] [INFO] Stopping timer service
+[2025-09-25 20:07:13] [INFO] Timer service loop finished
+[2025-09-25 20:07:13] [INFO] Timer service stopped
+[2025-09-25 20:07:16] [INFO] Stopping timer service
+[2025-09-25 20:07:16] [INFO] Timer service loop finished
+[2025-09-25 20:07:16] [INFO] Timer service stopped
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:18] [INFO] Timer service started successfully
+[2025-09-25 20:07:18] [INFO] Timer service loop started
+[2025-09-25 20:07:23] [INFO] Stopping timer service
+[2025-09-25 20:07:23] [INFO] Timer service loop finished
+[2025-09-25 20:07:23] [INFO] Timer service stopped
+[2025-09-25 20:07:23] [INFO] Stopping timer service
+[2025-09-25 20:07:23] [INFO] Timer service loop finished
+[2025-09-25 20:07:23] [INFO] Timer service stopped
+[2025-09-25 20:07:23] [INFO] Stopping timer service
+[2025-09-25 20:07:23] [INFO] Timer service loop finished
+[2025-09-25 20:07:23] [INFO] Timer service stopped
+[2025-09-25 20:07:23] [INFO] Stopping timer service
+[2025-09-25 20:07:23] [INFO] Timer service loop finished
+[2025-09-25 20:07:23] [INFO] Timer service stopped
+[2025-09-25 20:07:23] [INFO] Stopping timer service
+[2025-09-25 20:07:23] [INFO] Timer service loop finished
+[2025-09-25 20:07:23] [INFO] Timer service stopped
+[2025-09-25 20:07:24] [INFO] Stopping timer service
+[2025-09-25 20:07:24] [INFO] Timer service loop finished
+[2025-09-25 20:07:24] [INFO] Timer service stopped
+[2025-09-25 20:07:28] [INFO] Timer service started successfully
+[2025-09-25 20:07:28] [INFO] Timer service loop started
+[2025-09-25 20:07:28] [INFO] Stopping timer service
+[2025-09-25 20:07:28] [INFO] Timer service loop finished
+[2025-09-25 20:07:28] [INFO] Timer service stopped
+[2025-09-25 20:07:33] [INFO] Timer service started successfully
+[2025-09-25 20:07:33] [INFO] Timer service loop started
+[2025-09-25 20:07:33] [INFO] Stopping timer service
+[2025-09-25 20:07:33] [INFO] Timer service loop finished
+[2025-09-25 20:07:33] [INFO] Timer service stopped
+===============================================================================
+All tests passed (27 assertions in 6 test cases)
+
+<end of output>
+Test time =  50.01 sec
+----------------------------------------------------------
+Test Passed.
+"service::iora_test_iora_service" end time: Sep 25 20:07 AWST
+"service::iora_test_iora_service" time elapsed: 00:00:50
+----------------------------------------------------------
+
+26/32 Testing: service::iora_test_plugin
+26/32 Test: service::iora_test_plugin
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_plugin"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"service::iora_test_plugin" start time: Sep 25 20:07 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:07:38.241] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:07:38.241] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:07:38] [INFO] Timer service started successfully
+[2025-09-25 20:07:38] [INFO] Timer service loop started
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.243] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.343] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.343] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.343] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.343] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.443] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.544] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.544] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.544] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.544] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.644] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.644] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.644] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.644] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.700] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.700] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.700] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.700] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.710] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.710] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.710] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.710] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.720] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.720] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.720] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.720] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.731] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.731] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.731] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.731] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.741] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.741] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.741] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.741] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+Thread safety test completed:
+  Success count: 1000
+  Exception count: 0
+  Total calls: 1000
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.797] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.797] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.797] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.797] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+
+=== Performance Benchmark Results ===
+Test: 100000 API calls each
+1. Unsafe API (getExportedApi):     1.67 ns/call
+2. Safe API (getExportedApiSafe):   26.64 ns/call
+3. CallExportedApi (lookup each):   40.71 ns/call
+
+Safe API overhead: 24.97 ns/call (1494.8%)
+Plugin path: /workspace/karoo_sbc/libs/iora/build/tests/plugins/testplugin.so
+[2025-09-25 20:07:38.804] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.804] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.804] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.804] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.805] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.805] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.805] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.805] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.806] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.806] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.806] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.806] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.807] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.807] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.807] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.807] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.808] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.808] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.808] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.808] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.810] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.810] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.810] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.810] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.811] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.811] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.811] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.811] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.812] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.812] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.812] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.812] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.814] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.814] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.814] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.814] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.815] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.815] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.815] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.815] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.816] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.add for plugin: testplugin.so
+[2025-09-25 20:07:38.816] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.greet for plugin: testplugin.so
+[2025-09-25 20:07:38.816] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.toggleLoaded for plugin: testplugin.so
+[2025-09-25 20:07:38.816] [INFO] IoraService::exportApi() - Registering plugin API: testplugin.isLoaded for plugin: testplugin.so
+
+=== Cache Refresh Performance ===
+Average cache refresh time: 1511 ns
+This cost is only paid on first call after module reload
+===============================================================================
+All tests passed (79 assertions in 1 test case)
+
+[2025-09-25 20:07:38] [INFO] Stopping timer service
+[2025-09-25 20:07:38] [INFO] Timer service loop finished
+[2025-09-25 20:07:38] [INFO] Timer service stopped
+<end of output>
+Test time =   5.00 sec
+----------------------------------------------------------
+Test Passed.
+"service::iora_test_plugin" end time: Sep 25 20:07 AWST
+"service::iora_test_plugin" time elapsed: 00:00:05
+----------------------------------------------------------
+
+27/32 Testing: service::iora_test_plugin_dependencies
+27/32 Test: service::iora_test_plugin_dependencies
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/iora_test_plugin_dependencies"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"service::iora_test_plugin_dependencies" start time: Sep 25 20:07 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:07:43.246] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:07:43.247] [DEBUG] EventQueue: Worker thread 0 started
+[2025-09-25 20:07:43.247] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:07:43] [INFO] Timer service started successfully
+[2025-09-25 20:07:43] [INFO] Timer service loop started
+[2025-09-25 20:07:43.248] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.248] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.248] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.248] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.248] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.248] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.useChain for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.getDependencyStatus for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.complexOperation for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.useChain for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.getDependencyStatus for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.complexOperation for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.useChain for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.getDependencyStatus for plugin: chainedplugin.so
+[2025-09-25 20:07:43.249] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.complexOperation for plugin: chainedplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:43.250] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:43.260] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.260] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.260] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.260] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.260] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.265] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.265] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.265] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.265] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.265] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.270] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.270] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.270] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.270] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.270] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:43.276] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:43.276] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:43.276] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.276] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:43.276] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+===============================================================================
+All tests passed (129 assertions in 1 test case)
+
+[2025-09-25 20:07:43] [INFO] Stopping timer service
+[2025-09-25 20:07:43] [INFO] Timer service loop finished
+[2025-09-25 20:07:43] [INFO] Timer service stopped
+<end of output>
+Test time =   5.01 sec
+----------------------------------------------------------
+Test Passed.
+"service::iora_test_plugin_dependencies" end time: Sep 25 20:07 AWST
+"service::iora_test_plugin_dependencies" time elapsed: 00:00:05
+----------------------------------------------------------
+
+28/32 Testing: debug_chained_test
+28/32 Test: debug_chained_test
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/debug_chained_test"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"debug_chained_test" start time: Sep 25 20:07 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:07:48.252] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:07:48.252] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:07:48] [INFO] Timer service started successfully
+[2025-09-25 20:07:48] [INFO] Timer service loop started
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.useChain for plugin: chainedplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.getDependencyStatus for plugin: chainedplugin.so
+[2025-09-25 20:07:48.253] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.complexOperation for plugin: chainedplugin.so
+[2025-09-25 20:07:48] [INFO] Stopping timer service
+[2025-09-25 20:07:48] [INFO] Timer service loop finished
+[2025-09-25 20:07:48] [INFO] Timer service stopped
+===============================================================================
+All tests passed (8 assertions in 1 test case)
+
+<end of output>
+Test time =   5.00 sec
+----------------------------------------------------------
+Test Passed.
+"debug_chained_test" end time: Sep 25 20:07 AWST
+"debug_chained_test" time elapsed: 00:00:05
+----------------------------------------------------------
+
+29/32 Testing: simple_chained_test
+29/32 Test: simple_chained_test
+Command: "/workspace/karoo_sbc/libs/iora/build/tests/simple_chained_test"
+Directory: /workspace/karoo_sbc/libs/iora/build/tests
+"simple_chained_test" start time: Sep 25 20:07 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:07:53.256] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:07:53.257] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:07:53] [INFO] Timer service started successfully
+[2025-09-25 20:07:53] [INFO] Timer service loop started
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getVersion for plugin: baseplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.increment for plugin: baseplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.getCounter for plugin: baseplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.setCounter for plugin: baseplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: baseplugin.reset for plugin: baseplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.useBase for plugin: dependentplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getStatus for plugin: dependentplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: dependentplugin.getNotificationCounts for plugin: dependentplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.useChain for plugin: chainedplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.getDependencyStatus for plugin: chainedplugin.so
+[2025-09-25 20:07:53.258] [INFO] IoraService::exportApi() - Registering plugin API: chainedplugin.complexOperation for plugin: chainedplugin.so
+[2025-09-25 20:07:53] [INFO] Stopping timer service
+[2025-09-25 20:07:53] [INFO] Timer service loop finished
+[2025-09-25 20:07:53] [INFO] Timer service stopped
+===============================================================================
+All tests passed (8 assertions in 1 test case)
+
+<end of output>
+Test time =   5.00 sec
+----------------------------------------------------------
+Test Passed.
+"simple_chained_test" end time: Sep 25 20:07 AWST
+"simple_chained_test" time elapsed: 00:00:05
+----------------------------------------------------------
+
+30/32 Testing: IoraTestKvStore
+30/32 Test: IoraTestKvStore
+Command: "/workspace/karoo_sbc/libs/iora/build/src/modules/storage/kvstore/tests/iora_test_mod_kvstore"
+Directory: /workspace/karoo_sbc/libs/iora/build/src/modules/storage/kvstore/tests
+"IoraTestKvStore" start time: Sep 25 20:07 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:07:58.381] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:07:58.381] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:07:58] [INFO] Timer service started successfully
+[2025-09-25 20:07:58] [INFO] Timer service loop started
+Plugin path: /workspace/karoo_sbc/libs/iora/build/src/modules/storage/kvstore/mod_kvstore.so
+[2025-09-25 20:07:58.382] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.get for plugin: mod_kvstore.so
+[2025-09-25 20:07:58.382] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.set for plugin: mod_kvstore.so
+[2025-09-25 20:07:58.382] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.setBatch for plugin: mod_kvstore.so
+[2025-09-25 20:07:58.382] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.getBatch for plugin: mod_kvstore.so
+[2025-09-25 20:07:58.382] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.getString for plugin: mod_kvstore.so
+[2025-09-25 20:07:58.382] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.setString for plugin: mod_kvstore.so
+[2025-09-25 20:07:58] [INFO] Stopping timer service
+[2025-09-25 20:07:58] [INFO] Timer service loop finished
+[2025-09-25 20:07:58] [INFO] Timer service stopped
+[2025-09-25 20:08:03] [INFO] Timer service started successfully
+Plugin path: /workspace/karoo_sbc/libs/iora/build/src/modules/storage/kvstore/mod_kvstore.so
+[2025-09-25 20:08:03.384] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.get for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.384] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.set for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.384] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.setBatch for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.384] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.getBatch for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.384] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.getString for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.384] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.setString for plugin: mod_kvstore.so
+[2025-09-25 20:08:03] [INFO] Timer service loop started
+[2025-09-25 20:08:03.393] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.get for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.393] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.set for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.393] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.setBatch for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.393] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.getBatch for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.393] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.getString for plugin: mod_kvstore.so
+[2025-09-25 20:08:03.393] [INFO] IoraService::exportApi() - Registering plugin API: kvstore.setString for plugin: mod_kvstore.so
+[2025-09-25 20:08:03] [INFO] Stopping timer service
+[2025-09-25 20:08:03] [INFO] Timer service loop finished
+[2025-09-25 20:08:03] [INFO] Timer service stopped
+===============================================================================
+All tests passed (2346 assertions in 24 test cases)
+
+<end of output>
+Test time =  10.13 sec
+----------------------------------------------------------
+Test Passed.
+"IoraTestKvStore" end time: Sep 25 20:08 AWST
+"IoraTestKvStore" time elapsed: 00:00:10
+----------------------------------------------------------
+
+31/32 Testing: JsonRpcServerModule
+31/32 Test: JsonRpcServerModule
+Command: "/workspace/karoo_sbc/libs/iora/build/src/modules/endpoints/jsonrpc_server/tests/iora_test_mod_jsonrpc_server"
+Directory: /workspace/karoo_sbc/libs/iora/build/src/modules/endpoints/jsonrpc_server/tests
+"JsonRpcServerModule" start time: Sep 25 20:08 AWST
+Output:
+----------------------------------------------------------
+[2025-09-25 20:08:08.388] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:08:08.388] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:08:08] [INFO] Timer service started successfully
+[2025-09-25 20:08:08] [INFO] Timer service loop started
+[2025-09-25 20:08:08] [INFO] Stopping timer service
+[2025-09-25 20:08:08] [INFO] Timer service loop finished
+[2025-09-25 20:08:08] [INFO] Timer service stopped
+[2025-09-25 20:08:13] [INFO] Timer service started successfully
+[2025-09-25 20:08:13.391] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13.391] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:13] [INFO] Timer service loop started
+[2025-09-25 20:08:13] [INFO] Stopping timer service
+[2025-09-25 20:08:13] [INFO] Timer service loop finished
+[2025-09-25 20:08:13] [INFO] Timer service stopped
+[2025-09-25 20:08:18] [INFO] Timer service started successfully
+[2025-09-25 20:08:18.393] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18.393] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:18] [INFO] Timer service loop started
+[2025-09-25 20:08:18] [INFO] Stopping timer service
+[2025-09-25 20:08:18] [INFO] Timer service loop finished
+[2025-09-25 20:08:18] [INFO] Timer service stopped
+[2025-09-25 20:08:23] [INFO] Timer service started successfully
+[2025-09-25 20:08:23.394] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:23] [INFO] Timer service loop started
+[2025-09-25 20:08:23] [INFO] Stopping timer service
+[2025-09-25 20:08:23] [INFO] Timer service loop finished
+[2025-09-25 20:08:23] [INFO] Timer service stopped
+[2025-09-25 20:08:28] [INFO] Timer service started successfully
+[2025-09-25 20:08:28.394] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28.394] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:28] [INFO] Timer service loop started
+[2025-09-25 20:08:28] [INFO] Stopping timer service
+[2025-09-25 20:08:28] [INFO] Timer service loop finished
+[2025-09-25 20:08:28] [INFO] Timer service stopped
+[2025-09-25 20:08:33] [INFO] Timer service started successfully
+[2025-09-25 20:08:33.395] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33.395] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:33] [INFO] Timer service loop started
+[2025-09-25 20:08:33] [INFO] Stopping timer service
+[2025-09-25 20:08:33] [INFO] Timer service loop finished
+[2025-09-25 20:08:33] [INFO] Timer service stopped
+[2025-09-25 20:08:38] [INFO] Timer service started successfully
+[2025-09-25 20:08:38.397] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38.397] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:38] [INFO] Timer service loop started
+[2025-09-25 20:08:38] [INFO] Stopping timer service
+[2025-09-25 20:08:38] [INFO] Timer service loop finished
+[2025-09-25 20:08:38] [INFO] Timer service stopped
+===============================================================================
+All tests passed (159 assertions in 13 test cases)
+
+<end of output>
+Test time =  35.02 sec
+----------------------------------------------------------
+Test Passed.
+"JsonRpcServerModule" end time: Sep 25 20:08 AWST
+"JsonRpcServerModule" time elapsed: 00:00:35
+----------------------------------------------------------
+
+32/32 Testing: JsonRpcClientServerRealTest
+32/32 Test: JsonRpcClientServerRealTest
+Command: "/workspace/karoo_sbc/libs/iora/build/src/modules/connectors/jsonrpc_client/tests/iora_test_mod_jsonrpc_client_server_real"
+Directory: /workspace/karoo_sbc/libs/iora/build/src/modules/connectors/jsonrpc_client/tests
+"JsonRpcClientServerRealTest" start time: Sep 25 20:08 AWST
+Output:
+----------------------------------------------------------
+Real JSON-RPC Client-Server Integration Test
+============================================
+
+[2025-09-25 20:08:43.401] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:08:43.401] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+Loading server plugin from: /workspace/karoo_sbc/libs/iora/build/src/modules//endpoints/jsonrpc_server/mod_jsonrpc_server.so
+Loading client plugin from: /workspace/karoo_sbc/libs/iora/build/src/modules//connectors/jsonrpc_client/mod_jsonrpc_client.so
+✓ JSON-RPC server module loaded
+✓ JSON-RPC client module loaded
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43.403] [INFO] JSON-RPC server plugin configured: path=/rpc, auth=false, timeout=5000ms
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.version for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.register for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.registerWithOptions for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.unregister for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.has for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getMethods for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.getStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.resetStats for plugin: mod_jsonrpc_server.so
+[2025-09-25 20:08:43.403] [INFO] JSON-RPC client plugin configured: per-endpoint max=8, global max=0, pools max=0, reqTimeoutMs=30000
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.version for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.call for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.notify for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.callAsync for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.callBatch for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.callBatchAsync for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.result for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.getStats for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.resetStats for plugin: mod_jsonrpc_client.so
+[2025-09-25 20:08:43.403] [INFO] IoraService::exportApi() - Registering plugin API: jsonrpc.client.purgeIdle for plugin: mod_jsonrpc_client.so
+
+Exported APIs after plugin load:
+  jsonrpc.client.purgeIdle
+  jsonrpc.client.resetStats
+  jsonrpc.client.callBatchAsync
+  jsonrpc.client.call
+  jsonrpc.client.version
+  jsonrpc.registerWithOptions
+  jsonrpc.has
+  jsonrpc.getMethods
+  jsonrpc.client.getStats
+  jsonrpc.getStats
+  jsonrpc.client.callBatch
+  jsonrpc.version
+  jsonrpc.unregister
+  jsonrpc.resetStats
+  jsonrpc.client.result
+  jsonrpc.client.notify
+  jsonrpc.register
+  jsonrpc.client.callAsync
+✓ Server version: 2
+✓ Registered 'echo' method on server
+✓ Server has 'echo' method
+✓ Server getMethods includes 'echo'
+✓ Server stats: {"notificationRequests":0,"batchRequests":0,"timeoutRequests":0,"failedRequests":0,"successfulRequests":0,"totalRequests":0}
+✓ Server stats reset
+✓ Unregistered 'echo' method
+✓ Server no longer has 'echo' method
+✓ Client version: 2
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43.517] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43.518] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 66 bytes)
+[2025-09-25 20:08:43.520] [INFO] EventQueue: Initializing with 4 worker threads
+[2025-09-25 20:08:43.520] [INFO] EventQueue: All worker threads started successfully
+[2025-09-25 20:08:43.520] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 84 bytes)
+○ Client call failed (expected if server not running): JSON-RPC remote error: (-32601) Method 'echo' not found
+[2025-09-25 20:08:43.520] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 59 bytes)
+[2025-09-25 20:08:43.521] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 87 bytes)
+✓ Client notify sent
+✓ Client callAsync jobId: rpcjob-1
+✓ Client callAsync result: {"done":false}
+✓ Client stats reset
+✓ Client purged idle: 0
+✓ Client getStats (JSON format): {"connectionsEvicted":0,"connectionsCreated":0,"notificationRequests":0,"batchRequests":0,"poolExhaustions":0,"timeoutRequests":0,"retriedRequests":0,"failedRequests":0,"successfulRequests":0,"totalRequests":0}
+[2025-09-25 20:08:43.521] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 201 bytes)
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+[2025-09-25 20:08:43.522] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 259 bytes)
+○ Client callBatch failed (expected if server not running): JSON-RPC remote error: (-32601) Method 'echo' not found
+✓ Client callBatchAsync jobId: rpcjob-2
+  Batch async result (attempt 1): {"done":false}
+[2025-09-25 20:08:43.522] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 141 bytes)
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43.523] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 173 bytes)
+[2025-09-25 20:08:43.534] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+[2025-09-25 20:08:43] [INFO] Timer service started successfully
+[2025-09-25 20:08:43] [INFO] Timer service loop started
+[2025-09-25 20:08:43.535] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 66 bytes)
+[2025-09-25 20:08:43.537] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 84 bytes)
+  Batch async result (attempt 2): {"error":{"message":"Method 'echo' not found","data":null,"code":-32601},"done":true}
+✓ Comprehensive JSON-RPC API coverage test completed (including previously leaking APIs)
+✓ Registered 'secure_method' with options
+✓ getMethods includes 'secure_method'
+✓ Registered multiple methods. Total methods: 3
+  - math.multiply
+  - math.add
+  - secure_method
+✓ Server stats after registrations: {"notificationRequests":2,"batchRequests":2,"timeoutRequests":0,"failedRequests":5,"successfulRequests":0,"totalRequests":5}
+✓ Cleanup completed. Remaining methods: 0
+✓ Batch with invalid JSON structure properly rejected: Batch items must be a JSON array
+✓ Batch with missing method field properly rejected: Each batch item must be an object with 'method' field
+✓ Client statistics format validation passed
+✓ Non-existent async job properly handled: {"done":false}
+✓ Registered echo and add methods on server
+[2025-09-25 20:08:44.122] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 82 bytes)
+Server: echo called with {"message":"Hello from client!"}
+[2025-09-25 20:08:44.123] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 66 bytes)
+✓ Direct RPC call successful: {"message":"Hello from client!"}
+[2025-09-25 20:08:44.123] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 207 bytes)
+Server: echo called with {"msg":"batch echo test"}
+Server: echo called with {"notification":true}
+[2025-09-25 20:08:44.124] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 106 bytes)
+✓ Batch RPC call successful with 3 results:
+  Result[0]: {"msg":"batch echo test"}
+  Result[1]: {"sum":30}
+✓ Async RPC call initiated with jobId: rpcjob-3
+  Async poll attempt 1: {"done":false}
+[2025-09-25 20:08:44.124] [INFO] HttpClient: POST http://localhost:8135/rpc (body size: 72 bytes)
+Server: echo called with {"async_test":"value"}
+[2025-09-25 20:08:44.124] [INFO] HttpClient: Received 200 response from http://localhost:8135/rpc (body size: 56 bytes)
+  Async poll attempt 2: {"result":{"async_test":"value"},"done":true}
+✓ Async operation completed successfully
+✓ Final client statistics: {"connectionsEvicted":0,"connectionsCreated":1,"notificationRequests":2,"batchRequests":3,"poolExhaustions":0,"timeoutRequests":0,"retriedRequests":0,"failedRequests":3,"successfulRequests":6,"totalRequests":6}
+✓ Final server statistics: {"notificationRequests":3,"batchRequests":3,"timeoutRequests":0,"failedRequests":5,"successfulRequests":3,"totalRequests":8}
+✓ Full client-server communication test completed
+[2025-09-25 20:08:44] [INFO] Timer service started successfully
+[2025-09-25 20:08:44] [INFO] Timer service loop started
+[2025-09-25 20:08:44.237] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:08:44] [INFO] Timer service started successfully
+[2025-09-25 20:08:44] [INFO] Timer service loop started
+[2025-09-25 20:08:44] [INFO] Timer service started successfully
+[2025-09-25 20:08:44] [INFO] Timer service loop started
+[2025-09-25 20:08:44.253] [INFO] HttpClient: POST http://127.0.0.1:9999/rpc (body size: 68 bytes)
+[2025-09-25 20:08:44.304] [ERROR] HttpClient: Request to http://127.0.0.1:9999/rpc failed after 1 attempts: Localhost connection taking too long - should fail immediately. Waited 51ms
+[2025-09-25 20:08:44.404] [INFO] HttpClient: POST http://127.0.0.1:9999/rpc (body size: 68 bytes)
+[2025-09-25 20:08:44.455] [ERROR] HttpClient: Request to http://127.0.0.1:9999/rpc failed after 1 attempts: Localhost connection taking too long - should fail immediately. Waited 50ms
+[2025-09-25 20:08:44.655] [INFO] HttpClient: POST http://127.0.0.1:9999/rpc (body size: 68 bytes)
+[2025-09-25 20:08:44.706] [ERROR] HttpClient: Request to http://127.0.0.1:9999/rpc failed after 1 attempts: Localhost connection taking too long - should fail immediately. Waited 50ms
+[2025-09-25 20:08:45.106] [INFO] HttpClient: POST http://127.0.0.1:9999/rpc (body size: 68 bytes)
+[2025-09-25 20:08:45.156] [ERROR] HttpClient: Request to http://127.0.0.1:9999/rpc failed after 1 attempts: Localhost connection taking too long - should fail immediately. Waited 50ms
+✓ Client correctly threw exception after 0 seconds: Localhost connection taking too long - should fail immediately. Waited 50ms
+[2025-09-25 20:08:45] [INFO] Timer service started successfully
+[2025-09-25 20:08:45] [INFO] Timer service loop started
+[2025-09-25 20:08:45.171] [INFO] ExpiringCache: Initializing with TTL of 300 seconds and eviction callback
+[2025-09-25 20:08:45] [INFO] Timer service started successfully
+[2025-09-25 20:08:45] [INFO] Timer service started successfully
+[2025-09-25 20:08:45.173] [INFO] HttpClient: POST not-a-valid-url (body size: 68 bytes)
+[2025-09-25 20:08:45.173] [ERROR] HttpClient: Request to not-a-valid-url failed after 1 attempts: Invalid URL format: not-a-valid-url
+[2025-09-25 20:08:45] [INFO] Timer service loop started
+[2025-09-25 20:08:45] [INFO] Timer service loop started
+[2025-09-25 20:08:45.273] [INFO] HttpClient: POST not-a-valid-url (body size: 68 bytes)
+[2025-09-25 20:08:45.273] [ERROR] HttpClient: Request to not-a-valid-url failed after 1 attempts: Invalid URL format: not-a-valid-url
+[2025-09-25 20:08:45.473] [INFO] HttpClient: POST not-a-valid-url (body size: 68 bytes)
+[2025-09-25 20:08:45.473] [ERROR] HttpClient: Request to not-a-valid-url failed after 1 attempts: Invalid URL format: not-a-valid-url
+[2025-09-25 20:08:45.873] [INFO] HttpClient: POST not-a-valid-url (body size: 68 bytes)
+[2025-09-25 20:08:45.873] [ERROR] HttpClient: Request to not-a-valid-url failed after 1 attempts: Invalid URL format: not-a-valid-url
+✓ Client correctly rejected invalid URL: Invalid URL format: not-a-valid-url
+===============================================================================
+All tests passed (50 assertions in 5 test cases)
+
+[2025-09-25 20:08:49] [INFO] Stopping timer service
+[2025-09-25 20:08:49] [INFO] Timer service loop finished
+[2025-09-25 20:08:49] [INFO] Timer service stopped
+[2025-09-25 20:08:50] [INFO] Stopping timer service
+[2025-09-25 20:08:50] [INFO] Timer service loop finished
+[2025-09-25 20:08:50] [INFO] Timer service stopped
+[2025-09-25 20:08:53] [INFO] Stopping timer service
+[2025-09-25 20:08:53] [INFO] Timer service loop finished
+[2025-09-25 20:08:53] [INFO] Timer service stopped
+[2025-09-25 20:08:58] [INFO] Stopping timer service
+[2025-09-25 20:08:58] [INFO] Timer service loop finished
+[2025-09-25 20:08:58] [INFO] Timer service stopped
+[2025-09-25 20:08:58] [INFO] Stopping timer service
+[2025-09-25 20:08:58] [INFO] Timer service loop finished
+[2025-09-25 20:08:58] [INFO] Timer service stopped
+<end of output>
+Test time =  20.01 sec
+----------------------------------------------------------
+Test Passed.
+"JsonRpcClientServerRealTest" end time: Sep 25 20:09 AWST
+"JsonRpcClientServerRealTest" time elapsed: 00:00:20
+----------------------------------------------------------
+
+End testing: Sep 25 20:09 AWST

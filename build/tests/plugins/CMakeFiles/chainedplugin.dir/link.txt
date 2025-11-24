@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -fPIC -O3 -DNDEBUG -shared -Wl,-soname,chainedplugin.so -o chainedplugin.so CMakeFiles/chainedplugin.dir/ChainedPlugin.cpp.o  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 

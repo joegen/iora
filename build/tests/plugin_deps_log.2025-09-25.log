@@ -1,0 +1,38 @@
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1072 applyConfig] applyConfig: Logger initialized
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1080 applyConfig] applyConfig: state.file = plugin_deps_state5.json
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1081 applyConfig] applyConfig: log.level = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1082 applyConfig] applyConfig: log.file = plugin_deps_log
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1083 applyConfig] applyConfig: log.async = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1086 applyConfig] applyConfig: log.retentionDays = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1090 applyConfig] applyConfig: log.timeFormat = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1091 applyConfig] applyConfig: server.bindAddress = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1093 applyConfig] applyConfig: server.port = 8144
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1096 applyConfig] applyConfig: server.tls.certFile = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1098 applyConfig] applyConfig: server.tls.keyFile = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1100 applyConfig] applyConfig: server.tls.caFile = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1102 applyConfig] applyConfig: server.tls.requireClientCert = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1106 applyConfig] applyConfig: modules.directory = <unset>
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1111 applyConfig] applyConfig: Creating JsonFileStore at: plugin_deps_state5.json
+[2025-09-25 20:07:48.252] [INFO] JsonFileStore: Initializing with file: plugin_deps_state5.json
+[2025-09-25 20:07:48.252] [INFO] JsonFileStore: File plugin_deps_state5.json does not exist, starting with empty store
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1114 applyConfig] applyConfig: JsonFileStore created at: plugin_deps_state5.json
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1120 applyConfig] applyConfig: Setting webhook server to bind on 0.0.0.0:8144
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1141 applyConfig] applyConfig: TLS is not enabled
+[2025-09-25 20:07:48.252] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1145 applyConfig] applyConfig: Starting webhook server on port: 8144
+[2025-09-25 20:07:48.253] [INFO] WebhookServer started on 0.0.0.0:8144
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1149 applyConfig] applyConfig: Webhook server started successfully
+[2025-09-25 20:07:48.253] [WARN] [/workspace/karoo_sbc/libs/iora/include/iora/core/config_loader.hpp:50 load] ConfigLoader: Failed to load configuration file: /etc/iora.conf.d/iora.cfg
+[2025-09-25 20:07:48.253] [INFO] ExpiringCache: Initializing with TTL of 60 seconds
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1198 applyConfig] applyConfig: Auto-loading modules is disabled
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:1201 applyConfig] applyConfig: Configuration applied
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:891 loadSingleModule] Loading module: baseplugin.so
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:891 loadSingleModule] Loading module: dependentplugin.so
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:891 loadSingleModule] Loading module: chainedplugin.so
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:749 unloadAllModules] Plugin chainedplugin.so onUnload completed.
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:749 unloadAllModules] Plugin dependentplugin.so onUnload completed.
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:749 unloadAllModules] Plugin baseplugin.so onUnload completed.
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:776 unloadAllModules] Plugin library chainedplugin.so unloaded successfully.
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:776 unloadAllModules] Plugin library dependentplugin.so unloaded successfully.
+[2025-09-25 20:07:48.253] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/iora.hpp:776 unloadAllModules] Plugin library baseplugin.so unloaded successfully.
+[2025-09-25 20:07:48.404] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/storage/json_file_store.hpp:267 unregisterStore] No more stores registered, stopping flush thread
+[2025-09-25 20:07:48.404] [INFO] [/workspace/karoo_sbc/libs/iora/include/iora/storage/json_file_store.hpp:275 unregisterStore] Flush thread stopped

@@ -1,0 +1,1 @@
+/usr/bin/c++  -fPIC -O3 -DNDEBUG CMakeFiles/iora_test_xml_parser.dir/parsers/iora_test_xml_parser.cpp.o -o iora_test_xml_parser  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/libCatch2WithMain.a 

@@ -276,6 +276,7 @@ class SyncAsyncTransport
 public:
   using DataCallback =
     std::function<void(SessionId, const std::uint8_t *, std::size_t, const IoResult &)>;
+  using AcceptCallback = std::function<void(SessionId, const std::string &, const IoResult &)>;
   using ConnectCallback = std::function<void(SessionId, const IoResult &)>;
   using CloseCallback = std::function<void(SessionId, const IoResult &)>;
   using ErrorCallback = std::function<void(TransportError, const std::string &)>;
@@ -364,6 +365,7 @@ public:
 
     iora::core::Logger::debug("SyncAsyncTransport::stop() - Stopping underlying transport");
     _transport->stop();
+
     iora::core::Logger::debug("SyncAsyncTransport::stop() - Completed");
   }
 
@@ -450,6 +452,13 @@ public:
     _errorCallback = cb;
   }
 
+  /// \brief Set async accept callback (for incoming connections)
+  void setAcceptCallback(AcceptCallback cb)
+  {
+    std::lock_guard<std::mutex> lock(_callbackMutex);
+    _acceptCallback = cb;
+  }
+
   /// \brief Async send with completion callback
   void sendAsync(SessionId sid, const void *data, std::size_t len,
                  SendCompleteCallback cb = nullptr)
@@ -489,6 +498,63 @@ public:
     core::Logger::debug("SyncAsyncTransport: sendSync starting for session " + std::to_string(sid) +
                         ", len=" + std::to_string(len) +
                         ", timeout=" + std::to_string(timeout.count()) + "ms");
+
+    // CRITICAL FIX: Wait for TCP connection to be ready before sending
+    // TCP connect() is asynchronous - must wait for handshake to complete
+    // UDP does not need to wait - sessions are immediately ready
+    bool isUdp = std::string(typeid(*_transport).name()).find("Udp") != std::string::npos;
+
+    if (!isUdp)
+    {
+      auto deadline = std::chrono::steady_clock::now() + timeout;
+      {
+        std::unique_lock<std::mutex> lock(_sessionMutex);
+        auto &session = getOrCreateSession(sid);
+
+        // Wait for connection to become healthy (ready)
+        auto remaining = timeout;
+        while (!session.health.isHealthy && _running)
+        {
+          if (session.closed.load())
+          {
+            core::Logger::debug("SyncAsyncTransport: sendSync - connection closed during connect wait for session " +
+                                std::to_string(sid));
+            return SyncResult::failure(TransportError::PeerClosed, "Connection closed during connect");
+          }
+
+          // Wait with timeout for connection to become ready
+          auto wait_start = std::chrono::steady_clock::now();
+          session.readCv.wait_for(lock, remaining, [&] {
+            return session.health.isHealthy || session.closed.load() || !_running;
+          });
+
+          // Check if connection is now healthy
+          if (session.health.isHealthy)
+          {
+            core::Logger::debug("SyncAsyncTransport: sendSync - connection is ready for session " +
+                                std::to_string(sid));
+            break;
+          }
+
+          // Check timeout
+          auto now = std::chrono::steady_clock::now();
+          if (now >= deadline)
+          {
+            core::Logger::debug("SyncAsyncTransport: sendSync - timeout waiting for connection ready for session " +
+                                std::to_string(sid));
+            return SyncResult::timeout();
+          }
+          remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        }
+
+        if (!session.health.isHealthy)
+        {
+          core::Logger::debug("SyncAsyncTransport: sendSync - connection not ready for session " +
+                              std::to_string(sid));
+          return SyncResult::failure(TransportError::Connect, "Connection not ready");
+        }
+      }
+    }
 
     auto operation = std::make_shared<SyncOperation>();
     operation->type = SyncOperation::Type::Send;
@@ -791,6 +857,17 @@ public:
     return _transport->close(sid);
   }
 
+  /// \brief Mark a session as healthy (ready for I/O)
+  /// Used for UDP sessions created via connectViaListener() which are immediately ready
+  void markSessionHealthy(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    auto &session = getOrCreateSession(sid);
+    session.health.isHealthy = true;
+    session.health.lastActivity = std::chrono::steady_clock::now();
+    session.readCv.notify_all();  // Wake any threads waiting in sendSync()
+  }
+
   /// \brief Cancel all pending sync operations for a session
   void cancelPendingOperations(SessionId sid)
   {
@@ -918,16 +995,48 @@ private:
     // Data callback router
     _transport->setDataCallback(
       [this](SessionId sid, const std::uint8_t *data, std::size_t len, const IoResult &result)
-      { handleIncomingData(sid, data, len, result); });
+      {
+        handleIncomingData(sid, data, len, result);
+      });
 
     // Accept callback pass-through
     _transport->setAcceptCallback(
       [this](SessionId sid, const std::string &peer, const IoResult &result)
       {
+        IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Accept callback fired for session " << sid
+                       << ", peer=" << peer << ", result.ok=" << (result.ok ? "true" : "false"));
+
+        // CRITICAL: Lock ordering must match connect callback to prevent AB-BA deadlock
+        // 1. First: Acquire _callbackMutex and call user callback
+        std::lock_guard<std::mutex> cbLock(_callbackMutex);
+        IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Acquired _callbackMutex for session " << sid);
+
+        if (_acceptCallback)
+        {
+          _acceptCallback(sid, peer, result);
+        }
+
+        // 2. Second: Acquire _sessionMutex and mark session healthy (only if successful)
         if (result.ok)
         {
-          std::lock_guard<std::mutex> lock(_sessionMutex);
-          getOrCreateSession(sid); // Initialize session state
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] About to acquire _sessionMutex for session " << sid);
+          std::lock_guard<std::mutex> slock(_sessionMutex);
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Acquired _sessionMutex for session " << sid);
+          auto &session = getOrCreateSession(sid);
+
+          // CRITICAL FIX: Mark accepted (incoming) connections as healthy immediately
+          // Incoming connections are already established - they can send/receive immediately
+          // Without this, sendSync() will timeout waiting for isHealthy flag
+          session.health.isHealthy = true;
+          session.health.lastActivity = std::chrono::steady_clock::now();
+          session.readCv.notify_all();
+
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Marked accepted session " << sid << " as healthy");
+        }
+        else
+        {
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Accept failed for session " << sid
+                         << ", error=" << result.message);
         }
       });
 
@@ -935,7 +1044,13 @@ private:
     _transport->setConnectCallback(
       [this](SessionId sid, const IoResult &result)
       {
+        IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Connect callback fired for session " << sid
+                       << ", result.ok=" << (result.ok ? "true" : "false")
+                       << ", error=" << result.message);
+
         std::lock_guard<std::mutex> lock(_callbackMutex);
+        IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Acquired _callbackMutex for session " << sid);
+
         if (_connectCallback)
         {
           _connectCallback(sid, result);
@@ -944,10 +1059,24 @@ private:
         // Update health
         if (result.ok)
         {
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] About to acquire _sessionMutex for session " << sid);
           std::lock_guard<std::mutex> slock(_sessionMutex);
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Acquired _sessionMutex for session " << sid);
           auto &session = getOrCreateSession(sid);
           session.health.isHealthy = true;
           session.health.lastActivity = std::chrono::steady_clock::now();
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Set health.isHealthy=true for session " << sid
+                         << ", calling notify_all()");
+
+          // CRITICAL FIX: Wake up any threads waiting for connection to be ready
+          // This is needed for sendSync() which waits for TCP handshake to complete
+          session.readCv.notify_all();
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] Completed callback for session " << sid);
+        }
+        else
+        {
+          IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] result.ok=false for session " << sid
+                         << ", not setting health");
         }
       });
 
@@ -1075,20 +1204,27 @@ private:
 
   void processOperations()
   {
+    IORA_LOG_DEBUG("[PROCESSING-THREAD] Thread started");
     while (_running)
     {
+      IORA_LOG_DEBUG("[PROCESSING-THREAD] Waiting for operations...");
       std::unique_lock<std::mutex> lock(_mutex);
       _operationCv.wait_for(lock, std::chrono::milliseconds(100),
                             [this] { return !_running || hasQueuedOperations(); });
 
       if (!_running)
       {
+        IORA_LOG_DEBUG("[PROCESSING-THREAD] Shutting down");
         break;
       }
+
+      bool hasOps = hasQueuedOperations();
+      IORA_LOG_DEBUG("[PROCESSING-THREAD] Woke up, hasQueuedOperations=" << (hasOps ? "true" : "false"));
 
       // Process queued sync operations
       processSyncOperations();
     }
+    IORA_LOG_DEBUG("[PROCESSING-THREAD] Thread exiting");
   }
 
   bool hasQueuedOperations()
@@ -1108,8 +1244,16 @@ private:
   {
     std::lock_guard<std::mutex> lock(_sessionMutex);
 
+    IORA_LOG_DEBUG("[PROCESSING-THREAD] Processing sync operations, sessions=" << _sessions.size());
+
     for (auto &[sid, session] : _sessions)
     {
+      if (!session.pendingSyncOps.empty())
+      {
+        IORA_LOG_DEBUG("[PROCESSING-THREAD] Session " << sid << " has "
+                      << session.pendingSyncOps.size() << " pending ops");
+      }
+
       while (!session.pendingSyncOps.empty())
       {
         auto op = session.pendingSyncOps.front();
@@ -1117,6 +1261,7 @@ private:
         // Check if cancelled or timed out
         if (op->cancelled || (std::chrono::steady_clock::now() - op->startTime) > op->timeout)
         {
+          IORA_LOG_DEBUG("[PROCESSING-THREAD] Operation cancelled or timed out for sid=" << sid);
           op->result = op->cancelled ? SyncResult::cancelled() : SyncResult::timeout();
           op->completed = true;
           op->cv.notify_all();
@@ -1127,8 +1272,13 @@ private:
         // Process based on type
         if (op->type == SyncOperation::Type::Send)
         {
+          IORA_LOG_DEBUG("[PROCESSING-THREAD] About to call _transport->send() for sid=" << sid
+                        << ", data size=" << op->data.size());
+
           // Execute the send
           bool sent = _transport->send(sid, op->data.data(), op->data.size());
+
+          IORA_LOG_DEBUG("[PROCESSING-THREAD] _transport->send() returned " << (sent ? "true" : "false"));
 
           auto elapsed = std::chrono::steady_clock::now() - op->startTime;
           op->result = sent ? SyncResult::success(op->data.size())
@@ -1136,6 +1286,7 @@ private:
           op->result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
 
           op->completed = true;
+          IORA_LOG_DEBUG("[PROCESSING-THREAD] Marking operation complete and notifying waiter for sid=" << sid);
           op->cv.notify_all();
           session.pendingSyncOps.pop_front();
         }
@@ -1219,6 +1370,7 @@ private:
   std::unordered_map<SessionId, SessionState> _sessions;
 
   // User callbacks
+  AcceptCallback _acceptCallback;
   ConnectCallback _connectCallback;
   CloseCallback _closeCallback;
   ErrorCallback _errorCallback;

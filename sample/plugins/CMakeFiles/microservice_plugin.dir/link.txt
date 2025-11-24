@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -fPIC -O3 -DNDEBUG -shared -Wl,-soname,microservice_plugin.so -o microservice_plugin.so CMakeFiles/microservice_plugin.dir/microservice_plugin.cpp.o  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 

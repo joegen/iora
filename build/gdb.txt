@@ -1,0 +1,157 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff741e6c0 (LWP 53392)]
+[New Thread 0x7ffff6c1d6c0 (LWP 53393)]
+[New Thread 0x7ffff641c6c0 (LWP 53394)]
+[New Thread 0x7ffff5c1b6c0 (LWP 53395)]
+[New Thread 0x7ffff541a6c0 (LWP 53396)]
+[New Thread 0x7ffff4c196c0 (LWP 53397)]
+[New Thread 0x7fffdffff6c0 (LWP 53398)]
+[New Thread 0x7fffdf7fe6c0 (LWP 53399)]
+[Thread 0x7fffdf7fe6c0 (LWP 53399) exited]
+[Thread 0x7ffff741e6c0 (LWP 53392) exited]
+[New Thread 0x7fffdf7fe6c0 (LWP 53431)]
+[Thread 0x7fffdffff6c0 (LWP 53398) exited]
+[New Thread 0x7fffdffff6c0 (LWP 53432)]
+[New Thread 0x7ffff741e6c0 (LWP 53433)]
+[New Thread 0x7fffdeffd6c0 (LWP 53434)]
+[New Thread 0x7fffde7fc6c0 (LWP 53435)]
+[New Thread 0x7fffddffb6c0 (LWP 53436)]
+[New Thread 0x7fffdd7fa6c0 (LWP 53437)]
+[New Thread 0x7fffdcff96c0 (LWP 53438)]
+
+Thread 11 "DnsRetryTimer" received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fffdffff6c0 (LWP 53432)]
+0x0000555555639545 in iora::network::dns::DnsTransport::queryAsync(iora::network::dns::DnsQuestion const&, std::function<void (iora::network::dns::DnsResult const&, std::__exception_ptr::exception_ptr const&)>, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned short) ()
+
+Thread 17 (Thread 0x7fffdcff96c0 (LWP 53438) "iora_test_dns_c"):
+#0  0x00007ffff75296df in __libc_accept (fd=29, addr=..., len=0x7fffdcff8e2c) at ../sysdeps/unix/sysv/linux/accept.c:26
+#1  0x0000555555607a6c in std::thread::_State_impl<std::thread::_Invoker<std::tuple<MockDnsServer::start()::{lambda()#2}> > >::_M_run() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 16 (Thread 0x7fffdd7fa6c0 (LWP 53437) "iora_test_dns_c"):
+#0  0x00007ffff74ee545 in __GI___clock_nanosleep (clock_id=clock_id@entry=0, flags=flags@entry=0, req=0x7fffdd7f9c90, rem=0x7fffdd7f9c90) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:48
+#1  0x00007ffff74f2e53 in __GI___nanosleep (req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/nanosleep.c:25
+#2  0x00005555555c86ad in void std::this_thread::sleep_for<long, std::ratio<1l, 1000l> >(std::chrono::duration<long, std::ratio<1l, 1000l> > const&) [clone .isra.0] ()
+#3  0x000055555560967b in MockDnsServer::processDnsQuery(unsigned char const*, unsigned long, bool) ()
+#4  0x0000555555609b12 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<MockDnsServer::start()::{lambda()#1}> > >::_M_run() ()
+#5  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#6  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#7  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 15 (Thread 0x7fffddffb6c0 (LWP 53436) "iora_test_dns_c"):
+#0  __futex_abstimed_wait_common64 (private=0, cancel=true, abstime=0x7fffddffae70, op=137, expected=0, futex_word=0x5555556ef590) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (futex_word=futex_word@entry=0x5555556ef590, expected=expected@entry=0, clockid=clockid@entry=1, abstime=abstime@entry=0x7fffddffae70, private=private@entry=0, cancel=cancel@entry=true) at ./nptl/futex-internal.c:87
+#2  0x00007ffff74a4f7b in __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x5555556ef590, expected=expected@entry=0, clockid=clockid@entry=1, abstime=abstime@entry=0x7fffddffae70, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ffff74a7baf in __pthread_cond_wait_common (abstime=<optimized out>, clockid=1, mutex=0x5555556ef598, cond=0x5555556ef568) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_clockwait64 (abstime=<optimized out>, clockid=1, mutex=0x5555556ef598, cond=0x5555556ef568) at ./nptl/pthread_cond_wait.c:682
+#5  ___pthread_cond_clockwait64 (cond=0x5555556ef568, mutex=0x5555556ef598, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:670
+#6  0x0000555555631ee4 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<iora::network::dns::DnsTransport::startCleanupTimer()::{lambda()#1}> > >::_M_run() ()
+#7  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#9  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 14 (Thread 0x7fffde7fc6c0 (LWP 53435) "iora_test_dns_c"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=25, events=0x7fffc8000b70, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055555564131a in iora::network::SharedTransport::loop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 13 (Thread 0x7fffdeffd6c0 (LWP 53434) "iora_test_dns_c"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=22, events=0x7fffd4000ba0, maxevents=16, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00005555556019f5 in iora::core::TimerService::runLoop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 12 (Thread 0x7ffff741e6c0 (LWP 53433) "iora_test_dns_c"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=19, events=0x7fffd0000b70, maxevents=128, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x0000555555624e52 in iora::network::SharedUdpTransport::loop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 11 (Thread 0x7fffdffff6c0 (LWP 53432) "DnsRetryTimer"):
+#0  0x0000555555639545 in iora::network::dns::DnsTransport::queryAsync(iora::network::dns::DnsQuestion const&, std::function<void (iora::network::dns::DnsResult const&, std::__exception_ptr::exception_ptr const&)>, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, unsigned short) ()
+#1  0x0000555555645698 in iora::network::dns::DnsResolver::performDirectSrvResolutionAsync(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::function<void (iora::network::dns::ServiceResolutionResult const&, std::__exception_ptr::exception_ptr const&)>, std::vector<iora::network::dns::ServiceType, std::allocator<iora::network::dns::ServiceType> > const&, std::optional<std::vector<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, iora::network::dns::ServiceType>, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, iora::network::dns::ServiceType> > > > const&) ()
+#2  0x0000555555647546 in iora::network::dns::DnsResolver::performServiceResolutionAsync(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::function<void (iora::network::dns::ServiceResolutionResult const&, std::__exception_ptr::exception_ptr const&)>, std::vector<iora::network::dns::ServiceType, std::allocator<iora::network::dns::ServiceType> > const&)::{lambda(iora::network::dns::DnsResult const&, std::__exception_ptr::exception_ptr const&)#1}::operator()(iora::network::dns::DnsResult const&, std::__exception_ptr::exception_ptr const&) const [clone .isra.0] ()
+#3  0x00005555555f0aae in iora::network::dns::DnsTransport::scheduleQueryTimeout(std::shared_ptr<iora::network::dns::DnsTransport::PendingQuery>)::{lambda()#1}::operator()() const ()
+#4  0x00005555555d23df in iora::core::TimerService::safeRun(iora::core::TimerService::Handler const&) ()
+#5  0x0000555555601cf3 in iora::core::TimerService::runLoop() ()
+#6  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#7  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#8  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 10 (Thread 0x7fffdf7fe6c0 (LWP 53431) "iora_test_dns_c"):
+#0  0x00007ffff74ee545 in __GI___clock_nanosleep (clock_id=clock_id@entry=0, flags=flags@entry=0, req=0x7fffdf7fde60, rem=0x7fffdf7fde60) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:48
+#1  0x00007ffff74f2e53 in __GI___nanosleep (req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/nanosleep.c:25
+#2  0x00005555556132f2 in iora::util::ExpiringCache<iora::network::dns::DnsCacheKey, iora::network::dns::CachedDnsResult>::startPurgeThread()::{lambda()#1}::operator()() const ()
+#3  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#4  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#5  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 7 (Thread 0x7ffff4c196c0 (LWP 53397) "iora_test_dns_c"):
+#0  __futex_abstimed_wait_common64 (private=0, cancel=true, abstime=0x7ffff4c18e70, op=137, expected=0, futex_word=0x5555556c33a0) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (futex_word=futex_word@entry=0x5555556c33a0, expected=expected@entry=0, clockid=clockid@entry=1, abstime=abstime@entry=0x7ffff4c18e70, private=private@entry=0, cancel=cancel@entry=true) at ./nptl/futex-internal.c:87
+#2  0x00007ffff74a4f7b in __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x5555556c33a0, expected=expected@entry=0, clockid=clockid@entry=1, abstime=abstime@entry=0x7ffff4c18e70, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007ffff74a7baf in __pthread_cond_wait_common (abstime=<optimized out>, clockid=1, mutex=0x5555556c33a8, cond=0x5555556c3378) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_clockwait64 (abstime=<optimized out>, clockid=1, mutex=0x5555556c33a8, cond=0x5555556c3378) at ./nptl/pthread_cond_wait.c:682
+#5  ___pthread_cond_clockwait64 (cond=0x5555556c3378, mutex=0x5555556c33a8, clockid=1, abstime=<optimized out>) at ./nptl/pthread_cond_wait.c:670
+#6  0x0000555555631ee4 in std::thread::_State_impl<std::thread::_Invoker<std::tuple<iora::network::dns::DnsTransport::startCleanupTimer()::{lambda()#1}> > >::_M_run() ()
+#7  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#8  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#9  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 6 (Thread 0x7ffff541a6c0 (LWP 53396) "iora_test_dns_c"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=12, events=0x7fffe4000b70, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x000055555564131a in iora::network::SharedTransport::loop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 5 (Thread 0x7ffff5c1b6c0 (LWP 53395) "iora_test_dns_c"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=9, events=0x7fffe0000ba0, maxevents=16, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00005555556019f5 in iora::core::TimerService::runLoop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 4 (Thread 0x7ffff641c6c0 (LWP 53394) "iora_test_dns_c"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=6, events=0x7fffec000b70, maxevents=128, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x0000555555624e52 in iora::network::SharedUdpTransport::loop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 3 (Thread 0x7ffff6c1d6c0 (LWP 53393) "DnsRetryTimer"):
+#0  0x00007ffff7527ee6 in epoll_wait (epfd=3, events=0x7fffe8000ba0, maxevents=16, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00005555556019f5 in iora::core::TimerService::runLoop() ()
+#2  0x00007ffff76d44a3 in ?? () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#3  0x00007ffff74a81f5 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#4  0x00007ffff752889c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 1 (Thread 0x7ffff7edbb80 (LWP 53389) "iora_test_dns_c"):
+#0  __futex_abstimed_wait_common64 (private=128, cancel=true, abstime=0x0, op=265, expected=53431, futex_word=0x7fffdf7fe990) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (futex_word=futex_word@entry=0x7fffdf7fe990, expected=53431, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=128, cancel=cancel@entry=true) at ./nptl/futex-internal.c:87
+#2  0x00007ffff74a4f7b in __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7fffdf7fe990, expected=<optimized out>, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=128) at ./nptl/futex-internal.c:139
+#3  0x00007ffff74a9ce3 in __pthread_clockjoin_ex (threadid=140736943089344, thread_return=0x0, clockid=0, abstime=0x0, block=<optimized out>) at ./nptl/pthread_join_common.c:102
+#4  0x00007ffff76d4517 in std::thread::join() () from /lib/x86_64-linux-gnu/libstdc++.so.6
+#5  0x00005555555fde49 in iora::util::ExpiringCache<iora::network::dns::DnsCacheKey, iora::network::dns::CachedDnsResult>::~ExpiringCache() ()
+#6  0x00005555555fde8c in std::_Sp_counted_ptr_inplace<iora::network::dns::DnsCache, std::allocator<void>, (__gnu_cxx::_Lock_policy)2>::_M_dispose() ()
+#7  0x00005555555d92e7 in std::_Sp_counted_base<(__gnu_cxx::_Lock_policy)2>::_M_release() ()
+#8  0x00005555555a0786 in (anonymous namespace)::DnsTestFixture::~DnsTestFixture() ()
+#9  0x00005555555b2236 in Catch::TestInvokerAsMethod<(anonymous namespace)::C_A_T_C_H_T_E_S_T_50>::invoke() const ()
+#10 0x00005555555848db in Catch::RunContext::invokeActiveTestCase() ()
+#11 0x000055555559ef90 in Catch::RunContext::runCurrentTest(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&) ()
+#12 0x00005555555b0232 in Catch::RunContext::runTest(Catch::TestCase const&) ()
+#13 0x00005555555bc088 in Catch::Session::runInternal() ()
+#14 0x00005555555bc658 in Catch::Session::run() ()
+#15 0x00005555555770a1 in main ()
+A debugging session is active.
+
+	Inferior 1 [process 53389] will be killed.
+
+Quit anyway? (y or n) [answered Y; input not from terminal]

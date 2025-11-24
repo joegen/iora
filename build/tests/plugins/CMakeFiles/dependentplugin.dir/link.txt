@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -fPIC -O3 -DNDEBUG -shared -Wl,-soname,dependentplugin.so -o dependentplugin.so CMakeFiles/dependentplugin.dir/DependentPlugin.cpp.o  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 
