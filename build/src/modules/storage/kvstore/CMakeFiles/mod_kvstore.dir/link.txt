@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC  -fPIC -O3 -DNDEBUG -shared -Wl,-soname,mod_kvstore.so -o mod_kvstore.so CMakeFiles/mod_kvstore.dir/mod_kvstore.cpp.o  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 

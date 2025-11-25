@@ -1,1 +1,0 @@
-/usr/bin/c++  -fPIC -O3 -DNDEBUG CMakeFiles/iora_test_timer_lifecycle.dir/core/iora_test_timer_lifecycle.cpp.o -o iora_test_timer_lifecycle  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/libCatch2WithMain.a 

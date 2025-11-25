@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC  -fPIC -O3 -DNDEBUG -shared -Wl,-soname,cyclepluginb.so -o cyclepluginb.so CMakeFiles/cyclepluginb.dir/CyclePluginB.cpp.o  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 

@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC  -fPIC -O3 -DNDEBUG -shared -Wl,-soname,mod_jsonrpc_client.so -o mod_jsonrpc_client.so CMakeFiles/mod_jsonrpc_client.dir/mod_jsonrpc_client.cpp.o  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 

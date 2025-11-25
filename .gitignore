@@ -1,0 +1,85 @@
+# Build directories
+build/
+build_*/
+_build/
+_deps/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+CTestTestfile.cmake
+cmake_install.cmake
+install_manifest.txt
+Makefile
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+all_tests
+iora_test_*
+test_*
+
+# Test outputs
+Testing/
+*.log
+*.trs
+
+# IDE files
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Package files
+*.tar.gz
+*.zip
+
+# Configuration files (if generated)
+config/
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+
+# Python cache (if any Python tools)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Autotools
+.deps/
+.libs/
+*.la
+*.lo
+autom4te.cache/
