@@ -1075,7 +1075,11 @@ private:
         else
         {
           IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] result.ok=false for session " << sid
-                         << ", not setting health");
+                         << ", marking session as closed");
+          std::lock_guard<std::mutex> slock(_sessionMutex);
+          auto &session = getOrCreateSession(sid);
+          session.closed = true;
+          session.readCv.notify_all();
         }
       });
 

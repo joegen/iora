@@ -1316,21 +1316,61 @@ private:
     {
       int err = 0;
       socklen_t el = sizeof(err);
-      if (::getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+      int rc = ::getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &el);
+      if (rc < 0)
       {
-        IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] Socket is already writable for sid=" << cr.sid
-                       << ", firing connect callback immediately");
-        // Socket is already writable - connection completed immediately
-        // Manually trigger the connect callback
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onConnect)
+        // getsockopt() syscall failed - socket is invalid
+        int gso_errno = errno;
+        IORA_LOG_ERROR("[IMMEDIATE-CONNECT] getsockopt() failed for sid=" << cr.sid
+                       << ", errno=" << gso_errno);
+        closeNow(_sessions[cr.sid].get(), TransportError::Socket,
+                 std::string("getsockopt failed: ") + std::strerror(gso_errno), gso_errno);
+        return true;
+      }
+      else if (err == 0)
+      {
+        // SO_ERROR is 0, but must verify connection is truly established using getpeername()
+        // For non-routable addresses, SO_ERROR may be 0 before network error is detected
+        struct sockaddr_storage addr;
+        socklen_t addrlen = sizeof(addr);
+        if (::getpeername(cfd, reinterpret_cast<struct sockaddr *>(&addr), &addrlen) == 0)
         {
-          _atomicStats.connected++;
-          _cbs.onConnect(cr.sid, IoResult::success());
+          IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] Connection truly established for sid=" << cr.sid);
+          // Connection completed immediately - manually trigger the connect callback
+          std::lock_guard<std::mutex> g(_cbMutex);
+          if (_cbs.onConnect)
+          {
+            _atomicStats.connected++;
+            _cbs.onConnect(cr.sid, IoResult::success());
+          }
+          _sessions[cr.sid]->connectPending = false;
+          _sessions[cr.sid]->lastWriteProgress = MonoClock::now();
+          cancelConnectTimeout(_sessions[cr.sid].get());
         }
-        _sessions[cr.sid]->connectPending = false;
-        _sessions[cr.sid]->lastWriteProgress = MonoClock::now();
-        cancelConnectTimeout(_sessions[cr.sid].get());
+        else
+        {
+          // getpeername() failed - check errno to determine if connection has definitely failed
+          int gp_errno = errno;
+          if (gp_errno == ECONNREFUSED || gp_errno == ENETUNREACH ||
+              gp_errno == EHOSTUNREACH || gp_errno == ETIMEDOUT)
+          {
+            IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] getpeername() detected connection failure for sid="
+                           << cr.sid << ", errno=" << gp_errno);
+            closeNow(_sessions[cr.sid].get(), TransportError::Connect, std::strerror(gp_errno), gp_errno);
+            return true;
+          }
+          // else ENOTCONN or other transient error - connection not yet established, wait for epoll/timeout
+          IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] getpeername() returned errno=" << gp_errno
+                         << " for sid=" << cr.sid << ", waiting for epoll/timeout");
+        }
+      }
+      else
+      {
+        IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] SO_ERROR indicates connection failed for sid=" << cr.sid
+                       << ", error=" << std::strerror(err));
+        // Connection failed immediately - clean up and invoke failure callback
+        closeNow(_sessions[cr.sid].get(), TransportError::Connect, std::strerror(err), err);
+        return true;
       }
     }
 
@@ -1378,19 +1418,69 @@ private:
       if (events & EPOLLOUT)
       {
         IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT is set, connectPending=" << s->connectPending);
-        if (s->connectPending)
+        // P2 fix: Only handle non-TLS connections here; TLS goes through handshake state machine
+        if (s->connectPending && s->tlsMode == TlsMode::None)
         {
-          IORA_LOG_DEBUG("[EPOLL-EVENT] Firing connect callback for sid=" << s->id);
-          std::lock_guard<std::mutex> g(_cbMutex);
-          if (_cbs.onConnect)
+          // CRITICAL: SO_ERROR == 0 doesn't mean connection is established!
+          // For non-routable addresses, SO_ERROR returns 0 initially before network error is detected.
+          // Must use getpeername() to verify connection is truly established.
+          int err = 0;
+          socklen_t el = sizeof(err);
+          int rc = ::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+          if (rc < 0)
           {
-            _atomicStats.connected++;
-            _cbs.onConnect(s->id, IoResult::success());
+            // getsockopt() syscall failed - socket is invalid
+            int gso_errno = errno;
+            IORA_LOG_ERROR("[EPOLL-EVENT] getsockopt() failed for sid=" << s->id
+                           << ", errno=" << gso_errno);
+            closeNow(s, TransportError::Socket,
+                     std::string("getsockopt failed: ") + std::strerror(gso_errno), gso_errno);
+            return;
           }
-          s->connectPending = false;
-          s->lastWriteProgress = MonoClock::now();
-          cancelConnectTimeout(s);
-          updateInterest(s);
+          else if (err == 0)
+          {
+            // SO_ERROR is 0, but verify connection is truly established using getpeername()
+            struct sockaddr_storage addr;
+            socklen_t addrlen = sizeof(addr);
+            if (::getpeername(s->fd, reinterpret_cast<struct sockaddr *>(&addr), &addrlen) == 0)
+            {
+              IORA_LOG_DEBUG("[EPOLL-EVENT] Connection truly established for sid=" << s->id);
+              std::lock_guard<std::mutex> g(_cbMutex);
+              if (_cbs.onConnect)
+              {
+                _atomicStats.connected++;
+                _cbs.onConnect(s->id, IoResult::success());
+              }
+              s->connectPending = false;
+              s->lastWriteProgress = MonoClock::now();
+              cancelConnectTimeout(s);
+              updateInterest(s);
+            }
+            else
+            {
+              // getpeername() failed - check errno to determine if connection has definitely failed
+              int gp_errno = errno;
+              if (gp_errno == ECONNREFUSED || gp_errno == ENETUNREACH ||
+                  gp_errno == EHOSTUNREACH || gp_errno == ETIMEDOUT)
+              {
+                IORA_LOG_DEBUG("[EPOLL-EVENT] getpeername() detected connection failure for sid="
+                               << s->id << ", errno=" << gp_errno);
+                closeNow(s, TransportError::Connect, std::strerror(gp_errno), gp_errno);
+                return;
+              }
+              // else ENOTCONN or other transient error - connection not yet established, wait for timeout
+              IORA_LOG_DEBUG("[EPOLL-EVENT] getpeername() returned errno=" << gp_errno
+                             << " for sid=" << s->id << ", waiting for timeout");
+            }
+          }
+          else
+          {
+            // SO_ERROR indicates connection failed
+            IORA_LOG_DEBUG("[EPOLL-EVENT] SO_ERROR indicates connection failed for sid=" << s->id
+                           << ", error=" << std::strerror(err));
+            closeNow(s, TransportError::Connect, std::strerror(err), err);
+            return;
+          }
         }
         else
         {
