@@ -523,7 +523,6 @@ public:
           }
 
           // Wait with timeout for connection to become ready
-          auto wait_start = std::chrono::steady_clock::now();
           session.readCv.wait_for(lock, remaining, [&] {
             return session.health.isHealthy || session.closed.load() || !_running;
           });

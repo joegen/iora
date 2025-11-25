@@ -90,6 +90,7 @@ set(PARSERS_TESTS
 # Util namespace tests
 set(UTIL_TESTS
     util/iora_test_expiring_cache
+    util/iora_test_shell_runner
 )
 
 # Storage namespace tests
