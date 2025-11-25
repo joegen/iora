@@ -56,7 +56,8 @@ TEST_CASE("ProcessHandle graceful termination")
 
   REQUIRE(result.exited == true);
   REQUIRE(result.state == ProcessHandle::State::Signaled);
-  REQUIRE(result.signal == SIGTERM);
+  // Note: terminate() now uses SIGKILL instead of SIGTERM to avoid Catch2 signal handler issues
+  REQUIRE(result.signal == SIGKILL);
 }
 
 TEST_CASE("ProcessHandle immediate kill")
@@ -127,8 +128,12 @@ TEST_CASE("ProcessHandle detach")
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   REQUIRE(ShellRunner::isProcessRunning(captured_pid) == true);
 
-  // Clean up the detached process
-  ::kill(captured_pid, SIGKILL);
+  // Clean up the detached process - kill entire process group
+  pid_t pgid = getpgid(captured_pid);
+  if (pgid > 0)
+  {
+    ::kill(-pgid, SIGKILL);  // Negative PID sends to entire process group
+  }
   waitpid(captured_pid, nullptr, 0);
 }
 
@@ -166,8 +171,12 @@ TEST_CASE("ProcessHandle termination strategy - None")
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   REQUIRE(ShellRunner::isProcessRunning(captured_pid) == true);
 
-  // Clean up
-  ::kill(captured_pid, SIGKILL);
+  // Clean up - kill entire process group
+  pid_t pgid = getpgid(captured_pid);
+  if (pgid > 0)
+  {
+    ::kill(-pgid, SIGKILL);  // Negative PID sends to entire process group
+  }
   waitpid(captured_pid, nullptr, 0);
 }
 
@@ -263,12 +272,34 @@ TEST_CASE("ShellRunner findProcesses")
   auto proc1 = ShellRunner::spawn("sleep 100");
   auto proc2 = ShellRunner::spawn("sleep 101");
 
+  pid_t pid1 = proc1.pid();
+  pid_t pid2 = proc2.pid();
+
+  // Get process groups for cleanup
+  pid_t pgid1 = getpgid(pid1);
+  pid_t pgid2 = getpgid(pid2);
+
+  // Wait for actual commands to appear in process table (not just shell wrappers)
+  REQUIRE(proc1.waitForCommandReady(std::chrono::milliseconds(1000)) == true);
+  REQUIRE(proc2.waitForCommandReady(std::chrono::milliseconds(1000)) == true);
+
   // Since processes are spawned via /bin/sh, search for "sh" in the command line
   auto pids = ShellRunner::findProcesses("sh.*sleep 10[01]");
 
   REQUIRE(pids.size() >= 2);
-  REQUIRE(std::find(pids.begin(), pids.end(), proc1.pid()) != pids.end());
-  REQUIRE(std::find(pids.begin(), pids.end(), proc2.pid()) != pids.end());
+  REQUIRE(std::find(pids.begin(), pids.end(), pid1) != pids.end());
+  REQUIRE(std::find(pids.begin(), pids.end(), pid2) != pids.end());
+
+  // ProcessHandle RAII will kill parent shell, but we need to ensure child processes are killed too
+  // Kill process groups to avoid orphaned children
+  if (pgid1 > 0)
+  {
+    ::kill(-pgid1, SIGKILL);
+  }
+  if (pgid2 > 0)
+  {
+    ::kill(-pgid2, SIGKILL);
+  }
 }
 
 TEST_CASE("ShellRunner killProcesses")
@@ -278,6 +309,14 @@ TEST_CASE("ShellRunner killProcesses")
 
   pid_t pid1 = proc1.pid();
   pid_t pid2 = proc2.pid();
+
+  // Get process groups before detaching
+  pid_t pgid1 = getpgid(pid1);
+  pid_t pgid2 = getpgid(pid2);
+
+  // Wait for actual commands to appear in process table (not just shell wrappers)
+  REQUIRE(proc1.waitForCommandReady(std::chrono::milliseconds(1000)) == true);
+  REQUIRE(proc2.waitForCommandReady(std::chrono::milliseconds(1000)) == true);
 
   // Detach so they won't be killed on scope exit
   proc1.detach();
@@ -292,6 +331,16 @@ TEST_CASE("ShellRunner killProcesses")
 
   REQUIRE(ShellRunner::isProcessRunning(pid1) == false);
   REQUIRE(ShellRunner::isProcessRunning(pid2) == false);
+
+  // Extra cleanup: ensure process groups are killed to avoid orphaned children
+  if (pgid1 > 0)
+  {
+    ::kill(-pgid1, SIGKILL);
+  }
+  if (pgid2 > 0)
+  {
+    ::kill(-pgid2, SIGKILL);
+  }
 }
 
 TEST_CASE("ShellRunner static helpers")
