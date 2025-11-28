@@ -625,6 +625,9 @@ private:
     SSL *ssl{nullptr};
     TlsState tlsState{TlsState::None};
     MonoTime tlsStart{};
+    // Track SSL_ERROR_WANT_WRITE during handshake and renegotiation.
+    // I/O thread only - not thread-safe, accessed exclusively from epoll loop.
+    bool tlsWantWrite{false};
 
     std::deque<ByteBuffer> wq;
     bool wantWrite{false};
@@ -1293,6 +1296,7 @@ private:
       ::SSL_set_connect_state(s->ssl);
       s->tlsState = TlsState::Handshake;
       s->tlsStart = MonoClock::now();
+      s->tlsWantWrite = true; // Client needs to send ClientHello first
       scheduleHandshakeTimeout(s.get());
     }
 
@@ -1527,6 +1531,7 @@ private:
     if (rc == 1)
     {
       s->tlsState = TlsState::Open;
+      s->tlsWantWrite = false; // Reset handshake tracking
       _atomicStats.tlsHandshakes++;
       cancelHandshakeTimeout(s);
 
@@ -1554,6 +1559,10 @@ private:
     int errc = ::SSL_get_error(s->ssl, rc);
     if (errc == SSL_ERROR_WANT_READ || errc == SSL_ERROR_WANT_WRITE)
     {
+      // Track what SSL needs to prevent edge-triggered epoll CPU busy loop.
+      // Without this, EPOLL_CTL_MOD re-arms EPOLLOUT, which fires immediately
+      // if socket is writable, causing 100% CPU spin during handshake.
+      s->tlsWantWrite = (errc == SSL_ERROR_WANT_WRITE);
       updateInterest(s);
       return false;
     }
@@ -1581,6 +1590,10 @@ private:
           int ge = ::SSL_get_error(s->ssl, n);
           if (ge == SSL_ERROR_WANT_READ || ge == SSL_ERROR_WANT_WRITE)
           {
+            // Track SSL state for renegotiation - prevents epoll busy loop
+            // during mid-connection renegotiation (not just initial handshake)
+            s->tlsWantWrite = (ge == SSL_ERROR_WANT_WRITE);
+            updateInterest(s);
             break;
           }
           if (ge == SSL_ERROR_ZERO_RETURN)
@@ -1655,6 +1668,8 @@ private:
           if (ge == SSL_ERROR_WANT_WRITE || ge == SSL_ERROR_WANT_READ)
           {
             s->wantWrite = true;
+            // Track SSL state for renegotiation - prevents epoll busy loop
+            s->tlsWantWrite = (ge == SSL_ERROR_WANT_WRITE);
             updateInterest(s);
             break;
           }
@@ -1705,7 +1720,24 @@ private:
     // CRITICAL FIX: Keep EPOLLOUT registered while connection is pending
     // This ensures we receive the EPOLLOUT event when TCP handshake completes,
     // even in edge-triggered mode where events can be missed if we unregister too early
-    if (s->wantWrite || !s->wq.empty() || s->tlsState == TlsState::Handshake || s->connectPending)
+    //
+    // TLS HANDSHAKE FIX: During TLS handshake, only set EPOLLOUT when SSL actually
+    // needs to write (SSL_ERROR_WANT_WRITE). Previously we always set EPOLLOUT during
+    // handshake, which caused edge-triggered epoll to re-arm and fire immediately
+    // (since socket is always writable), creating a tight CPU-burning loop.
+    bool needWrite = s->wantWrite || !s->wq.empty();
+    if (s->tlsState == TlsState::Handshake)
+    {
+      // During TLS handshake, only use tlsWantWrite for EPOLLOUT decision
+      // Don't use connectPending - that's only for TCP connect phase
+      needWrite = needWrite || s->tlsWantWrite;
+    }
+    else
+    {
+      // For non-TLS or established TLS connections, use connectPending
+      needWrite = needWrite || s->connectPending;
+    }
+    if (needWrite)
     {
       ev |= EPOLLOUT;
     }
@@ -2025,6 +2057,21 @@ private:
       }
       if (!_srvTls.certFile.empty() && !_srvTls.keyFile.empty())
       {
+        // Validate files exist before attempting to load (clearer error messages)
+        if (::access(_srvTls.certFile.c_str(), R_OK) != 0)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config,
+            "Server cert file not readable: " + _srvTls.certFile));
+          err(TransportError::Config, "server cert not readable: " + _srvTls.certFile);
+          return false;
+        }
+        if (::access(_srvTls.keyFile.c_str(), R_OK) != 0)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config,
+            "Server key file not readable: " + _srvTls.keyFile));
+          err(TransportError::Config, "server key not readable: " + _srvTls.keyFile);
+          return false;
+        }
         if (::SSL_CTX_use_certificate_file(_sslSrv, _srvTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
               1 ||
             ::SSL_CTX_use_PrivateKey_file(_sslSrv, _srvTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
@@ -2099,6 +2146,48 @@ private:
       if (!_cliTls.ciphers.empty())
       {
         ::SSL_CTX_set_cipher_list(_sslCli, _cliTls.ciphers.c_str());
+      }
+      // Load client certificate and key for mutual TLS
+      if (!_cliTls.certFile.empty())
+      {
+        // Validate file exists before attempting to load (clearer error messages)
+        if (::access(_cliTls.certFile.c_str(), R_OK) != 0)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config,
+            "Client cert file not readable: " + _cliTls.certFile));
+          err(TransportError::Config, "client cert not readable: " + _cliTls.certFile);
+          return false;
+        }
+        if (::SSL_CTX_use_certificate_file(_sslCli, _cliTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
+            1)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config, "client load cert failed"));
+          err(TransportError::Config, "client load cert");
+          return false;
+        }
+      }
+      if (!_cliTls.keyFile.empty())
+      {
+        // Validate file exists before attempting to load (clearer error messages)
+        if (::access(_cliTls.keyFile.c_str(), R_OK) != 0)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config,
+            "Client key file not readable: " + _cliTls.keyFile));
+          err(TransportError::Config, "client key not readable: " + _cliTls.keyFile);
+          return false;
+        }
+        if (::SSL_CTX_use_PrivateKey_file(_sslCli, _cliTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config, "client load key failed"));
+          err(TransportError::Config, "client load key");
+          return false;
+        }
+        if (::SSL_CTX_check_private_key(_sslCli) != 1)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config, "client cert/key mismatch"));
+          err(TransportError::Config, "client cert/key mismatch");
+          return false;
+        }
       }
       if (_cliTls.verifyPeer)
       {
