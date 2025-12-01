@@ -64,6 +64,19 @@ namespace network
 
 /// \brief Shared TCP/TLS transport (single-threaded epoll loop).
 /// \note Linux-only.
+///
+/// \par Subclassing Support
+/// This class supports subclassing for testing purposes. Protected virtual hooks
+/// are provided to enable fault injection at the TLS layer:
+/// - beforeSslHandshake() - called before SSL_do_handshake()
+/// - afterSslHandshake() - called after SSL_do_handshake() completes
+/// - beforeSslRead() - called before SSL_read()
+/// - beforeSslWrite() - called before SSL_write()
+///
+/// All hooks are called from the I/O thread context. Subclasses must be thread-safe
+/// if they access shared state. The destructor is virtual to support proper cleanup.
+///
+/// \see TlsFaultInjectionTransport in tests/sipp_integration/ for usage example.
 class SharedTransport
 {
 public:
@@ -148,7 +161,8 @@ public:
   }
 
   /// \brief Destructor; calls stop() if needed.
-  ~SharedTransport() { stop(); }
+  /// \note Virtual to support subclassing for fault injection testing.
+  virtual ~SharedTransport() { stop(); }
 
   SharedTransport(const SharedTransport &) = delete;
   SharedTransport &operator=(const SharedTransport &) = delete;
@@ -369,6 +383,77 @@ public:
   std::thread::id getIoThreadId() const
   {
     return _loop.get_id();
+  }
+
+protected:
+  // ===== Virtual hooks for fault injection (B6 TLS testing) =====
+  // These hooks allow subclasses to intercept SSL operations for testing.
+  // Return false from before* hooks to simulate failure.
+  // Default implementations are pass-through (no fault injection).
+
+  /// \brief Called before SSL_do_handshake() is invoked
+  /// \param sid Session ID for the connection
+  /// \param remoteAddr Remote address string (host:port), may be empty if not yet resolved
+  /// \return true to proceed with handshake, false to simulate failure
+  /// \note Called from I/O thread - must be thread-safe if accessing shared state.
+  ///       Invocations on the same session are sequential (never concurrent).
+  virtual bool beforeSslHandshake(SessionId sid, const std::string& remoteAddr)
+  {
+    (void)sid;
+    (void)remoteAddr;
+    return true;
+  }
+
+  /// \brief Called after SSL_do_handshake() completes or fails
+  /// \param sid Session ID for the connection
+  /// \param success true if handshake succeeded, false if it failed
+  /// \param sslError SSL_get_error() result if handshake failed
+  /// \return true to accept the result, false to force failure even on success
+  /// \note Called from I/O thread - must be thread-safe if accessing shared state.
+  ///       Invocations on the same session are sequential (never concurrent).
+  virtual bool afterSslHandshake(SessionId sid, bool success, int sslError)
+  {
+    (void)sid;
+    (void)sslError;
+    return success;
+  }
+
+  /// \brief Called before SSL_read() is invoked
+  /// \param sid Session ID for the connection
+  /// \return true to proceed with read, false to simulate read failure
+  /// \note Called from I/O thread - must be thread-safe if accessing shared state.
+  ///       May be called multiple times per session as data arrives.
+  virtual bool beforeSslRead(SessionId sid)
+  {
+    (void)sid;
+    return true;
+  }
+
+  /// \brief Called before SSL_write() is invoked
+  /// \param sid Session ID for the connection
+  /// \param dataSize Size of data being written
+  /// \return true to proceed with write, false to simulate write failure
+  /// \note Called from I/O thread - must be thread-safe if accessing shared state.
+  ///       May be called multiple times per session as data is sent.
+  virtual bool beforeSslWrite(SessionId sid, std::size_t dataSize)
+  {
+    (void)sid;
+    (void)dataSize;
+    return true;
+  }
+
+  /// \brief Get SSL error code to inject when hook returns false
+  /// \return SSL error code (default: SSL_ERROR_SSL for generic failure)
+  virtual int getInjectedSslError() const
+  {
+    return SSL_ERROR_SSL;
+  }
+
+  /// \brief Get error message to use when hook injection fails
+  /// \return Error message string
+  virtual std::string getInjectedErrorMessage() const
+  {
+    return "Injected TLS fault for testing";
   }
 
 private:
@@ -1527,9 +1612,25 @@ private:
       return false;
     }
 
+    // B6 Hook: Allow subclass to inject fault before handshake
+    if (!beforeSslHandshake(s->id, s->peerKey))
+    {
+      closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
+      _atomicStats.tlsFailures++;
+      return false;
+    }
+
     int rc = ::SSL_do_handshake(s->ssl);
     if (rc == 1)
     {
+      // B6 Hook: Allow subclass to reject successful handshake
+      if (!afterSslHandshake(s->id, true, 0))
+      {
+        closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
+        _atomicStats.tlsFailures++;
+        return false;
+      }
+
       s->tlsState = TlsState::Open;
       s->tlsWantWrite = false; // Reset handshake tracking
       _atomicStats.tlsHandshakes++;
@@ -1557,6 +1658,15 @@ private:
     }
 
     int errc = ::SSL_get_error(s->ssl, rc);
+
+    // B6 Hook: Allow subclass to override error handling
+    if (!afterSslHandshake(s->id, false, errc))
+    {
+      closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
+      _atomicStats.tlsFailures++;
+      return false;
+    }
+
     if (errc == SSL_ERROR_WANT_READ || errc == SSL_ERROR_WANT_WRITE)
     {
       // Track what SSL needs to prevent edge-triggered epoll CPU busy loop.
@@ -1584,6 +1694,13 @@ private:
       int n = 0;
       if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
       {
+        // B6 Hook: Allow subclass to inject read fault
+        if (!beforeSslRead(s->id))
+        {
+          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), getInjectedSslError());
+          return;
+        }
+
         n = ::SSL_read(s->ssl, buf.data(), (int)buf.size());
         if (n <= 0)
         {
@@ -1661,6 +1778,13 @@ private:
       int n = 0;
       if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
       {
+        // B6 Hook: Allow subclass to inject write fault
+        if (!beforeSslWrite(s->id, d.size()))
+        {
+          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), getInjectedSslError());
+          return;
+        }
+
         n = ::SSL_write(s->ssl, d.data(), (int)d.size());
         if (n <= 0)
         {
@@ -1769,6 +1893,13 @@ private:
       int n = 0;
       if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
       {
+        // B6 Hook: Allow subclass to inject write fault
+        if (!beforeSslWrite(s->id, sr.payload.size()))
+        {
+          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), getInjectedSslError());
+          return;
+        }
+
         IORA_LOG_DEBUG("[IO-THREAD] About to call SSL_write for sid=" << sr.sid << ", size=" << sr.payload.size());
         n = ::SSL_write(s->ssl, sr.payload.data(), (int)sr.payload.size());
         IORA_LOG_DEBUG("[IO-THREAD] SSL_write returned " << n << " for sid=" << sr.sid);
