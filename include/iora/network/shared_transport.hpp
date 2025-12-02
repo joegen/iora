@@ -408,14 +408,17 @@ protected:
   /// \param sid Session ID for the connection
   /// \param success true if handshake succeeded, false if it failed
   /// \param sslError SSL_get_error() result if handshake failed
-  /// \return true to accept the result, false to force failure even on success
+  /// \return true to accept the result (success or failure), false to override with injected failure
   /// \note Called from I/O thread - must be thread-safe if accessing shared state.
   ///       Invocations on the same session are sequential (never concurrent).
+  ///       The default implementation accepts whatever result SSL_do_handshake() returned.
+  ///       Subclasses can return false to inject failure even when handshake succeeded.
   virtual bool afterSslHandshake(SessionId sid, bool success, int sslError)
   {
     (void)sid;
+    (void)success;
     (void)sslError;
-    return success;
+    return true;  // Accept the natural result (success or failure)
   }
 
   /// \brief Called before SSL_read() is invoked
