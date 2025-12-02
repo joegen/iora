@@ -517,9 +517,12 @@ public:
         {
           if (session.closed.load())
           {
+            // Use stored error info instead of generic message
+            TransportError err = session.closeError != TransportError::None ? session.closeError : TransportError::PeerClosed;
+            std::string msg = session.closeMessage.empty() ? "Connection closed during connect" : session.closeMessage;
             core::Logger::debug("SyncAsyncTransport: sendSync - connection closed during connect wait for session " +
-                                std::to_string(sid));
-            return SyncResult::failure(TransportError::PeerClosed, "Connection closed during connect");
+                                std::to_string(sid) + ", error=" + msg);
+            return SyncResult::failure(err, msg);
           }
 
           // Wait with timeout for connection to become ready
@@ -948,6 +951,8 @@ private:
     std::condition_variable readCv;
     std::deque<std::shared_ptr<SyncOperation>> pendingSyncOps;
     std::atomic<bool> closed{false}; // Flag to indicate session is closed
+    TransportError closeError{TransportError::None}; // Error type when closed
+    std::string closeMessage;                        // Error message when closed
 
     // Health monitoring
     HybridConnectionHealth health;
@@ -1075,9 +1080,11 @@ private:
         else
         {
           IORA_LOG_DEBUG("[SYNC-ASYNC-CALLBACK] result.ok=false for session " << sid
-                         << ", marking session as closed");
+                         << ", marking session as closed, error=" << result.message);
           std::lock_guard<std::mutex> slock(_sessionMutex);
           auto &session = getOrCreateSession(sid);
+          session.closeError = result.code;
+          session.closeMessage = result.message;
           session.closed = true;
           session.readCv.notify_all();
         }
@@ -1088,7 +1095,7 @@ private:
       [this](SessionId sid, const IoResult &result)
       {
         core::Logger::debug("SyncAsyncTransport: Close callback for session " +
-                            std::to_string(sid));
+                            std::to_string(sid) + ", error=" + result.message);
         // Clean up session state
         {
           std::lock_guard<std::mutex> lock(_sessionMutex);
@@ -1099,13 +1106,16 @@ private:
                                 std::to_string(it->second.pendingSyncOps.size()) +
                                 " pending sync operations");
 
-            // Mark session as closed before waking operations
+            // Store error info and mark session as closed before waking operations
+            it->second.closeError = result.code;
+            it->second.closeMessage = result.message.empty() ? "Connection closed" : result.message;
             it->second.closed = true;
 
-            // Wake any waiting sync operations
+            // Wake any waiting sync operations with the actual error
             for (auto &op : it->second.pendingSyncOps)
             {
-              op->result = SyncResult::failure(TransportError::PeerClosed, "Connection closed");
+              TransportError err = result.code != TransportError::None ? result.code : TransportError::PeerClosed;
+              op->result = SyncResult::failure(err, it->second.closeMessage);
               op->completed = true;
               op->cv.notify_all();
             }
@@ -1210,7 +1220,6 @@ private:
     IORA_LOG_DEBUG("[PROCESSING-THREAD] Thread started");
     while (_running)
     {
-      IORA_LOG_DEBUG("[PROCESSING-THREAD] Waiting for operations...");
       std::unique_lock<std::mutex> lock(_mutex);
       _operationCv.wait_for(lock, std::chrono::milliseconds(100),
                             [this] { return !_running || hasQueuedOperations(); });
@@ -1220,9 +1229,6 @@ private:
         IORA_LOG_DEBUG("[PROCESSING-THREAD] Shutting down");
         break;
       }
-
-      bool hasOps = hasQueuedOperations();
-      IORA_LOG_DEBUG("[PROCESSING-THREAD] Woke up, hasQueuedOperations=" << (hasOps ? "true" : "false"));
 
       // Process queued sync operations
       processSyncOperations();
@@ -1247,16 +1253,8 @@ private:
   {
     std::lock_guard<std::mutex> lock(_sessionMutex);
 
-    IORA_LOG_DEBUG("[PROCESSING-THREAD] Processing sync operations, sessions=" << _sessions.size());
-
     for (auto &[sid, session] : _sessions)
     {
-      if (!session.pendingSyncOps.empty())
-      {
-        IORA_LOG_DEBUG("[PROCESSING-THREAD] Session " << sid << " has "
-                      << session.pendingSyncOps.size() << " pending ops");
-      }
-
       while (!session.pendingSyncOps.empty())
       {
         auto op = session.pendingSyncOps.front();
@@ -1275,13 +1273,8 @@ private:
         // Process based on type
         if (op->type == SyncOperation::Type::Send)
         {
-          IORA_LOG_DEBUG("[PROCESSING-THREAD] About to call _transport->send() for sid=" << sid
-                        << ", data size=" << op->data.size());
-
           // Execute the send
           bool sent = _transport->send(sid, op->data.data(), op->data.size());
-
-          IORA_LOG_DEBUG("[PROCESSING-THREAD] _transport->send() returned " << (sent ? "true" : "false"));
 
           auto elapsed = std::chrono::steady_clock::now() - op->startTime;
           op->result = sent ? SyncResult::success(op->data.size())
@@ -1289,7 +1282,6 @@ private:
           op->result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
 
           op->completed = true;
-          IORA_LOG_DEBUG("[PROCESSING-THREAD] Marking operation complete and notifying waiter for sid=" << sid);
           op->cv.notify_all();
           session.pendingSyncOps.pop_front();
         }
