@@ -247,18 +247,30 @@ public:
 
   HostResult resolveHost(const std::string &hostname)
   {
+    HostResult result;
+
+    // Resolve A records (IPv4) - failure should not prevent IPv6 resolution
     try
     {
-      HostResult result;
       result.ipv4 = resolveA(hostname);
-      result.ipv6 = resolveAAAA(hostname);
-      result.success = !result.ipv4.empty() || !result.ipv6.empty();
-      return result;
     }
     catch (...)
     {
-      return {}; // Return empty result on error
+      // IPv4 resolution failed, continue with IPv6
     }
+
+    // Resolve AAAA records (IPv6) - failure should not discard IPv4 results
+    try
+    {
+      result.ipv6 = resolveAAAA(hostname);
+    }
+    catch (...)
+    {
+      // IPv6 resolution failed, continue with IPv4 results
+    }
+
+    result.success = !result.ipv4.empty() || !result.ipv6.empty();
+    return result;
   }
 
   // Disable copy constructor and assignment operator
