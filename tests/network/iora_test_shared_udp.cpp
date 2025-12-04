@@ -769,3 +769,116 @@ TEST_CASE("UDP socket buffer configuration", "[udp][socket]")
 
   f.tx.stop();
 }
+
+TEST_CASE("UDP self-loopback via listener", "[udp][loopback][via]")
+{
+  // This tests the critical scenario where an application sends data
+  // to itself via the listener (e.g., SIP proxy routing to itself).
+  // The packet is sent from listener:port TO listener:port.
+  UdpFixture f;
+  REQUIRE(f.tx.start());
+  auto port = testnet::getFreePortUDP();
+
+  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(lid != 0);
+
+  // Connect via the listener TO THE SAME listener address (self-loopback)
+  SessionId cs = f.tx.connectViaListener(lid, "127.0.0.1", port);
+  REQUIRE(cs != 0);
+  REQUIRE(f.waitFor(f.connected));
+
+  // Send to self
+  const char *msg = "self_loopback_test";
+  REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
+
+  // Data should arrive on the listener
+  REQUIRE(f.waitForCount(f.dataCount, 1, 2000));
+
+  // Verify we received the data
+  {
+    std::lock_guard<std::mutex> lock(f.dataMutex);
+    REQUIRE(f.receivedData.size() >= 1);
+    REQUIRE(f.receivedData[0] == msg);
+  }
+
+  f.tx.stop();
+}
+
+TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
+{
+  // Test that multiple SessionIds can connect to the same peer.
+  // This is important for protocols that use multiple logical connections
+  // to the same remote address (e.g., SIP dialogs).
+  UdpFixture f;
+  REQUIRE(f.tx.start());
+  auto port1 = testnet::getFreePortUDP();
+  auto port2 = testnet::getFreePortUDP();
+
+  // Set up a server
+  SharedUdpTransport::Config cfg2{};
+  SharedUdpTransport::TlsConfig tlsCfg2{};
+  SharedUdpTransport tx2{cfg2, tlsCfg2, tlsCfg2};
+
+  std::atomic<int> server2DataCount{0};
+  std::mutex server2Mutex;
+  std::vector<std::string> server2Data;
+
+  SharedUdpTransport::Callbacks cbs2{};
+  cbs2.onData = [&](SessionId, const std::uint8_t *data, std::size_t n, const IoResult &)
+  {
+    std::lock_guard<std::mutex> lock(server2Mutex);
+    server2Data.push_back(std::string(reinterpret_cast<const char *>(data), n));
+    server2DataCount++;
+  };
+  tx2.setCallbacks(cbs2);
+
+  REQUIRE(tx2.start());
+  ListenerId lid2 = tx2.addListener("127.0.0.1", port2, TlsMode::None);
+  REQUIRE(lid2 != 0);
+
+  // Create a listener to connect via
+  ListenerId lid1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
+  REQUIRE(lid1 != 0);
+
+  // Connect via the first listener to the server - multiple times
+  SessionId cs1 = f.tx.connectViaListener(lid1, "127.0.0.1", port2);
+  REQUIRE(cs1 != 0);
+  REQUIRE(f.waitFor(f.connected));
+
+  // Reset and connect again (same peer, different SessionId)
+  f.connected = false;
+  SessionId cs2 = f.tx.connectViaListener(lid1, "127.0.0.1", port2);
+  REQUIRE(cs2 != 0);
+  REQUIRE(cs2 != cs1); // Different SessionId
+  REQUIRE(f.waitFor(f.connected));
+
+  f.connected = false;
+  SessionId cs3 = f.tx.connectViaListener(lid1, "127.0.0.1", port2);
+  REQUIRE(cs3 != 0);
+  REQUIRE(cs3 != cs1);
+  REQUIRE(cs3 != cs2);
+  REQUIRE(f.waitFor(f.connected));
+
+  // Send from each session
+  REQUIRE(f.tx.send(cs1, "msg1", 4));
+  REQUIRE(f.tx.send(cs2, "msg2", 4));
+  REQUIRE(f.tx.send(cs3, "msg3", 4));
+
+  // Wait for server to receive all 3 messages
+  for (int i = 0; i < 200 && server2DataCount.load() < 3; ++i)
+    std::this_thread::sleep_for(5ms);
+  REQUIRE(server2DataCount.load() == 3);
+
+  // Verify all messages received
+  {
+    std::lock_guard<std::mutex> lock(server2Mutex);
+    std::sort(server2Data.begin(), server2Data.end());
+    REQUIRE(server2Data.size() == 3);
+    REQUIRE(server2Data[0] == "msg1");
+    REQUIRE(server2Data[1] == "msg2");
+    REQUIRE(server2Data[2] == "msg3");
+  }
+
+  f.tx.stop();
+  tx2.stop();
+}

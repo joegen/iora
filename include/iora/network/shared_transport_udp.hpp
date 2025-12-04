@@ -1017,15 +1017,11 @@ private:
     ::freeaddrinfo(res);
     std::string k = key(to);
     auto pit = _peerIndex.find(k);
-    if (pit != _peerIndex.end())
-    {
-      {
-        std::lock_guard<std::mutex> g(_cb);
-        if (_cbs.onConnect)
-          _cbs.onConnect(vr.sid, IoResult::success());
-      }
-      return true;
-    }
+    bool peerExists = (pit != _peerIndex.end());
+    // Note: Even if peer exists, we must create a Session for the new SessionId.
+    // This enables self-loopback (same address as listener) and multiple logical
+    // connections to the same remote peer. The _peerIndex maps peer address to
+    // ONE SessionId for incoming data dispatch; applications must demultiplex.
     if (_cfg.maxSessions && _atomicStats.sessionsCurrent.load() >= _cfg.maxSessions)
     {
       {
@@ -1048,7 +1044,10 @@ private:
     s->lastWriteProgress = s->created;
     s->connectPending = false;
     _sessions.emplace(s->id, std::move(s));
-    _peerIndex.emplace(k, vr.sid);
+    if (!peerExists)
+    {
+      _peerIndex.emplace(k, vr.sid);
+    }
     bumpSess();
     {
       std::lock_guard<std::mutex> g(_cb);
