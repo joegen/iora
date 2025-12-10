@@ -21,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace iora
 {
@@ -98,10 +99,7 @@ public:
       data.rawQueue.pop();
 
       // Format the message for external handler
-      std::ostringstream oss;
-      oss << "[" << timestamp() << "] "
-          << "[" << levelToString(level) << "] " << rawMessage << std::endl;
-      std::string formattedMessage = oss.str();
+      std::string formattedMessage = formatLogMessage(level, rawMessage);
 
       // Temporarily unlock to call external handler
       lock.unlock();
@@ -184,6 +182,38 @@ public:
     // File logging will be restored on next log call via rotateLogFileIfNeeded
   }
 
+  /// \brief Set the log format string (thread-safe)
+  /// Supported placeholders:
+  ///   %T - timestamp (uses timestampFormat from init())
+  ///   %t - thread ID
+  ///   %L - log level (e.g., INFO, DEBUG, ERROR)
+  ///   %m - message content
+  ///   %% - literal percent sign
+  /// \param format The format string (default: "[%T] [%L] %m")
+  /// Example with thread ID: "[%T] [%t] [%L] %m"
+  /// \note Format is pre-compiled for performance; parsing happens only on this call.
+  /// \note Empty format strings are ignored.
+  static void setLogFormat(const std::string &format)
+  {
+    if (format.empty())
+    {
+      return;
+    }
+    auto &data = getData();
+    std::lock_guard<std::mutex> lock(data.mutex);
+    data._logFormat = format;
+    compileFormat(format, data._compiledFormat);
+  }
+
+  /// \brief Get the current log format string
+  /// \return The current log format string
+  static std::string getLogFormat()
+  {
+    auto &data = getData();
+    std::lock_guard<std::mutex> lock(data.mutex);
+    return data._logFormat;
+  }
+
   static void trace(const std::string &message) { log(Level::Trace, message); }
   static void debug(const std::string &message) { log(Level::Debug, message); }
   static void info(const std::string &message) { log(Level::Info, message); }
@@ -201,11 +231,7 @@ public:
       return;
     }
 
-    std::ostringstream oss;
-    oss << "[" << timestamp() << "] "
-        << "[" << levelToString(level) << "] " << message << std::endl;
-
-    std::string output = oss.str();
+    std::string output = formatLogMessage(level, message);
 
     if (data.asyncMode)
     {
@@ -250,6 +276,23 @@ public:
 public:
   friend class LoggerStream;
 
+  /// \brief Token type for pre-compiled format segments
+  enum class FormatToken
+  {
+    Literal,    ///< Literal string segment
+    Timestamp,  ///< %T - timestamp
+    ThreadId,   ///< %t - thread ID
+    Level,      ///< %L - log level
+    Message     ///< %m - message content
+  };
+
+  /// \brief Pre-compiled format segment
+  struct FormatSegment
+  {
+    FormatToken token;
+    std::string literal;  ///< Only used when token == Literal
+  };
+
   struct LoggerData
   {
     std::mutex mutex;
@@ -267,6 +310,10 @@ public:
     std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
     ExternalHandler externalHandler;
     bool useExternalHandler = false;
+    /// Original log format string (for getLogFormat())
+    std::string _logFormat = "[%T] [%L] %m";
+    /// Pre-compiled format segments for fast formatting
+    std::vector<FormatSegment> _compiledFormat;
 
     ~LoggerData()
     {
@@ -309,10 +356,7 @@ public:
         data.rawQueue.pop();
 
         // Format the message for external handler
-        std::ostringstream oss;
-        oss << "[" << timestamp() << "] "
-            << "[" << levelToString(level) << "] " << rawMessage << std::endl;
-        std::string formattedMessage = oss.str();
+        std::string formattedMessage = formatLogMessage(level, rawMessage);
 
         // Temporarily unlock to call external handler
         lock.unlock();
@@ -502,6 +546,128 @@ public:
     default:
       return "UNKNOWN";
     }
+  }
+
+  /// \brief Compile a format string into segments for fast formatting
+  /// \param format The format string to compile
+  /// \param segments Output vector to store compiled segments
+  static void compileFormat(const std::string &format, std::vector<FormatSegment> &segments)
+  {
+    segments.clear();
+    std::string currentLiteral;
+
+    for (std::size_t i = 0; i < format.size(); ++i)
+    {
+      if (format[i] == '%' && i + 1 < format.size())
+      {
+        // Flush accumulated literal before processing placeholder
+        if (!currentLiteral.empty())
+        {
+          segments.push_back({FormatToken::Literal, std::move(currentLiteral)});
+          currentLiteral.clear();
+        }
+
+        char spec = format[i + 1];
+        switch (spec)
+        {
+        case 'T':
+          segments.push_back({FormatToken::Timestamp, ""});
+          ++i;
+          break;
+        case 't':
+          segments.push_back({FormatToken::ThreadId, ""});
+          ++i;
+          break;
+        case 'L':
+          segments.push_back({FormatToken::Level, ""});
+          ++i;
+          break;
+        case 'm':
+          segments.push_back({FormatToken::Message, ""});
+          ++i;
+          break;
+        case '%':
+          currentLiteral += '%';
+          ++i;
+          break;
+        default:
+          // Unknown placeholder, treat % as literal
+          currentLiteral += format[i];
+          break;
+        }
+      }
+      else
+      {
+        currentLiteral += format[i];
+      }
+    }
+
+    // Flush any remaining literal
+    if (!currentLiteral.empty())
+    {
+      segments.push_back({FormatToken::Literal, std::move(currentLiteral)});
+    }
+  }
+
+  /// \brief Format a log message using pre-compiled format segments
+  /// \param level The log level
+  /// \param message The raw message content
+  /// \return Formatted log string with newline
+  /// \note Uses pre-compiled segments for optimal performance.
+  ///       Thread-safe: all shared data is copied under lock before formatting.
+  static std::string formatLogMessage(Level level, const std::string &message)
+  {
+    auto &data = getData();
+
+    // Copy compiled segments and timestamp format under lock to avoid race conditions
+    std::vector<FormatSegment> segments;
+    std::string timestampFmt;
+    {
+      std::lock_guard<std::mutex> lock(data.mutex);
+      // Compile on first use if not yet compiled
+      if (data._compiledFormat.empty() && !data._logFormat.empty())
+      {
+        compileFormat(data._logFormat, data._compiledFormat);
+      }
+      segments = data._compiledFormat;
+      timestampFmt = data.timestampFormat;
+    }
+
+    std::ostringstream oss;
+    for (const auto &seg : segments)
+    {
+      switch (seg.token)
+      {
+      case FormatToken::Literal:
+        oss << seg.literal;
+        break;
+      case FormatToken::Timestamp:
+        {
+          // Generate timestamp using copied format (thread-safe)
+          auto now = std::chrono::system_clock::now();
+          auto t = std::chrono::system_clock::to_time_t(now);
+          auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+          oss << std::put_time(std::localtime(&t), timestampFmt.c_str());
+          if (timestampFmt.find("%S") != std::string::npos)
+          {
+            oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+          }
+        }
+        break;
+      case FormatToken::ThreadId:
+        oss << std::this_thread::get_id();
+        break;
+      case FormatToken::Level:
+        oss << levelToString(level);
+        break;
+      case FormatToken::Message:
+        oss << message;
+        break;
+      }
+    }
+    oss << std::endl;
+    return oss.str();
   }
 };
 
