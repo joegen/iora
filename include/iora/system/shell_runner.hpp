@@ -74,6 +74,10 @@ struct SpawnOptions
   /// Redirect stderr to file
   std::string stderrFile;
 
+  /// Close stdin (redirect to /dev/null)
+  /// Useful for background processes that should not read from TTY
+  bool closeStdin = false;
+
   /// Create new process group
   bool createProcessGroup = true;
 

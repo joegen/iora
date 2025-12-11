@@ -1827,7 +1827,24 @@ private:
       {
         _atomicStats.bytesOut += n;
         s->lastWriteProgress = MonoClock::now();
-        s->wq.pop_front();
+
+        // Handle partial writes - only remove sent bytes from buffer
+        if (static_cast<size_t>(n) < d.size())
+        {
+          IORA_LOG_DEBUG("[IO-THREAD] writePending() PARTIAL WRITE for sid=" << s->id
+                        << ": sent " << n << " of " << d.size() << " bytes");
+          // Remove the sent bytes from the front of the buffer
+          d.erase(d.begin(), d.begin() + n);
+          // Keep trying to write - socket may accept more data
+          s->wantWrite = true;
+          updateInterest(s);
+          break;  // Exit loop, will retry on next EPOLLOUT
+        }
+        else
+        {
+          // Full buffer sent - remove it from queue
+          s->wq.pop_front();
+        }
       }
     }
 
@@ -1911,6 +1928,19 @@ private:
           _atomicStats.bytesOut += n;
           s->lastActivity = MonoClock::now();
           s->lastWriteProgress = MonoClock::now();
+
+          // Check if partial write occurred - queue remaining bytes
+          if (static_cast<size_t>(n) < sr.payload.size())
+          {
+            IORA_LOG_DEBUG("[IO-THREAD] SSL PARTIAL WRITE for sid=" << sr.sid << ": sent " << n
+                         << " of " << sr.payload.size() << " bytes, queuing remaining "
+                         << (sr.payload.size() - n) << " bytes");
+            // Queue the unsent portion for later transmission
+            ByteBuffer remaining(sr.payload.begin() + n, sr.payload.end());
+            s->wq.emplace_front(std::move(remaining));
+            s->wantWrite = true;
+            updateInterest(s);
+          }
           return;
         }
         int ge = ::SSL_get_error(s->ssl, n);
@@ -1928,17 +1958,25 @@ private:
       else
       {
         n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), 0);
+        IORA_LOG_DEBUG("[IO-THREAD] ::send() for sid=" << sr.sid << " returned " << n
+                      << " (requested " << sr.payload.size() << " bytes)");
         if (n >= 0)
         {
           _atomicStats.bytesOut += n;
           s->lastActivity = MonoClock::now();
           s->lastWriteProgress = MonoClock::now();
 
-          // Check if partial write occurred
+          // Check if partial write occurred - queue remaining bytes
           if (static_cast<size_t>(n) < sr.payload.size())
           {
-            IORA_LOG_WARN("[IO-THREAD] PARTIAL WRITE for sid=" << sr.sid << ": sent " << n
-                         << " of " << sr.payload.size() << " bytes");
+            IORA_LOG_DEBUG("[IO-THREAD] PARTIAL WRITE for sid=" << sr.sid << ": sent " << n
+                         << " of " << sr.payload.size() << " bytes, queuing remaining "
+                         << (sr.payload.size() - n) << " bytes");
+            // Queue the unsent portion for later transmission
+            ByteBuffer remaining(sr.payload.begin() + n, sr.payload.end());
+            s->wq.emplace_front(std::move(remaining));
+            s->wantWrite = true;
+            updateInterest(s);
           }
           return;
         }
