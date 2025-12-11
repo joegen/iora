@@ -39,9 +39,13 @@ Makefile
 *.exe
 *.out
 *.app
-all_tests
-iora_test_*
-test_*
+
+# Test executables (built binaries, not source files)
+# These patterns match files without extensions in the tests directory
+/tests/all_tests
+/tests/**/iora_test_*
+!/tests/**/*.cpp
+!/tests/**/*.hpp
 
 # Test outputs
 Testing/
@@ -55,6 +59,9 @@ Testing/
 *.swo
 *~
 .DS_Store
+
+#Agent Tasks
+agent_tasks/
 
 # Temporary files
 *.tmp
