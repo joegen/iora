@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -24,6 +26,14 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+  #include <io.h>
+  #define isatty _isatty
+  #define fileno _fileno
+#else
+  #include <unistd.h>
+#endif
 
 namespace iora
 {
@@ -251,6 +261,33 @@ public:
     return data._logFormat;
   }
 
+  /// \brief Enable or disable ANSI color codes for console output
+  /// \param enable Whether to enable console colors
+  /// \note Colors are only applied to console output (std::cout), not file logs
+  /// \note Automatically checks if stdout is a TTY and respects NO_COLOR environment variable
+  /// \note Color scheme: TRACE=gray, DEBUG=cyan, INFO=green, WARN=yellow, ERROR=red, FATAL=bright red
+  static void setConsoleColors(bool enable)
+  {
+    auto &data = getData();
+    std::lock_guard<std::mutex> lock(data.mutex);
+
+    // Check NO_COLOR environment variable (standard convention)
+    const char *noColor = std::getenv("NO_COLOR");
+    if (noColor && noColor[0] != '\0')
+    {
+      // NO_COLOR is set and non-empty, disable colors
+      data._enableConsoleColors = false;
+      data._isTTY = false;
+      return;
+    }
+
+    // Check if stdout is a TTY
+    data._isTTY = (isatty(fileno(stdout)) != 0);
+
+    // Only enable colors if requested, stdout is a TTY, and NO_COLOR not set
+    data._enableConsoleColors = enable && data._isTTY;
+  }
+
   static void trace(const std::string &message) { log(Level::Trace, message); }
   static void debug(const std::string &message) { log(Level::Debug, message); }
   static void info(const std::string &message) { log(Level::Info, message); }
@@ -377,7 +414,8 @@ public:
         }
         else
         {
-          std::cout << output;
+          // Colorize output for console if colors enabled
+          std::cout << colorizeOutput(output, level);
         }
       }
     }
@@ -434,7 +472,8 @@ public:
         }
         else
         {
-          std::cout << output;
+          // Colorize output for console if colors enabled
+          std::cout << colorizeOutput(output, level);
         }
       }
     }
@@ -484,6 +523,10 @@ public:
     std::string _logFormat = "[%T] [%L] %m";
     /// Pre-compiled format segments for fast formatting
     std::vector<FormatSegment> _compiledFormat;
+    /// Enable ANSI color codes for console output
+    bool _enableConsoleColors = false;
+    /// Cache whether stdout is a TTY
+    bool _isTTY = false;
 
     ~LoggerData()
     {
@@ -726,6 +769,83 @@ public:
     default:
       return "UNKNOWN";
     }
+  }
+
+  /// \brief Get ANSI color code for log level
+  /// \param level The log level
+  /// \return ANSI color code string
+  static const char *getColorCode(Level level)
+  {
+    switch (level)
+    {
+    case Level::Trace:
+      return "\033[90m"; // Gray
+    case Level::Debug:
+      return "\033[36m"; // Cyan
+    case Level::Info:
+      return "\033[32m"; // Green
+    case Level::Warning:
+      return "\033[33m"; // Yellow
+    case Level::Error:
+      return "\033[31m"; // Red
+    case Level::Fatal:
+      return "\033[91m"; // Bright Red
+    default:
+      return "";
+    }
+  }
+
+  /// \brief Get ANSI reset code
+  /// \return ANSI reset code string
+  static const char *getResetCode()
+  {
+    return "\033[0m";
+  }
+
+  /// \brief Get colorized level string if colors enabled
+  /// \param level The log level
+  /// \param useColors Whether to apply ANSI colors
+  /// \return Level string with optional ANSI color codes
+  static std::string getColorizedLevel(Level level, bool useColors)
+  {
+    if (useColors)
+    {
+      std::string result;
+      result += getColorCode(level);
+      result += levelToString(level);
+      result += getResetCode();
+      return result;
+    }
+    else
+    {
+      return levelToString(level);
+    }
+  }
+
+  /// \brief Colorize formatted log output by replacing level strings with colored versions
+  /// \param output The formatted log message
+  /// \param level The log level
+  /// \return Colorized output if colors enabled, otherwise original output
+  static std::string colorizeOutput(const std::string &output, Level level)
+  {
+    auto &data = getData();
+    if (!data._enableConsoleColors)
+    {
+      return output;
+    }
+
+    // Find and replace the level string with colorized version
+    const char *levelStr = levelToString(level);
+    std::string colorizedLevel = getColorizedLevel(level, true);
+
+    std::string result = output;
+    size_t pos = result.find(levelStr);
+    if (pos != std::string::npos)
+    {
+      result.replace(pos, std::strlen(levelStr), colorizedLevel);
+    }
+
+    return result;
   }
 
   /// \brief Compile a format string into segments for fast formatting
