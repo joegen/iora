@@ -10,6 +10,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -220,6 +222,74 @@ public:
   static void warning(const std::string &message) { log(Level::Warning, message); }
   static void error(const std::string &message) { log(Level::Error, message); }
   static void fatal(const std::string &message) { log(Level::Fatal, message); }
+
+  /// \brief Printf-style logging methods
+  /// Format string and log at specified level with compile-time format checking
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 1, 2)))
+#endif
+  static void tracef(const char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    logFormatted(Level::Trace, fmt, args);
+    va_end(args);
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 1, 2)))
+#endif
+  static void debugf(const char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    logFormatted(Level::Debug, fmt, args);
+    va_end(args);
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 1, 2)))
+#endif
+  static void infof(const char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    logFormatted(Level::Info, fmt, args);
+    va_end(args);
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 1, 2)))
+#endif
+  static void warningf(const char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    logFormatted(Level::Warning, fmt, args);
+    va_end(args);
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 1, 2)))
+#endif
+  static void errorf(const char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    logFormatted(Level::Error, fmt, args);
+    va_end(args);
+  }
+
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 1, 2)))
+#endif
+  static void fatalf(const char *fmt, ...)
+  {
+    va_list args;
+    va_start(args, fmt);
+    logFormatted(Level::Fatal, fmt, args);
+    va_end(args);
+  }
 
   static LoggerStream stream(Level level);
 
@@ -609,6 +679,40 @@ public:
     }
   }
 
+  /// \brief Format string using printf-style format and varargs
+  /// \param level The log level
+  /// \param fmt Printf-style format string
+  /// \param args Variable arguments list
+  /// \note Thread-safe, handles buffer allocation automatically
+  static void logFormatted(Level level, const char *fmt, va_list args)
+  {
+    auto &data = getData();
+    if (level < data.minLevel)
+    {
+      return;
+    }
+
+    // Determine required buffer size
+    va_list argsCopy;
+    va_copy(argsCopy, args);
+    int size = std::vsnprintf(nullptr, 0, fmt, argsCopy);
+    va_end(argsCopy);
+
+    if (size < 0)
+    {
+      // Format error, log error message instead
+      log(level, "[Logger] Invalid format string");
+      return;
+    }
+
+    // Allocate buffer and format string
+    std::vector<char> buffer(size + 1);
+    std::vsnprintf(buffer.data(), buffer.size(), fmt, args);
+
+    // Log formatted message
+    log(level, std::string(buffer.data(), size));
+  }
+
   /// \brief Format a log message using pre-compiled format segments
   /// \param level The log level
   /// \param message The raw message content
@@ -763,6 +867,67 @@ namespace detail
 #define IORA_LOG_WARN(msg) IORA_LOG_WITH_LEVEL(Warning, msg)
 #define IORA_LOG_ERROR(msg) IORA_LOG_WITH_LEVEL(Error, msg)
 #define IORA_LOG_FATAL(msg) IORA_LOG_WITH_LEVEL(Fatal, msg)
+
+/// Printf-style logging macros with context information
+#define IORA_LOG_TRACEF(fmt, ...)                                                                      \
+  do                                                                                                   \
+  {                                                                                                    \
+    std::ostringstream _oss;                                                                           \
+    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
+    char _buf[4096];                                                                                   \
+    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
+    iora::core::Logger::trace(_oss.str() + _buf);                                                      \
+  } while (0)
+
+#define IORA_LOG_DEBUGF(fmt, ...)                                                                      \
+  do                                                                                                   \
+  {                                                                                                    \
+    std::ostringstream _oss;                                                                           \
+    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
+    char _buf[4096];                                                                                   \
+    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
+    iora::core::Logger::debug(_oss.str() + _buf);                                                      \
+  } while (0)
+
+#define IORA_LOG_INFOF(fmt, ...)                                                                       \
+  do                                                                                                   \
+  {                                                                                                    \
+    std::ostringstream _oss;                                                                           \
+    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
+    char _buf[4096];                                                                                   \
+    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
+    iora::core::Logger::info(_oss.str() + _buf);                                                       \
+  } while (0)
+
+#define IORA_LOG_WARNF(fmt, ...)                                                                       \
+  do                                                                                                   \
+  {                                                                                                    \
+    std::ostringstream _oss;                                                                           \
+    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
+    char _buf[4096];                                                                                   \
+    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
+    iora::core::Logger::warning(_oss.str() + _buf);                                                    \
+  } while (0)
+
+#define IORA_LOG_ERRORF(fmt, ...)                                                                      \
+  do                                                                                                   \
+  {                                                                                                    \
+    std::ostringstream _oss;                                                                           \
+    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
+    char _buf[4096];                                                                                   \
+    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
+    iora::core::Logger::error(_oss.str() + _buf);                                                      \
+  } while (0)
+
+#define IORA_LOG_FATALF(fmt, ...)                                                                      \
+  do                                                                                                   \
+  {                                                                                                    \
+    std::ostringstream _oss;                                                                           \
+    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
+    char _buf[4096];                                                                                   \
+    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
+    iora::core::Logger::fatal(_oss.str() + _buf);                                                      \
+  } while (0)
 
 inline LoggerStream Logger::stream(Logger::Level level) { return LoggerStream(level); }
 } // namespace core
