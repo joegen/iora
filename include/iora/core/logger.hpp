@@ -729,7 +729,26 @@ public:
 
 inline LoggerProxy Logger;
 
-#define IORA_LOG_CONTEXT_PREFIX "[" << __FILE__ << ":" << __LINE__ << " " << __func__ << "] "
+namespace detail
+{
+  /// \brief Extract filename from full path at compile-time
+  /// Handles both Unix (/) and Windows (\) path separators
+  constexpr const char* basename(const char* path)
+  {
+    const char* file = path;
+    while (*path)
+    {
+      if (*path == '/' || *path == '\\')
+      {
+        file = path + 1;
+      }
+      ++path;
+    }
+    return file;
+  }
+} // namespace detail
+
+#define IORA_LOG_CONTEXT_PREFIX "[" << iora::core::detail::basename(__FILE__) << ":" << __LINE__ << " " << __func__ << "] "
 
 #define IORA_LOG_WITH_LEVEL(level, msg)                                                            \
   do                                                                                               \
