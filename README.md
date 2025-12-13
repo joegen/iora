@@ -22,6 +22,15 @@
   - [Advanced Features](#-advanced-features-1)
   - [Performance Characteristics](#-performance-characteristics-1)
   - [Best Practices](#-best-practices-1)
+- [📝 Thread-Safe Logger](#-thread-safe-logger)
+  - [Core Features](#-core-features-3)
+  - [Log Levels](#-log-levels)
+  - [Logging Methods](#-logging-methods)
+  - [Format Placeholders](#-format-placeholders)
+  - [Console Color Support](#-console-color-support)
+  - [Async Mode & File Rotation](#-async-mode--file-rotation)
+  - [External Handler Integration](#-external-handler-integration)
+  - [Usage Examples](#-usage-examples-1)
 - [🌐 Unified Network Transport System](#-unified-network-transport-system)
   - [Core Architecture](#-core-architecture)
   - [Transport Capabilities](#️-transport-capabilities)
@@ -771,6 +780,233 @@ process(item);  // Undefined behavior
 while (true) {
     queue.dequeue(item);  // Will hang if queue closed and empty
     process(item);
+}
+```
+
+---
+
+## 📝 Thread-Safe Logger
+
+Iora's **Logger** provides a comprehensive, thread-safe logging system designed for production environments. It supports both synchronous and asynchronous modes, customizable format strings, file rotation, and ANSI color output for improved console readability.
+
+### ⚡ **Core Features**
+
+- **Thread-Safe** — All operations are fully thread-safe for concurrent logging
+- **Async Mode** — Non-blocking logging with background worker thread
+- **File Rotation** — Automatic daily log rotation with retention policies
+- **Custom Formats** — Configurable format strings with placeholders
+- **ANSI Colors** — Optional colored console output for improved readability
+- **Multiple APIs** — Stream-style (`<<`) and printf-style (`infof()`) logging
+- **Source Location** — Optional file, line, and function tracking in output
+- **External Handlers** — Integration with custom log processing systems
+- **Zero Dependencies** — Uses only standard C++ library
+
+### 📊 **Log Levels**
+
+Six log levels from least to most severe:
+
+| Level | Method | Color | Use Case |
+|-------|--------|-------|----------|
+| `Trace` | `trace()` | Gray | Detailed debugging, performance profiling |
+| `Debug` | `debug()` | Cyan | Development debugging information |
+| `Info` | `info()` | Green | General operational messages |
+| `Warning` | `warning()` | Yellow | Potential issues, deprecated features |
+| `Error` | `error()` | Red | Errors that need attention |
+| `Fatal` | `fatal()` | Bright Red | Critical failures, system shutdown |
+
+### 🎯 **Logging Methods**
+
+#### Stream-Style Logging
+```cpp
+iora::core::Logger::info("User logged in: " + username);
+iora::core::Logger::error("Connection failed after " + std::to_string(retries) + " attempts");
+```
+
+#### Printf-Style Logging
+```cpp
+iora::core::Logger::infof("User %s logged in from %s", username.c_str(), ipAddress.c_str());
+iora::core::Logger::errorf("Connection failed after %d attempts (error: %d)", retries, errorCode);
+iora::core::Logger::debugf("Processing %.2f MB in %d chunks", sizeMb, chunkCount);
+```
+
+#### Macros with Source Location
+```cpp
+// Automatically includes file:line function in output
+IORA_LOG_INFO("Processing request");
+IORA_LOG_ERRORF("Failed to open file: %s", filename.c_str());
+```
+
+### 📐 **Format Placeholders**
+
+Customize log output format using `setLogFormat()`:
+
+| Placeholder | Description | Example Output |
+|-------------|-------------|----------------|
+| `%T` | Timestamp | `2025-12-13 14:30:45.123` |
+| `%L` | Log level | `INFO`, `ERROR`, etc. |
+| `%t` | Thread ID (hex) | `d4bb52008fe71a22` |
+| `%m` | Message content | Your log message |
+| `%F` | Filename (no path) | `server.cpp` |
+| `%l` | Line number | `142` |
+| `%f` | Function name | `handleRequest` |
+
+```cpp
+// Default format
+Logger::setLogFormat("[%T] [%L] %m");
+// Output: [2025-12-13 14:30:45.123] [INFO] User connected
+
+// With thread ID
+Logger::setLogFormat("[%T] [%t] [%L] %m");
+// Output: [2025-12-13 14:30:45.123] [d4bb52008fe71a22] [INFO] User connected
+
+// With source location (requires IORA_LOG_* macros)
+Logger::setLogFormat("[%T] [%L] [%F:%l %f] %m");
+// Output: [2025-12-13 14:30:45.123] [INFO] [server.cpp:142 handleRequest] User connected
+```
+
+### 🎨 **Console Color Support**
+
+Enable ANSI colors for terminal output to quickly identify log levels visually:
+
+```cpp
+// Enable colored output
+Logger::setConsoleColors(true);
+
+// Colors are only applied when:
+// - Writing to stdout (not file logs)
+// - stdout is a TTY (terminal)
+// - NO_COLOR environment variable is not set
+```
+
+**Color Scheme:**
+- **TRACE** — Gray (`\033[90m`)
+- **DEBUG** — Cyan (`\033[36m`)
+- **INFO** — Green (`\033[32m`)
+- **WARNING** — Yellow (`\033[33m`)
+- **ERROR** — Red (`\033[31m`)
+- **FATAL** — Bright Red (`\033[91m`)
+
+### 🔄 **Async Mode & File Rotation**
+
+```cpp
+// Initialize with async mode and file logging
+Logger::init(
+    Logger::Level::Debug,      // Minimum level
+    "/var/log/myapp/app.log",  // Base log path
+    true                       // Enable async mode
+);
+
+// Configure retention (keep 30 days of logs)
+Logger::setRetentionDays(30);
+
+// Files are automatically rotated daily:
+// /var/log/myapp/app.log.2025-12-13.log
+// /var/log/myapp/app.log.2025-12-12.log
+// etc.
+```
+
+### 🔌 **External Handler Integration**
+
+Route logs to external systems (databases, remote services, monitoring tools):
+
+```cpp
+// Set external log handler
+Logger::setExternalHandler([](Logger::Level level,
+                              const std::string& formatted,
+                              const std::string& raw) {
+    // Send to external monitoring system
+    monitoring.log(levelToString(level), raw);
+
+    // Or store in database
+    db.insert("logs", {
+        {"level", static_cast<int>(level)},
+        {"message", raw},
+        {"timestamp", std::time(nullptr)}
+    });
+});
+```
+
+### 📝 **Usage Examples**
+
+#### Basic Setup
+```cpp
+#include "iora/iora.hpp"
+using namespace iora::core;
+
+int main() {
+    // Initialize logger with debug level, console only
+    Logger::init(Logger::Level::Debug);
+
+    // Set custom format
+    Logger::setLogFormat("[%T] [%L] %m");
+
+    // Enable console colors
+    Logger::setConsoleColors(true);
+
+    // Log messages
+    Logger::info("Application started");
+    Logger::debug("Loading configuration...");
+    Logger::warning("Config file not found, using defaults");
+
+    // Printf-style with formatting
+    Logger::infof("Server listening on port %d", 8080);
+    Logger::debugf("Allocated %.2f MB for cache", 256.5);
+
+    // Cleanup
+    Logger::flush();
+    Logger::shutdown();
+    return 0;
+}
+```
+
+#### Production Setup with File Logging
+```cpp
+#include "iora/iora.hpp"
+using namespace iora::core;
+
+int main() {
+    // Initialize with async mode and file logging
+    Logger::init(
+        Logger::Level::Info,           // Only Info and above in production
+        "/var/log/myapp/app.log",     // Base path for log files
+        true                           // Async mode for performance
+    );
+
+    // Keep 30 days of logs
+    Logger::setRetentionDays(30);
+
+    // Format with thread ID for multi-threaded debugging
+    Logger::setLogFormat("[%T] [%t] [%L] %m");
+
+    // Application code...
+    Logger::info("Service started");
+
+    // Ensure all logs are written before exit
+    Logger::flush();
+    Logger::shutdown();
+    return 0;
+}
+```
+
+#### Using Macros for Source Location
+```cpp
+#include "iora/iora.hpp"
+using namespace iora::core;
+
+void processRequest(const Request& req) {
+    // Set format to include source location
+    Logger::setLogFormat("[%T] [%L] [%F:%l %f] %m");
+
+    IORA_LOG_DEBUG("Processing request");
+    // Output: [2025-12-13 14:30:45.123] [DEBUG] [handler.cpp:15 processRequest] Processing request
+
+    if (req.invalid()) {
+        IORA_LOG_ERRORF("Invalid request from %s", req.clientIp().c_str());
+        // Output: [2025-12-13 14:30:45.124] [ERROR] [handler.cpp:19 processRequest] Invalid request from 192.168.1.100
+        return;
+    }
+
+    IORA_LOG_INFOF("Request completed in %dms", elapsed);
 }
 ```
 
@@ -3662,9 +3898,10 @@ To enable plugin loading, specify the directory containing your plugins in your 
 
 ### Logging and Error Handling
 
-- Plugin initialization errors are logged using the `iora::core::Logger`.
+- Plugin initialization errors are logged using the `iora::core::Logger` (see [Thread-Safe Logger](#-thread-safe-logger) for full documentation).
 - Dependency failures result in detailed error messages indicating which dependencies are missing.
 - If a plugin fails to load, it will be skipped, and the system will continue loading other plugins.
+- Use `Logger::setLogFormat()` with `%F`, `%l`, `%f` placeholders for source location in plugin logs.
 
 ### JSON-RPC Server Module
 
