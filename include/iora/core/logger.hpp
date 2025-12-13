@@ -187,7 +187,7 @@ public:
   /// \brief Set the log format string (thread-safe)
   /// Supported placeholders:
   ///   %T - timestamp (uses timestampFormat from init())
-  ///   %t - thread ID
+  ///   %t - thread ID (hex hash: 8 digits on 32-bit, 16 digits on 64-bit)
   ///   %L - log level (e.g., INFO, DEBUG, ERROR)
   ///   %m - message content
   ///   %% - literal percent sign
@@ -195,6 +195,7 @@ public:
   /// Example with thread ID: "[%T] [%t] [%L] %m"
   /// \note Format is pre-compiled for performance; parsing happens only on this call.
   /// \note Empty format strings are ignored.
+  /// \note Thread ID is formatted as hex hash with platform-specific width for consistency.
   static void setLogFormat(const std::string &format)
   {
     if (format.empty())
@@ -781,7 +782,14 @@ public:
         oss << timestampStr;
         break;
       case FormatToken::ThreadId:
-        oss << std::this_thread::get_id();
+        {
+          // Convert thread ID to numeric hash for consistent formatting across platforms
+          std::hash<std::thread::id> hasher;
+          std::size_t threadHash = hasher(std::this_thread::get_id());
+          // Format as hex with width matching size_t (8 chars on 32-bit, 16 chars on 64-bit)
+          oss << std::hex << std::setfill('0') << std::setw(sizeof(std::size_t) * 2)
+              << threadHash << std::dec;
+        }
         break;
       case FormatToken::Level:
         oss << levelToString(level);
