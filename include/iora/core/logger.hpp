@@ -223,8 +223,13 @@ public:
   static void error(const std::string &message) { log(Level::Error, message); }
   static void fatal(const std::string &message) { log(Level::Fatal, message); }
 
-  /// \brief Printf-style logging methods
-  /// Format string and log at specified level with compile-time format checking
+  /// \brief Printf-style logging methods with automatic buffer sizing
+  /// These methods support printf-style formatting with no message length limit.
+  /// Buffer is automatically sized to fit the formatted output.
+  /// \note Does NOT include context info (file/line/function). Use IORA_LOG_*F macros for context.
+  /// \note Compile-time format checking enabled for GCC/Clang via __attribute__((format)).
+  /// \param fmt Printf-style format string
+  /// \param ... Variable arguments matching format specifiers
 #if defined(__GNUC__) || defined(__clang__)
   __attribute__((format(printf, 1, 2)))
 #endif
@@ -868,7 +873,13 @@ namespace detail
 #define IORA_LOG_ERROR(msg) IORA_LOG_WITH_LEVEL(Error, msg)
 #define IORA_LOG_FATAL(msg) IORA_LOG_WITH_LEVEL(Fatal, msg)
 
-/// Printf-style logging macros with context information
+/// \brief Printf-style logging macros with context information
+/// These macros include file:line:function context via IORA_LOG_CONTEXT_PREFIX.
+/// \warning Messages are limited to 4096 bytes (including null terminator).
+///          Longer messages will be silently truncated by std::snprintf.
+///          For messages exceeding this limit, use Logger::tracef() directly
+///          or consider using stream-style logging (IORA_LOG_TRACE).
+/// \note Uses stack buffer for performance - suitable for most logging scenarios.
 #define IORA_LOG_TRACEF(fmt, ...)                                                                      \
   do                                                                                                   \
   {                                                                                                    \
