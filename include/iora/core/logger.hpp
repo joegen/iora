@@ -742,6 +742,33 @@ public:
       timestampFmt = data.timestampFormat;
     }
 
+    // Pre-generate timestamp once to avoid redundant time syscalls
+    std::string timestampStr;
+    bool needsTimestamp = false;
+    for (const auto &seg : segments)
+    {
+      if (seg.token == FormatToken::Timestamp)
+      {
+        needsTimestamp = true;
+        break;
+      }
+    }
+
+    if (needsTimestamp)
+    {
+      auto now = std::chrono::system_clock::now();
+      auto t = std::chrono::system_clock::to_time_t(now);
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+      std::ostringstream tsOss;
+      tsOss << std::put_time(std::localtime(&t), timestampFmt.c_str());
+      if (timestampFmt.find("%S") != std::string::npos)
+      {
+        tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+      }
+      timestampStr = tsOss.str();
+    }
+
     std::ostringstream oss;
     for (const auto &seg : segments)
     {
@@ -751,18 +778,7 @@ public:
         oss << seg.literal;
         break;
       case FormatToken::Timestamp:
-        {
-          // Generate timestamp using copied format (thread-safe)
-          auto now = std::chrono::system_clock::now();
-          auto t = std::chrono::system_clock::to_time_t(now);
-          auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now.time_since_epoch()) % 1000;
-          oss << std::put_time(std::localtime(&t), timestampFmt.c_str());
-          if (timestampFmt.find("%S") != std::string::npos)
-          {
-            oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-          }
-        }
+        oss << timestampStr;
         break;
       case FormatToken::ThreadId:
         oss << std::this_thread::get_id();
