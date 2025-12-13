@@ -31,6 +31,25 @@ namespace iora
 namespace core
 {
 
+namespace detail
+{
+  /// \brief Extract filename from full path at compile-time
+  /// Handles both Unix (/) and Windows (\) path separators
+  constexpr const char* basename(const char* path)
+  {
+    const char* file = path;
+    while (*path)
+    {
+      if (*path == '/' || *path == '\\')
+      {
+        file = path + 1;
+      }
+      ++path;
+    }
+    return file;
+  }
+} // namespace detail
+
 // Forward declaration
 class LoggerStream;
 
@@ -190,12 +209,17 @@ public:
   ///   %t - thread ID (hex hash: 8 digits on 32-bit, 16 digits on 64-bit)
   ///   %L - log level (e.g., INFO, DEBUG, ERROR)
   ///   %m - message content
+  ///   %F - source file name (only filename, no directory path)
+  ///   %l - source line number
+  ///   %f - function name
   ///   %% - literal percent sign
   /// \param format The format string (default: "[%T] [%L] %m")
   /// Example with thread ID: "[%T] [%t] [%L] %m"
+  /// Example with source location: "[%T] [%L] [%F:%l %f] %m"
   /// \note Format is pre-compiled for performance; parsing happens only on this call.
   /// \note Empty format strings are ignored.
   /// \note Thread ID is formatted as hex hash with platform-specific width for consistency.
+  /// \note Source location placeholders (%F, %l, %f) require using IORA_LOG_* macros.
   static void setLogFormat(const std::string &format)
   {
     if (format.empty())
@@ -349,6 +373,63 @@ public:
     }
   }
 
+  /// \brief Log a message with source location information
+  /// \param level The log level
+  /// \param message The message to log
+  /// \param file Source file name (from __FILE__)
+  /// \param line Source line number (from __LINE__)
+  /// \param function Function name (from __func__)
+  static void log(Level level, const std::string &message,
+                  const char *file, int line, const char *function)
+  {
+    auto &data = getData();
+    if (level < data.minLevel)
+    {
+      return;
+    }
+
+    std::string output = formatLogMessage(level, message, file, line, function);
+
+    if (data.asyncMode)
+    {
+      {
+        std::lock_guard<std::mutex> lock(data.mutex);
+        if (data.useExternalHandler)
+        {
+          data.rawQueue.push({level, message});
+        }
+        else
+        {
+          data.queue.push(std::move(output));
+        }
+      }
+      data.cv.notify_one();
+    }
+    else
+    {
+      std::lock_guard<std::mutex> lock(data.mutex);
+
+      if (data.useExternalHandler && data.externalHandler)
+      {
+        data.externalHandler(level, output, message);
+      }
+      else
+      {
+        rotateLogFileIfNeeded();
+
+        if (data.fileStream)
+        {
+          (*data.fileStream) << output;
+          data.fileStream->flush();
+        }
+        else
+        {
+          std::cout << output;
+        }
+      }
+    }
+  }
+
 public:
   friend class LoggerStream;
 
@@ -359,7 +440,10 @@ public:
     Timestamp,  ///< %T - timestamp
     ThreadId,   ///< %t - thread ID
     Level,      ///< %L - log level
-    Message     ///< %m - message content
+    Message,    ///< %m - message content
+    File,       ///< %F - source file name
+    Line,       ///< %l - source line number
+    Function    ///< %f - function name
   };
 
   /// \brief Pre-compiled format segment
@@ -662,6 +746,18 @@ public:
           segments.push_back({FormatToken::Message, ""});
           ++i;
           break;
+        case 'F':
+          segments.push_back({FormatToken::File, ""});
+          ++i;
+          break;
+        case 'l':
+          segments.push_back({FormatToken::Line, ""});
+          ++i;
+          break;
+        case 'f':
+          segments.push_back({FormatToken::Function, ""});
+          ++i;
+          break;
         case '%':
           currentLiteral += '%';
           ++i;
@@ -797,6 +893,110 @@ public:
       case FormatToken::Message:
         oss << message;
         break;
+      case FormatToken::File:
+        // File placeholder - will be empty unless source location provided
+        break;
+      case FormatToken::Line:
+        // Line placeholder - will be empty unless source location provided
+        break;
+      case FormatToken::Function:
+        // Function placeholder - will be empty unless source location provided
+        break;
+      }
+    }
+    oss << std::endl;
+    return oss.str();
+  }
+
+  /// \brief Format a log message with source location information
+  /// \param level The log level
+  /// \param message The raw message content
+  /// \param file Source file name (from __FILE__)
+  /// \param line Source line number (from __LINE__)
+  /// \param function Function name (from __func__)
+  /// \return Formatted log string with newline
+  static std::string formatLogMessage(Level level, const std::string &message,
+                                      const char *file, int line, const char *function)
+  {
+    auto &data = getData();
+
+    // Copy compiled segments and timestamp format under lock
+    std::vector<FormatSegment> segments;
+    std::string timestampFmt;
+    {
+      std::lock_guard<std::mutex> lock(data.mutex);
+      if (data._compiledFormat.empty() && !data._logFormat.empty())
+      {
+        compileFormat(data._logFormat, data._compiledFormat);
+      }
+      segments = data._compiledFormat;
+      timestampFmt = data.timestampFormat;
+    }
+
+    // Pre-generate timestamp once
+    std::string timestampStr;
+    bool needsTimestamp = false;
+    for (const auto &seg : segments)
+    {
+      if (seg.token == FormatToken::Timestamp)
+      {
+        needsTimestamp = true;
+        break;
+      }
+    }
+
+    if (needsTimestamp)
+    {
+      auto now = std::chrono::system_clock::now();
+      auto t = std::chrono::system_clock::to_time_t(now);
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+      std::ostringstream tsOss;
+      tsOss << std::put_time(std::localtime(&t), timestampFmt.c_str());
+      if (timestampFmt.find("%S") != std::string::npos)
+      {
+        tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+      }
+      timestampStr = tsOss.str();
+    }
+
+    // Extract filename from full path
+    std::string filename = detail::basename(file);
+
+    std::ostringstream oss;
+    for (const auto &seg : segments)
+    {
+      switch (seg.token)
+      {
+      case FormatToken::Literal:
+        oss << seg.literal;
+        break;
+      case FormatToken::Timestamp:
+        oss << timestampStr;
+        break;
+      case FormatToken::ThreadId:
+        {
+          std::hash<std::thread::id> hasher;
+          std::size_t threadHash = hasher(std::this_thread::get_id());
+          oss << std::hex << std::setfill('0') << std::setw(sizeof(std::size_t) * 2)
+              << threadHash << std::dec;
+        }
+        break;
+      case FormatToken::Level:
+        oss << levelToString(level);
+        break;
+      case FormatToken::Message:
+        oss << message;
+        break;
+      case FormatToken::File:
+        oss << filename;
+        break;
+      case FormatToken::Line:
+        oss << line;
+        break;
+      case FormatToken::Function:
+        oss << function;
+        break;
       }
     }
     oss << std::endl;
@@ -862,32 +1062,18 @@ public:
 
 inline LoggerProxy Logger;
 
-namespace detail
-{
-  /// \brief Extract filename from full path at compile-time
-  /// Handles both Unix (/) and Windows (\) path separators
-  constexpr const char* basename(const char* path)
-  {
-    const char* file = path;
-    while (*path)
-    {
-      if (*path == '/' || *path == '\\')
-      {
-        file = path + 1;
-      }
-      ++path;
-    }
-    return file;
-  }
-} // namespace detail
-
+/// \brief Legacy context prefix macro (deprecated - use format placeholders %F, %l, %f instead)
 #define IORA_LOG_CONTEXT_PREFIX "[" << iora::core::detail::basename(__FILE__) << ":" << __LINE__ << " " << __func__ << "] "
 
+/// \brief Stream-style logging macro with source location support
+/// Uses format string placeholders (%F, %l, %f) for source location
 #define IORA_LOG_WITH_LEVEL(level, msg)                                                            \
   do                                                                                               \
   {                                                                                                \
-    iora::core::Logger << iora::core::Logger::Level::level << IORA_LOG_CONTEXT_PREFIX << msg       \
-                       << iora::core::Logger::endl;                                                \
+    std::ostringstream _oss;                                                                       \
+    _oss << msg;                                                                                   \
+    iora::core::Logger::log(iora::core::Logger::Level::level, _oss.str(),                         \
+                            __FILE__, __LINE__, __func__);                                         \
   } while (0)
 
 #define IORA_LOG_TRACE(msg) IORA_LOG_WITH_LEVEL(Trace, msg)
@@ -897,71 +1083,65 @@ namespace detail
 #define IORA_LOG_ERROR(msg) IORA_LOG_WITH_LEVEL(Error, msg)
 #define IORA_LOG_FATAL(msg) IORA_LOG_WITH_LEVEL(Fatal, msg)
 
-/// \brief Printf-style logging macros with context information
-/// These macros include file:line:function context via IORA_LOG_CONTEXT_PREFIX.
+/// \brief Printf-style logging macros with source location support
+/// Source location is passed to logger and formatted according to format string.
+/// Use placeholders %F (file), %l (line), %f (function) in format string to display source location.
 /// \warning Messages are limited to 4096 bytes (including null terminator).
 ///          Longer messages will be silently truncated by std::snprintf.
-///          For messages exceeding this limit, use Logger::tracef() directly
-///          or consider using stream-style logging (IORA_LOG_TRACE).
+///          For messages exceeding this limit, use Logger::tracef() directly.
 /// \note Uses stack buffer for performance - suitable for most logging scenarios.
 #define IORA_LOG_TRACEF(fmt, ...)                                                                      \
   do                                                                                                   \
   {                                                                                                    \
-    std::ostringstream _oss;                                                                           \
-    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
     char _buf[4096];                                                                                   \
     std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::trace(_oss.str() + _buf);                                                      \
+    iora::core::Logger::log(iora::core::Logger::Level::Trace, _buf,                                   \
+                            __FILE__, __LINE__, __func__);                                             \
   } while (0)
 
 #define IORA_LOG_DEBUGF(fmt, ...)                                                                      \
   do                                                                                                   \
   {                                                                                                    \
-    std::ostringstream _oss;                                                                           \
-    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
     char _buf[4096];                                                                                   \
     std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::debug(_oss.str() + _buf);                                                      \
+    iora::core::Logger::log(iora::core::Logger::Level::Debug, _buf,                                   \
+                            __FILE__, __LINE__, __func__);                                             \
   } while (0)
 
 #define IORA_LOG_INFOF(fmt, ...)                                                                       \
   do                                                                                                   \
   {                                                                                                    \
-    std::ostringstream _oss;                                                                           \
-    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
     char _buf[4096];                                                                                   \
     std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::info(_oss.str() + _buf);                                                       \
+    iora::core::Logger::log(iora::core::Logger::Level::Info, _buf,                                    \
+                            __FILE__, __LINE__, __func__);                                             \
   } while (0)
 
 #define IORA_LOG_WARNF(fmt, ...)                                                                       \
   do                                                                                                   \
   {                                                                                                    \
-    std::ostringstream _oss;                                                                           \
-    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
     char _buf[4096];                                                                                   \
     std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::warning(_oss.str() + _buf);                                                    \
+    iora::core::Logger::log(iora::core::Logger::Level::Warning, _buf,                                 \
+                            __FILE__, __LINE__, __func__);                                             \
   } while (0)
 
 #define IORA_LOG_ERRORF(fmt, ...)                                                                      \
   do                                                                                                   \
   {                                                                                                    \
-    std::ostringstream _oss;                                                                           \
-    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
     char _buf[4096];                                                                                   \
     std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::error(_oss.str() + _buf);                                                      \
+    iora::core::Logger::log(iora::core::Logger::Level::Error, _buf,                                   \
+                            __FILE__, __LINE__, __func__);                                             \
   } while (0)
 
 #define IORA_LOG_FATALF(fmt, ...)                                                                      \
   do                                                                                                   \
   {                                                                                                    \
-    std::ostringstream _oss;                                                                           \
-    _oss << IORA_LOG_CONTEXT_PREFIX;                                                                   \
     char _buf[4096];                                                                                   \
     std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::fatal(_oss.str() + _buf);                                                      \
+    iora::core::Logger::log(iora::core::Logger::Level::Fatal, _buf,                                   \
+                            __FILE__, __LINE__, __func__);                                             \
   } while (0)
 
 inline LoggerStream Logger::stream(Logger::Level level) { return LoggerStream(level); }
