@@ -390,7 +390,16 @@ public:
         }
         else
         {
-          data.queue.push(std::move(output));
+          // Colorize output before queuing if writing to console
+          // This preserves color info since level is lost after queuing
+          if (!data.fileStream && data._enableConsoleColors)
+          {
+            data.queue.push(colorizeOutput(output, level));
+          }
+          else
+          {
+            data.queue.push(std::move(output));
+          }
         }
       }
       data.cv.notify_one();
@@ -448,7 +457,16 @@ public:
         }
         else
         {
-          data.queue.push(std::move(output));
+          // Colorize output before queuing if writing to console
+          // This preserves color info since level is lost after queuing
+          if (!data.fileStream && data._enableConsoleColors)
+          {
+            data.queue.push(colorizeOutput(output, level));
+          }
+          else
+          {
+            data.queue.push(std::move(output));
+          }
         }
       }
       data.cv.notify_one();
