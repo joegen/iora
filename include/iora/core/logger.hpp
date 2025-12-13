@@ -119,12 +119,20 @@ public:
       auto [level, rawMessage] = data.rawQueue.front();
       data.rawQueue.pop();
 
-      // Format the message for external handler
-      std::string formattedMessage = formatLogMessage(level, rawMessage);
+      // Extract what we need while holding the lock
+      auto segments = data._compiledFormat;
+      auto timestampFmt = data.timestampFormat;
 
-      // Temporarily unlock to call external handler
+      // Unlock before formatting and calling handler
       lock.unlock();
+
+      // Format the message (no locking performed internally)
+      std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+
+      // Call external handler (no lock held)
       data.externalHandler(level, formattedMessage, rawMessage);
+
+      // Re-lock for next iteration
       lock.lock();
     }
 
@@ -515,12 +523,20 @@ public:
         auto [level, rawMessage] = data.rawQueue.front();
         data.rawQueue.pop();
 
-        // Format the message for external handler
-        std::string formattedMessage = formatLogMessage(level, rawMessage);
+        // Extract what we need while holding the lock
+        auto segments = data._compiledFormat;
+        auto timestampFmt = data.timestampFormat;
 
-        // Temporarily unlock to call external handler
+        // Unlock before formatting and calling handler
         lock.unlock();
+
+        // Format the message (no locking performed internally)
+        std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+
+        // Call external handler (no lock held)
         data.externalHandler(level, formattedMessage, rawMessage);
+
+        // Re-lock for next iteration
         lock.lock();
       }
 
@@ -815,30 +831,17 @@ public:
     log(level, std::string(buffer.data(), size));
   }
 
-  /// \brief Format a log message using pre-compiled format segments
+  /// \brief Internal helper to format log message without locking
   /// \param level The log level
   /// \param message The raw message content
+  /// \param segments Pre-compiled format segments
+  /// \param timestampFmt Timestamp format string
   /// \return Formatted log string with newline
-  /// \note Uses pre-compiled segments for optimal performance.
-  ///       Thread-safe: all shared data is copied under lock before formatting.
-  static std::string formatLogMessage(Level level, const std::string &message)
+  /// \note Caller must ensure thread-safety (no locking performed internally)
+  static std::string formatLogMessageInternal(Level level, const std::string &message,
+                                              const std::vector<FormatSegment> &segments,
+                                              const std::string &timestampFmt)
   {
-    auto &data = getData();
-
-    // Copy compiled segments and timestamp format under lock to avoid race conditions
-    std::vector<FormatSegment> segments;
-    std::string timestampFmt;
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-      // Compile on first use if not yet compiled
-      if (data._compiledFormat.empty() && !data._logFormat.empty())
-      {
-        compileFormat(data._logFormat, data._compiledFormat);
-      }
-      segments = data._compiledFormat;
-      timestampFmt = data.timestampFormat;
-    }
-
     // Pre-generate timestamp once to avoid redundant time syscalls
     std::string timestampStr;
     bool needsTimestamp = false;
@@ -908,31 +911,21 @@ public:
     return oss.str();
   }
 
-  /// \brief Format a log message with source location information
+  /// \brief Internal helper to format log message with source location (no locking)
   /// \param level The log level
   /// \param message The raw message content
   /// \param file Source file name (from __FILE__)
   /// \param line Source line number (from __LINE__)
   /// \param function Function name (from __func__)
+  /// \param segments Pre-compiled format segments
+  /// \param timestampFmt Timestamp format string
   /// \return Formatted log string with newline
-  static std::string formatLogMessage(Level level, const std::string &message,
-                                      const char *file, int line, const char *function)
+  /// \note Caller must ensure thread-safety (no locking performed internally)
+  static std::string formatLogMessageInternal(Level level, const std::string &message,
+                                              const char *file, int line, const char *function,
+                                              const std::vector<FormatSegment> &segments,
+                                              const std::string &timestampFmt)
   {
-    auto &data = getData();
-
-    // Copy compiled segments and timestamp format under lock
-    std::vector<FormatSegment> segments;
-    std::string timestampFmt;
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-      if (data._compiledFormat.empty() && !data._logFormat.empty())
-      {
-        compileFormat(data._logFormat, data._compiledFormat);
-      }
-      segments = data._compiledFormat;
-      timestampFmt = data.timestampFormat;
-    }
-
     // Pre-generate timestamp once
     std::string timestampStr;
     bool needsTimestamp = false;
@@ -1001,6 +994,61 @@ public:
     }
     oss << std::endl;
     return oss.str();
+  }
+
+  /// \brief Format a log message using pre-compiled format segments
+  /// \param level The log level
+  /// \param message The raw message content
+  /// \return Formatted log string with newline
+  /// \note Uses pre-compiled segments for optimal performance.
+  ///       Thread-safe: all shared data is copied under lock before formatting.
+  static std::string formatLogMessage(Level level, const std::string &message)
+  {
+    auto &data = getData();
+
+    // Copy compiled segments and timestamp format under lock to avoid race conditions
+    std::vector<FormatSegment> segments;
+    std::string timestampFmt;
+    {
+      std::lock_guard<std::mutex> lock(data.mutex);
+      // Compile on first use if not yet compiled
+      if (data._compiledFormat.empty() && !data._logFormat.empty())
+      {
+        compileFormat(data._logFormat, data._compiledFormat);
+      }
+      segments = data._compiledFormat;
+      timestampFmt = data.timestampFormat;
+    }
+
+    return formatLogMessageInternal(level, message, segments, timestampFmt);
+  }
+
+  /// \brief Format a log message with source location information
+  /// \param level The log level
+  /// \param message The raw message content
+  /// \param file Source file name (from __FILE__)
+  /// \param line Source line number (from __LINE__)
+  /// \param function Function name (from __func__)
+  /// \return Formatted log string with newline
+  static std::string formatLogMessage(Level level, const std::string &message,
+                                      const char *file, int line, const char *function)
+  {
+    auto &data = getData();
+
+    // Copy compiled segments and timestamp format under lock
+    std::vector<FormatSegment> segments;
+    std::string timestampFmt;
+    {
+      std::lock_guard<std::mutex> lock(data.mutex);
+      if (data._compiledFormat.empty() && !data._logFormat.empty())
+      {
+        compileFormat(data._logFormat, data._compiledFormat);
+      }
+      segments = data._compiledFormat;
+      timestampFmt = data.timestampFormat;
+    }
+
+    return formatLogMessageInternal(level, message, file, line, function, segments, timestampFmt);
   }
 };
 
