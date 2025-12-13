@@ -123,13 +123,15 @@ public:
       auto segments = data._compiledFormat;
       auto timestampFmt = data.timestampFormat;
 
-      // Unlock before formatting and calling handler
+      // CRITICAL: Unlock before formatting and calling handler to avoid deadlock.
+      // formatLogMessageInternal() does not lock internally (lock-free design).
+      // External handler may be slow or call back into logger - must not hold lock.
       lock.unlock();
 
       // Format the message (no locking performed internally)
       std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
 
-      // Call external handler (no lock held)
+      // Call external handler (no lock held to prevent deadlock)
       data.externalHandler(level, formattedMessage, rawMessage);
 
       // Re-lock for next iteration
@@ -527,13 +529,15 @@ public:
         auto segments = data._compiledFormat;
         auto timestampFmt = data.timestampFormat;
 
-        // Unlock before formatting and calling handler
+        // CRITICAL: Unlock before formatting and calling handler to avoid deadlock.
+        // formatLogMessageInternal() does not lock internally (lock-free design).
+        // External handler may be slow or call back into logger - must not hold lock.
         lock.unlock();
 
         // Format the message (no locking performed internally)
         std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
 
-        // Call external handler (no lock held)
+        // Call external handler (no lock held to prevent deadlock)
         data.externalHandler(level, formattedMessage, rawMessage);
 
         // Re-lock for next iteration
