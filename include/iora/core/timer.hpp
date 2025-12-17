@@ -187,12 +187,21 @@ public:
 class ConsoleTimerLogger : public TimerLogger
 {
 public:
-  explicit ConsoleTimerLogger(Level minLevel = Level::Info) : _minLevel(minLevel) {}
+  explicit ConsoleTimerLogger(Level minLevel = Level::Info, bool enabled = false)
+      : _minLevel(minLevel), _enabled(enabled) {}
+
+  /// \brief Enable or disable console logging
+  /// \param enable Whether to enable logging
+  void setEnabled(bool enable) { _enabled.store(enable, std::memory_order_release); }
+
+  /// \brief Check if console logging is enabled
+  /// \return True if logging is enabled
+  bool isEnabled() const { return _enabled.load(std::memory_order_acquire); }
 
   void log(Level level, const std::string &message, TimerError error = TimerError::None,
            int errno_val = 0) override
   {
-    if (level < _minLevel)
+    if (!_enabled.load(std::memory_order_relaxed) || level < _minLevel)
       return;
 
     std::string levelStr;
@@ -218,9 +227,12 @@ public:
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
     auto tm = *std::localtime(&time_t);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch()) % 1000;
 
-    std::printf("[%04d-%02d-%02d %02d:%02d:%02d] [%s] %s", tm.tm_year + 1900, tm.tm_mon + 1,
-                tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, levelStr.c_str(), message.c_str());
+    std::printf("[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] %s", tm.tm_year + 1900, tm.tm_mon + 1,
+                tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms.count()),
+                levelStr.c_str(), message.c_str());
 
     if (error != TimerError::None)
     {
@@ -238,6 +250,7 @@ public:
 
 private:
   Level _minLevel;
+  std::atomic<bool> _enabled;
 };
 
 /// \brief Linux epoll-based timer service.
