@@ -810,6 +810,31 @@ public:
     }
   }
 
+  /// \brief Set DNS cache default TTL at runtime
+  ///
+  /// Updates the default TTL used when DNS records don't specify a TTL.
+  /// This affects new cache entries only; existing entries retain their TTL.
+  ///
+  /// \param ttl New default time-to-live for cache entries
+  void setCacheTtl(std::chrono::seconds ttl)
+  {
+    if (cache_)
+    {
+      cache_->setDefaultTtl(ttl);
+    }
+  }
+
+  /// \brief Get current DNS cache default TTL
+  /// \return Current default TTL in seconds, or 0 if caching is disabled
+  std::chrono::seconds getCacheTtl() const
+  {
+    if (cache_)
+    {
+      return cache_->getDefaultTtl();
+    }
+    return std::chrono::seconds{0};
+  }
+
 private:
   dns::DnsConfig config_;                                   ///< DNS configuration
   std::shared_ptr<UnifiedSharedTransport> customTransport_; ///< Custom transport (optional)

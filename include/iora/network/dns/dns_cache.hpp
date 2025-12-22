@@ -69,15 +69,15 @@ class DnsCache
 {
 public:
   /// \brief Constructor with default configuration
-  DnsCache() : defaultTtl_(std::chrono::seconds(300)) { initializeCache(); } // 5 minute default TTL
+  DnsCache() : defaultTtlSeconds_(300) { initializeCache(); } // 5 minute default TTL
 
   /// \brief Constructor with configurable TTL
   /// \param ttl Time-to-live for cache entries
-  explicit DnsCache(std::chrono::seconds ttl) : defaultTtl_(ttl) { initializeCache(); }
+  explicit DnsCache(std::chrono::seconds ttl) : defaultTtlSeconds_(ttl.count()) { initializeCache(); }
 
   /// \brief Constructor with maximum cache size (ignored - ExpiringCache uses TTL only)
   /// \param maxSize Ignored for compatibility with old API
-  explicit DnsCache(std::size_t maxSize) : defaultTtl_(std::chrono::seconds(300))
+  explicit DnsCache(std::size_t maxSize) : defaultTtlSeconds_(300)
   {
     // maxSize is ignored - ExpiringCache uses time-based expiration only
     initializeCache();
@@ -266,7 +266,7 @@ public:
 
     // ExpiringCache doesn't have a clear method, so we create a new instance
     // The cleanupCallback_ is preserved and passed to initializeCache()
-    // The defaultTtl_ is also preserved from construction time
+    // The defaultTtlSeconds_ is also preserved from construction time
     initializeCache();
   }
 
@@ -307,12 +307,32 @@ public:
     cleanupCallback_ = callback;
   }
 
+  /// \brief Set default TTL for cache entries at runtime
+  ///
+  /// Updates the default TTL used when DNS records don't specify a TTL.
+  /// This affects new cache entries only; existing entries retain their TTL.
+  /// Thread-safe.
+  ///
+  /// \param ttl New default time-to-live for cache entries
+  void setDefaultTtl(std::chrono::seconds ttl)
+  {
+    defaultTtlSeconds_.store(ttl.count(), std::memory_order_relaxed);
+  }
+
+  /// \brief Get current default TTL for cache entries
+  /// Thread-safe.
+  /// \return Current default TTL in seconds
+  std::chrono::seconds getDefaultTtl() const
+  {
+    return std::chrono::seconds{defaultTtlSeconds_.load(std::memory_order_relaxed)};
+  }
+
 private:
   /// \brief Underlying expiring cache
   std::unique_ptr<util::ExpiringCache<DnsCacheKey, CachedDnsResult>> cache_;
 
-  /// \brief Default TTL for cache entries
-  std::chrono::seconds defaultTtl_;
+  /// \brief Default TTL for cache entries (atomic for thread safety)
+  std::atomic<int64_t> defaultTtlSeconds_;
 
   /// \brief Atomic statistics counters
   struct AtomicStats
@@ -347,7 +367,7 @@ private:
       }
     };
 
-    cache_ = std::make_unique<util::ExpiringCache<DnsCacheKey, CachedDnsResult>>(defaultTtl_,
+    cache_ = std::make_unique<util::ExpiringCache<DnsCacheKey, CachedDnsResult>>(getDefaultTtl(),
                                                                                  evictionCallback);
   }
 
@@ -365,7 +385,7 @@ private:
   ///    - This handles cases where SOA parsing might have been missed
   ///    - Note: This is less accurate as it doesn't extract MINIMUM from RDATA
   ///
-  /// 3. **Default**: Uses provided default when no SOA found
+  /// 3. **Default**: Uses configured defaultTtl_ when no SOA found
   ///    - Standard fallback per RFC 2308 recommendations
   ///
   /// The authority section fallback exists because SOA records in NXDOMAIN responses
@@ -373,10 +393,10 @@ private:
   /// them to soa_records. If this fallback is frequently used, it may indicate a parsing issue.
   ///
   /// \param result DNS query result containing potential SOA records
-  /// \param defaultNegativeTtl Fallback TTL if no SOA found (default: 5 minutes)
+  /// \param defaultNegativeTtl Fallback TTL if no SOA found (0 = use defaultTtl_)
   /// \return Negative TTL in seconds (from SOA minimum or default)
   std::uint32_t calculateNegativeTtl(const DnsResult &result,
-                                     std::uint32_t defaultNegativeTtl = 300) const
+                                     std::uint32_t defaultNegativeTtl = 0) const
   {
     // RFC 2308: Use SOA MINIMUM field for negative caching (preferred path)
     for (const auto &record : result.soa_records)
@@ -399,7 +419,8 @@ private:
     }
 
     // RFC 2308 fallback: use default negative TTL when no SOA found
-    return defaultNegativeTtl;
+    return defaultNegativeTtl > 0 ? defaultNegativeTtl
+                                  : static_cast<std::uint32_t>(defaultTtlSeconds_.load(std::memory_order_relaxed));
   }
 
   /// \brief Calculate appropriate TTL from DNS result using conservative minimum approach
@@ -484,7 +505,7 @@ private:
     // Default TTL if no records found (RFC 1035 suggests reasonable defaults)
     if (min_ttl == std::numeric_limits<std::uint32_t>::max())
     {
-      min_ttl = 300; // 5 minutes default
+      min_ttl = static_cast<std::uint32_t>(defaultTtlSeconds_.load(std::memory_order_relaxed));
     }
 
     return min_ttl;
