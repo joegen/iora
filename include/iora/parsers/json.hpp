@@ -494,6 +494,11 @@ public:
 
   const Json &operator[](const char *key) const { return operator[](std::string(key)); }
 
+  // Explicit int overloads to resolve ambiguity with literal 0
+  // Without these, json[0] is ambiguous between size_t and const char* (null pointer conversion)
+  Json &operator[](int index) { return operator[](static_cast<std::size_t>(index)); }
+  const Json &operator[](int index) const { return operator[](static_cast<std::size_t>(index)); }
+
   // Check if object contains a key
   bool contains(const std::string &key) const
   {
