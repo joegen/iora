@@ -5,7 +5,14 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #include "iora/iora.hpp"
-#include "kvstore.hpp"
+#include "iora/storage/kvstore.hpp"
+
+// Use namespaced types
+using iora::storage::KVStore;
+using iora::storage::KVStoreConfig;
+using iora::storage::KVStoreException;
+using iora::storage::MAX_KEY_LENGTH;
+using iora::storage::MAX_VALUE_LENGTH;
 #include <atomic>
 #include <catch2/catch.hpp>
 #include <chrono>

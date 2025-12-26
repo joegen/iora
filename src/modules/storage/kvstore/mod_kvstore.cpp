@@ -5,7 +5,7 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #include "iora/iora.hpp"
-#include "kvstore.hpp"
+#include "iora/storage/kvstore.hpp"
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -14,6 +14,9 @@
 class KVStorePlugin : public iora::IoraService::Plugin
 {
 public:
+  using KVStore = iora::storage::KVStore;
+  using KVStoreConfig = iora::storage::KVStoreConfig;
+
   explicit KVStorePlugin(iora::IoraService *service) : Plugin(service) {}
 
   void onLoad(iora::IoraService *service) override
