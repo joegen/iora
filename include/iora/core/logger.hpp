@@ -97,15 +97,8 @@ public:
     data.minLevel = level;
     data.asyncMode = async;
     data.exit = false;
-    // If no filePath provided, use default in current directory
-    if (filePath.empty())
-    {
-      data.logBasePath = "iora.log";
-    }
-    else
-    {
-      data.logBasePath = filePath;
-    }
+    // If no filePath provided, log to console only (no file)
+    data.logBasePath = filePath;
     data.retentionDays = retentionDays;
     data.timestampFormat = timeFormat;
     // Reset current log date so rotateLogFileIfNeeded always opens a new file
@@ -193,6 +186,15 @@ public:
     auto &data = getData();
     std::lock_guard<std::mutex> lock(data.mutex);
     data.minLevel = level;
+  }
+
+  /// \brief Get the current minimum log level
+  /// \return The current minimum log level
+  static Level getLevel()
+  {
+    auto &data = getData();
+    std::lock_guard<std::mutex> lock(data.mutex);
+    return data.minLevel;
   }
 
   /// \brief Register an external log handler
