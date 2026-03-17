@@ -90,6 +90,9 @@ function(configure_iora_dependencies)
         INCLUDE_DIR CATCH2_INCLUDE_DIR
     )
        
+    # Threads - Required globally (iora_core, all targets via configure_threading_support)
+    find_package(Threads REQUIRED)
+
     # OpenSSL - Required for HTTPS support in homegrown HTTP client
     find_package(OpenSSL REQUIRED)
     if(OpenSSL_FOUND)

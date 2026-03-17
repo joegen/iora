@@ -12,7 +12,16 @@ function(create_iora_lib)
     )
     
     target_compile_features(iora_lib INTERFACE cxx_std_17)
-    
+
+    # Conditionally link iora_core and propagate IORA_CORE_SHARED
+    if(TARGET iora_core)
+        target_link_libraries(iora_lib INTERFACE iora_core)
+        target_compile_definitions(iora_lib INTERFACE IORA_CORE_SHARED)
+        message(STATUS "iora_lib linked with iora_core (shared singleton mode)")
+    else()
+        message(STATUS "iora_lib in header-only mode (iora_core not available)")
+    endif()
+
     message(STATUS "Created iora_lib interface library")
 endfunction()
 
