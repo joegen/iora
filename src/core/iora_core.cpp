@@ -39,4 +39,50 @@ void IoraService::destroyInstance()
   getInstancePtr().reset();
 }
 
+namespace storage {
+
+std::set<JsonFileStore *> &JsonFileStore::registry()
+{
+  static std::set<JsonFileStore *> s;
+  return s;
+}
+
+std::mutex &JsonFileStore::registryMutex()
+{
+  static std::mutex m;
+  return m;
+}
+
+std::thread &JsonFileStore::flushThread()
+{
+  static std::thread t;
+  return t;
+}
+
+std::chrono::milliseconds &JsonFileStore::flushInterval()
+{
+  static std::chrono::milliseconds ms{2000};
+  return ms;
+}
+
+std::condition_variable &JsonFileStore::terminationCv()
+{
+  static std::condition_variable cv;
+  return cv;
+}
+
+std::mutex &JsonFileStore::terminateCvMutex()
+{
+  static std::mutex m;
+  return m;
+}
+
+std::atomic<bool> &JsonFileStore::shouldExit()
+{
+  static std::atomic<bool> flag{false};
+  return flag;
+}
+
+} // namespace storage
+
 } // namespace iora
