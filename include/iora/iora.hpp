@@ -843,7 +843,7 @@ private:
     }
   }
 
-protected:
+public:
   /// \brief Internal singleton storage using shared_ptr for safe lifetime management
   static std::shared_ptr<IoraService> &getInstancePtr()
   {
@@ -875,6 +875,7 @@ protected:
     getInstancePtr().reset();
   }
 
+protected:
   bool loadSingleModule(const std::filesystem::directory_entry &entry)
   {
     std::string pluginName;

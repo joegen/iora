@@ -62,6 +62,7 @@ Testing/
 
 #Agent Tasks
 agent_tasks/
+.tasks/
 
 # Temporary files
 *.tmp
