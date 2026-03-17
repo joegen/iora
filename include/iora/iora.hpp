@@ -844,6 +844,15 @@ private:
   }
 
 public:
+#if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)
+  /// \brief Internal singleton storage using shared_ptr for safe lifetime management
+  static std::shared_ptr<IoraService> &getInstancePtr();
+  /// \brief Thread-safe singleton access with shared_ptr for safe lifetime management
+  static std::shared_ptr<IoraService> instancePtr();
+  /// \brief Explicitly destroy the singleton instance (for tests only)
+  /// WARNING: Only call when no other threads are using the instance
+  static void destroyInstance();
+#else
   /// \brief Internal singleton storage using shared_ptr for safe lifetime management
   static std::shared_ptr<IoraService> &getInstancePtr()
   {
@@ -874,6 +883,7 @@ public:
     std::lock_guard<std::mutex> lock(instanceMutex);
     getInstancePtr().reset();
   }
+#endif
 
 protected:
   bool loadSingleModule(const std::filesystem::directory_entry &entry)
