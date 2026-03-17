@@ -169,6 +169,16 @@ public:
       // Mark as shutting down immediately to prevent reentrancy
       svc._isRunning = false;
 
+      // Stop and destroy the webhook server BEFORE unloading modules.
+      // Plugins may have registered route handlers (std::function callbacks)
+      // on the webhook server. If modules are unloaded first, those callbacks
+      // become dangling pointers into unmapped .so memory.
+      if (svc._webhookServer)
+      {
+        svc._webhookServer->stop();
+        svc._webhookServer.reset();
+      }
+
       svc.unloadAllModules();
 
       // Stop ThreadPool if it exists
@@ -190,14 +200,7 @@ public:
         svc._jsonFileStore->flush();
       }
 
-      // Stop the webhook server if running
-      if (svc._webhookServer)
-      {
-        svc._webhookServer->stop();
-      }
-
-      // Destroy unique_ptr members
-      svc._webhookServer.reset();
+      // Destroy remaining unique_ptr members
       svc._stateStore.reset();
       svc._jsonFileStore.reset();
       svc._configLoader.reset();
