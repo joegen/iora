@@ -567,11 +567,15 @@ public:
     }
   };
 
+#if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)
+  static LoggerData &getData();
+#else
   static LoggerData &getData()
   {
     static LoggerData data;
     return data;
   }
+#endif
 
   static void runWorker()
   {
