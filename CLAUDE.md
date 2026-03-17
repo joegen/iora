@@ -59,10 +59,20 @@ export OPENAI_API_KEY="your-key"
 
 ## Architecture & Key Patterns
 
-### Header-Only Design
+### Hybrid Header + Shared Library Design
 - Main entry: `include/iora/iora.hpp`
-- All components in single include tree
+- All logic, templates, and parsers are header-only
+- Shared mutable state (Logger, IoraService, JsonFileStore flush system) lives in `libiora-core.so` (`src/core/iora_core.cpp`)
+- Plugins load with `RTLD_LOCAL` for symbol isolation; shared state is unified through `libiora-core.so` linkage
 - Plugin system via `IoraService::instance()`
+
+### Shared Library: libiora-core.so
+- Houses singleton state that must be unified across host and all plugins
+- Built as CMake target `iora_core` (SHARED), automatically linked via `iora_lib` INTERFACE
+- `IORA_CORE_SHARED` compile definition is propagated to all consumers via `iora_lib`
+- `IORA_CORE_BUILDING` is defined only when building `iora_core.cpp` itself
+- Headers use `#if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)` to switch between declaration-only (shared lib mode) and inline definition (header-only fallback)
+- Header-only fallback preserved for single-binary builds that don't load plugins
 
 ### Plugin API Access Patterns
 ```cpp
@@ -155,7 +165,7 @@ cmake --build build
 
 ### Check Dependencies
 ```bash
-# Only external dependency should be OpenSSL
+# Expected external dependencies: OpenSSL and libiora_core
 ldd build/src/iora | grep -v "linux-vdso\|ld-linux\|libc\|libm\|libdl\|libpthread\|libgcc\|libstdc++"
 ```
 
