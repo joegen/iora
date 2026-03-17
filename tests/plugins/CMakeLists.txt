@@ -31,6 +31,11 @@ create_iora_plugin_target(cyclepluginc
     SOURCES CyclePluginC.cpp
 )
 
+# Singleton isolation probe plugin
+create_iora_plugin_target(singletonprobe
+    SOURCES SingletonProbePlugin.cpp
+)
+
 # Indirect cycle test plugins
 create_iora_plugin_target(indirectcyclea
     SOURCES IndirectCycleA.cpp

@@ -60,8 +60,12 @@ Testing/
 *~
 .DS_Store
 
+# Claude Code
+CLAUDE.md
+
 #Agent Tasks
 agent_tasks/
+.tasks/
 
 # Temporary files
 *.tmp

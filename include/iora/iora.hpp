@@ -169,6 +169,16 @@ public:
       // Mark as shutting down immediately to prevent reentrancy
       svc._isRunning = false;
 
+      // Stop and destroy the webhook server BEFORE unloading modules.
+      // Plugins may have registered route handlers (std::function callbacks)
+      // on the webhook server. If modules are unloaded first, those callbacks
+      // become dangling pointers into unmapped .so memory.
+      if (svc._webhookServer)
+      {
+        svc._webhookServer->stop();
+        svc._webhookServer.reset();
+      }
+
       svc.unloadAllModules();
 
       // Stop ThreadPool if it exists
@@ -190,14 +200,7 @@ public:
         svc._jsonFileStore->flush();
       }
 
-      // Stop the webhook server if running
-      if (svc._webhookServer)
-      {
-        svc._webhookServer->stop();
-      }
-
-      // Destroy unique_ptr members
-      svc._webhookServer.reset();
+      // Destroy remaining unique_ptr members
       svc._stateStore.reset();
       svc._jsonFileStore.reset();
       svc._configLoader.reset();
@@ -843,7 +846,16 @@ private:
     }
   }
 
-protected:
+public:
+#if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)
+  /// \brief Internal singleton storage using shared_ptr for safe lifetime management
+  static std::shared_ptr<IoraService> &getInstancePtr();
+  /// \brief Thread-safe singleton access with shared_ptr for safe lifetime management
+  static std::shared_ptr<IoraService> instancePtr();
+  /// \brief Explicitly destroy the singleton instance (for tests only)
+  /// WARNING: Only call when no other threads are using the instance
+  static void destroyInstance();
+#else
   /// \brief Internal singleton storage using shared_ptr for safe lifetime management
   static std::shared_ptr<IoraService> &getInstancePtr()
   {
@@ -874,7 +886,9 @@ protected:
     std::lock_guard<std::mutex> lock(instanceMutex);
     getInstancePtr().reset();
   }
+#endif
 
+protected:
   bool loadSingleModule(const std::filesystem::directory_entry &entry)
   {
     std::string pluginName;

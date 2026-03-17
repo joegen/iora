@@ -17,6 +17,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 
+# Install directories (must be before any add_subdirectory that references them)
+include(GNUInstallDirs)
+
+# RPATH configuration so installed binaries find libiora_core.so
+set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
 # Include our modular CMake files
 include(cmake/Dependencies.cmake)
 include(cmake/IoraTargets.cmake)
@@ -24,7 +31,10 @@ include(cmake/IoraTargets.cmake)
 # Configure all dependencies with system library detection
 configure_iora_dependencies()
 
-# Create the main iora_lib interface library
+# Build the iora_core shared library (must exist before create_iora_lib)
+add_subdirectory(src/core)
+
+# Create the main iora_lib interface library (conditionally links iora_core)
 create_iora_lib()
 
 # Optional: Build tests (disabled by default for external project integration)
@@ -54,7 +64,7 @@ add_subdirectory(src)
 
 
 # Installation configuration
-include(GNUInstallDirs)
+# (GNUInstallDirs already included near the top of this file)
 
 # Install the header files
 install(DIRECTORY include/
@@ -73,7 +83,7 @@ install(CODE "
 ")
 
 # Install the iora_lib target
-install(TARGETS iora_lib
+install(TARGETS iora_lib iora_core
     EXPORT IoraTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

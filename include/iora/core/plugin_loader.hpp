@@ -40,10 +40,10 @@ public:
                                ", error: " + std::to_string(GetLastError()));
     }
 #else
-    // RTLD_GLOBAL ensures all plugins share the same static/singleton instances
-    // (Logger, IoraService) since iora is a header-only library. Without this,
-    // each .so gets its own copy of function-local static variables.
-    _handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    // RTLD_LOCAL provides symbol isolation between plugins. Shared state
+    // (Logger, IoraService, JsonFileStore) is unified through libiora-core.so
+    // linkage — each plugin links against the same .so at build time.
+    _handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!_handle)
     {
       throw std::runtime_error("Failed to load library: " + path + ", error: " + dlerror());

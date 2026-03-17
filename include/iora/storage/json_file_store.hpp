@@ -175,6 +175,15 @@ public:
   }
 
   /// \brief Configure the background flush interval (in milliseconds)
+#if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)
+  static std::set<JsonFileStore *> &registry();
+  static std::mutex &registryMutex();
+  static std::thread &flushThread();
+  static std::chrono::milliseconds &flushInterval();
+  static std::condition_variable &terminationCv();
+  static std::mutex &terminateCvMutex();
+  static std::atomic<bool> &shouldExit();
+#else
   static std::set<JsonFileStore *> &registry()
   {
     static std::set<JsonFileStore *> s;
@@ -210,6 +219,7 @@ public:
     static std::atomic<bool> flag{false};
     return flag;
   }
+#endif
   static void setFlushInterval(std::chrono::milliseconds interval) { flushInterval() = interval; }
 
 private:
