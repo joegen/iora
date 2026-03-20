@@ -82,6 +82,7 @@ set(CORE_TESTS
     core/iora_test_timer_lifecycle
     core/iora_test_metrics
     core/iora_test_result
+    core/iora_test_string_utils
 )
 
 # Parsers namespace tests
