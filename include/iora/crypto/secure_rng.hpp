@@ -83,6 +83,29 @@ public:
     }
   }
 
+  /// \brief Compute SHA-1 hash of input data (20 bytes output).
+  /// Used for WebSocket handshake (RFC 6455 Sec-WebSocket-Accept).
+  /// \param data Input data to hash
+  /// \param out Output buffer (must be at least 20 bytes)
+  /// \throws std::runtime_error if hashing fails
+  static void sha1(const std::string &data, unsigned char out[20])
+  {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx)
+    {
+      throw std::runtime_error("SecureRng/sha1: EVP_MD_CTX_new failed");
+    }
+    int ok = EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+    ok &= EVP_DigestUpdate(ctx, data.data(), data.size());
+    unsigned int len = 0;
+    ok &= EVP_DigestFinal_ex(ctx, out, &len);
+    EVP_MD_CTX_free(ctx);
+    if (!ok || len != 20U)
+    {
+      throw std::runtime_error("SecureRng/sha1: EVP_Digest (SHA-1) failed");
+    }
+  }
+
   /// \brief Compute HMAC-SHA256 of input data with a secret key.
   ///
   /// This provides authenticated keyed hashing suitable for temporary GRUU

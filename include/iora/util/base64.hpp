@@ -83,5 +83,66 @@ public:
   }
 };
 
+/// \brief Standard Base64 encoder (RFC 4648) with padding.
+///
+/// Uses '+' and '/' with '=' padding. Required for WebSocket handshake
+/// (Sec-WebSocket-Accept computation).
+class Base64
+{
+public:
+  /// \brief Encode binary data to standard Base64 string with padding.
+  static std::string encode(const std::uint8_t *data, std::size_t len)
+  {
+    static constexpr char kTable[65] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (len == 0)
+    {
+      return {};
+    }
+
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+
+    std::size_t i = 0;
+    while (i + 3 <= len)
+    {
+      std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
+                        (static_cast<std::uint32_t>(data[i + 1]) << 8) |
+                        (static_cast<std::uint32_t>(data[i + 2]));
+      out.push_back(kTable[(v >> 18) & 0x3F]);
+      out.push_back(kTable[(v >> 12) & 0x3F]);
+      out.push_back(kTable[(v >> 6) & 0x3F]);
+      out.push_back(kTable[v & 0x3F]);
+      i += 3;
+    }
+
+    std::size_t rem = len - i;
+    if (rem == 1)
+    {
+      std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
+      out.push_back(kTable[(v >> 18) & 0x3F]);
+      out.push_back(kTable[(v >> 12) & 0x3F]);
+      out.push_back('=');
+      out.push_back('=');
+    }
+    else if (rem == 2)
+    {
+      std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
+                        (static_cast<std::uint32_t>(data[i + 1]) << 8);
+      out.push_back(kTable[(v >> 18) & 0x3F]);
+      out.push_back(kTable[(v >> 12) & 0x3F]);
+      out.push_back(kTable[(v >> 6) & 0x3F]);
+      out.push_back('=');
+    }
+    return out;
+  }
+
+  /// \brief Encode a vector of bytes to standard Base64 string.
+  static std::string encode(const std::vector<std::uint8_t> &bytes)
+  {
+    return encode(bytes.data(), bytes.size());
+  }
+};
+
 } // namespace util
 } // namespace iora

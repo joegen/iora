@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 #include "iora/core/logger.hpp"
@@ -431,9 +432,11 @@ public:
               "HttpServer: HTTP connection closed from " + it->second.peerAddress + ":" +
               std::to_string(it->second.peerPort) + " (session " + std::to_string(sid) + ")");
             _sessionInfo.erase(it);
+            _upgradedSessions.erase(sid);
           }
           else
           {
+            _upgradedSessions.erase(sid);
             iora::core::Logger::debug("HttpServer: Connection closed (session " +
                                       std::to_string(sid) + ")");
           }
@@ -531,9 +534,67 @@ public:
   }
 
 protected:
+  // ── Upgrade support for WebSocket and other protocol upgrades ──────────
+
+  /// \brief Mark a session as upgraded (e.g., to WebSocket).
+  /// Future data for this session will be routed to onUpgradedData().
+  void markSessionUpgraded(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    _upgradedSessions.insert(sid);
+  }
+
+  /// \brief Called when data arrives on an upgraded session.
+  /// Override in WebSocketServer to feed into frame parser.
+  virtual void onUpgradedData(SessionId sid, const std::uint8_t* data,
+                              std::size_t len)
+  {
+    (void)sid; (void)data; (void)len;
+  }
+
+  /// \brief Send raw bytes to a session (for WebSocket frame sending).
+  void sendRaw(SessionId sid, const std::uint8_t* data, std::size_t len)
+  {
+    auto sharedData = std::make_shared<std::string>(
+      reinterpret_cast<const char*>(data), len);
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_transport && !_shutdown)
+    {
+      _transport->sendAsync(sid, sharedData->data(), sharedData->size(),
+        [sharedData](SessionId, const SyncResult&) {});
+    }
+  }
+
+  /// \brief Close a session's TCP connection.
+  void closeSession(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_transport)
+    {
+      _transport->close(sid);
+    }
+  }
+
   /// \brief Handle incoming data from a session
   void handleIncomingData(SessionId sid, const std::uint8_t *data, std::size_t len)
   {
+    // Check if this session has been upgraded (e.g., to WebSocket).
+    // Route directly to onUpgradedData, bypassing HTTP parsing.
+    // Check-then-release: do NOT call virtual onUpgradedData under lock
+    // (it may access _sessionInfo or _upgradedSessions → deadlock).
+    {
+      bool isUpgraded = false;
+      {
+        std::lock_guard<std::mutex> lock(_sessionMutex);
+        isUpgraded = _upgradedSessions.count(sid) > 0;
+      }
+      if (isUpgraded)
+      {
+        onUpgradedData(sid, data, len);
+        return;
+      }
+    }
+
     std::string dataStr(reinterpret_cast<const char *>(data), len);
 
     // Append to session buffer with size limits
@@ -850,6 +911,27 @@ protected:
                                         {
                                           // Response sent; connection remains open for upgraded protocol
                                         });
+                }
+              }
+              // Buffer-drain: feed any remaining bytes from session buffer
+              // to the upgraded protocol handler (e.g., WebSocket frame parser).
+              // The client may have sent WebSocket frames in the same TCP segment.
+              {
+                std::string remaining;
+                {
+                  std::lock_guard<std::mutex> lock(_sessionMutex);
+                  auto it = _sessionInfo.find(sid);
+                  if (it != _sessionInfo.end() && !it->second.buffer.empty())
+                  {
+                    remaining = std::move(it->second.buffer);
+                    it->second.buffer.clear();
+                  }
+                }
+                if (!remaining.empty())
+                {
+                  onUpgradedData(sid,
+                    reinterpret_cast<const std::uint8_t*>(remaining.data()),
+                    remaining.size());
                 }
               }
               return; // Skip normal route dispatch
@@ -1325,6 +1407,10 @@ private:
 
   // Handler storage: method -> path -> handler
   std::unordered_map<HttpMethod, std::unordered_map<std::string, Handler>> _handlers;
+
+  // Sessions that have been upgraded (e.g., to WebSocket).
+  // Data for these sessions is routed to onUpgradedData() instead of HTTP parsing.
+  std::unordered_set<SessionId> _upgradedSessions;
 };
 
 } // namespace network

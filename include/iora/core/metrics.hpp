@@ -70,7 +70,7 @@ struct MetricKeyHash
 };
 
 /// \brief Abstract base class for all metric types.
-/// Defined in iora_core.so (vtable lives in metrics.cpp).
+/// Vtable anchor defined in src/core/iora_core.cpp (linked into iora_core.so).
 class MetricBase
 {
 public:

@@ -61,6 +61,8 @@ set(NETWORK_TESTS
     network/iora_test_transport_improvements
     network/iora_test_unified_tcp_udp
     network/iora_test_webhook_transport
+    network/iora_test_websocket_frame
+    network/iora_test_websocket
 )
 
 # Additional network tests that might exist
