@@ -86,6 +86,7 @@ set(CORE_TESTS
     core/iora_test_buffer_view
     core/iora_test_ring_buffer
     core/iora_test_concurrent_hash_map
+    core/iora_test_state_machine
 )
 
 # Parsers namespace tests
