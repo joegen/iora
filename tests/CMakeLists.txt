@@ -88,6 +88,7 @@ set(CORE_TESTS
     core/iora_test_concurrent_hash_map
     core/iora_test_state_machine
     core/iora_test_signal
+    core/iora_test_timing_wheel
 )
 
 # Parsers namespace tests
