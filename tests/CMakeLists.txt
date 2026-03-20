@@ -83,6 +83,7 @@ set(CORE_TESTS
     core/iora_test_metrics
     core/iora_test_result
     core/iora_test_string_utils
+    core/iora_test_buffer_view
 )
 
 # Parsers namespace tests
