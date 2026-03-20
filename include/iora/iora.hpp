@@ -8,6 +8,7 @@
 #pragma once
 
 #include "core/config_loader.hpp"
+#include "core/metrics.hpp"
 #include "core/event_queue.hpp"
 #include "core/logger.hpp"
 #include "core/plugin_loader.hpp"
@@ -347,6 +348,10 @@ public:
 
   /// \brief Get the thread pool instance.
   const std::unique_ptr<core::ThreadPool> &threadPool() const { return _threadPool; }
+
+  /// \brief Get the global MetricsRegistry singleton.
+  /// Available before init() and during shutdown (function-local static).
+  core::MetricsRegistry &metrics() { return core::MetricsRegistry::instance(); }
 
   /// \brief Factory for creating a JSON file store backed by the given file.
   std::unique_ptr<storage::JsonFileStore> makeJsonFileStore(const std::string &filename) const

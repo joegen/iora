@@ -80,6 +80,7 @@ set(CORE_TESTS
     core/iora_test_threadpool_lifecycle
     core/iora_test_timer
     core/iora_test_timer_lifecycle
+    core/iora_test_metrics
 )
 
 # Parsers namespace tests

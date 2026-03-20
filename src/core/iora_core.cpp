@@ -1,9 +1,20 @@
 // iora_core — shared library housing singleton state for cross-plugin unification.
 
 #include "iora/iora.hpp"
+#include "iora/core/metrics.hpp"
 
 namespace iora {
 namespace core {
+
+// MetricBase vtable anchor
+MetricBase::~MetricBase() = default;
+
+// MetricsRegistry singleton — function-local static, available before IoraService::init()
+MetricsRegistry& MetricsRegistry::instance()
+{
+  static MetricsRegistry registry;
+  return registry;
+}
 
 Logger::LoggerData &Logger::getData()
 {
