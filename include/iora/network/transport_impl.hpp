@@ -34,7 +34,24 @@ struct Transport::Impl
   TransportConfig config;
   std::unique_ptr<detail::EngineBase> engine;
 
-  // Callbacks (protected by callbackMutex)
+  // ── Lock ordering ──────────────────────────────────────────────────────────
+  // If multiple Transport-level locks are ever needed (they shouldn't be),
+  // the order is: callbackMutex → syncMutex → observerMutex → userDataMutex.
+  //
+  // In practice, no code path acquires more than one Transport-level lock.
+  // Each lock is acquired briefly (to copy data), then released BEFORE
+  // invoking any user callback. This is the core invariant (HR-6).
+  //
+  // Engine-internal locks (held by I/O thread) may be active when engine
+  // callbacks fire. Transport callback handlers then acquire Transport locks
+  // briefly to copy state, release them, then invoke user callbacks with
+  // zero locks held.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Lock order 1: Protects global callback storage.
+  // Acquired by: callback setters (onAccept, onConnect, ...) and internal
+  //   dispatch handlers (to copy callback before invocation).
+  // NEVER held during user callback invocation.
   std::mutex callbackMutex;
   AcceptCallback onAcceptCb;
   ConnectCallback onConnectCb;
@@ -42,13 +59,19 @@ struct Transport::Impl
   CloseCallback onCloseCb;
   ErrorCallback onErrorCb;
 
-  // Per-session observers (protected by observerMutex)
+  // Lock order 3: Protects observer maps (_observers, _observerToSession).
+  // Acquired by: observe(), unobserve(), and close handler (to copy observer
+  //   list before invocation).
+  // NEVER held during observer callback invocation (copy-then-iterate, HR-7).
   std::mutex observerMutex;
   std::unordered_map<SessionId, std::vector<std::pair<ObserverId, CloseCallback>>> observers;
   std::unordered_map<ObserverId, SessionId> observerToSession;
   std::atomic<ObserverId> nextObserverId{1};
 
-  // Per-session user data (protected by userDataMutex)
+  // Lock order 4: Protects user data map (_sessionData).
+  // Acquired by: setSessionData(), getSessionData(), and close handler
+  //   (to extract and remove data before cleanup invocation).
+  // NEVER held during cleanup callback invocation.
   struct UserData
   {
     void *data{nullptr};
@@ -57,7 +80,14 @@ struct Transport::Impl
   std::mutex userDataMutex;
   std::unordered_map<SessionId, UserData> sessionData;
 
-  // Sync operations (protected by syncMutex)
+  // Lock order 2: Protects sync operation state (_pendingConnects, _readModes,
+  //   _receiveBuffers).
+  // Acquired by: connectSync (to register/check pending ops), receiveSync
+  //   (to access receive buffer), setReadMode (to update mode and flush),
+  //   getReadMode (to read current mode), and I/O thread data handler
+  //   (to check mode and buffer data).
+  // NEVER held during user callback invocation. setReadMode releases
+  //   syncMutex before flushing buffered data via onData callback.
   struct SyncConnectOp
   {
     std::condition_variable cv;
