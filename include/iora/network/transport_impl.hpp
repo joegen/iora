@@ -1,0 +1,730 @@
+#pragma once
+#ifndef __linux__
+#error "Linux-only (epoll/eventfd/timerfd)"
+#endif
+
+/// \file transport_impl.hpp
+/// \brief Transport method definitions. Include in exactly ONE translation unit.
+/// \details Contains engine headers (epoll, OpenSSL) — do NOT include broadly.
+
+#include "iora/network/transport.hpp"
+#include "iora/network/detail/tcp_engine.hpp"
+#include "iora/network/detail/udp_engine.hpp"
+#include "iora/network/sync_async_transport.hpp" // for ReadMode, CancellationToken (Phase 3 legacy)
+
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+namespace iora
+{
+namespace network
+{
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Transport::Impl — all internal state
+// ══════════════════════════════════════════════════════════════════════════════
+
+struct Transport::Impl
+{
+  TransportConfig config;
+  std::unique_ptr<detail::EngineBase> engine;
+
+  // Callbacks (protected by callbackMutex)
+  std::mutex callbackMutex;
+  AcceptCallback onAcceptCb;
+  ConnectCallback onConnectCb;
+  DataCallback onDataCb;
+  CloseCallback onCloseCb;
+  ErrorCallback onErrorCb;
+
+  // Per-session observers (protected by observerMutex)
+  std::mutex observerMutex;
+  std::unordered_map<SessionId, std::vector<std::pair<ObserverId, CloseCallback>>> observers;
+  std::unordered_map<ObserverId, SessionId> observerToSession;
+  std::atomic<ObserverId> nextObserverId{1};
+
+  // Per-session user data (protected by userDataMutex)
+  struct UserData
+  {
+    void *data{nullptr};
+    SessionCleanupCallback cleanup;
+  };
+  std::mutex userDataMutex;
+  std::unordered_map<SessionId, UserData> sessionData;
+
+  // Sync operations (protected by syncMutex)
+  struct SyncConnectOp
+  {
+    std::condition_variable cv;
+    bool done{false};
+    ConnectResult result{ConnectResult::err(TransportErrorInfo{TransportError::Timeout, "pending"})};
+  };
+  std::mutex syncMutex;
+  std::unordered_map<SessionId, std::shared_ptr<SyncConnectOp>> pendingConnects;
+
+  // Read modes (protected by syncMutex)
+  std::unordered_map<SessionId, ReadMode> readModes;
+
+  // Sync receive buffers (protected by syncMutex)
+  struct SyncReceiveBuffer
+  {
+    std::vector<std::uint8_t> data;
+    std::condition_variable cv;
+    bool hasData{false};
+    bool closed{false};
+  };
+  std::unordered_map<SessionId, std::shared_ptr<SyncReceiveBuffer>> receiveBuffers;
+
+  void setupEngineCallbacks()
+  {
+    detail::EngineBase::Callbacks cbs;
+
+    cbs.onAccept = [this](SessionId sid, const TransportAddress &addr)
+    {
+      AcceptCallback cb;
+      {
+        std::lock_guard<std::mutex> lk(callbackMutex);
+        cb = onAcceptCb;
+      }
+      if (cb)
+      {
+        cb(sid, addr);
+      }
+    };
+
+    cbs.onConnect = [this](SessionId sid, const TransportAddress &addr)
+    {
+      // Check if this is a connectSync — deliver to waiting caller, NOT global callback
+      {
+        std::lock_guard<std::mutex> lk(syncMutex);
+        auto it = pendingConnects.find(sid);
+        if (it != pendingConnects.end())
+        {
+          it->second->result = ConnectResult::ok(sid);
+          it->second->done = true;
+          it->second->cv.notify_one();
+          pendingConnects.erase(it);
+          return; // Do NOT fire global onConnect
+        }
+      }
+
+      ConnectCallback cb;
+      {
+        std::lock_guard<std::mutex> lk(callbackMutex);
+        cb = onConnectCb;
+      }
+      if (cb)
+      {
+        cb(sid, addr);
+      }
+    };
+
+    cbs.onData = [this](SessionId sid, iora::core::BufferView data,
+                        std::chrono::steady_clock::time_point receiveTime)
+    {
+      // Read mode and handle Sync/Disabled under a single lock acquisition
+      // to prevent TOCTOU race with concurrent setReadMode calls.
+      {
+        std::lock_guard<std::mutex> lk(syncMutex);
+        auto modeIt = readModes.find(sid);
+        ReadMode mode = (modeIt != readModes.end()) ? modeIt->second : ReadMode::Async;
+
+        if (mode == ReadMode::Sync)
+        {
+          auto bufIt = receiveBuffers.find(sid);
+          if (bufIt != receiveBuffers.end())
+          {
+            if (bufIt->second->data.size() + data.size() > config.maxSyncReceiveBuffer)
+            {
+              return; // Drop — buffer full. Prevents unbounded memory growth.
+            }
+            bufIt->second->data.insert(bufIt->second->data.end(), data.data(),
+                                       data.data() + data.size());
+            bufIt->second->hasData = true;
+            bufIt->second->cv.notify_one();
+          }
+          return;
+        }
+
+        if (mode == ReadMode::Disabled)
+        {
+          // TODO(Phase 7): Call engine->setReadEnabled(sid, false) to remove fd
+          // from EPOLLIN, preventing unnecessary reads. Currently drops data here
+          // which is functionally correct but wastes CPU on recv() syscalls.
+          return;
+        }
+      } // syncMutex released before user callback
+
+      // Async mode — deliver to user callback
+      DataCallback cb;
+      {
+        std::lock_guard<std::mutex> lk(callbackMutex);
+        cb = onDataCb;
+      }
+      if (cb)
+      {
+        cb(sid, data, receiveTime);
+      }
+    };
+
+    cbs.onClose = [this](SessionId sid, const TransportErrorInfo &reason)
+    {
+      // Session close flow (architecture doc steps):
+      // 1. Mark session as closing (implicit — engine already closed it)
+      // 2. Invoke global onClose FIRST
+      CloseCallback closeCb;
+      {
+        std::lock_guard<std::mutex> lk(callbackMutex);
+        closeCb = onCloseCb;
+      }
+      if (closeCb)
+      {
+        closeCb(sid, reason);
+      }
+
+      // 3-5. Invoke per-session observers (copy-then-iterate, HR-7)
+      std::vector<std::pair<ObserverId, CloseCallback>> sessionObservers;
+      {
+        std::lock_guard<std::mutex> lk(observerMutex);
+        auto it = observers.find(sid);
+        if (it != observers.end())
+        {
+          sessionObservers = it->second; // Copy
+          // Clean up observer maps
+          for (auto &[obsId, _] : it->second)
+          {
+            observerToSession.erase(obsId);
+          }
+          observers.erase(it);
+        }
+      }
+      for (auto &[obsId, obsCb] : sessionObservers)
+      {
+        if (obsCb)
+        {
+          obsCb(sid, reason);
+        }
+      }
+
+      // 6. Notify pending sync operations and clean up sync state
+      {
+        std::lock_guard<std::mutex> lk(syncMutex);
+        // Wake pending connectSync
+        auto connIt = pendingConnects.find(sid);
+        if (connIt != pendingConnects.end())
+        {
+          connIt->second->result = ConnectResult::err(reason);
+          connIt->second->done = true;
+          connIt->second->cv.notify_one();
+          pendingConnects.erase(connIt);
+        }
+        // Wake pending receiveSync with closed flag
+        auto bufIt = receiveBuffers.find(sid);
+        if (bufIt != receiveBuffers.end())
+        {
+          bufIt->second->closed = true;
+          bufIt->second->cv.notify_one();
+        }
+        // Clean up sync state
+        readModes.erase(sid);
+        receiveBuffers.erase(sid);
+      }
+
+      // 7. User data cleanup LAST (HR-11)
+      UserData ud;
+      {
+        std::lock_guard<std::mutex> lk(userDataMutex);
+        auto it = sessionData.find(sid);
+        if (it != sessionData.end())
+        {
+          ud = it->second;
+          sessionData.erase(it);
+        }
+      }
+      if (ud.cleanup && ud.data)
+      {
+        ud.cleanup(ud.data);
+      }
+    };
+
+    cbs.onError = [this](TransportError code, const std::string &msg)
+    {
+      ErrorCallback cb;
+      {
+        std::lock_guard<std::mutex> lk(callbackMutex);
+        cb = onErrorCb;
+      }
+      if (cb)
+      {
+        cb(code, msg);
+      }
+    };
+
+    engine->setCallbacks(std::move(cbs));
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Transport method definitions
+// ══════════════════════════════════════════════════════════════════════════════
+
+inline Transport::Transport(TransportConfig config)
+  : _impl(std::make_unique<Impl>())
+{
+  _impl->config = std::move(config);
+  if (_impl->config.protocol == Protocol::TCP)
+  {
+    _impl->engine = std::make_unique<detail::TcpEngine>(_impl->config);
+  }
+  else
+  {
+    _impl->engine = std::make_unique<detail::UdpEngine>(_impl->config);
+  }
+  _impl->setupEngineCallbacks();
+}
+
+inline Transport::Transport(std::unique_ptr<detail::EngineBase> engine, TransportConfig config)
+  : _impl(std::make_unique<Impl>())
+{
+  _impl->config = std::move(config);
+  _impl->engine = std::move(engine);
+  _impl->setupEngineCallbacks();
+}
+
+inline Transport::~Transport()
+{
+  if (_impl && _impl->engine && _impl->engine->isRunning())
+  {
+    stop();
+  }
+}
+
+inline Transport::Transport(Transport &&other) noexcept
+  : _impl(std::move(other._impl))
+{
+  if (_impl && _impl->engine)
+  {
+    _impl->setupEngineCallbacks(); // Re-register callbacks to point to this object's Impl
+  }
+}
+
+inline Transport &Transport::operator=(Transport &&other) noexcept
+{
+  if (this != &other)
+  {
+    if (_impl && _impl->engine && _impl->engine->isRunning())
+    {
+      stop();
+    }
+    _impl = std::move(other._impl);
+    if (_impl && _impl->engine)
+    {
+      _impl->setupEngineCallbacks();
+    }
+  }
+  return *this;
+}
+
+inline Transport Transport::tcp(TransportConfig config)
+{
+  config.protocol = Protocol::TCP;
+  return Transport(std::move(config));
+}
+
+inline Transport Transport::udp(TransportConfig config)
+{
+  config.protocol = Protocol::UDP;
+  return Transport(std::move(config));
+}
+
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
+inline StartResult Transport::start()
+{
+  return _impl->engine->start();
+}
+
+inline void Transport::stop()
+{
+  if (_impl && _impl->engine)
+  {
+    _impl->engine->stop();
+  }
+}
+
+inline bool Transport::isRunning() const
+{
+  return _impl && _impl->engine && _impl->engine->isRunning();
+}
+
+inline TransportErrorInfo Transport::lastError() const
+{
+  if (!_impl || !_impl->engine)
+  {
+    return TransportErrorInfo{TransportError::Config, "transport not initialized"};
+  }
+  return _impl->engine->lastError();
+}
+
+// ── Connection Management ────────────────────────────────────────────────────
+
+inline ListenResult Transport::addListener(const std::string &bindIp, std::uint16_t port,
+                                           TlsMode tls)
+{
+  return _impl->engine->addListener(bindIp, port, tls);
+}
+
+inline ConnectResult Transport::connect(const std::string &host, std::uint16_t port, TlsMode tls)
+{
+  return _impl->engine->connect(host, port, tls);
+}
+
+inline ConnectResult Transport::connectViaListener(ListenerId lid, const std::string &host,
+                                                   std::uint16_t port)
+{
+  return _impl->engine->connectViaListener(lid, host, port);
+}
+
+inline bool Transport::close(SessionId sid)
+{
+  return _impl->engine->close(sid);
+}
+
+// ── Async Data Operations ────────────────────────────────────────────────────
+
+inline bool Transport::send(SessionId sid, iora::core::BufferView data)
+{
+  return _impl->engine->send(sid, data.data(), data.size());
+}
+
+inline void Transport::sendAsync(SessionId sid, iora::core::BufferView data,
+                                 SendCompleteCallback cb)
+{
+  _impl->engine->sendAsync(sid, data.data(), data.size(), std::move(cb));
+}
+
+// ── Sync Connection ──────────────────────────────────────────────────────────
+
+inline ConnectResult Transport::connectSync(const std::string &host, std::uint16_t port,
+                                            TlsMode tls, std::chrono::milliseconds timeout)
+{
+  // For UDP, connect is immediate — no handshake
+  if (_impl->config.protocol == Protocol::UDP)
+  {
+    return _impl->engine->connect(host, port, tls);
+  }
+
+  // TCP: initiate async connect, then wait for onConnect
+  auto result = _impl->engine->connect(host, port, tls);
+  if (result.isErr())
+  {
+    return result;
+  }
+  SessionId sid = result.value();
+
+  auto op = std::make_shared<Impl::SyncConnectOp>();
+  {
+    std::lock_guard<std::mutex> lk(_impl->syncMutex);
+    _impl->pendingConnects[sid] = op;
+  }
+
+  std::unique_lock<std::mutex> lk(_impl->syncMutex);
+  if (op->cv.wait_for(lk, timeout, [&op] { return op->done; }))
+  {
+    return std::move(op->result);
+  }
+
+  // Timeout — clean up
+  _impl->pendingConnects.erase(sid);
+  _impl->engine->close(sid);
+  return ConnectResult::err(TransportErrorInfo{TransportError::Timeout, "connectSync timed out"});
+}
+
+// ── Sync Data Operations ─────────────────────────────────────────────────────
+
+inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data,
+                                      std::chrono::milliseconds timeout)
+{
+  // Simple implementation: delegate to engine's sync send.
+  // The engine's send() is non-blocking (enqueues), so this blocks until
+  // the data is actually enqueued. For true blocking-until-sent semantics,
+  // Phase 7 will add proper completion tracking.
+  bool ok = _impl->engine->send(sid, data.data(), data.size());
+  if (ok)
+  {
+    return SendResult::ok(data.size());
+  }
+  return SendResult::err(TransportErrorInfo{TransportError::Socket, "send failed"});
+}
+
+inline SendResult Transport::receiveSync(SessionId sid, void *buffer, std::size_t &len,
+                                         std::chrono::milliseconds timeout)
+{
+  std::shared_ptr<Impl::SyncReceiveBuffer> buf;
+  {
+    std::lock_guard<std::mutex> lk(_impl->syncMutex);
+    auto it = _impl->receiveBuffers.find(sid);
+    if (it == _impl->receiveBuffers.end())
+    {
+      // Create buffer on first receiveSync for this session
+      buf = std::make_shared<Impl::SyncReceiveBuffer>();
+      _impl->receiveBuffers[sid] = buf;
+    }
+    else
+    {
+      buf = it->second;
+    }
+  }
+
+  std::unique_lock<std::mutex> lk(_impl->syncMutex);
+  if (!buf->cv.wait_for(lk, timeout, [&buf] { return buf->hasData || buf->closed; }))
+  {
+    return SendResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
+  }
+  if (buf->closed)
+  {
+    return SendResult::err(TransportErrorInfo{TransportError::PeerClosed, "session closed"});
+  }
+
+  std::size_t copyLen = std::min(len, buf->data.size());
+  std::memcpy(buffer, buf->data.data(), copyLen);
+  buf->data.erase(buf->data.begin(), buf->data.begin() + static_cast<std::ptrdiff_t>(copyLen));
+  buf->hasData = !buf->data.empty();
+  len = copyLen;
+  return SendResult::ok(copyLen);
+}
+
+// ── Read Modes ───────────────────────────────────────────────────────────────
+
+inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
+{
+  if (!_impl->config.allowReadModeSwitch)
+  {
+    return false;
+  }
+
+  // Step 1: Update mode and collect flush data under syncMutex
+  ReadMode oldMode = ReadMode::Async;
+  std::vector<std::uint8_t> flushData;
+  {
+    std::lock_guard<std::mutex> lk(_impl->syncMutex);
+    auto it = _impl->readModes.find(sid);
+    if (it != _impl->readModes.end())
+    {
+      oldMode = it->second;
+    }
+    _impl->readModes[sid] = mode;
+
+    // If switching from Sync to Async, copy buffered data for flushing
+    if (oldMode == ReadMode::Sync && mode == ReadMode::Async)
+    {
+      auto bufIt = _impl->receiveBuffers.find(sid);
+      if (bufIt != _impl->receiveBuffers.end() && !bufIt->second->data.empty())
+      {
+        flushData = std::move(bufIt->second->data);
+        bufIt->second->data.clear();
+        bufIt->second->hasData = false;
+      }
+    }
+
+    // If switching to Sync, ensure receive buffer exists
+    if (mode == ReadMode::Sync)
+    {
+      if (_impl->receiveBuffers.find(sid) == _impl->receiveBuffers.end())
+      {
+        _impl->receiveBuffers[sid] = std::make_shared<Impl::SyncReceiveBuffer>();
+      }
+    }
+  } // syncMutex released
+
+  // Step 2: Flush buffered data via callback with NO locks held (HR-6)
+  if (!flushData.empty())
+  {
+    DataCallback cb;
+    {
+      std::lock_guard<std::mutex> cbLk(_impl->callbackMutex);
+      cb = _impl->onDataCb;
+    }
+    if (cb)
+    {
+      cb(sid, iora::core::BufferView{flushData.data(), flushData.size()},
+         std::chrono::steady_clock::now());
+    }
+  }
+
+  return true;
+}
+
+inline bool Transport::getReadMode(SessionId sid, ReadMode &mode) const
+{
+  std::lock_guard<std::mutex> lk(_impl->syncMutex);
+  auto it = _impl->readModes.find(sid);
+  if (it == _impl->readModes.end())
+  {
+    return false;
+  }
+  mode = it->second;
+  return true;
+}
+
+// ── Callbacks ────────────────────────────────────────────────────────────────
+
+inline void Transport::onAccept(AcceptCallback cb)
+{
+  std::lock_guard<std::mutex> lk(_impl->callbackMutex);
+  _impl->onAcceptCb = std::move(cb);
+}
+
+inline void Transport::onConnect(ConnectCallback cb)
+{
+  std::lock_guard<std::mutex> lk(_impl->callbackMutex);
+  _impl->onConnectCb = std::move(cb);
+}
+
+inline void Transport::onData(DataCallback cb)
+{
+  std::lock_guard<std::mutex> lk(_impl->callbackMutex);
+  _impl->onDataCb = std::move(cb);
+}
+
+inline void Transport::onClose(CloseCallback cb)
+{
+  std::lock_guard<std::mutex> lk(_impl->callbackMutex);
+  _impl->onCloseCb = std::move(cb);
+}
+
+inline void Transport::onError(ErrorCallback cb)
+{
+  std::lock_guard<std::mutex> lk(_impl->callbackMutex);
+  _impl->onErrorCb = std::move(cb);
+}
+
+// ── Observers ────────────────────────────────────────────────────────────────
+
+inline ObserverId Transport::observe(SessionId sid, CloseCallback cb)
+{
+  ObserverId id = _impl->nextObserverId.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(_impl->observerMutex);
+  _impl->observers[sid].emplace_back(id, std::move(cb));
+  _impl->observerToSession[id] = sid;
+  return id;
+}
+
+inline bool Transport::unobserve(ObserverId id)
+{
+  std::lock_guard<std::mutex> lk(_impl->observerMutex);
+  auto sessIt = _impl->observerToSession.find(id);
+  if (sessIt == _impl->observerToSession.end())
+  {
+    return false;
+  }
+  SessionId sid = sessIt->second;
+  _impl->observerToSession.erase(sessIt);
+
+  auto obsIt = _impl->observers.find(sid);
+  if (obsIt != _impl->observers.end())
+  {
+    auto &vec = obsIt->second;
+    vec.erase(std::remove_if(vec.begin(), vec.end(),
+                             [id](const auto &p) { return p.first == id; }),
+              vec.end());
+    if (vec.empty())
+    {
+      _impl->observers.erase(obsIt);
+    }
+  }
+  return true;
+}
+
+// ── Session Introspection ────────────────────────────────────────────────────
+
+inline TransportAddress Transport::getListenerAddress(ListenerId lid) const
+{
+  return _impl->engine->getListenerAddress(lid);
+}
+
+inline TransportAddress Transport::getLocalAddress(SessionId sid) const
+{
+  return _impl->engine->getLocalAddress(sid);
+}
+
+inline TransportAddress Transport::getRemoteAddress(SessionId sid) const
+{
+  return _impl->engine->getRemoteAddress(sid);
+}
+
+inline void Transport::setSessionData(SessionId sid, void *data, SessionCleanupCallback cleanup)
+{
+  std::lock_guard<std::mutex> lk(_impl->userDataMutex);
+  _impl->sessionData[sid] = {data, std::move(cleanup)};
+}
+
+inline void *Transport::getSessionData(SessionId sid) const
+{
+  std::lock_guard<std::mutex> lk(_impl->userDataMutex);
+  auto it = _impl->sessionData.find(sid);
+  if (it == _impl->sessionData.end())
+  {
+    return nullptr;
+  }
+  return it->second.data;
+}
+
+// ── Stats ────────────────────────────────────────────────────────────────────
+
+inline TransportStats Transport::getStats() const
+{
+  return _impl->engine->getStats();
+}
+
+inline Protocol Transport::getProtocol() const
+{
+  return _impl->config.protocol;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ITransport default implementations for cancellable methods
+// ══════════════════════════════════════════════════════════════════════════════
+
+inline ConnectResult ITransport::connectSyncCancellable(
+  const std::string &host, std::uint16_t port, CancellationToken &token, TlsMode tls,
+  std::chrono::milliseconds timeout)
+{
+  if (token.isCancelled())
+  {
+    return ConnectResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+  }
+  // Simple implementation: delegate with full timeout.
+  // A more sophisticated version would use sub-timeouts with token checks.
+  return connectSync(host, port, tls, timeout);
+}
+
+inline SendResult ITransport::sendSyncCancellable(
+  SessionId sid, iora::core::BufferView data, CancellationToken &token,
+  std::chrono::milliseconds timeout)
+{
+  if (token.isCancelled())
+  {
+    return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+  }
+  return sendSync(sid, data, timeout);
+}
+
+inline SendResult ITransport::receiveSyncCancellable(
+  SessionId sid, void *buffer, std::size_t &len, CancellationToken &token,
+  std::chrono::milliseconds timeout)
+{
+  if (token.isCancelled())
+  {
+    return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+  }
+  return receiveSync(sid, buffer, len, timeout);
+}
+
+} // namespace network
+} // namespace iora
