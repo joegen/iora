@@ -18,16 +18,37 @@
 namespace testnet
 {
 
-inline std::uint16_t getFreePortTCP()
+/// \brief Get a free TCP port. If minPort/maxPort are 0, the OS assigns one.
+/// Sets SO_REUSEADDR to reduce TOCTOU race with parallel tests.
+inline std::uint16_t getFreePortTCP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
 {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   REQUIRE(fd >= 0);
 
+  int reuse = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
 
+  if (minPort > 0 && maxPort >= minPort)
+  {
+    for (std::uint16_t p = minPort; p <= maxPort; ++p)
+    {
+      addr.sin_port = htons(p);
+      if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
+      {
+        ::close(fd);
+        return p;
+      }
+    }
+    ::close(fd);
+    REQUIRE(false); // No free port in range
+    return 0;
+  }
+
+  addr.sin_port = 0;
   REQUIRE(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
 
   socklen_t len = sizeof(addr);
@@ -37,16 +58,37 @@ inline std::uint16_t getFreePortTCP()
   return port;
 }
 
-inline std::uint16_t getFreePortUDP()
+/// \brief Get a free UDP port. If minPort/maxPort are 0, the OS assigns one.
+/// Sets SO_REUSEADDR to reduce TOCTOU race with parallel tests.
+inline std::uint16_t getFreePortUDP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
 {
   int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
   REQUIRE(fd >= 0);
 
+  int reuse = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
 
+  if (minPort > 0 && maxPort >= minPort)
+  {
+    for (std::uint16_t p = minPort; p <= maxPort; ++p)
+    {
+      addr.sin_port = htons(p);
+      if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
+      {
+        ::close(fd);
+        return p;
+      }
+    }
+    ::close(fd);
+    REQUIRE(false); // No free port in range
+    return 0;
+  }
+
+  addr.sin_port = 0;
   REQUIRE(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
 
   socklen_t len = sizeof(addr);

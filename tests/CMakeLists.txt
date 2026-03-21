@@ -63,6 +63,7 @@ set(NETWORK_TESTS
     network/iora_test_webhook_transport
     network/iora_test_websocket_frame
     network/iora_test_websocket
+    network/iora_test_transport
 )
 
 # Additional network tests that might exist
