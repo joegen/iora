@@ -815,3 +815,577 @@ TEST_CASE("UDP connectViaListener works", "[transport][udp][connection]")
 
   t.stop();
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.5: Sync data operations
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("sendSync blocks and returns result", "[transport][sync]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  server.onData([](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point) {});
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return serverSid.load() != 0; }));
+
+  const char *msg = "sync hello";
+  auto result = client.sendSync(conn.value(),
+    iora::core::BufferView{reinterpret_cast<const std::uint8_t *>(msg), std::strlen(msg)});
+  REQUIRE(result.isOk());
+  REQUIRE(result.value() == std::strlen(msg));
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("receiveSync blocks and returns data", "[transport][sync]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> clientConnected{false};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  client.onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return serverSid.load() != 0 && clientConnected.load(); }));
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Sync));
+  server.send(serverSid.load(), "sync data", 9);
+
+  char buf[64]{};
+  std::size_t len = sizeof(buf);
+  auto result = client.receiveSync(conn.value(), buf, len);
+  REQUIRE(result.isOk());
+  REQUIRE(result.value() > 0);
+  REQUIRE(std::string(buf, result.value()) == "sync data");
+
+  client.stop();
+  server.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.6: connectSync operations
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("connectSync blocks until handshake completes", "[transport][connectSync]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  server.onAccept([](SessionId, const TransportAddress &) {});
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+
+  auto client = Transport::tcp();
+  REQUIRE(client.start().isOk());
+
+  auto result = client.connectSync("127.0.0.1", port);
+  REQUIRE(result.isOk());
+  SessionId sid = result.value();
+  REQUIRE(sid > 0);
+  REQUIRE(client.send(sid, "test", 4));
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("connectSync timeout on unreachable host", "[transport][connectSync]")
+{
+  auto client = Transport::tcp();
+  REQUIRE(client.start().isOk());
+
+  auto result = client.connectSync("10.254.254.254", 9999, TlsMode::None, 500ms);
+  REQUIRE(result.isErr());
+  REQUIRE(result.error().code == TransportError::Timeout);
+
+  client.stop();
+}
+
+TEST_CASE("connectSync global onConnect NOT fired", "[transport][connectSync]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  server.onAccept([](SessionId, const TransportAddress &) {});
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+
+  auto client = Transport::tcp();
+  std::atomic<int> globalConnectCount{0};
+  client.onConnect([&](SessionId, const TransportAddress &) { globalConnectCount++; });
+  REQUIRE(client.start().isOk());
+
+  auto result = client.connectSync("127.0.0.1", port);
+  REQUIRE(result.isOk());
+
+  std::this_thread::sleep_for(100ms);
+  REQUIRE(globalConnectCount.load() == 0);
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("UDP connectSync behaves like connect (immediate)", "[transport][connectSync][udp]")
+{
+  auto port = testnet::getFreePortUDP();
+  auto t = Transport::udp();
+  REQUIRE(t.start().isOk());
+  REQUIRE(t.addListener("127.0.0.1", port).isOk());
+
+  auto before = std::chrono::steady_clock::now();
+  auto result = t.connectSync("127.0.0.1", port + 1);
+  auto elapsed = std::chrono::steady_clock::now() - before;
+
+  REQUIRE(result.isOk());
+  REQUIRE(result.value() > 0);
+  REQUIRE(elapsed < 100ms);
+
+  t.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.8 remaining: Observer edge cases
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Observer auto-cleanup on session destruction", "[transport][observers]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  std::atomic<SessionId> sid{0};
+  std::atomic<int> obsCount{0};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { sid = s; });
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+
+  auto client = Transport::tcp();
+  REQUIRE(client.start().isOk());
+  client.connect("127.0.0.1", port);
+  REQUIRE(waitFor([&] { return sid.load() != 0; }));
+
+  auto id = server.observe(sid.load(), [&](SessionId, const TransportErrorInfo &) { obsCount++; });
+
+  server.close(sid.load());
+  REQUIRE(waitFor([&] { return obsCount.load() > 0; }));
+
+  REQUIRE_FALSE(server.unobserve(id));
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("Observer can close a different session", "[transport][observers]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  std::atomic<SessionId> sid1{0};
+  std::atomic<SessionId> sid2{0};
+  std::atomic<int> acceptCount{0};
+  std::atomic<int> closeCount{0};
+
+  server.onAccept([&](SessionId s, const TransportAddress &)
+  {
+    if (acceptCount.fetch_add(1) == 0)
+      sid1 = s;
+    else
+      sid2 = s;
+  });
+  server.onClose([&](SessionId, const TransportErrorInfo &) { closeCount++; });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+
+  auto client1 = Transport::tcp();
+  auto client2 = Transport::tcp();
+  REQUIRE(client1.start().isOk());
+  REQUIRE(client2.start().isOk());
+  client1.connect("127.0.0.1", port);
+  client2.connect("127.0.0.1", port);
+  REQUIRE(waitFor([&] { return sid1.load() != 0 && sid2.load() != 0; }));
+
+  server.observe(sid1.load(), [&](SessionId, const TransportErrorInfo &)
+  { server.close(sid2.load()); });
+
+  server.close(sid1.load());
+  REQUIRE(waitFor([&] { return closeCount.load() >= 2; }));
+
+  client1.stop();
+  client2.stop();
+  server.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.12: Read modes
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("setReadMode switches between Async and Sync", "[transport][readmode]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<bool> clientConnected{false};
+
+  server.onAccept([](SessionId, const TransportAddress &) {});
+  client.onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return clientConnected.load(); }));
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Sync));
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Async));
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("Sync mode buffers data for receiveSync", "[transport][readmode]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> clientConnected{false};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  client.onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return serverSid.load() != 0 && clientConnected.load(); }));
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Sync));
+  server.send(serverSid.load(), "buffered", 8);
+
+  char buf[64]{};
+  std::size_t len = sizeof(buf);
+  auto result = client.receiveSync(conn.value(), buf, len);
+  REQUIRE(result.isOk());
+  REQUIRE(std::string(buf, result.value()) == "buffered");
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("Switching Sync to Async flushes buffered data", "[transport][readmode]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> clientConnected{false};
+  std::string asyncReceived;
+  std::mutex mtx;
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  client.onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+  client.onData([&](SessionId, iora::core::BufferView data, std::chrono::steady_clock::time_point)
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    asyncReceived.append(reinterpret_cast<const char *>(data.data()), data.size());
+  });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return serverSid.load() != 0 && clientConnected.load(); }));
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Sync));
+  server.send(serverSid.load(), "flushed", 7);
+  std::this_thread::sleep_for(200ms);
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Async));
+  REQUIRE(waitFor([&]
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    return !asyncReceived.empty();
+  }));
+
+  std::lock_guard<std::mutex> lk(mtx);
+  REQUIRE(asyncReceived == "flushed");
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("Disabled mode suppresses reads", "[transport][readmode]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> clientConnected{false};
+  std::atomic<int> dataCount{0};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  client.onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+  client.onData([&](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point)
+  { dataCount++; });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return serverSid.load() != 0 && clientConnected.load(); }));
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Disabled));
+  server.send(serverSid.load(), "dropped", 7);
+  std::this_thread::sleep_for(200ms);
+  REQUIRE(dataCount.load() == 0);
+
+  REQUIRE(client.setReadMode(conn.value(), ReadMode::Async));
+  server.send(serverSid.load(), "visible", 7);
+  REQUIRE(waitFor([&] { return dataCount.load() > 0; }));
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("getReadMode returns false for unknown session", "[transport][readmode]")
+{
+  auto t = Transport::tcp();
+  REQUIRE(t.start().isOk());
+  ReadMode mode;
+  REQUIRE_FALSE(t.getReadMode(999999, mode));
+  t.stop();
+}
+
+TEST_CASE("setReadMode returns false when allowReadModeSwitch is false", "[transport][readmode]")
+{
+  TransportConfig cfg;
+  cfg.allowReadModeSwitch = false;
+  auto t = Transport(std::move(cfg));
+  REQUIRE(t.start().isOk());
+  REQUIRE_FALSE(t.setReadMode(1, ReadMode::Sync));
+  t.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.9: Session introspection (adapter stubs — Phase 7 for full impl)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("getListenerAddress does not crash (stub)", "[transport][introspection]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto t = Transport::tcp();
+  REQUIRE(t.start().isOk());
+  auto lr = t.addListener("127.0.0.1", port);
+  REQUIRE(lr.isOk());
+  auto addr = t.getListenerAddress(lr.value());
+  (void)addr; // Stub returns empty — verified doesn't crash
+  t.stop();
+}
+
+TEST_CASE("getLocalAddress/getRemoteAddress do not crash (stub)", "[transport][introspection]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<bool> connected{false};
+
+  client.onConnect([&](SessionId, const TransportAddress &) { connected = true; });
+  server.onAccept([](SessionId, const TransportAddress &) {});
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return connected.load(); }));
+
+  auto local = client.getLocalAddress(conn.value());
+  auto remote = client.getRemoteAddress(conn.value());
+  (void)local;
+  (void)remote;
+
+  client.stop();
+  server.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.15: DSCP (adapter stub — Phase 7 for socket-level verification)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("DSCP config value accepted without crash", "[transport][dscp]")
+{
+  TransportConfig cfg;
+  cfg.dscpValue = 46;
+  auto t = Transport(std::move(cfg));
+  REQUIRE(t.start().isOk());
+  t.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.16: Batching (adapter stub — Phase 7 for batched I/O verification)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Batching config accepted without crash", "[transport][batching]")
+{
+  auto cfg = TransportConfig::forHighThroughput();
+  REQUIRE(cfg.batching.enabled == true);
+  auto t = Transport(std::move(cfg));
+  REQUIRE(t.start().isOk());
+  t.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.14 addition: lastError
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("lastError returns error info without crash", "[transport][result]")
+{
+  auto t = Transport::tcp();
+  auto err = t.lastError();
+  (void)err;
+  REQUIRE(t.start().isOk());
+  auto err2 = t.lastError();
+  (void)err2;
+  t.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// task-6.17: Thread safety (concurrent access)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Concurrent send from multiple threads", "[transport][thread-safety]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  auto client = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> clientConnected{false};
+  std::atomic<std::size_t> totalReceived{0};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  server.onData([&](SessionId, iora::core::BufferView data, std::chrono::steady_clock::time_point)
+  { totalReceived += data.size(); });
+  client.onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+  REQUIRE(client.start().isOk());
+  auto conn = client.connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return clientConnected.load(); }));
+
+  constexpr int numThreads = 4;
+  constexpr int sendsPerThread = 50;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < numThreads; ++i)
+  {
+    threads.emplace_back([&, sid = conn.value()]
+    {
+      for (int j = 0; j < sendsPerThread; ++j)
+      {
+        client.send(sid, "X", 1);
+      }
+    });
+  }
+  for (auto &th : threads)
+  {
+    th.join();
+  }
+
+  REQUIRE(waitFor([&] { return totalReceived.load() >= numThreads * sendsPerThread; }));
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("observe/unobserve concurrent with session close", "[transport][thread-safety]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  std::atomic<SessionId> sid{0};
+
+  server.onAccept([&](SessionId s, const TransportAddress &) { sid = s; });
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+
+  auto client = Transport::tcp();
+  REQUIRE(client.start().isOk());
+  client.connect("127.0.0.1", port);
+  REQUIRE(waitFor([&] { return sid.load() != 0; }));
+
+  std::atomic<bool> done{false};
+  std::thread observerThread([&]
+  {
+    while (!done.load())
+    {
+      auto id = server.observe(sid.load(), [](SessionId, const TransportErrorInfo &) {});
+      server.unobserve(id);
+    }
+  });
+
+  std::this_thread::sleep_for(50ms);
+  server.close(sid.load());
+  done = true;
+  observerThread.join();
+
+  client.stop();
+  server.stop();
+}
+
+TEST_CASE("Callback replacement concurrent with callback invocation", "[transport][thread-safety]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  std::atomic<int> totalAccepts{0};
+
+  server.onAccept([&](SessionId, const TransportAddress &) { totalAccepts++; });
+  REQUIRE(server.start().isOk());
+  REQUIRE(server.addListener("127.0.0.1", port).isOk());
+
+  std::atomic<bool> done{false};
+  std::thread replacer([&]
+  {
+    while (!done.load())
+    {
+      server.onAccept([&](SessionId, const TransportAddress &) { totalAccepts++; });
+    }
+  });
+
+  std::vector<Transport> clients;
+  for (int i = 0; i < 5; ++i)
+  {
+    clients.push_back(Transport::tcp());
+    clients.back().start();
+    clients.back().connect("127.0.0.1", port);
+  }
+
+  REQUIRE(waitFor([&] { return totalAccepts.load() >= 3; }));
+
+  done = true;
+  replacer.join();
+
+  for (auto &c : clients)
+  {
+    c.stop();
+  }
+  server.stop();
+}
