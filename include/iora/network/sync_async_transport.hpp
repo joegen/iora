@@ -92,62 +92,10 @@ public:
   virtual BasicTransportStats getBasicStats() const = 0;
 };
 
-/// \brief Token for cancelling synchronous operations
-/// \note Non-copyable to ensure clear ownership semantics
-class CancellationToken
-{
-public:
-  CancellationToken() : _cancelled(std::make_shared<std::atomic<bool>>(false)) {}
-
-  // Delete copy operations to prevent shared state confusion
-  CancellationToken(const CancellationToken &) = delete;
-  CancellationToken &operator=(const CancellationToken &) = delete;
-
-  // Allow move operations for transferring ownership
-  CancellationToken(CancellationToken &&) = default;
-  CancellationToken &operator=(CancellationToken &&) = default;
-
-  /// \brief Cancel any operations using this token
-  void cancel()
-  {
-    _cancelled->store(true);
-    std::lock_guard<std::mutex> lock(_mutex);
-    for (auto &cv : _waiters)
-    {
-      cv->notify_all();
-    }
-  }
-
-  /// \brief Check if token has been cancelled
-  bool isCancelled() const { return _cancelled->load(); }
-
-  /// \brief Reset token for reuse
-  void reset()
-  {
-    _cancelled->store(false);
-    std::lock_guard<std::mutex> lock(_mutex);
-    _waiters.clear();
-  }
-
-  /// \brief Register a condition variable to be notified on cancellation
-  void registerWaiter(std::shared_ptr<std::condition_variable> cv)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _waiters.push_back(cv);
-  }
-
-  /// \brief Unregister a condition variable
-  void unregisterWaiter(std::shared_ptr<std::condition_variable> cv)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _waiters.erase(std::remove(_waiters.begin(), _waiters.end(), cv), _waiters.end());
-  }
-
-private:
-  std::shared_ptr<std::atomic<bool>> _cancelled;
-  mutable std::mutex _mutex;
-  std::vector<std::shared_ptr<std::condition_variable>> _waiters;
-};
+// CancellationToken is now defined in transport_types.hpp.
+// This file previously defined it. The canonical definition has been moved
+// to support the new Transport API. The type is still available via
+// transport_types.hpp which is included transitively.
 
 /// \brief Source for creating linked cancellation tokens
 /// \note Use this when you need hierarchical cancellation (cancel all
@@ -223,13 +171,9 @@ struct HybridConnectionHealth
   std::string lastErrorMessage;
 };
 
-/// \brief Read mode for exclusive access control
-enum class ReadMode
-{
-  Async,   ///< Callback-based reads (default)
-  Sync,    ///< Blocking reads via receiveSync()
-  Disabled ///< No reads allowed
-};
+// ReadMode is now defined in transport_types.hpp.
+// This file previously defined it. The canonical definition has been moved
+// to support the new Transport API.
 
 /// \brief Result of a sync operation with detailed error info
 struct SyncResult

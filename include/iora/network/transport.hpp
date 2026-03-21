@@ -29,13 +29,7 @@ namespace detail
 class EngineBase;
 } // namespace detail
 
-// Forward declaration — CancellationToken is currently in sync_async_transport.hpp.
-// Will be moved to transport_types.hpp in Phase 3.
-class CancellationToken;
-
-// Forward declaration — ReadMode is currently in sync_async_transport.hpp.
-// Will be moved to transport_types.hpp in Phase 3.
-enum class ReadMode;
+// CancellationToken and ReadMode are defined in transport_types.hpp (included above).
 
 /// \brief Abstract transport interface — the single public API contract.
 ///

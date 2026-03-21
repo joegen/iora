@@ -10,7 +10,7 @@
 #include "iora/network/transport.hpp"
 #include "iora/network/detail/tcp_engine.hpp"
 #include "iora/network/detail/udp_engine.hpp"
-#include "iora/network/sync_async_transport.hpp" // for ReadMode, CancellationToken (Phase 3 legacy)
+// ReadMode and CancellationToken are now in transport_types.hpp (included via transport.hpp)
 
 #include <algorithm>
 #include <atomic>

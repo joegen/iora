@@ -10,9 +10,14 @@
 #error "Linux-only (epoll/eventfd/timerfd)"
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -151,9 +156,12 @@ enum class Protocol
   UDP
 };
 
-// ReadMode is defined in sync_async_transport.hpp (legacy location).
-// It will be moved here in Phase 3 when SyncAsyncTransport is folded into Transport.
-// Values: Async, Sync, Disabled
+enum class ReadMode
+{
+  Async,
+  Sync,
+  Disabled
+};
 
 struct TransportAddress
 {
@@ -202,9 +210,52 @@ using SendCompleteCallback =
   std::function<void(SessionId sid, const SendResult &result)>;
 using SessionCleanupCallback = std::function<void(void *userData)>;
 
-// CancellationToken is defined in sync_async_transport.hpp (legacy location).
-// It will be moved here in Phase 3 with the waiter notification mechanism added.
-// For now, the existing CancellationToken in sync_async_transport.hpp is used.
+class CancellationToken
+{
+public:
+  CancellationToken() : _cancelled(std::make_shared<std::atomic<bool>>(false)) {}
+
+  CancellationToken(const CancellationToken &) = delete;
+  CancellationToken &operator=(const CancellationToken &) = delete;
+  CancellationToken(CancellationToken &&) = default;
+  CancellationToken &operator=(CancellationToken &&) = default;
+
+  void cancel()
+  {
+    _cancelled->store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto &cv : _waiters)
+    {
+      cv->notify_all();
+    }
+  }
+
+  bool isCancelled() const { return _cancelled->load(std::memory_order_acquire); }
+
+  void reset()
+  {
+    _cancelled->store(false, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(_mutex);
+    _waiters.clear();
+  }
+
+  void registerWaiter(std::shared_ptr<std::condition_variable> cv)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _waiters.push_back(std::move(cv));
+  }
+
+  void unregisterWaiter(const std::shared_ptr<std::condition_variable> &cv)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _waiters.erase(std::remove(_waiters.begin(), _waiters.end(), cv), _waiters.end());
+  }
+
+private:
+  std::shared_ptr<std::atomic<bool>> _cancelled;
+  mutable std::mutex _mutex;
+  std::vector<std::shared_ptr<std::condition_variable>> _waiters;
+};
 
 /// \brief Transport configuration. Single config type replacing the 4 existing
 /// config types (SharedTransport::Config, SharedUdpTransport::Config,
