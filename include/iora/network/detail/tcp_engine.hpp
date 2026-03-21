@@ -263,6 +263,11 @@ public:
     return false;
   }
 
+  // ── I/O Thread Identification ────────────────────────────────────────────────
+
+  std::thread::id getIoThreadId() const override { return _impl->getIoThreadId(); }
+  void detachForTermination() override { _impl->detachForTermination(); }
+
   // ── Access to underlying SharedTransport (for testing/backward compat) ─────
 
   SharedTransport &impl() { return *_impl; }

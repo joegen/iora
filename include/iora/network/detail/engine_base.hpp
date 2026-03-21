@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <thread>
 
 namespace iora
 {
@@ -66,6 +67,14 @@ public:
 
   // DSCP (per-session runtime change)
   virtual bool setDscp(SessionId sid, std::uint8_t dscp) = 0;
+
+  // I/O thread identification (for deadlock detection in sync operations)
+  virtual std::thread::id getIoThreadId() const = 0;
+
+  // Emergency detach for destruction from I/O thread.
+  // Sets _running=false and detaches the I/O thread so that the engine's
+  // destructor doesn't deadlock trying to join the current thread.
+  virtual void detachForTermination() = 0;
 };
 
 } // namespace detail

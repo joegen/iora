@@ -142,6 +142,16 @@ public:
 
   SharedUdpTransport(const SharedUdpTransport &) = delete;
   SharedUdpTransport &operator=(const SharedUdpTransport &) = delete;
+
+  void detachForTermination()
+  {
+    _running.store(false, std::memory_order_release);
+    if (_loop.joinable())
+    {
+      _loop.detach();
+    }
+  }
+
   void setCallbacks(const Callbacks &c)
   {
     std::lock_guard<std::mutex> g(_cb);
@@ -261,6 +271,7 @@ public:
   }
   bool close(SessionId sid) { return enqueue(Cmd::close(sid)); }
   bool isRunning() const { return _running.load(std::memory_order_acquire); }
+  std::thread::id getIoThreadId() const { return _loop.get_id(); }
   void reconfigure(const Config &cfg) { enqueue(Cmd::reconf(cfg)); }
   Stats stats() const
   {

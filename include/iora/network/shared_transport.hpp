@@ -167,6 +167,21 @@ public:
   SharedTransport(const SharedTransport &) = delete;
   SharedTransport &operator=(const SharedTransport &) = delete;
 
+  /// \brief Emergency detach for destruction from I/O thread.
+  /// Sets _running to false and detaches the I/O thread so that
+  /// ~SharedTransport's stop() becomes a no-op (CAS fails, thread
+  /// not joinable). The I/O thread exits its loop naturally when it
+  /// sees _running == false. This is a last-resort safety net for
+  /// the case where Transport is destroyed from within a callback.
+  void detachForTermination()
+  {
+    _running.store(false, std::memory_order_release);
+    if (_loop.joinable())
+    {
+      _loop.detach();
+    }
+  }
+
   /// \brief Install callbacks (may be called before or after start()).
   void setCallbacks(const Callbacks &cbs)
   {

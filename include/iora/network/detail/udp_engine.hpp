@@ -226,6 +226,11 @@ public:
 
   bool setDscp(SessionId, std::uint8_t) override { return false; }
 
+  // ── I/O Thread Identification ──────────────────────────────────────────────
+
+  std::thread::id getIoThreadId() const override { return _impl->getIoThreadId(); }
+  void detachForTermination() override { _impl->detachForTermination(); }
+
   // ── Access to underlying SharedUdpTransport ────────────────────────────────
 
   SharedUdpTransport &impl() { return *_impl; }

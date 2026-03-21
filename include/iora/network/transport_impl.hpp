@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -328,10 +329,31 @@ inline Transport::Transport(std::unique_ptr<detail::EngineBase> engine, Transpor
 
 inline Transport::~Transport()
 {
-  if (_impl && _impl->engine && _impl->engine->isRunning())
+  if (!_impl || !_impl->engine)
   {
-    stop();
+    return;
   }
+  if (!_impl->engine->isRunning())
+  {
+    return;
+  }
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    // PROGRAMMING ERROR: Transport destroyed from the I/O thread (e.g.,
+    // last shared_ptr dropped inside a callback). Cannot stop/join the
+    // I/O thread from itself.
+    // Safety net: detach the I/O thread so the engine destructor's stop()
+    // becomes a no-op (CAS on _running fails, _loop is not joinable).
+    // The detached I/O thread will exit its loop naturally when it sees
+    // _running == false.
+    std::fprintf(stderr,
+      "WARNING: Transport destroyed from I/O thread. "
+      "Detaching I/O thread to prevent deadlock. "
+      "Fix: ensure Transport outlives all callbacks.\n");
+    _impl->engine->detachForTermination();
+    return;
+  }
+  _impl->engine->stop();
 }
 
 inline Transport::Transport(Transport &&other) noexcept
@@ -349,7 +371,17 @@ inline Transport &Transport::operator=(Transport &&other) noexcept
   {
     if (_impl && _impl->engine && _impl->engine->isRunning())
     {
-      stop();
+      if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
+      {
+        std::fprintf(stderr,
+          "WARNING: Transport move-assigned from I/O thread. "
+          "Detaching old I/O thread to prevent deadlock.\n");
+        _impl->engine->detachForTermination();
+      }
+      else
+      {
+        _impl->engine->stop();
+      }
     }
     _impl = std::move(other._impl);
     if (_impl && _impl->engine)
@@ -383,6 +415,12 @@ inline void Transport::stop()
 {
   if (_impl && _impl->engine)
   {
+    if (_impl->engine->isRunning() &&
+        std::this_thread::get_id() == _impl->engine->getIoThreadId())
+    {
+      throw std::logic_error("stop() called from I/O thread — would deadlock. "
+                             "Post to a worker thread instead.");
+    }
     _impl->engine->stop();
   }
 }
@@ -406,6 +444,12 @@ inline TransportErrorInfo Transport::lastError() const
 inline ListenResult Transport::addListener(const std::string &bindIp, std::uint16_t port,
                                            TlsMode tls)
 {
+  if (_impl->engine->isRunning() &&
+      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    throw std::logic_error("addListener() called from I/O thread — not permitted. "
+                           "Call before start() or from a worker thread.");
+  }
   return _impl->engine->addListener(bindIp, port, tls);
 }
 
@@ -443,6 +487,13 @@ inline void Transport::sendAsync(SessionId sid, iora::core::BufferView data,
 inline ConnectResult Transport::connectSync(const std::string &host, std::uint16_t port,
                                             TlsMode tls, std::chrono::milliseconds timeout)
 {
+  if (_impl->engine->isRunning() &&
+      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    throw std::logic_error("connectSync() called from I/O thread — would deadlock. "
+                           "Use connect() (async) instead, or post to a worker thread.");
+  }
+
   // For UDP, connect is immediate — no handshake
   if (_impl->config.protocol == Protocol::UDP)
   {
@@ -480,6 +531,13 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
 inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data,
                                       std::chrono::milliseconds timeout)
 {
+  if (_impl->engine->isRunning() &&
+      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    throw std::logic_error("sendSync() called from I/O thread — would deadlock. "
+                           "Use send() (async) instead.");
+  }
+
   // Simple implementation: delegate to engine's sync send.
   // The engine's send() is non-blocking (enqueues), so this blocks until
   // the data is actually enqueued. For true blocking-until-sent semantics,
@@ -495,6 +553,13 @@ inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data
 inline SendResult Transport::receiveSync(SessionId sid, void *buffer, std::size_t &len,
                                          std::chrono::milliseconds timeout)
 {
+  if (_impl->engine->isRunning() &&
+      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    throw std::logic_error("receiveSync() called from I/O thread — would deadlock. "
+                           "Use ReadMode::Async with onData() callback instead.");
+  }
+
   std::shared_ptr<Impl::SyncReceiveBuffer> buf;
   {
     std::lock_guard<std::mutex> lk(_impl->syncMutex);
