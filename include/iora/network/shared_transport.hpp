@@ -377,6 +377,9 @@ public:
     return _lastFatal;
   }
 
+  /// \brief Check if the transport I/O loop is running.
+  bool isRunning() const { return _running.load(std::memory_order_acquire); }
+
   /// \brief Get I/O thread ID for deadlock detection
   /// \return Thread ID of the I/O event loop thread, or default-constructed ID if not running
   /// \note Used by SyncAsyncTransport to detect when sendSync() is called from I/O thread context

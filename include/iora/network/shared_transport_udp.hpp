@@ -260,6 +260,7 @@ public:
     return enqueue(Cmd::send(std::move(sr)));
   }
   bool close(SessionId sid) { return enqueue(Cmd::close(sid)); }
+  bool isRunning() const { return _running.load(std::memory_order_acquire); }
   void reconfigure(const Config &cfg) { enqueue(Cmd::reconf(cfg)); }
   Stats stats() const
   {
