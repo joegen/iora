@@ -78,6 +78,11 @@ public:
         TransportErrorInfo{TransportError::Config, "TLS/DTLS not supported on UDP"});
     }
     ListenerId lid = _impl->addListener(bindIp, port, TlsMode::None);
+    if (lid == 0)
+    {
+      return ListenResult::err(
+        TransportErrorInfo{TransportError::Bind, "bind/listen failed on " + bindIp + ":" + std::to_string(port)});
+    }
     return ListenResult::ok(lid);
   }
 
@@ -166,8 +171,21 @@ public:
 
     if (engineOnConnect)
     {
-      legacy.onConnect = [cb = std::move(engineOnConnect)](SessionId sid, const IoResult &)
-      { cb(sid, TransportAddress{}); };
+      // SharedUdpTransport fires onConnect for both success AND failure (IoResult.ok).
+      // New Transport API: onConnect fires only on success; failures go to onClose.
+      auto closeCb = engineOnClose;
+      legacy.onConnect = [connectCb = std::move(engineOnConnect), closeCb](SessionId sid,
+                                                                           const IoResult &r)
+      {
+        if (r.ok)
+        {
+          connectCb(sid, TransportAddress{});
+        }
+        else if (closeCb)
+        {
+          closeCb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError});
+        }
+      };
     }
 
     if (engineOnData)

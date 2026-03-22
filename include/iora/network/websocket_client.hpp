@@ -8,7 +8,7 @@
 #pragma once
 
 #include "iora/network/websocket_frame.hpp"
-#include "iora/network/unified_shared_transport.hpp"
+#include "iora/network/transport_impl.hpp"
 #include "iora/crypto/secure_rng.hpp"
 #include "iora/util/base64.hpp"
 
@@ -231,11 +231,11 @@ private:
     setState(WebSocketState::CONNECTING);
 
     // Create transport
-    UnifiedSharedTransport::Config config;
-    config.protocol = UnifiedSharedTransport::Protocol::TCP;
+    TransportConfig config;
+    config.protocol = Protocol::TCP;
     config.enableTcpNoDelay = true;
 
-    _transport = std::make_unique<UnifiedSharedTransport>(config);
+    _transport = std::make_unique<Transport>(config);
     {
       std::lock_guard<std::mutex> lock(_dataMutex);
       _buffer.clear();
@@ -244,19 +244,27 @@ private:
     }
     _upgradeComplete.store(false);
 
-    _transport->setCloseCallback(
-      [this](SessionId, const IoResult&)
+    // Set up global data callback before start (new Transport requires global, not per-session)
+    _transport->onData(
+      [this](SessionId s, iora::core::BufferView data,
+             std::chrono::steady_clock::time_point)
+      {
+        handleData(s, data.data(), data.size());
+      });
+
+    _transport->onClose(
+      [this](SessionId, const TransportErrorInfo&)
       {
         handleDisconnect();
       });
 
-    _transport->setErrorCallback(
+    _transport->onError(
       [this](TransportError, const std::string& message)
       {
         if (_onError) _onError(message);
       });
 
-    if (!_transport->start())
+    if (_transport->start().isErr())
     {
       setState(WebSocketState::DISCONNECTED);
       if (_onError) _onError("Failed to start transport");
@@ -264,9 +272,9 @@ private:
       return;
     }
 
-    // Connect — returns session ID, connection establishes asynchronously
-    _sessionId = _transport->connect(_host, _port, _options.tlsMode);
-    if (_sessionId == 0)
+    // Connect — returns ConnectResult
+    auto connectResult = _transport->connect(_host, _port, _options.tlsMode);
+    if (connectResult.isErr())
     {
       setState(WebSocketState::DISCONNECTED);
       if (_onError) _onError("Failed to connect to " + _host + ":" + std::to_string(_port));
@@ -275,19 +283,20 @@ private:
       scheduleReconnect();
       return;
     }
+    _sessionId = connectResult.value();
 
     // Send upgrade request synchronously — sendSync blocks until the
     // TCP connection is established and the data is sent.
     auto upgradeReq = buildUpgradeRequest();
     auto result = _transport->sendSync(
       _sessionId,
-      upgradeReq.data(), upgradeReq.size(),
+      iora::core::BufferView{reinterpret_cast<const std::uint8_t*>(upgradeReq.data()), upgradeReq.size()},
       std::chrono::milliseconds(5000));
 
-    if (!result.ok)
+    if (result.isErr())
     {
       setState(WebSocketState::DISCONNECTED);
-      if (_onError) _onError("Failed to send upgrade: " + result.errorMessage);
+      if (_onError) _onError("Failed to send upgrade: " + result.error().message);
       _transport->close(_sessionId);
       _transport->stop();
       _transport.reset();
@@ -295,15 +304,7 @@ private:
       return;
     }
 
-    // Switch to async mode for receiving the upgrade response and frames
-    _transport->setReadMode(_sessionId, ReadMode::Async);
-    _transport->setDataCallback(_sessionId,
-      [this](SessionId s, const std::uint8_t* data, std::size_t len,
-             const IoResult&)
-      {
-        handleData(s, data, len);
-      });
-
+    // Data is already flowing via the global onData callback set before start.
   }
 
   std::string buildUpgradeRequest()
@@ -595,7 +596,7 @@ private:
     {
       auto shared = std::make_shared<std::vector<std::uint8_t>>(data, data + len);
       _transport->sendAsync(_sessionId, shared->data(), shared->size(),
-        [shared](SessionId, const SyncResult&) {});
+        [shared](SessionId, const SendResult&) {});
     }
   }
 
@@ -624,7 +625,7 @@ private:
   Options _options;
 
   // Transport
-  std::unique_ptr<UnifiedSharedTransport> _transport;
+  std::unique_ptr<Transport> _transport;
   SessionId _sessionId;
 
   // State

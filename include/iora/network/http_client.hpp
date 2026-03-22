@@ -24,7 +24,7 @@
 #include <unordered_map>
 
 #include "iora/network/dns_client.hpp"
-#include "iora/network/unified_shared_transport.hpp"
+#include "iora/network/transport_impl.hpp"
 #include "iora/parsers/http_message.hpp"
 #include "iora/parsers/json.hpp"
 
@@ -38,7 +38,7 @@ namespace network
 
 /// \brief Modern HTTP client using hybrid transport for sync/async operations
 /// \details
-///   - Built on UnifiedSharedTransport for reliable networking
+///   - Built on Transport for reliable networking
 ///   - Uses DnsClient for domain resolution
 ///   - Supports both synchronous and asynchronous operations
 ///   - Connection pooling with automatic cleanup
@@ -108,10 +108,10 @@ private:
     if (!_transport)
     {
       // Create TCP transport for HTTP/HTTPS
-      auto transportConfig =
-        UnifiedSharedTransport::Config::minimal(UnifiedSharedTransport::Protocol::TCP);
+      TransportConfig transportConfig;
+      transportConfig.protocol = Protocol::TCP;
       transportConfig.connectTimeout =
-        std::chrono::duration_cast<std::chrono::seconds>(_config.connectTimeout);
+        std::chrono::duration_cast<std::chrono::milliseconds>(_config.connectTimeout);
       transportConfig.defaultSyncTimeout = _config.requestTimeout;
       transportConfig.idleTimeout = _config.connectionIdleTimeout;
 
@@ -120,9 +120,9 @@ private:
       transportConfig.clientTls.defaultMode = TlsMode::Client;
       transportConfig.clientTls.verifyPeer = _tlsConfig.verifyPeer;
 
-      _transport = std::make_unique<UnifiedSharedTransport>(transportConfig);
-      bool startResult = _transport->start();
-      if (!startResult)
+      _transport = std::make_unique<Transport>(transportConfig);
+      auto startResult = _transport->start();
+      if (startResult.isErr())
       {
         throw std::runtime_error("Failed to start HTTP client transport layer");
       }
@@ -138,13 +138,12 @@ private:
   TlsConfig _tlsConfig;
 
   // Transport and DNS client (initialized lazily)
-  mutable std::unique_ptr<UnifiedSharedTransport> _transport;
+  mutable std::unique_ptr<Transport> _transport;
   mutable std::unique_ptr<DnsClient> _dnsClient;
 
   // Simple connection pool: host:port -> SessionId
   mutable std::unordered_map<std::string, SessionId> _connections;
   mutable std::unordered_map<SessionId, std::chrono::steady_clock::time_point> _connectionLastUsed;
-  mutable SyncAsyncTransport::ConnectCallback _connectCallback;
 
   /// \brief URL parsing structure
   struct ParsedUrl
@@ -426,10 +425,6 @@ private:
   /// \brief Get or create connection to host
   SessionId getConnection(const ParsedUrl &parsedUrl)
   {
-    // EMERGENCY TIMEOUT: Wrap entire connection attempt with ultimate timeout
-    auto emergencyStart = std::chrono::steady_clock::now();
-    auto emergencyTimeout = std::chrono::milliseconds(5000); // 5 seconds maximum
-
     std::lock_guard<std::mutex> lock(_mutex);
 
     std::string hostPort = parsedUrl.getHostPort();
@@ -438,23 +433,17 @@ private:
     auto it = _connections.find(hostPort);
     if (it != _connections.end())
     {
-      // Check if connection is still alive and not idle
       auto sessionId = it->second;
-      auto health = _transport->getConnectionHealth(sessionId);
+      auto now = std::chrono::steady_clock::now();
+      auto lastUsed = _connectionLastUsed[sessionId];
 
-      if (health.isHealthy)
+      if (now - lastUsed < _config.connectionIdleTimeout)
       {
-        auto now = std::chrono::steady_clock::now();
-        auto lastUsed = _connectionLastUsed[sessionId];
-
-        if (now - lastUsed < _config.connectionIdleTimeout)
-        {
-          _connectionLastUsed[sessionId] = now;
-          return sessionId;
-        }
+        _connectionLastUsed[sessionId] = now;
+        return sessionId;
       }
 
-      // Connection is dead or idle, remove it
+      // Connection is idle, remove it
       _transport->close(sessionId);
       _connections.erase(it);
       _connectionLastUsed.erase(sessionId);
@@ -491,82 +480,21 @@ private:
       }
     }
 
-    // Create new connection with callback-based timeout
+    // Create new connection synchronously
     TlsMode tlsMode = parsedUrl.isHttps() ? TlsMode::Client : TlsMode::None;
 
-    // Call connect directly - the transport layer now handles timeouts
-    // properly
-    SessionId sessionId = _transport->connect(resolvedHost, parsedUrl.port, tlsMode);
+    // Use shorter timeout for localhost — connection refused should be instant
+    auto timeout = (resolvedHost == "127.0.0.1" || resolvedHost == "::1")
+      ? std::min(_config.connectTimeout, std::chrono::milliseconds(200))
+      : _config.connectTimeout;
 
-    // Emergency timeout check
-    if (std::chrono::steady_clock::now() - emergencyStart > emergencyTimeout)
+    auto connectResult = _transport->connectSync(resolvedHost, parsedUrl.port, tlsMode, timeout);
+    if (connectResult.isErr())
     {
-      throw std::runtime_error("EMERGENCY TIMEOUT: Connection attempt to " + hostPort +
-                               " exceeded 5 seconds");
+      throw std::runtime_error("Connection failed to " + hostPort + ": " +
+                               connectResult.error().message);
     }
-    if (sessionId == 0)
-    {
-      throw std::runtime_error("Failed to initiate connection to " + hostPort);
-    }
-
-    // Use aggressive polling with immediate failure detection for localhost
-    auto startTime = std::chrono::steady_clock::now();
-
-    // For localhost connections, we expect immediate failure - don't wait
-    // long
-    auto maxWaitTime =
-      (resolvedHost == "127.0.0.1") ? std::chrono::milliseconds(100) : _config.connectTimeout;
-
-    while (true)
-    {
-      auto health = _transport->getConnectionHealth(sessionId);
-
-      // If connection becomes healthy, we're done
-      if (health.isHealthy)
-      {
-        break;
-      }
-
-      // Check for explicit errors (this should catch failed connections)
-      if (health.errorCount > 0)
-      {
-        _transport->close(sessionId);
-        throw std::runtime_error("Connection failed to " + hostPort + " (" +
-                                 health.lastErrorMessage + ")");
-      }
-
-      // Check for timeout
-      auto elapsed = std::chrono::steady_clock::now() - startTime;
-      if (elapsed > maxWaitTime)
-      {
-        _transport->close(sessionId);
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-        throw std::runtime_error("Connection timeout to " + hostPort + " after " +
-                                 std::to_string(elapsedMs) + "ms");
-      }
-
-      // Emergency timeout check
-      if (std::chrono::steady_clock::now() - emergencyStart > emergencyTimeout)
-      {
-        _transport->close(sessionId);
-        throw std::runtime_error("EMERGENCY TIMEOUT: Connection polling to " + hostPort +
-                                 " exceeded 5 seconds");
-      }
-
-      // For debugging: if this is a localhost connection and we've waited
-      // more than 50ms, something is wrong
-      if (resolvedHost == "127.0.0.1" && elapsed > std::chrono::milliseconds(50))
-      {
-        _transport->close(sessionId);
-        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-        throw std::runtime_error("Localhost connection taking too long - "
-                                 "should fail immediately. Waited " +
-                                 std::to_string(elapsedMs) + "ms");
-      }
-
-      // Very short sleep to check frequently
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    SessionId sessionId = connectResult.value();
 
     // Store connection
     _connections[hostPort] = sessionId;
@@ -680,12 +608,14 @@ private:
     std::string requestStr = request.str();
 
     // Send request synchronously
-    auto sendResult =
-      _transport->sendSync(sessionId, requestStr.data(), requestStr.size(), sendTimeout);
-    if (!sendResult.ok)
+    auto sendResult = _transport->sendSync(
+      sessionId,
+      iora::core::BufferView{reinterpret_cast<const std::uint8_t*>(requestStr.data()), requestStr.size()},
+      sendTimeout);
+    if (sendResult.isErr())
     {
       _transport->setReadMode(sessionId, ReadMode::Async);
-      throw std::runtime_error("Failed to send HTTP request: " + sendResult.errorMessage);
+      throw std::runtime_error("Failed to send HTTP request: " + sendResult.error().message);
     }
 
     // Receive response synchronously by accumulating data until we have a
@@ -701,7 +631,7 @@ private:
 
         auto recvResult = _transport->receiveSync(sessionId, buffer, len, sendTimeout);
 
-        if (recvResult.ok && len > 0)
+        if (recvResult.isOk() && len > 0)
         {
           responseData.append(buffer, len);
 
@@ -711,11 +641,11 @@ private:
             break;
           }
         }
-        else if (!recvResult.ok && recvResult.error == TransportError::Timeout)
+        else if (recvResult.isErr() && recvResult.error().code == TransportError::Timeout)
         {
           throw std::runtime_error("HTTP response timeout");
         }
-        else if (!recvResult.ok)
+        else if (recvResult.isErr())
         {
           throw std::runtime_error("Connection closed before receiving complete HTTP response");
         }

@@ -49,17 +49,7 @@ namespace network
 // Forward declarations
 struct UnifiedStats;
 
-/// \brief Basic transport statistics (to avoid circular dependencies)
-struct BasicTransportStats
-{
-  std::uint64_t accepted{0};
-  std::uint64_t connected{0};
-  std::uint64_t closed{0};
-  std::uint64_t errors{0};
-  std::uint64_t bytesIn{0};
-  std::uint64_t bytesOut{0};
-  std::size_t sessionsCurrent{0};
-};
+// BasicTransportStats is now defined in transport_types.hpp.
 
 /// \brief Base transport interface for SyncAsyncTransport
 /// \note Minimal interface to avoid circular dependencies

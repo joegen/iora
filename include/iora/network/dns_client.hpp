@@ -213,7 +213,7 @@ public:
   /// \brief Constructor with custom transport (for testing)
   /// \param transport Custom transport implementation
   /// \param config DNS client configuration
-  explicit DnsClient(std::shared_ptr<UnifiedSharedTransport> transport,
+  explicit DnsClient(std::shared_ptr<Transport> transport,
                      const dns::DnsConfig &config = dns::DnsConfig{})
       : config_(config), customTransport_(transport)
   {
@@ -837,7 +837,7 @@ public:
 
 private:
   dns::DnsConfig config_;                                   ///< DNS configuration
-  std::shared_ptr<UnifiedSharedTransport> customTransport_; ///< Custom transport (optional)
+  std::shared_ptr<Transport> customTransport_; ///< Custom transport (optional)
   std::shared_ptr<dns::DnsTransport> transport_;            ///< DNS transport layer
   std::shared_ptr<dns::DnsCache> cache_;                    ///< DNS cache (optional)
   std::shared_ptr<dns::DnsResolver> resolver_;              ///< DNS resolver

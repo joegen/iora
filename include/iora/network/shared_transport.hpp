@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -273,7 +274,17 @@ public:
 
     try
     {
-      _loop = std::thread([this] { loop(); });
+      _loop = std::thread([this]
+      {
+        // Block SIGPIPE on this I/O thread only. SSL_write uses the underlying
+        // send() without MSG_NOSIGNAL, so writing to a closed peer can deliver
+        // SIGPIPE. Blocking it per-thread avoids process-wide side effects.
+        sigset_t sigpipeSet;
+        sigemptyset(&sigpipeSet);
+        sigaddset(&sigpipeSet, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
+        loop();
+      });
     }
     catch (const std::exception &ex)
     {
@@ -310,7 +321,21 @@ public:
     lc.addr = bind;
     lc.port = port;
     lc.tls = tls;
-    enqueue(Command::addListener(lc));
+
+    if (_running.load())
+    {
+      // Synchronous: wait for I/O thread to complete the bind so the listener
+      // is ready to accept connections when this method returns.
+      auto ready = std::make_shared<std::promise<bool>>();
+      auto fut = ready->get_future();
+      enqueue(Command::addListener(lc, std::move(ready)));
+      bool ok = fut.get(); // blocks until I/O thread processes the command
+      return ok ? lc.id : 0; // 0 signals bind failure
+    }
+    else
+    {
+      enqueue(Command::addListener(lc));
+    }
     return lc.id;
   }
 
@@ -602,6 +627,14 @@ private:
     Reconf
   };
 
+  enum class CloseOrigin
+  {
+    App,              // User-initiated close()
+    ConnectTimeout,   // Timer: connect timeout
+    HandshakeTimeout, // Timer: TLS handshake timeout
+    WriteStall        // Timer: write stall timeout
+  };
+
   struct Command
   {
     Cmd t;
@@ -609,13 +642,19 @@ private:
     ConnectReq c;
     SendReq s;
     SessionId closeSid{};
+    TransportError closeReason{TransportError::Unknown};
+    std::string closeMsg;
+    CloseOrigin closeOrigin{CloseOrigin::App};
     Config cfg;
+    std::shared_ptr<std::promise<bool>> listenerReady; // signals when addListener bind completes
 
     static Command shutdown() { return Command{Cmd::Shutdown}; }
-    static Command addListener(const ListenerCfg &lc)
+    static Command addListener(const ListenerCfg &lc,
+                               std::shared_ptr<std::promise<bool>> ready = nullptr)
     {
       Command x{Cmd::AddListener};
       x.l = lc;
+      x.listenerReady = std::move(ready);
       return x;
     }
     static Command connect(const ConnectReq &cr)
@@ -630,10 +669,15 @@ private:
       x.s = std::move(sr);
       return x;
     }
-    static Command close(SessionId sid)
+    static Command close(SessionId sid, TransportError reason = TransportError::Unknown,
+                         const std::string &msg = "closed by app",
+                         CloseOrigin origin = CloseOrigin::App)
     {
       Command x{Cmd::Close};
       x.closeSid = sid;
+      x.closeReason = reason;
+      x.closeMsg = msg;
+      x.closeOrigin = origin;
       return x;
     }
     static Command reconf(const Config &cfg)
@@ -822,44 +866,17 @@ private:
 
   void handleConnectTimeout(SessionId sid)
   {
-    auto it = _sessions.find(sid);
-    if (it != _sessions.end())
-    {
-      auto *s = it->second.get();
-      s->connectTimeoutId = 0; // Mark as expired
-      if (s->connectPending)
-      {
-        closeNow(s, TransportError::Timeout, "Connect timeout", 0);
-      }
-    }
+    enqueue(Command::close(sid, TransportError::Timeout, "Connect timeout", CloseOrigin::ConnectTimeout));
   }
 
   void handleHandshakeTimeout(SessionId sid)
   {
-    auto it = _sessions.find(sid);
-    if (it != _sessions.end())
-    {
-      auto *s = it->second.get();
-      s->handshakeTimeoutId = 0; // Mark as expired
-      if (s->tlsState == TlsState::Handshake)
-      {
-        closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", 0);
-      }
-    }
+    enqueue(Command::close(sid, TransportError::TLSHandshake, "TLS handshake timeout", CloseOrigin::HandshakeTimeout));
   }
 
   void handleWriteStallTimeout(SessionId sid)
   {
-    auto it = _sessions.find(sid);
-    if (it != _sessions.end())
-    {
-      auto *s = it->second.get();
-      s->writeStallTimeoutId = 0; // Mark as expired
-      if (!s->wq.empty())
-      {
-        closeNow(s, TransportError::Timeout, "Write stall timeout", 0);
-      }
-    }
+    enqueue(Command::close(sid, TransportError::Timeout, "Write stall timeout", CloseOrigin::WriteStall));
   }
 
   struct Listener
@@ -944,12 +961,14 @@ private:
         continue;
       s->closed = true;
       delEpoll(s->fd);
-      ::close(s->fd);
+      // SSL_shutdown before close(fd) — same ordering as closeNow
       if (s->ssl)
       {
+        ::SSL_shutdown(s->ssl);
         ::SSL_free(s->ssl);
         s->ssl = nullptr;
       }
+      ::close(s->fd);
       _atomicStats.closed++;
       _atomicStats.sessionsCurrent--;
       {
@@ -1010,8 +1029,14 @@ private:
           _running.store(false);
           break;
         case Cmd::AddListener:
-          doAddListener(c.l);
+        {
+          bool ok = doAddListener(c.l);
+          if (c.listenerReady)
+          {
+            c.listenerReady->set_value(ok);
+          }
           break;
+        }
         case Cmd::Connect:
           doConnect(c.c);
           break;
@@ -1023,7 +1048,24 @@ private:
           auto it = _sessions.find(c.closeSid);
           if (it != _sessions.end())
           {
-            closeNow(it->second.get(), TransportError::Unknown, "closed by app", 0);
+            auto *s = it->second.get();
+            // For timer-originated closes, verify the condition still applies.
+            // The timer fires on the TimerService thread and enqueues a close
+            // command. By the time the I/O thread processes it, the session
+            // may have completed the operation that triggered the timeout.
+            if (c.closeOrigin == CloseOrigin::ConnectTimeout)
+            {
+              if (!s->connectPending) break; // Connect completed, ignore stale timeout
+            }
+            else if (c.closeOrigin == CloseOrigin::HandshakeTimeout)
+            {
+              if (s->tlsState != TlsState::Handshake) break; // Handshake completed
+            }
+            else if (c.closeOrigin == CloseOrigin::WriteStall)
+            {
+              if (s->wq.empty()) break; // Write queue drained
+            }
+            closeNow(s, c.closeReason, c.closeMsg, 0);
           }
           break;
         }
@@ -1035,6 +1077,11 @@ private:
       }
       catch (const std::exception &ex)
       {
+        // Fulfill any pending addListener promise to prevent caller deadlock
+        if (c.listenerReady)
+        {
+          try { c.listenerReady->set_value(false); } catch (...) {}
+        }
         std::lock_guard<std::mutex> g(_cbMutex);
         if (_cbs.onError)
         {
@@ -1309,8 +1356,10 @@ private:
       // local ports
       if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH)
       {
-        // Connection definitively failed - don't retry other addresses for
-        // same host
+        // Save errno before system calls clobber it
+        int connectErrno = errno;
+        std::string connectErr = lastErr();
+
         ::close(cfd);
         cfd = -1;
 
@@ -1333,14 +1382,28 @@ private:
         if (_cbs.onConnect)
         {
           std::string errMsg =
-            "Connection refused to " + cr.host + ":" + ps.c_str() + " - " + lastErr();
-          _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, errMsg, errno, 0));
+            "Connection refused to " + cr.host + ":" + ps.c_str() + " - " + connectErr;
+          _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, errMsg, connectErrno, 0));
         }
-        err(TransportError::Connect, "connect immediately failed: " + lastErr());
+        err(TransportError::Connect, "connect immediately failed: " + connectErr);
         return false;
       }
       ::close(cfd);
       cfd = -1;
+    }
+
+    // Save errno from the connect loop BEFORE cleanup calls clobber it.
+    int loopErrno = errno;
+    std::string loopErr = lastErr();
+
+    // Save peer address from chosen entry BEFORE freeing the addrinfo chain.
+    // chosen points into res, so it becomes dangling after freeaddrinfo/delete.
+    sockaddr_storage savedPeer{};
+    socklen_t savedPeerLen = 0;
+    if (chosen)
+    {
+      savedPeerLen = (socklen_t)chosen->ai_addrlen;
+      std::memcpy(&savedPeer, chosen->ai_addr, savedPeerLen);
     }
 
     // Custom cleanup for manually created addrinfo structure
@@ -1356,15 +1419,17 @@ private:
     {
       ::freeaddrinfo(res);
     }
+    res = nullptr;
+    chosen = nullptr; // dangling after free — use savedPeer instead
 
     if (cfd < 0)
     {
       std::lock_guard<std::mutex> g(_cbMutex);
       if (_cbs.onConnect)
       {
-        _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, lastErr(), errno, 0));
+        _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, loopErr, loopErrno, 0));
       }
-      err(TransportError::Connect, "connect: " + lastErr());
+      err(TransportError::Connect, "connect: " + loopErr);
       return false;
     }
 
@@ -1378,14 +1443,11 @@ private:
     s->connectStart = MonoClock::now();
     scheduleConnectTimeout(s.get());
 
-    if (chosen)
+    if (savedPeerLen > 0)
     {
-      sockaddr_storage peer{};
-      socklen_t pl = (socklen_t)chosen->ai_addrlen;
-      std::memcpy(&peer, chosen->ai_addr, pl);
-      s->peerLen = pl;
-      s->peerKey = keyFromSockaddr(peer);
-      std::memcpy(&s->peer, &peer, pl);
+      s->peerLen = savedPeerLen;
+      s->peerKey = keyFromSockaddr(savedPeer);
+      std::memcpy(&s->peer, &savedPeer, savedPeerLen);
     }
 
     if (cr.tls == TlsMode::Client && _cliTls.enabled && _sslCli)
@@ -1508,6 +1570,7 @@ private:
       if (::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0)
       {
         IORA_LOG_DEBUG("[EPOLL-EVENT] Connection error detected: " << std::strerror(err));
+        errno = err; // Ensure closeNow's savedErrno captures the SO_ERROR value
         closeNow(s, TransportError::Connect, std::strerror(err), 0);
         return;
       }
@@ -1517,10 +1580,20 @@ private:
     if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake)
     {
       IORA_LOG_DEBUG("[EPOLL-EVENT] TLS handshake in progress for sid=" << s->id);
+      SessionId sid = s->id;
       if (!driveHandshake(s))
       {
+        return; // still in progress or closed
+      }
+      // Handshake completed — driveHandshake called readAvail internally,
+      // which may have called closeNow (freeing s). Re-lookup before
+      // falling through to writePending.
+      auto it = _sessions.find(sid);
+      if (it == _sessions.end())
+      {
         return;
-      } // progressed or closed; if still handshaking, return
+      }
+      s = it->second.get();
     }
     else
     {
@@ -1614,7 +1687,16 @@ private:
 
     if (events & EPOLLIN)
     {
+      SessionId sid = s->id;
       readAvail(s);
+      // readAvail may have called closeNow, freeing s. Re-lookup before
+      // touching s again.
+      auto it = _sessions.find(sid);
+      if (it == _sessions.end())
+      {
+        return;
+      }
+      s = it->second.get();
     }
     if (events & EPOLLOUT)
     {
@@ -1827,7 +1909,7 @@ private:
       }
       else
       {
-        n = ::send(s->fd, d.data(), (int)d.size(), 0);
+        n = ::send(s->fd, d.data(), (int)d.size(), MSG_NOSIGNAL);
         if (n < 0)
         {
           if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -1975,7 +2057,7 @@ private:
       }
       else
       {
-        n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), 0);
+        n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL);
         IORA_LOG_DEBUG("[IO-THREAD] ::send() for sid=" << sr.sid << " returned " << n
                       << " (requested " << sr.payload.size() << " bytes)");
         if (n >= 0)
@@ -2045,8 +2127,10 @@ private:
     s->closed = true;
     cancelAllTimers(s);
 
+    // Save caller's errno before system calls that overwrite it
+    int savedErrno = errno;
+
     delEpoll(s->fd);
-    ::close(s->fd);
 
     auto tagIt = _fdTags.find(s->fd);
     if (tagIt != _fdTags.end())
@@ -2054,6 +2138,8 @@ private:
       _fdTags.erase(tagIt);
     }
 
+    // SSL_shutdown BEFORE close(fd) — send close_notify on the live fd.
+    // After ::close(fd), the fd number may be reused by another connection.
     if (s->ssl)
     {
       ::SSL_shutdown(s->ssl);
@@ -2061,18 +2147,17 @@ private:
       s->ssl = nullptr;
     }
 
+    ::close(s->fd);
+
     _atomicStats.closed++;
     _atomicStats.sessionsCurrent--;
 
     {
       std::lock_guard<std::mutex> g(_cbMutex);
 
-      // CRITICAL FIX: If connection was still pending, this is a failed
-      // connect, not a closed connection
       if (s->connectPending && _cbs.onConnect)
       {
-        // Failed connection - call onConnect with failure
-        IoResult r = IoResult::failure(why, msg, errno, tlsErr);
+        IoResult r = IoResult::failure(why, msg, savedErrno, tlsErr);
         _cbs.onConnect(s->id, r);
       }
       else if (_cbs.onClosed)
@@ -2080,7 +2165,7 @@ private:
         // Established connection was closed - call onClosed
         IoResult r = (why == TransportError::None && msg.empty())
                        ? IoResult::success()
-                       : IoResult::failure(why, msg, errno, tlsErr);
+                       : IoResult::failure(why, msg, savedErrno, tlsErr);
         _cbs.onClosed(s->id, r);
       }
     }

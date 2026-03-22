@@ -142,10 +142,23 @@ struct ListenerResult
   }
 };
 
+/// \brief Basic transport stats for legacy compatibility.
+/// Used by SharedTransport::getBasicStats() and the old adapter layer.
+struct BasicTransportStats
+{
+  std::uint64_t accepted{0};
+  std::uint64_t connected{0};
+  std::uint64_t closed{0};
+  std::uint64_t errors{0};
+  std::uint64_t bytesIn{0};
+  std::uint64_t bytesOut{0};
+  std::size_t sessionsCurrent{0};
+};
+
 // ══════════════════════════════════════════════════════════════════════════════
 // New Transport API Types (Phase 1 of transport refactor)
-// The types above (IoResult, ListenerResult, TransportEvent) are legacy and
-// will be removed in Phase 3 when engines are adapted.
+// The types above (IoResult, ListenerResult, TransportEvent, BasicTransportStats)
+// are legacy and will be removed when engines are fully migrated.
 // ══════════════════════════════════════════════════════════════════════════════
 
 using iora::core::Result;

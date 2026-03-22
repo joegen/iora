@@ -20,7 +20,9 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <csignal>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <netdb.h>
@@ -187,7 +189,14 @@ public:
     }
     addEpoll(_timerFd, EPOLLIN);
     armGc(_cfg.gcInterval);
-    _loop = std::thread([this] { loop(); });
+    _loop = std::thread([this]
+    {
+      sigset_t sigpipeSet;
+      sigemptyset(&sigpipeSet);
+      sigaddset(&sigpipeSet, SIGPIPE);
+      pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
+      loop();
+    });
     return true;
   }
   void stop()
@@ -212,7 +221,19 @@ public:
     lc.id = _nextListenerId++;
     lc.addr = bind;
     lc.port = port;
-    enqueue(Cmd::addListener(lc));
+
+    if (_running.load())
+    {
+      auto ready = std::make_shared<std::promise<bool>>();
+      auto fut = ready->get_future();
+      enqueue(Cmd::addListener(lc, std::move(ready)));
+      bool ok = fut.get();
+      return ok ? lc.id : 0;
+    }
+    else
+    {
+      enqueue(Cmd::addListener(lc));
+    }
     return lc.id;
   }
 
@@ -403,17 +424,20 @@ private:
     SendReq s;
     SessionId closeSid{};
     Config cfg;
+    std::shared_ptr<std::promise<bool>> listenerReady;
     static Cmd shutdown()
     {
       Cmd x;
       x.t = CmdType::Shutdown;
       return x;
     }
-    static Cmd addListener(const ListenerCfg &lc)
+    static Cmd addListener(const ListenerCfg &lc,
+                           std::shared_ptr<std::promise<bool>> ready = nullptr)
     {
       Cmd x;
       x.t = CmdType::AddListener;
       x.l = lc;
+      x.listenerReady = std::move(ready);
       return x;
     }
     static Cmd connect(const ConnectReq &cr)
@@ -647,14 +671,14 @@ private:
         _running.store(false);
         break;
       case CmdType::AddListener:
-        if (!addListenerDo(c.l))
+      {
+        bool ok = addListenerDo(c.l);
+        if (c.listenerReady)
         {
-          // Listener creation failed, the error was already reported
-          // The ListenerId was pre-allocated but the listener doesn't exist
-          // This is fine since subsequent operations on this ID will fail
-          // gracefully
+          try { c.listenerReady->set_value(ok); } catch (...) {}
         }
         break;
+      }
       case CmdType::Connect:
         connectDo(c.c);
         break;
@@ -828,7 +852,7 @@ private:
     while (!lst->wq.empty())
     {
       auto &d = lst->wq.front();
-      int n = ::sendto(lst->fd, d.payload.data(), (int)d.payload.size(), 0,
+      int n = ::sendto(lst->fd, d.payload.data(), (int)d.payload.size(), MSG_NOSIGNAL,
                        reinterpret_cast<sockaddr *>(&d.to), d.toLen);
       if (n >= 0)
       {
@@ -910,15 +934,18 @@ private:
       ::close(sfd);
       sfd = -1;
     }
+    // Save errno before freeaddrinfo may clobber it
+    int connectErrno = errno;
+    std::string connectErr = lastErr();
     ::freeaddrinfo(res);
     if (sfd < 0)
     {
       {
         std::lock_guard<std::mutex> g(_cb);
         if (_cbs.onConnect)
-          _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, lastErr(), errno, 0));
+          _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, connectErr, connectErrno, 0));
       }
-      error(TransportError::Connect, "UDP connect: " + lastErr());
+      error(TransportError::Connect, "UDP connect: " + connectErr);
       return false;
     }
     auto s = std::make_unique<Session>();
@@ -1113,7 +1140,7 @@ private:
     while (!s->wq.empty())
     {
       ByteBuffer &d = s->wq.front();
-      int n = ::send(s->fd, d.data(), (int)d.size(), 0);
+      int n = ::send(s->fd, d.data(), (int)d.size(), MSG_NOSIGNAL);
       if (n >= 0)
       {
         _atomicStats.bytesOut += n;
@@ -1156,7 +1183,7 @@ private:
       return;
     if (s->role == Role::ClientConnected)
     {
-      int n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), 0);
+      int n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL);
       if (n >= 0)
       {
         _atomicStats.bytesOut += n;
@@ -1194,7 +1221,7 @@ private:
       return;
     }
     Listener *lst = lit->second.get();
-    int n = ::sendto(lst->fd, sr.payload.data(), (int)sr.payload.size(), 0,
+    int n = ::sendto(lst->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL,
                      reinterpret_cast<sockaddr *>(&s->peer), s->plen);
     if (n >= 0)
     {
@@ -1233,6 +1260,8 @@ private:
   {
     if (!s || s->closed)
       return;
+    // Save errno before system calls clobber it
+    int savedErrno = errno;
     s->closed = true;
     if (s->role == Role::ClientConnected)
     {
@@ -1252,7 +1281,7 @@ private:
       {
         IoResult r = (why == TransportError::None && m.empty())
                        ? IoResult::success()
-                       : IoResult::failure(why, m, errno, 0);
+                       : IoResult::failure(why, m, savedErrno, 0);
         _cbs.onClosed(s->id, r);
       }
     }

@@ -142,6 +142,7 @@ struct Transport::Impl
           pendingConnects.erase(it);
           return; // Do NOT fire global onConnect
         }
+        // Not a connectSync session — fall through to global callback
       }
 
       ConnectCallback cb;
@@ -254,16 +255,27 @@ struct Transport::Impl
           connIt->second->cv.notify_one();
           pendingConnects.erase(connIt);
         }
-        // Wake pending receiveSync with closed flag
+        // If not in pendingConnects, this is a normal close (not a connectSync)
+        // Wake pending receiveSync with closed flag.
+        // Wake pending receiveSync or leave a tombstone for late callers.
+        // Tombstones prevent a race where onClose fires before setReadMode/
+        // receiveSync — without them, receiveSync would wait forever on a
+        // closed session. Tombstones are cleaned up by receiveSync (line ~607)
+        // and by receiveSync timeout. For async-only sessions, tombstones are
+        // small (empty shared_ptr) and bounded by concurrent session count.
         auto bufIt = receiveBuffers.find(sid);
         if (bufIt != receiveBuffers.end())
         {
           bufIt->second->closed = true;
           bufIt->second->cv.notify_one();
         }
-        // Clean up sync state
+        else
+        {
+          auto tomb = std::make_shared<SyncReceiveBuffer>();
+          tomb->closed = true;
+          receiveBuffers[sid] = tomb;
+        }
         readModes.erase(sid);
-        receiveBuffers.erase(sid);
       }
 
       // 7. User data cleanup LAST (HR-11)
@@ -500,7 +512,16 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
     return _impl->engine->connect(host, port, tls);
   }
 
-  // TCP: initiate async connect, then wait for onConnect
+  // TCP: initiate async connect WITHOUT holding syncMutex (avoids deadlock
+  // where engine->connect() could throw/fire callbacks that acquire syncMutex
+  // via the I/O thread while we hold it — AB-BA with engine-internal locks).
+  // Race safety: engine->connect() only enqueues a command — the actual TCP
+  // connect happens on the I/O thread asynchronously. This is a hard contract
+  // on EngineBase: connect() MUST only enqueue, never process synchronously.
+  // The I/O thread processes the command after we register in pendingConnects
+  // below, so the callback always finds the entry.
+  auto op = std::make_shared<Impl::SyncConnectOp>();
+
   auto result = _impl->engine->connect(host, port, tls);
   if (result.isErr())
   {
@@ -508,20 +529,19 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   }
   SessionId sid = result.value();
 
-  auto op = std::make_shared<Impl::SyncConnectOp>();
-  {
-    std::lock_guard<std::mutex> lk(_impl->syncMutex);
-    _impl->pendingConnects[sid] = op;
-  }
-
+  // Register and wait in a single unique_lock scope — no gap between
+  // registration and wait where a notification could be missed.
   std::unique_lock<std::mutex> lk(_impl->syncMutex);
+  _impl->pendingConnects[sid] = op;
   if (op->cv.wait_for(lk, timeout, [&op] { return op->done; }))
   {
     return std::move(op->result);
   }
 
-  // Timeout — clean up
+  // Timeout — clean up. Release syncMutex BEFORE calling engine methods
+  // to avoid AB-BA deadlock risk on the close path.
   _impl->pendingConnects.erase(sid);
+  lk.unlock();
   _impl->engine->close(sid);
   return ConnectResult::err(TransportErrorInfo{TransportError::Timeout, "connectSync timed out"});
 }
@@ -579,10 +599,19 @@ inline SendResult Transport::receiveSync(SessionId sid, void *buffer, std::size_
   std::unique_lock<std::mutex> lk(_impl->syncMutex);
   if (!buf->cv.wait_for(lk, timeout, [&buf] { return buf->hasData || buf->closed; }))
   {
+    // Clean up tombstone on timeout to prevent leak
+    if (buf->closed)
+    {
+      _impl->receiveBuffers.erase(sid);
+      _impl->readModes.erase(sid);
+    }
     return SendResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
   }
   if (buf->closed)
   {
+    // Clean up tombstone to prevent unbounded receiveBuffers growth
+    _impl->receiveBuffers.erase(sid);
+    _impl->readModes.erase(sid);
     return SendResult::err(TransportErrorInfo{TransportError::PeerClosed, "session closed"});
   }
 

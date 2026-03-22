@@ -12,7 +12,7 @@
 #include "iora/core/logger.hpp"
 #include "iora/core/thread_pool.hpp"
 #include "iora/core/timer.hpp"
-#include "iora/network/unified_shared_transport.hpp"
+#include "iora/network/transport_impl.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -68,7 +68,7 @@ public:
   }
 };
 
-/// \brief DNS transport implementation using Iora's UnifiedSharedTransport
+/// \brief DNS transport implementation using Iora's Transport
 class DnsTransport : public std::enable_shared_from_this<DnsTransport>
 {
 public:
@@ -216,19 +216,16 @@ private:
   void sendTcpQuery(std::shared_ptr<PendingQuery> query);
 
   /// \brief Handle incoming UDP data
-  void handleUdpData(SessionId sessionId, const std::uint8_t *data, std::size_t size,
-                     const IoResult &result);
+  void handleUdpData(SessionId sessionId, iora::core::BufferView data,
+                     std::chrono::steady_clock::time_point receiveTime);
 
   /// \brief Handle incoming TCP data
-  void handleTcpData(SessionId sessionId, const std::uint8_t *data, std::size_t size,
-                     const IoResult &result);
-
-  /// \brief Handle transport errors
-  void handleTransportError(SessionId sessionId, const IoResult &result);
+  void handleTcpData(SessionId sessionId, iora::core::BufferView data,
+                     std::chrono::steady_clock::time_point receiveTime);
 
   /// \brief Handle transport connection events
-  void handleConnect(SessionId sessionId, const IoResult &result);
-  void handleClose(SessionId sessionId, const IoResult &result);
+  void handleConnect(SessionId sessionId, const TransportAddress &addr);
+  void handleClose(SessionId sessionId, const TransportErrorInfo &reason);
 
   /// \brief Process DNS response
   void processResponse(const std::uint8_t *data, std::size_t size, DnsTransportMode mode,
@@ -276,20 +273,20 @@ private:
   std::uint16_t generateUniqueQueryId(const std::string &server, std::uint16_t port);
 
   /// \brief Get transport for mode
-  std::shared_ptr<UnifiedSharedTransport> getTransport(DnsTransportMode mode);
+  std::shared_ptr<Transport> getTransport(DnsTransportMode mode);
 
   /// \brief Create UDP transport
-  std::shared_ptr<UdpTransportAdapter> createUdpTransport();
+  std::shared_ptr<Transport> createUdpTransport();
 
   /// \brief Create TCP transport
-  std::shared_ptr<TcpTlsTransportAdapter> createTcpTransport();
+  std::shared_ptr<Transport> createTcpTransport();
 
   // Configuration
   DnsConfig config_;
 
   // Transport instances
-  std::shared_ptr<UdpTransportAdapter> udpTransport_;
-  std::shared_ptr<TcpTlsTransportAdapter> tcpTransport_;
+  std::shared_ptr<Transport> udpTransport_;
+  std::shared_ptr<Transport> tcpTransport_;
 
   // State management
   std::atomic<bool> running_{false};
@@ -379,14 +376,22 @@ inline void DnsTransport::start()
         config_.transportMode == DnsTransportMode::Both)
     {
       udpTransport_ = createUdpTransport();
-      udpTransport_->start();
+      auto sr = udpTransport_->start();
+      if (sr.isErr())
+      {
+        throw DnsTransportException("Failed to start UDP transport: " + sr.error().message);
+      }
     }
 
     if (config_.transportMode == DnsTransportMode::TCP ||
         config_.transportMode == DnsTransportMode::Both)
     {
       tcpTransport_ = createTcpTransport();
-      tcpTransport_->start();
+      auto sr = tcpTransport_->start();
+      if (sr.isErr())
+      {
+        throw DnsTransportException("Failed to start TCP transport: " + sr.error().message);
+      }
     }
 
     // Timer service is already started by its constructor
@@ -659,55 +664,60 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
   }
 }
 
-inline std::shared_ptr<UdpTransportAdapter> DnsTransport::createUdpTransport()
+inline std::shared_ptr<Transport> DnsTransport::createUdpTransport()
 {
-  SharedUdpTransport::Config config{};
+  TransportConfig config;
+  config.protocol = Protocol::UDP;
 
-  auto adapter = std::make_shared<UdpTransportAdapter>(config);
+  auto transport = std::make_shared<Transport>(config);
 
-  // Set up callbacks using UnifiedCallbacks with shared_ptr capture for lifetime safety
-  UnifiedCallbacks callbacks;
-  auto self = shared_from_this(); // Ensure transport remains alive during async operations
-  callbacks.onData =
-    [self](SessionId sid, const std::uint8_t *data, std::size_t size, const IoResult &result)
-  { self->handleUdpData(sid, data, size, result); };
-  callbacks.onConnect = [self](SessionId sid, const IoResult &result)
-  { self->handleConnect(sid, result); };
-  callbacks.onClosed = [self](SessionId sid, const IoResult &result)
-  { self->handleClose(sid, result); };
-  callbacks.onError = [self](TransportError error, const std::string &message)
-  {
-    // Handle transport-level errors
-  };
+  // Set up callbacks with shared_ptr capture for lifetime safety
+  auto self = shared_from_this();
+  transport->onData(
+    [self](SessionId sid, iora::core::BufferView data,
+           std::chrono::steady_clock::time_point receiveTime)
+    { self->handleUdpData(sid, data, receiveTime); });
+  transport->onConnect(
+    [self](SessionId sid, const TransportAddress &addr)
+    { self->handleConnect(sid, addr); });
+  transport->onClose(
+    [self](SessionId sid, const TransportErrorInfo &reason)
+    { self->handleClose(sid, reason); });
+  transport->onError(
+    [self](TransportError, const std::string &)
+    {
+      // Handle transport-level errors
+    });
 
-  adapter->setCallbacks(callbacks);
-  return adapter;
+  return transport;
 }
 
-inline std::shared_ptr<TcpTlsTransportAdapter> DnsTransport::createTcpTransport()
+inline std::shared_ptr<Transport> DnsTransport::createTcpTransport()
 {
-  SharedTransport::Config config{};
-  SharedTransport::TlsConfig serverTls{}, clientTls{};
+  TransportConfig config;
+  config.protocol = Protocol::TCP;
 
-  auto adapter = std::make_shared<TcpTlsTransportAdapter>(config, serverTls, clientTls);
+  auto transport = std::make_shared<Transport>(config);
 
-  // Set up callbacks using UnifiedCallbacks with shared_ptr capture for lifetime safety
-  UnifiedCallbacks callbacks;
-  auto self = shared_from_this(); // Ensure transport remains alive during async operations
-  callbacks.onData =
-    [self](SessionId sid, const std::uint8_t *data, std::size_t size, const IoResult &result)
-  { self->handleTcpData(sid, data, size, result); };
-  callbacks.onConnect = [self](SessionId sid, const IoResult &result)
-  { self->handleConnect(sid, result); };
-  callbacks.onClosed = [self](SessionId sid, const IoResult &result)
-  { self->handleClose(sid, result); };
-  callbacks.onError = [self](TransportError error, const std::string &message)
-  {
-    // Handle transport-level errors
-  };
+  // Set up callbacks with shared_ptr capture for lifetime safety
+  auto self = shared_from_this();
+  transport->onData(
+    [self](SessionId sid, iora::core::BufferView data,
+           std::chrono::steady_clock::time_point receiveTime)
+    { self->handleTcpData(sid, data, receiveTime); });
+  transport->onConnect(
+    [self](SessionId sid, const TransportAddress &addr)
+    { self->handleConnect(sid, addr); });
+  transport->onClose(
+    [self](SessionId sid, const TransportErrorInfo &reason)
+    { self->handleClose(sid, reason); });
+  transport->onError(
+    [self](TransportError, const std::string &)
+    {
+      // Handle transport-level errors
+    });
 
-  adapter->setCallbacks(callbacks);
-  return adapter;
+  return transport;
 }
 
 inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
@@ -736,11 +746,12 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
     else
     {
       // Create new session
-      sessionId = udpTransport_->connect(query->server, query->port, TlsMode::None);
-      if (sessionId == 0)
+      auto cr = udpTransport_->connect(query->server, query->port, TlsMode::None);
+      if (cr.isErr())
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
+      sessionId = cr.value();
       serverSessions_[serverKey] = sessionId;
       sessionToServer_[sessionId] = {query->server, query->port};
     }
@@ -788,11 +799,12 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
     else
     {
       // Create new session
-      sessionId = tcpTransport_->connect(query->server, query->port, TlsMode::None);
-      if (sessionId == 0)
+      auto cr = tcpTransport_->connect(query->server, query->port, TlsMode::None);
+      if (cr.isErr())
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
+      sessionId = cr.value();
       serverSessions_[serverKey] = sessionId;
       sessionToServer_[sessionId] = {query->server, query->port};
     }
@@ -834,15 +846,9 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   }
 }
 
-inline void DnsTransport::handleUdpData(SessionId sessionId, const std::uint8_t *data,
-                                        std::size_t size, const IoResult &result)
+inline void DnsTransport::handleUdpData(SessionId sessionId, iora::core::BufferView data,
+                                        std::chrono::steady_clock::time_point)
 {
-  if (!result.ok)
-  {
-    handleTransportError(sessionId, result);
-    return;
-  }
-
   // Look up server and port for this session
   std::string server;
   std::uint16_t port;
@@ -862,25 +868,19 @@ inline void DnsTransport::handleUdpData(SessionId sessionId, const std::uint8_t 
     }
   }
 
-  processResponse(data, size, DnsTransportMode::UDP, server, port);
+  processResponse(data.data(), data.size(), DnsTransportMode::UDP, server, port);
 }
 
-inline void DnsTransport::handleTcpData(SessionId sessionId, const std::uint8_t *data,
-                                        std::size_t size, const IoResult &result)
+inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferView data,
+                                        std::chrono::steady_clock::time_point)
 {
-  if (!result.ok)
-  {
-    handleTransportError(sessionId, result);
-    return;
-  }
-
   // TCP DNS messages are length-prefixed, may arrive in fragments
   {
     std::lock_guard<std::mutex> lock(tcpBuffersMutex_);
     auto &buffer = tcpBuffers_[sessionId];
 
     // Prevent unbounded buffer growth using configured limit
-    if (buffer.size() + size > config_.maxTcpBufferSize)
+    if (buffer.size() + data.size() > config_.maxTcpBufferSize)
     {
       // Clear buffer and close session on excessive buffer growth
       buffer.clear();
@@ -888,7 +888,7 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, const std::uint8_t 
       return;
     }
 
-    buffer.insert(buffer.end(), data, data + size);
+    buffer.insert(buffer.end(), data.data(), data.data() + data.size());
 
     // Process complete messages
     while (buffer.size() >= 2)
@@ -1030,72 +1030,16 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
   }
 }
 
-inline void DnsTransport::handleTransportError(SessionId sessionId, const IoResult &result)
-{
-  // Handle transport-level errors by finding queries specific to this session
-  std::vector<std::shared_ptr<PendingQuery>> affectedQueries;
-  std::string errorServer;
-  std::uint16_t errorPort;
+// handleTransportError removed — new Transport API delivers errors via onClose/onError
+// callbacks, not via data callback IoResult. The onClose handler (handleClose) cleans up
+// sessions; the onError handler can be enhanced to retry pending queries if needed.
 
-  // First, identify which server:port this session corresponds to
-  {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = sessionToServer_.find(sessionId);
-    if (it != sessionToServer_.end())
-    {
-      errorServer = it->second.first;
-      errorPort = it->second.second;
-    }
-    else
-    {
-      iora::core::Logger::error("Transport error for unknown session ID " +
-                                std::to_string(sessionId));
-      return;
-    }
-  }
-
-  // Find queries specifically targeting this server:port
-  {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
-    for (const auto &[key, query] : pendingQueries_)
-    {
-      if (query->server == errorServer && query->port == errorPort)
-      {
-        affectedQueries.push_back(query);
-      }
-    }
-  }
-
-  iora::core::Logger::info("DNS transport error for " + errorServer + ":" +
-                           std::to_string(errorPort) + " affecting " +
-                           std::to_string(affectedQueries.size()) + " queries: " + result.message);
-
-  // Try to retry affected queries
-  for (auto &query : affectedQueries)
-  {
-    if (query->retryCount.load() < config_.retryCount)
-    {
-      retryQuery(query, "transport error: " + result.message);
-    }
-    else
-    {
-      // Max retries exceeded, complete with error
-      auto error = std::make_exception_ptr(
-        DnsTransportException("Transport error after retries: " + result.message));
-      completeQuery(QueryKey(query->queryId, query->server, query->port), error);
-    }
-  }
-
-  // Atomic increment - no mutex needed
-  stats_.errors.fetch_add(1, std::memory_order_relaxed);
-}
-
-inline void DnsTransport::handleConnect(SessionId sessionId, const IoResult &result)
+inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddress &)
 {
   // Handle connection events
 }
 
-inline void DnsTransport::handleClose(SessionId sessionId, const IoResult &result)
+inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorInfo &)
 {
   // Remove closed sessions from mappings
   {

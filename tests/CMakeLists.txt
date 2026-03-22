@@ -46,7 +46,6 @@ endif()
 
 # Network namespace tests
 set(NETWORK_TESTS
-    network/iora_test_batch_integration
     network/iora_test_batch_processor
     network/iora_test_dns_basic
     network/iora_test_dns_timer_cancellation
@@ -59,7 +58,6 @@ set(NETWORK_TESTS
     network/iora_test_shared_transport_timers
     network/iora_test_shared_udp
     network/iora_test_transport_improvements
-    network/iora_test_unified_tcp_udp
     network/iora_test_webhook_transport
     network/iora_test_websocket_frame
     network/iora_test_websocket

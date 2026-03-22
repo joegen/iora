@@ -24,7 +24,7 @@
 
 #include "iora/core/logger.hpp"
 #include "iora/core/thread_pool.hpp"
-#include "iora/network/unified_shared_transport.hpp"
+#include "iora/network/transport_impl.hpp"
 #include "iora/parsers/http_message.hpp"
 
 namespace iora
@@ -341,8 +341,8 @@ public:
       _shutdown = false;
 
       // Configure transport
-      UnifiedSharedTransport::Config config;
-      config.protocol = UnifiedSharedTransport::Protocol::TCP;
+      TransportConfig config;
+      config.protocol = Protocol::TCP;
       config.idleTimeout = std::chrono::seconds(600);
       config.maxPendingSyncOps = 32;
       config.defaultSyncTimeout = std::chrono::milliseconds(30000);
@@ -362,67 +362,40 @@ public:
         config.serverTls.verifyPeer = tlsCfg.requireClientCert;
       }
 
-      _transport = std::make_unique<UnifiedSharedTransport>(config);
+      _transport = std::make_unique<Transport>(config);
 
       // Set up callbacks before starting
 
       // Accept callback - new connection accepted
-      _transport->setAcceptCallback(
-        [this](SessionId sid, const std::string &peer, const IoResult &result)
+      _transport->onAccept(
+        [this](SessionId sid, const TransportAddress &peerAddr)
         {
-          if (result.ok)
+          // Initialize session state
           {
-            // Initialize session state and parse peer address
-            {
-              std::lock_guard<std::mutex> lock(_sessionMutex);
-              SessionInfo &info = _sessionInfo[sid];
-              info.buffer = "";
+            std::lock_guard<std::mutex> lock(_sessionMutex);
+            SessionInfo &info = _sessionInfo[sid];
+            info.buffer = "";
+            info.peerAddress = peerAddr.host;
+            info.peerPort = peerAddr.port;
 
-              // Parse peer address from format "ip:port"
-              auto colonPos = peer.find(':');
-              if (colonPos != std::string::npos)
-              {
-                info.peerAddress = peer.substr(0, colonPos);
-                try
-                {
-                  info.peerPort = static_cast<std::uint16_t>(std::stoi(peer.substr(colonPos + 1)));
-                }
-                catch (...)
-                {
-                  info.peerPort = 0;
-                }
-              }
-              else
-              {
-                info.peerAddress = peer;
-                info.peerPort = 0;
-              }
-
-              // Log the accepted connection
-              iora::core::Logger::info("HttpServer: Accepted HTTP connection from " +
-                                       info.peerAddress + ":" + std::to_string(info.peerPort) +
-                                       " (session " + std::to_string(sid) + ")");
-            }
-
-            // Set session to async mode for receiving data
-            _transport->setReadMode(sid, ReadMode::Async);
-
-            // Set up data callback for this session
-            _transport->setDataCallback(sid,
-                                        [this](SessionId session, const std::uint8_t *data,
-                                               std::size_t len, const IoResult &result)
-                                        {
-                                          if (result.ok)
-                                          {
-                                            handleIncomingData(session, data, len);
-                                          }
-                                        });
+            // Log the accepted connection
+            iora::core::Logger::info("HttpServer: Accepted HTTP connection from " +
+                                     info.peerAddress + ":" + std::to_string(info.peerPort) +
+                                     " (session " + std::to_string(sid) + ")");
           }
         });
 
+      // Global data callback — dispatched per session
+      _transport->onData(
+        [this](SessionId session, iora::core::BufferView data,
+               std::chrono::steady_clock::time_point)
+        {
+          handleIncomingData(session, data.data(), data.size());
+        });
+
       // Close callback - connection closed
-      _transport->setCloseCallback(
-        [this](SessionId sid, const IoResult &result)
+      _transport->onClose(
+        [this](SessionId sid, const TransportErrorInfo &)
         {
           std::lock_guard<std::mutex> lock(_sessionMutex);
           auto it = _sessionInfo.find(sid);
@@ -443,19 +416,24 @@ public:
         });
 
       // Error callback
-      _transport->setErrorCallback(
-        [this](TransportError error, const std::string &message)
+      _transport->onError(
+        [this](TransportError, const std::string &message)
         { iora::core::Logger::error("HttpServer transport error: " + message); });
 
       // Start transport
-      if (!_transport->start())
+      if (_transport->start().isErr())
       {
         throw std::runtime_error("Failed to start transport");
       }
 
       // Add listener
       TlsMode tlsMode = _tlsConfig.has_value() ? TlsMode::Server : TlsMode::None;
-      _listenerId = _transport->addListener(_bindAddress, _port, tlsMode);
+      auto listenResult = _transport->addListener(_bindAddress, static_cast<std::uint16_t>(_port), tlsMode);
+      if (listenResult.isErr())
+      {
+        throw std::runtime_error("Failed to add listener: " + listenResult.error().message);
+      }
+      _listenerId = listenResult.value();
 
       iora::core::Logger::info("HttpServer started on " + _bindAddress + ":" + std::to_string(_port));
     }
@@ -561,7 +539,7 @@ protected:
     if (_transport && !_shutdown)
     {
       _transport->sendAsync(sid, sharedData->data(), sharedData->size(),
-        [sharedData](SessionId, const SyncResult&) {});
+        [sharedData](SessionId, const SendResult&) {});
     }
   }
 
@@ -790,7 +768,7 @@ protected:
         if (_transport)
         {
           _transport->sendAsync(sid, shutdownResponseData->data(), shutdownResponseData->size(),
-                                [this, sid](SessionId session, const SyncResult &result)
+                                [this, sid](SessionId session, const SendResult &result)
                                 {
                                   // Always close connection during shutdown
                                   std::lock_guard<std::mutex> lock(_mutex);
@@ -907,7 +885,7 @@ protected:
                 if (_transport && !_shutdown)
                 {
                   _transport->sendAsync(sid, sharedResponseData->data(), sharedResponseData->size(),
-                                        [sharedResponseData](SessionId session, const SyncResult &result)
+                                        [sharedResponseData](SessionId session, const SendResult &result)
                                         {
                                           // Response sent; connection remains open for upgraded protocol
                                         });
@@ -1064,12 +1042,12 @@ protected:
             std::to_string(sid) + ", " + std::to_string(sharedResponseData->size()) + " bytes)");
           _transport->sendAsync(sid, sharedResponseData->data(), sharedResponseData->size(),
                                 [this, sid, shouldCloseConnection,
-                                 sharedResponseData](SessionId session, const SyncResult &result)
+                                 sharedResponseData](SessionId session, const SendResult &result)
                                 {
-                                  if (!result.ok)
+                                  if (!result.isOk())
                                   {
                                     iora::core::Logger::error("Failed to send HTTP response: " +
-                                                              result.errorMessage);
+                                                              result.error().message);
                                     // Close connection on send failure
                                     std::lock_guard<std::mutex> lock(_mutex);
                                     if (_transport && !_shutdown)
@@ -1129,7 +1107,7 @@ protected:
           auto errorResponseData = std::make_shared<std::string>(errorRes.toWireFormat());
           _transport->sendAsync(
             sid, errorResponseData->data(), errorResponseData->size(),
-            [this, sid, errorResponseData](SessionId session, const SyncResult &result)
+            [this, sid, errorResponseData](SessionId session, const SendResult &result)
             {
               // Close connection after error response is sent
               std::lock_guard<std::mutex> lock(_mutex);
@@ -1319,10 +1297,10 @@ protected:
                                  std::to_string(errorResponseData->size()) + " bytes)");
         _transport->sendAsync(
           sid, errorResponseData->data(), errorResponseData->size(),
-          [this, sid, errorResponseData](SessionId session, const SyncResult &result)
+          [this, sid, errorResponseData](SessionId session, const SendResult &result)
           {
             // Close connection after error response is sent
-            if (result.ok)
+            if (result.isOk())
             {
               iora::core::Logger::debug("HttpServer: Error response "
                                         "sent successfully to session " +
@@ -1332,7 +1310,7 @@ protected:
             {
               iora::core::Logger::error("HttpServer: Failed to send "
                                         "error response to session " +
-                                        std::to_string(session) + ": " + result.errorMessage);
+                                        std::to_string(session) + ": " + result.error().message);
             }
 
             // Always close the connection after sending error response
@@ -1380,7 +1358,7 @@ private:
   std::string _bindAddress;
   int _port;
   std::optional<TlsConfig> _tlsConfig;
-  std::unique_ptr<UnifiedSharedTransport> _transport;
+  std::unique_ptr<Transport> _transport;
   ListenerId _listenerId{0};
   std::atomic<bool> _shutdown;
 
