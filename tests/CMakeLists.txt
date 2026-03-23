@@ -53,10 +53,10 @@ set(NETWORK_TESTS
     network/iora_test_dns_comprehensive
     network/iora_test_http
     network/iora_test_http_client_pool
-    network/iora_test_shared_tcp
+    network/iora_test_tcp_engine
     network/iora_test_tcp_rapid_send
-    network/iora_test_shared_transport_timers
-    network/iora_test_shared_udp
+    network/iora_test_tcp_engine_timers
+    network/iora_test_udp_engine
     network/iora_test_transport_improvements
     network/iora_test_webhook_transport
     network/iora_test_websocket_frame
@@ -64,10 +64,6 @@ set(NETWORK_TESTS
     network/iora_test_transport
 )
 
-# Additional network tests that might exist
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/network/iora_test_sync_async_transport.cpp")
-    list(APPEND NETWORK_TESTS network/iora_test_sync_async_transport)
-endif()
 
 # Core namespace tests
 set(CORE_TESTS
