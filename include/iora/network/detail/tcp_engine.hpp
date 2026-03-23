@@ -2424,9 +2424,10 @@ private:
       if (_config.serverTls.verifyPeer)
       {
         ::SSL_CTX_set_verify(_sslSrv, SSL_VERIFY_PEER, nullptr);
-        if (!_config.serverTls.caFile.empty())
+        if (!_config.serverTls.caFile.empty() || !_config.serverTls.caPath.empty())
         {
-          if (::SSL_CTX_load_verify_locations(_sslSrv, _config.serverTls.caFile.c_str(),
+          if (::SSL_CTX_load_verify_locations(_sslSrv,
+                _config.serverTls.caFile.empty() ? nullptr : _config.serverTls.caFile.c_str(),
                 _config.serverTls.caPath.empty() ? nullptr : _config.serverTls.caPath.c_str()) != 1)
           {
             setLastFatal(IoResult::failure(TransportError::Config, "server load CA failed"));
@@ -2541,9 +2542,10 @@ private:
       if (_config.clientTls.verifyPeer)
       {
         ::SSL_CTX_set_verify(_sslCli, SSL_VERIFY_PEER, nullptr);
-        if (!_config.clientTls.caFile.empty())
+        if (!_config.clientTls.caFile.empty() || !_config.clientTls.caPath.empty())
         {
-          if (::SSL_CTX_load_verify_locations(_sslCli, _config.clientTls.caFile.c_str(),
+          if (::SSL_CTX_load_verify_locations(_sslCli,
+                _config.clientTls.caFile.empty() ? nullptr : _config.clientTls.caFile.c_str(),
                 _config.clientTls.caPath.empty() ? nullptr : _config.clientTls.caPath.c_str()) != 1)
           {
             setLastFatal(IoResult::failure(TransportError::Config, "client load CA failed"));
