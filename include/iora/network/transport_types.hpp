@@ -143,7 +143,7 @@ struct ListenerResult
 };
 
 /// \brief Basic transport stats for legacy compatibility.
-/// Used by SharedTransport::getBasicStats() and the old adapter layer.
+/// Used by TcpEngine::getBasicStats() and the old adapter layer.
 struct BasicTransportStats
 {
   std::uint64_t accepted{0};
@@ -275,8 +275,7 @@ private:
 };
 
 /// \brief Transport configuration. Single config type replacing the 4 existing
-/// config types (SharedTransport::Config, SharedUdpTransport::Config,
-/// SyncAsyncTransport::Config, UnifiedSharedTransport::Config).
+/// config types from the old architecture.
 struct TransportConfig
 {
   Protocol protocol{Protocol::TCP};

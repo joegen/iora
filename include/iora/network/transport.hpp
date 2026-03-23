@@ -145,7 +145,7 @@ public:
 
 /// \brief Concrete transport implementation — single protocol per instance.
 ///
-/// Owns an internal engine (SharedTransport or SharedUdpTransport) via unique_ptr<EngineBase>.
+/// Owns an internal engine (TcpEngine or UdpEngine) via unique_ptr<EngineBase>.
 /// Implements ITransport. Non-copyable, movable.
 ///
 /// Construction:

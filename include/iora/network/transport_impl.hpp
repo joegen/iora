@@ -350,11 +350,11 @@ inline Transport::Transport(TransportConfig config)
   _impl->config = std::move(config);
   if (_impl->config.protocol == Protocol::TCP)
   {
-    _impl->engine = std::make_unique<SharedTransport>(_impl->config);
+    _impl->engine = std::make_unique<TcpEngine>(_impl->config);
   }
   else
   {
-    _impl->engine = std::make_unique<SharedUdpTransport>(_impl->config);
+    _impl->engine = std::make_unique<UdpEngine>(_impl->config);
   }
   _impl->setupEngineCallbacks();
 }

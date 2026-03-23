@@ -9,7 +9,7 @@
 #include <vector>
 
 using namespace std::chrono_literals;
-using SharedTransport = iora::network::SharedTransport;
+using TcpEngine = iora::network::TcpEngine;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
 using IoResult = iora::network::IoResult;
@@ -20,10 +20,10 @@ namespace
 {
 struct TcpFixture
 {
-  SharedTransport::Config cfg{};
-  SharedTransport::TlsConfig srvTls{};
-  SharedTransport::TlsConfig cliTls{};
-  SharedTransport tx{cfg, srvTls, cliTls};
+  TcpEngine::Config cfg{};
+  TcpEngine::TlsConfig srvTls{};
+  TcpEngine::TlsConfig cliTls{};
+  TcpEngine tx{cfg, srvTls, cliTls};
 
   std::atomic<size_t> acceptCount{0};
   std::atomic<size_t> connectCount{0};
@@ -47,7 +47,7 @@ struct TcpFixture
 
   TcpFixture()
   {
-    SharedTransport::Callbacks cbs{};
+    TcpEngine::Callbacks cbs{};
     cbs.onAccept = [&](SessionId sid, const std::string &addr, const IoResult &res)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);

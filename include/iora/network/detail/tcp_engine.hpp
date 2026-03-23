@@ -78,7 +78,7 @@ namespace network
 /// if they access shared state. The destructor is virtual to support proper cleanup.
 ///
 /// \see TlsFaultInjectionTransport in tests/sipp_integration/ for usage example.
-class SharedTransport : public detail::EngineBase
+class TcpEngine : public detail::EngineBase
 {
 public:
   /// \brief Runtime configuration.
@@ -145,7 +145,7 @@ public:
   };
 
   /// \brief Construct with config and TLS contexts.
-  SharedTransport(const Config &cfg, const TlsConfig &srv, const TlsConfig &cli)
+  TcpEngine(const Config &cfg, const TlsConfig &srv, const TlsConfig &cli)
       : _cfg(cfg), _srvTls(srv), _cliTls(cli)
   {
     // Ensure OpenSSL is initialized once per process
@@ -156,14 +156,14 @@ public:
     {
       _timerConfig.limits.maxConcurrentTimers = 10000;
       _timerConfig.enableStatistics = true;
-      _timerConfig.threadName = "SharedTransportTimer";
+      _timerConfig.threadName = "TcpEngineTimer";
       _timerService = std::make_unique<iora::core::TimerService>(_timerConfig);
     }
   }
 
   /// \brief Construct from TransportConfig (EngineBase-compatible config).
-  explicit SharedTransport(const TransportConfig &config)
-    : SharedTransport(configFromTransport(config),
+  explicit TcpEngine(const TransportConfig &config)
+    : TcpEngine(configFromTransport(config),
                       tlsFromTransport(config.serverTls),
                       tlsFromTransport(config.clientTls))
   {
@@ -171,14 +171,14 @@ public:
 
   /// \brief Destructor; calls stop() if needed.
   /// \note Virtual to support subclassing for fault injection testing.
-  virtual ~SharedTransport() { stop(); }
+  virtual ~TcpEngine() { stop(); }
 
-  SharedTransport(const SharedTransport &) = delete;
-  SharedTransport &operator=(const SharedTransport &) = delete;
+  TcpEngine(const TcpEngine &) = delete;
+  TcpEngine &operator=(const TcpEngine &) = delete;
 
   /// \brief Emergency detach for destruction from I/O thread.
   /// Sets _running to false and detaches the I/O thread so that
-  /// ~SharedTransport's stop() becomes a no-op (CAS fails, thread
+  /// ~TcpEngine's stop() becomes a no-op (CAS fails, thread
   /// not joinable). The I/O thread exits its loop naturally when it
   /// sees _running == false. This is a last-resort safety net for
   /// the case where Transport is destroyed from within a callback.
@@ -2721,10 +2721,10 @@ private:
 };
 
 // Static member definitions
-inline std::once_flag SharedTransport::_sslGlobalInitFlag;
-inline std::atomic<int> SharedTransport::debugInstanceCount{0};
+inline std::once_flag TcpEngine::_sslGlobalInitFlag;
+inline std::atomic<int> TcpEngine::debugInstanceCount{0};
 
-inline void SharedTransport::initSslGlobal()
+inline void TcpEngine::initSslGlobal()
 {
   // Initialize OpenSSL library once per process
   // This prevents deadlocks when multiple transports initialize

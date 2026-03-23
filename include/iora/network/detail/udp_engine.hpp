@@ -44,7 +44,7 @@ namespace iora
 namespace network
 {
 
-class SharedUdpTransport : public detail::EngineBase
+class UdpEngine : public detail::EngineBase
 {
 public:
   /// \brief Returns the last error message from a failed operation.
@@ -95,7 +95,7 @@ public:
     std::size_t sessionsCurrent{0}, sessionsPeak{0};
   };
 
-  SharedUdpTransport(const Config &cfg, const TlsConfig &, const TlsConfig &)
+  UdpEngine(const Config &cfg, const TlsConfig &, const TlsConfig &)
       : _cfg(cfg), _sessionPool([]() { return std::make_unique<Session>(); },
                                 [](Session *s)
                                 {
@@ -132,12 +132,12 @@ public:
   }
 
   /// \brief Construct from TransportConfig (EngineBase-compatible config).
-  explicit SharedUdpTransport(const TransportConfig &config)
-    : SharedUdpTransport(configFromTransport(config), TlsConfig{}, TlsConfig{})
+  explicit UdpEngine(const TransportConfig &config)
+    : UdpEngine(configFromTransport(config), TlsConfig{}, TlsConfig{})
   {
   }
 
-  ~SharedUdpTransport() noexcept
+  ~UdpEngine() noexcept
   {
     try
     {
@@ -149,8 +149,8 @@ public:
     }
   }
 
-  SharedUdpTransport(const SharedUdpTransport &) = delete;
-  SharedUdpTransport &operator=(const SharedUdpTransport &) = delete;
+  UdpEngine(const UdpEngine &) = delete;
+  UdpEngine &operator=(const UdpEngine &) = delete;
 
   void detachForTermination() override
   {

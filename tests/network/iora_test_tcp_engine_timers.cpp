@@ -5,7 +5,7 @@
 #include "test_helpers.hpp"
 
 using namespace std::chrono_literals;
-using SharedTransport = iora::network::SharedTransport;
+using TcpEngine = iora::network::TcpEngine;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
 using IoResult = iora::network::IoResult;
@@ -13,16 +13,16 @@ using SessionId = iora::network::SessionId;
 
 TEST_CASE("High-resolution timer configuration", "[shared_transport][timers]")
 {
-  SharedTransport::Config cfg{};
+  TcpEngine::Config cfg{};
   cfg.enableHighResolutionTimers = true;
   cfg.connectTimeout = 500ms;
   cfg.handshakeTimeout = 1000ms;
   cfg.writeStallTimeout = 750ms;
 
-  SharedTransport::TlsConfig srvTls{};
-  SharedTransport::TlsConfig cliTls{};
+  TcpEngine::TlsConfig srvTls{};
+  TcpEngine::TlsConfig cliTls{};
 
-  SharedTransport transport(cfg, srvTls, cliTls);
+  TcpEngine transport(cfg, srvTls, cliTls);
   REQUIRE(transport.start().isOk());
 
   // Verify the configuration is set correctly
@@ -36,16 +36,16 @@ TEST_CASE("High-resolution timer configuration", "[shared_transport][timers]")
 
 TEST_CASE("Legacy timer fallback when high-resolution disabled", "[shared_transport][timers]")
 {
-  SharedTransport::Config cfg{};
+  TcpEngine::Config cfg{};
   cfg.enableHighResolutionTimers = false;
   cfg.connectTimeout = 1000ms;
   cfg.handshakeTimeout = 2000ms;
   cfg.gcInterval = 1s;
 
-  SharedTransport::TlsConfig srvTls{};
-  SharedTransport::TlsConfig cliTls{};
+  TcpEngine::TlsConfig srvTls{};
+  TcpEngine::TlsConfig cliTls{};
 
-  SharedTransport transport(cfg, srvTls, cliTls);
+  TcpEngine transport(cfg, srvTls, cliTls);
   REQUIRE(transport.start().isOk());
 
   // Verify legacy configuration
@@ -58,7 +58,7 @@ TEST_CASE("Legacy timer fallback when high-resolution disabled", "[shared_transp
 TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip]")
 {
   // Test SIP-specific timeout configurations for DNS/SRV failover
-  SharedTransport::Config sipCfg{};
+  TcpEngine::Config sipCfg{};
   sipCfg.enableHighResolutionTimers = true;
   sipCfg.connectTimeout = 2000ms;    // 2s per SRV record
   sipCfg.handshakeTimeout = 3000ms;  // 3s for TLS handshake
@@ -75,9 +75,9 @@ TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip
   REQUIRE(sipCfg.handshakeTimeout <= 5000ms);  // Fast TLS establishment
   REQUIRE(sipCfg.writeStallTimeout <= 2000ms); // Quick write failure detection
 
-  SharedTransport::TlsConfig srvTls{};
-  SharedTransport::TlsConfig cliTls{};
-  SharedTransport sipTransport(sipCfg, srvTls, cliTls);
+  TcpEngine::TlsConfig srvTls{};
+  TcpEngine::TlsConfig cliTls{};
+  TcpEngine sipTransport(sipCfg, srvTls, cliTls);
 
   REQUIRE(sipTransport.start().isOk());
   sipTransport.stop();
@@ -85,20 +85,20 @@ TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip
 
 TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][timers][integration]")
 {
-  SharedTransport::Config cfg{};
+  TcpEngine::Config cfg{};
   cfg.enableHighResolutionTimers = true;
   cfg.connectTimeout = 100ms; // Very short timeout for testing
 
-  SharedTransport::TlsConfig srvTls{};
-  SharedTransport::TlsConfig cliTls{};
-  SharedTransport transport(cfg, srvTls, cliTls);
+  TcpEngine::TlsConfig srvTls{};
+  TcpEngine::TlsConfig cliTls{};
+  TcpEngine transport(cfg, srvTls, cliTls);
 
   std::atomic<bool> connectionFailed{false};
   std::atomic<bool> connected{false};
   std::string lastErrorMessage;
   TransportError lastErrorCode{TransportError::None};
 
-  SharedTransport::Callbacks cbs{};
+  TcpEngine::Callbacks cbs{};
   cbs.onConnect = [&](SessionId sid, const IoResult &res)
   {
     if (res.ok)

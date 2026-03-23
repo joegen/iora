@@ -39,7 +39,7 @@
 #include <vector>
 
 using namespace std::chrono_literals;
-using SharedTransport = iora::network::SharedTransport;
+using TcpEngine = iora::network::TcpEngine;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
 using IoResult = iora::network::IoResult;
@@ -74,10 +74,10 @@ std::vector<uint8_t> encodeMessage(const std::string &msg)
 /// - A "client" that tracks received messages
 struct ProxyThreadedFixture
 {
-  SharedTransport::Config cfg{};
-  SharedTransport::TlsConfig srvTls{};
-  SharedTransport::TlsConfig cliTls{};
-  SharedTransport tx{cfg, srvTls, cliTls};
+  TcpEngine::Config cfg{};
+  TcpEngine::TlsConfig srvTls{};
+  TcpEngine::TlsConfig cliTls{};
+  TcpEngine tx{cfg, srvTls, cliTls};
 
   // Connection tracking
   SessionId serverSid{0};  // Server's view of client connection
@@ -113,7 +113,7 @@ struct ProxyThreadedFixture
 
   ProxyThreadedFixture()
   {
-    SharedTransport::Callbacks cbs{};
+    TcpEngine::Callbacks cbs{};
 
     cbs.onAccept = [&](SessionId sid, const std::string &, const IoResult &res)
     {

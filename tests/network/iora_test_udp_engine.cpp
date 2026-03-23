@@ -5,7 +5,7 @@
 #include "test_helpers.hpp"
 
 using namespace std::chrono_literals;
-using SharedUdpTransport = iora::network::SharedUdpTransport;
+using UdpEngine = iora::network::UdpEngine;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
 using IoResult = iora::network::IoResult;
@@ -16,9 +16,9 @@ namespace
 {
 struct UdpFixture
 {
-  SharedUdpTransport::Config cfg{};
-  SharedUdpTransport::TlsConfig tlsConfig{};
-  SharedUdpTransport tx{cfg, tlsConfig, tlsConfig};
+  UdpEngine::Config cfg{};
+  UdpEngine::TlsConfig tlsConfig{};
+  UdpEngine tx{cfg, tlsConfig, tlsConfig};
 
   std::atomic<bool> accepted{false};
   std::atomic<bool> connected{false};
@@ -41,7 +41,7 @@ struct UdpFixture
 
   UdpFixture()
   {
-    SharedUdpTransport::Callbacks cbs{};
+    UdpEngine::Callbacks cbs{};
     cbs.onAccept = [&](SessionId sid, const std::string &, const IoResult &res)
     {
       REQUIRE(res.ok);
@@ -274,12 +274,12 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
   ListenerId lid = lr.value();
 
   // Set up a second UDP server to connect to
-  SharedUdpTransport::Config cfg2{};
-  SharedUdpTransport::TlsConfig tlsCfg2{};
-  SharedUdpTransport tx2{cfg2, tlsCfg2, tlsCfg2};
+  UdpEngine::Config cfg2{};
+  UdpEngine::TlsConfig tlsCfg2{};
+  UdpEngine tx2{cfg2, tlsCfg2, tlsCfg2};
 
   std::atomic<bool> server2Received{false};
-  SharedUdpTransport::Callbacks cbs2{};
+  UdpEngine::Callbacks cbs2{};
   cbs2.onData = [&](SessionId, const std::uint8_t *data, std::size_t n, const IoResult &)
   {
     std::string msg(reinterpret_cast<const char *>(data), n);
@@ -322,7 +322,7 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
   REQUIRE(f.waitFor(f.connected));
 
   // Change configuration
-  SharedUdpTransport::Config newCfg = f.cfg;
+  UdpEngine::Config newCfg = f.cfg;
   newCfg.gcInterval = std::chrono::seconds(2);
   newCfg.maxWriteQueue = 20;
   newCfg.ioReadChunk = 128 * 1024;
@@ -473,11 +473,11 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
 
   // Create a server that doesn't echo (to cause backpressure)
-  SharedUdpTransport::Config cfg2{};
-  SharedUdpTransport::TlsConfig tlsCfg2{};
-  SharedUdpTransport tx2{cfg2, tlsCfg2, tlsCfg2};
+  UdpEngine::Config cfg2{};
+  UdpEngine::TlsConfig tlsCfg2{};
+  UdpEngine tx2{cfg2, tlsCfg2, tlsCfg2};
 
-  SharedUdpTransport::Callbacks cbs2{};
+  UdpEngine::Callbacks cbs2{};
   cbs2.onData = [&](SessionId, const std::uint8_t *, std::size_t, const IoResult &)
   {
     // Don't echo - just receive
@@ -812,15 +812,15 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
   auto port2 = testnet::getFreePortUDP();
 
   // Set up a server
-  SharedUdpTransport::Config cfg2{};
-  SharedUdpTransport::TlsConfig tlsCfg2{};
-  SharedUdpTransport tx2{cfg2, tlsCfg2, tlsCfg2};
+  UdpEngine::Config cfg2{};
+  UdpEngine::TlsConfig tlsCfg2{};
+  UdpEngine tx2{cfg2, tlsCfg2, tlsCfg2};
 
   std::atomic<int> server2DataCount{0};
   std::mutex server2Mutex;
   std::vector<std::string> server2Data;
 
-  SharedUdpTransport::Callbacks cbs2{};
+  UdpEngine::Callbacks cbs2{};
   cbs2.onData = [&](SessionId, const std::uint8_t *data, std::size_t n, const IoResult &)
   {
     std::lock_guard<std::mutex> lock(server2Mutex);
