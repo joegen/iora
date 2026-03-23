@@ -207,7 +207,25 @@ struct Transport::Impl
     cbs.onClose = [this](SessionId sid, const TransportErrorInfo &reason)
     {
       // Session close flow (architecture doc steps):
-      // 1. Mark session as closing (implicit — engine already closed it)
+      // 1. Check if this is a connectSync session — deliver to waiting caller
+      //    and suppress global onClose (same pattern as onConnect suppression).
+      //    Without this, a failed connectSync (e.g., ECONNREFUSED) would fire
+      //    the global onClose for a sid the user never received.
+      {
+        std::lock_guard<std::mutex> lk(syncMutex);
+        auto connIt = pendingConnects.find(sid);
+        if (connIt != pendingConnects.end())
+        {
+          connIt->second->result = ConnectResult::err(reason);
+          connIt->second->done = true;
+          connIt->second->cv.notify_one();
+          pendingConnects.erase(connIt);
+          // No global onClose, no observers, no tombstone — connectSync
+          // session never escaped to user code, so nothing to clean up.
+          return;
+        }
+      }
+
       // 2. Invoke global onClose FIRST
       CloseCallback closeCb;
       {
@@ -243,26 +261,17 @@ struct Transport::Impl
         }
       }
 
-      // 6. Notify pending sync operations and clean up sync state
+      // 6. Wake pending receiveSync or leave a tombstone for late callers.
+      // Tombstones prevent a race where onClose fires before setReadMode/
+      // receiveSync — without them, receiveSync would wait forever on a
+      // closed session. Tombstones are cleaned up by receiveSync when it
+      // detects the closed flag.
+      //
+      // To prevent unbounded tombstone growth from async-only sessions
+      // (which never call receiveSync), we periodically GC stale tombstones.
+      // A tombstone is stale if it is closed and has no pending data.
       {
         std::lock_guard<std::mutex> lk(syncMutex);
-        // Wake pending connectSync
-        auto connIt = pendingConnects.find(sid);
-        if (connIt != pendingConnects.end())
-        {
-          connIt->second->result = ConnectResult::err(reason);
-          connIt->second->done = true;
-          connIt->second->cv.notify_one();
-          pendingConnects.erase(connIt);
-        }
-        // If not in pendingConnects, this is a normal close (not a connectSync)
-        // Wake pending receiveSync with closed flag.
-        // Wake pending receiveSync or leave a tombstone for late callers.
-        // Tombstones prevent a race where onClose fires before setReadMode/
-        // receiveSync — without them, receiveSync would wait forever on a
-        // closed session. Tombstones are cleaned up by receiveSync (line ~607)
-        // and by receiveSync timeout. For async-only sessions, tombstones are
-        // small (empty shared_ptr) and bounded by concurrent session count.
         auto bufIt = receiveBuffers.find(sid);
         if (bufIt != receiveBuffers.end())
         {
@@ -276,6 +285,25 @@ struct Transport::Impl
           receiveBuffers[sid] = tomb;
         }
         readModes.erase(sid);
+
+        // GC stale tombstones when map grows beyond threshold.
+        // Stale = closed with no pending data and no waiters (hasData==false).
+        // This caps memory to O(threshold + concurrent closes between GCs).
+        constexpr std::size_t gcThreshold = 1024;
+        if (receiveBuffers.size() > gcThreshold)
+        {
+          for (auto it = receiveBuffers.begin(); it != receiveBuffers.end();)
+          {
+            if (it->first != sid && it->second->closed && !it->second->hasData)
+            {
+              it = receiveBuffers.erase(it);
+            }
+            else
+            {
+              ++it;
+            }
+          }
+        }
       }
 
       // 7. User data cleanup LAST (HR-11)
@@ -538,9 +566,11 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
     return std::move(op->result);
   }
 
-  // Timeout — clean up. Release syncMutex BEFORE calling engine methods
-  // to avoid AB-BA deadlock risk on the close path.
-  _impl->pendingConnects.erase(sid);
+  // Timeout — keep the pendingConnects entry so that when engine->close()
+  // fires onClose, the handler finds it and suppresses the global onClose
+  // callback. Without this, the timed-out session's close would leak to
+  // the user's onClose callback for a sid they never received.
+  // Release syncMutex BEFORE calling engine methods to avoid AB-BA deadlock.
   lk.unlock();
   _impl->engine->close(sid);
   return ConnectResult::err(TransportErrorInfo{TransportError::Timeout, "connectSync timed out"});
@@ -632,9 +662,8 @@ inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
     return false;
   }
 
-  // Step 1: Update mode and collect flush data under syncMutex
+  // Step 1: Determine old mode and handle simple transitions under syncMutex
   ReadMode oldMode = ReadMode::Async;
-  std::vector<std::uint8_t> flushData;
   {
     std::lock_guard<std::mutex> lk(_impl->syncMutex);
     auto it = _impl->readModes.find(sid);
@@ -642,11 +671,38 @@ inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
     {
       oldMode = it->second;
     }
-    _impl->readModes[sid] = mode;
 
-    // If switching from Sync to Async, copy buffered data for flushing
-    if (oldMode == ReadMode::Sync && mode == ReadMode::Async)
+    // If NOT switching from Sync to Async, update mode directly
+    if (!(oldMode == ReadMode::Sync && mode == ReadMode::Async))
     {
+      _impl->readModes[sid] = mode;
+
+      // If switching to Sync, ensure receive buffer exists
+      if (mode == ReadMode::Sync)
+      {
+        if (_impl->receiveBuffers.find(sid) == _impl->receiveBuffers.end())
+        {
+          _impl->receiveBuffers[sid] = std::make_shared<Impl::SyncReceiveBuffer>();
+        }
+      }
+      return true; // Early return for non-flush transitions
+    }
+  } // syncMutex released
+
+  // Step 2: Sync→Async transition with ordered flush.
+  // Keep mode as Sync during flush so the I/O thread continues buffering
+  // any data that arrives mid-flush. Drain in a loop until empty.
+  DataCallback cb;
+  {
+    std::lock_guard<std::mutex> cbLk(_impl->callbackMutex);
+    cb = _impl->onDataCb;
+  }
+
+  for (;;)
+  {
+    std::vector<std::uint8_t> flushData;
+    {
+      std::lock_guard<std::mutex> lk(_impl->syncMutex);
       auto bufIt = _impl->receiveBuffers.find(sid);
       if (bufIt != _impl->receiveBuffers.end() && !bufIt->second->data.empty())
       {
@@ -654,27 +710,16 @@ inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
         bufIt->second->data.clear();
         bufIt->second->hasData = false;
       }
-    }
-
-    // If switching to Sync, ensure receive buffer exists
-    if (mode == ReadMode::Sync)
-    {
-      if (_impl->receiveBuffers.find(sid) == _impl->receiveBuffers.end())
+      else
       {
-        _impl->receiveBuffers[sid] = std::make_shared<Impl::SyncReceiveBuffer>();
+        // Buffer is empty — atomically switch mode to Async while holding lock.
+        // The I/O thread will see Async mode on the next data arrival.
+        _impl->readModes[sid] = ReadMode::Async;
+        break;
       }
-    }
-  } // syncMutex released
+    } // syncMutex released before callback invocation (HR-6)
 
-  // Step 2: Flush buffered data via callback with NO locks held (HR-6)
-  if (!flushData.empty())
-  {
-    DataCallback cb;
-    {
-      std::lock_guard<std::mutex> cbLk(_impl->callbackMutex);
-      cb = _impl->onDataCb;
-    }
-    if (cb)
+    if (cb && !flushData.empty())
     {
       cb(sid, iora::core::BufferView{flushData.data(), flushData.size()},
          std::chrono::steady_clock::now());
@@ -823,9 +868,53 @@ inline ConnectResult ITransport::connectSyncCancellable(
   {
     return ConnectResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
-  // Simple implementation: delegate with full timeout.
-  // A more sophisticated version would use sub-timeouts with token checks.
-  return connectSync(host, port, tls, timeout);
+  // Sub-timeout loop: break the total timeout into intervals of at most 100ms
+  // so that cancel() is checked between iterations. connectSync handles the
+  // internal waiting, so each sub-call is capped.
+  constexpr auto subInterval = std::chrono::milliseconds{100};
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto remaining = timeout;
+
+  // For connectSync, we can only call it once (it initiates the connection).
+  // Use the full timeout but poll cancellation via a short sub-timeout.
+  // The first call starts the connection attempt.
+  auto subTimeout = std::min(remaining, subInterval);
+  auto result = connectSync(host, port, tls, subTimeout);
+  if (result.isOk())
+  {
+    return result;
+  }
+  if (result.error().code != TransportError::Timeout)
+  {
+    return result; // Non-timeout error — return immediately
+  }
+
+  // The initial connectSync timed out with the sub-interval. For TCP, the
+  // connection attempt is already in flight. We can't call connectSync again
+  // (it would start a second connection). The connectSync implementation
+  // handles this correctly — the sub-timeout just determines how long we
+  // waited. Since connectSync already cleaned up and returned Timeout, the
+  // session is closed. We need to retry the full connect.
+  while (std::chrono::steady_clock::now() < deadline)
+  {
+    if (token.isCancelled())
+    {
+      return ConnectResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+    }
+    remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero())
+    {
+      break;
+    }
+    subTimeout = std::min(remaining, subInterval);
+    result = connectSync(host, port, tls, subTimeout);
+    if (result.isOk() || result.error().code != TransportError::Timeout)
+    {
+      return result;
+    }
+  }
+  return ConnectResult::err(TransportErrorInfo{TransportError::Timeout, "connectSync timed out"});
 }
 
 inline SendResult ITransport::sendSyncCancellable(
@@ -836,7 +925,14 @@ inline SendResult ITransport::sendSyncCancellable(
   {
     return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
-  return sendSync(sid, data, timeout);
+  // sendSync is non-blocking (enqueue-based), so it completes quickly.
+  // Check cancellation before and after — no sub-timeout loop needed.
+  auto result = sendSync(sid, data, timeout);
+  if (token.isCancelled() && result.isOk())
+  {
+    return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled after send"});
+  }
+  return result;
 }
 
 inline SendResult ITransport::receiveSyncCancellable(
@@ -847,7 +943,35 @@ inline SendResult ITransport::receiveSyncCancellable(
   {
     return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
-  return receiveSync(sid, buffer, len, timeout);
+  // Sub-timeout loop: break the total timeout into intervals so that
+  // cancel() is detected between iterations.
+  constexpr auto subInterval = std::chrono::milliseconds{100};
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+
+  while (std::chrono::steady_clock::now() < deadline)
+  {
+    if (token.isCancelled())
+    {
+      return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+    }
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero())
+    {
+      break;
+    }
+    auto subTimeout = std::min(remaining, subInterval);
+    auto result = receiveSync(sid, buffer, len, subTimeout);
+    if (result.isOk())
+    {
+      return result;
+    }
+    if (result.error().code != TransportError::Timeout)
+    {
+      return result; // Non-timeout error (PeerClosed, etc.) — return immediately
+    }
+  }
+  return SendResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
 }
 
 } // namespace network

@@ -56,7 +56,12 @@ public:
     {
       return StartResult::ok();
     }
-    return StartResult::err(TransportErrorInfo{TransportError::Config, "UDP transport start failed"});
+    auto msg = _impl->lastError();
+    if (msg.empty())
+    {
+      msg = "UDP transport start failed";
+    }
+    return StartResult::err(TransportErrorInfo{TransportError::Config, msg});
   }
 
   void stop() override { _impl->stop(); }
@@ -64,7 +69,12 @@ public:
 
   TransportErrorInfo lastError() const override
   {
-    return TransportErrorInfo{TransportError::None, ""};
+    auto msg = _impl->lastError();
+    if (msg.empty())
+    {
+      return TransportErrorInfo{TransportError::None, ""};
+    }
+    return TransportErrorInfo{TransportError::Unknown, msg};
   }
 
   // ── Connection Management ──────────────────────────────────────────────────

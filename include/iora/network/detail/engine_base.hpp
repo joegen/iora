@@ -19,6 +19,20 @@ namespace network
 namespace detail
 {
 
+/// \brief Abstract engine interface — owned by Transport, never by consumers.
+///
+/// **Hard requirement on connect():** connect() MUST only enqueue a command
+/// for the I/O thread to process asynchronously. It MUST NOT perform any
+/// synchronous I/O, DNS resolution, or callback invocation. This is because
+/// Transport::connectSync() relies on the following ordering:
+///   1. engine->connect() returns a SessionId (command enqueued, not processed)
+///   2. caller registers the SessionId in pendingConnects
+///   3. I/O thread processes the command and fires onConnect/onClose
+///
+/// If connect() were to process synchronously (e.g., fire onConnect before
+/// returning), step 2 would not yet have run, and connectSync would miss the
+/// notification — hanging forever. Every EngineBase implementation must
+/// preserve this enqueue-only contract.
 class EngineBase
 {
 public:
@@ -43,6 +57,11 @@ public:
   // Connection management
   virtual ListenResult addListener(const std::string &bindIp, std::uint16_t port,
                                    TlsMode tlsMode) = 0;
+
+  /// \brief Initiate an outbound connection (async).
+  ///
+  /// MUST only enqueue a command — never process synchronously.
+  /// See class-level documentation for the ordering invariant.
   virtual ConnectResult connect(const std::string &host, std::uint16_t port,
                                 TlsMode tlsMode) = 0;
   virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,

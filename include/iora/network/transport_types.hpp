@@ -245,6 +245,10 @@ public:
 
   bool isCancelled() const { return _cancelled->load(std::memory_order_acquire); }
 
+  /// \brief Reset the token for reuse.
+  /// MUST NOT be called while any sync operation is in flight using this
+  /// token — doing so removes their waiter registration, causing cancel()
+  /// to silently fail to wake them. Create a new token instead if unsure.
   void reset()
   {
     _cancelled->store(false, std::memory_order_release);
