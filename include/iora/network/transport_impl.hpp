@@ -9,7 +9,7 @@
 
 #include "iora/network/transport.hpp"
 #include "iora/network/shared_transport.hpp"
-#include "iora/network/detail/udp_engine.hpp"
+#include "iora/network/shared_transport_udp.hpp"
 // ReadMode and CancellationToken are now in transport_types.hpp (included via transport.hpp)
 
 #include <algorithm>
@@ -354,7 +354,7 @@ inline Transport::Transport(TransportConfig config)
   }
   else
   {
-    _impl->engine = std::make_unique<detail::UdpEngine>(_impl->config);
+    _impl->engine = std::make_unique<SharedUdpTransport>(_impl->config);
   }
   _impl->setupEngineCallbacks();
 }

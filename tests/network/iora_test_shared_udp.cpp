@@ -112,8 +112,8 @@ struct UdpFixture
 TEST_CASE("UDP start/stop idempotent", "[udp]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
-  REQUIRE_FALSE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
+  REQUIRE(f.tx.start().isErr());
   f.tx.stop();
   f.tx.stop();
 }
@@ -121,14 +121,14 @@ TEST_CASE("UDP start/stop idempotent", "[udp]")
 TEST_CASE("UDP loopback echo", "[udp][echo]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   // In UDP, connected should be immediate, but accepted only happens after first data
   REQUIRE(f.waitFor(f.connected));
@@ -151,12 +151,12 @@ TEST_CASE("UDP loopback echo", "[udp][echo]")
 TEST_CASE("UDP rejects TLS mode", "[udp][config]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
-  // Should return 0 and error-callback for TLS attempt
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::Server);
-  REQUIRE(lid == 0);
+  // Should return err for TLS attempt
+  auto lr = f.tx.addListener("127.0.0.1", port, TlsMode::Server);
+  REQUIRE(lr.isErr());
 
   f.tx.stop();
 }
@@ -164,14 +164,13 @@ TEST_CASE("UDP rejects TLS mode", "[udp][config]")
 TEST_CASE("UDP duplicate listener error", "[udp][error]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId a = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(a != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  ListenerId b = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(b != 0); // Returns a valid ID, but bind will fail async
+  // Second bind to same port — may succeed or fail
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
 
   // Give time for async bind error
   std::this_thread::sleep_for(100ms);
@@ -182,10 +181,10 @@ TEST_CASE("UDP duplicate listener error", "[udp][error]")
 TEST_CASE("UDP stats verification", "[udp][stats]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
-  auto stats1 = f.tx.stats();
+  auto stats1 = f.tx.getStats();
   REQUIRE(stats1.connected == 0);
   REQUIRE(stats1.accepted == 0);
   REQUIRE(stats1.bytesIn == 0);
@@ -193,7 +192,7 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
   REQUIRE(stats1.sessionsCurrent == 0);
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -204,7 +203,7 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
 
-  auto stats2 = f.tx.stats();
+  auto stats2 = f.tx.getStats();
   REQUIRE(stats2.connected == 1);
   REQUIRE(stats2.accepted == 1);
   REQUIRE(stats2.bytesIn >= msgLen);    // At least the original message
@@ -215,7 +214,7 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
   f.tx.close(cs);
   REQUIRE(f.waitFor(f.anyClosed));
 
-  auto stats3 = f.tx.stats();
+  auto stats3 = f.tx.getStats();
   REQUIRE(stats3.closed >= 1);
   REQUIRE(stats3.sessionsCurrent == 1); // Server peer still exists
 
@@ -225,11 +224,10 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
 TEST_CASE("UDP multiple simultaneous connections", "[udp][multi]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
   // Create multiple clients
   const int numClients = 5;
@@ -237,9 +235,9 @@ TEST_CASE("UDP multiple simultaneous connections", "[udp][multi]")
 
   for (int i = 0; i < numClients; ++i)
   {
-    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    REQUIRE(cs != 0);
-    clients.push_back(cs);
+    auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+    REQUIRE(cr.isOk());
+    clients.push_back(cr.value());
   }
 
   // Wait for all connections
@@ -256,7 +254,7 @@ TEST_CASE("UDP multiple simultaneous connections", "[udp][multi]")
   REQUIRE(f.waitForCount(f.acceptCount, numClients, 2000));
   REQUIRE(f.waitForCount(f.dataCount, numClients * 2, 2000)); // Original + echo
 
-  auto stats = f.tx.stats();
+  auto stats = f.tx.getStats();
   REQUIRE(stats.accepted == numClients);
   REQUIRE(stats.connected == numClients);
   REQUIRE(stats.sessionsCurrent == numClients * 2); // Clients + server peers
@@ -267,12 +265,13 @@ TEST_CASE("UDP multiple simultaneous connections", "[udp][multi]")
 TEST_CASE("UDP connectViaListener", "[udp][via]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port1 = testnet::getFreePortUDP();
   auto port2 = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
-  REQUIRE(lid != 0);
+  auto lr = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
 
   // Set up a second UDP server to connect to
   SharedUdpTransport::Config cfg2{};
@@ -289,13 +288,11 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
   };
   tx2.setCallbacks(cbs2);
 
-  REQUIRE(tx2.start());
-  ListenerId lid2 = tx2.addListener("127.0.0.1", port2, TlsMode::None);
-  REQUIRE(lid2 != 0);
+  REQUIRE(tx2.start().isOk());
+  REQUIRE(tx2.addListener("127.0.0.1", port2, TlsMode::None).isOk());
 
   // Connect via the first listener to the second server
-  SessionId cs = f.tx.connectViaListener(lid, "127.0.0.1", port2);
-  REQUIRE(cs != 0);
+  SessionId cs = f.tx.connectViaListener(lid, "127.0.0.1", port2).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -316,11 +313,11 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
   UdpFixture f;
   f.cfg.gcInterval = std::chrono::seconds(1);
   f.cfg.maxWriteQueue = 10;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -346,7 +343,7 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
 TEST_CASE("UDP error conditions", "[udp][error]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   SECTION("send to non-existent session")
   {
@@ -363,7 +360,7 @@ TEST_CASE("UDP error conditions", "[udp][error]")
 
   SECTION("invalid address format")
   {
-    SessionId cs = f.tx.connect("not.an.ip.address", 1234, TlsMode::None);
+    SessionId cs = f.tx.connect("not.an.ip.address", 1234, TlsMode::None).value();
     REQUIRE(cs != 0); // ID allocated
 
     // Wait for connect error callback
@@ -376,8 +373,7 @@ TEST_CASE("UDP error conditions", "[udp][error]")
   SECTION("connect via non-existent listener")
   {
     ListenerId fakeLid = 9999;
-    SessionId cs = f.tx.connectViaListener(fakeLid, "127.0.0.1", 1234);
-    REQUIRE(cs != 0); // ID allocated
+    (void)f.tx.connectViaListener(fakeLid, "127.0.0.1", 1234); // ID allocated
 
     // Wait a bit
     std::this_thread::sleep_for(100ms);
@@ -396,11 +392,11 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   f.cfg.gcInterval = std::chrono::seconds(1);
   f.cfg.maxConnAge = std::chrono::seconds(0); // Disabled
 
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -408,14 +404,14 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.accepted));
 
-  auto stats1 = f.tx.stats();
+  auto stats1 = f.tx.getStats();
   REQUIRE(stats1.sessionsCurrent == 2);
 
   // Wait for idle timeout + GC interval (need to ensure GC runs)
   // GC timer might not be properly armed, so we just check that sessions exist
   std::this_thread::sleep_for(3000ms);
 
-  (void)f.tx.stats();
+  (void)f.tx.getStats();
   // Note: GC timer implementation might not be working in tests
   // Just verify basic functionality
   // sessionsCurrent is unsigned, so >= 0 check is always true
@@ -431,11 +427,11 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   f.cfg.maxConnAge = std::chrono::seconds(1);
   f.cfg.gcInterval = std::chrono::seconds(1);
 
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -443,7 +439,7 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.accepted));
 
-  auto stats1 = f.tx.stats();
+  auto stats1 = f.tx.getStats();
   REQUIRE(stats1.sessionsCurrent == 2);
 
   // Keep sending to prevent idle timeout
@@ -456,7 +452,7 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   // After max age, sessions might be closed
   std::this_thread::sleep_for(1000ms);
 
-  (void)f.tx.stats();
+  (void)f.tx.getStats();
   // Note: GC timer implementation might not be working in tests
   // Just verify basic functionality
   // sessionsCurrent is unsigned, so >= 0 check is always true
@@ -471,7 +467,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   f.cfg.maxWriteQueue = 5;
   f.cfg.closeOnBackpressure = true;
 
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
@@ -488,11 +484,11 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   };
   tx2.setCallbacks(cbs2);
 
-  REQUIRE(tx2.start());
+  REQUIRE(tx2.start().isOk());
   auto port2 = testnet::getFreePortUDP();
   (void)tx2.addListener("127.0.0.1", port2, TlsMode::None);
 
-  SessionId cs = f.tx.connect("127.0.0.1", port2, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port2, TlsMode::None).value();
   REQUIRE(f.waitFor(f.connected));
 
   // Spam messages to trigger backpressure
@@ -504,7 +500,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
 
   std::this_thread::sleep_for(100ms);
 
-  (void)f.tx.stats();
+  (void)f.tx.getStats();
   // Should have some backpressure events if queue filled
   // Note: UDP might not actually trigger backpressure easily
 
@@ -515,17 +511,18 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
 TEST_CASE("UDP IPv6 support", "[udp][ipv6]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
 
   // Try IPv6 loopback
-  ListenerId lid = f.tx.addListener("::1", port, TlsMode::None);
+  auto lr6 = f.tx.addListener("::1", port, TlsMode::None);
 
-  if (lid != 0) // Only if IPv6 is available
+  if (lr6.isOk()) // Only if IPv6 is available
   {
-    SessionId cs = f.tx.connect("::1", port, TlsMode::None);
-    REQUIRE(cs != 0);
+    auto cr6 = f.tx.connect("::1", port, TlsMode::None);
+    REQUIRE(cr6.isOk());
+    SessionId cs = cr6.value();
 
     REQUIRE(f.waitFor(f.connected));
 
@@ -543,11 +540,11 @@ TEST_CASE("UDP IPv6 support", "[udp][ipv6]")
 TEST_CASE("UDP large data transfer", "[udp][large]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -573,30 +570,31 @@ TEST_CASE("UDP large data transfer", "[udp][large]")
 TEST_CASE("UDP multiple listeners", "[udp][multi-listener]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port1 = testnet::getFreePortUDP();
   auto port2 = testnet::getFreePortUDP();
   auto port3 = testnet::getFreePortUDP();
 
-  ListenerId lid1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
-  ListenerId lid2 = f.tx.addListener("127.0.0.1", port2, TlsMode::None);
-  ListenerId lid3 = f.tx.addListener("127.0.0.1", port3, TlsMode::None);
-
-  REQUIRE(lid1 != 0);
-  REQUIRE(lid2 != 0);
-  REQUIRE(lid3 != 0);
-  REQUIRE(lid1 != lid2);
-  REQUIRE(lid2 != lid3);
+  auto lr1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
+  auto lr2 = f.tx.addListener("127.0.0.1", port2, TlsMode::None);
+  auto lr3 = f.tx.addListener("127.0.0.1", port3, TlsMode::None);
+  REQUIRE(lr1.isOk());
+  REQUIRE(lr2.isOk());
+  REQUIRE(lr3.isOk());
+  REQUIRE(lr1.value() != lr2.value());
+  REQUIRE(lr2.value() != lr3.value());
 
   // Connect to each listener
-  SessionId cs1 = f.tx.connect("127.0.0.1", port1, TlsMode::None);
-  SessionId cs2 = f.tx.connect("127.0.0.1", port2, TlsMode::None);
-  SessionId cs3 = f.tx.connect("127.0.0.1", port3, TlsMode::None);
-
-  REQUIRE(cs1 != 0);
-  REQUIRE(cs2 != 0);
-  REQUIRE(cs3 != 0);
+  auto cr1 = f.tx.connect("127.0.0.1", port1, TlsMode::None);
+  auto cr2 = f.tx.connect("127.0.0.1", port2, TlsMode::None);
+  auto cr3 = f.tx.connect("127.0.0.1", port3, TlsMode::None);
+  REQUIRE(cr1.isOk());
+  REQUIRE(cr2.isOk());
+  REQUIRE(cr3.isOk());
+  SessionId cs1 = cr1.value();
+  SessionId cs2 = cr2.value();
+  SessionId cs3 = cr3.value();
 
   REQUIRE(f.waitForCount(f.connectCount, 3));
 
@@ -607,7 +605,7 @@ TEST_CASE("UDP multiple listeners", "[udp][multi-listener]")
 
   REQUIRE(f.waitForCount(f.acceptCount, 3));
 
-  auto stats = f.tx.stats();
+  auto stats = f.tx.getStats();
   REQUIRE(stats.accepted == 3);
   REQUIRE(stats.connected == 3);
 
@@ -620,11 +618,11 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
   {
     UdpFixture f;
     f.cfg.useEdgeTriggered = true;
-    REQUIRE(f.tx.start());
+    REQUIRE(f.tx.start().isOk());
 
     auto port = testnet::getFreePortUDP();
     (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
     REQUIRE(f.waitFor(f.connected));
 
@@ -640,11 +638,11 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
   {
     UdpFixture f;
     f.cfg.useEdgeTriggered = false;
-    REQUIRE(f.tx.start());
+    REQUIRE(f.tx.start().isOk());
 
     auto port = testnet::getFreePortUDP();
     (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
     REQUIRE(f.waitFor(f.connected));
 
@@ -660,7 +658,7 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
 TEST_CASE("UDP synchronous listener API", "[udp][sync]")
 {
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   SECTION("successful bind")
   {
@@ -707,7 +705,7 @@ TEST_CASE("UDP session limits", "[udp][limits]")
 {
   UdpFixture f;
   f.cfg.maxSessions = 4; // Set limit to 4 (2 clients + 2 server peers)
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
@@ -716,9 +714,9 @@ TEST_CASE("UDP session limits", "[udp][limits]")
   std::vector<SessionId> clients;
   for (int i = 0; i < 2; ++i)
   {
-    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    REQUIRE(cs != 0);
-    clients.push_back(cs);
+    auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+    REQUIRE(cr.isOk());
+    clients.push_back(cr.value());
   }
 
   REQUIRE(f.waitForCount(f.connectCount, 2));
@@ -729,18 +727,17 @@ TEST_CASE("UDP session limits", "[udp][limits]")
 
   std::this_thread::sleep_for(100ms);
 
-  auto stats = f.tx.stats();
+  auto stats = f.tx.getStats();
   REQUIRE(stats.sessionsCurrent <= f.cfg.maxSessions);
 
   // Now try to create another client - should still work
-  SessionId cs3 = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs3 != 0);
+  SessionId cs3 = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   // But sending from it should not create a new server peer (would exceed limit)
   REQUIRE(f.tx.send(cs3, "test3", 5));
   std::this_thread::sleep_for(100ms);
 
-  auto stats2 = f.tx.stats();
+  auto stats2 = f.tx.getStats();
   // Session count should be reasonable (3 clients + up to 2 server peers)
   // The limit applies to preventing new server peer creation
   REQUIRE(stats2.sessionsCurrent <= 6); // Maximum possible: 3 clients + 3 peers
@@ -753,11 +750,11 @@ TEST_CASE("UDP socket buffer configuration", "[udp][socket]")
   UdpFixture f;
   f.cfg.soRcvBuf = 256 * 1024;
   f.cfg.soSndBuf = 256 * 1024;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
   REQUIRE(f.waitFor(f.connected));
 
@@ -776,15 +773,15 @@ TEST_CASE("UDP self-loopback via listener", "[udp][loopback][via]")
   // to itself via the listener (e.g., SIP proxy routing to itself).
   // The packet is sent from listener:port TO listener:port.
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  auto lrSelf = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(lrSelf.isOk());
+  ListenerId lid = lrSelf.value();
 
   // Connect via the listener TO THE SAME listener address (self-loopback)
-  SessionId cs = f.tx.connectViaListener(lid, "127.0.0.1", port);
-  REQUIRE(cs != 0);
+  SessionId cs = f.tx.connectViaListener(lid, "127.0.0.1", port).value();
   REQUIRE(f.waitFor(f.connected));
 
   // Send to self
@@ -810,7 +807,7 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
   // This is important for protocols that use multiple logical connections
   // to the same remote address (e.g., SIP dialogs).
   UdpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port1 = testnet::getFreePortUDP();
   auto port2 = testnet::getFreePortUDP();
 
@@ -832,29 +829,26 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
   };
   tx2.setCallbacks(cbs2);
 
-  REQUIRE(tx2.start());
-  ListenerId lid2 = tx2.addListener("127.0.0.1", port2, TlsMode::None);
-  REQUIRE(lid2 != 0);
+  REQUIRE(tx2.start().isOk());
+  REQUIRE(tx2.addListener("127.0.0.1", port2, TlsMode::None).isOk());
 
   // Create a listener to connect via
-  ListenerId lid1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
-  REQUIRE(lid1 != 0);
+  auto lrMulti = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
+  REQUIRE(lrMulti.isOk());
+  ListenerId lid1 = lrMulti.value();
 
   // Connect via the first listener to the server - multiple times
-  SessionId cs1 = f.tx.connectViaListener(lid1, "127.0.0.1", port2);
-  REQUIRE(cs1 != 0);
+  SessionId cs1 = f.tx.connectViaListener(lid1, "127.0.0.1", port2).value();
   REQUIRE(f.waitFor(f.connected));
 
   // Reset and connect again (same peer, different SessionId)
   f.connected = false;
-  SessionId cs2 = f.tx.connectViaListener(lid1, "127.0.0.1", port2);
-  REQUIRE(cs2 != 0);
+  SessionId cs2 = f.tx.connectViaListener(lid1, "127.0.0.1", port2).value();
   REQUIRE(cs2 != cs1); // Different SessionId
   REQUIRE(f.waitFor(f.connected));
 
   f.connected = false;
-  SessionId cs3 = f.tx.connectViaListener(lid1, "127.0.0.1", port2);
-  REQUIRE(cs3 != 0);
+  SessionId cs3 = f.tx.connectViaListener(lid1, "127.0.0.1", port2).value();
   REQUIRE(cs3 != cs1);
   REQUIRE(cs3 != cs2);
   REQUIRE(f.waitFor(f.connected));

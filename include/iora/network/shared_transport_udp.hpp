@@ -12,6 +12,7 @@
 
 #include "circuit_breaker.hpp"
 #include "connection_health.hpp"
+#include "detail/engine_base.hpp"
 #include "object_pool.hpp"
 #include "transport_types.hpp"
 #include <arpa/inet.h>
@@ -43,11 +44,11 @@ namespace iora
 namespace network
 {
 
-class SharedUdpTransport
+class SharedUdpTransport : public detail::EngineBase
 {
 public:
   /// \brief Returns the last error message from a failed operation.
-  std::string lastError() const
+  std::string lastErrorMessage() const
   {
     std::lock_guard<std::mutex> lock(_errorMutex);
     return _lastError;
@@ -130,6 +131,12 @@ public:
   {
   }
 
+  /// \brief Construct from TransportConfig (EngineBase-compatible config).
+  explicit SharedUdpTransport(const TransportConfig &config)
+    : SharedUdpTransport(configFromTransport(config), TlsConfig{}, TlsConfig{})
+  {
+  }
+
   ~SharedUdpTransport() noexcept
   {
     try
@@ -145,7 +152,7 @@ public:
   SharedUdpTransport(const SharedUdpTransport &) = delete;
   SharedUdpTransport &operator=(const SharedUdpTransport &) = delete;
 
-  void detachForTermination()
+  void detachForTermination() override
   {
     _running.store(false, std::memory_order_release);
     if (_loop.joinable())
@@ -160,24 +167,24 @@ public:
     _cbs = c;
   }
 
-  bool start()
+  StartResult start() override
   {
     bool exp = false;
     if (!_running.compare_exchange_strong(exp, true))
-      return false;
+      return StartResult::err(TransportErrorInfo{TransportError::Config, "already running"});
     _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
     if (_epollFd < 0)
     {
       error(TransportError::Config, "epoll_create1: " + lastErr());
       _running.store(false);
-      return false;
+      return StartResult::err(TransportErrorInfo{TransportError::Config, "epoll_create1: " + lastErr()});
     }
     _eventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (_eventFd < 0)
     {
       error(TransportError::Config, "eventfd: " + lastErr());
       cleanupFail();
-      return false;
+      return StartResult::err(TransportErrorInfo{TransportError::Config, "eventfd: " + lastErr()});
     }
     addEpoll(_eventFd, EPOLLIN);
     _timerFd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -185,7 +192,7 @@ public:
     {
       error(TransportError::Config, "timerfd_create: " + lastErr());
       cleanupFail();
-      return false;
+      return StartResult::err(TransportErrorInfo{TransportError::Config, "timerfd_create: " + lastErr()});
     }
     addEpoll(_timerFd, EPOLLIN);
     armGc(_cfg.gcInterval);
@@ -197,9 +204,9 @@ public:
       pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
       loop();
     });
-    return true;
+    return StartResult::ok();
   }
-  void stop()
+  void stop() override
   {
     bool exp = true;
     if (!_running.compare_exchange_strong(exp, false))
@@ -209,13 +216,13 @@ public:
       _loop.join();
   }
 
-  // Legacy async interface - returns ID immediately, validates later
-  ListenerId addListener(const std::string &bind, uint16_t port, TlsMode tls)
+  ListenResult addListener(const std::string &bind, uint16_t port, TlsMode tls) override
   {
     if (tls != TlsMode::None)
     {
       error(TransportError::Config, "UDP does not support TLS/DTLS");
-      return 0;
+      return ListenResult::err(
+        TransportErrorInfo{TransportError::Config, "TLS/DTLS not supported on UDP"});
     }
     ListenerCfg lc;
     lc.id = _nextListenerId++;
@@ -228,13 +235,19 @@ public:
       auto fut = ready->get_future();
       enqueue(Cmd::addListener(lc, std::move(ready)));
       bool ok = fut.get();
-      return ok ? lc.id : 0;
+      if (!ok)
+      {
+        return ListenResult::err(
+          TransportErrorInfo{TransportError::Bind,
+            "bind/listen failed on " + bind + ":" + std::to_string(port)});
+      }
+      return ListenResult::ok(lc.id);
     }
     else
     {
       enqueue(Cmd::addListener(lc));
     }
-    return lc.id;
+    return ListenResult::ok(lc.id);
   }
 
   // New synchronous interface - validates immediately
@@ -261,25 +274,29 @@ public:
 
     return ListenerResult::success(lc.id, bind + ":" + std::to_string(port));
   }
-  SessionId connect(const std::string &host, uint16_t port, TlsMode tls)
+  ConnectResult connect(const std::string &host, uint16_t port, TlsMode tls) override
   {
+    if (tls != TlsMode::None)
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::Config, "TLS/DTLS not supported on UDP"});
+    }
     SessionId sid = _nextSessionId++;
     ConnectReq cr;
     cr.sid = sid;
     cr.host = host;
     cr.port = port;
-    cr.rejectTls = (tls != TlsMode::None);
     enqueue(Cmd::connect(cr));
-    return sid;
+    return ConnectResult::ok(sid);
   }
-  SessionId connectViaListener(ListenerId lid, const std::string &host, uint16_t port)
+  ConnectResult connectViaListener(ListenerId lid, const std::string &host, uint16_t port) override
   {
     SessionId sid = _nextSessionId++;
     ViaReq vr{sid, lid, host, port};
     enqueue(Cmd::via(vr));
-    return sid;
+    return ConnectResult::ok(sid);
   }
-  bool send(SessionId sid, const void *p, std::size_t n)
+  bool send(SessionId sid, const void *p, std::size_t n) override
   {
     if (n == 0)
       return true;
@@ -290,33 +307,163 @@ public:
     sr.payload = std::move(b);
     return enqueue(Cmd::send(std::move(sr)));
   }
-  bool close(SessionId sid) { return enqueue(Cmd::close(sid)); }
-  bool isRunning() const { return _running.load(std::memory_order_acquire); }
-  std::thread::id getIoThreadId() const { return _loop.get_id(); }
+  bool close(SessionId sid) override { return enqueue(Cmd::close(sid)); }
+  bool isRunning() const override { return _running.load(std::memory_order_acquire); }
+  std::thread::id getIoThreadId() const override { return _loop.get_id(); }
   void reconfigure(const Config &cfg) { enqueue(Cmd::reconf(cfg)); }
-  Stats stats() const
+  TransportStats getStats() const override
   {
-    Stats copy;
-    copy.accepted = _atomicStats.accepted.load();
-    copy.connected = _atomicStats.connected.load();
-    copy.closed = _atomicStats.closed.load();
-    copy.errors = _atomicStats.errors.load();
-    copy.tlsHandshakes = _atomicStats.tlsHandshakes.load();
-    copy.tlsFailures = _atomicStats.tlsFailures.load();
-    copy.bytesIn = _atomicStats.bytesIn.load();
-    copy.bytesOut = _atomicStats.bytesOut.load();
-    copy.epollWakeups = _atomicStats.epollWakeups.load();
-    copy.commands = _atomicStats.commands.load();
-    copy.gcRuns = _atomicStats.gcRuns.load();
-    copy.gcClosedIdle = _atomicStats.gcClosedIdle.load();
-    copy.gcClosedAged = _atomicStats.gcClosedAged.load();
-    copy.backpressureCloses = _atomicStats.backpressureCloses.load();
-    copy.sessionsCurrent = _atomicStats.sessionsCurrent.load();
-    copy.sessionsPeak = _atomicStats.sessionsPeak.load();
-    return copy;
+    TransportStats ts;
+    ts.accepted = _atomicStats.accepted.load();
+    ts.connected = _atomicStats.connected.load();
+    ts.closed = _atomicStats.closed.load();
+    ts.errors = _atomicStats.errors.load();
+    ts.tlsHandshakes = _atomicStats.tlsHandshakes.load();
+    ts.tlsFailures = _atomicStats.tlsFailures.load();
+    ts.bytesIn = _atomicStats.bytesIn.load();
+    ts.bytesOut = _atomicStats.bytesOut.load();
+    ts.epollWakeups = _atomicStats.epollWakeups.load();
+    ts.commands = _atomicStats.commands.load();
+    ts.gcRuns = _atomicStats.gcRuns.load();
+    ts.gcClosedIdle = _atomicStats.gcClosedIdle.load();
+    ts.gcClosedAged = _atomicStats.gcClosedAged.load();
+    ts.backpressureCloses = _atomicStats.backpressureCloses.load();
+    ts.sessionsCurrent = _atomicStats.sessionsCurrent.load();
+    ts.sessionsPeak = _atomicStats.sessionsPeak.load();
+    return ts;
   }
 
+  // ── EngineBase overrides ──────────────────────────────────────────────────
+
+  TransportErrorInfo lastError() const override
+  {
+    auto msg = lastErrorMessage();
+    if (msg.empty())
+    {
+      return TransportErrorInfo{TransportError::None, ""};
+    }
+    return TransportErrorInfo{TransportError::Unknown, msg};
+  }
+
+  void sendAsync(SessionId sid, const void *data, std::size_t len,
+                 SendCompleteCallback cb) override
+  {
+    bool ok = send(sid, data, len);
+    if (cb)
+    {
+      if (ok)
+      {
+        cb(sid, SendResult::ok(len));
+      }
+      else
+      {
+        cb(sid, SendResult::err(TransportErrorInfo{TransportError::Socket, "send enqueue failed"}));
+      }
+    }
+  }
+
+  void setCallbacks(detail::EngineBase::Callbacks cbs) override
+  {
+    Callbacks legacy;
+
+    auto engineOnAccept = std::move(cbs.onAccept);
+    auto engineOnConnect = std::move(cbs.onConnect);
+    auto engineOnData = std::move(cbs.onData);
+    auto engineOnClose = std::move(cbs.onClose);
+    auto engineOnError = std::move(cbs.onError);
+
+    if (engineOnAccept)
+    {
+      legacy.onAccept = [cb = std::move(engineOnAccept)](SessionId sid, const std::string &peer,
+                                                         const IoResult &)
+      {
+        auto colon = peer.rfind(':');
+        TransportAddress addr;
+        if (colon != std::string::npos)
+        {
+          addr.host = peer.substr(0, colon);
+          try
+          {
+            addr.port = static_cast<std::uint16_t>(std::stoi(peer.substr(colon + 1)));
+          }
+          catch (...)
+          {
+            addr.port = 0;
+          }
+        }
+        else
+        {
+          addr.host = peer;
+        }
+        cb(sid, addr);
+      };
+    }
+
+    if (engineOnConnect)
+    {
+      auto closeCb = engineOnClose;
+      legacy.onConnect = [connectCb = std::move(engineOnConnect), closeCb](SessionId sid,
+                                                                           const IoResult &r)
+      {
+        if (r.ok)
+        {
+          connectCb(sid, TransportAddress{});
+        }
+        else if (closeCb)
+        {
+          closeCb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError});
+        }
+      };
+    }
+
+    if (engineOnData)
+    {
+      legacy.onData = [cb = std::move(engineOnData)](SessionId sid, const std::uint8_t *data,
+                                                     std::size_t len, const IoResult &)
+      { cb(sid, iora::core::BufferView{data, len}, std::chrono::steady_clock::now()); };
+    }
+
+    if (engineOnClose)
+    {
+      legacy.onClosed = [cb = std::move(engineOnClose)](SessionId sid, const IoResult &r)
+      { cb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError}); };
+    }
+
+    if (engineOnError)
+    {
+      legacy.onError = std::move(engineOnError);
+    }
+
+    setCallbacks(legacy);
+  }
+
+  TransportAddress getListenerAddress(ListenerId) const override { return {}; }
+  TransportAddress getLocalAddress(SessionId) const override { return {}; }
+  TransportAddress getRemoteAddress(SessionId) const override { return {}; }
+  bool setDscp(SessionId, std::uint8_t) override { return false; }
+
 private:
+  static Config configFromTransport(const TransportConfig &tc)
+  {
+    Config c;
+    c.epollMaxEvents = tc.epollMaxEvents;
+    c.ioReadChunk = tc.ioReadChunk;
+    c.maxWriteQueue = tc.maxWriteQueue;
+    c.idleTimeout = tc.idleTimeout;
+    c.maxConnAge = tc.maxConnAge;
+    c.handshakeTimeout = std::chrono::duration_cast<std::chrono::seconds>(tc.handshakeTimeout);
+    c.gcInterval = tc.gcInterval;
+    c.maxSessions = tc.maxSessions;
+    c.listenBacklog = tc.listenBacklog;
+    c.useEdgeTriggered = tc.useEdgeTriggered;
+    c.closeOnBackpressure = tc.closeOnBackpressure;
+    c.soRcvBuf = tc.soRcvBuf;
+    c.soSndBuf = tc.soSndBuf;
+    c.connectTimeout = std::chrono::duration_cast<std::chrono::seconds>(tc.connectTimeout);
+    c.writeStallTimeout = std::chrono::duration_cast<std::chrono::seconds>(tc.writeStallTimeout);
+    return c;
+  }
+
   static std::string lastErr()
   {
     int e = errno;
@@ -401,7 +548,6 @@ private:
     SessionId sid{};
     std::string host;
     uint16_t port{};
-    bool rejectTls{false};
   };
   struct ViaReq
   {
@@ -888,16 +1034,6 @@ private:
 
   bool connectDo(const ConnectReq &cr)
   {
-    if (cr.rejectTls)
-    {
-      {
-        std::lock_guard<std::mutex> g(_cb);
-        if (_cbs.onConnect)
-          _cbs.onConnect(cr.sid,
-                         IoResult::failure(TransportError::Config, "UDP: TLS/DTLS not supported"));
-      }
-      return false;
-    }
     addrinfo *res = nullptr;
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
