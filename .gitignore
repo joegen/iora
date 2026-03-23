@@ -1,6 +1,7 @@
 # Build directories
 build/
 build_*/
+build-*/
 _build/
 _deps/
 
@@ -59,6 +60,9 @@ Testing/
 *.swo
 *~
 .DS_Store
+
+# Runtime state files
+ioraservice_*.json
 
 # Claude Code
 CLAUDE.md
