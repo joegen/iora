@@ -289,7 +289,7 @@ struct Transport::Impl
         // GC stale tombstones when map grows beyond threshold.
         // Stale = closed with no pending data and no waiters (hasData==false).
         // This caps memory to O(threshold + concurrent closes between GCs).
-        constexpr std::size_t gcThreshold = 1024;
+        const std::size_t gcThreshold = config.syncBufferGcThreshold;
         if (receiveBuffers.size() > gcThreshold)
         {
           for (auto it = receiveBuffers.begin(); it != receiveBuffers.end();)
@@ -600,8 +600,8 @@ inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data
   return SendResult::err(TransportErrorInfo{TransportError::Socket, "send failed"});
 }
 
-inline SendResult Transport::receiveSync(SessionId sid, void *buffer, std::size_t &len,
-                                         std::chrono::milliseconds timeout)
+inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::size_t &len,
+                                            std::chrono::milliseconds timeout)
 {
   if (_impl->engine->isRunning() &&
       std::this_thread::get_id() == _impl->engine->getIoThreadId())
@@ -635,14 +635,14 @@ inline SendResult Transport::receiveSync(SessionId sid, void *buffer, std::size_
       _impl->receiveBuffers.erase(sid);
       _impl->readModes.erase(sid);
     }
-    return SendResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
+    return ReceiveResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
   }
   if (buf->closed)
   {
     // Clean up tombstone to prevent unbounded receiveBuffers growth
     _impl->receiveBuffers.erase(sid);
     _impl->readModes.erase(sid);
-    return SendResult::err(TransportErrorInfo{TransportError::PeerClosed, "session closed"});
+    return ReceiveResult::err(TransportErrorInfo{TransportError::PeerClosed, "session closed"});
   }
 
   std::size_t copyLen = std::min(len, buf->data.size());
@@ -650,7 +650,7 @@ inline SendResult Transport::receiveSync(SessionId sid, void *buffer, std::size_
   buf->data.erase(buf->data.begin(), buf->data.begin() + static_cast<std::ptrdiff_t>(copyLen));
   buf->hasData = !buf->data.empty();
   len = copyLen;
-  return SendResult::ok(copyLen);
+  return ReceiveResult::ok(copyLen);
 }
 
 // ── Read Modes ───────────────────────────────────────────────────────────────
@@ -935,13 +935,13 @@ inline SendResult ITransport::sendSyncCancellable(
   return result;
 }
 
-inline SendResult ITransport::receiveSyncCancellable(
+inline ReceiveResult ITransport::receiveSyncCancellable(
   SessionId sid, void *buffer, std::size_t &len, CancellationToken &token,
   std::chrono::milliseconds timeout)
 {
   if (token.isCancelled())
   {
-    return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+    return ReceiveResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
   // Sub-timeout loop: break the total timeout into intervals so that
   // cancel() is detected between iterations.
@@ -952,7 +952,7 @@ inline SendResult ITransport::receiveSyncCancellable(
   {
     if (token.isCancelled())
     {
-      return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
+      return ReceiveResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
     }
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
       deadline - std::chrono::steady_clock::now());
@@ -971,7 +971,7 @@ inline SendResult ITransport::receiveSyncCancellable(
       return result; // Non-timeout error (PeerClosed, etc.) — return immediately
     }
   }
-  return SendResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
+  return ReceiveResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
 }
 
 } // namespace network

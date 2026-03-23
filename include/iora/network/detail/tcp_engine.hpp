@@ -352,6 +352,10 @@ public:
       TransportErrorInfo{TransportError::Config, "connectViaListener not supported on TCP/TLS"});
   }
 
+  /// \note The completion callback fires synchronously on the caller's thread
+  /// after the send command is enqueued (not after wire delivery). This is
+  /// intentional — the result reflects whether the command was accepted by
+  /// the I/O thread's queue, not whether data reached the peer.
   void sendAsync(SessionId sid, const void *data, std::size_t len,
                  SendCompleteCallback cb) override
   {
@@ -1215,7 +1219,7 @@ private:
       ::close(sfd);
       return false;
     }
-    if (::listen(sfd, 256) < 0)
+    if (::listen(sfd, _config.listenBacklog) < 0)
     {
       err(TransportError::Listen, "listen: " + lastErr());
       ::close(sfd);
@@ -1773,8 +1777,7 @@ private:
   {
     // Only check timeout here if high-resolution timers are not available
     if (!_timerService && _config.handshakeTimeout.count() > 0 &&
-        (MonoClock::now() - s->tlsStart) >
-          std::chrono::duration_cast<std::chrono::seconds>(_config.handshakeTimeout))
+        (MonoClock::now() - s->tlsStart) > _config.handshakeTimeout)
     {
       closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", 0);
       return false;
@@ -2285,8 +2288,7 @@ private:
       {
         if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake &&
             _config.handshakeTimeout.count() > 0 &&
-            (now - s->tlsStart) >
-              std::chrono::duration_cast<std::chrono::seconds>(_config.handshakeTimeout))
+            (now - s->tlsStart) > _config.handshakeTimeout)
         {
           toClose.push_back(s->id);
           continue;
@@ -2294,8 +2296,7 @@ private:
 
         // Safety-net: connect timeout
         if (_config.connectTimeout.count() > 0 && s->connectPending &&
-            (now - s->connectStart) >
-              std::chrono::duration_cast<std::chrono::seconds>(_config.connectTimeout))
+            (now - s->connectStart) > _config.connectTimeout)
         {
           toClose.push_back(s->id);
           continue;
@@ -2303,8 +2304,7 @@ private:
 
         // Safety-net: write stall with queued data
         if (_config.writeStallTimeout.count() > 0 && !s->wq.empty() &&
-            (now - s->lastWriteProgress) >
-              std::chrono::duration_cast<std::chrono::seconds>(_config.writeStallTimeout))
+            (now - s->lastWriteProgress) > _config.writeStallTimeout)
         {
           toClose.push_back(s->id);
           continue;
@@ -2426,7 +2426,8 @@ private:
         ::SSL_CTX_set_verify(_sslSrv, SSL_VERIFY_PEER, nullptr);
         if (!_config.serverTls.caFile.empty())
         {
-          if (::SSL_CTX_load_verify_locations(_sslSrv, _config.serverTls.caFile.c_str(), nullptr) != 1)
+          if (::SSL_CTX_load_verify_locations(_sslSrv, _config.serverTls.caFile.c_str(),
+                _config.serverTls.caPath.empty() ? nullptr : _config.serverTls.caPath.c_str()) != 1)
           {
             setLastFatal(IoResult::failure(TransportError::Config, "server load CA failed"));
             err(TransportError::Config, "server load CA");
@@ -2437,6 +2438,14 @@ private:
         {
           ::SSL_CTX_set_default_verify_paths(_sslSrv);
         }
+      }
+      if (_config.serverTls.verifyDepth > 0)
+      {
+        ::SSL_CTX_set_verify_depth(_sslSrv, _config.serverTls.verifyDepth);
+      }
+      if (_config.serverTls.minVersion > 0)
+      {
+        ::SSL_CTX_set_min_proto_version(_sslSrv, _config.serverTls.minVersion);
       }
       if (!_config.serverTls.alpn.empty())
       {
@@ -2534,7 +2543,8 @@ private:
         ::SSL_CTX_set_verify(_sslCli, SSL_VERIFY_PEER, nullptr);
         if (!_config.clientTls.caFile.empty())
         {
-          if (::SSL_CTX_load_verify_locations(_sslCli, _config.clientTls.caFile.c_str(), nullptr) != 1)
+          if (::SSL_CTX_load_verify_locations(_sslCli, _config.clientTls.caFile.c_str(),
+                _config.clientTls.caPath.empty() ? nullptr : _config.clientTls.caPath.c_str()) != 1)
           {
             setLastFatal(IoResult::failure(TransportError::Config, "client load CA failed"));
             err(TransportError::Config, "client load CA");
@@ -2545,6 +2555,14 @@ private:
         {
           ::SSL_CTX_set_default_verify_paths(_sslCli);
         }
+      }
+      if (_config.clientTls.verifyDepth > 0)
+      {
+        ::SSL_CTX_set_verify_depth(_sslCli, _config.clientTls.verifyDepth);
+      }
+      if (_config.clientTls.minVersion > 0)
+      {
+        ::SSL_CTX_set_min_proto_version(_sslCli, _config.clientTls.minVersion);
       }
       if (!_config.clientTls.alpn.empty())
       {

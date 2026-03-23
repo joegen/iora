@@ -202,8 +202,10 @@ struct TransportErrorInfo
 using ObserverId = std::uint64_t;
 
 // Result<T,E> aliases for Transport API return types.
-// Note: IoResult alias deferred to Phase 3 (name conflicts with legacy IoResult struct above).
+// IoResult alias: deferred until legacy IoResult struct (above) is removed from
+// engine internals. The legacy struct is used only by TcpEngine::lastFatalError().
 using SendResult = Result<std::size_t, TransportErrorInfo>;
+using ReceiveResult = Result<std::size_t, TransportErrorInfo>;
 using StartResult = Result<void, TransportErrorInfo>;
 using ListenResult = Result<ListenerId, TransportErrorInfo>;
 using ConnectResult = Result<SessionId, TransportErrorInfo>;
@@ -228,16 +230,16 @@ using SessionCleanupCallback = std::function<void(void *userData)>;
 class CancellationToken
 {
 public:
-  CancellationToken() : _cancelled(std::make_shared<std::atomic<bool>>(false)) {}
+  CancellationToken() = default;
 
   CancellationToken(const CancellationToken &) = delete;
   CancellationToken &operator=(const CancellationToken &) = delete;
-  CancellationToken(CancellationToken &&) = default;
-  CancellationToken &operator=(CancellationToken &&) = default;
+  CancellationToken(CancellationToken &&) = delete;
+  CancellationToken &operator=(CancellationToken &&) = delete;
 
   void cancel()
   {
-    _cancelled->store(true, std::memory_order_release);
+    _cancelled.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lock(_mutex);
     for (auto &cv : _waiters)
     {
@@ -245,7 +247,7 @@ public:
     }
   }
 
-  bool isCancelled() const { return _cancelled->load(std::memory_order_acquire); }
+  bool isCancelled() const { return _cancelled.load(std::memory_order_acquire); }
 
   /// \brief Reset the token for reuse.
   /// MUST NOT be called while any sync operation is in flight using this
@@ -253,7 +255,7 @@ public:
   /// to silently fail to wake them. Create a new token instead if unsure.
   void reset()
   {
-    _cancelled->store(false, std::memory_order_release);
+    _cancelled.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lock(_mutex);
     _waiters.clear();
   }
@@ -271,7 +273,7 @@ public:
   }
 
 private:
-  std::shared_ptr<std::atomic<bool>> _cancelled;
+  std::atomic<bool> _cancelled{false};
   mutable std::mutex _mutex;
   std::vector<std::shared_ptr<std::condition_variable>> _waiters;
 };
@@ -303,6 +305,7 @@ struct TransportConfig
   int soSndBuf{0};
   std::uint8_t dscpValue{0};
   bool enableHighResolutionTimers{true};
+  int listenBacklog{256};
 
   struct TcpKeepalive
   {
@@ -314,11 +317,11 @@ struct TransportConfig
 
   // === UDP-specific ===
   std::size_t maxSessions{0};
-  int listenBacklog{0};
 
   // === Sync operations ===
   std::size_t maxPendingSyncOps{32};
   std::size_t maxSyncReceiveBuffer{1024 * 1024};
+  std::size_t syncBufferGcThreshold{1024};
   std::chrono::milliseconds defaultSyncTimeout{30000};
   bool allowReadModeSwitch{true};
   bool autoHealthMonitoring{true};

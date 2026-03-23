@@ -284,6 +284,10 @@ public:
     return TransportErrorInfo{TransportError::Unknown, _lastError};
   }
 
+  /// \note The completion callback fires synchronously on the caller's thread
+  /// after the send command is enqueued (not after wire delivery). This is
+  /// intentional — the result reflects whether the command was accepted by
+  /// the I/O thread's queue, not whether data reached the peer.
   void sendAsync(SessionId sid, const void *data, std::size_t len,
                  SendCompleteCallback cb) override
   {
@@ -1530,16 +1534,14 @@ private:
       }
       // NEW: safety-net connect timeout (mostly moot for UDP client)
       if (_config.connectTimeout.count() > 0 && s->connectPending &&
-          (now - s->connectStart) >
-            std::chrono::duration_cast<std::chrono::seconds>(_config.connectTimeout))
+          (now - s->connectStart) > _config.connectTimeout)
       {
         to.push_back(s->id);
         continue;
       }
       // NEW: safety-net write stall (applies to client-connected sessions)
       if (_config.writeStallTimeout.count() > 0 && !s->wq.empty() &&
-          (now - s->lastWriteProgress) >
-            std::chrono::duration_cast<std::chrono::seconds>(_config.writeStallTimeout))
+          (now - s->lastWriteProgress) > _config.writeStallTimeout)
       {
         to.push_back(s->id);
         continue;

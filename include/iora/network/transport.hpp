@@ -101,19 +101,19 @@ public:
                               std::chrono::milliseconds timeout =
                                 std::chrono::milliseconds{30000}) = 0;
 
-  virtual SendResult receiveSync(SessionId sid, void *buffer, std::size_t &len,
-                                 std::chrono::milliseconds timeout =
-                                   std::chrono::milliseconds{30000}) = 0;
+  virtual ReceiveResult receiveSync(SessionId sid, void *buffer, std::size_t &len,
+                                    std::chrono::milliseconds timeout =
+                                      std::chrono::milliseconds{30000}) = 0;
 
   virtual SendResult sendSyncCancellable(SessionId sid, iora::core::BufferView data,
                                          CancellationToken &token,
                                          std::chrono::milliseconds timeout =
                                            std::chrono::milliseconds{30000});
 
-  virtual SendResult receiveSyncCancellable(SessionId sid, void *buffer, std::size_t &len,
-                                            CancellationToken &token,
-                                            std::chrono::milliseconds timeout =
-                                              std::chrono::milliseconds{30000});
+  virtual ReceiveResult receiveSyncCancellable(SessionId sid, void *buffer, std::size_t &len,
+                                               CancellationToken &token,
+                                               std::chrono::milliseconds timeout =
+                                                 std::chrono::milliseconds{30000});
 
   // ===== Read Modes =====
   virtual bool setReadMode(SessionId sid, ReadMode mode) = 0;
@@ -201,9 +201,9 @@ public:
   SendResult sendSync(SessionId sid, iora::core::BufferView data,
                       std::chrono::milliseconds timeout =
                         std::chrono::milliseconds{30000}) override;
-  SendResult receiveSync(SessionId sid, void *buffer, std::size_t &len,
-                         std::chrono::milliseconds timeout =
-                           std::chrono::milliseconds{30000}) override;
+  ReceiveResult receiveSync(SessionId sid, void *buffer, std::size_t &len,
+                            std::chrono::milliseconds timeout =
+                              std::chrono::milliseconds{30000}) override;
 
   bool setReadMode(SessionId sid, ReadMode mode) override;
   bool getReadMode(SessionId sid, ReadMode &mode) const override;
