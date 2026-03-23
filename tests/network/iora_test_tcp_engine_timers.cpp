@@ -6,23 +6,22 @@
 
 using namespace std::chrono_literals;
 using TcpEngine = iora::network::TcpEngine;
+using TransportConfig = iora::network::TransportConfig;
+using TransportAddress = iora::network::TransportAddress;
+using TransportErrorInfo = iora::network::TransportErrorInfo;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
-using IoResult = iora::network::IoResult;
 using SessionId = iora::network::SessionId;
 
 TEST_CASE("High-resolution timer configuration", "[shared_transport][timers]")
 {
-  TcpEngine::Config cfg{};
+  TransportConfig cfg{};
   cfg.enableHighResolutionTimers = true;
   cfg.connectTimeout = 500ms;
   cfg.handshakeTimeout = 1000ms;
   cfg.writeStallTimeout = 750ms;
 
-  TcpEngine::TlsConfig srvTls{};
-  TcpEngine::TlsConfig cliTls{};
-
-  TcpEngine transport(cfg, srvTls, cliTls);
+  TcpEngine transport(cfg);
   REQUIRE(transport.start().isOk());
 
   // Verify the configuration is set correctly
@@ -36,16 +35,13 @@ TEST_CASE("High-resolution timer configuration", "[shared_transport][timers]")
 
 TEST_CASE("Legacy timer fallback when high-resolution disabled", "[shared_transport][timers]")
 {
-  TcpEngine::Config cfg{};
+  TransportConfig cfg{};
   cfg.enableHighResolutionTimers = false;
   cfg.connectTimeout = 1000ms;
   cfg.handshakeTimeout = 2000ms;
   cfg.gcInterval = 1s;
 
-  TcpEngine::TlsConfig srvTls{};
-  TcpEngine::TlsConfig cliTls{};
-
-  TcpEngine transport(cfg, srvTls, cliTls);
+  TcpEngine transport(cfg);
   REQUIRE(transport.start().isOk());
 
   // Verify legacy configuration
@@ -58,7 +54,7 @@ TEST_CASE("Legacy timer fallback when high-resolution disabled", "[shared_transp
 TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip]")
 {
   // Test SIP-specific timeout configurations for DNS/SRV failover
-  TcpEngine::Config sipCfg{};
+  TransportConfig sipCfg{};
   sipCfg.enableHighResolutionTimers = true;
   sipCfg.connectTimeout = 2000ms;    // 2s per SRV record
   sipCfg.handshakeTimeout = 3000ms;  // 3s for TLS handshake
@@ -75,9 +71,7 @@ TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip
   REQUIRE(sipCfg.handshakeTimeout <= 5000ms);  // Fast TLS establishment
   REQUIRE(sipCfg.writeStallTimeout <= 2000ms); // Quick write failure detection
 
-  TcpEngine::TlsConfig srvTls{};
-  TcpEngine::TlsConfig cliTls{};
-  TcpEngine sipTransport(sipCfg, srvTls, cliTls);
+  TcpEngine sipTransport(sipCfg);
 
   REQUIRE(sipTransport.start().isOk());
   sipTransport.stop();
@@ -85,42 +79,29 @@ TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip
 
 TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][timers][integration]")
 {
-  TcpEngine::Config cfg{};
+  TransportConfig cfg{};
   cfg.enableHighResolutionTimers = true;
   cfg.connectTimeout = 100ms; // Very short timeout for testing
 
-  TcpEngine::TlsConfig srvTls{};
-  TcpEngine::TlsConfig cliTls{};
-  TcpEngine transport(cfg, srvTls, cliTls);
+  TcpEngine transport(cfg);
 
   std::atomic<bool> connectionFailed{false};
   std::atomic<bool> connected{false};
   std::string lastErrorMessage;
   TransportError lastErrorCode{TransportError::None};
 
-  TcpEngine::Callbacks cbs{};
-  cbs.onConnect = [&](SessionId sid, const IoResult &res)
+  iora::network::detail::EngineBase::Callbacks cbs{};
+  cbs.onConnect = [&](SessionId sid, const TransportAddress &addr)
   {
-    if (res.ok)
-    {
-      connected = true;
-    }
-    else
-    {
-      connectionFailed = true;
-      lastErrorMessage = res.message;
-      lastErrorCode = res.code;
-      std::cout << "Connection failed: " << res.message << " (code " << static_cast<int>(res.code)
-                << ")\n";
-    }
+    connected = true;
   };
 
-  cbs.onClosed = [&](SessionId sid, const IoResult &res)
+  cbs.onClose = [&](SessionId sid, const TransportErrorInfo &err)
   {
     connectionFailed = true;
-    lastErrorMessage = res.message;
-    lastErrorCode = res.code;
-    std::cout << "Connection closed: " << res.message << " (code " << static_cast<int>(res.code)
+    lastErrorMessage = err.message;
+    lastErrorCode = err.code;
+    std::cout << "Connection closed: " << err.message << " (code " << static_cast<int>(err.code)
               << ")\n";
   };
 

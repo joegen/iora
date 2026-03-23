@@ -6,9 +6,11 @@
 
 using namespace std::chrono_literals;
 using UdpEngine = iora::network::UdpEngine;
+using TransportConfig = iora::network::TransportConfig;
+using TransportAddress = iora::network::TransportAddress;
+using TransportErrorInfo = iora::network::TransportErrorInfo;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
-using IoResult = iora::network::IoResult;
 using SessionId = iora::network::SessionId;
 using ListenerId = iora::network::ListenerId;
 
@@ -16,9 +18,8 @@ namespace
 {
 struct UdpFixture
 {
-  UdpEngine::Config cfg{};
-  UdpEngine::TlsConfig tlsConfig{};
-  UdpEngine tx{cfg, tlsConfig, tlsConfig};
+  TransportConfig cfg{};
+  UdpEngine tx{cfg};
 
   std::atomic<bool> accepted{false};
   std::atomic<bool> connected{false};
@@ -41,29 +42,27 @@ struct UdpFixture
 
   UdpFixture()
   {
-    UdpEngine::Callbacks cbs{};
-    cbs.onAccept = [&](SessionId sid, const std::string &, const IoResult &res)
+    iora::network::detail::EngineBase::Callbacks cbs{};
+    cbs.onAccept = [&](SessionId sid, const TransportAddress &)
     {
-      REQUIRE(res.ok);
       serverSid = sid;
       accepted = true;
       acceptCount++;
       acceptedSessions.push_back(sid);
     };
-    cbs.onConnect = [&](SessionId sid, const IoResult &res)
+    cbs.onConnect = [&](SessionId sid, const TransportAddress &)
     {
-      if (res.ok)
-      {
-        clientSid = sid;
-        connected = true;
-        connectCount++;
-        connectedSessions.push_back(sid);
-      }
+      clientSid = sid;
+      connected = true;
+      connectCount++;
+      connectedSessions.push_back(sid);
     };
-    cbs.onData = [&](SessionId sid, const std::uint8_t *data, std::size_t n, const IoResult &res)
+    cbs.onData = [&](SessionId sid, iora::core::BufferView bv,
+                     std::chrono::steady_clock::time_point)
     {
-      REQUIRE(res.ok);
       dataCount++;
+      auto *data = bv.data();
+      auto n = bv.size();
       // Echo on server; detect on client
       if (std::find(acceptedSessions.begin(), acceptedSessions.end(), sid) !=
           acceptedSessions.end())
@@ -80,7 +79,7 @@ struct UdpFixture
         receivedData.push_back(std::string(reinterpret_cast<const char *>(data), n));
       }
     };
-    cbs.onClosed = [&](SessionId, const IoResult &)
+    cbs.onClose = [&](SessionId, const TransportErrorInfo &)
     {
       anyClosed = true;
       closeCount++;
@@ -90,7 +89,7 @@ struct UdpFixture
       lastErrMsg = msg;
       errored = true;
     };
-    tx.setCallbacks(cbs);
+    tx.setCallbacks(std::move(cbs));
   }
 
   bool waitFor(const std::atomic<bool> &flag, int ms = 1000)
@@ -274,19 +273,19 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
   ListenerId lid = lr.value();
 
   // Set up a second UDP server to connect to
-  UdpEngine::Config cfg2{};
-  UdpEngine::TlsConfig tlsCfg2{};
-  UdpEngine tx2{cfg2, tlsCfg2, tlsCfg2};
+  TransportConfig cfg2{};
+  UdpEngine tx2{cfg2};
 
   std::atomic<bool> server2Received{false};
-  UdpEngine::Callbacks cbs2{};
-  cbs2.onData = [&](SessionId, const std::uint8_t *data, std::size_t n, const IoResult &)
+  iora::network::detail::EngineBase::Callbacks cbs2{};
+  cbs2.onData = [&](SessionId, iora::core::BufferView bv,
+                    std::chrono::steady_clock::time_point)
   {
-    std::string msg(reinterpret_cast<const char *>(data), n);
+    std::string msg(reinterpret_cast<const char *>(bv.data()), bv.size());
     if (msg == "via_test")
       server2Received = true;
   };
-  tx2.setCallbacks(cbs2);
+  tx2.setCallbacks(std::move(cbs2));
 
   REQUIRE(tx2.start().isOk());
   REQUIRE(tx2.addListener("127.0.0.1", port2, TlsMode::None).isOk());
@@ -308,7 +307,7 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
   tx2.stop();
 }
 
-TEST_CASE("UDP configuration changes", "[udp][config]")
+TEST_CASE("UDP basic operation after start", "[udp][config]")
 {
   UdpFixture f;
   f.cfg.gcInterval = std::chrono::seconds(1);
@@ -321,16 +320,8 @@ TEST_CASE("UDP configuration changes", "[udp][config]")
 
   REQUIRE(f.waitFor(f.connected));
 
-  // Change configuration
-  UdpEngine::Config newCfg = f.cfg;
-  newCfg.gcInterval = std::chrono::seconds(2);
-  newCfg.maxWriteQueue = 20;
-  newCfg.ioReadChunk = 128 * 1024;
-
-  f.tx.reconfigure(newCfg);
-
-  // Verify connection still works after reconfigure
-  const char *msg = "after_reconfig";
+  // Verify connection works
+  const char *msg = "basic_op";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
 
   REQUIRE(f.waitFor(f.accepted));
@@ -473,16 +464,16 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
 
   // Create a server that doesn't echo (to cause backpressure)
-  UdpEngine::Config cfg2{};
-  UdpEngine::TlsConfig tlsCfg2{};
-  UdpEngine tx2{cfg2, tlsCfg2, tlsCfg2};
+  TransportConfig cfg2{};
+  UdpEngine tx2{cfg2};
 
-  UdpEngine::Callbacks cbs2{};
-  cbs2.onData = [&](SessionId, const std::uint8_t *, std::size_t, const IoResult &)
+  iora::network::detail::EngineBase::Callbacks cbs2{};
+  cbs2.onData = [&](SessionId, iora::core::BufferView,
+                    std::chrono::steady_clock::time_point)
   {
     // Don't echo - just receive
   };
-  tx2.setCallbacks(cbs2);
+  tx2.setCallbacks(std::move(cbs2));
 
   REQUIRE(tx2.start().isOk());
   auto port2 = testnet::getFreePortUDP();
@@ -655,52 +646,6 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
   }
 }
 
-TEST_CASE("UDP synchronous listener API", "[udp][sync]")
-{
-  UdpFixture f;
-  REQUIRE(f.tx.start().isOk());
-
-  SECTION("successful bind")
-  {
-    auto port = testnet::getFreePortUDP();
-    auto result = f.tx.addListenerSync("127.0.0.1", port, TlsMode::None);
-
-    REQUIRE(result.result.ok);
-    REQUIRE(result.id != 0);
-    REQUIRE(result.bindAddress == "127.0.0.1:" + std::to_string(port));
-  }
-
-  SECTION("duplicate bind fails immediately")
-  {
-    auto port = testnet::getFreePortUDP();
-
-    // First bind should succeed
-    auto result1 = f.tx.addListenerSync("127.0.0.1", port, TlsMode::None);
-    REQUIRE(result1.result.ok);
-
-    // Give time for the first listener to be actually bound
-    std::this_thread::sleep_for(50ms);
-
-    // Second bind should fail immediately
-    auto result2 = f.tx.addListenerSync("127.0.0.1", port, TlsMode::None);
-    REQUIRE_FALSE(result2.result.ok);
-    REQUIRE(result2.result.code == TransportError::Bind);
-    REQUIRE(result2.id == 0);
-  }
-
-  SECTION("TLS rejected immediately")
-  {
-    auto port = testnet::getFreePortUDP();
-    auto result = f.tx.addListenerSync("127.0.0.1", port, TlsMode::Server);
-
-    REQUIRE_FALSE(result.result.ok);
-    REQUIRE(result.result.code == TransportError::Config);
-    REQUIRE(result.id == 0);
-  }
-
-  f.tx.stop();
-}
-
 TEST_CASE("UDP session limits", "[udp][limits]")
 {
   UdpFixture f;
@@ -812,22 +757,22 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
   auto port2 = testnet::getFreePortUDP();
 
   // Set up a server
-  UdpEngine::Config cfg2{};
-  UdpEngine::TlsConfig tlsCfg2{};
-  UdpEngine tx2{cfg2, tlsCfg2, tlsCfg2};
+  TransportConfig cfg2{};
+  UdpEngine tx2{cfg2};
 
   std::atomic<int> server2DataCount{0};
   std::mutex server2Mutex;
   std::vector<std::string> server2Data;
 
-  UdpEngine::Callbacks cbs2{};
-  cbs2.onData = [&](SessionId, const std::uint8_t *data, std::size_t n, const IoResult &)
+  iora::network::detail::EngineBase::Callbacks cbs2{};
+  cbs2.onData = [&](SessionId, iora::core::BufferView bv,
+                    std::chrono::steady_clock::time_point)
   {
     std::lock_guard<std::mutex> lock(server2Mutex);
-    server2Data.push_back(std::string(reinterpret_cast<const char *>(data), n));
+    server2Data.push_back(std::string(reinterpret_cast<const char *>(bv.data()), bv.size()));
     server2DataCount++;
   };
-  tx2.setCallbacks(cbs2);
+  tx2.setCallbacks(std::move(cbs2));
 
   REQUIRE(tx2.start().isOk());
   REQUIRE(tx2.addListener("127.0.0.1", port2, TlsMode::None).isOk());

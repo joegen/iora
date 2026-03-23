@@ -17,7 +17,7 @@
 ///   - Async accept/connect/read/write with internal session GC
 ///   - Optional TLS (OpenSSL) for server and client
 ///   - Safety-net timeouts: idle/connect/handshake/write-stall/max-age
-///   - Rich IoResult on all callbacks
+///   - EngineBase::Callbacks with TransportAddress/TransportErrorInfo/BufferView signatures
 ///   - Thread-safe public API (signals I/O thread via eventfd)
 ///
 
@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -54,6 +55,7 @@
 #include "iora/core/logger.hpp"
 #include "iora/core/timer.hpp"
 #include "iora/network/detail/engine_base.hpp"
+#include "iora/network/event_batch_processor.hpp"
 #include "iora/network/transport_types.hpp"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -81,92 +83,21 @@ namespace network
 class TcpEngine : public detail::EngineBase
 {
 public:
-  /// \brief Runtime configuration.
-  struct Config
-  {
-    int epollMaxEvents{256};
-    std::size_t ioReadChunk{64 * 1024};
-    std::size_t maxWriteQueue{1024};
-    bool closeOnBackpressure{true};
-
-    std::chrono::seconds idleTimeout{600};
-    std::chrono::seconds maxConnAge{std::chrono::seconds::zero()};
-    // High-resolution timers (milliseconds precision)
-    std::chrono::milliseconds handshakeTimeout{30000};
-    std::chrono::milliseconds connectTimeout{30000};
-    std::chrono::milliseconds writeStallTimeout{0};
-    std::chrono::seconds gcInterval{5};    // Keep for legacy cleanup
-    bool enableHighResolutionTimers{true}; // Enable TimerService integration
-
-    bool useEdgeTriggered{true};
-    bool enableTcpNoDelay{true};
-    int soRcvBuf{0};
-    int soSndBuf{0};
-
-    struct TcpKeepalive
-    {
-      bool enable{false};
-      int idleSec{60};
-      int intvlSec{10};
-      int cnt{3};
-    } tcpKeepalive;
-  };
-
-  /// \brief TLS configuration (OpenSSL).
-  struct TlsConfig
-  {
-    bool enabled{false};
-    TlsMode defaultMode{TlsMode::None};
-    std::string certFile;
-    std::string keyFile;
-    std::string caFile;
-    std::string ciphers;
-    std::string alpn; ///< semicolon-separated, e.g. "h2;http/1.1"
-    bool verifyPeer{false};
-  };
-
-  /// \brief Callback bundle (all optional).
-  struct Callbacks
-  {
-    std::function<void(SessionId, const std::string &, const IoResult &)> onAccept;
-    std::function<void(SessionId, const IoResult &)> onConnect;
-    std::function<void(SessionId, const std::uint8_t *, std::size_t, const IoResult &)> onData;
-    std::function<void(SessionId, const IoResult &)> onClosed;
-    std::function<void(TransportError, const std::string &)> onError;
-  };
-
-  /// \brief Basic counters (monotonic).
-  struct Stats
-  {
-    std::uint64_t accepted{0}, connected{0}, closed{0}, errors{0}, tlsHandshakes{0}, tlsFailures{0},
-      bytesIn{0}, bytesOut{0}, epollWakeups{0}, commands{0}, gcRuns{0}, gcClosedIdle{0},
-      gcClosedAged{0}, backpressureCloses{0};
-    std::size_t sessionsCurrent{0}, sessionsPeak{0};
-  };
-
-  /// \brief Construct with config and TLS contexts.
-  TcpEngine(const Config &cfg, const TlsConfig &srv, const TlsConfig &cli)
-      : _cfg(cfg), _srvTls(srv), _cliTls(cli)
+  /// \brief Construct from TransportConfig.
+  explicit TcpEngine(const TransportConfig &config)
+      : _config(config)
   {
     // Ensure OpenSSL is initialized once per process
     std::call_once(_sslGlobalInitFlag, initSslGlobal);
 
     // Initialize high-resolution timer service if enabled
-    if (_cfg.enableHighResolutionTimers)
+    if (_config.enableHighResolutionTimers)
     {
       _timerConfig.limits.maxConcurrentTimers = 10000;
       _timerConfig.enableStatistics = true;
       _timerConfig.threadName = "TcpEngineTimer";
       _timerService = std::make_unique<iora::core::TimerService>(_timerConfig);
     }
-  }
-
-  /// \brief Construct from TransportConfig (EngineBase-compatible config).
-  explicit TcpEngine(const TransportConfig &config)
-    : TcpEngine(configFromTransport(config),
-                      tlsFromTransport(config.serverTls),
-                      tlsFromTransport(config.clientTls))
-  {
   }
 
   /// \brief Destructor; calls stop() if needed.
@@ -192,44 +123,10 @@ public:
   }
 
   /// \brief Install callbacks (may be called before or after start()).
-  void setCallbacks(const Callbacks &cbs)
+  void setCallbacks(detail::EngineBase::Callbacks cbs) override
   {
     std::lock_guard<std::mutex> g(_cbMutex);
-    _cbs = cbs;
-  }
-
-  // ITransportBase interface implementation - individual callback setters
-  // These methods preserve existing callbacks and only update the specific
-  // one
-  void setDataCallback(
-    std::function<void(SessionId, const std::uint8_t *, std::size_t, const IoResult &)> cb)
-  {
-    std::lock_guard<std::mutex> g(_cbMutex);
-    _cbs.onData = cb;
-  }
-
-  void setAcceptCallback(std::function<void(SessionId, const std::string &, const IoResult &)> cb)
-  {
-    std::lock_guard<std::mutex> g(_cbMutex);
-    _cbs.onAccept = cb;
-  }
-
-  void setConnectCallback(std::function<void(SessionId, const IoResult &)> cb)
-  {
-    std::lock_guard<std::mutex> g(_cbMutex);
-    _cbs.onConnect = cb;
-  }
-
-  void setCloseCallback(std::function<void(SessionId, const IoResult &)> cb)
-  {
-    std::lock_guard<std::mutex> g(_cbMutex);
-    _cbs.onClosed = cb;
-  }
-
-  void setErrorCallback(std::function<void(TransportError, const std::string &)> cb)
-  {
-    std::lock_guard<std::mutex> g(_cbMutex);
-    _cbs.onError = cb;
+    _cbs = std::move(cbs);
   }
 
   /// \brief Start I/O thread and initialize TLS contexts.
@@ -279,7 +176,18 @@ public:
       return StartResult::err(lastError());
     }
     addEpoll(_timerFd, EPOLLIN);
-    armGc(_cfg.gcInterval);
+    armGc(_config.gcInterval);
+
+    if (_config.batching.enabled)
+    {
+      BatchProcessingConfig batchCfg;
+      batchCfg.maxBatchSize = _config.batching.maxBatchSize;
+      batchCfg.maxBatchDelay = _config.batching.maxBatchDelay;
+      batchCfg.adaptiveThreshold = _config.batching.adaptiveThreshold;
+      batchCfg.enableAdaptiveSizing = _config.batching.enableAdaptiveSizing;
+      batchCfg.loadFactor = _config.batching.loadFactor;
+      _batchProcessor = std::make_unique<EventBatchProcessor>(batchCfg);
+    }
 
     try
     {
@@ -381,11 +289,8 @@ public:
     return result;
   }
 
-  /// \brief Close a session (idempotent). onClosed will fire.
+  /// \brief Close a session (idempotent). onClose will fire.
   bool close(SessionId sid) override { return enqueue(Command::close(sid)); }
-
-  /// \brief Reconfigure runtime knobs; safe while running.
-  void reconfigure(const Config &c) { enqueue(Command::reconf(c)); }
 
   /// \brief Snapshot of counters.
   TransportStats getStats() const override
@@ -407,21 +312,11 @@ public:
     ts.backpressureCloses = _atomicStats.backpressureCloses.load();
     ts.sessionsCurrent = _atomicStats.sessionsCurrent.load();
     ts.sessionsPeak = _atomicStats.sessionsPeak.load();
+    if (_batchProcessor)
+    {
+      ts.batchingStats = _batchProcessor->getStats();
+    }
     return ts;
-  }
-
-  /// \brief Basic stats for ITransportBase compatibility
-  BasicTransportStats getBasicStats() const
-  {
-    BasicTransportStats basic{};
-    basic.accepted = _atomicStats.accepted.load();
-    basic.connected = _atomicStats.connected.load();
-    basic.closed = _atomicStats.closed.load();
-    basic.errors = _atomicStats.errors.load();
-    basic.bytesIn = _atomicStats.bytesIn.load();
-    basic.bytesOut = _atomicStats.bytesOut.load();
-    basic.sessionsCurrent = _atomicStats.sessionsCurrent.load();
-    return basic;
   }
 
   /// \brief Sticky last fatal error (since process start). Valid after
@@ -474,85 +369,73 @@ public:
     }
   }
 
-  void setCallbacks(detail::EngineBase::Callbacks cbs) override
+  TransportAddress getListenerAddress(ListenerId lid) const override
   {
-    Callbacks legacy;
-
-    auto engineOnAccept = std::move(cbs.onAccept);
-    auto engineOnConnect = std::move(cbs.onConnect);
-    auto engineOnData = std::move(cbs.onData);
-    auto engineOnClose = std::move(cbs.onClose);
-    auto engineOnError = std::move(cbs.onError);
-
-    if (engineOnAccept)
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _listeners.find(lid);
+    if (it == _listeners.end() || it->second->fd < 0)
     {
-      legacy.onAccept = [cb = std::move(engineOnAccept)](SessionId sid, const std::string &peer,
-                                                         const IoResult &)
-      {
-        auto colon = peer.rfind(':');
-        TransportAddress addr;
-        if (colon != std::string::npos)
-        {
-          addr.host = peer.substr(0, colon);
-          try
-          {
-            addr.port = static_cast<std::uint16_t>(std::stoi(peer.substr(colon + 1)));
-          }
-          catch (...)
-          {
-            addr.port = 0;
-          }
-        }
-        else
-        {
-          addr.host = peer;
-        }
-        cb(sid, addr);
-      };
+      return {};
     }
-
-    if (engineOnConnect)
+    sockaddr_storage ss{};
+    socklen_t sl = sizeof(ss);
+    if (::getsockname(it->second->fd, reinterpret_cast<sockaddr *>(&ss), &sl) != 0)
     {
-      auto closeCb = engineOnClose;
-      legacy.onConnect = [connectCb = std::move(engineOnConnect), closeCb](SessionId sid,
-                                                                           const IoResult &r)
-      {
-        if (r.ok)
-        {
-          connectCb(sid, TransportAddress{});
-        }
-        else if (closeCb)
-        {
-          closeCb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError});
-        }
-      };
+      return {};
     }
-
-    if (engineOnData)
-    {
-      legacy.onData = [cb = std::move(engineOnData)](SessionId sid, const std::uint8_t *data,
-                                                     std::size_t len, const IoResult &)
-      { cb(sid, iora::core::BufferView{data, len}, std::chrono::steady_clock::now()); };
-    }
-
-    if (engineOnClose)
-    {
-      legacy.onClosed = [cb = std::move(engineOnClose)](SessionId sid, const IoResult &r)
-      { cb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError}); };
-    }
-
-    if (engineOnError)
-    {
-      legacy.onError = std::move(engineOnError);
-    }
-
-    setCallbacks(legacy);
+    return addressFromSockaddr(ss);
   }
 
-  TransportAddress getListenerAddress(ListenerId) const override { return {}; }
-  TransportAddress getLocalAddress(SessionId) const override { return {}; }
-  TransportAddress getRemoteAddress(SessionId) const override { return {}; }
-  bool setDscp(SessionId, std::uint8_t) override { return false; }
+  TransportAddress getLocalAddress(SessionId sid) const override
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second->fd < 0)
+    {
+      return {};
+    }
+    sockaddr_storage ss{};
+    socklen_t sl = sizeof(ss);
+    if (::getsockname(it->second->fd, reinterpret_cast<sockaddr *>(&ss), &sl) != 0)
+    {
+      return {};
+    }
+    return addressFromSockaddr(ss);
+  }
+
+  TransportAddress getRemoteAddress(SessionId sid) const override
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second->fd < 0 || it->second->peerLen == 0)
+    {
+      return {};
+    }
+    return addressFromSockaddr(it->second->peer);
+  }
+
+  bool setDscp(SessionId sid, std::uint8_t dscp) override
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second->fd < 0)
+    {
+      return false;
+    }
+    int fd = it->second->fd;
+    sockaddr_storage ss{};
+    socklen_t sl = sizeof(ss);
+    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&ss), &sl) != 0)
+    {
+      return false;
+    }
+    int val = static_cast<int>(dscp) << 2;
+    if (ss.ss_family == AF_INET6)
+    {
+      return ::setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &val, sizeof(val)) == 0;
+    }
+    return ::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) == 0;
+  }
 
 protected:
   // ===== Virtual hooks for fault injection (B6 TLS testing) =====
@@ -676,6 +559,27 @@ private:
     return {};
   }
 
+  static TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
+  {
+    TransportAddress addr;
+    char host[NI_MAXHOST]{};
+    if (ss.ss_family == AF_INET)
+    {
+      auto *sa4 = reinterpret_cast<const sockaddr_in *>(&ss);
+      ::inet_ntop(AF_INET, &sa4->sin_addr, host, sizeof(host));
+      addr.host = host;
+      addr.port = ntohs(sa4->sin_port);
+    }
+    else if (ss.ss_family == AF_INET6)
+    {
+      auto *sa6 = reinterpret_cast<const sockaddr_in6 *>(&ss);
+      ::inet_ntop(AF_INET6, &sa6->sin6_addr, host, sizeof(host));
+      addr.host = host;
+      addr.port = ntohs(sa6->sin6_port);
+    }
+    return addr;
+  }
+
   void armGc(std::chrono::seconds sec)
   {
     itimerspec its{};
@@ -708,11 +612,9 @@ private:
   void err(TransportError te, const std::string &m)
   {
     _atomicStats.errors++;
-    std::lock_guard<std::mutex> g(_cbMutex);
-    if (_cbs.onError)
-    {
-      _cbs.onError(te, m);
-    }
+    decltype(_cbs.onError) cb;
+    { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
+    if (cb) cb(te, m);
   }
 
   void setLastFatal(const IoResult &r) const
@@ -749,8 +651,7 @@ private:
     AddListener,
     Connect,
     Send,
-    Close,
-    Reconf
+    Close
   };
 
   enum class CloseOrigin
@@ -771,7 +672,6 @@ private:
     TransportError closeReason{TransportError::Unknown};
     std::string closeMsg;
     CloseOrigin closeOrigin{CloseOrigin::App};
-    Config cfg;
     std::shared_ptr<std::promise<bool>> listenerReady; // signals when addListener bind completes
 
     static Command shutdown() { return Command{Cmd::Shutdown}; }
@@ -806,12 +706,6 @@ private:
       x.closeOrigin = origin;
       return x;
     }
-    static Command reconf(const Config &cfg)
-    {
-      Command x{Cmd::Reconf};
-      x.cfg = cfg;
-      return x;
-    }
   };
 
   bool enqueue(const Command &cmd)
@@ -831,11 +725,9 @@ private:
     {
       setLastFatal(
         IoResult::failure(TransportError::Unknown, std::string("enqueue(copy): ") + ex.what()));
-      std::lock_guard<std::mutex> g(_cbMutex);
-      if (_cbs.onError)
-      {
-        _cbs.onError(TransportError::Unknown, std::string("enqueue(copy): ") + ex.what());
-      }
+      decltype(_cbs.onError) cb;
+      { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
+      if (cb) cb(TransportError::Unknown, std::string("enqueue(copy): ") + ex.what());
       return false;
     }
   }
@@ -857,11 +749,9 @@ private:
     {
       setLastFatal(
         IoResult::failure(TransportError::Unknown, std::string("enqueue(move): ") + ex.what()));
-      std::lock_guard<std::mutex> g(_cbMutex);
-      if (_cbs.onError)
-      {
-        _cbs.onError(TransportError::Unknown, std::string("enqueue(move): ") + ex.what());
-      }
+      decltype(_cbs.onError) cb;
+      { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
+      if (cb) cb(TransportError::Unknown, std::string("enqueue(move): ") + ex.what());
       return false;
     }
   }
@@ -925,35 +815,35 @@ private:
 
   void scheduleConnectTimeout(Session *s)
   {
-    if (!_timerService || _cfg.connectTimeout.count() == 0 || s->connectTimeoutId != 0)
+    if (!_timerService || _config.connectTimeout.count() == 0 || s->connectTimeoutId != 0)
     {
       return;
     }
 
-    s->connectTimeoutId = _timerService->scheduleAfter(_cfg.connectTimeout, [this, sid = s->id]()
+    s->connectTimeoutId = _timerService->scheduleAfter(_config.connectTimeout, [this, sid = s->id]()
                                                        { handleConnectTimeout(sid); });
   }
 
   void scheduleHandshakeTimeout(Session *s)
   {
-    if (!_timerService || _cfg.handshakeTimeout.count() == 0 || s->handshakeTimeoutId != 0)
+    if (!_timerService || _config.handshakeTimeout.count() == 0 || s->handshakeTimeoutId != 0)
     {
       return;
     }
 
     s->handshakeTimeoutId = _timerService->scheduleAfter(
-      _cfg.handshakeTimeout, [this, sid = s->id]() { handleHandshakeTimeout(sid); });
+      _config.handshakeTimeout, [this, sid = s->id]() { handleHandshakeTimeout(sid); });
   }
 
   void scheduleWriteStallTimeout(Session *s)
   {
-    if (!_timerService || _cfg.writeStallTimeout.count() == 0 || s->writeStallTimeoutId != 0)
+    if (!_timerService || _config.writeStallTimeout.count() == 0 || s->writeStallTimeoutId != 0)
     {
       return;
     }
 
     s->writeStallTimeoutId = _timerService->scheduleAfter(
-      _cfg.writeStallTimeout, [this, sid = s->id]() { handleWriteStallTimeout(sid); });
+      _config.writeStallTimeout, [this, sid = s->id]() { handleWriteStallTimeout(sid); });
   }
 
   void cancelConnectTimeout(Session *s)
@@ -1022,7 +912,98 @@ private:
 
   void loop()
   {
-    std::vector<epoll_event> evs((std::size_t)_cfg.epollMaxEvents);
+    if (_batchProcessor)
+      loopBatched();
+    else
+      loopUnbatched();
+  }
+
+  void handleFdEvent(int fd, std::uint32_t events)
+  {
+    auto it = _fdTags.find(fd);
+    if (it == _fdTags.end())
+      return;
+    Tag *t = it->second.get();
+    if (t->isListener)
+      onListener(t->lst);
+    else
+      onSession(t->sess, events);
+  }
+
+  void shutdownDrain()
+  {
+    // Draining on shutdown
+    process();
+    // Collect sessions to close to avoid iterator invalidation
+    std::vector<Session *> toClose;
+    toClose.reserve(_sessions.size());
+    for (auto &kv : _sessions)
+      toClose.push_back(kv.second.get());
+
+    // Close all sessions safely (but don't erase from _sessions yet)
+    for (auto *s : toClose)
+    {
+      if (!s || s->closed)
+        continue;
+      s->closed = true;
+      delEpoll(s->fd);
+      // SSL_shutdown before close(fd) — same ordering as closeNow
+      if (s->ssl)
+      {
+        ::SSL_shutdown(s->ssl);
+        ::SSL_free(s->ssl);
+        s->ssl = nullptr;
+      }
+      ::close(s->fd);
+      _atomicStats.closed++;
+      _atomicStats.sessionsCurrent--;
+      decltype(_cbs.onClose) closeCb;
+      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+      if (closeCb)
+      {
+        closeCb(s->id, TransportErrorInfo{TransportError::Unknown, "shutdown", 0, 0});
+      }
+    }
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _sessions.clear();
+    }
+
+    // Close listeners
+    std::vector<Listener *> listenersToClose;
+    listenersToClose.reserve(_listeners.size());
+    for (auto &kv : _listeners)
+      listenersToClose.push_back(kv.second.get());
+
+    for (auto *lst : listenersToClose)
+      closeListenerNow(lst);
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _listeners.clear();
+    }
+    if (_timerFd >= 0)
+    {
+      delEpoll(_timerFd);
+      ::close(_timerFd);
+      _timerFd = -1;
+    }
+    if (_eventFd >= 0)
+    {
+      delEpoll(_eventFd);
+      ::close(_eventFd);
+      _eventFd = -1;
+    }
+    if (_epollFd >= 0)
+    {
+      ::close(_epollFd);
+      _epollFd = -1;
+    }
+    freeTls();
+  }
+
+  void loopUnbatched()
+  {
+    std::vector<epoll_event> evs((std::size_t)_config.epollMaxEvents);
     while (_running.load())
     {
       int n = ::epoll_wait(_epollFd, evs.data(), (int)evs.size(), -1);
@@ -1055,86 +1036,47 @@ private:
           continue;
         }
 
-        auto it = _fdTags.find(fd);
-        if (it == _fdTags.end())
-        {
-          continue;
-        }
-        Tag *t = it->second.get();
-        if (t->isListener)
-        {
-          onListener(t->lst);
-        }
-        else
-        {
-          onSession(t->sess, events);
-        }
+        handleFdEvent(fd, events);
       }
     }
+    shutdownDrain();
+  }
 
-    // Draining on shutdown
-    process();
-    // Collect sessions to close to avoid iterator invalidation
-    std::vector<Session *> toClose;
-    toClose.reserve(_sessions.size());
-    for (auto &kv : _sessions)
-      toClose.push_back(kv.second.get());
-
-    // Close all sessions safely (but don't erase from _sessions yet)
-    for (auto *s : toClose)
+  void loopBatched()
+  {
+    while (_running.load())
     {
-      if (!s || s->closed)
+      try
+      {
+        _batchProcessor->processBatchWithSpecialFDs(
+          _epollFd, _eventFd, _timerFd,
+          // generalHandler — handles session/listener fds
+          [this](int fd, std::uint32_t events)
+          {
+            handleFdEvent(fd, events);
+          },
+          // onEventFd
+          [this]()
+          {
+            drainEvt();
+            process();
+          },
+          // onTimerFd
+          [this]()
+          {
+            drainTim();
+            runGc();
+          }
+        );
+        _atomicStats.epollWakeups++;
+      }
+      catch (const std::system_error &)
+      {
+        // epoll_wait EINTR handled inside processBatch
         continue;
-      s->closed = true;
-      delEpoll(s->fd);
-      // SSL_shutdown before close(fd) — same ordering as closeNow
-      if (s->ssl)
-      {
-        ::SSL_shutdown(s->ssl);
-        ::SSL_free(s->ssl);
-        s->ssl = nullptr;
-      }
-      ::close(s->fd);
-      _atomicStats.closed++;
-      _atomicStats.sessionsCurrent--;
-      {
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onClosed)
-        {
-          IoResult r = IoResult::failure(TransportError::Unknown, "shutdown", 0, 0);
-          _cbs.onClosed(s->id, r);
-        }
       }
     }
-    _sessions.clear();
-
-    // Close listeners
-    std::vector<Listener *> listenersToClose;
-    listenersToClose.reserve(_listeners.size());
-    for (auto &kv : _listeners)
-      listenersToClose.push_back(kv.second.get());
-
-    for (auto *lst : listenersToClose)
-      closeListenerNow(lst);
-    _listeners.clear();
-    if (_timerFd >= 0)
-    {
-      delEpoll(_timerFd);
-      ::close(_timerFd);
-      _timerFd = -1;
-    }
-    if (_eventFd >= 0)
-    {
-      delEpoll(_eventFd);
-      ::close(_eventFd);
-      _eventFd = -1;
-    }
-    if (_epollFd >= 0)
-    {
-      ::close(_epollFd);
-      _epollFd = -1;
-    }
-    freeTls();
+    shutdownDrain();
   }
 
   void process()
@@ -1195,10 +1137,6 @@ private:
           }
           break;
         }
-        case Cmd::Reconf:
-          _cfg = c.cfg;
-          armGc(_cfg.gcInterval);
-          break;
         }
       }
       catch (const std::exception &ex)
@@ -1208,11 +1146,9 @@ private:
         {
           try { c.listenerReady->set_value(false); } catch (...) {}
         }
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onError)
-        {
-          _cbs.onError(TransportError::Unknown, std::string("cmd dispatch: ") + ex.what());
-        }
+        decltype(_cbs.onError) cb;
+        { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
+        if (cb) cb(TransportError::Unknown, std::string("cmd dispatch: ") + ex.what());
       }
     }
   }
@@ -1268,10 +1204,10 @@ private:
       sl = sizeof(sa4);
     }
 
-    if (_cfg.soRcvBuf > 0)
-      ::setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &_cfg.soRcvBuf, sizeof(int));
-    if (_cfg.soSndBuf > 0)
-      ::setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &_cfg.soSndBuf, sizeof(int));
+    if (_config.soRcvBuf > 0)
+      ::setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &_config.soRcvBuf, sizeof(int));
+    if (_config.soSndBuf > 0)
+      ::setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &_config.soSndBuf, sizeof(int));
 
     if (::bind(sfd, reinterpret_cast<sockaddr *>(&ss), sl) < 0)
     {
@@ -1292,16 +1228,21 @@ private:
     lst->bind = lc.addr + ":" + std::to_string(lc.port);
     lst->tls = lc.tls;
     std::uint32_t ev = EPOLLIN;
-    if (_cfg.useEdgeTriggered)
+    if (_config.useEdgeTriggered)
       ev |= EPOLLET;
     addEpoll(sfd, ev);
 
+    Listener *rawLst = lst.get();
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _listeners.emplace(lst->id, std::move(lst));
+    }
+
     auto tag = std::make_unique<Tag>();
     tag->isListener = true;
-    tag->lst = lst.get();
+    tag->lst = rawLst;
     _fdTags.emplace(sfd, std::move(tag));
 
-    _listeners.emplace(lst->id, std::move(lst));
     return true;
   }
 
@@ -1335,7 +1276,7 @@ private:
       s->lastActivity = s->created;
       s->lastWriteProgress = s->created;
 
-      if (lst->tls == TlsMode::Server && _srvTls.enabled && _sslSrv)
+      if (lst->tls == TlsMode::Server && _config.serverTls.enabled && _sslSrv)
       {
         s->tlsMode = TlsMode::Server;
         s->ssl = ::SSL_new(_sslSrv);
@@ -1352,25 +1293,28 @@ private:
         scheduleHandshakeTimeout(s.get());
       }
 
-      _sessions.emplace(sid, std::move(s));
+      std::string peerKey = s->peerKey;
+      Session *sPtr = s.get();
+      {
+        std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+        _sessions.emplace(sid, std::move(s));
+      }
       bumpSess();
 
       std::uint32_t ev = EPOLLIN;
-      if (_cfg.useEdgeTriggered)
+      if (_config.useEdgeTriggered)
         ev |= EPOLLET;
       addEpoll(cfd, ev);
 
       auto tg = std::make_unique<Tag>();
       tg->isListener = false;
-      tg->sess = _sessions[sid].get();
+      tg->sess = sPtr;
       _fdTags.emplace(cfd, std::move(tg));
 
       _atomicStats.accepted++;
-      std::lock_guard<std::mutex> g(_cbMutex);
-      if (_cbs.onAccept)
-      {
-        _cbs.onAccept(sid, _sessions[sid]->peerKey, IoResult::success());
-      }
+      decltype(_cbs.onAccept) acceptCb;
+      { std::lock_guard<std::mutex> g(_cbMutex); acceptCb = _cbs.onAccept; }
+      if (acceptCb) acceptCb(sid, addressFromSockaddr(peer));
     }
   }
 
@@ -1394,35 +1338,39 @@ private:
     bool isIPv4 = (inet_pton(AF_INET, cr.host.c_str(), &(sa4.sin_addr)) == 1);
     bool isIPv6 = (inet_pton(AF_INET6, cr.host.c_str(), &(sa6.sin6_addr)) == 1);
 
+    bool manualAddrinfo = false;
+    addrinfo manualHints{};
+
     if (isIPv4 || isIPv6)
     {
-      // For IP addresses, create minimal addrinfo structure manually
-      res = new addrinfo();
-      memset(res, 0, sizeof(addrinfo));
-      res->ai_family = isIPv4 ? AF_INET : AF_INET6;
-      res->ai_socktype = SOCK_STREAM;
-      res->ai_protocol = IPPROTO_TCP;
+      // For IP addresses, use stack-allocated addrinfo instead of heap allocation
+      manualAddrinfo = true;
+      std::memset(&manualHints, 0, sizeof(manualHints));
+      manualHints.ai_family = isIPv4 ? AF_INET : AF_INET6;
+      manualHints.ai_socktype = SOCK_STREAM;
+      manualHints.ai_protocol = IPPROTO_TCP;
+      manualHints.ai_next = nullptr;
 
       if (isIPv4)
       {
-        res->ai_addrlen = sizeof(sockaddr_in);
-        auto *addr4 = new sockaddr_in();
-        memset(addr4, 0, sizeof(sockaddr_in));
-        addr4->sin_family = AF_INET;
-        addr4->sin_port = htons(cr.port);
-        addr4->sin_addr = sa4.sin_addr;
-        res->ai_addr = reinterpret_cast<sockaddr *>(addr4);
+        manualHints.ai_addrlen = sizeof(sockaddr_in);
+        std::memset(&sa4, 0, sizeof(sa4));
+        sa4.sin_family = AF_INET;
+        sa4.sin_port = htons(cr.port);
+        inet_pton(AF_INET, cr.host.c_str(), &(sa4.sin_addr));
+        manualHints.ai_addr = reinterpret_cast<sockaddr *>(&sa4);
       }
       else
       {
-        res->ai_addrlen = sizeof(sockaddr_in6);
-        auto *addr6 = new sockaddr_in6();
-        memset(addr6, 0, sizeof(sockaddr_in6));
-        addr6->sin6_family = AF_INET6;
-        addr6->sin6_port = htons(cr.port);
-        addr6->sin6_addr = sa6.sin6_addr;
-        res->ai_addr = reinterpret_cast<sockaddr *>(addr6);
+        manualHints.ai_addrlen = sizeof(sockaddr_in6);
+        std::memset(&sa6, 0, sizeof(sa6));
+        sa6.sin6_family = AF_INET6;
+        sa6.sin6_port = htons(cr.port);
+        inet_pton(AF_INET6, cr.host.c_str(), &(sa6.sin6_addr));
+        manualHints.ai_addr = reinterpret_cast<sockaddr *>(&sa6);
       }
+
+      res = &manualHints;
       rc = 0; // Success
     }
     else
@@ -1436,13 +1384,11 @@ private:
       auto dnsStatus = dnsResult.wait_for(dnsTimeout);
       if (dnsStatus == std::future_status::timeout)
       {
-        std::lock_guard<std::mutex> g(_cbMutex);
         std::string timeoutMsg = "DNS_TIMEOUT_FIX_TRIGGERED: getaddrinfo timeout after " +
                                  std::to_string(dnsTimeout.count()) + "s for " + cr.host + ":" + ps;
-        if (_cbs.onConnect)
-        {
-          _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Resolve, timeoutMsg));
-        }
+        decltype(_cbs.onClose) closeCb;
+        { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+        if (closeCb) closeCb(cr.sid, TransportErrorInfo{TransportError::Resolve, timeoutMsg});
         err(TransportError::Resolve, timeoutMsg);
         return false;
       }
@@ -1451,11 +1397,12 @@ private:
     }
     if (rc != 0 || !res)
     {
-      std::lock_guard<std::mutex> g(_cbMutex);
-      if (_cbs.onConnect)
+      decltype(_cbs.onClose) closeCb;
+      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+      if (closeCb)
       {
-        _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Resolve,
-                                                 std::string("getaddrinfo: ") + gai_strerror(rc)));
+        closeCb(cr.sid, TransportErrorInfo{TransportError::Resolve,
+                                            std::string("getaddrinfo: ") + gai_strerror(rc)});
       }
       err(TransportError::Resolve, "getaddrinfo failed");
       return false;
@@ -1490,26 +1437,19 @@ private:
         cfd = -1;
 
         // Clean up addrinfo before returning
-        if (isIPv4 || isIPv6)
-        {
-          if (res && res->ai_addr)
-          {
-            delete res->ai_addr;
-          }
-          delete res;
-        }
-        else
+        if (!manualAddrinfo)
         {
           ::freeaddrinfo(res);
         }
 
         // Report immediate failure
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onConnect)
+        decltype(_cbs.onClose) closeCb;
+        { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+        if (closeCb)
         {
           std::string errMsg =
-            "Connection refused to " + cr.host + ":" + ps.c_str() + " - " + connectErr;
-          _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, errMsg, connectErrno, 0));
+            "Connection refused to " + cr.host + ":" + ps + " - " + connectErr;
+          closeCb(cr.sid, TransportErrorInfo{TransportError::Connect, errMsg, connectErrno, 0});
         }
         err(TransportError::Connect, "connect immediately failed: " + connectErr);
         return false;
@@ -1532,16 +1472,8 @@ private:
       std::memcpy(&savedPeer, chosen->ai_addr, savedPeerLen);
     }
 
-    // Custom cleanup for manually created addrinfo structure
-    if (isIPv4 || isIPv6)
-    {
-      if (res && res->ai_addr)
-      {
-        delete res->ai_addr;
-      }
-      delete res;
-    }
-    else
+    // Clean up addrinfo (stack-allocated manualHints needs no cleanup)
+    if (!manualAddrinfo)
     {
       ::freeaddrinfo(res);
     }
@@ -1550,10 +1482,11 @@ private:
 
     if (cfd < 0)
     {
-      std::lock_guard<std::mutex> g(_cbMutex);
-      if (_cbs.onConnect)
+      decltype(_cbs.onClose) closeCb;
+      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+      if (closeCb)
       {
-        _cbs.onConnect(cr.sid, IoResult::failure(TransportError::Connect, loopErr, loopErrno, 0));
+        closeCb(cr.sid, TransportErrorInfo{TransportError::Connect, loopErr, loopErrno, 0});
       }
       err(TransportError::Connect, "connect: " + loopErr);
       return false;
@@ -1576,7 +1509,7 @@ private:
       std::memcpy(&s->peer, &savedPeer, savedPeerLen);
     }
 
-    if (cr.tls == TlsMode::Client && _cliTls.enabled && _sslCli)
+    if (cr.tls == TlsMode::Client && _config.clientTls.enabled && _sslCli)
     {
       s->tlsMode = TlsMode::Client;
       s->ssl = ::SSL_new(_sslCli);
@@ -1594,16 +1527,20 @@ private:
       scheduleHandshakeTimeout(s.get());
     }
 
-    _sessions.emplace(s->id, std::move(s));
+    Session *sPtr = s.get();
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _sessions.emplace(s->id, std::move(s));
+    }
     bumpSess();
 
     std::uint32_t ev = EPOLLIN | EPOLLOUT;
-    if (_cfg.useEdgeTriggered)
+    if (_config.useEdgeTriggered)
       ev |= EPOLLET;
     addEpoll(cfd, ev);
     auto tg = std::make_unique<Tag>();
     tg->isListener = false;
-    tg->sess = _sessions[cr.sid].get();
+    tg->sess = sPtr;
     _fdTags.emplace(cfd, std::move(tg));
 
     // DEFENSE-IN-DEPTH: Check if socket is already writable (handles immediate connects)
@@ -1621,7 +1558,7 @@ private:
         int gso_errno = errno;
         IORA_LOG_ERROR("[IMMEDIATE-CONNECT] getsockopt() failed for sid=" << cr.sid
                        << ", errno=" << gso_errno);
-        closeNow(_sessions[cr.sid].get(), TransportError::Socket,
+        closeNow(sPtr, TransportError::Socket,
                  std::string("getsockopt failed: ") + std::strerror(gso_errno), gso_errno);
         return true;
       }
@@ -1635,15 +1572,16 @@ private:
         {
           IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] Connection truly established for sid=" << cr.sid);
           // Connection completed immediately - manually trigger the connect callback
-          std::lock_guard<std::mutex> g(_cbMutex);
-          if (_cbs.onConnect)
+          decltype(_cbs.onConnect) connectCb;
+          { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
+          if (connectCb)
           {
             _atomicStats.connected++;
-            _cbs.onConnect(cr.sid, IoResult::success());
+            connectCb(cr.sid, addressFromSockaddr(sPtr->peer));
           }
-          _sessions[cr.sid]->connectPending = false;
-          _sessions[cr.sid]->lastWriteProgress = MonoClock::now();
-          cancelConnectTimeout(_sessions[cr.sid].get());
+          sPtr->connectPending = false;
+          sPtr->lastWriteProgress = MonoClock::now();
+          cancelConnectTimeout(sPtr);
         }
         else
         {
@@ -1654,7 +1592,7 @@ private:
           {
             IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] getpeername() detected connection failure for sid="
                            << cr.sid << ", errno=" << gp_errno);
-            closeNow(_sessions[cr.sid].get(), TransportError::Connect, std::strerror(gp_errno), gp_errno);
+            closeNow(sPtr, TransportError::Connect, std::strerror(gp_errno), gp_errno);
             return true;
           }
           // else ENOTCONN or other transient error - connection not yet established, wait for epoll/timeout
@@ -1667,7 +1605,7 @@ private:
         IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] SO_ERROR indicates connection failed for sid=" << cr.sid
                        << ", error=" << std::strerror(err));
         // Connection failed immediately - clean up and invoke failure callback
-        closeNow(_sessions[cr.sid].get(), TransportError::Connect, std::strerror(err), err);
+        closeNow(sPtr, TransportError::Connect, std::strerror(err), err);
         return true;
       }
     }
@@ -1754,11 +1692,12 @@ private:
             if (::getpeername(s->fd, reinterpret_cast<struct sockaddr *>(&addr), &addrlen) == 0)
             {
               IORA_LOG_DEBUG("[EPOLL-EVENT] Connection truly established for sid=" << s->id);
-              std::lock_guard<std::mutex> g(_cbMutex);
-              if (_cbs.onConnect)
+              decltype(_cbs.onConnect) connectCb;
+              { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
+              if (connectCb)
               {
                 _atomicStats.connected++;
-                _cbs.onConnect(s->id, IoResult::success());
+                connectCb(s->id, addressFromSockaddr(s->peer));
               }
               s->connectPending = false;
               s->lastWriteProgress = MonoClock::now();
@@ -1833,9 +1772,9 @@ private:
   bool driveHandshake(Session *s)
   {
     // Only check timeout here if high-resolution timers are not available
-    if (!_timerService && _cfg.handshakeTimeout.count() > 0 &&
+    if (!_timerService && _config.handshakeTimeout.count() > 0 &&
         (MonoClock::now() - s->tlsStart) >
-          std::chrono::duration_cast<std::chrono::seconds>(_cfg.handshakeTimeout))
+          std::chrono::duration_cast<std::chrono::seconds>(_config.handshakeTimeout))
     {
       closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", 0);
       return false;
@@ -1865,13 +1804,12 @@ private:
       _atomicStats.tlsHandshakes++;
       cancelHandshakeTimeout(s);
 
+      decltype(_cbs.onConnect) connectCb;
+      { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
+      if (connectCb)
       {
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onConnect)
-        {
-          _atomicStats.connected++;
-          _cbs.onConnect(s->id, IoResult::success());
-        }
+        _atomicStats.connected++;
+        connectCb(s->id, addressFromSockaddr(s->peer));
       }
       s->connectPending = false;
       s->lastWriteProgress = MonoClock::now();
@@ -1919,7 +1857,7 @@ private:
     for (;;)
     {
       std::vector<std::uint8_t> buf;
-      buf.resize(_cfg.ioReadChunk);
+      buf.resize(_config.ioReadChunk);
       int n = 0;
       if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
       {
@@ -1981,11 +1919,12 @@ private:
       {
         _atomicStats.bytesIn += n;
         s->lastActivity = MonoClock::now();
-        std::lock_guard<std::mutex> g(_cbMutex);
-        if (_cbs.onData)
+        decltype(_cbs.onData) dataCb;
+        { std::lock_guard<std::mutex> g(_cbMutex); dataCb = _cbs.onData; }
+        if (dataCb)
         {
           IORA_LOG_DEBUG("[RECV] Calling onData callback for sid=" << s->id << ", bytes=" << n);
-          _cbs.onData(s->id, buf.data(), (std::size_t)n, IoResult::success());
+          dataCb(s->id, iora::core::BufferView{buf.data(), (std::size_t)n}, std::chrono::steady_clock::now());
         }
         else
         {
@@ -2085,7 +2024,7 @@ private:
   void updateInterest(Session *s)
   {
     std::uint32_t ev = EPOLLIN;
-    if (_cfg.useEdgeTriggered)
+    if (_config.useEdgeTriggered)
       ev |= EPOLLET;
     // CRITICAL FIX: Keep EPOLLOUT registered while connection is pending
     // This ensures we receive the EPOLLOUT event when TCP handshake completes,
@@ -2223,10 +2162,10 @@ private:
       // First item in queue - schedule write stall timeout
       scheduleWriteStallTimeout(s);
     }
-    if (s->wq.size() > _cfg.maxWriteQueue)
+    if (s->wq.size() > _config.maxWriteQueue)
     {
       _atomicStats.backpressureCloses++;
-      if (_cfg.closeOnBackpressure)
+      if (_config.closeOnBackpressure)
       {
         IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", closing connection");
         closeNow(s, TransportError::WriteBackpressure, "write queue overflow", 0);
@@ -2256,47 +2195,47 @@ private:
     // Save caller's errno before system calls that overwrite it
     int savedErrno = errno;
 
-    delEpoll(s->fd);
+    // Save fields before erasing session from map
+    int fd = s->fd;
+    SessionId sid = s->id;
+    SSL *ssl = s->ssl;
+    s->ssl = nullptr; // Take ownership to prevent double-free
 
-    auto tagIt = _fdTags.find(s->fd);
+    delEpoll(fd);
+
+    auto tagIt = _fdTags.find(fd);
     if (tagIt != _fdTags.end())
     {
       _fdTags.erase(tagIt);
     }
 
+    // Remove from session map under write lock (before closing fd)
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _sessions.erase(sid);
+    }
+    // s is now dangling — use only saved locals below
+
     // SSL_shutdown BEFORE close(fd) — send close_notify on the live fd.
     // After ::close(fd), the fd number may be reused by another connection.
-    if (s->ssl)
+    if (ssl)
     {
-      ::SSL_shutdown(s->ssl);
-      ::SSL_free(s->ssl);
-      s->ssl = nullptr;
+      ::SSL_shutdown(ssl);
+      ::SSL_free(ssl);
     }
 
-    ::close(s->fd);
+    ::close(fd);
 
     _atomicStats.closed++;
     _atomicStats.sessionsCurrent--;
 
+    decltype(_cbs.onClose) closeCb;
+    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+
+    if (closeCb)
     {
-      std::lock_guard<std::mutex> g(_cbMutex);
-
-      if (s->connectPending && _cbs.onConnect)
-      {
-        IoResult r = IoResult::failure(why, msg, savedErrno, tlsErr);
-        _cbs.onConnect(s->id, r);
-      }
-      else if (_cbs.onClosed)
-      {
-        // Established connection was closed - call onClosed
-        IoResult r = (why == TransportError::None && msg.empty())
-                       ? IoResult::success()
-                       : IoResult::failure(why, msg, savedErrno, tlsErr);
-        _cbs.onClosed(s->id, r);
-      }
+      closeCb(sid, TransportErrorInfo{why, msg, savedErrno, tlsErr});
     }
-
-    _sessions.erase(s->id);
   }
 
   void closeListenerNow(Listener *lst)
@@ -2314,7 +2253,7 @@ private:
   {
     _atomicStats.gcRuns++;
     const auto now = MonoClock::now();
-    const bool age = _cfg.maxConnAge.count() > 0;
+    const bool age = _config.maxConnAge.count() > 0;
 
     std::vector<SessionId> toClose;
     toClose.reserve(_sessions.size());
@@ -2327,14 +2266,14 @@ private:
         continue;
       }
 
-      if (_cfg.idleTimeout.count() > 0 && (now - s->lastActivity) > _cfg.idleTimeout)
+      if (_config.idleTimeout.count() > 0 && (now - s->lastActivity) > _config.idleTimeout)
       {
         toClose.push_back(s->id);
         _atomicStats.gcClosedIdle++;
         continue;
       }
 
-      if (age && (now - s->created) > _cfg.maxConnAge)
+      if (age && (now - s->created) > _config.maxConnAge)
       {
         toClose.push_back(s->id);
         _atomicStats.gcClosedAged++;
@@ -2345,27 +2284,27 @@ private:
       if (!_timerService)
       {
         if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake &&
-            _cfg.handshakeTimeout.count() > 0 &&
+            _config.handshakeTimeout.count() > 0 &&
             (now - s->tlsStart) >
-              std::chrono::duration_cast<std::chrono::seconds>(_cfg.handshakeTimeout))
+              std::chrono::duration_cast<std::chrono::seconds>(_config.handshakeTimeout))
         {
           toClose.push_back(s->id);
           continue;
         }
 
         // Safety-net: connect timeout
-        if (_cfg.connectTimeout.count() > 0 && s->connectPending &&
+        if (_config.connectTimeout.count() > 0 && s->connectPending &&
             (now - s->connectStart) >
-              std::chrono::duration_cast<std::chrono::seconds>(_cfg.connectTimeout))
+              std::chrono::duration_cast<std::chrono::seconds>(_config.connectTimeout))
         {
           toClose.push_back(s->id);
           continue;
         }
 
         // Safety-net: write stall with queued data
-        if (_cfg.writeStallTimeout.count() > 0 && !s->wq.empty() &&
+        if (_config.writeStallTimeout.count() > 0 && !s->wq.empty() &&
             (now - s->lastWriteProgress) >
-              std::chrono::duration_cast<std::chrono::seconds>(_cfg.writeStallTimeout))
+              std::chrono::duration_cast<std::chrono::seconds>(_config.writeStallTimeout))
         {
           toClose.push_back(s->id);
           continue;
@@ -2394,26 +2333,26 @@ private:
 
   void applySockOpts(int fd)
   {
-    if (_cfg.enableTcpNoDelay)
+    if (_config.enableTcpNoDelay)
     {
       int one = 1;
       (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     }
-    if (_cfg.soRcvBuf > 0)
+    if (_config.soRcvBuf > 0)
     {
-      (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &_cfg.soRcvBuf, sizeof(int));
+      (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &_config.soRcvBuf, sizeof(int));
     }
-    if (_cfg.soSndBuf > 0)
+    if (_config.soSndBuf > 0)
     {
-      (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_cfg.soSndBuf, sizeof(int));
+      (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &_config.soSndBuf, sizeof(int));
     }
-    if (_cfg.tcpKeepalive.enable)
+    if (_config.tcpKeepalive.enable)
     {
       int one = 1;
       (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-      (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &_cfg.tcpKeepalive.idleSec, sizeof(int));
-      (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &_cfg.tcpKeepalive.intvlSec, sizeof(int));
-      (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &_cfg.tcpKeepalive.cnt, sizeof(int));
+      (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &_config.tcpKeepalive.idle, sizeof(int));
+      (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &_config.tcpKeepalive.interval, sizeof(int));
+      (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &_config.tcpKeepalive.count, sizeof(int));
     }
   }
 
@@ -2443,7 +2382,7 @@ private:
   bool initTls()
   {
     // Server
-    if (_srvTls.enabled && _srvTls.defaultMode == TlsMode::Server)
+    if (_config.serverTls.enabled && _config.serverTls.defaultMode == TlsMode::Server)
     {
       _sslSrv = ::SSL_CTX_new(TLS_server_method());
       if (!_sslSrv)
@@ -2452,42 +2391,42 @@ private:
         err(TransportError::Config, "SSL_CTX_new(server)");
         return false;
       }
-      if (!_srvTls.ciphers.empty())
+      if (!_config.serverTls.ciphers.empty())
       {
-        ::SSL_CTX_set_cipher_list(_sslSrv, _srvTls.ciphers.c_str());
+        ::SSL_CTX_set_cipher_list(_sslSrv, _config.serverTls.ciphers.c_str());
       }
-      if (!_srvTls.certFile.empty() && !_srvTls.keyFile.empty())
+      if (!_config.serverTls.certFile.empty() && !_config.serverTls.keyFile.empty())
       {
         // Validate files exist before attempting to load (clearer error messages)
-        if (::access(_srvTls.certFile.c_str(), R_OK) != 0)
+        if (::access(_config.serverTls.certFile.c_str(), R_OK) != 0)
         {
           setLastFatal(IoResult::failure(TransportError::Config,
-            "Server cert file not readable: " + _srvTls.certFile));
-          err(TransportError::Config, "server cert not readable: " + _srvTls.certFile);
+            "Server cert file not readable: " + _config.serverTls.certFile));
+          err(TransportError::Config, "server cert not readable: " + _config.serverTls.certFile);
           return false;
         }
-        if (::access(_srvTls.keyFile.c_str(), R_OK) != 0)
+        if (::access(_config.serverTls.keyFile.c_str(), R_OK) != 0)
         {
           setLastFatal(IoResult::failure(TransportError::Config,
-            "Server key file not readable: " + _srvTls.keyFile));
-          err(TransportError::Config, "server key not readable: " + _srvTls.keyFile);
+            "Server key file not readable: " + _config.serverTls.keyFile));
+          err(TransportError::Config, "server key not readable: " + _config.serverTls.keyFile);
           return false;
         }
-        if (::SSL_CTX_use_certificate_file(_sslSrv, _srvTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
+        if (::SSL_CTX_use_certificate_file(_sslSrv, _config.serverTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
               1 ||
-            ::SSL_CTX_use_PrivateKey_file(_sslSrv, _srvTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
+            ::SSL_CTX_use_PrivateKey_file(_sslSrv, _config.serverTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
         {
           setLastFatal(IoResult::failure(TransportError::Config, "load server cert/key failed"));
           err(TransportError::Config, "load server cert/key");
           return false;
         }
       }
-      if (_srvTls.verifyPeer)
+      if (_config.serverTls.verifyPeer)
       {
         ::SSL_CTX_set_verify(_sslSrv, SSL_VERIFY_PEER, nullptr);
-        if (!_srvTls.caFile.empty())
+        if (!_config.serverTls.caFile.empty())
         {
-          if (::SSL_CTX_load_verify_locations(_sslSrv, _srvTls.caFile.c_str(), nullptr) != 1)
+          if (::SSL_CTX_load_verify_locations(_sslSrv, _config.serverTls.caFile.c_str(), nullptr) != 1)
           {
             setLastFatal(IoResult::failure(TransportError::Config, "server load CA failed"));
             err(TransportError::Config, "server load CA");
@@ -2499,10 +2438,10 @@ private:
           ::SSL_CTX_set_default_verify_paths(_sslSrv);
         }
       }
-      if (!_srvTls.alpn.empty())
+      if (!_config.serverTls.alpn.empty())
       {
         _alpnPref.clear();
-        buildAlpnWire(_srvTls.alpn, _alpnPref);
+        buildAlpnWire(_config.serverTls.alpn, _alpnPref);
         (void)::SSL_CTX_set_alpn_select_cb(
           _sslSrv,
           [](SSL *, const unsigned char **out, unsigned char *outlen, const unsigned char *in,
@@ -2535,7 +2474,7 @@ private:
     }
 
     // Client
-    if (_cliTls.enabled && _cliTls.defaultMode == TlsMode::Client)
+    if (_config.clientTls.enabled && _config.clientTls.defaultMode == TlsMode::Client)
     {
       _sslCli = ::SSL_CTX_new(TLS_client_method());
       if (!_sslCli)
@@ -2544,22 +2483,22 @@ private:
         err(TransportError::Config, "SSL_CTX_new(client)");
         return false;
       }
-      if (!_cliTls.ciphers.empty())
+      if (!_config.clientTls.ciphers.empty())
       {
-        ::SSL_CTX_set_cipher_list(_sslCli, _cliTls.ciphers.c_str());
+        ::SSL_CTX_set_cipher_list(_sslCli, _config.clientTls.ciphers.c_str());
       }
       // Load client certificate and key for mutual TLS
-      if (!_cliTls.certFile.empty())
+      if (!_config.clientTls.certFile.empty())
       {
         // Validate file exists before attempting to load (clearer error messages)
-        if (::access(_cliTls.certFile.c_str(), R_OK) != 0)
+        if (::access(_config.clientTls.certFile.c_str(), R_OK) != 0)
         {
           setLastFatal(IoResult::failure(TransportError::Config,
-            "Client cert file not readable: " + _cliTls.certFile));
-          err(TransportError::Config, "client cert not readable: " + _cliTls.certFile);
+            "Client cert file not readable: " + _config.clientTls.certFile));
+          err(TransportError::Config, "client cert not readable: " + _config.clientTls.certFile);
           return false;
         }
-        if (::SSL_CTX_use_certificate_file(_sslCli, _cliTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
+        if (::SSL_CTX_use_certificate_file(_sslCli, _config.clientTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
             1)
         {
           setLastFatal(IoResult::failure(TransportError::Config, "client load cert failed"));
@@ -2567,17 +2506,17 @@ private:
           return false;
         }
       }
-      if (!_cliTls.keyFile.empty())
+      if (!_config.clientTls.keyFile.empty())
       {
         // Validate file exists before attempting to load (clearer error messages)
-        if (::access(_cliTls.keyFile.c_str(), R_OK) != 0)
+        if (::access(_config.clientTls.keyFile.c_str(), R_OK) != 0)
         {
           setLastFatal(IoResult::failure(TransportError::Config,
-            "Client key file not readable: " + _cliTls.keyFile));
-          err(TransportError::Config, "client key not readable: " + _cliTls.keyFile);
+            "Client key file not readable: " + _config.clientTls.keyFile));
+          err(TransportError::Config, "client key not readable: " + _config.clientTls.keyFile);
           return false;
         }
-        if (::SSL_CTX_use_PrivateKey_file(_sslCli, _cliTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
+        if (::SSL_CTX_use_PrivateKey_file(_sslCli, _config.clientTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
         {
           setLastFatal(IoResult::failure(TransportError::Config, "client load key failed"));
           err(TransportError::Config, "client load key");
@@ -2590,12 +2529,12 @@ private:
           return false;
         }
       }
-      if (_cliTls.verifyPeer)
+      if (_config.clientTls.verifyPeer)
       {
         ::SSL_CTX_set_verify(_sslCli, SSL_VERIFY_PEER, nullptr);
-        if (!_cliTls.caFile.empty())
+        if (!_config.clientTls.caFile.empty())
         {
-          if (::SSL_CTX_load_verify_locations(_sslCli, _cliTls.caFile.c_str(), nullptr) != 1)
+          if (::SSL_CTX_load_verify_locations(_sslCli, _config.clientTls.caFile.c_str(), nullptr) != 1)
           {
             setLastFatal(IoResult::failure(TransportError::Config, "client load CA failed"));
             err(TransportError::Config, "client load CA");
@@ -2607,10 +2546,10 @@ private:
           ::SSL_CTX_set_default_verify_paths(_sslCli);
         }
       }
-      if (!_cliTls.alpn.empty())
+      if (!_config.clientTls.alpn.empty())
       {
         std::vector<unsigned char> wire;
-        buildAlpnWire(_cliTls.alpn, wire);
+        buildAlpnWire(_config.clientTls.alpn, wire);
         (void)::SSL_CTX_set_alpn_protos(_sslCli, wire.data(), (unsigned int)wire.size());
       }
     }
@@ -2632,46 +2571,6 @@ private:
     }
   }
 
-private:
-  static Config configFromTransport(const TransportConfig &tc)
-  {
-    Config c;
-    c.epollMaxEvents = tc.epollMaxEvents;
-    c.ioReadChunk = tc.ioReadChunk;
-    c.maxWriteQueue = tc.maxWriteQueue;
-    c.closeOnBackpressure = tc.closeOnBackpressure;
-    c.idleTimeout = tc.idleTimeout;
-    c.maxConnAge = tc.maxConnAge;
-    c.handshakeTimeout = tc.handshakeTimeout;
-    c.connectTimeout = tc.connectTimeout;
-    c.writeStallTimeout = tc.writeStallTimeout;
-    c.gcInterval = tc.gcInterval;
-    c.enableHighResolutionTimers = tc.enableHighResolutionTimers;
-    c.useEdgeTriggered = tc.useEdgeTriggered;
-    c.enableTcpNoDelay = tc.enableTcpNoDelay;
-    c.soRcvBuf = tc.soRcvBuf;
-    c.soSndBuf = tc.soSndBuf;
-    c.tcpKeepalive.enable = tc.tcpKeepalive.enable;
-    c.tcpKeepalive.idleSec = tc.tcpKeepalive.idle;
-    c.tcpKeepalive.intvlSec = tc.tcpKeepalive.interval;
-    c.tcpKeepalive.cnt = tc.tcpKeepalive.count;
-    return c;
-  }
-
-  static TlsConfig tlsFromTransport(const TransportConfig::TlsConfig &src)
-  {
-    TlsConfig t;
-    t.enabled = src.enabled;
-    t.defaultMode = src.defaultMode;
-    t.certFile = src.certFile;
-    t.keyFile = src.keyFile;
-    t.caFile = src.caFile;
-    t.ciphers = src.ciphers;
-    t.alpn = src.alpn;
-    t.verifyPeer = src.verifyPeer;
-    return t;
-  }
-
   struct AtomicStats
   {
     std::atomic<std::uint64_t> accepted{0}, connected{0}, closed{0}, errors{0}, tlsHandshakes{0},
@@ -2680,16 +2579,20 @@ private:
     std::atomic<std::size_t> sessionsCurrent{0}, sessionsPeak{0};
   };
 
-  Config _cfg{};
-  TlsConfig _srvTls{}, _cliTls{};
+  TransportConfig _config{};
   mutable AtomicStats _atomicStats{};
 
   std::atomic<bool> _running{false};
   int _epollFd{-1}, _eventFd{-1}, _timerFd{-1};
   std::thread _loop;
 
+  // Lock ordering: _cbMutex and _sessionRwMutex are never held simultaneously.
+  // _cbMutex protects callback copies (acquired/released before any _sessionRwMutex use).
+  // _sessionRwMutex protects session/listener maps (shared_lock for reads, unique_lock for mutations).
   std::mutex _cbMutex;
-  Callbacks _cbs{};
+  detail::EngineBase::Callbacks _cbs{};
+
+  mutable std::shared_mutex _sessionRwMutex;
 
   std::mutex _cmdMutex;
   std::deque<Command> _cmds;
@@ -2713,6 +2616,9 @@ private:
   // High-resolution timer service
   std::unique_ptr<iora::core::TimerService> _timerService;
   iora::core::TimerServiceConfig _timerConfig;
+
+  // Batch processor (created when batching is enabled)
+  std::unique_ptr<EventBatchProcessor> _batchProcessor;
 
   // Static SSL initialization coordination
   static std::once_flag _sslGlobalInitFlag;

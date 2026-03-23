@@ -1190,7 +1190,7 @@ TEST_CASE("setReadMode returns false when allowReadModeSwitch is false", "[trans
 // task-6.9: Session introspection (adapter stubs — Phase 7 for full impl)
 // ══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("getListenerAddress does not crash (stub)", "[transport][introspection]")
+TEST_CASE("getListenerAddress returns actual bound address", "[transport][introspection]")
 {
   auto port = testnet::getFreePortTCP();
   auto t = Transport::tcp();
@@ -1198,11 +1198,12 @@ TEST_CASE("getListenerAddress does not crash (stub)", "[transport][introspection
   auto lr = t.addListener("127.0.0.1", port);
   REQUIRE(lr.isOk());
   auto addr = t.getListenerAddress(lr.value());
-  (void)addr; // Stub returns empty — verified doesn't crash
+  REQUIRE(addr.host == "127.0.0.1");
+  REQUIRE(addr.port == port);
   t.stop();
 }
 
-TEST_CASE("getLocalAddress/getRemoteAddress do not crash (stub)", "[transport][introspection]")
+TEST_CASE("getLocalAddress/getRemoteAddress return actual addresses", "[transport][introspection]")
 {
   auto port = testnet::getFreePortTCP();
   auto server = Transport::tcp();
@@ -1221,8 +1222,10 @@ TEST_CASE("getLocalAddress/getRemoteAddress do not crash (stub)", "[transport][i
 
   auto local = client.getLocalAddress(conn.value());
   auto remote = client.getRemoteAddress(conn.value());
-  (void)local;
-  (void)remote;
+  REQUIRE(local.host == "127.0.0.1");
+  REQUIRE(local.port > 0);
+  REQUIRE(remote.host == "127.0.0.1");
+  REQUIRE(remote.port == port);
 
   client.stop();
   server.stop();

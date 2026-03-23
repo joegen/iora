@@ -40,9 +40,11 @@
 
 using namespace std::chrono_literals;
 using TcpEngine = iora::network::TcpEngine;
+using TransportConfig = iora::network::TransportConfig;
+using TransportAddress = iora::network::TransportAddress;
+using TransportErrorInfo = iora::network::TransportErrorInfo;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
-using IoResult = iora::network::IoResult;
 using SessionId = iora::network::SessionId;
 using ListenerId = iora::network::ListenerId;
 
@@ -74,10 +76,8 @@ std::vector<uint8_t> encodeMessage(const std::string &msg)
 /// - A "client" that tracks received messages
 struct ProxyThreadedFixture
 {
-  TcpEngine::Config cfg{};
-  TcpEngine::TlsConfig srvTls{};
-  TcpEngine::TlsConfig cliTls{};
-  TcpEngine tx{cfg, srvTls, cliTls};
+  TransportConfig cfg{};
+  TcpEngine tx{cfg};
 
   // Connection tracking
   SessionId serverSid{0};  // Server's view of client connection
@@ -113,37 +113,32 @@ struct ProxyThreadedFixture
 
   ProxyThreadedFixture()
   {
-    TcpEngine::Callbacks cbs{};
+    iora::network::detail::EngineBase::Callbacks cbs{};
 
-    cbs.onAccept = [&](SessionId sid, const std::string &, const IoResult &res)
+    cbs.onAccept = [&](SessionId sid, const TransportAddress &)
     {
       std::lock_guard<std::mutex> lock(mtx);
-      if (res.ok)
-      {
-        serverSid = sid;
-      }
+      serverSid = sid;
       cv.notify_all();
     };
 
-    cbs.onConnect = [&](SessionId sid, const IoResult &res)
+    cbs.onConnect = [&](SessionId sid, const TransportAddress &)
     {
       std::lock_guard<std::mutex> lock(mtx);
-      if (res.ok)
-      {
-        clientSid = sid;
-      }
+      clientSid = sid;
       cv.notify_all();
     };
 
-    cbs.onData = [&](SessionId sid, const std::uint8_t *data, std::size_t n, const IoResult &res)
+    cbs.onData = [&](SessionId sid, iora::core::BufferView data,
+                      std::chrono::steady_clock::time_point)
     {
-      if (!res.ok || n == 0) return;
+      if (data.empty()) return;
 
       std::unique_lock<std::mutex> lock(mtx);
 
       // Accumulate data and parse length-prefixed messages
       auto &buf = receiveBuffers[sid];
-      buf.insert(buf.end(), data, data + n);
+      buf.insert(buf.end(), data.data(), data.data() + data.size());
 
       while (buf.size() >= 4)
       {
@@ -174,7 +169,7 @@ struct ProxyThreadedFixture
       cv.notify_all();
     };
 
-    cbs.onClosed = [&](SessionId, const IoResult &)
+    cbs.onClose = [&](SessionId, const TransportErrorInfo &)
     {
     };
 

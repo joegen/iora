@@ -10,9 +10,11 @@
 
 using namespace std::chrono_literals;
 using TcpEngine = iora::network::TcpEngine;
+using TransportConfig = iora::network::TransportConfig;
+using TransportAddress = iora::network::TransportAddress;
+using TransportErrorInfo = iora::network::TransportErrorInfo;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
-using IoResult = iora::network::IoResult;
 using SessionId = iora::network::SessionId;
 using ListenerId = iora::network::ListenerId;
 
@@ -20,10 +22,8 @@ namespace
 {
 struct TcpFixture
 {
-  TcpEngine::Config cfg{};
-  TcpEngine::TlsConfig srvTls{};
-  TcpEngine::TlsConfig cliTls{};
-  TcpEngine tx{cfg, srvTls, cliTls};
+  TransportConfig cfg{};
+  TcpEngine tx{cfg};
 
   std::atomic<size_t> acceptCount{0};
   std::atomic<size_t> connectCount{0};
@@ -47,50 +47,38 @@ struct TcpFixture
 
   TcpFixture()
   {
-    TcpEngine::Callbacks cbs{};
-    cbs.onAccept = [&](SessionId sid, const std::string &addr, const IoResult &res)
+    iora::network::detail::EngineBase::Callbacks cbs{};
+    cbs.onAccept = [&](SessionId sid, const TransportAddress &addr)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      if (res.ok)
-      {
-        acceptedSessions.push_back(sid);
-        if (serverSid == 0)
-          serverSid = sid;
-      }
+      acceptedSessions.push_back(sid);
+      if (serverSid == 0)
+        serverSid = sid;
       acceptCount++;
     };
-    cbs.onConnect = [&](SessionId sid, const IoResult &res)
+    cbs.onConnect = [&](SessionId sid, const TransportAddress &addr)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      if (res.ok)
-      {
-        connectedSessions.push_back(sid);
-        if (clientSid == 0)
-          clientSid = sid;
-        connectCount++;
-      }
-      else
-      {
-        connectFailCount++;
-      }
+      connectedSessions.push_back(sid);
+      if (clientSid == 0)
+        clientSid = sid;
+      connectCount++;
     };
-    cbs.onData = [&](SessionId sid, const std::uint8_t *data, std::size_t n, const IoResult &res)
+    cbs.onData = [&](SessionId sid, iora::core::BufferView data,
+                      std::chrono::steady_clock::time_point)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
-      if (res.ok)
-      {
-        totalBytesReceived += n;
-        sessionData[sid].append(reinterpret_cast<const char *>(data), n);
+      totalBytesReceived += data.size();
+      sessionData[sid].append(reinterpret_cast<const char *>(data.data()), data.size());
 
-        // Echo back from server; detect echo on client
-        if (sid == serverSid)
-        {
-          tx.send(sid, data, n);
-        }
+      // Echo back from server; detect echo on client
+      if (sid == serverSid)
+      {
+        tx.send(sid, data.data(), data.size());
       }
       dataCount++;
     };
-    cbs.onClosed = [&](SessionId sid, const IoResult &res)
+    cbs.onClose = [&](SessionId sid, const TransportErrorInfo &err)
     {
       std::lock_guard<std::mutex> lock(callbackMutex);
       closedSessions.push_back(sid);
@@ -296,8 +284,9 @@ TEST_CASE("TCP failed connection handling", "[tcp][error]")
   auto cr = f.tx.connect("127.0.0.1", 12345, TlsMode::None);
   REQUIRE(cr.isOk());
 
-  REQUIRE(f.waitForCondition([&]() { return f.connectFailCount > 0; }));
-  REQUIRE(f.connectFailCount == 1);
+  // Connect failures now come through onClose, not onConnect
+  REQUIRE(f.waitForCondition([&]() { return f.closeCount > 0; }));
+  REQUIRE(f.closeCount >= 1);
   REQUIRE(f.connectCount == 0);
 
   f.tx.stop();

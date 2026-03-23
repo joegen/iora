@@ -18,11 +18,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "iora/core/buffer_view.hpp"
 #include "iora/core/result.hpp"
+#include "iora/network/event_batch_processor.hpp"
 
 namespace iora
 {
@@ -143,7 +145,7 @@ struct ListenerResult
 };
 
 /// \brief Basic transport stats for legacy compatibility.
-/// Used by TcpEngine::getBasicStats() and the old adapter layer.
+/// Used by the old adapter layer.
 struct BasicTransportStats
 {
   std::uint64_t accepted{0};
@@ -440,9 +442,7 @@ struct TransportStats
   std::uint64_t backpressureCloses{0};
   std::size_t sessionsCurrent{0};
   std::size_t sessionsPeak{0};
-  // batchingStats: std::optional<BatchProcessingStats> deferred to Phase 4
-  // (batching integration). Will be added when EventBatchProcessor is wired
-  // into the engine. Default: std::nullopt when batching disabled.
+  std::optional<BatchProcessingStats> batchingStats;
 };
 
 } // namespace network

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <system_error>
@@ -44,7 +45,7 @@ struct BatchProcessingStats
 };
 
 // Event handler types
-using EventHandler = std::function<void(int fd, uint32_t events)>;
+using EventHandler = std::function<void(int fd, std::uint32_t events)>;
 using BatchCompleteHandler =
   std::function<void(std::size_t batchSize, std::chrono::microseconds processingTime)>;
 
@@ -52,8 +53,13 @@ using BatchCompleteHandler =
 class EventBatchProcessor
 {
 public:
-  explicit EventBatchProcessor(const BatchProcessingConfig &config = {}) : config_(config)
+  explicit EventBatchProcessor(const BatchProcessingConfig &config = {})
+    : config_(config), currentBatchSize_(config.enableAdaptiveSizing ? config.maxBatchSize / 2 : config.maxBatchSize)
   {
+    if (currentBatchSize_ == 0)
+    {
+      currentBatchSize_ = 1;
+    }
     events_.resize(config_.maxBatchSize);
   }
 
@@ -68,8 +74,8 @@ public:
     // Determine batch size (adaptive or fixed)
     std::size_t currentBatchSize = getCurrentBatchSize();
 
-    // Wait for events with timeout
-    int timeout = static_cast<int>(config_.maxBatchDelay.count() / 1000); // Convert to ms
+    // Wait for events with timeout (round up to at least 1ms to avoid busy-spin)
+    int timeout = std::max(1, static_cast<int>((config_.maxBatchDelay.count() + 999) / 1000));
     int n = ::epoll_wait(epollFd, events_.data(), static_cast<int>(currentBatchSize), timeout);
 
     if (n < 0)
@@ -83,13 +89,13 @@ public:
       return; // Timeout with no events
 
     // Process the batch of events
-    std::vector<std::pair<int, uint32_t>> normalEvents;
+    std::vector<std::pair<int, std::uint32_t>> normalEvents;
     normalEvents.reserve(n);
 
     for (int i = 0; i < n; ++i)
     {
       int fd = events_[i].data.fd;
-      uint32_t eventMask = events_[i].events;
+      std::uint32_t eventMask = events_[i].events;
 
       // Handle special file descriptors first (eventfd, timerfd, etc.)
       if (specialHandler(fd, eventMask))
@@ -134,7 +140,7 @@ public:
                                   const BatchCompleteHandler &onBatchComplete = nullptr)
   {
     auto specialHandler = [eventFd, timerFd, onEventFd, onTimerFd](int fd,
-                                                                   uint32_t /*events*/) -> bool
+                                                                   std::uint32_t /*events*/) -> bool
     {
       if (fd == eventFd)
       {
@@ -289,7 +295,7 @@ private:
   BatchProcessingStats stats_;
 
   // Adaptive sizing state
-  std::size_t currentBatchSize_;
+  std::size_t currentBatchSize_{0};
   std::chrono::steady_clock::time_point lastAdjustment_{std::chrono::steady_clock::now()};
 };
 
