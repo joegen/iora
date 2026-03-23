@@ -53,8 +53,8 @@
 
 #include "iora/core/logger.hpp"
 #include "iora/core/timer.hpp"
+#include "detail/engine_base.hpp"
 #include "transport_types.hpp"
-#include "sync_async_transport.hpp"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
@@ -78,7 +78,7 @@ namespace network
 /// if they access shared state. The destructor is virtual to support proper cleanup.
 ///
 /// \see TlsFaultInjectionTransport in tests/sipp_integration/ for usage example.
-class SharedTransport
+class SharedTransport : public detail::EngineBase
 {
 public:
   /// \brief Runtime configuration.
@@ -161,6 +161,14 @@ public:
     }
   }
 
+  /// \brief Construct from TransportConfig (EngineBase-compatible config).
+  explicit SharedTransport(const TransportConfig &config)
+    : SharedTransport(configFromTransport(config),
+                      tlsFromTransport(config.serverTls),
+                      tlsFromTransport(config.clientTls))
+  {
+  }
+
   /// \brief Destructor; calls stop() if needed.
   /// \note Virtual to support subclassing for fault injection testing.
   virtual ~SharedTransport() { stop(); }
@@ -174,7 +182,7 @@ public:
   /// not joinable). The I/O thread exits its loop naturally when it
   /// sees _running == false. This is a last-resort safety net for
   /// the case where Transport is destroyed from within a callback.
-  void detachForTermination()
+  void detachForTermination() override
   {
     _running.store(false, std::memory_order_release);
     if (_loop.joinable())
@@ -225,19 +233,20 @@ public:
   }
 
   /// \brief Start I/O thread and initialize TLS contexts.
-  /// \return true on success; false on failure (inspect lastFatalError()).
-  bool start()
+  /// \return StartResult::ok() on success; StartResult::err() on failure.
+  StartResult start() override
   {
     bool exp = false;
     if (!_running.compare_exchange_strong(exp, true))
     {
-      return false;
+      return StartResult::err(
+        TransportErrorInfo{TransportError::Config, "already running"});
     }
 
     if (!initTls())
     {
       _running.store(false);
-      return false;
+      return StartResult::err(lastError());
     }
 
     _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
@@ -247,7 +256,7 @@ public:
       err(TransportError::Config, "epoll_create1: " + lastErr());
       _running.store(false);
       freeTls();
-      return false;
+      return StartResult::err(lastError());
     }
 
     _eventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -256,7 +265,7 @@ public:
       setLastFatal(IoResult::failure(TransportError::Config, "eventfd: " + lastErr(), errno));
       err(TransportError::Config, "eventfd: " + lastErr());
       cleanupStartFail();
-      return false;
+      return StartResult::err(lastError());
     }
     addEpoll(_eventFd, EPOLLIN);
 
@@ -267,7 +276,7 @@ public:
         IoResult::failure(TransportError::Config, "timerfd_create: " + lastErr(), errno));
       err(TransportError::Config, "timerfd_create: " + lastErr());
       cleanupStartFail();
-      return false;
+      return StartResult::err(lastError());
     }
     addEpoll(_timerFd, EPOLLIN);
     armGc(_cfg.gcInterval);
@@ -291,14 +300,14 @@ public:
       setLastFatal(
         IoResult::failure(TransportError::Config, std::string("thread start: ") + ex.what()));
       cleanupStartFail();
-      return false;
+      return StartResult::err(lastError());
     }
 
-    return true;
+    return StartResult::ok();
   }
 
   /// \brief Stop I/O thread and release resources.
-  void stop()
+  void stop() override
   {
     bool exp = true;
     if (!_running.compare_exchange_strong(exp, false))
@@ -314,7 +323,7 @@ public:
 
   /// \brief Add a listening socket (IPv4/IPv6), optionally with TLS for
   /// server.
-  ListenerId addListener(const std::string &bind, std::uint16_t port, TlsMode tls)
+  ListenResult addListener(const std::string &bind, std::uint16_t port, TlsMode tls) override
   {
     ListenerCfg lc;
     lc.id = _nextListenerId++;
@@ -330,26 +339,32 @@ public:
       auto fut = ready->get_future();
       enqueue(Command::addListener(lc, std::move(ready)));
       bool ok = fut.get(); // blocks until I/O thread processes the command
-      return ok ? lc.id : 0; // 0 signals bind failure
+      if (!ok)
+      {
+        return ListenResult::err(
+          TransportErrorInfo{TransportError::Bind,
+            "bind/listen failed on " + bind + ":" + std::to_string(port)});
+      }
+      return ListenResult::ok(lc.id);
     }
     else
     {
       enqueue(Command::addListener(lc));
     }
-    return lc.id;
+    return ListenResult::ok(lc.id);
   }
 
   /// \brief Begin an outbound connection (async); result via onConnect.
-  SessionId connect(const std::string &host, std::uint16_t port, TlsMode tls)
+  ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls) override
   {
     SessionId sid = _nextSessionId++;
     ConnectReq cr{sid, host, port, tls};
     enqueue(Command::connect(cr));
-    return sid;
+    return ConnectResult::ok(sid);
   }
 
   /// \brief Queue a send on a session (non-blocking; may enqueue on EAGAIN).
-  bool send(SessionId sid, const void *data, std::size_t n)
+  bool send(SessionId sid, const void *data, std::size_t n) override
   {
     if (n == 0)
     {
@@ -367,32 +382,32 @@ public:
   }
 
   /// \brief Close a session (idempotent). onClosed will fire.
-  bool close(SessionId sid) { return enqueue(Command::close(sid)); }
+  bool close(SessionId sid) override { return enqueue(Command::close(sid)); }
 
   /// \brief Reconfigure runtime knobs; safe while running.
   void reconfigure(const Config &c) { enqueue(Command::reconf(c)); }
 
   /// \brief Snapshot of counters.
-  Stats stats() const
+  TransportStats getStats() const override
   {
-    Stats copy;
-    copy.accepted = _atomicStats.accepted.load();
-    copy.connected = _atomicStats.connected.load();
-    copy.closed = _atomicStats.closed.load();
-    copy.errors = _atomicStats.errors.load();
-    copy.tlsHandshakes = _atomicStats.tlsHandshakes.load();
-    copy.tlsFailures = _atomicStats.tlsFailures.load();
-    copy.bytesIn = _atomicStats.bytesIn.load();
-    copy.bytesOut = _atomicStats.bytesOut.load();
-    copy.epollWakeups = _atomicStats.epollWakeups.load();
-    copy.commands = _atomicStats.commands.load();
-    copy.gcRuns = _atomicStats.gcRuns.load();
-    copy.gcClosedIdle = _atomicStats.gcClosedIdle.load();
-    copy.gcClosedAged = _atomicStats.gcClosedAged.load();
-    copy.backpressureCloses = _atomicStats.backpressureCloses.load();
-    copy.sessionsCurrent = _atomicStats.sessionsCurrent.load();
-    copy.sessionsPeak = _atomicStats.sessionsPeak.load();
-    return copy;
+    TransportStats ts;
+    ts.accepted = _atomicStats.accepted.load();
+    ts.connected = _atomicStats.connected.load();
+    ts.closed = _atomicStats.closed.load();
+    ts.errors = _atomicStats.errors.load();
+    ts.tlsHandshakes = _atomicStats.tlsHandshakes.load();
+    ts.tlsFailures = _atomicStats.tlsFailures.load();
+    ts.bytesIn = _atomicStats.bytesIn.load();
+    ts.bytesOut = _atomicStats.bytesOut.load();
+    ts.epollWakeups = _atomicStats.epollWakeups.load();
+    ts.commands = _atomicStats.commands.load();
+    ts.gcRuns = _atomicStats.gcRuns.load();
+    ts.gcClosedIdle = _atomicStats.gcClosedIdle.load();
+    ts.gcClosedAged = _atomicStats.gcClosedAged.load();
+    ts.backpressureCloses = _atomicStats.backpressureCloses.load();
+    ts.sessionsCurrent = _atomicStats.sessionsCurrent.load();
+    ts.sessionsPeak = _atomicStats.sessionsPeak.load();
+    return ts;
   }
 
   /// \brief Basic stats for ITransportBase compatibility
@@ -418,15 +433,126 @@ public:
   }
 
   /// \brief Check if the transport I/O loop is running.
-  bool isRunning() const { return _running.load(std::memory_order_acquire); }
+  bool isRunning() const override { return _running.load(std::memory_order_acquire); }
 
   /// \brief Get I/O thread ID for deadlock detection
   /// \return Thread ID of the I/O event loop thread, or default-constructed ID if not running
   /// \note Used by SyncAsyncTransport to detect when sendSync() is called from I/O thread context
-  std::thread::id getIoThreadId() const
+  std::thread::id getIoThreadId() const override
   {
     return _loop.get_id();
   }
+
+  // ── EngineBase overrides ──────────────────────────────────────────────────
+
+  TransportErrorInfo lastError() const override
+  {
+    auto fatal = lastFatalError();
+    return TransportErrorInfo{fatal.code, fatal.message, fatal.sysErrno, fatal.tlsError};
+  }
+
+  ConnectResult connectViaListener(ListenerId, const std::string &, std::uint16_t) override
+  {
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::Config, "connectViaListener not supported on TCP/TLS"});
+  }
+
+  void sendAsync(SessionId sid, const void *data, std::size_t len,
+                 SendCompleteCallback cb) override
+  {
+    bool ok = send(sid, data, len);
+    if (cb)
+    {
+      if (ok)
+      {
+        cb(sid, SendResult::ok(len));
+      }
+      else
+      {
+        cb(sid, SendResult::err(TransportErrorInfo{TransportError::Socket, "send enqueue failed"}));
+      }
+    }
+  }
+
+  void setCallbacks(detail::EngineBase::Callbacks cbs) override
+  {
+    Callbacks legacy;
+
+    auto engineOnAccept = std::move(cbs.onAccept);
+    auto engineOnConnect = std::move(cbs.onConnect);
+    auto engineOnData = std::move(cbs.onData);
+    auto engineOnClose = std::move(cbs.onClose);
+    auto engineOnError = std::move(cbs.onError);
+
+    if (engineOnAccept)
+    {
+      legacy.onAccept = [cb = std::move(engineOnAccept)](SessionId sid, const std::string &peer,
+                                                         const IoResult &)
+      {
+        auto colon = peer.rfind(':');
+        TransportAddress addr;
+        if (colon != std::string::npos)
+        {
+          addr.host = peer.substr(0, colon);
+          try
+          {
+            addr.port = static_cast<std::uint16_t>(std::stoi(peer.substr(colon + 1)));
+          }
+          catch (...)
+          {
+            addr.port = 0;
+          }
+        }
+        else
+        {
+          addr.host = peer;
+        }
+        cb(sid, addr);
+      };
+    }
+
+    if (engineOnConnect)
+    {
+      auto closeCb = engineOnClose;
+      legacy.onConnect = [connectCb = std::move(engineOnConnect), closeCb](SessionId sid,
+                                                                           const IoResult &r)
+      {
+        if (r.ok)
+        {
+          connectCb(sid, TransportAddress{});
+        }
+        else if (closeCb)
+        {
+          closeCb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError});
+        }
+      };
+    }
+
+    if (engineOnData)
+    {
+      legacy.onData = [cb = std::move(engineOnData)](SessionId sid, const std::uint8_t *data,
+                                                     std::size_t len, const IoResult &)
+      { cb(sid, iora::core::BufferView{data, len}, std::chrono::steady_clock::now()); };
+    }
+
+    if (engineOnClose)
+    {
+      legacy.onClosed = [cb = std::move(engineOnClose)](SessionId sid, const IoResult &r)
+      { cb(sid, TransportErrorInfo{r.code, r.message, r.sysErrno, r.tlsError}); };
+    }
+
+    if (engineOnError)
+    {
+      legacy.onError = std::move(engineOnError);
+    }
+
+    setCallbacks(legacy);
+  }
+
+  TransportAddress getListenerAddress(ListenerId) const override { return {}; }
+  TransportAddress getLocalAddress(SessionId) const override { return {}; }
+  TransportAddress getRemoteAddress(SessionId) const override { return {}; }
+  bool setDscp(SessionId, std::uint8_t) override { return false; }
 
 protected:
   // ===== Virtual hooks for fault injection (B6 TLS testing) =====
@@ -2507,6 +2633,45 @@ private:
   }
 
 private:
+  static Config configFromTransport(const TransportConfig &tc)
+  {
+    Config c;
+    c.epollMaxEvents = tc.epollMaxEvents;
+    c.ioReadChunk = tc.ioReadChunk;
+    c.maxWriteQueue = tc.maxWriteQueue;
+    c.closeOnBackpressure = tc.closeOnBackpressure;
+    c.idleTimeout = tc.idleTimeout;
+    c.maxConnAge = tc.maxConnAge;
+    c.handshakeTimeout = tc.handshakeTimeout;
+    c.connectTimeout = tc.connectTimeout;
+    c.writeStallTimeout = tc.writeStallTimeout;
+    c.gcInterval = tc.gcInterval;
+    c.enableHighResolutionTimers = tc.enableHighResolutionTimers;
+    c.useEdgeTriggered = tc.useEdgeTriggered;
+    c.enableTcpNoDelay = tc.enableTcpNoDelay;
+    c.soRcvBuf = tc.soRcvBuf;
+    c.soSndBuf = tc.soSndBuf;
+    c.tcpKeepalive.enable = tc.tcpKeepalive.enable;
+    c.tcpKeepalive.idleSec = tc.tcpKeepalive.idle;
+    c.tcpKeepalive.intvlSec = tc.tcpKeepalive.interval;
+    c.tcpKeepalive.cnt = tc.tcpKeepalive.count;
+    return c;
+  }
+
+  static TlsConfig tlsFromTransport(const TransportConfig::TlsConfig &src)
+  {
+    TlsConfig t;
+    t.enabled = src.enabled;
+    t.defaultMode = src.defaultMode;
+    t.certFile = src.certFile;
+    t.keyFile = src.keyFile;
+    t.caFile = src.caFile;
+    t.ciphers = src.ciphers;
+    t.alpn = src.alpn;
+    t.verifyPeer = src.verifyPeer;
+    return t;
+  }
+
   struct AtomicStats
   {
     std::atomic<std::uint64_t> accepted{0}, connected{0}, closed{0}, errors{0}, tlsHandshakes{0},

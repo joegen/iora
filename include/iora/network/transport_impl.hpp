@@ -8,7 +8,7 @@
 /// \details Contains engine headers (epoll, OpenSSL) — do NOT include broadly.
 
 #include "iora/network/transport.hpp"
-#include "iora/network/detail/tcp_engine.hpp"
+#include "iora/network/shared_transport.hpp"
 #include "iora/network/detail/udp_engine.hpp"
 // ReadMode and CancellationToken are now in transport_types.hpp (included via transport.hpp)
 
@@ -350,7 +350,7 @@ inline Transport::Transport(TransportConfig config)
   _impl->config = std::move(config);
   if (_impl->config.protocol == Protocol::TCP)
   {
-    _impl->engine = std::make_unique<detail::TcpEngine>(_impl->config);
+    _impl->engine = std::make_unique<SharedTransport>(_impl->config);
   }
   else
   {

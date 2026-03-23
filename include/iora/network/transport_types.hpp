@@ -422,7 +422,7 @@ struct TransportConfig
 };
 
 /// \brief Transport statistics. Single stats type replacing the 3 existing
-/// stats types (SharedTransport::Stats, BasicTransportStats, UnifiedStats).
+/// stats types (BasicTransportStats, UnifiedStats).
 struct TransportStats
 {
   std::uint64_t accepted{0};

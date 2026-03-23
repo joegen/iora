@@ -135,8 +135,8 @@ struct TcpFixture
 TEST_CASE("TCP start/stop idempotent", "[tcp]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
-  REQUIRE_FALSE(f.tx.start()); // already running should return false
+  REQUIRE(f.tx.start().isOk());
+  REQUIRE(f.tx.start().isErr()); // already running should return err
   f.tx.stop();
   f.tx.stop(); // idempotent
 }
@@ -144,14 +144,14 @@ TEST_CASE("TCP start/stop idempotent", "[tcp]")
 TEST_CASE("TCP loopback echo", "[tcp][echo]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   // Wait for accept/connect to fire
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
@@ -175,24 +175,24 @@ TEST_CASE("TCP loopback echo", "[tcp][echo]")
 TEST_CASE("TCP stats verification", "[tcp][stats]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  auto stats1 = f.tx.stats();
+  auto stats1 = f.tx.getStats();
   REQUIRE(stats1.sessionsCurrent == 0);
   REQUIRE(stats1.sessionsPeak == 0);
   REQUIRE(stats1.bytesOut == 0);
   REQUIRE(stats1.bytesIn == 0);
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
-  auto stats2 = f.tx.stats();
+  auto stats2 = f.tx.getStats();
   REQUIRE(stats2.sessionsCurrent == 2); // client + server session
   REQUIRE(stats2.sessionsPeak >= 2);
 
@@ -202,14 +202,14 @@ TEST_CASE("TCP stats verification", "[tcp][stats]")
 
   REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() > 0; }));
 
-  auto stats3 = f.tx.stats();
+  auto stats3 = f.tx.getStats();
   REQUIRE(stats3.bytesOut >= msgLen);
   REQUIRE(stats3.bytesIn >= msgLen);
 
   f.tx.close(cs);
   REQUIRE(f.waitForCondition([&]() { return f.closeCount > 0; }));
 
-  auto stats4 = f.tx.stats();
+  auto stats4 = f.tx.getStats();
   REQUIRE(stats4.sessionsCurrent < stats3.sessionsCurrent);
   REQUIRE(stats4.sessionsPeak >= stats3.sessionsPeak);
 
@@ -219,11 +219,10 @@ TEST_CASE("TCP stats verification", "[tcp][stats]")
 TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
   const size_t numClients = 5;
   std::vector<SessionId> clients;
@@ -231,9 +230,9 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
   // Connect multiple clients
   for (size_t i = 0; i < numClients; ++i)
   {
-    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    REQUIRE(cs != 0);
-    clients.push_back(cs);
+    auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+    REQUIRE(cr.isOk());
+    clients.push_back(cr.value());
   }
 
   REQUIRE(f.waitForCondition(
@@ -291,11 +290,11 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
 TEST_CASE("TCP failed connection handling", "[tcp][error]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   // Try to connect to non-existent server
-  SessionId cs = f.tx.connect("127.0.0.1", 12345, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", 12345, TlsMode::None);
+  REQUIRE(cr.isOk());
 
   REQUIRE(f.waitForCondition([&]() { return f.connectFailCount > 0; }));
   REQUIRE(f.connectFailCount == 1);
@@ -307,14 +306,14 @@ TEST_CASE("TCP failed connection handling", "[tcp][error]")
 TEST_CASE("TCP large data transfer", "[tcp][largedata]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -340,14 +339,14 @@ TEST_CASE("TCP large data transfer", "[tcp][largedata]")
 TEST_CASE("TCP binary data handling", "[tcp][binary]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -369,14 +368,14 @@ TEST_CASE("TCP binary data handling", "[tcp][binary]")
 TEST_CASE("TCP immediate close after connect", "[tcp][closefast]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -390,14 +389,14 @@ TEST_CASE("TCP immediate close after connect", "[tcp][closefast]")
 TEST_CASE("TCP operations on closed session", "[tcp][closedops]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -417,7 +416,7 @@ TEST_CASE("TCP operations on closed session", "[tcp][closedops]")
 TEST_CASE("TCP invalid session operations", "[tcp][invalidsession]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   // Operations on invalid session ID should be handled by implementation
   SessionId invalidSid = 99999;
@@ -432,25 +431,29 @@ TEST_CASE("TCP invalid session operations", "[tcp][invalidsession]")
 TEST_CASE("TCP listener management", "[tcp][listeners]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port1 = testnet::getFreePortTCP();
   auto port2 = testnet::getFreePortTCP();
 
   // Add multiple listeners
-  ListenerId lid1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
-  REQUIRE(lid1 != 0);
+  auto lr1 = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
+  REQUIRE(lr1.isOk());
+  ListenerId lid1 = lr1.value();
 
-  ListenerId lid2 = f.tx.addListener("127.0.0.1", port2, TlsMode::None);
-  REQUIRE(lid2 != 0);
+  auto lr2 = f.tx.addListener("127.0.0.1", port2, TlsMode::None);
+  REQUIRE(lr2.isOk());
+  ListenerId lid2 = lr2.value();
 
   REQUIRE(lid1 != lid2);
 
   // Connect to both listeners
-  SessionId cs1 = f.tx.connect("127.0.0.1", port1, TlsMode::None);
-  SessionId cs2 = f.tx.connect("127.0.0.1", port2, TlsMode::None);
-  REQUIRE(cs1 != 0);
-  REQUIRE(cs2 != 0);
+  auto cr1 = f.tx.connect("127.0.0.1", port1, TlsMode::None);
+  auto cr2 = f.tx.connect("127.0.0.1", port2, TlsMode::None);
+  REQUIRE(cr1.isOk());
+  REQUIRE(cr2.isOk());
+  SessionId cs1 = cr1.value();
+  SessionId cs2 = cr2.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount >= 2 && f.connectCount >= 2; }));
 
@@ -478,14 +481,14 @@ TEST_CASE("TCP listener management", "[tcp][listeners]")
 TEST_CASE("TCP empty data send", "[tcp][emptydata]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -500,11 +503,10 @@ TEST_CASE("TCP empty data send", "[tcp][emptydata]")
 TEST_CASE("TCP session ID uniqueness", "[tcp][sessionids]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
   const size_t numConnections = 10;
   std::vector<SessionId> clientIds;
@@ -513,9 +515,9 @@ TEST_CASE("TCP session ID uniqueness", "[tcp][sessionids]")
   // Create multiple connections
   for (size_t i = 0; i < numConnections; ++i)
   {
-    SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    REQUIRE(cs != 0);
-    clientIds.push_back(cs);
+    auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+    REQUIRE(cr.isOk());
+    clientIds.push_back(cr.value());
   }
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptedSessions.size() >= numConnections; }));
@@ -533,14 +535,14 @@ TEST_CASE("TCP session ID uniqueness", "[tcp][sessionids]")
 TEST_CASE("TCP high frequency small messages", "[tcp][highfreq]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -568,14 +570,13 @@ TEST_CASE("TCP high frequency small messages", "[tcp][highfreq]")
 TEST_CASE("TCP duplicate listener error handling", "[tcp][duplicatelistener]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid1 = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid1 != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  ListenerId lid2 = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid2 != 0); // API might return valid ID, but binding should fail
+  // Second bind to same port — may succeed (SO_REUSEADDR) or fail
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
 
   // Give time for async bind failures to surface
   std::this_thread::sleep_for(100ms);
@@ -586,14 +587,14 @@ TEST_CASE("TCP duplicate listener error handling", "[tcp][duplicatelistener]")
 TEST_CASE("TCP transport restart with existing sessions", "[tcp][restart]")
 {
   TcpFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortTCP();
 
-  ListenerId lid = f.tx.addListener("127.0.0.1", port, TlsMode::None);
-  REQUIRE(lid != 0);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cs = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cs != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
 
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
 
@@ -604,7 +605,7 @@ TEST_CASE("TCP transport restart with existing sessions", "[tcp][restart]")
   std::this_thread::sleep_for(100ms);
 
   // Operations on old sessions after restart
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
   // TCP transport may not immediately fail on send to stale session
   (void)f.tx.send(cs, "test", 4);
   // Note: Implementation may handle stale sessions gracefully or asynchronously

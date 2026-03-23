@@ -23,7 +23,7 @@ TEST_CASE("High-resolution timer configuration", "[shared_transport][timers]")
   SharedTransport::TlsConfig cliTls{};
 
   SharedTransport transport(cfg, srvTls, cliTls);
-  REQUIRE(transport.start());
+  REQUIRE(transport.start().isOk());
 
   // Verify the configuration is set correctly
   REQUIRE(cfg.enableHighResolutionTimers == true);
@@ -46,7 +46,7 @@ TEST_CASE("Legacy timer fallback when high-resolution disabled", "[shared_transp
   SharedTransport::TlsConfig cliTls{};
 
   SharedTransport transport(cfg, srvTls, cliTls);
-  REQUIRE(transport.start());
+  REQUIRE(transport.start().isOk());
 
   // Verify legacy configuration
   REQUIRE(cfg.enableHighResolutionTimers == false);
@@ -79,7 +79,7 @@ TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip
   SharedTransport::TlsConfig cliTls{};
   SharedTransport sipTransport(sipCfg, srvTls, cliTls);
 
-  REQUIRE(sipTransport.start());
+  REQUIRE(sipTransport.start().isOk());
   sipTransport.stop();
 }
 
@@ -125,12 +125,12 @@ TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][time
   };
 
   transport.setCallbacks(cbs);
-  REQUIRE(transport.start());
+  REQUIRE(transport.start().isOk());
 
   // Try to connect to a non-routable address that should timeout quickly
   // Using 10.254.254.254 which should be non-routable
-  SessionId sid = transport.connect("10.254.254.254", 9999, TlsMode::None);
-  REQUIRE(sid != 0);
+  auto cr = transport.connect("10.254.254.254", 9999, TlsMode::None);
+  REQUIRE(cr.isOk());
 
   // Wait for timeout to occur (should be around 100ms)
   auto start = std::chrono::steady_clock::now();

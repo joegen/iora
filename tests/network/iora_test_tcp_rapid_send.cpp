@@ -14,8 +14,8 @@
 ///
 /// The rapid send scenario:
 ///   - UAS sends 180 Ringing followed by 200 OK within ~17 microseconds
-///   - TransactionShard worker thread A processes 180 Ringing → calls sendSync() to UAC
-///   - TransactionShard worker thread A (or B) processes 200 OK → calls sendSync() to UAC
+///   - TransactionShard worker thread A processes 180 Ringing -> calls sendSync() to UAC
+///   - TransactionShard worker thread A (or B) processes 200 OK -> calls sendSync() to UAC
 ///   - Both sendSync() calls queue commands to I/O thread which processes them sequentially
 ///   - BUT: 200 OK data is lost despite sendSync() and ::send() reporting success
 ///
@@ -25,7 +25,6 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 #include "iora/network/shared_transport.hpp"
-#include "iora/network/sync_async_transport.hpp"
 #include "iora_test_net_utils.hpp"
 #include "test_helpers.hpp"
 
@@ -41,7 +40,6 @@
 
 using namespace std::chrono_literals;
 using SharedTransport = iora::network::SharedTransport;
-using SyncAsyncTransport = iora::network::SyncAsyncTransport;
 using TransportError = iora::network::TransportError;
 using TlsMode = iora::network::TlsMode;
 using IoResult = iora::network::IoResult;
@@ -301,17 +299,18 @@ struct ProxyThreadedFixture
 TEST_CASE("THREADED-1: Single worker rapid sends", "[tcp][rapid][threaded][critical]")
 {
   ProxyThreadedFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortTCP();
   REQUIRE(port > 0);
 
   // Start server
-  f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
   // Connect client
-  SessionId cid = f.tx.connect("127.0.0.1", port, TlsMode::None);
-  REQUIRE(cid != 0);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cid = cr.value();
 
   // Wait for connection
   REQUIRE(f.waitFor([&] { return f.serverSid != 0; }));
@@ -348,12 +347,14 @@ TEST_CASE("THREADED-1: Single worker rapid sends", "[tcp][rapid][threaded][criti
 TEST_CASE("THREADED-2: Two workers concurrent rapid sends", "[tcp][rapid][threaded]")
 {
   ProxyThreadedFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortTCP();
-  f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cid = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cid = cr.value();
   REQUIRE(f.waitFor([&] { return f.serverSid != 0; }));
   std::this_thread::sleep_for(50ms);
 
@@ -386,12 +387,14 @@ TEST_CASE("THREADED-2: Two workers concurrent rapid sends", "[tcp][rapid][thread
 TEST_CASE("THREADED-3: Burst queue with single worker", "[tcp][rapid][threaded][critical]")
 {
   ProxyThreadedFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortTCP();
-  f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cid = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cid = cr.value();
   REQUIRE(f.waitFor([&] { return f.serverSid != 0; }));
   std::this_thread::sleep_for(50ms);
 
@@ -439,10 +442,10 @@ TEST_CASE("THREADED-3: Burst queue with single worker", "[tcp][rapid][threaded][
 TEST_CASE("THREADED-4: Server-to-client rapid sends (proxy to UAC pattern)", "[tcp][rapid][threaded][critical]")
 {
   ProxyThreadedFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortTCP();
-  f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
   // Client connects
   (void)f.tx.connect("127.0.0.1", port, TlsMode::None);
@@ -490,12 +493,14 @@ TEST_CASE("THREADED-4: Server-to-client rapid sends (proxy to UAC pattern)", "[t
 TEST_CASE("THREADED-5: High volume threaded sends", "[tcp][rapid][threaded][stress]")
 {
   ProxyThreadedFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortTCP();
-  f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cid = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cid = cr.value();
   REQUIRE(f.waitFor([&] { return f.serverSid != 0; }));
   std::this_thread::sleep_for(50ms);
 
@@ -530,12 +535,14 @@ TEST_CASE("THREADED-5: High volume threaded sends", "[tcp][rapid][threaded][stre
 TEST_CASE("BASELINE: Direct sequential sends from main thread", "[tcp][baseline]")
 {
   ProxyThreadedFixture f;
-  REQUIRE(f.tx.start());
+  REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortTCP();
-  f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  SessionId cid = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cid = cr.value();
   REQUIRE(f.waitFor([&] { return f.serverSid != 0; }));
   std::this_thread::sleep_for(50ms);
 
