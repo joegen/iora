@@ -10,8 +10,8 @@
 #error "Linux-only (epoll/eventfd/timerfd)"
 #endif
 
-/// \file iora_shared_transport.hpp
-/// \brief Header-only, Linux-only epoll-based shared TCP/TLS transport.
+/// \file detail/tcp_engine.hpp
+/// \brief Header-only, Linux-only epoll-based TCP/TLS engine (EngineBase implementation).
 /// \details
 ///   - Single I/O thread (epoll + eventfd + timerfd)
 ///   - Async accept/connect/read/write with internal session GC
@@ -53,8 +53,8 @@
 
 #include "iora/core/logger.hpp"
 #include "iora/core/timer.hpp"
-#include "detail/engine_base.hpp"
-#include "transport_types.hpp"
+#include "iora/network/detail/engine_base.hpp"
+#include "iora/network/transport_types.hpp"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 

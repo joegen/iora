@@ -8,8 +8,8 @@
 /// \details Contains engine headers (epoll, OpenSSL) — do NOT include broadly.
 
 #include "iora/network/transport.hpp"
-#include "iora/network/shared_transport.hpp"
-#include "iora/network/shared_transport_udp.hpp"
+#include "iora/network/detail/tcp_engine.hpp"
+#include "iora/network/detail/udp_engine.hpp"
 // ReadMode and CancellationToken are now in transport_types.hpp (included via transport.hpp)
 
 #include <algorithm>

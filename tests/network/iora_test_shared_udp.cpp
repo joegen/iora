@@ -1,6 +1,6 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
-#include "iora/network/shared_transport_udp.hpp"
+#include "iora/network/detail/udp_engine.hpp"
 #include "iora_test_net_utils.hpp"
 #include "test_helpers.hpp"
 

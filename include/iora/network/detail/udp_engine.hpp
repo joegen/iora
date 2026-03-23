@@ -10,11 +10,11 @@
 #error "Linux-only (epoll/eventfd/timerfd)"
 #endif
 
-#include "circuit_breaker.hpp"
-#include "connection_health.hpp"
-#include "detail/engine_base.hpp"
-#include "object_pool.hpp"
-#include "transport_types.hpp"
+#include "iora/network/circuit_breaker.hpp"
+#include "iora/network/connection_health.hpp"
+#include "iora/network/detail/engine_base.hpp"
+#include "iora/network/object_pool.hpp"
+#include "iora/network/transport_types.hpp"
 #include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
