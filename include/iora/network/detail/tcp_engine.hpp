@@ -2076,6 +2076,19 @@ private:
     IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " wq.size=" << s->wq.size()
                   << ", tlsMode=" << (int)s->tlsMode << ", fd=" << s->fd);
 
+    // If TLS handshake is still in progress, queue data — do NOT send raw bytes
+    // over a TLS session. Raw ::send() during handshake causes the peer's SSL_accept
+    // to fail with SSL_ERROR_SSL (protocol error) because it sees non-TLS data.
+    if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake)
+    {
+      IORA_LOG_DEBUG("[IO-THREAD] TLS handshake in progress for sid=" << sr.sid
+                    << ", queuing " << sr.payload.size() << " bytes until handshake completes");
+      s->wq.emplace_back(std::move(sr.payload));
+      s->wantWrite = true;
+      updateInterest(s);
+      return;
+    }
+
     if (s->wq.empty())
     {
       int n = 0;
