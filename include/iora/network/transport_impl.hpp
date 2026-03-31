@@ -132,14 +132,23 @@ struct Transport::Impl
     {
       // Check if this is a connectSync — deliver to waiting caller, NOT global callback
       {
-        std::lock_guard<std::mutex> lk(syncMutex);
-        auto it = pendingConnects.find(sid);
-        if (it != pendingConnects.end())
+        std::shared_ptr<SyncConnectOp> op;
         {
-          it->second->result = ConnectResult::ok(sid);
-          it->second->done = true;
-          it->second->cv.notify_one();
-          pendingConnects.erase(it);
+          std::lock_guard<std::mutex> lk(syncMutex);
+          auto it = pendingConnects.find(sid);
+          if (it != pendingConnects.end())
+          {
+            op = it->second;
+            op->result = ConnectResult::ok(sid);
+            op->done = true;
+            pendingConnects.erase(it);
+          }
+        }
+        // Notify outside syncMutex — avoids the woken thread immediately
+        // blocking on syncMutex reacquisition inside cv.wait_for().
+        if (op)
+        {
+          op->cv.notify_one();
           return; // Do NOT fire global onConnect
         }
         // Not a connectSync session — fall through to global callback
@@ -212,14 +221,22 @@ struct Transport::Impl
       //    Without this, a failed connectSync (e.g., ECONNREFUSED) would fire
       //    the global onClose for a sid the user never received.
       {
-        std::lock_guard<std::mutex> lk(syncMutex);
-        auto connIt = pendingConnects.find(sid);
-        if (connIt != pendingConnects.end())
+        std::shared_ptr<SyncConnectOp> op;
         {
-          connIt->second->result = ConnectResult::err(reason);
-          connIt->second->done = true;
-          connIt->second->cv.notify_one();
-          pendingConnects.erase(connIt);
+          std::lock_guard<std::mutex> lk(syncMutex);
+          auto connIt = pendingConnects.find(sid);
+          if (connIt != pendingConnects.end())
+          {
+            op = connIt->second;
+            op->result = ConnectResult::err(reason);
+            op->done = true;
+            pendingConnects.erase(connIt);
+          }
+        }
+        // Notify outside syncMutex — same pattern as onConnect.
+        if (op)
+        {
+          op->cv.notify_one();
           // No global onClose, no observers, no tombstone — connectSync
           // session never escaped to user code, so nothing to clean up.
           return;
@@ -540,15 +557,14 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
     return _impl->engine->connect(host, port, tls);
   }
 
-  // TCP: initiate async connect WITHOUT holding syncMutex (avoids deadlock
-  // where engine->connect() could throw/fire callbacks that acquire syncMutex
-  // via the I/O thread while we hold it — AB-BA with engine-internal locks).
-  // Race safety: engine->connect() only enqueues a command — the actual TCP
-  // connect happens on the I/O thread asynchronously. This is a hard contract
-  // on EngineBase: connect() MUST only enqueue, never process synchronously.
-  // The I/O thread processes the command after we register in pendingConnects
-  // below, so the callback always finds the entry.
+  // Acquire syncMutex BEFORE calling engine->connect(). This ensures the
+  // I/O thread's onConnect callback (which acquires syncMutex) cannot fire
+  // until we have registered in pendingConnects and entered cv.wait_for()
+  // (which atomically releases syncMutex). engine->connect() only acquires
+  // the engine's internal _cmdMutex (atomic++ + push + eventfd write ≈ μs),
+  // not syncMutex — no AB-BA deadlock risk, no convoy under concurrency.
   auto op = std::make_shared<Impl::SyncConnectOp>();
+  std::unique_lock<std::mutex> lk(_impl->syncMutex);
 
   auto result = _impl->engine->connect(host, port, tls);
   if (result.isErr())
@@ -557,19 +573,16 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   }
   SessionId sid = result.value();
 
-  // Register and wait in a single unique_lock scope — no gap between
-  // registration and wait where a notification could be missed.
-  std::unique_lock<std::mutex> lk(_impl->syncMutex);
   _impl->pendingConnects[sid] = op;
   if (op->cv.wait_for(lk, timeout, [&op] { return op->done; }))
   {
     return std::move(op->result);
   }
 
-  // Timeout — keep the pendingConnects entry so that when engine->close()
-  // fires onClose, the handler finds it and suppresses the global onClose
-  // callback. Without this, the timed-out session's close would leak to
-  // the user's onClose callback for a sid they never received.
+  // Timeout — keep pendingConnects[sid] entry so onClose finds it and suppresses
+  // the global onClose callback (the user never received this sid). The entry's
+  // shared_ptr<SyncConnectOp> keeps op alive until the I/O thread's onClose
+  // handler erases it — the local op going out of scope here is safe.
   // Release syncMutex BEFORE calling engine methods to avoid AB-BA deadlock.
   lk.unlock();
   _impl->engine->close(sid);
