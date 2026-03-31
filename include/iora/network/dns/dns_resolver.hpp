@@ -12,9 +12,10 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
-#include <regex>
 #include <string>
 #include <vector>
 
@@ -31,9 +32,11 @@ enum class ServiceType
 {
   SIPS_TLS,  ///< SIPS over TLS (secure)
   SIPS_SCTP, ///< SIPS over SCTP (secure)
+  SIPS_WSS,  ///< SIPS over WSS (secure WebSocket)
   SIP_TCP,   ///< SIP over TCP
   SIP_UDP,   ///< SIP over UDP
   SIP_SCTP,  ///< SIP over SCTP
+  SIP_WS,    ///< SIP over WebSocket
   HTTP_TCP,  ///< HTTP over TCP (for generic HTTP service discovery)
   HTTPS_TCP, ///< HTTPS over TCP (secure HTTP)
   Unknown    ///< Unknown or unsupported service
@@ -47,6 +50,8 @@ struct ServiceTarget
   ServiceType transport;              ///< Transport protocol
   std::uint16_t priority;             ///< SRV priority (lower = higher priority)
   std::uint16_t weight;               ///< SRV weight for load balancing
+  std::uint16_t naptrPreference{0};   ///< NAPTR preference (RFC 3403 §2.1) — lower = preferred.
+                                      ///< 0 = no NAPTR tier (direct SRV/A fallback path).
   std::vector<std::string> addresses; ///< Resolved IP addresses (A/AAAA)
 
   /// \brief Get transport protocol as string
@@ -64,6 +69,10 @@ struct ServiceTarget
       return "sctp";
     case ServiceType::SIPS_SCTP:
       return "sctp";
+    case ServiceType::SIPS_WSS:
+      return "wss";
+    case ServiceType::SIP_WS:
+      return "ws";
     case ServiceType::HTTP_TCP:
       return "tcp";
     case ServiceType::HTTPS_TCP:
@@ -77,8 +86,27 @@ struct ServiceTarget
   bool isSecure() const
   {
     return transport == ServiceType::SIPS_TLS || transport == ServiceType::SIPS_SCTP ||
-           transport == ServiceType::HTTPS_TCP;
+           transport == ServiceType::SIPS_WSS || transport == ServiceType::HTTPS_TCP;
   }
+};
+
+/// \brief NAPTR 'S' flag target — SRV domain name for SRV resolution
+/// Carries NAPTR preference so SRV results preserve NAPTR transport ordering
+struct NaptrSrvTarget
+{
+  ServiceType service{ServiceType::Unknown};
+  std::string srvName;
+  std::uint16_t naptrPreference{0};
+};
+
+/// \brief NAPTR 'A' flag target — hostname for direct A/AAAA resolution (no SRV)
+/// Carries NAPTR order/preference for correct priority ordering (RFC 3403 §2.1)
+struct NaptrDirectTarget
+{
+  ServiceType service{ServiceType::Unknown};
+  std::string hostname;
+  std::uint16_t order{0};
+  std::uint16_t preference{0};
 };
 
 /// \brief Service resolution result with prioritized targets
@@ -134,19 +162,31 @@ struct ServiceResolutionResult
       return ServiceTarget{};
     }
 
-    // Find all targets with highest priority (lowest numeric value)
-    std::uint16_t best_priority = targets[0].priority;
-    std::vector<ServiceTarget> candidates;
-
+    // First: find the best (lowest) NAPTR preference tier
+    std::uint16_t bestNaptrPref = targets[0].naptrPreference;
     for (const auto &target : targets)
     {
-      if (target.priority < best_priority)
+      if (target.naptrPreference < bestNaptrPref)
+      {
+        bestNaptrPref = target.naptrPreference;
+      }
+    }
+
+    // Second: within that NAPTR tier, find best (lowest) SRV priority
+    std::uint16_t best_priority = std::numeric_limits<std::uint16_t>::max();
+    for (const auto &target : targets)
+    {
+      if (target.naptrPreference == bestNaptrPref && target.priority < best_priority)
       {
         best_priority = target.priority;
-        candidates.clear();
-        candidates.push_back(target);
       }
-      else if (target.priority == best_priority)
+    }
+
+    // Third: collect candidates matching both naptrPreference and SRV priority
+    std::vector<ServiceTarget> candidates;
+    for (const auto &target : targets)
+    {
+      if (target.naptrPreference == bestNaptrPref && target.priority == best_priority)
       {
         candidates.push_back(target);
       }
@@ -235,19 +275,31 @@ struct ServiceResolutionResult
       return ServiceTarget{};
     }
 
-    // Find all targets with highest priority (lowest numeric value)
-    std::uint16_t best_priority = targets[0].priority;
-    std::vector<ServiceTarget> candidates;
-
+    // First: find the best (lowest) NAPTR preference tier
+    std::uint16_t bestNaptrPref = targets[0].naptrPreference;
     for (const auto &target : targets)
     {
-      if (target.priority < best_priority)
+      if (target.naptrPreference < bestNaptrPref)
+      {
+        bestNaptrPref = target.naptrPreference;
+      }
+    }
+
+    // Second: within that NAPTR tier, find best (lowest) SRV priority
+    std::uint16_t best_priority = std::numeric_limits<std::uint16_t>::max();
+    for (const auto &target : targets)
+    {
+      if (target.naptrPreference == bestNaptrPref && target.priority < best_priority)
       {
         best_priority = target.priority;
-        candidates.clear();
-        candidates.push_back(target);
       }
-      else if (target.priority == best_priority)
+    }
+
+    // Third: collect candidates matching both naptrPreference and SRV priority
+    std::vector<ServiceTarget> candidates;
+    for (const auto &target : targets)
+    {
+      if (target.naptrPreference == bestNaptrPref && target.priority == best_priority)
       {
         candidates.push_back(target);
       }
@@ -899,8 +951,10 @@ public:
     // Chain SRV queries asynchronously
     auto result = std::make_shared<ServiceResolutionResult>(domain);
     auto remainingQueries = std::make_shared<std::atomic<size_t>>(actualSrvQueries.size());
-    // firstCompleter ensures only the first thread to complete calls the callback
-    auto firstCompleter = std::make_shared<std::atomic<bool>>(false);
+    // callbackFired ensures the completion callback is invoked exactly once
+    auto callbackFired = std::make_shared<std::atomic<bool>>(false);
+    // Mutex protects concurrent writes to result->targets from parallel SRV callbacks
+    auto resultMutex = std::make_shared<std::mutex>();
 
     for (const auto &[srvName, service] : actualSrvQueries)
     {
@@ -909,13 +963,14 @@ public:
       auto self = shared_from_this();
       transport_->queryAsync(
         srvQuestion,
-        [self, result, service, remainingQueries, firstCompleter, callback, domain,
+        [self, result, service, remainingQueries, callbackFired, resultMutex, callback, domain,
          preferredTransports](const DnsResult &srvResult, const std::exception_ptr &srvError)
         {
-          if (!srvError && !firstCompleter->load())
+          if (!srvError)
           {
             try
             {
+              std::lock_guard<std::mutex> lock(*resultMutex);
               self->processSrvRecords(srvResult.srv_records, service, *result);
             }
             catch (...)
@@ -925,7 +980,7 @@ public:
           }
 
           // Check if all SRV queries are complete
-          if (--(*remainingQueries) == 0 && !firstCompleter->exchange(true))
+          if (--(*remainingQueries) == 0 && !callbackFired->exchange(true))
           {
             // If no SRV records found, fall back to A/AAAA
             if (result->targets.empty())
@@ -1024,9 +1079,13 @@ private:
       return false; // Reasonable length limit
     }
 
-    // Check for valid SIP service patterns
-    if (service == "SIPS+D2T" || service == "SIPS+D2S" || service == "SIP+D2T" ||
-        service == "SIP+D2U" || service == "SIP+D2S")
+    // Check for valid SIP/WebSocket service patterns (case-insensitive)
+    std::string upper = service;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    if (upper == "SIPS+D2T" || upper == "SIPS+D2S" || upper == "SIPS+D2W" ||
+        upper == "SIP+D2T" || upper == "SIP+D2U" || upper == "SIP+D2S" ||
+        upper == "SIP+D2W")
     {
       return true; // Known good SIP services
     }
@@ -1054,39 +1113,6 @@ private:
     }
 
     return validateHostname(replacement);
-  }
-
-  /// \brief Validate NAPTR regex field (basic safety check)
-  /// \param regex NAPTR regex pattern
-  /// \return true if appears safe, false otherwise
-  bool validateNaptrRegex(const std::string &regex) const
-  {
-    if (regex.empty() || regex.length() > 255)
-    {
-      return false; // Reasonable length limit
-    }
-
-    // Check for potentially dangerous regex constructs
-    if (regex.find("(.*)(.*)") != std::string::npos)
-    {
-      return false; // Potential ReDoS pattern
-    }
-
-    if (std::count(regex.begin(), regex.end(), '(') > 10)
-    {
-      return false; // Too many capture groups
-    }
-
-    // Basic regex syntax validation
-    try
-    {
-      std::regex testRegex(regex);
-      return true;
-    }
-    catch (const std::exception &)
-    {
-      return false; // Invalid regex syntax
-    }
   }
 
   /// \brief Sanitize and validate input string
@@ -1121,9 +1147,12 @@ private:
     return sanitized;
   }
 
-  /// \brief Parse service type from NAPTR service field
+  /// \brief Parse service type from NAPTR service field (iora-level, includes HTTP)
+  /// Returns ServiceType::Unknown for unrecognized strings — callers must filter.
+  /// Note: SipDnsAdapter::parseNaptrService() is the SIP-specific parallel that returns
+  /// std::optional<SipTransportProtocol> and excludes HTTP types.
   /// \param service NAPTR service string (e.g., "SIP+D2U", "SIPS+D2T", "HTTP+D2T")
-  /// \return Parsed service type
+  /// \return Parsed service type (Unknown for unrecognized strings)
   ServiceType parseServiceType(const std::string &service) const
   {
     // Validate service string first
@@ -1132,22 +1161,31 @@ private:
       return ServiceType::Unknown;
     }
 
+    // Normalize to uppercase for case-insensitive matching (RFC 3403)
+    std::string upper = service;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+
     // SIP service mappings
-    if (service == "SIPS+D2T")
+    if (upper == "SIPS+D2T")
       return ServiceType::SIPS_TLS;
-    if (service == "SIPS+D2S")
+    if (upper == "SIPS+D2S")
       return ServiceType::SIPS_SCTP;
-    if (service == "SIP+D2T")
+    if (upper == "SIPS+D2W")
+      return ServiceType::SIPS_WSS;
+    if (upper == "SIP+D2T")
       return ServiceType::SIP_TCP;
-    if (service == "SIP+D2U")
+    if (upper == "SIP+D2U")
       return ServiceType::SIP_UDP;
-    if (service == "SIP+D2S")
+    if (upper == "SIP+D2S")
       return ServiceType::SIP_SCTP;
+    if (upper == "SIP+D2W")
+      return ServiceType::SIP_WS;
 
     // HTTP service mappings
-    if (service == "HTTP+D2T")
+    if (upper == "HTTP+D2T")
       return ServiceType::HTTP_TCP;
-    if (service == "HTTPS+D2T")
+    if (upper == "HTTPS+D2T")
       return ServiceType::HTTPS_TCP;
 
     return ServiceType::Unknown;
@@ -1164,12 +1202,16 @@ private:
       return 5061;
     case ServiceType::SIPS_SCTP:
       return 5061;
+    case ServiceType::SIPS_WSS:
+      return 443;
     case ServiceType::SIP_TCP:
       return 5060;
     case ServiceType::SIP_UDP:
       return 5060;
     case ServiceType::SIP_SCTP:
       return 5060;
+    case ServiceType::SIP_WS:
+      return 80;
     case ServiceType::HTTP_TCP:
       return 80;
     case ServiceType::HTTPS_TCP:
@@ -1202,23 +1244,37 @@ private:
       return performDirectSrvResolution(domain, preferredTransports, std::nullopt);
     }
 
-    // Step 2: Process NAPTR records to get SRV targets
-    std::vector<std::pair<ServiceType, std::string>> srvTargets;
-    processNaptrRecords(naptrRecords, srvTargets, preferredTransports);
+    // Step 2: Process NAPTR records to get SRV and direct-A targets
+    std::vector<NaptrSrvTarget> srvTargets;
+    std::vector<NaptrDirectTarget> aTargets;
+    processNaptrRecords(naptrRecords, srvTargets, aTargets, preferredTransports);
 
-    // Step 3: Query SRV records for each target
-    for (const auto &[service, srvName] : srvTargets)
+    // Step 3: Query SRV records for 'S' flag targets
+    for (const auto &srvTarget : srvTargets)
     {
       try
       {
-        DnsResult srvResult = query(DnsQuestion(srvName, DnsType::SRV, DnsClass::IN));
-        processSrvRecords(srvResult.srv_records, service, result);
+        DnsResult srvResult = query(DnsQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN));
+        processSrvRecords(srvResult.srv_records, srvTarget.service, result, srvTarget.naptrPreference);
       }
       catch (const DnsResolverException &)
       {
         // Skip failed SRV queries, continue with others
         continue;
       }
+    }
+
+    // Step 3b: Resolve 'A' flag targets directly via A/AAAA (no SRV)
+    for (const auto &aTarget : aTargets)
+    {
+      ServiceTarget target;
+      target.hostname = aTarget.hostname;
+      target.port = getDefaultServicePort(aTarget.service);
+      target.transport = aTarget.service;
+      target.priority = 0;
+      target.weight = 0;
+      target.naptrPreference = aTarget.preference;
+      result.targets.push_back(target);
     }
 
     // Step 4: Resolve hostnames to IP addresses
@@ -1253,11 +1309,12 @@ private:
           return;
         }
 
-        // Process NAPTR records to get SRV targets
-        std::vector<std::pair<ServiceType, std::string>> srvTargets;
+        // Process NAPTR records to get SRV and direct-A targets
+        std::vector<NaptrSrvTarget> srvTargets;
+        std::vector<NaptrDirectTarget> aTargets;
         try
         {
-          self->processNaptrRecords(naptrResult.naptr_records, srvTargets, preferredTransports);
+          self->processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets, preferredTransports);
         }
         catch (const std::exception &e)
         {
@@ -1265,33 +1322,59 @@ private:
           return;
         }
 
-        if (srvTargets.empty())
+        if (srvTargets.empty() && aTargets.empty())
         {
-          // No valid SRV targets, try direct SRV resolution
+          // No valid targets, try direct SRV resolution
           self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt);
           return;
         }
 
         // Chain SRV queries asynchronously
         auto result = std::make_shared<ServiceResolutionResult>(domain);
-        auto remainingQueries = std::make_shared<std::atomic<size_t>>(srvTargets.size());
-        // firstCompleter ensures only the first thread to complete calls the callback
-        auto firstCompleter = std::make_shared<std::atomic<bool>>(false);
 
-        for (const auto &[service, srvName] : srvTargets)
+        // Add 'A' flag targets directly (no SRV query needed)
+        for (const auto &aTarget : aTargets)
         {
-          DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
+          ServiceTarget target;
+          target.hostname = aTarget.hostname;
+          target.port = self->getDefaultServicePort(aTarget.service);
+          target.transport = aTarget.service;
+          target.priority = 0;
+          target.weight = 0;
+          target.naptrPreference = aTarget.preference;
+          result->targets.push_back(target);
+        }
+
+        if (srvTargets.empty())
+        {
+          // Only A-flag targets — resolve addresses and return
+          self->resolveTargetAddressesAsync(result, callback);
+          return;
+        }
+
+        auto remainingQueries = std::make_shared<std::atomic<size_t>>(srvTargets.size());
+        // callbackFired ensures the completion callback is invoked exactly once
+        auto callbackFired = std::make_shared<std::atomic<bool>>(false);
+        // Mutex protects concurrent writes to result->targets from parallel SRV callbacks
+        auto resultMutex = std::make_shared<std::mutex>();
+
+        for (const auto &srvTarget : srvTargets)
+        {
+          DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
+          auto service = srvTarget.service;
+          auto naptrPref = srvTarget.naptrPreference;
 
           self->transport_->queryAsync(
             srvQuestion,
-            [self, result, service, remainingQueries, firstCompleter,
+            [self, result, service, naptrPref, remainingQueries, callbackFired, resultMutex,
              callback](const DnsResult &srvResult, const std::exception_ptr &srvError)
             {
-              if (!srvError && !firstCompleter->load())
+              if (!srvError)
               {
                 try
                 {
-                  self->processSrvRecords(srvResult.srv_records, service, *result);
+                  std::lock_guard<std::mutex> lock(*resultMutex);
+                  self->processSrvRecords(srvResult.srv_records, service, *result, naptrPref);
                 }
                 catch (...)
                 {
@@ -1300,7 +1383,7 @@ private:
               }
 
               // Check if all SRV queries are complete
-              if (--(*remainingQueries) == 0 && !firstCompleter->exchange(true))
+              if (--(*remainingQueries) == 0 && !callbackFired->exchange(true))
               {
                 // All SRV queries done, now resolve hostnames asynchronously
                 self->resolveTargetAddressesAsync(result, callback);
@@ -1317,30 +1400,43 @@ private:
   void processCachedServiceResolution(ServiceResolutionResult &result, const DnsResult &naptrResult,
                                       const std::vector<ServiceType> &preferredTransports)
   {
-    // Step 1: Process NAPTR records to get SRV targets
-    std::vector<std::pair<ServiceType, std::string>> srvTargets;
-    processNaptrRecords(naptrResult.naptr_records, srvTargets, preferredTransports);
+    // Step 1: Process NAPTR records to get SRV and direct-A targets
+    std::vector<NaptrSrvTarget> srvTargets;
+    std::vector<NaptrDirectTarget> aTargets;
+    processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets, preferredTransports);
 
-    if (srvTargets.empty())
+    if (srvTargets.empty() && aTargets.empty())
     {
       // No valid NAPTR targets found
       return;
     }
 
+    // Add 'A' flag targets directly (no SRV query needed)
+    for (const auto &aTarget : aTargets)
+    {
+      ServiceTarget target;
+      target.hostname = aTarget.hostname;
+      target.port = getDefaultServicePort(aTarget.service);
+      target.transport = aTarget.service;
+      target.priority = 0;
+      target.weight = 0;
+      target.naptrPreference = aTarget.preference;
+      result.targets.push_back(target);
+    }
+
     // Step 2: Try to get SRV records from cache for each target
-    for (const auto &[service, srvName] : srvTargets)
+    for (const auto &srvTarget : srvTargets)
     {
       if (!cache_)
       {
         continue;
       }
 
-      DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
+      DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
       DnsResult srvResult;
       if (cache_->get(srvQuestion, srvResult))
       {
-        // Process SRV records and add to result
-        processSrvRecords(srvResult.srv_records, service, result);
+        processSrvRecords(srvResult.srv_records, srvTarget.service, result, srvTarget.naptrPreference);
       }
     }
 
@@ -1388,14 +1484,21 @@ private:
     sortTargetsByPriority(result);
   }
 
-  /// \brief Process NAPTR records to extract SRV targets
+  /// \brief Process NAPTR records to extract SRV and direct-A targets
   /// \param naptrRecords NAPTR records to process
-  /// \param srvTargets Output vector of SRV targets
+  /// \param srvTargets Output: 'S' flag records (replacement is SRV domain name)
+  /// \param aTargets Output: 'A' flag records (replacement is hostname for direct A/AAAA)
   /// \param preferredTransports Preferred transport types
   void processNaptrRecords(const std::vector<NaptrRecord> &naptrRecords,
-                           std::vector<std::pair<ServiceType, std::string>> &srvTargets,
+                           std::vector<NaptrSrvTarget> &srvTargets,
+                           std::vector<NaptrDirectTarget> &aTargets,
                            const std::vector<ServiceType> &preferredTransports)
   {
+    if (naptrRecords.empty())
+    {
+      return;
+    }
+
     // Sort NAPTR records by order then preference
     auto sortedRecords = naptrRecords;
     std::sort(sortedRecords.begin(), sortedRecords.end(),
@@ -1408,9 +1511,18 @@ private:
                 return a.preference < b.preference;
               });
 
-    // Process records to extract SRV targets
+    // RFC 3403 §2.4.4: only process records at the lowest order value
+    const auto lowestOrder = sortedRecords.front().order;
+
+    // Process records to extract targets
     for (const auto &record : sortedRecords)
     {
+      // Break-at-first-order: stop when we exceed the lowest order
+      if (record.order != lowestOrder)
+      {
+        break;
+      }
+
       ServiceType service = parseServiceType(record.service);
       if (service == ServiceType::Unknown)
       {
@@ -1427,11 +1539,38 @@ private:
         }
       }
 
-      // Extract SRV target from replacement field
-      if (!record.replacement.empty() && record.flags.find('S') != std::string::npos)
+      // Skip records with empty or terminal-dot replacement
+      if (record.replacement.empty() || record.replacement == ".")
       {
-        srvTargets.emplace_back(service, record.replacement);
+        continue;
       }
+
+      // Validate replacement as a hostname (RFC 3403 §4)
+      if (!validateNaptrReplacement(record.replacement))
+      {
+        continue;
+      }
+
+      // Case-insensitive flag check (RFC 3403)
+      std::string flags = record.flags;
+      std::transform(flags.begin(), flags.end(), flags.begin(),
+                     [](unsigned char c) { return std::toupper(c); });
+
+      if (flags.find('S') != std::string::npos)
+      {
+        // 'S' flag: replacement is an SRV domain name
+        srvTargets.push_back({service, record.replacement, record.preference});
+      }
+      else if (flags.find('A') != std::string::npos)
+      {
+        // 'A' flag: replacement is a hostname for direct A/AAAA lookup (skip SRV)
+        aTargets.push_back({service, record.replacement, record.order, record.preference});
+      }
+      // 'U' flag (terminal URI via regexp) and empty flag (chained NAPTR) are
+      // intentionally not handled. RFC 3263 §4.1 defines both 'S' and 'A' flag
+      // semantics for SIP. ENUM (RFC 6116) uses 'U' flag with regexp — out of scope.
+      // Chained NAPTR (empty flag → query replacement as new NAPTR) is not
+      // implemented; such records are skipped.
     }
   }
 
@@ -1439,8 +1578,9 @@ private:
   /// \param srvRecords SRV records to process
   /// \param service Service type for these records
   /// \param result Result to populate
+  /// \param naptrPref NAPTR preference for this SRV group (0 if not from NAPTR)
   void processSrvRecords(const std::vector<SrvRecord> &srvRecords, ServiceType service,
-                         ServiceResolutionResult &result)
+                         ServiceResolutionResult &result, std::uint16_t naptrPref = 0)
   {
     for (const auto &record : srvRecords)
     {
@@ -1450,6 +1590,7 @@ private:
       target.transport = service;
       target.priority = record.priority;
       target.weight = record.weight;
+      target.naptrPreference = naptrPref;
 
       result.targets.push_back(target);
     }
@@ -1479,13 +1620,21 @@ private:
                          result.targets.end());
   }
 
-  /// \brief Sort targets by priority (lower priority value = higher precedence)
-  /// \param result Result to sort
+  /// \brief Sort targets by NAPTR preference then SRV priority
+  /// NAPTR preference (RFC 3403 §2.1) is the primary key — lower = preferred transport.
+  /// SRV priority (RFC 2782) is the secondary key — lower = higher precedence within
+  /// the same NAPTR preference tier.
   void sortTargetsByPriority(ServiceResolutionResult &result)
   {
-    std::sort(result.targets.begin(), result.targets.end(),
-              [](const ServiceTarget &a, const ServiceTarget &b)
-              { return a.priority < b.priority; });
+    std::stable_sort(result.targets.begin(), result.targets.end(),
+                     [](const ServiceTarget &a, const ServiceTarget &b)
+                     {
+                       if (a.naptrPreference != b.naptrPreference)
+                       {
+                         return a.naptrPreference < b.naptrPreference;
+                       }
+                       return a.priority < b.priority;
+                     });
   }
 
   /// \brief Fallback to A/AAAA resolution when no SRV records exist
@@ -1666,7 +1815,7 @@ private:
 
             transport_->queryAsync(
               aaaaQuestion,
-              [targetIndex, initialTargetCount, remainingTargets, result,
+              [this, targetIndex, initialTargetCount, remainingTargets, result,
                callback](const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
               {
                 if (!aaaaError && targetIndex < initialTargetCount)
@@ -1686,9 +1835,7 @@ private:
                                    [](const ServiceTarget &t) { return t.addresses.empty(); }),
                     result->targets.end());
 
-                  std::sort(result->targets.begin(), result->targets.end(),
-                            [](const ServiceTarget &a, const ServiceTarget &b)
-                            { return a.priority < b.priority; });
+                  sortTargetsByPriority(*result);
 
                   callback(*result, nullptr);
                 }
@@ -1705,9 +1852,7 @@ private:
                                                    { return t.addresses.empty(); }),
                                     result->targets.end());
 
-              std::sort(result->targets.begin(), result->targets.end(),
-                        [](const ServiceTarget &a, const ServiceTarget &b)
-                        { return a.priority < b.priority; });
+              sortTargetsByPriority(*result);
 
               callback(*result, nullptr);
             }
