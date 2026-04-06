@@ -220,20 +220,24 @@ public:
     initialize();
   }
 
-  /// \brief Destructor - stops transport automatically
+  /// \brief Destructor - stops transport before destruction
   ~DnsClient()
   {
-    // Transport stop is handled automatically by dns::DnsTransport destructor
-    // No explicit action needed - RAII pattern
+    stop();
   }
 
   /// \brief Start the DNS client (compatibility method)
   /// \return Always returns true - transport is started in constructor
   bool start() { return true; }
 
-  /// \brief Stop the DNS client (compatibility method)
-  /// Cleanup handled by destructor
-  void stop() { /* No explicit action needed - RAII */ }
+  /// \brief Stop the DNS client and its transport threads
+  void stop()
+  {
+    if (transport_)
+    {
+      transport_->stop();
+    }
+  }
 
   /// \brief Resolve hostname to IP addresses (compatibility method)
   /// \param hostname Hostname to resolve
