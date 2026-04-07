@@ -148,18 +148,24 @@ TEST_CASE("TW: schedule returns InvalidTimerId after stop", "[timing_wheel][life
   REQUIRE(id == InvalidTimerId);
 }
 
-TEST_CASE("TW: drain fires pending timers", "[timing_wheel][lifecycle]")
+TEST_CASE("TW: drain fires expired pending timers", "[timing_wheel][lifecycle]")
 {
-  TimingWheel tw(10ms, 16, 2);
+  // Use 2000ms tick so tick thread won't fire the 5ms timers before drain
+  TimingWheel tw(2000ms, 16, 2);
   tw.start();
 
   int count = 0;
   tw.schedule(5ms, [&]() { ++count; });
   tw.schedule(5ms, [&]() { ++count; });
 
-  tw.drain(5000ms);
-  // Timers should have fired during drain
+  // Sleep past the 5ms deadlines so drain sees them as expired
+  std::this_thread::sleep_for(10ms);
+
+  auto stats = tw.drain(5000ms);
   REQUIRE(tw.pendingCount() == 0);
+  REQUIRE(count == 2);
+  REQUIRE(stats.fired == 2);
+  REQUIRE(stats.cancelled == 0);
 }
 
 TEST_CASE("TW: shutdown convenience", "[timing_wheel][lifecycle]")
@@ -310,22 +316,45 @@ TEST_CASE("TW: timer inserted during advance still fires", "[timing_wheel]")
 
 TEST_CASE("TW: DrainStats returned from drain", "[timing_wheel][drain]")
 {
-  TimingWheel tw(5ms, 16, 2);
+  // Use 2000ms tick so tick thread won't fire the 5ms timers before drain
+  TimingWheel tw(2000ms, 16, 2);
   tw.start();
 
   tw.schedule(5ms, []() {});
   tw.schedule(5ms, []() {});
   tw.schedule(5ms, []() {});
 
+  // Sleep past the 5ms deadlines so drain sees them as expired
+  std::this_thread::sleep_for(10ms);
+
   auto stats = tw.drain(5000ms);
-  REQUIRE(stats.fired >= 3);
+  REQUIRE(stats.fired == 3);
   REQUIRE(stats.remaining == 0);
+  REQUIRE(stats.cancelled == 0);
   REQUIRE(stats.elapsed.count() >= 0);
+}
+
+TEST_CASE("TW: drain cancels future timers without firing", "[timing_wheel][drain]")
+{
+  TimingWheel tw(10ms, 16, 2);
+  tw.start();
+
+  std::atomic<int> fired{0};
+  tw.schedule(60000ms, [&]() { fired.fetch_add(1); });
+  tw.schedule(60000ms, [&]() { fired.fetch_add(1); });
+  tw.schedule(60000ms, [&]() { fired.fetch_add(1); });
+
+  auto stats = tw.drain(5000ms);
+  REQUIRE(stats.fired == 0);
+  REQUIRE(stats.cancelled == 3);
+  REQUIRE(stats.remaining == 0);
+  REQUIRE(fired.load() == 0);
 }
 
 TEST_CASE("TW: drain timeout cancels remaining", "[timing_wheel][drain]")
 {
-  TimingWheel tw(10ms, 16, 2);
+  // Use 2000ms tick so tick thread won't fire the 5ms timers before drain
+  TimingWheel tw(2000ms, 16, 2);
   tw.start();
 
   // Schedule many slow callbacks that each take time
@@ -339,17 +368,25 @@ TEST_CASE("TW: drain timeout cancels remaining", "[timing_wheel][drain]")
     });
   }
 
-  // Drain with very short timeout — should hit timeout during slow callbacks
+  // Sleep past the 5ms deadlines so drain sees them as expired
+  std::this_thread::sleep_for(10ms);
+
+  // Drain with very short timeout — should hit timeout during slow callbacks.
+  // 100 callbacks × 5ms each = 500ms total, so 20ms timeout must leave some unfinished.
   auto stats = tw.drain(20ms);
   // Verify drain completed and returned stats
   REQUIRE(tw.getState() == TimingWheelState::STOPPED);
   REQUIRE(tw.pendingCount() == 0); // all cleaned up
+  REQUIRE(stats.cancelled == 0); // all were expired (slept past deadline)
   REQUIRE(stats.fired + stats.remaining == 100);
+  REQUIRE(stats.remaining > 0); // timeout must have left some unfired
+  REQUIRE(stats.fired > 0); // some should have fired before timeout
 }
 
-TEST_CASE("TW: drain fires timers in deadline order", "[timing_wheel][drain]")
+TEST_CASE("TW: drain fires expired timers in deadline order", "[timing_wheel][drain]")
 {
-  TimingWheel tw(10ms, 16, 2);
+  // Use 2000ms tick so tick thread won't fire the timers before drain
+  TimingWheel tw(2000ms, 16, 2);
   tw.start();
 
   std::vector<int> order;
@@ -360,14 +397,18 @@ TEST_CASE("TW: drain fires timers in deadline order", "[timing_wheel][drain]")
   tw.schedule(10ms, [&]() { std::lock_guard l(orderMutex); order.push_back(1); });
   tw.schedule(20ms, [&]() { std::lock_guard l(orderMutex); order.push_back(2); });
 
+  // Sleep past all deadlines so drain sees them as expired
+  std::this_thread::sleep_for(40ms);
+
   // Drain should fire in deadline order (earliest first)
-  tw.drain(5000ms);
+  auto stats = tw.drain(5000ms);
 
   std::lock_guard l(orderMutex);
   REQUIRE(order.size() == 3);
   REQUIRE(order[0] == 1);
   REQUIRE(order[1] == 2);
   REQUIRE(order[2] == 3);
+  REQUIRE(stats.cancelled == 0);
 }
 
 TEST_CASE("TW: cascade from level 1 to level 0", "[timing_wheel][cascade]")

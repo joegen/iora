@@ -101,7 +101,7 @@ TEST_CASE("TimerService lifecycle: drain() waits for in-flight timers", "[timer]
   REQUIRE(result.drainStats->remaining == 0);
 }
 
-TEST_CASE("TimerService lifecycle: drain() with timeout", "[timer][lifecycle][drain][timeout]")
+TEST_CASE("TimerService lifecycle: drain() cancels far-future timers", "[timer][lifecycle][drain][timeout]")
 {
   TimerService timer;
 
@@ -117,18 +117,20 @@ TEST_CASE("TimerService lifecycle: drain() with timeout", "[timer][lifecycle][dr
                         });
   }
 
-  // Immediately drain with short timeout - timers won't fire in time
+  // Drain with short timeout — timers are beyond the drain deadline,
+  // so they are cancelled (not waited for). Drain succeeds immediately.
   auto result = timer.drain(500);
 
-  REQUIRE(result.success == false); // Timeout is considered failure
+  REQUIRE(result.success == true);
   REQUIRE(result.newState == LifecycleState::Draining);
   REQUIRE(timer.getState() == LifecycleState::Draining);
 
-  // Verify drain statistics show remaining work
+  // Verify drain statistics show cancelled timers
   REQUIRE(result.drainStats.has_value());
-  REQUIRE(result.drainStats->remaining > 0);
+  REQUIRE(result.drainStats->remaining == 0);
+  REQUIRE(result.drainStats->cancelled == 5);
 
-  // Timers should not have executed
+  // Timers should not have executed (they were cancelled, not fired)
   REQUIRE(timerCount.load() == 0);
 }
 

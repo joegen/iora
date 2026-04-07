@@ -40,6 +40,7 @@ struct DrainStats
 {
   std::size_t fired = 0;
   std::size_t remaining = 0;
+  std::size_t cancelled = 0;
   std::chrono::milliseconds elapsed{0};
 };
 
@@ -100,7 +101,7 @@ public:
 
   ~TimingWheel()
   {
-    if (_running.load(std::memory_order_relaxed))
+    if (_running.load(std::memory_order_acquire))
     {
       stopTickThread();
     }
@@ -117,7 +118,7 @@ public:
 
   TimerId schedule(std::chrono::milliseconds delay, Callback callback)
   {
-    if (!_accepting.load(std::memory_order_relaxed))
+    if (!_accepting.load(std::memory_order_acquire))
     {
       return InvalidTimerId;
     }
@@ -227,7 +228,7 @@ public:
         return;
       }
     }
-    _accepting.store(true, std::memory_order_relaxed);
+    _accepting.store(true, std::memory_order_release);
     {
       std::lock_guard lock(_wheelMutex);
       _lastAdvanceTime = Clock::now();
@@ -239,17 +240,26 @@ public:
   /// Stops the tick thread first, collects all entries, sorts by deadline,
   /// fires them in order. If timeout is exceeded, remaining timers are
   /// cancelled (not fired) and counted in DrainStats.remaining.
+  /// \brief Drain the timing wheel: fire expired timers, cancel future ones.
+  /// \note When a Dispatcher is set, expired callbacks are posted to the
+  ///       dispatcher (e.g., a thread pool) and may still be in-flight when
+  ///       drain() returns. The caller must drain the dispatcher separately
+  ///       to ensure all callbacks have completed before destroying targets.
   DrainStats drain(std::chrono::milliseconds timeoutMs = std::chrono::milliseconds(30000))
   {
-    _accepting.store(false, std::memory_order_relaxed);
-    _state.store(TimingWheelState::DRAINING, std::memory_order_relaxed);
+    _accepting.store(false, std::memory_order_release);
+    _state.store(TimingWheelState::DRAINING, std::memory_order_release);
     stopTickThread();
 
     DrainStats stats;
     auto startTime = Clock::now();
 
-    // Collect ALL pending entries from all buckets, sorted by deadline
+    // Collect pending entries from all buckets, sorted by deadline.
+    // Cancelled callbacks are moved outside the lock scope so their
+    // destructors (which may release shared_ptr captures) don't run
+    // while _wheelMutex is held.
     std::vector<std::pair<TimerId, Callback>> toFire;
+    std::vector<Callback> toDiscard;
     {
       std::lock_guard lock(_wheelMutex);
 
@@ -287,13 +297,27 @@ public:
           return a.deadline < b.deadline;
         });
 
+      // Only fire timers whose deadline has passed. Timers scheduled for the
+      // future are cancelled — firing them would execute callbacks at unexpected
+      // times, risking use-after-free on targets that expect the timer to fire
+      // much later (or never, if cancelled before then).
+      auto now = Clock::now();
       for (auto& e : entries)
       {
-        toFire.emplace_back(e.id, std::move(e.callback));
+        if (e.deadline <= now)
+        {
+          toFire.emplace_back(e.id, std::move(e.callback));
+        }
+        else
+        {
+          toDiscard.push_back(std::move(e.callback));
+          ++stats.cancelled;
+        }
       }
     }
+    // toDiscard destroyed here, outside the lock
 
-    // Fire in deadline order, respecting timeout
+    // Fire expired timers in deadline order, respecting timeout
     for (auto& [id, cb] : toFire)
     {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -302,7 +326,7 @@ public:
       {
         stats.remaining = toFire.size() - stats.fired;
         stats.elapsed = elapsed;
-        _state.store(TimingWheelState::STOPPED, std::memory_order_relaxed);
+        _state.store(TimingWheelState::STOPPED, std::memory_order_release);
         return stats;
       }
 
@@ -312,16 +336,16 @@ public:
 
     stats.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       Clock::now() - startTime);
-    _state.store(TimingWheelState::STOPPED, std::memory_order_relaxed);
+    _state.store(TimingWheelState::STOPPED, std::memory_order_release);
     return stats;
   }
 
   void stop()
   {
-    _accepting.store(false, std::memory_order_relaxed);
+    _accepting.store(false, std::memory_order_release);
     stopTickThread();
     clearAllEntries();
-    _state.store(TimingWheelState::STOPPED, std::memory_order_relaxed);
+    _state.store(TimingWheelState::STOPPED, std::memory_order_release);
   }
 
   void reset()
@@ -596,35 +620,47 @@ private:
 
   void clearAllEntries()
   {
-    std::lock_guard lock(_wheelMutex);
-    for (auto& [id, entry] : _entryMap)
+    // Move callbacks out so their destructors run outside _wheelMutex,
+    // same pattern as drain()'s toDiscard. Prevents deadlock if a callback
+    // destructor re-enters the wheel (e.g., via cancel()).
+    std::vector<Callback> toDestroy;
     {
-      freeEntry(entry);
-    }
-    _entryMap.clear();
-    for (auto& w : _wheels)
-    {
-      for (auto& b : w.buckets)
+      std::lock_guard lock(_wheelMutex);
+      toDestroy.reserve(_entryMap.size());
+      for (auto& [id, entry] : _entryMap)
       {
-        b.head = nullptr;
-        b.tail = nullptr;
+        if (entry->callback)
+        {
+          toDestroy.push_back(std::move(entry->callback));
+        }
+        freeEntry(entry);
+      }
+      _entryMap.clear();
+      for (auto& w : _wheels)
+      {
+        for (auto& b : w.buckets)
+        {
+          b.head = nullptr;
+          b.tail = nullptr;
+        }
       }
     }
+    // toDestroy destroyed here, outside the lock
   }
 
   void startTickThread()
   {
-    _running.store(true, std::memory_order_relaxed);
+    _running.store(true, std::memory_order_release);
     _tickThread = std::thread([this]()
     {
-      while (_running.load(std::memory_order_relaxed))
+      while (_running.load(std::memory_order_acquire))
       {
         std::unique_lock lock(_tickCvMutex);
         _tickCv.wait_for(lock, _tickDuration, [this]()
         {
-          return !_running.load(std::memory_order_relaxed);
+          return !_running.load(std::memory_order_acquire);
         });
-        if (_running.load(std::memory_order_relaxed))
+        if (_running.load(std::memory_order_acquire))
         {
           advance();
         }
@@ -634,7 +670,7 @@ private:
 
   void stopTickThread()
   {
-    _running.store(false, std::memory_order_relaxed);
+    _running.store(false, std::memory_order_release);
     _tickCv.notify_all();
     if (_tickThread.joinable())
     {
@@ -652,12 +688,12 @@ private:
   // Wheel structure
   std::vector<WheelLevel> _wheels;
   std::unordered_map<TimerId, TimerEntry*> _entryMap;
-  mutable std::mutex _wheelMutex;
+  mutable std::mutex _wheelMutex; // Lock ordering: _wheelMutex BEFORE _poolMutex
   TimePoint _lastAdvanceTime{};
 
   // Entry pool (free-list)
   TimerEntry* _freeListHead = nullptr;
-  std::mutex _poolMutex;
+  std::mutex _poolMutex; // Lock ordering: _wheelMutex BEFORE _poolMutex
 
   // State
   std::atomic<TimerId> _nextId;

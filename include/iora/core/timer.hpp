@@ -382,16 +382,16 @@ public:
   /// \brief Schedule periodic timer (simplified implementation).
   template <typename F> std::uint64_t schedulePeriodic(Duration interval, F &&handler)
   {
-    if (_periodicTimers.size() >= _config.limits.maxPeriodicTimers)
-    {
-      handleError(TimerError::ResourceExhausted, "Maximum periodic timers exceeded", 0);
-      return 0;
-    }
-
-    std::uint64_t id = ++_nextId;
+    std::uint64_t id = 0;
 
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      if (_periodicTimers.size() >= _config.limits.maxPeriodicTimers)
+      {
+        handleError(TimerError::ResourceExhausted, "Maximum periodic timers exceeded", 0);
+        return 0;
+      }
+      id = ++_nextId;
       _periodicTimers.emplace(id, PeriodicTimer{id, interval, Clock::now() + interval, false});
     }
 
@@ -520,7 +520,9 @@ public:
   }
 
   /// Begin graceful drain (Running → Draining)
-  /// @param timeoutMs Maximum time to wait for in-flight timers (0 = wait indefinitely)
+  /// Fires already-expired timers, cancels future timers, waits for in-flight
+  /// callbacks to complete. Uniform semantics with TimingWheel::drain().
+  /// @param timeoutMs Maximum time to wait for in-flight callbacks (0 = wait indefinitely)
   /// @return Result with drain statistics
   iora::common::LifecycleResult drain(std::uint32_t timeoutMs = 30000) override
   {
@@ -546,18 +548,53 @@ public:
 
     _logger->info("Draining timer service, in-flight timers: " + std::to_string(inFlightAtStart));
 
-    // Wait for all in-flight timers to complete
-    int waitMs = 0;
-    const int maxWaitMs = (timeoutMs == 0) ? 3600000 : static_cast<int>(timeoutMs); // 1 hour if 0
+    // Cancel timers that can't possibly complete within the drain timeout.
+    // The run loop is still running and will fire timers naturally, so
+    // timers within the timeout window are left to fire. Only far-future
+    // timers (deadline beyond drain deadline) are cancelled — their callback
+    // targets may be destroyed by the time they would expire.
+    std::uint32_t cancelledCount = 0;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto drainDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+      for (auto& [id, rec] : _records)
+      {
+        if (!rec.canceled && rec.tp > drainDeadline)
+        {
+          rec.canceled = true;
+          ++cancelledCount;
+        }
+      }
+      for (auto& [id, pt] : _periodicTimers)
+      {
+        if (!pt.canceled)
+        {
+          pt.canceled = true;
+          ++cancelledCount;
+        }
+      }
+    }
+    // Wake the run loop so it re-evaluates with the cancellations
+    poke();
 
-    std::uint32_t remaining = inFlightAtStart;
+    if (cancelledCount > 0)
+    {
+      _logger->info("Cancelled " + std::to_string(cancelledCount) + " future timers during drain");
+    }
+
+    // Wait for any in-flight expired callbacks to complete
+    std::uint32_t waitMs = 0;
+    const std::uint32_t maxWaitMs = (timeoutMs == 0) ? 3600000u : timeoutMs;
+
+    std::uint32_t remaining = 0;
     bool timedOut = false;
 
     while (waitMs < maxWaitMs)
     {
       remaining = getInFlightCount();
+      auto executing = _executingCallbacks.load(std::memory_order_acquire);
 
-      if (remaining == 0)
+      if (remaining == 0 && executing == 0)
       {
         break;
       }
@@ -566,14 +603,15 @@ public:
       waitMs += 10;
     }
 
-    if (waitMs >= maxWaitMs && remaining > 0)
+    if (waitMs >= maxWaitMs && (remaining > 0 || _executingCallbacks.load(std::memory_order_acquire) > 0))
     {
       timedOut = true;
     }
 
-    std::uint32_t completed = inFlightAtStart - remaining;
+    std::uint32_t accounted = remaining + cancelledCount;
+    std::uint32_t completed = (inFlightAtStart >= accounted) ? (inFlightAtStart - accounted) : 0;
 
-    DrainStats stats(inFlightAtStart, remaining, 0, completed);
+    DrainStats stats(inFlightAtStart, remaining, cancelledCount, completed);
 
     std::string message = timedOut
       ? "Drain timed out with " + std::to_string(remaining) + " timers remaining"
@@ -1036,6 +1074,14 @@ private:
 
   void safeRun(const Handler &h)
   {
+    // Always decrement _executingCallbacks (pre-incremented by runLoop).
+    // Use RAII guard so the decrement happens even on early return or exception.
+    struct CountGuard
+    {
+      std::atomic<std::uint32_t>& counter;
+      ~CountGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
+    } guard{_executingCallbacks};
+
     if (!static_cast<bool>(h))
       return;
 
@@ -1089,6 +1135,7 @@ private:
     {
       std::optional<TimePoint> nextDue;
       std::vector<Handler> ready;
+      bool shouldExit = false;
 
       {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -1098,25 +1145,38 @@ private:
           TimePoint now = Clock::now();
           collectDueLocked(now, ready);
           programTimerfd(std::nullopt);
-          for (auto &h : ready)
-          {
-            safeRun(h);
-          }
-          break;
+          shouldExit = true;
         }
-
-        if (auto top = heapTop())
+        else
         {
-          nextDue = top->tp;
+          if (auto top = heapTop())
+          {
+            nextDue = top->tp;
+          }
+          programTimerfd(nextDue);
         }
 
-        programTimerfd(nextDue);
+        // Pre-announce executing count while lock is held, so drain()
+        // cannot observe _records empty + _executingCallbacks == 0
+        // between collectDueLocked and the safeRun loop.
+        if (!ready.empty())
+        {
+          _executingCallbacks.fetch_add(
+            static_cast<std::uint32_t>(ready.size()), std::memory_order_release);
+        }
       }
 
+      // Fire callbacks OUTSIDE the lock
       for (auto &h : ready)
       {
         safeRun(h);
       }
+
+      if (shouldExit)
+      {
+        break;
+      }
+
       ready.clear();
 
       int timeout =
@@ -1178,6 +1238,12 @@ private:
         std::lock_guard<std::mutex> lock(_mutex);
         TimePoint now = Clock::now();
         collectDueLocked(now, ready);
+
+        if (!ready.empty())
+        {
+          _executingCallbacks.fetch_add(
+            static_cast<std::uint32_t>(ready.size()), std::memory_order_release);
+        }
       }
 
       for (auto &h : ready)
@@ -1215,6 +1281,7 @@ private:
   // Lifecycle management
   std::atomic<iora::common::LifecycleState> _lifecycleState{iora::common::LifecycleState::Created};
   std::atomic<bool> _accepting{false};
+  std::atomic<std::uint32_t> _executingCallbacks{0}; // Callbacks in safeRun(), not in _records
 };
 
 /// \brief Enhanced ASIO-like timer bound to TimerService.
