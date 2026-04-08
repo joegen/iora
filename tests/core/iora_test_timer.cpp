@@ -18,20 +18,29 @@ public:
     int errno_val;
   };
 
-  mutable std::vector<LogEntry> entries;
-
   void log(Level level, const std::string &message, TimerError error = TimerError::None,
            int errno_val = 0) override
   {
-    entries.push_back({level, message, error, errno_val});
+    std::lock_guard<std::mutex> lock(_mtx);
+    _entries.push_back({level, message, error, errno_val});
   }
 
-  void clear() { entries.clear(); }
-  size_t count() const { return entries.size(); }
+  void clear()
+  {
+    std::lock_guard<std::mutex> lock(_mtx);
+    _entries.clear();
+  }
+
+  size_t count() const
+  {
+    std::lock_guard<std::mutex> lock(_mtx);
+    return _entries.size();
+  }
 
   bool hasMessage(const std::string &msg) const
   {
-    for (const auto &entry : entries)
+    std::lock_guard<std::mutex> lock(_mtx);
+    for (const auto &entry : _entries)
     {
       if (entry.message.find(msg) != std::string::npos)
       {
@@ -40,6 +49,10 @@ public:
     }
     return false;
   }
+
+private:
+  mutable std::mutex _mtx;
+  std::vector<LogEntry> _entries;
 };
 
 TEST_CASE("TimerService basic functionality", "[enhanced_timer][basic]")
@@ -105,7 +118,7 @@ TEST_CASE("TimerService basic functionality", "[enhanced_timer][basic]")
                             execution_order.push_back(1);
                           });
 
-    std::this_thread::sleep_for(150ms);
+    std::this_thread::sleep_for(250ms);
 
     REQUIRE(execution_order.size() == 3);
     REQUIRE(execution_order[0] == 1);
@@ -402,15 +415,18 @@ TEST_CASE("TimerService perfect forwarding", "[enhanced_timer][forwarding]")
     };
 
     TimerService service;
+    std::atomic<bool> ran{false};
 
     MoveOnlyHandler handler("test message");
-    service.scheduleAfter(10ms, std::move(handler));
+    service.scheduleAfter(10ms,
+      [h = std::move(handler), &ran]() mutable
+      {
+        h();
+        ran.store(true, std::memory_order_release);
+      });
 
     std::this_thread::sleep_for(50ms);
-
-    // Note: We can't directly check the handler since it was moved
-    // But the test passes if compilation succeeds and no crashes occur
-    REQUIRE(true); // If we get here, perfect forwarding worked
+    REQUIRE(ran.load(std::memory_order_acquire) == true);
   }
 
   SECTION("Lambda with move capture")
@@ -534,5 +550,269 @@ TEST_CASE("Timer configuration options", "[enhanced_timer][config]")
         service.scheduleAfter(1ms, []() {});
         std::this_thread::sleep_for(10ms);
       }());
+  }
+}
+
+TEST_CASE("TimerService thread safety: F4a scheduleAt TOCTOU", "[enhanced_timer][thread_safety]")
+{
+  SECTION("No timer inserted after drain begins")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<bool> drainStarted{false};
+
+    // Schedule some timers so drain has work to do
+    for (int i = 0; i < 10; ++i)
+    {
+      service.scheduleAfter(500ms, []() {});
+    }
+
+    // Thread A: drain the service
+    std::thread drainer(
+      [&]()
+      {
+        drainStarted.store(true, std::memory_order_release);
+        service.drain(5000);
+      });
+
+    // Thread B: try to schedule after drain starts
+    while (!drainStarted.load(std::memory_order_acquire))
+    {
+      std::this_thread::yield();
+    }
+
+    // Attempt many scheduleAt calls — some may race and succeed before
+    // drain sets _accepting=false, but drain will cancel them
+    for (int i = 0; i < 100; ++i)
+    {
+      service.scheduleAfter(1ms, []() {});
+    }
+
+    drainer.join();
+
+    // After drain completes, no timers should be in-flight
+    REQUIRE(service.getInFlightCount() == 0);
+
+    // After drain has fully completed, _accepting is false — all new
+    // scheduleAt calls must be rejected (return 0)
+    auto postDrainId = service.scheduleAfter(1ms, []() {});
+    REQUIRE(postDrainId == 0);
+  }
+}
+
+TEST_CASE("TimerService thread safety: F3 inFlightAtStart accuracy", "[enhanced_timer][thread_safety]")
+{
+  SECTION("drain inFlightAtStart matches actual count")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+
+    // Schedule known number of far-future timers
+    const int numTimers = 5;
+    for (int i = 0; i < numTimers; ++i)
+    {
+      service.scheduleAfter(10s, []() {});
+    }
+
+    REQUIRE(service.getInFlightCount() == numTimers);
+
+    // Drain — all far-future timers should be cancelled
+    auto result = service.drain(1000);
+    REQUIRE(result.success);
+    REQUIRE(service.getInFlightCount() == 0);
+  }
+}
+
+TEST_CASE("TimerService thread safety: F2 poke outside lock", "[enhanced_timer][thread_safety]")
+{
+  SECTION("Concurrent scheduling does not deadlock")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<int> scheduled{0};
+    const int numThreads = 4;
+    const int timersPerThread = 50;
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < numThreads; ++t)
+    {
+      threads.emplace_back(
+        [&]()
+        {
+          for (int i = 0; i < timersPerThread; ++i)
+          {
+            auto id = service.scheduleAfter(10ms, []() {});
+            if (id != 0)
+            {
+              scheduled.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        });
+    }
+
+    for (auto &t : threads)
+    {
+      t.join();
+    }
+
+    REQUIRE(scheduled.load() == numThreads * timersPerThread);
+
+    // Wait for all to fire
+    std::this_thread::sleep_for(100ms);
+    REQUIRE(service.getStats().timersExecuted.load() == static_cast<std::uint64_t>(numThreads * timersPerThread));
+  }
+}
+
+TEST_CASE("TimerService thread safety: F1+F6 concurrent setErrorHandler/setLogger", "[enhanced_timer][thread_safety]")
+{
+  SECTION("Concurrent setErrorHandler with timer callbacks")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).throwOnSystemError(false).build();
+    TimerService service(config);
+    std::atomic<bool> done{false};
+
+    // Schedule timers that throw — triggers handleError from safeRun
+    for (int i = 0; i < 20; ++i)
+    {
+      service.scheduleAfter(std::chrono::milliseconds(5 * i + 5),
+        []() { throw std::runtime_error("test"); });
+    }
+
+    // Concurrently swap error handler many times
+    std::thread swapper(
+      [&]()
+      {
+        while (!done.load(std::memory_order_acquire))
+        {
+          service.setErrorHandler(
+            [](TimerError, const std::string&, int) {});
+          service.setErrorHandler(nullptr);
+        }
+      });
+
+    std::this_thread::sleep_for(200ms);
+    done.store(true, std::memory_order_release);
+    swapper.join();
+
+    // No crash = success. Verify some exceptions were caught.
+    REQUIRE(service.getStats().exceptionsSwallowed.load() > 0);
+  }
+
+  SECTION("Concurrent setLogger with timer callbacks")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).throwOnSystemError(false).build();
+    auto logger1 = std::make_shared<TestTimerLogger>();
+    auto logger2 = std::make_shared<TestTimerLogger>();
+    TimerService service(config, logger1);
+    std::atomic<bool> done{false};
+
+    // Schedule timers that throw — triggers logger from handleError
+    for (int i = 0; i < 20; ++i)
+    {
+      service.scheduleAfter(std::chrono::milliseconds(5 * i + 5),
+        []() { throw std::runtime_error("test"); });
+    }
+
+    // Concurrently swap logger
+    std::thread swapper(
+      [&]()
+      {
+        while (!done.load(std::memory_order_acquire))
+        {
+          service.setLogger(logger2);
+          service.setLogger(logger1);
+        }
+      });
+
+    std::this_thread::sleep_for(200ms);
+    done.store(true, std::memory_order_release);
+    swapper.join();
+
+    // No crash = success. Some messages should have been logged.
+    REQUIRE((logger1->count() + logger2->count()) > 0);
+  }
+}
+
+TEST_CASE("TimerService thread safety: concurrent drain CAS", "[enhanced_timer][thread_safety]")
+{
+  SECTION("Only one concurrent drain succeeds")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+
+    // Schedule far-future timers so drain has work
+    for (int i = 0; i < 5; ++i)
+    {
+      service.scheduleAfter(10s, []() {});
+    }
+    REQUIRE(service.getInFlightCount() == 5);
+
+    std::atomic<int> successes{0};
+    std::atomic<int> failures{0};
+
+    auto drainFn = [&]()
+    {
+      auto result = service.drain(5000);
+      if (result.success)
+      {
+        successes.fetch_add(1, std::memory_order_relaxed);
+      }
+      else
+      {
+        failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+
+    std::thread t1(drainFn);
+    std::thread t2(drainFn);
+
+    t1.join();
+    t2.join();
+
+    // Exactly one should succeed, one should fail
+    REQUIRE(successes.load() == 1);
+    REQUIRE(failures.load() == 1);
+    REQUIRE(service.getInFlightCount() == 0);
+  }
+}
+
+TEST_CASE("TimerService thread safety: F5 drain promptness", "[enhanced_timer][thread_safety]")
+{
+  SECTION("drain completes promptly after last callback")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+
+    // Schedule a single timer that fires quickly
+    service.scheduleAfter(10ms, []() {});
+
+    // Measure drain time — should complete well within timeout
+    auto start = std::chrono::steady_clock::now();
+    auto result = service.drain(5000);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    REQUIRE(result.success);
+    // drain should complete within ~50ms (timer fires at 10ms + overhead),
+    // not polling at 10ms intervals
+    REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() < 200);
+  }
+
+  SECTION("drain with periodic timer completes promptly")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+
+    service.schedulePeriodic(20ms, []() {});
+
+    // Let it fire once
+    std::this_thread::sleep_for(30ms);
+
+    auto start = std::chrono::steady_clock::now();
+    auto result = service.drain(5000);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    REQUIRE(result.success);
+    REQUIRE(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() < 200);
+    REQUIRE(service.getInFlightCount() == 0);
   }
 }

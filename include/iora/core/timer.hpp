@@ -7,6 +7,7 @@
 #pragma once
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -204,7 +205,7 @@ public:
     if (!_enabled.load(std::memory_order_relaxed) || level < _minLevel)
       return;
 
-    std::string levelStr;
+    const char *levelStr = "";
     switch (level)
     {
     case Level::Debug:
@@ -225,14 +226,17 @@ public:
     }
 
     auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    auto tm = *std::localtime(&time_t);
+    auto time_t_val = std::chrono::system_clock::to_time_t(now);
+    struct tm tm{};
+    localtime_r(&time_t_val, &tm);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       now.time_since_epoch()) % 1000;
 
+    std::lock_guard<std::mutex> lock(_logMutex);
+
     std::printf("[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] %s", tm.tm_year + 1900, tm.tm_mon + 1,
                 tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms.count()),
-                levelStr.c_str(), message.c_str());
+                levelStr, message.c_str());
 
     if (error != TimerError::None)
     {
@@ -251,6 +255,7 @@ public:
 private:
   Level _minLevel;
   std::atomic<bool> _enabled;
+  std::mutex _logMutex;
 };
 
 /// \brief Linux epoll-based timer service.
@@ -344,30 +349,50 @@ public:
       return 0;
     }
 
-    std::lock_guard<std::mutex> lock(_mutex);
-
-    if (_records.size() >= _config.limits.maxConcurrentTimers)
+    TimerError pendingError = TimerError::None;
+    std::string pendingMsg;
+    std::uint64_t id = 0;
     {
-      handleError(TimerError::ResourceExhausted, "Maximum concurrent timers exceeded", 0);
-      return 0;
+      std::lock_guard<std::mutex> lock(_mutex);
+
+      // Re-check under lock: drain() may have set _accepting=false between
+      // the lock-free check above and this point.
+      if (!_accepting.load(std::memory_order_relaxed))
+      {
+        pendingError = TimerError::ServiceStopped;
+        pendingMsg = "Timer service is draining and not accepting new timers";
+      }
+      else if (_records.size() >= _config.limits.maxConcurrentTimers)
+      {
+        pendingError = TimerError::ResourceExhausted;
+        pendingMsg = "Maximum concurrent timers exceeded";
+      }
+      else
+      {
+        id = ++_nextId;
+        _records.emplace(id, Record{tp, std::forward<Handler>(handler), false});
+        _heap.emplace_back(HeapItem{tp, id});
+        siftUp(_heap.size() - 1);
+
+        if (_config.enableStatistics)
+        {
+          _stats.timersScheduled.fetch_add(1, std::memory_order_relaxed);
+          _stats.heapOperations.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
     }
 
-    std::uint64_t id = ++_nextId;
-    _records.emplace(id, Record{tp, std::forward<Handler>(handler), false});
-    _heap.emplace_back(HeapItem{tp, id});
-    siftUp(_heap.size() - 1);
-
-    if (_config.enableStatistics)
+    if (pendingError != TimerError::None)
     {
-      _stats.timersScheduled.fetch_add(1, std::memory_order_relaxed);
-      _stats.heapOperations.fetch_add(1, std::memory_order_relaxed);
+      handleError(pendingError, pendingMsg, 0);
+      return 0;
     }
 
     poke();
 
     if (_config.enableDetailedLogging)
     {
-      _logger->debug("Timer " + std::to_string(id) + " scheduled");
+      loggerSnapshot()->debug("Timer " + std::to_string(id) + " scheduled");
     }
 
     return id;
@@ -401,102 +426,119 @@ public:
       return 0;
     }
 
-    std::lock_guard<std::mutex> lock(_mutex);
-
-    // Re-check under lock: drain() may have set _accepting=false between
-    // the lock-free check above and this point.
-    if (!_accepting.load(std::memory_order_relaxed))
+    TimerError pendingError = TimerError::None;
+    std::string pendingMsg;
+    std::uint64_t id = 0;
     {
-      handleError(TimerError::ServiceStopped, "Timer service is draining and not accepting new timers", 0);
-      return 0;
+      std::lock_guard<std::mutex> lock(_mutex);
+
+      // Re-check under lock: drain() may have set _accepting=false between
+      // the lock-free check above and this point.
+      if (!_accepting.load(std::memory_order_relaxed))
+      {
+        pendingError = TimerError::ServiceStopped;
+        pendingMsg = "Timer service is draining and not accepting new timers";
+      }
+      else if (_periodicTimers.size() >= _config.limits.maxPeriodicTimers)
+      {
+        pendingError = TimerError::ResourceExhausted;
+        pendingMsg = "Maximum periodic timers exceeded";
+      }
+      else if (_records.size() >= _config.limits.maxConcurrentTimers)
+      {
+        pendingError = TimerError::ResourceExhausted;
+        pendingMsg = "Maximum concurrent timers exceeded";
+      }
+      else
+      {
+        // Use a single ID for both _periodicTimers and _records so that
+        // cancel(id) cancels both and getInFlightCount() doesn't double-count.
+        id = ++_nextId;
+
+        // Copy handler into std::function BEFORE forwarding into Record.
+        // std::forward<F> may move from handler, so the copy must happen first.
+        std::function<void()> storedFn(handler);
+        _periodicTimers.emplace(id, PeriodicTimer{id, interval, deadline, false, std::move(storedFn)});
+        _records.emplace(id, Record{deadline, Handler{std::forward<F>(handler)}, false});
+        _heap.emplace_back(HeapItem{deadline, id});
+        siftUp(_heap.size() - 1);
+
+        if (_config.enableStatistics)
+        {
+          _stats.periodicTimersActive.fetch_add(1, std::memory_order_relaxed);
+          _stats.timersScheduled.fetch_add(1, std::memory_order_relaxed);
+          _stats.heapOperations.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
     }
 
-    if (_periodicTimers.size() >= _config.limits.maxPeriodicTimers)
+    if (pendingError != TimerError::None)
     {
-      handleError(TimerError::ResourceExhausted, "Maximum periodic timers exceeded", 0);
+      handleError(pendingError, pendingMsg, 0);
       return 0;
-    }
-
-    if (_records.size() >= _config.limits.maxConcurrentTimers)
-    {
-      handleError(TimerError::ResourceExhausted, "Maximum concurrent timers exceeded", 0);
-      return 0;
-    }
-
-    // Use a single ID for both _periodicTimers and _records so that
-    // cancel(id) cancels both and getInFlightCount() doesn't double-count.
-    std::uint64_t id = ++_nextId;
-
-    // Copy handler into std::function BEFORE forwarding into Record.
-    // std::forward<F> may move from handler, so the copy must happen first.
-    std::function<void()> storedFn(handler);
-    _periodicTimers.emplace(id, PeriodicTimer{id, interval, deadline, false, std::move(storedFn)});
-    _records.emplace(id, Record{deadline, Handler{std::forward<F>(handler)}, false});
-    _heap.emplace_back(HeapItem{deadline, id});
-    siftUp(_heap.size() - 1);
-
-    if (_config.enableStatistics)
-    {
-      _stats.periodicTimersActive.fetch_add(1, std::memory_order_relaxed);
-      _stats.timersScheduled.fetch_add(1, std::memory_order_relaxed);
-      _stats.heapOperations.fetch_add(1, std::memory_order_relaxed);
     }
 
     poke();
-
     return id;
   }
 
   /// \brief Cancel a scheduled timer; returns true if existed.
   bool cancel(std::uint64_t id)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-
     bool found = false;
-
-    // Cancel in _records (one-shot or periodic's underlying record)
-    auto it = _records.find(id);
-    if (it != _records.end() && !it->second.canceled)
+    bool needsPoke = false;
     {
-      it->second.canceled = true;
-      poke();
+      std::lock_guard<std::mutex> lock(_mutex);
 
-      if (_config.enableStatistics)
+      // Cancel in _records (one-shot or periodic's underlying record)
+      auto it = _records.find(id);
+      if (it != _records.end() && !it->second.canceled)
       {
-        _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
-      }
-
-      if (_config.enableDetailedLogging)
-      {
-        _logger->debug("Timer " + std::to_string(id) + " canceled");
-      }
-
-      found = true;
-    }
-
-    // Also cancel in _periodicTimers (same ID is used for both stores)
-    auto periodicIt = _periodicTimers.find(id);
-    if (periodicIt != _periodicTimers.end())
-    {
-      if (!periodicIt->second.canceled)
-      {
-        periodicIt->second.canceled = true;
+        it->second.canceled = true;
+        needsPoke = true;
 
         if (_config.enableStatistics)
         {
-          _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
-          if (!found)
-          {
-            // Record was already fired and erased — count this cancellation
-            _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
-          }
+          _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
         }
+
+        found = true;
       }
 
-      // Erase the entry to prevent unbounded accumulation
-      _periodicTimers.erase(periodicIt);
+      // Also cancel in _periodicTimers (same ID is used for both stores)
+      auto periodicIt = _periodicTimers.find(id);
+      if (periodicIt != _periodicTimers.end())
+      {
+        if (!periodicIt->second.canceled)
+        {
+          periodicIt->second.canceled = true;
 
-      found = true;
+          if (_config.enableStatistics)
+          {
+            _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+            if (!found)
+            {
+              // Record was already fired and erased — count this cancellation
+              _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        }
+
+        // Erase the entry to prevent unbounded accumulation
+        _periodicTimers.erase(periodicIt);
+
+        found = true;
+      }
+    }
+
+    if (needsPoke)
+    {
+      poke();
+    }
+
+    if (found && _config.enableDetailedLogging)
+    {
+      loggerSnapshot()->debug("Timer " + std::to_string(id) + " canceled");
     }
 
     return found;
@@ -509,7 +551,7 @@ public:
   void resetStats()
   {
     _stats.reset();
-    _logger->info("Timer statistics reset");
+    loggerSnapshot()->info("Timer statistics reset");
   }
 
   /// \brief Get current configuration.
@@ -518,14 +560,14 @@ public:
   /// \brief Set error handler.
   void setErrorHandler(ErrorHandler handler)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_handlerMutex);
     _errorHandler = std::move(handler);
   }
 
   /// \brief Set logger.
   void setLogger(std::shared_ptr<TimerLogger> logger)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_handlerMutex);
     _logger = std::move(logger);
   }
 
@@ -584,68 +626,87 @@ public:
     using iora::common::LifecycleResult;
     using iora::common::DrainStats;
 
-    auto currentState = _lifecycleState.load(std::memory_order_acquire);
-
-    // Can only drain from Running state
-    if (currentState != LifecycleState::Running)
+    // Atomically transition Running → Draining and stop accepting new timers.
+    // Both under _mutex so the pair (state, accepting) is consistent with
+    // the timeout recovery path which also stores both under _mutex.
     {
-      return LifecycleResult(false, currentState,
-                             "Can only drain from Running state");
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto expected = LifecycleState::Running;
+      if (!_lifecycleState.compare_exchange_strong(
+            expected, LifecycleState::Draining,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+      {
+        return LifecycleResult(false, expected,
+                               "Can only drain from Running state");
+      }
+      _accepting.store(false, std::memory_order_release);
     }
+    auto drainStart = Clock::now();
 
-    // Transition to Draining and stop accepting new timers
-    _lifecycleState.store(LifecycleState::Draining, std::memory_order_release);
-    _accepting.store(false, std::memory_order_release);
-
-    // Capture initial in-flight count
-    std::uint32_t inFlightAtStart = getInFlightCount();
-
-    _logger->info("Draining timer service, in-flight timers: " + std::to_string(inFlightAtStart));
+    loggerSnapshot()->info("Draining timer service");
 
     // Cancel timers that can't possibly complete within the drain timeout.
     // The run loop is still running and will fire timers naturally, so
     // timers within the timeout window are left to fire. Only far-future
     // timers (deadline beyond drain deadline) are cancelled — their callback
     // targets may be destroyed by the time they would expire.
+    std::uint32_t inFlightAtStart = 0;
     std::uint32_t cancelledCount = 0;
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      auto drainDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
-      for (auto& [id, rec] : _records)
+
+      // Inline getInFlightCount logic under the existing lock to avoid
+      // stale count (F3 fix). With unified IDs, counting _records alone
+      // is sufficient — every active periodic timer has a _records entry.
+      for (const auto &pair : _records)
       {
-        if (!rec.canceled && rec.tp > drainDeadline)
+        if (!pair.second.canceled)
         {
-          rec.canceled = true;
-          ++cancelledCount;
-          if (_config.enableStatistics)
-          {
-            _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
-          }
+          ++inFlightAtStart;
         }
       }
-      for (auto& [id, pt] : _periodicTimers)
+      // When timeoutMs > 0, cancel timers beyond the drain deadline and all
+      // periodic timers. When timeoutMs == 0 (wait indefinitely), let all
+      // timers fire naturally — don't cancel anything upfront.
+      if (timeoutMs > 0)
       {
-        if (!pt.canceled)
+        auto drainDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+        for (auto& [id, rec] : _records)
         {
-          pt.canceled = true;
-          if (_config.enableStatistics)
+          if (!rec.canceled && rec.tp > drainDeadline)
           {
-            _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
-          }
-
-          // Check if the records loop already canceled (and counted) this ID
-          auto recIt = _records.find(id);
-          bool alreadyCounted = (recIt != _records.end() && recIt->second.canceled);
-
-          if (_config.enableStatistics && !alreadyCounted)
-          {
-            _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
-          }
-
-          // Only count toward DrainStats if no corresponding _records entry
-          if (recIt == _records.end())
-          {
+            rec.canceled = true;
             ++cancelledCount;
+            if (_config.enableStatistics)
+            {
+              _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        }
+        for (auto& [id, pt] : _periodicTimers)
+        {
+          if (!pt.canceled)
+          {
+            pt.canceled = true;
+            if (_config.enableStatistics)
+            {
+              _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+            }
+
+            // Check if the records loop already canceled (and counted) this ID
+            auto recIt = _records.find(id);
+            bool alreadyCounted = (recIt != _records.end() && recIt->second.canceled);
+
+            if (_config.enableStatistics && !alreadyCounted)
+            {
+              _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // Only count toward DrainStats if no corresponding _records entry
+            if (recIt == _records.end())
+            {
+              ++cancelledCount;
+            }
           }
         }
       }
@@ -653,35 +714,53 @@ public:
     // Wake the run loop so it re-evaluates with the cancellations
     poke();
 
+    loggerSnapshot()->info("In-flight timers at drain start: " + std::to_string(inFlightAtStart));
+
     if (cancelledCount > 0)
     {
-      _logger->info("Cancelled " + std::to_string(cancelledCount) + " future timers during drain");
+      loggerSnapshot()->info("Cancelled " + std::to_string(cancelledCount) + " future timers during drain");
     }
 
-    // Wait for any in-flight expired callbacks to complete
-    std::uint32_t waitMs = 0;
-    const std::uint32_t maxWaitMs = (timeoutMs == 0) ? 3600000u : timeoutMs;
-
+    // Wait for all in-flight timers and executing callbacks to complete.
+    // Uses _drainCV instead of polling to avoid lock contention with run loop.
     std::uint32_t remaining = 0;
     bool timedOut = false;
 
-    while (waitMs < maxWaitMs)
+    auto drainDone = [this, &remaining]()
     {
-      remaining = getInFlightCount();
-      auto executing = _executingCallbacks.load(std::memory_order_acquire);
-
-      if (remaining == 0 && executing == 0)
+      // Inline count under lock (same logic as getInFlightCount, avoids deadlock)
+      // With unified IDs, counting _records alone is sufficient.
+      remaining = 0;
+      for (const auto &pair : _records)
       {
-        break;
+        if (!pair.second.canceled)
+        {
+          ++remaining;
+        }
       }
+      return remaining == 0 && _executingCallbacks.load(std::memory_order_acquire) == 0;
+    };
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      waitMs += 10;
-    }
-
-    if (waitMs >= maxWaitMs && (remaining > 0 || _executingCallbacks.load(std::memory_order_acquire) > 0))
     {
-      timedOut = true;
+      std::unique_lock<std::mutex> lock(_mutex);
+      if (timeoutMs == 0)
+      {
+        _drainCV.wait(lock, drainDone);
+      }
+      else
+      {
+        // Adjust budget for time already spent in cancellation sweep
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - drainStart);
+        auto budget = std::chrono::milliseconds(timeoutMs) - elapsed;
+        if (budget <= std::chrono::milliseconds::zero())
+        {
+          timedOut = !drainDone();
+        }
+        else
+        {
+          timedOut = !_drainCV.wait_for(lock, budget, drainDone);
+        }
+      }
     }
 
     std::uint32_t accounted = remaining + cancelledCount;
@@ -689,13 +768,34 @@ public:
 
     DrainStats stats(inFlightAtStart, remaining, cancelledCount, completed);
 
-    std::string message = timedOut
-      ? "Drain timed out with " + std::to_string(remaining) + " timers remaining"
-      : "Drain completed successfully";
+    std::string message;
+    if (timedOut)
+    {
+      // Restore to Running so drain can be retried. Use CAS (Draining→Running)
+      // so if stop() already transitioned to Stopped, we don't overwrite it.
+      // Both operations under _mutex for consistency with the drain entry gate.
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto drainExpected = LifecycleState::Draining;
+        if (_lifecycleState.compare_exchange_strong(
+              drainExpected, LifecycleState::Running,
+              std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+          _accepting.store(true, std::memory_order_release);
+        }
+        // If CAS failed, stop() already moved past Draining — don't restore
+      }
+      message = "Drain timed out with " + std::to_string(remaining) + " timers remaining";
+    }
+    else
+    {
+      message = "Drain completed successfully";
+    }
 
-    _logger->info(message);
+    loggerSnapshot()->info(message);
 
-    return LifecycleResult(!timedOut, LifecycleState::Draining, message, stats);
+    auto resultState = _lifecycleState.load(std::memory_order_acquire);
+    return LifecycleResult(!timedOut, resultState, message, stats);
   }
 
   /// Stop the timer service (Running/Draining → Stopped)
@@ -720,7 +820,7 @@ public:
       auto drainResult = drain(5000); // 5 second drain timeout
       if (!drainResult.success)
       {
-        _logger->warning("Drain failed during stop, forcing shutdown");
+        loggerSnapshot()->warning("Drain failed during stop, forcing shutdown");
       }
     }
 
@@ -728,7 +828,7 @@ public:
     bool expected = true;
     if (_running.compare_exchange_strong(expected, false, std::memory_order_acq_rel))
     {
-      _logger->info("Stopping timer service");
+      loggerSnapshot()->info("Stopping timer service");
       poke();
 
       if (_thread.joinable())
@@ -738,7 +838,7 @@ public:
 
       cleanup();
       _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
-      _logger->info("Timer service stopped");
+      loggerSnapshot()->info("Timer service stopped");
 
       return LifecycleResult(true, LifecycleState::Stopped, "Timer service stopped");
     }
@@ -777,7 +877,7 @@ public:
     _stats.reset();
 
     _lifecycleState.store(LifecycleState::Reset, std::memory_order_release);
-    _logger->info("Timer service reset to clean state");
+    loggerSnapshot()->info("Timer service reset to clean state");
 
     return LifecycleResult(true, LifecycleState::Reset, "Timer service reset");
   }
@@ -796,22 +896,12 @@ public:
     std::lock_guard<std::mutex> lock(_mutex);
 
     // Count non-canceled timers in _records.
-    // Periodic timers now share IDs with _records, so counting _records
-    // alone captures both one-shot and periodic timers without double-counting.
+    // With unified IDs, every active periodic timer has a corresponding
+    // _records entry, so counting _records alone is sufficient.
     std::uint32_t activeTimers = 0;
     for (const auto &pair : _records)
     {
       if (!pair.second.canceled)
-      {
-        activeTimers++;
-      }
-    }
-
-    // Count periodic timers that have no corresponding _records entry
-    // (shouldn't happen with unified IDs, but defensive)
-    for (const auto &pair : _periodicTimers)
-    {
-      if (!pair.second.canceled && _records.find(pair.first) == _records.end())
       {
         activeTimers++;
       }
@@ -886,15 +976,15 @@ private:
       _accepting.store(true, std::memory_order_release);
       _lifecycleState.store(iora::common::LifecycleState::Running, std::memory_order_release);
 
-      _logger->info("Timer service started successfully");
+      loggerSnapshot()->info("Timer service started successfully");
     }
     catch (const TimerException &e)
     {
       handleError(e.code(), e.what(), e.getErrno());
-      if (_config.throwOnSystemError)
-      {
-        throw;
-      }
+      // Always rethrow from initialize() — a partially initialized
+      // TimerService is non-functional (zombie state). throwOnSystemError
+      // only applies to runtime errors, not construction failures.
+      throw;
     }
   }
 
@@ -907,7 +997,7 @@ private:
       param.sched_priority = _config.threadPriority;
       if (pthread_setschedparam(_thread.native_handle(), SCHED_FIFO, &param) != 0)
       {
-        _logger->warning("Failed to set thread priority");
+        loggerSnapshot()->warning("Failed to set thread priority");
       }
     }
 
@@ -944,6 +1034,12 @@ private:
     return duration <= _config.limits.maxTimeout;
   }
 
+  std::shared_ptr<TimerLogger> loggerSnapshot() const
+  {
+    std::lock_guard<std::mutex> lock(_handlerMutex);
+    return _logger;
+  }
+
   void handleError(TimerError error, const std::string &message, int errno_val)
   {
     if (_config.enableStatistics && error == TimerError::SystemError)
@@ -951,17 +1047,28 @@ private:
       _stats.systemErrors.fetch_add(1, std::memory_order_relaxed);
     }
 
-    _logger->error(message, error, errno_val);
+    // Copy _logger and _errorHandler under _handlerMutex, then invoke outside.
+    // Safe to call from both locked (_mutex held) and unlocked contexts because
+    // _handlerMutex is always the inner lock (never held while acquiring _mutex).
+    std::shared_ptr<TimerLogger> logger;
+    ErrorHandler handler;
+    {
+      std::lock_guard<std::mutex> lock(_handlerMutex);
+      logger = _logger;
+      handler = _errorHandler;
+    }
 
-    if (_errorHandler)
+    logger->error(message, error, errno_val);
+
+    if (handler)
     {
       try
       {
-        _errorHandler(error, message, errno_val);
+        handler(error, message, errno_val);
       }
       catch (...)
       {
-        _logger->critical("Error handler threw exception");
+        logger->critical("Error handler threw exception");
       }
     }
   }
@@ -1032,7 +1139,9 @@ private:
     }
   }
 
-  void programTimerfd(std::optional<TimePoint> nextDue)
+  /// Programs timerfd. Returns 0 on success, or the errno value on failure.
+  /// Caller must handle errors outside _mutex.
+  int programTimerfd(std::optional<TimePoint> nextDue)
   {
     itimerspec its{};
     if (nextDue.has_value())
@@ -1052,18 +1161,20 @@ private:
 
     if (::timerfd_settime(_timerFd, 0, &its, nullptr) != 0)
     {
-      handleError(TimerError::SystemError, "timerfd_settime failed", errno);
-      if (_config.throwOnSystemError)
-      {
-        throw TimerException(TimerError::SystemError, "timerfd_settime failed", errno);
-      }
+      return errno;
     }
+    return 0;
   }
 
   void poke()
   {
+    int fd = _eventFd.load(std::memory_order_acquire);
+    if (fd < 0)
+    {
+      return; // fd closed (cleanup already ran)
+    }
     std::uint64_t one = 1;
-    ssize_t n = ::write(_eventFd, &one, sizeof(one));
+    ssize_t n = ::write(fd, &one, sizeof(one));
     if (n < 0 && errno != EAGAIN)
     {
       handleError(TimerError::SystemError, "eventfd write failed", errno);
@@ -1072,10 +1183,15 @@ private:
 
   void drainEventfd()
   {
+    int fd = _eventFd.load(std::memory_order_acquire);
+    if (fd < 0)
+    {
+      return;
+    }
     std::uint64_t val = 0;
     while (true)
     {
-      ssize_t n = ::read(_eventFd, &val, sizeof(val));
+      ssize_t n = ::read(fd, &val, sizeof(val));
       if (n < 0)
       {
         if (errno == EAGAIN)
@@ -1098,6 +1214,10 @@ private:
 
   void drainTimerfd()
   {
+    if (_timerFd < 0)
+    {
+      return;
+    }
     std::uint64_t expirations = 0;
     (void)::read(_timerFd, &expirations, sizeof(expirations));
 
@@ -1188,8 +1308,20 @@ private:
     struct CountGuard
     {
       std::atomic<std::uint32_t>& counter;
-      ~CountGuard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
-    } guard{_executingCallbacks};
+      std::mutex& mx;
+      std::condition_variable& cv;
+      ~CountGuard()
+      {
+        if (counter.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+          // Lock/unlock _mutex to ensure the state change is visible to
+          // drain()'s predicate before signaling the CV. Without this,
+          // the notify can be lost if drain() hasn't entered wait yet.
+          { std::lock_guard<std::mutex> g(mx); }
+          cv.notify_all();
+        }
+      }
+    } guard{_executingCallbacks, _mutex, _drainCV};
 
     if (!static_cast<bool>(h))
       return;
@@ -1217,11 +1349,15 @@ private:
         {
         }
 
-        // Update average (simple moving average)
+        // Update average — approximate under concurrent execution since
+        // totalExecuted and totalTime are loaded independently (lock-free).
         auto totalExecuted = _stats.timersExecuted.load(std::memory_order_relaxed);
         auto totalTime = _stats.totalHandlerExecutionTimeNs.load(std::memory_order_relaxed);
-        _stats.avgHandlerExecutionTimeNs.store(totalTime / totalExecuted,
-                                               std::memory_order_relaxed);
+        if (totalExecuted > 0)
+        {
+          _stats.avgHandlerExecutionTimeNs.store(totalTime / totalExecuted,
+                                                 std::memory_order_relaxed);
+        }
       }
     }
     catch (...)
@@ -1236,7 +1372,7 @@ private:
 
   void runLoop()
   {
-    _logger->info("Timer service loop started");
+    loggerSnapshot()->info("Timer service loop started");
 
     std::vector<epoll_event> events(_config.maxEpollEvents);
 
@@ -1245,6 +1381,7 @@ private:
       std::optional<TimePoint> nextDue;
       std::vector<Handler> ready;
       bool shouldExit = false;
+      int timerfdErr = 0;
 
       {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -1253,7 +1390,7 @@ private:
         {
           TimePoint now = Clock::now();
           collectDueLocked(now, ready);
-          programTimerfd(std::nullopt);
+          timerfdErr = programTimerfd(std::nullopt);
           shouldExit = true;
         }
         else
@@ -1262,7 +1399,7 @@ private:
           {
             nextDue = top->tp;
           }
-          programTimerfd(nextDue);
+          timerfdErr = programTimerfd(nextDue);
         }
 
         // Pre-announce executing count while lock is held, so drain()
@@ -1275,14 +1412,23 @@ private:
         }
       }
 
-      // Fire callbacks OUTSIDE the lock
+      // Fire callbacks OUTSIDE the lock — always runs before any break
+      // so CountGuard can decrement _executingCallbacks correctly
       for (auto &h : ready)
       {
         safeRun(h);
       }
 
-      if (shouldExit)
+      // Handle programTimerfd error outside the lock, after callbacks
+      if (timerfdErr != 0)
       {
+        handleError(TimerError::SystemError, "timerfd_settime failed", timerfdErr);
+      }
+
+      if (shouldExit || (timerfdErr != 0 && _config.throwOnSystemError))
+      {
+        // Wake drain() in case it's waiting — runLoop is exiting
+        _drainCV.notify_all();
         break;
       }
 
@@ -1313,6 +1459,8 @@ private:
 
       bool timerTriggered = false;
       bool woke = false;
+      int timerFdSnap = _timerFd;
+      int eventFdSnap = _eventFd.load(std::memory_order_acquire);
 
       for (int i = 0; i < rc; ++i)
       {
@@ -1321,14 +1469,14 @@ private:
 
         if ((ev & (EPOLLERR | EPOLLHUP)) != 0)
         {
-          _logger->warning("epoll error on fd " + std::to_string(fd));
+          loggerSnapshot()->warning("epoll error on fd " + std::to_string(fd));
         }
 
-        if (fd == _timerFd && (ev & EPOLLIN))
+        if (fd == timerFdSnap && (ev & EPOLLIN))
         {
           timerTriggered = true;
         }
-        else if (fd == _eventFd && (ev & EPOLLIN))
+        else if (fd == eventFdSnap && (ev & EPOLLIN))
         {
           woke = true;
         }
@@ -1353,6 +1501,12 @@ private:
           _executingCallbacks.fetch_add(
             static_cast<std::uint32_t>(ready.size()), std::memory_order_release);
         }
+        else if (!_accepting.load(std::memory_order_relaxed))
+        {
+          // Draining and nothing collected — notify drain CV in case
+          // all timers have been canceled or already fired
+          _drainCV.notify_all();
+        }
       }
 
       for (auto &h : ready)
@@ -1361,14 +1515,15 @@ private:
       }
     }
 
-    _logger->info("Timer service loop finished");
+    loggerSnapshot()->info("Timer service loop finished");
   }
 
 private:
   // Configuration and logging
   TimerServiceConfig _config;
-  std::shared_ptr<TimerLogger> _logger;
-  ErrorHandler _errorHandler;
+  std::shared_ptr<TimerLogger> _logger;   // guarded by _handlerMutex
+  ErrorHandler _errorHandler;             // guarded by _handlerMutex
+  mutable std::mutex _handlerMutex;       // protects _logger and _errorHandler
 
   // Statistics
   mutable TimerStats _stats;
@@ -1383,14 +1538,15 @@ private:
   // Threading and fds
   std::atomic<bool> _running{false};
   std::thread _thread;
-  int _epollFd{-1};
-  int _timerFd{-1};
-  int _eventFd{-1};
+  int _epollFd{-1};              // only accessed from init/runLoop/cleanup (single thread)
+  int _timerFd{-1};              // only accessed from init/runLoop/cleanup (single thread)
+  std::atomic<int> _eventFd{-1}; // accessed cross-thread by poke()
 
   // Lifecycle management
   std::atomic<iora::common::LifecycleState> _lifecycleState{iora::common::LifecycleState::Created};
   std::atomic<bool> _accepting{false};
   std::atomic<std::uint32_t> _executingCallbacks{0}; // Callbacks in safeRun(), not in _records
+  std::condition_variable _drainCV;                   // notified when drain may complete
 };
 
 /// \brief Enhanced ASIO-like timer bound to TimerService.
