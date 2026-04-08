@@ -271,25 +271,107 @@ TEST_CASE("TimerService periodic timer unified ID", "[enhanced_timer][periodic]"
     REQUIRE(count == 0);
   }
 
-  SECTION("getInFlightCount returns 0 after periodic timer fires")
+  SECTION("getInFlightCount after periodic fire reflects rescheduling")
   {
     auto config = TimerConfigBuilder().enableStatistics(true).build();
     TimerService service(config);
     std::atomic<bool> fired{false};
 
-    auto id = service.schedulePeriodic(20ms, [&fired]() { fired = true; });
+    // Use a large interval so there's no race with a second fire
+    auto id = service.schedulePeriodic(200ms, [&fired]() { fired = true; });
     REQUIRE(id != 0);
     REQUIRE(service.getInFlightCount() == 1);
 
-    // Wait for the timer to fire
-    std::this_thread::sleep_for(100ms);
+    // Wait for the first fire
+    std::this_thread::sleep_for(300ms);
     REQUIRE(fired.load());
 
-    // After firing, in-flight count must be 0 (no orphaned _periodicTimers entry)
-    REQUIRE(service.getInFlightCount() == 0);
+    // After firing, the periodic timer is rescheduled — still in-flight
+    REQUIRE(service.getInFlightCount() == 1);
+    REQUIRE(service.getStats().periodicTimersActive.load() == 1);
 
-    // Stats: periodicTimersActive should be 0 after fire
+    // After cancel, counts should drop to 0
+    service.cancel(id);
+    REQUIRE(service.getInFlightCount() == 0);
     REQUIRE(service.getStats().periodicTimersActive.load() == 0);
+  }
+}
+
+TEST_CASE("TimerService periodic rescheduling", "[enhanced_timer][periodic]")
+{
+  SECTION("Periodic timer fires multiple times")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<int> fireCount{0};
+
+    auto id = service.schedulePeriodic(20ms, [&fireCount]() { fireCount++; });
+
+    std::this_thread::sleep_for(100ms);
+    service.cancel(id);
+
+    int count = fireCount.load();
+    REQUIRE(count >= 3);
+    REQUIRE(count <= 8);
+
+    // Verify stats: timersScheduled = 1 (initial) + count (reschedules for each fire)
+    // timersExpired = count (each fire increments expired)
+    const auto &stats = service.getStats();
+    REQUIRE(stats.timersScheduled.load() == static_cast<std::uint64_t>(count + 1));
+    REQUIRE(stats.timersExpired.load() == static_cast<std::uint64_t>(count));
+  }
+
+  SECTION("Cancel periodic timer after first fire")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<int> fireCount{0};
+
+    auto id = service.schedulePeriodic(100ms, [&fireCount]() { fireCount++; });
+
+    // Poll for first fire with timeout
+    for (int i = 0; i < 500 && fireCount.load() == 0; ++i)
+    {
+      std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(fireCount.load() >= 1);
+
+    // Cancel immediately — then verify no further fires
+    service.cancel(id);
+    int countAtCancel = fireCount.load();
+
+    std::this_thread::sleep_for(200ms);
+    REQUIRE(fireCount.load() == countAtCancel);
+  }
+
+  SECTION("Drain stops periodic timer rescheduling")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<int> fireCount{0};
+
+    service.schedulePeriodic(20ms, [&fireCount]() { fireCount++; });
+
+    // Wait for at least one fire
+    for (int i = 0; i < 500 && fireCount.load() == 0; ++i)
+    {
+      std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(fireCount.load() >= 1);
+
+    // Drain the service
+    auto result = service.drain(5000);
+    REQUIRE(result.success);
+
+    int countAtDrain = fireCount.load();
+
+    // Wait and verify no further fires after drain
+    std::this_thread::sleep_for(100ms);
+    REQUIRE(fireCount.load() == countAtDrain);
+
+    REQUIRE(service.getInFlightCount() == 0);
+    REQUIRE(service.getStats().periodicTimersActive.load() == 0);
+    REQUIRE(service.getStats().timersCanceled.load() == 1);
   }
 }
 

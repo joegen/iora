@@ -379,7 +379,11 @@ public:
     return scheduleAt(Clock::now() + d, std::forward<Handler>(handler));
   }
 
-  /// \brief Schedule periodic timer (fires once; rescheduling not yet implemented).
+  /// \brief Schedule periodic timer that fires repeatedly at the given interval.
+  /// \note The callable F must be CopyConstructible. Periodic timers copy the
+  /// handler into a std::function<void()> for reuse across fires. Move-only
+  /// callables (e.g., lambdas capturing unique_ptr) are not supported and
+  /// will produce a compile error.
   template <typename F> std::uint64_t schedulePeriodic(Duration interval, F &&handler)
   {
     // Check if service is accepting new timers
@@ -422,8 +426,12 @@ public:
     // Use a single ID for both _periodicTimers and _records so that
     // cancel(id) cancels both and getInFlightCount() doesn't double-count.
     std::uint64_t id = ++_nextId;
-    _periodicTimers.emplace(id, PeriodicTimer{id, interval, deadline, false});
-    _records.emplace(id, Record{deadline, std::forward<F>(handler), false});
+
+    // Copy handler into std::function BEFORE forwarding into Record.
+    // std::forward<F> may move from handler, so the copy must happen first.
+    std::function<void()> storedFn(handler);
+    _periodicTimers.emplace(id, PeriodicTimer{id, interval, deadline, false, std::move(storedFn)});
+    _records.emplace(id, Record{deadline, Handler{std::forward<F>(handler)}, false});
     _heap.emplace_back(HeapItem{deadline, id});
     siftUp(_heap.size() - 1);
 
@@ -609,6 +617,10 @@ public:
         {
           rec.canceled = true;
           ++cancelledCount;
+          if (_config.enableStatistics)
+          {
+            _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
+          }
         }
       }
       for (auto& [id, pt] : _periodicTimers)
@@ -620,9 +632,18 @@ public:
           {
             _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
           }
-          // Only count if no corresponding _records entry was already counted
-          // (unified IDs mean both stores share the same ID)
-          if (_records.find(id) == _records.end())
+
+          // Check if the records loop already canceled (and counted) this ID
+          auto recIt = _records.find(id);
+          bool alreadyCounted = (recIt != _records.end() && recIt->second.canceled);
+
+          if (_config.enableStatistics && !alreadyCounted)
+          {
+            _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
+          }
+
+          // Only count toward DrainStats if no corresponding _records entry
+          if (recIt == _records.end())
           {
             ++cancelledCount;
           }
@@ -819,6 +840,7 @@ private:
     Duration interval;
     TimePoint nextExecution;
     bool canceled{false};
+    std::function<void()> handler; ///< Copyable handler for rescheduling
   };
 
   static bool less(const HeapItem &a, const HeapItem &b)
@@ -1118,17 +1140,6 @@ private:
       Record rec = std::move(it->second);
       _records.erase(it);
 
-      // Clean up corresponding _periodicTimers entry (unified ID scheme)
-      auto periodicIt = _periodicTimers.find(firedId);
-      if (periodicIt != _periodicTimers.end())
-      {
-        if (_config.enableStatistics && !periodicIt->second.canceled)
-        {
-          _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
-        }
-        _periodicTimers.erase(periodicIt);
-      }
-
       if (!rec.canceled)
       {
         out.push_back(std::move(rec.handler));
@@ -1138,6 +1149,35 @@ private:
           _stats.timersExpired.fetch_add(1, std::memory_order_relaxed);
         }
       }
+
+      // Handle periodic timer rescheduling (replaces old erase-always block)
+      auto periodicIt = _periodicTimers.find(firedId);
+      if (periodicIt != _periodicTimers.end())
+      {
+        if (!periodicIt->second.canceled && !rec.canceled)
+        {
+          // Still active — reschedule for next interval
+          auto &pt = periodicIt->second;
+          pt.nextExecution += pt.interval;
+          _records.emplace(firedId, Record{pt.nextExecution, Handler{pt.handler}, false});
+          _heap.emplace_back(HeapItem{pt.nextExecution, firedId});
+          siftUp(_heap.size() - 1);
+
+          if (_config.enableStatistics)
+          {
+            _stats.timersScheduled.fetch_add(1, std::memory_order_relaxed);
+            _stats.heapOperations.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        else
+        {
+          // Canceled by drain() (marks canceled=true) — clean up.
+          // Do NOT decrement periodicTimersActive: drain() already did when
+          // it marked pt.canceled = true.
+          _periodicTimers.erase(periodicIt);
+        }
+      }
+      // If periodicIt == end(): entry was erased by cancel() — no reschedule needed
     }
   }
 
