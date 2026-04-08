@@ -103,6 +103,13 @@ public:
     data.timestampFormat = timeFormat;
     // Reset current log date so rotateLogFileIfNeeded always opens a new file
     data.currentLogDate.clear();
+
+    // Clear any leftover queued messages from a prior session to prevent
+    // cross-session leaks (e.g., rawQueue entries left after shutdown when
+    // useExternalHandler was already cleared).
+    while (!data.queue.empty()) data.queue.pop();
+    while (!data.rawQueue.empty()) data.rawQueue.pop();
+
     rotateLogFileIfNeeded();
 
     if (data.asyncMode && !data.workerThread.joinable())
@@ -122,22 +129,19 @@ public:
       auto [level, rawMessage] = data.rawQueue.front();
       data.rawQueue.pop();
 
-      // Extract what we need while holding the lock
+      // Capture everything needed BEFORE unlocking
       auto segments = data._compiledFormat;
       auto timestampFmt = data.timestampFormat;
+      auto handler = data.externalHandler;
 
-      // CRITICAL: Unlock before formatting and calling handler to avoid deadlock.
-      // formatLogMessageInternal() does not lock internally (lock-free design).
-      // External handler may be slow or call back into logger - must not hold lock.
       lock.unlock();
 
-      // Format the message (no locking performed internally)
       std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+      if (handler)
+      {
+        handler(level, formattedMessage, rawMessage);
+      }
 
-      // Call external handler (no lock held to prevent deadlock)
-      data.externalHandler(level, formattedMessage, rawMessage);
-
-      // Re-lock for next iteration
       lock.lock();
     }
 
@@ -592,20 +596,20 @@ public:
         auto [level, rawMessage] = data.rawQueue.front();
         data.rawQueue.pop();
 
-        // Extract what we need while holding the lock
+        // Capture everything needed BEFORE unlocking — clearExternalHandler()
+        // can null data.externalHandler while the lock is released.
         auto segments = data._compiledFormat;
         auto timestampFmt = data.timestampFormat;
+        auto handler = data.externalHandler;
 
         // CRITICAL: Unlock before formatting and calling handler to avoid deadlock.
-        // formatLogMessageInternal() does not lock internally (lock-free design).
-        // External handler may be slow or call back into logger - must not hold lock.
         lock.unlock();
 
-        // Format the message (no locking performed internally)
         std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
-
-        // Call external handler (no lock held to prevent deadlock)
-        data.externalHandler(level, formattedMessage, rawMessage);
+        if (handler)
+        {
+          handler(level, formattedMessage, rawMessage);
+        }
 
         // Re-lock for next iteration
         lock.lock();

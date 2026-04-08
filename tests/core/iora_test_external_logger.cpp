@@ -78,8 +78,13 @@ TEST_CASE("External log handler", "[logger][external]")
     iora::core::Logger::debug("Async debug message");
     iora::core::Logger::info("Async info message");
 
-    // Flush to ensure all messages are processed
+    // Flush then shutdown to ensure the async worker has fully completed
+    // all handler invocations. flush() only drains the queue, but the
+    // worker may still be mid-handler-call. shutdown() joins the worker
+    // thread, guaranteeing all calls are done.
     iora::core::Logger::flush();
+    iora::core::Logger::clearExternalHandler();
+    iora::core::Logger::shutdown();
 
     REQUIRE(capturedLogs.size() == 2);
     REQUIRE(capturedLogs[0].level == iora::core::Logger::Level::Debug);
@@ -87,9 +92,6 @@ TEST_CASE("External log handler", "[logger][external]")
     REQUIRE(capturedLogs[1].level == iora::core::Logger::Level::Info);
     REQUIRE(capturedLogs[1].rawMessage == "Async info message");
 
-    // Clear external handler and shutdown
-    iora::core::Logger::clearExternalHandler();
-    iora::core::Logger::shutdown();
     capturedLogs.clear();
   }
 
