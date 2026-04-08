@@ -353,7 +353,7 @@ public:
     }
 
     std::uint64_t id = ++_nextId;
-    _records.emplace(id, Record{tp, std::forward<Handler>(handler), false, false});
+    _records.emplace(id, Record{tp, std::forward<Handler>(handler), false});
     _heap.emplace_back(HeapItem{tp, id});
     siftUp(_heap.size() - 1);
 
@@ -379,31 +379,64 @@ public:
     return scheduleAt(Clock::now() + d, std::forward<Handler>(handler));
   }
 
-  /// \brief Schedule periodic timer (simplified implementation).
+  /// \brief Schedule periodic timer (fires once; rescheduling not yet implemented).
   template <typename F> std::uint64_t schedulePeriodic(Duration interval, F &&handler)
   {
-    std::uint64_t id = 0;
-
+    // Check if service is accepting new timers
+    if (!_accepting.load(std::memory_order_acquire))
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (_periodicTimers.size() >= _config.limits.maxPeriodicTimers)
-      {
-        handleError(TimerError::ResourceExhausted, "Maximum periodic timers exceeded", 0);
-        return 0;
-      }
-      id = ++_nextId;
-      _periodicTimers.emplace(id, PeriodicTimer{id, interval, Clock::now() + interval, false});
+      handleError(TimerError::ServiceStopped, "Timer service is draining and not accepting new timers", 0);
+      return 0;
     }
+
+    auto deadline = Clock::now() + interval;
+
+    if (!isValidTimeout(deadline))
+    {
+      handleError(TimerError::InvalidTimeout, "Timeout exceeds maximum allowed", 0);
+      return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    // Re-check under lock: drain() may have set _accepting=false between
+    // the lock-free check above and this point.
+    if (!_accepting.load(std::memory_order_relaxed))
+    {
+      handleError(TimerError::ServiceStopped, "Timer service is draining and not accepting new timers", 0);
+      return 0;
+    }
+
+    if (_periodicTimers.size() >= _config.limits.maxPeriodicTimers)
+    {
+      handleError(TimerError::ResourceExhausted, "Maximum periodic timers exceeded", 0);
+      return 0;
+    }
+
+    if (_records.size() >= _config.limits.maxConcurrentTimers)
+    {
+      handleError(TimerError::ResourceExhausted, "Maximum concurrent timers exceeded", 0);
+      return 0;
+    }
+
+    // Use a single ID for both _periodicTimers and _records so that
+    // cancel(id) cancels both and getInFlightCount() doesn't double-count.
+    std::uint64_t id = ++_nextId;
+    _periodicTimers.emplace(id, PeriodicTimer{id, interval, deadline, false});
+    _records.emplace(id, Record{deadline, std::forward<F>(handler), false});
+    _heap.emplace_back(HeapItem{deadline, id});
+    siftUp(_heap.size() - 1);
 
     if (_config.enableStatistics)
     {
       _stats.periodicTimersActive.fetch_add(1, std::memory_order_relaxed);
+      _stats.timersScheduled.fetch_add(1, std::memory_order_relaxed);
+      _stats.heapOperations.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Simple implementation: just schedule once for now
-    // For a full implementation, you'd want a proper periodic scheduling
-    // mechanism
-    return scheduleAt(Clock::now() + interval, std::forward<F>(handler));
+    poke();
+
+    return id;
   }
 
   /// \brief Cancel a scheduled timer; returns true if existed.
@@ -411,9 +444,11 @@ public:
   {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    // Check regular timers
+    bool found = false;
+
+    // Cancel in _records (one-shot or periodic's underlying record)
     auto it = _records.find(id);
-    if (it != _records.end())
+    if (it != _records.end() && !it->second.canceled)
     {
       it->second.canceled = true;
       poke();
@@ -428,24 +463,35 @@ public:
         _logger->debug("Timer " + std::to_string(id) + " canceled");
       }
 
-      return true;
+      found = true;
     }
 
-    // Check periodic timers
+    // Also cancel in _periodicTimers (same ID is used for both stores)
     auto periodicIt = _periodicTimers.find(id);
     if (periodicIt != _periodicTimers.end())
     {
-      periodicIt->second.canceled = true;
-
-      if (_config.enableStatistics)
+      if (!periodicIt->second.canceled)
       {
-        _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+        periodicIt->second.canceled = true;
+
+        if (_config.enableStatistics)
+        {
+          _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+          if (!found)
+          {
+            // Record was already fired and erased — count this cancellation
+            _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
       }
 
-      return true;
+      // Erase the entry to prevent unbounded accumulation
+      _periodicTimers.erase(periodicIt);
+
+      found = true;
     }
 
-    return false;
+    return found;
   }
 
   /// \brief Get current statistics.
@@ -570,7 +616,16 @@ public:
         if (!pt.canceled)
         {
           pt.canceled = true;
-          ++cancelledCount;
+          if (_config.enableStatistics)
+          {
+            _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+          }
+          // Only count if no corresponding _records entry was already counted
+          // (unified IDs mean both stores share the same ID)
+          if (_records.find(id) == _records.end())
+          {
+            ++cancelledCount;
+          }
         }
       }
     }
@@ -719,7 +774,9 @@ public:
   {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    // Count non-canceled timers in _records
+    // Count non-canceled timers in _records.
+    // Periodic timers now share IDs with _records, so counting _records
+    // alone captures both one-shot and periodic timers without double-counting.
     std::uint32_t activeTimers = 0;
     for (const auto &pair : _records)
     {
@@ -729,10 +786,11 @@ public:
       }
     }
 
-    // Count non-canceled periodic timers
+    // Count periodic timers that have no corresponding _records entry
+    // (shouldn't happen with unified IDs, but defensive)
     for (const auto &pair : _periodicTimers)
     {
-      if (!pair.second.canceled)
+      if (!pair.second.canceled && _records.find(pair.first) == _records.end())
       {
         activeTimers++;
       }
@@ -747,7 +805,6 @@ private:
     TimePoint tp;
     Handler handler;
     bool canceled{false};
-    bool periodic{false};
   };
 
   struct HeapItem
@@ -1057,8 +1114,20 @@ private:
         continue;
       }
 
+      auto firedId = it->first;
       Record rec = std::move(it->second);
       _records.erase(it);
+
+      // Clean up corresponding _periodicTimers entry (unified ID scheme)
+      auto periodicIt = _periodicTimers.find(firedId);
+      if (periodicIt != _periodicTimers.end())
+      {
+        if (_config.enableStatistics && !periodicIt->second.canceled)
+        {
+          _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+        }
+        _periodicTimers.erase(periodicIt);
+      }
 
       if (!rec.canceled)
       {

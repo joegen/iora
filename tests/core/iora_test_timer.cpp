@@ -226,6 +226,73 @@ TEST_CASE("TimerService periodic timers", "[enhanced_timer][periodic]")
   }
 }
 
+TEST_CASE("TimerService periodic timer unified ID", "[enhanced_timer][periodic]")
+{
+  SECTION("cancel(id) cancels periodic timer and updates stats")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<int> fired{0};
+
+    auto id = service.schedulePeriodic(500ms, [&fired]() { fired++; });
+    REQUIRE(id != 0);
+
+    // Immediately cancel — the timer should not fire
+    bool cancelled = service.cancel(id);
+    REQUIRE(cancelled);
+
+    // Verify stats
+    REQUIRE(service.getStats().periodicTimersActive.load() == 0);
+    REQUIRE(service.getStats().timersCanceled.load() == 1);
+
+    // Wait past the scheduled interval
+    std::this_thread::sleep_for(700ms);
+    REQUIRE(fired.load() == 0);
+
+    // Double cancel should return false and not corrupt stats
+    REQUIRE_FALSE(service.cancel(id));
+    REQUIRE(service.getStats().periodicTimersActive.load() == 0);
+  }
+
+  SECTION("getInFlightCount does not double-count periodic timer")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+
+    auto id = service.schedulePeriodic(500ms, []() {});
+    REQUIRE(id != 0);
+
+    // A single schedulePeriodic should contribute exactly 1 to in-flight count
+    auto count = service.getInFlightCount();
+    REQUIRE(count == 1);
+
+    service.cancel(id);
+    count = service.getInFlightCount();
+    REQUIRE(count == 0);
+  }
+
+  SECTION("getInFlightCount returns 0 after periodic timer fires")
+  {
+    auto config = TimerConfigBuilder().enableStatistics(true).build();
+    TimerService service(config);
+    std::atomic<bool> fired{false};
+
+    auto id = service.schedulePeriodic(20ms, [&fired]() { fired = true; });
+    REQUIRE(id != 0);
+    REQUIRE(service.getInFlightCount() == 1);
+
+    // Wait for the timer to fire
+    std::this_thread::sleep_for(100ms);
+    REQUIRE(fired.load());
+
+    // After firing, in-flight count must be 0 (no orphaned _periodicTimers entry)
+    REQUIRE(service.getInFlightCount() == 0);
+
+    // Stats: periodicTimersActive should be 0 after fire
+    REQUIRE(service.getStats().periodicTimersActive.load() == 0);
+  }
+}
+
 TEST_CASE("TimerService perfect forwarding", "[enhanced_timer][forwarding]")
 {
   SECTION("Move-only handler types")
