@@ -96,6 +96,7 @@ set(CORE_TESTS
 set(PARSERS_TESTS
     parsers/iora_test_json_parser
     parsers/iora_test_xml_parser
+    parsers/iora_test_minimal_toml_serializer_array_of_tables
 )
 
 # Util namespace tests

@@ -613,17 +613,40 @@ private:
   static void serializeTable(std::ostringstream &os, const table &tbl, const std::string &prefix)
   {
     std::vector<std::pair<std::string, node>> simpleValues;
+    std::vector<std::pair<std::string, node>> arraysOfTables;
     std::vector<std::pair<std::string, node>> tables;
 
     for (const auto &[key, value] : tbl)
     {
       if (value.is_table())
+      {
         tables.push_back({key, value});
+      }
+      else if (value.is_array())
+      {
+        // Classify as array-of-tables only if non-empty AND first element is
+        // shared_ptr<table> (matches ensureArrayTable's guard). Empty arrays
+        // and scalar-first arrays route to simpleValues for '[]' emission.
+        const auto *arr = value.as_array();
+        if (arr && !arr->empty() &&
+            std::get_if<std::shared_ptr<table>>(&(*arr)[0]))
+        {
+          arraysOfTables.push_back({key, value});
+        }
+        else
+        {
+          simpleValues.push_back({key, value});
+        }
+      }
       else
+      {
         simpleValues.push_back({key, value});
+      }
     }
 
     std::sort(simpleValues.begin(), simpleValues.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::sort(arraysOfTables.begin(), arraysOfTables.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
     std::sort(tables.begin(), tables.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
@@ -640,7 +663,32 @@ private:
       os << "\n";
     }
 
-    if (!simpleValues.empty() && !tables.empty())
+    if (!simpleValues.empty() && !arraysOfTables.empty())
+      os << "\n";
+
+    for (const auto &[key, value] : arraysOfTables)
+    {
+      const std::string fullPrefix = prefix.empty() ? key : prefix + "." + key;
+      const auto *arr = value.as_array();
+      if (!arr)
+        continue;
+      const size_t n = arr->size();
+      for (size_t i = 0; i < n; ++i)
+      {
+        const auto *elemPtr = std::get_if<std::shared_ptr<table>>(&(*arr)[i]);
+        if (!elemPtr)
+          continue;
+        os << "[[" << fullPrefix << "]]\n";
+        // Empty prefix on the recursive call: the [[fullPrefix]] header
+        // already scopes the element; passing fullPrefix would emit a stray
+        // [fullPrefix] single-bracket header inside the block.
+        serializeTable(os, **elemPtr, "");
+        if (i + 1 < n)
+          os << "\n";
+      }
+    }
+
+    if ((!simpleValues.empty() || !arraysOfTables.empty()) && !tables.empty())
       os << "\n";
 
     for (const auto &[key, value] : tables)
@@ -703,6 +751,13 @@ private:
     else if (auto *b = std::get_if<bool>(&val))
     {
       os << (*b ? "true" : "false");
+    }
+    else if (std::get_if<std::shared_ptr<table>>(&val))
+    {
+      throw std::runtime_error(
+        "minimal_toml serializer: mixed-type array contains a sub-table "
+        "element, which is not expressible in TOML - caller must either use "
+        "[[array-of-tables]] structure or remove the table element");
     }
   }
 
