@@ -255,6 +255,31 @@ public:
     return ConfigSubTable{*p};
   }
 
+  /// \brief Retrieves a TOML [[array-of-tables]] as a vector of sub-tables.
+  ///
+  /// Each element of the returned vector wraps one [[dottedKey]] entry, in
+  /// declaration order. Returns std::nullopt when the key is absent OR when
+  /// the key exists but is not an array-of-tables (scalar, named sub-table,
+  /// or array of non-table elements) - this silent-nullopt-on-wrong-type
+  /// contract mirrors getTable and allows callers to distinguish absent
+  /// from wrong-type only by the presence of the optional.
+  std::optional<std::vector<ConfigSubTable>>
+  getTableArray(const std::string &dottedKey) const
+  {
+    auto n = _table.at_path(dottedKey);
+    if (!n || !n.is_array())
+      return std::nullopt;
+    std::vector<ConfigSubTable> result;
+    for (const auto &elem : *n.as_array())
+    {
+      auto *p = std::get_if<std::shared_ptr<parsers::toml::table>>(&elem);
+      if (!p)
+        return std::nullopt;
+      result.push_back(ConfigSubTable{*p});
+    }
+    return result;
+  }
+
 private:
   std::string _filename;
   parsers::toml::table _table;

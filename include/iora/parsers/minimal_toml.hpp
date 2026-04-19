@@ -229,8 +229,16 @@ public:
 
       if (peek() == '[')
       {
-        currentSection = parseSection();
-        currentTable = ensureTable(&root, currentSection);
+        if (peek(1) == '[')
+        {
+          currentSection = parseArraySection();
+          currentTable = ensureArrayTable(&root, currentSection);
+        }
+        else
+        {
+          currentSection = parseSection();
+          currentTable = ensureTable(&root, currentSection);
+        }
       }
       else
       {
@@ -297,6 +305,32 @@ private:
       throw std::runtime_error("Unterminated section");
     advance(); // skip ']'
     return section;
+  }
+
+  std::string parseArraySection()
+  {
+    advance(); // skip first '['
+    advance(); // skip second '['
+    std::string section;
+    while (!isEnd() && peek() != ']' && peek() != '\n')
+    {
+      section += advance();
+    }
+    if (peek() != ']')
+      throw std::runtime_error("Unterminated [[array-of-tables]] section");
+    advance(); // consume first ']'
+    if (peek() != ']')
+      throw std::runtime_error("Expected ']]' to close array-of-tables header");
+    advance(); // consume second ']'
+
+    // TOML permits surrounding whitespace in headers; strip ASCII space/tab
+    // from both ends. parseSection intentionally does NOT strip to preserve
+    // pre-existing single-bracket behavior; parseArraySection diverges here.
+    size_t start = section.find_first_not_of(" \t");
+    if (start == std::string::npos)
+      return "";
+    size_t end = section.find_last_not_of(" \t");
+    return section.substr(start, end - start + 1);
   }
 
   std::pair<std::string, node> parseKeyValue()
@@ -464,11 +498,77 @@ private:
       {
         current->insert(key, node(std::make_shared<table>()));
       }
-      current = current->operator[](key).as_table();
+      auto &n = current->operator[](key);
+      current = n.as_table();
       if (!current)
+      {
+        if (n.is_array())
+        {
+          throw std::runtime_error(
+            "Cannot redeclare [[" + key + "]] as [" + path +
+            "] - key already declared as array-of-tables");
+        }
         throw std::runtime_error("Invalid table path: " + path);
+      }
     }
     return current;
+  }
+
+  table *ensureArrayTable(table *root, const std::string &dottedPath)
+  {
+    std::vector<std::string> parts;
+    std::stringstream ss(dottedPath);
+    std::string part;
+    while (std::getline(ss, part, '.'))
+      parts.push_back(part);
+
+    if (parts.empty())
+      throw std::runtime_error("Empty array-of-tables header");
+
+    const std::string &terminalKey = parts.back();
+    table *parent = root;
+    if (parts.size() > 1)
+    {
+      std::string prefix;
+      for (size_t i = 0; i + 1 < parts.size(); ++i)
+      {
+        if (i > 0) prefix += '.';
+        prefix += parts[i];
+      }
+      parent = ensureTable(root, prefix);
+    }
+
+    if (!parent->contains(terminalKey))
+    {
+      parent->insert(terminalKey, node(std::make_shared<array>()));
+    }
+    else
+    {
+      auto &existing = parent->operator[](terminalKey);
+      if (!existing.is_array())
+      {
+        throw std::runtime_error(
+          "Cannot redeclare [" + dottedPath + "] as [[" + dottedPath +
+          "]] - key already declared as a table or scalar");
+      }
+      // Guard: reject value-arrays masquerading as array-of-tables. A legitimate
+      // array-of-tables node contains only shared_ptr<table>; a value array
+      // (e.g., tags = ["a","b"]) contains scalars. If non-empty and first
+      // element is not a table pointer, the key was previously a value array.
+      auto *rawArr = existing.as_array();
+      if (rawArr && !rawArr->empty() &&
+          !std::get_if<std::shared_ptr<table>>(&(*rawArr)[0]))
+      {
+        throw std::runtime_error(
+          "Cannot redeclare value array [" + dottedPath + "] as [[" +
+          dottedPath + "]]");
+      }
+    }
+
+    auto newTbl = std::make_shared<table>();
+    auto *arr = parent->operator[](terminalKey).as_array();
+    arr->push_back(value_type{newTbl});
+    return newTbl.get();
   }
 };
 
