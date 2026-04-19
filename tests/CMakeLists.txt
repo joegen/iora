@@ -70,6 +70,7 @@ set(NETWORK_TESTS
 set(CORE_TESTS
     core/iora_test_blocking_queue
     core/iora_test_config_loader
+    core/iora_test_config_loader_get_table
     core/iora_test_event_queue
     core/iora_test_external_logger
     core/iora_test_logger
