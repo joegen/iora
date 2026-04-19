@@ -374,3 +374,89 @@ TEST_CASE("parser rejects value-array followed by [[key]] at same path",
       "k = 1\n";
   REQUIRE_THROWS_AS(iora::parsers::toml::parse(toml), std::runtime_error);
 }
+
+// Tracker 2026-04-19-6 — CRLF header handling. Both parseSection and
+// parseArraySection must reject '\r' inside the header token. Without
+// this guard, the '\r' is silently accumulated into the section name
+// string (e.g. the key becomes "a.b\r"), and subsequent lookups via the
+// expected key "a.b" miss because the stored key contains an invisible
+// '\r'. The TOML spec accepts CRLF as valid line termination between
+// sections, so these guards only reject '\r' WITHIN the header token.
+//
+// REQUIRE_THROWS_WITH assertions (added per T6S4-L-3) confirm the thrown
+// message identifies the correct failure reason ("Unterminated ..." from
+// the post-loop termination check), not some unrelated std::runtime_error
+// from elsewhere in the parser.
+TEST_CASE("parseSection rejects CRLF inside header",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[ a.b\r\n]\n"),
+                    std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse("[ a.b\r\n]\n"),
+                      Catch::Contains("Unterminated"));
+}
+
+TEST_CASE("parseArraySection rejects CRLF inside header",
+          "[iora][parsers][toml][arrayOfTables]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[[ a.b\r\n]]\n"),
+                    std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse("[[ a.b\r\n]]\n"),
+                      Catch::Contains("Unterminated"));
+}
+
+TEST_CASE("parseSection rejects bare CR inside header",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[ a.b\r]"),
+                    std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse("[ a.b\r]"),
+                      Catch::Contains("Unterminated"));
+}
+
+TEST_CASE("parseArraySection rejects bare CR inside header",
+          "[iora][parsers][toml][arrayOfTables]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[[ a.b\r]]"),
+                    std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse("[[ a.b\r]]"),
+                      Catch::Contains("Unterminated"));
+}
+
+// Tracker 2026-04-19-6 — T6S4-L-2 fold. CR immediately after the opening
+// bracket (parallel to tracker-5's "parseSection rejects newline
+// immediately after opening bracket" at line ~340). The code handles
+// these correctly via the guard firing on the first loop iteration;
+// these tests assert that behavior explicitly for completeness.
+TEST_CASE("parseSection rejects CR immediately after opening bracket",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[\r\n]\n"),
+                    std::runtime_error);
+}
+
+TEST_CASE("parseArraySection rejects CR immediately after opening brackets",
+          "[iora][parsers][toml][arrayOfTables]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[[\r\n]]\n"),
+                    std::runtime_error);
+}
+
+// Tracker 2026-04-19-6 — T6S0-M-1 regression guard. Well-formed CRLF
+// input (where '\r\n' is the line terminator BETWEEN sections, not
+// INSIDE the header token) must still parse correctly after the fix.
+// The '\r\n' after ']' / ']]' is consumed by skipWhitespaceAndNewlines
+// via std::isspace; the section-header read loop never sees it. This
+// test guards against an overly-eager fix that would remove '\r'
+// tolerance from skipWhitespaceAndNewlines and break CRLF files.
+TEST_CASE("parseSection accepts CRLF between sections (regression guard)",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_NOTHROW(iora::parsers::toml::parse("[a.b]\r\nk = 1\r\n"));
+}
+
+TEST_CASE("parseArraySection accepts CRLF between sections (regression guard)",
+          "[iora][parsers][toml][arrayOfTables]")
+{
+  REQUIRE_NOTHROW(iora::parsers::toml::parse("[[a.b]]\r\nk = 1\r\n"));
+}

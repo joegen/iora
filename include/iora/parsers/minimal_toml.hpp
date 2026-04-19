@@ -297,7 +297,7 @@ private:
   {
     advance(); // skip '['
     std::string section;
-    while (!isEnd() && peek() != ']' && peek() != '\n')
+    while (!isEnd() && peek() != ']' && peek() != '\n' && peek() != '\r')
     {
       section += advance();
     }
@@ -312,7 +312,7 @@ private:
     advance(); // skip first '['
     advance(); // skip second '['
     std::string section;
-    while (!isEnd() && peek() != ']' && peek() != '\n')
+    while (!isEnd() && peek() != ']' && peek() != '\n' && peek() != '\r')
     {
       section += advance();
     }
