@@ -141,6 +141,24 @@ public:
       std::optional<std::chrono::seconds> idleTimeoutSeconds;
     } threadPool;
 
+    /// \brief Toggles for optional IoraService subsystems.
+    /// Unset fields resolve to `true` via `.value_or(true)` in applyConfig(),
+    /// preserving the legacy behavior of constructing every subsystem.
+    /// Hosts that do not need a subsystem (e.g. edge_proxy does not need
+    /// jsonFileStore/stateStore/expiringCache/modules) set the flag to `false`
+    /// via TOML or CLI to skip construction.
+    /// Precedence: CLI > TOML > default. Enforced by call order in main():
+    /// parseCliArgs() must run before parseTomlConfig(); parseTomlConfig()
+    /// writes only when !has_value(), so CLI (which sets directly) wins.
+    struct FeaturesConfig
+    {
+      std::optional<bool> server;
+      std::optional<bool> jsonFileStore;
+      std::optional<bool> stateStore;
+      std::optional<bool> expiringCache;
+      std::optional<bool> modules;
+    } features;
+
     // Configuration file path (used for CLI parsing)
     std::optional<std::string> configFile;
   };
@@ -1125,52 +1143,64 @@ protected:
     IORA_LOG_INFO(
       "applyConfig: modules.directory = " << _config.modules.directory.value_or("<unset>"));
 
-    // State file
-    std::string stateFile = _config.state.file.value_or(DEFAULT_STATE_FILE);
-    IORA_LOG_INFO("applyConfig: Creating JsonFileStore at: " << stateFile);
-    _jsonFileStore = std::make_unique<storage::JsonFileStore>(stateFile);
-    assert(_jsonFileStore && "_jsonFileStore must be initialized after config");
-    IORA_LOG_INFO("applyConfig: JsonFileStore created at: " << stateFile);
-
-    // Webhook Server
-    std::string bindAddress = _config.server.bindAddress.value_or("0.0.0.0");
-    auto port = _config.server.port.value_or(DEFAULT_PORT);
-    _webhookServer = std::make_unique<network::WebhookServer>(bindAddress, port);
-    IORA_LOG_INFO("applyConfig: Setting webhook server to bind on " << bindAddress << ":" << port);
-
-    // TLS
-    bool hasTls = _config.server.tls.certFile.has_value() &&
-                  _config.server.tls.keyFile.has_value() &&
-                  _config.server.tls.caFile.has_value();
-    if (hasTls)
+    // State file (JsonFileStore) — gated by features.jsonFileStore
+    if (_config.features.jsonFileStore.value_or(true))
     {
-      IORA_LOG_INFO("applyConfig: TLS is enabled");
-      network::WebhookServer::TlsConfig tlsCfg;
-      tlsCfg.certFile = _config.server.tls.certFile.value_or("");
-      tlsCfg.keyFile = _config.server.tls.keyFile.value_or("");
-      tlsCfg.caFile = _config.server.tls.caFile.value_or("");
-      tlsCfg.requireClientCert = _config.server.tls.requireClientCert.value_or(false);
-      IORA_LOG_INFO("applyConfig: Enabling TLS with certFile=" + tlsCfg.certFile +
-                    ", keyFile=" + tlsCfg.keyFile + ", caFile=" + tlsCfg.caFile +
-                    ", requireClientCert=" + (tlsCfg.requireClientCert ? "true" : "false"));
-      _webhookServer->enableTls(tlsCfg);
+      std::string stateFile = _config.state.file.value_or(DEFAULT_STATE_FILE);
+      IORA_LOG_INFO("applyConfig: Creating JsonFileStore at: " << stateFile);
+      _jsonFileStore = std::make_unique<storage::JsonFileStore>(stateFile);
+      IORA_LOG_INFO("applyConfig: JsonFileStore created at: " << stateFile);
     }
     else
     {
-      IORA_LOG_INFO("applyConfig: TLS is not enabled");
+      IORA_LOG_INFO("applyConfig: JsonFileStore disabled via features.jsonFileStore=false");
     }
 
-    // Start the webhook server
-    IORA_LOG_INFO("applyConfig: Starting webhook server on port: " << port);
-    try
+    // Webhook Server — gated by features.server
+    if (_config.features.server.value_or(true))
     {
-      _webhookServer->start();
-      IORA_LOG_INFO("applyConfig: Webhook server started successfully");
+      std::string bindAddress = _config.server.bindAddress.value_or("0.0.0.0");
+      auto port = _config.server.port.value_or(DEFAULT_PORT);
+      _webhookServer = std::make_unique<network::WebhookServer>(bindAddress, port);
+      IORA_LOG_INFO("applyConfig: Setting webhook server to bind on " << bindAddress << ":" << port);
+
+      // TLS
+      bool hasTls = _config.server.tls.certFile.has_value() &&
+                    _config.server.tls.keyFile.has_value() &&
+                    _config.server.tls.caFile.has_value();
+      if (hasTls)
+      {
+        IORA_LOG_INFO("applyConfig: TLS is enabled");
+        network::WebhookServer::TlsConfig tlsCfg;
+        tlsCfg.certFile = _config.server.tls.certFile.value_or("");
+        tlsCfg.keyFile = _config.server.tls.keyFile.value_or("");
+        tlsCfg.caFile = _config.server.tls.caFile.value_or("");
+        tlsCfg.requireClientCert = _config.server.tls.requireClientCert.value_or(false);
+        IORA_LOG_INFO("applyConfig: Enabling TLS with certFile=" + tlsCfg.certFile +
+                      ", keyFile=" + tlsCfg.keyFile + ", caFile=" + tlsCfg.caFile +
+                      ", requireClientCert=" + (tlsCfg.requireClientCert ? "true" : "false"));
+        _webhookServer->enableTls(tlsCfg);
+      }
+      else
+      {
+        IORA_LOG_INFO("applyConfig: TLS is not enabled");
+      }
+
+      IORA_LOG_INFO("applyConfig: Starting webhook server on port: " << port);
+      try
+      {
+        _webhookServer->start();
+        IORA_LOG_INFO("applyConfig: Webhook server started successfully");
+      }
+      catch (const std::exception &e)
+      {
+        IORA_LOG_ERROR("applyConfig: Failed to start webhook server: " << e.what());
+        throw;
+      }
     }
-    catch (const std::exception &e)
+    else
     {
-      IORA_LOG_ERROR("applyConfig: Failed to start webhook server: " << e.what());
-      throw;
+      IORA_LOG_INFO("applyConfig: WebhookServer disabled via features.server=false");
     }
 
     // Thread pool
@@ -1200,26 +1230,46 @@ protected:
       _modulesPath = _config.modules.directory.value();
     }
 
-    // State store
-    _stateStore = std::make_unique<storage::ConcreteStateStore>();
-
-    // Expiring cache
-    _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(
-      std::chrono::minutes(1)); // Default flush interval of 1 minute
-
-    if (_config.modules.autoLoad.value_or(true))
+    // State store — gated by features.stateStore
+    if (_config.features.stateStore.value_or(true))
     {
-      IORA_LOG_INFO("applyConfig: Auto-loading modules is enabled");
-      loadModules();
+      _stateStore = std::make_unique<storage::ConcreteStateStore>();
     }
     else
     {
-      IORA_LOG_INFO("applyConfig: Auto-loading modules is disabled");
+      IORA_LOG_INFO("applyConfig: StateStore disabled via features.stateStore=false");
+    }
+
+    // Expiring cache — gated by features.expiringCache
+    if (_config.features.expiringCache.value_or(true))
+    {
+      _cache = std::make_unique<util::ExpiringCache<std::string, std::string>>(
+        std::chrono::minutes(1)); // Default flush interval of 1 minute
+    }
+    else
+    {
+      IORA_LOG_INFO("applyConfig: ExpiringCache disabled via features.expiringCache=false");
+    }
+
+    // Module loader — gated by features.modules (outer); inner autoLoad preserved.
+    if (_config.features.modules.value_or(true))
+    {
+      if (_config.modules.autoLoad.value_or(true))
+      {
+        IORA_LOG_INFO("applyConfig: Auto-loading modules is enabled");
+        loadModules();
+      }
+      else
+      {
+        IORA_LOG_INFO("applyConfig: Auto-loading modules is disabled");
+      }
+    }
+    else
+    {
+      IORA_LOG_INFO("applyConfig: Module loader disabled via features.modules=false");
     }
 
     IORA_LOG_INFO("applyConfig: Configuration applied");
-
-    // Start the webhook server
 
     _isRunning = true;
   }
@@ -1447,7 +1497,17 @@ private:
 
 inline IoraService::RouteBuilder IoraService::on(const std::string &endpoint)
 {
-  // Use the accessor to ensure runtime check
+  // Guard against dereference when features.server=false.
+  // Destructor and other shutdown paths already handle null _webhookServer
+  // via `if (_webhookServer)` checks; this accessor is the only public entry
+  // point that unconditionally dereferences, so we fail loudly here.
+  if (!_webhookServer)
+  {
+    throw std::logic_error(
+      "IoraService::on() called but WebhookServer is disabled "
+      "(features.server=false). Enable the server or remove the route "
+      "registration.");
+  }
   return RouteBuilder(*_webhookServer, endpoint);
 }
 

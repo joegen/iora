@@ -38,10 +38,19 @@ static void printHelp()
             << "      --threadpool-queue <n>         Set thread pool queue size "
                "(default: 128)\n"
             << "      --threadpool-idle-timeout <n>  Set thread pool idle timeout "
-               "in seconds (default: 60)\n";
+               "in seconds (default: 60)\n"
+            << "      --no-state-store             Disable the state store subsystem\n"
+            << "      --no-json-file-store         Disable the JSON file store subsystem\n"
+            << "      --no-expiring-cache          Disable the expiring cache subsystem\n"
+            << "      --no-modules                 Disable the module loader subsystem\n";
 }
 
-/// \brief Parse command-line arguments into the internal config
+/// \brief Parse command-line arguments into the internal config.
+///
+/// Precedence invariant: CLI > TOML > default. Enforced at the call-site in
+/// main(): parseCliArgs() MUST be invoked before parseTomlConfig(). CLI sets
+/// optionals directly; parseTomlConfig() only writes when !has_value(), so
+/// CLI-set values win. Any new call site MUST preserve this order.
 void parseCliArgs(int argc, char **argv, iora::IoraService::Config &config,
                   std::unique_ptr<iora::core::ConfigLoader> &configLoader)
 {
@@ -164,6 +173,22 @@ void parseCliArgs(int argc, char **argv, iora::IoraService::Config &config,
         throw std::runtime_error("Invalid threadpool idle timeout: " + std::string(argv[i]));
       }
     }
+    else if (arg == "--no-state-store")
+    {
+      config.features.stateStore = false;
+    }
+    else if (arg == "--no-json-file-store")
+    {
+      config.features.jsonFileStore = false;
+    }
+    else if (arg == "--no-expiring-cache")
+    {
+      config.features.expiringCache = false;
+    }
+    else if (arg == "--no-modules")
+    {
+      config.features.modules = false;
+    }
     else if (arg == "-h" || arg == "--help")
     {
       printHelp();
@@ -176,7 +201,13 @@ void parseCliArgs(int argc, char **argv, iora::IoraService::Config &config,
   }
 }
 
-/// \brief Parse TOML configuration file
+/// \brief Parse TOML configuration file.
+///
+/// Precedence invariant: CLI > TOML > default. This function writes into each
+/// Config optional ONLY when !has_value(), so any value already set by
+/// parseCliArgs() is preserved. main() MUST call parseCliArgs() before this
+/// function — reversing the order would silently invert CLI/TOML precedence.
+/// Any new call site MUST preserve this order.
 void parseTomlConfig(iora::IoraService::Config &config,
                      std::unique_ptr<iora::core::ConfigLoader> &configLoader)
 {
@@ -311,6 +342,43 @@ void parseTomlConfig(iora::IoraService::Config &config,
         config.threadPool.idleTimeoutSeconds = std::chrono::seconds(*idleTimeoutOpt);
       }
     }
+    // [iora.features] — subsystem toggles. Each read follows the
+    // has_value()-guarded pattern so CLI values (set in parseCliArgs) win.
+    if (!config.features.server.has_value())
+    {
+      if (auto v = configLoader->getBool("iora.features.server"))
+      {
+        config.features.server = *v;
+      }
+    }
+    if (!config.features.jsonFileStore.has_value())
+    {
+      if (auto v = configLoader->getBool("iora.features.jsonFileStore"))
+      {
+        config.features.jsonFileStore = *v;
+      }
+    }
+    if (!config.features.stateStore.has_value())
+    {
+      if (auto v = configLoader->getBool("iora.features.stateStore"))
+      {
+        config.features.stateStore = *v;
+      }
+    }
+    if (!config.features.expiringCache.has_value())
+    {
+      if (auto v = configLoader->getBool("iora.features.expiringCache"))
+      {
+        config.features.expiringCache = *v;
+      }
+    }
+    if (!config.features.modules.has_value())
+    {
+      if (auto v = configLoader->getBool("iora.features.modules"))
+      {
+        config.features.modules = *v;
+      }
+    }
   }
   catch (const std::exception &e)
   {
@@ -327,7 +395,13 @@ int main(int argc, char **argv)
     parseCliArgs(argc, argv, config, configLoader);
     parseTomlConfig(config, configLoader);
 
-    iora::IoraService::instanceRef().setConfigLoader(std::move(configLoader));
+    // Note: we intentionally do NOT call setConfigLoader() on the pre-init
+    // instance. init() below calls shutdown() which destroyInstance()s any
+    // existing singleton, so a moved-in ConfigLoader would be discarded and
+    // silently recreated by applyConfig() from config.configFile. Let
+    // applyConfig() own the construction — the local configLoader above is
+    // only used to drive parseTomlConfig() above.
+    (void)configLoader;
 
     // Initialize the IoraService with command-line arguments
     iora::IoraService::init(config);
