@@ -297,12 +297,12 @@ private:
   {
     advance(); // skip '['
     std::string section;
-    while (!isEnd() && peek() != ']')
+    while (!isEnd() && peek() != ']' && peek() != '\n')
     {
       section += advance();
     }
     if (peek() != ']')
-      throw std::runtime_error("Unterminated section");
+      throw std::runtime_error("Unterminated [section] header");
     advance(); // skip ']'
     return section;
   }

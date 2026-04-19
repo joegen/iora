@@ -328,6 +328,38 @@ TEST_CASE("parseArraySection rejects newline inside header",
                     std::runtime_error);
 }
 
+// Tracker 2026-04-19-5 — backport of the \n guard to parseSection:
+// newline inside a single-bracket [section] header is a parse error.
+TEST_CASE("parseSection rejects newline after name",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[ a.b\n]\n"),
+                    std::runtime_error);
+}
+
+TEST_CASE("parseSection rejects newline immediately after opening bracket",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[\n a.b]\n"),
+                    std::runtime_error);
+}
+
+TEST_CASE("parseSection rejects newline-only section",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse("[\n]\n"),
+                    std::runtime_error);
+}
+
+// Regression guard: empty single-bracket section '[]' must still parse
+// (the read loop does not execute for this input, so the newline guard
+// cannot affect it).
+TEST_CASE("parseSection accepts empty section (regression guard)",
+          "[iora][parsers][toml][section]")
+{
+  REQUIRE_NOTHROW(iora::parsers::toml::parse("[]\nk = 1\n"));
+}
+
 // P3S4-H-1 fix — value-array at a key followed by [[key]] header must
 // throw (TOML spec: redefining a key as a different type is an error).
 // Without this guard, the parser would silently append a shared_ptr<table>
