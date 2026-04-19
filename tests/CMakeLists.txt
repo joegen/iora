@@ -113,6 +113,7 @@ set(SERVICE_TESTS
     service/iora_test_plugin
     service/iora_test_plugin_dependencies
     service/iora_test_plugin_isolation
+    service/iora_test_features_config
 )
 
 # Debug/helper tests (keep in root)
