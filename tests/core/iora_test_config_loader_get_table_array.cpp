@@ -460,3 +460,61 @@ TEST_CASE("parseArraySection accepts CRLF between sections (regression guard)",
 {
   REQUIRE_NOTHROW(iora::parsers::toml::parse("[[a.b]]\r\nk = 1\r\n"));
 }
+
+// Tracker 2026-04-19-7 — null-byte (\0) header handling. Both parseSection
+// and parseArraySection must reject '\0' inside the header token. Without
+// this guard, the \0 is silently accumulated into the section name string
+// because std::string does NOT terminate on embedded \0 (size() counts
+// past null bytes). The resulting key (e.g. "a.b\0c") fails all normal
+// string lookups since the caller queries by "a.b.c" or similar.
+//
+// Test inputs use std::initializer_list<char> construction (T7S4-L-1
+// fold) rather than (ptr, len) from a string literal. This avoids
+// embedding \0 inside a string literal, which some newer toolchains
+// (GCC >= 13, clang >= 16) flag with -Wstring-contains-nul or similar
+// diagnostics that would become errors under iora's -Werror policy.
+// Initializer-list construction produces the exact same byte sequence
+// without a literal-containing-nul.
+//
+// The fix is safe ONLY because !isEnd() is first in the &&-chain; at EOF,
+// peek() returns '\0' as a sentinel (minimal_toml.hpp:259), and
+// short-circuit evaluation prevents a false positive rejection. See the
+// tracker's non_goals[3] for details.
+TEST_CASE("parseSection rejects embedded null byte inside header",
+          "[iora][parsers][toml][section]")
+{
+  const std::string s1{'[', 'a', '.', 'b', '\0', 'c', ']'}; // 7 bytes
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse(s1), std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse(s1),
+                      Catch::Contains("Unterminated"));
+}
+
+TEST_CASE("parseArraySection rejects embedded null byte inside header",
+          "[iora][parsers][toml][arrayOfTables]")
+{
+  const std::string s2{'[', '[', 'a', '.', 'b', '\0', 'c', ']', ']'}; // 9
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse(s2), std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse(s2),
+                      Catch::Contains("Unterminated"));
+}
+
+// Tracker 2026-04-19-7 — T7S0-L-2 edge-case guard. Null byte immediately
+// after opening bracket (empty-name-with-null). Parallel to tracker-6's
+// "parseSection rejects CR immediately after opening bracket" pattern.
+TEST_CASE("parseSection rejects null byte immediately after opening bracket",
+          "[iora][parsers][toml][section]")
+{
+  const std::string s3{'[', '\0', ']'}; // 3 bytes
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse(s3), std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse(s3),
+                      Catch::Contains("Unterminated"));
+}
+
+TEST_CASE("parseArraySection rejects null byte immediately after opening brackets",
+          "[iora][parsers][toml][arrayOfTables]")
+{
+  const std::string s4{'[', '[', '\0', ']', ']'}; // 5 bytes
+  REQUIRE_THROWS_AS(iora::parsers::toml::parse(s4), std::runtime_error);
+  REQUIRE_THROWS_WITH(iora::parsers::toml::parse(s4),
+                      Catch::Contains("Unterminated"));
+}
