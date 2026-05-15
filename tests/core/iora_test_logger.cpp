@@ -7,6 +7,7 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include <regex>
 
 TEST_CASE("Logger Basic Levels", "[logger][levels]")
 {
@@ -440,6 +441,13 @@ TEST_CASE("Logger Timestamp Consistency", "[logger][timestamp]")
 
     // Both timestamps should be identical (generated once and cached)
     REQUIRE(timestamp1 == timestamp2);
+
+    // Default Logger format is "%Y-%m-%d %H:%M:%S"; timestamp() appends a
+    // ".NNN" 3-digit millisecond suffix when the format contains "%S".
+    // Regress-guard the localtime_r / struct-tm timestamp-formatting path.
+    std::regex tsPattern(R"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})");
+    REQUIRE(std::regex_match(timestamp1, tsPattern));
+    REQUIRE(timestamp1 != "[invalid-time]");
   }
 
   iora::util::removeFilesMatchingPrefix("timestamplog.");

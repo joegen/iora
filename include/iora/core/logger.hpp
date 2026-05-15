@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -34,6 +35,39 @@
 #else
   #include <unistd.h>
 #endif
+
+namespace iora
+{
+namespace core
+{
+namespace detail
+{
+  /// \brief Thread-safe reentrant local time conversion.
+  /// On POSIX uses localtime_r; on Windows uses localtime_s.
+  /// Returns true on success and fills tmBuf; returns false on failure.
+  inline bool localTimeReentrant(const std::time_t *t, std::tm *tmBuf)
+  {
+#ifdef _WIN32
+    return ::localtime_s(tmBuf, t) == 0;
+#else
+    return ::localtime_r(t, tmBuf) != nullptr;
+#endif
+  }
+
+  /// \brief Thread-safe UTC time conversion (no TZ global mutation).
+  /// Replaces std::mktime when TZ-globals contention is undesirable.
+  /// On POSIX uses timegm; on Windows uses _mkgmtime.
+  inline std::time_t timeGmReentrant(std::tm *tmBuf)
+  {
+#ifdef _WIN32
+    return ::_mkgmtime(tmBuf);
+#else
+    return ::timegm(tmBuf);
+#endif
+  }
+} // namespace detail
+} // namespace core
+} // namespace iora
 
 namespace iora
 {
@@ -646,10 +680,22 @@ public:
     auto t = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
-    std::ostringstream oss;
+    // Snapshot timestampFormat under lock to avoid a race with init()
     auto &data = getData();
-    oss << std::put_time(std::localtime(&t), data.timestampFormat.c_str());
-    if (data.timestampFormat.find("%S") != std::string::npos)
+    std::string fmt;
+    {
+      std::lock_guard<std::mutex> lock(data.mutex);
+      fmt = data.timestampFormat;
+    }
+
+    struct tm tmBuf{};
+    if (!detail::localTimeReentrant(&t, &tmBuf))
+    {
+      return "[invalid-time]";
+    }
+    std::ostringstream oss;
+    oss << std::put_time(&tmBuf, fmt.c_str());
+    if (fmt.find("%S") != std::string::npos)
     {
       oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
     }
@@ -660,8 +706,13 @@ public:
   {
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
+    struct tm tmBuf{};
+    if (!detail::localTimeReentrant(&t, &tmBuf))
+    {
+      return "0000-00-00";
+    }
     std::ostringstream oss;
-    oss << std::put_time(std::localtime(&t), "%Y-%m-%d");
+    oss << std::put_time(&tmBuf, "%Y-%m-%d");
     return oss.str();
   }
 
@@ -755,14 +806,23 @@ public:
 
       // Extract date from filename: baseName.YYYY-MM-DD.log
       std::string datePart = fname.substr(prefix.size(), 10); // YYYY-MM-DD
-      std::tm tm = {};
+      struct tm tm{};
       std::istringstream ss(datePart);
       ss >> std::get_time(&tm, "%Y-%m-%d");
       if (ss.fail())
       {
         continue;
       }
-      auto fileTime = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+      // Use timegm (UTC, no TZ globals) instead of std::mktime to avoid
+      // contention on glibc's tzset internals. Comparison is day-granular
+      // (retentionDays >= 1), so the UTC-vs-local offset is irrelevant.
+      std::time_t fileEpoch = detail::timeGmReentrant(&tm);
+      if (fileEpoch == static_cast<std::time_t>(-1))
+      {
+        // Malformed date parsed via get_time (e.g., "2025-02-30"): skip.
+        continue;
+      }
+      auto fileTime = std::chrono::system_clock::from_time_t(fileEpoch);
       // Only compare date, not time-of-day
       auto fileDays = std::chrono::duration_cast<std::chrono::hours>(now - fileTime).count() / 24;
       if (fileDays >= data.retentionDays)
@@ -1012,13 +1072,21 @@ public:
       auto t = std::chrono::system_clock::to_time_t(now);
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()) % 1000;
-      std::ostringstream tsOss;
-      tsOss << std::put_time(std::localtime(&t), timestampFmt.c_str());
-      if (timestampFmt.find("%S") != std::string::npos)
+      struct tm tmBuf{};
+      if (!detail::localTimeReentrant(&t, &tmBuf))
       {
-        tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        timestampStr = "[invalid-time]";
       }
-      timestampStr = tsOss.str();
+      else
+      {
+        std::ostringstream tsOss;
+        tsOss << std::put_time(&tmBuf, timestampFmt.c_str());
+        if (timestampFmt.find("%S") != std::string::npos)
+        {
+          tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        }
+        timestampStr = tsOss.str();
+      }
     }
 
     std::ostringstream oss;
@@ -1096,13 +1164,21 @@ public:
       auto t = std::chrono::system_clock::to_time_t(now);
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()) % 1000;
-      std::ostringstream tsOss;
-      tsOss << std::put_time(std::localtime(&t), timestampFmt.c_str());
-      if (timestampFmt.find("%S") != std::string::npos)
+      struct tm tmBuf{};
+      if (!detail::localTimeReentrant(&t, &tmBuf))
       {
-        tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        timestampStr = "[invalid-time]";
       }
-      timestampStr = tsOss.str();
+      else
+      {
+        std::ostringstream tsOss;
+        tsOss << std::put_time(&tmBuf, timestampFmt.c_str());
+        if (timestampFmt.find("%S") != std::string::npos)
+        {
+          tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+        }
+        timestampStr = tsOss.str();
+      }
     }
 
     // Extract filename from full path
