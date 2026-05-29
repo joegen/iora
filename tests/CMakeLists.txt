@@ -132,6 +132,7 @@ set(WEB_TESTS
     web/test_service_registry
     web/test_service_registry_concurrency
     web/test_service_registry_crossso
+    web/test_html_escape
 )
 
 # Combine enabled tests based on options
