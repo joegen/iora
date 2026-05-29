@@ -94,7 +94,13 @@ function(configure_iora_target target_name)
     if(CONFIG_COMPILE_DEFINITIONS)
         target_compile_definitions(${target_name} PRIVATE ${CONFIG_COMPILE_DEFINITIONS})
     endif()
-    
+
+    # Enforce the ServiceRegistry cross-.so ABI precondition per target (R-12):
+    # no -fvisibility=hidden / -fno-rtti on this target.
+    if(COMMAND iora_assert_target_abi)
+        iora_assert_target_abi(${target_name})
+    endif()
+
     message(STATUS "Configured Iora target: ${target_name}")
 endfunction()
 

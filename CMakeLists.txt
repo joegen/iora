@@ -27,6 +27,11 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 # Include our modular CMake files
 include(cmake/Dependencies.cmake)
 include(cmake/IoraTargets.cmake)
+include(cmake/AbiInvariant.cmake)
+
+# Enforce the ServiceRegistry cross-.so ABI precondition (R-12): no
+# -fvisibility=hidden / -fno-rtti. Fails configuration if violated.
+iora_assert_abi_invariant()
 
 # Configure all dependencies with system library detection
 configure_iora_dependencies()

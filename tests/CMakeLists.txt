@@ -31,6 +31,7 @@ option(IORA_BUILD_UTIL_TESTS "Build util namespace tests" OFF)
 option(IORA_BUILD_STORAGE_TESTS "Build storage namespace tests" OFF)
 option(IORA_BUILD_SERVICE_TESTS "Build service/plugin system tests" OFF)
 option(IORA_BUILD_DEBUG_TESTS "Build debug/helper tests" OFF)
+option(IORA_BUILD_WEB_TESTS "Build web namespace tests" OFF)
 option(IORA_BUILD_ALL_TESTS "Build all test groups (overrides individual options)" OFF)
 
 # If BUILD_ALL_TESTS is ON, enable all test groups
@@ -42,6 +43,7 @@ if(IORA_BUILD_ALL_TESTS)
     set(IORA_BUILD_STORAGE_TESTS ON)
     set(IORA_BUILD_SERVICE_TESTS ON)
     set(IORA_BUILD_DEBUG_TESTS ON)
+    set(IORA_BUILD_WEB_TESTS ON)
 endif()
 
 # Network namespace tests
@@ -125,6 +127,13 @@ set(DEBUG_TESTS
     simple_chained_test
 )
 
+# Web namespace tests (ServiceRegistry, middleware interfaces, HTMX support)
+set(WEB_TESTS
+    web/test_service_registry
+    web/test_service_registry_concurrency
+    web/test_service_registry_crossso
+)
+
 # Combine enabled tests based on options
 set(ALL_TESTS)
 if(IORA_BUILD_NETWORK_TESTS)
@@ -147,6 +156,9 @@ if(IORA_BUILD_SERVICE_TESTS)
 endif()
 if(IORA_BUILD_DEBUG_TESTS)
     list(APPEND ALL_TESTS ${DEBUG_TESTS})
+endif()
+if(IORA_BUILD_WEB_TESTS)
+    list(APPEND ALL_TESTS ${WEB_TESTS})
 endif()
 
 # Function to create individual test executables
@@ -304,7 +316,33 @@ if(IORA_BUILD_DEBUG_TESTS)
     endforeach()
 endif()
 
+if(IORA_BUILD_WEB_TESTS)
+    add_custom_target(test_web COMMENT "Running web tests")
+    foreach(test_path ${WEB_TESTS})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_path}.cpp")
+            get_filename_component(test_name ${test_path} NAME)
+            add_custom_command(TARGET test_web POST_BUILD
+                COMMAND ${test_name}
+                COMMENT "Running ${test_name}"
+                VERBATIM
+            )
+        endif()
+    endforeach()
+endif()
+
 # Build test plugins for dynamic loading tests (only if service tests enabled)
 if(IORA_BUILD_SERVICE_TESTS)
     add_subdirectory(plugins)
+endif()
+
+# Build web test plugins (ServiceRegistry cross-.so test) when web tests are on.
+# Kept separate from the SERVICE-gated plugins/ so the cross-.so test plugin is
+# present in a WEB-only configuration (-DIORA_BUILD_WEB_TESTS=ON).
+if(IORA_BUILD_WEB_TESTS)
+    add_subdirectory(web_plugins)
+    # The cross-.so test dlopen's the plugin at runtime; make the test depend on
+    # the plugin so a targeted build of the test also builds the .so.
+    if(TARGET test_service_registry_crossso AND TARGET web_test_registry_plugin)
+        add_dependencies(test_service_registry_crossso web_test_registry_plugin)
+    endif()
 endif()

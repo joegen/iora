@@ -12,6 +12,7 @@
 #include "core/event_queue.hpp"
 #include "core/logger.hpp"
 #include "core/plugin_loader.hpp"
+#include "core/service_registry.hpp"
 #include "core/thread_pool.hpp"
 #include "network/http_client.hpp"
 #include "network/webhook_server.hpp"
@@ -432,6 +433,10 @@ public:
       core::Logger::error("IoraService::exportApi() - Plugin API name cannot be empty");
       throw std::invalid_argument("Plugin API name cannot be empty");
     }
+    // Check-then-insert must be atomic under _apiMutex: reading _apiExports
+    // outside the lock is a data race with concurrent exportApi/unexportApi and a
+    // TOCTOU on the duplicate check.
+    std::lock_guard<std::mutex> lock(_apiMutex);
     if (_apiExports.find(name) != _apiExports.end())
     {
       core::Logger::error("IoraService::exportApi() - Plugin API already registered: " + name);
@@ -439,7 +444,6 @@ public:
     }
     core::Logger::info("IoraService::exportApi() - Registering plugin API: " + name +
                        " for plugin: " + pluginIdentity);
-    std::lock_guard<std::mutex> lock(_apiMutex);
     _apiExports[name] = ApiWrapper(makeStdFunction(std::forward<Func>(func)));
   }
 
@@ -673,6 +677,17 @@ public:
           {
             unexportApi(apiName);
           }
+          // Authoritative core-driven cleanup of this module's ServiceRegistry
+          // interface registrations, symmetric to the unexportApi loop above and
+          // running under the same _loadModulesMutex (lock-ordering edge
+          // _loadModulesMutex -> ServiceRegistry mutex). MUST run BEFORE
+          // _loadedModules.erase(it) (which invalidates pluginPtr/it) and BEFORE
+          // dlclose unmaps the plugin's vtables (C-5/RD-6). pluginName equals the
+          // module key and the plugin's getIdentity(), so it matches every entry
+          // the plugin registered. unregisterModule never throws (it aborts on
+          // misuse), so it is safe inside this try block — a throw here would be
+          // swallowed by the catch below and skip dlclose.
+          ServiceRegistry::unregisterModule(pluginName);
           _loadedModules.erase(it); // unique_ptr will delete
           PluginManager::unloadPlugin(pluginName);
 

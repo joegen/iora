@@ -2,6 +2,7 @@
 
 #include "iora/iora.hpp"
 #include "iora/core/metrics.hpp"
+#include "iora/core/service_registry.hpp"
 
 namespace iora {
 namespace core {
@@ -95,5 +96,18 @@ std::atomic<bool> &JsonFileStore::shouldExit()
 }
 
 } // namespace storage
+
+// ServiceRegistry storage — the single process-wide instance (C-4). Defined here
+// exactly once so libiora_core.so and every plugin .so resolve to the same map,
+// mirroring IoraService::getInstancePtr / MetricsRegistry::instance. The
+// templated set/get/unregister methods stay header-only; only this storage lives
+// in the .so. The function-local static and the return type both name the
+// PRIVATE NESTED type ServiceRegistry::Storage — legal in this out-of-line
+// member definition.
+ServiceRegistry::Storage &ServiceRegistry::storage()
+{
+  static Storage s;
+  return s;
+}
 
 } // namespace iora
