@@ -135,6 +135,8 @@ set(WEB_TESTS
     web/test_html_escape
     web/test_mustache
     web/test_routing_extensions
+    web/test_base64_decode
+    web/test_http_auth
 )
 
 # Combine enabled tests based on options
