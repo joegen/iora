@@ -8,10 +8,12 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -20,7 +22,9 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
+#include <vector>
 
 #include "iora/core/logger.hpp"
 #include "iora/core/thread_pool.hpp"
@@ -31,6 +35,12 @@ namespace iora
 {
 namespace network
 {
+
+// Forward declaration for the SSE response-suppression friend grant (RD-17).
+// SseStream + the upgradeToSse free function are defined in sse_stream.hpp
+// (sse_and_channels.json, a later tier); this declaration lets HttpServer
+// grant them access to its protected SSE primitives without a public leak.
+class SseStream;
 
 /// \brief Lightweight, testable HTTP server base class for handling REST
 /// endpoints.
@@ -66,6 +76,19 @@ public:
     std::string remote_addr;       // Peer IP address for httplib compatibility
     std::uint16_t remote_port = 0; // Peer port for additional context
 
+    /// \brief Trailing-wildcard suffix captured by a WILDCARD route match
+    /// (e.g. pattern "/static/*" + request "/static/css/app.css" -> "css/app.css").
+    /// Empty for EXACT/NAMED matches, for an empty-suffix wildcard match, and
+    /// for non-matching requests. Path-traversal hardening is the consumer's
+    /// responsibility (a wildcard suffix may begin with '/').
+    std::string pathRest;
+
+    /// \brief SessionId of the connection this request arrived on. Default-
+    /// initialized to the invalid sentinel (0; transport session ids start at
+    /// 1) and populated by the dispatcher on every path, so streaming handlers
+    /// (e.g. the SSE upgrade) can recover their own session.
+    SessionId sid{};
+
     std::string get_header_value(const std::string &key) const
     {
       auto it = headers.find(key);
@@ -81,6 +104,13 @@ public:
     int status = 200;
     HttpHeaders headers;
     std::string body;
+
+    /// \brief When set true by a handler, the dispatcher sends NOTHING for this
+    /// request (no terminal response, no keep-alive/close decision) — used by the
+    /// SSE upgrade, which writes its own preamble directly to the socket and takes
+    /// over the session. Default false, so existing handlers are unchanged. A
+    /// handler that throws clears this flag so a terminal 500 is still sent.
+    bool _suppressSend = false;
 
     void set_content(const std::string &content, const std::string &contentType)
     {
@@ -104,7 +134,7 @@ public:
   ///
   ///   for (int i = 0; i < 1000; ++i) {
   ///     if (shutdown.isShuttingDown()) {
-  ///       res.set_status(503);
+  ///       res.status = 503;
   ///       res.set_content("Service shutting down", "text/plain");
   ///       return;
   ///     }
@@ -297,39 +327,47 @@ public:
     iora::core::Logger::info("HttpServer: TLS configuration validated successfully");
   }
 
-  /// \brief Registers a GET handler for the given path.
+  /// \brief Registers a GET handler for the given path pattern.
+  /// The path may be exact ("/users"), contain named segments ("/users/:id"),
+  /// or end in a trailing wildcard ("/static/*"). A malformed pattern throws
+  /// std::invalid_argument at registration time.
   void onGet(const std::string &path, Handler handler)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _handlers[HttpMethod::GET][path] = std::move(handler);
+    registerHandler(HttpMethod::GET, path, std::move(handler));
   }
 
-  /// \brief Registers a POST handler for the given path.
+  /// \brief Registers a POST handler for the given path pattern.
   void onPost(const std::string &path, Handler handler)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _handlers[HttpMethod::POST][path] = std::move(handler);
+    registerHandler(HttpMethod::POST, path, std::move(handler));
   }
 
-  /// \brief Registers a PUT handler for the given path.
+  /// \brief Registers a PUT handler for the given path pattern.
   void onPut(const std::string &path, Handler handler)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _handlers[HttpMethod::PUT][path] = std::move(handler);
+    registerHandler(HttpMethod::PUT, path, std::move(handler));
   }
 
-  /// \brief Registers a PATCH handler for the given path.
+  /// \brief Registers a PATCH handler for the given path pattern.
   void onPatch(const std::string &path, Handler handler)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _handlers[HttpMethod::PATCH][path] = std::move(handler);
+    registerHandler(HttpMethod::PATCH, path, std::move(handler));
   }
 
-  /// \brief Registers a DELETE handler for the given path.
+  /// \brief Registers a DELETE handler for the given path pattern.
   void onDelete(const std::string &path, Handler handler)
   {
+    registerHandler(HttpMethod::DELETE, path, std::move(handler));
+  }
+
+  /// \brief Registers a fallback handler invoked when no route matches the
+  /// request path under any method (404 customization). Replaces the built-in
+  /// hard-coded 404 when set. The default handler runs under the same narrowed-
+  /// lock discipline and safety net as a matched route.
+  void setDefaultHandler(Handler handler)
+  {
     std::lock_guard<std::mutex> lock(_mutex);
-    _handlers[HttpMethod::DELETE][path] = std::move(handler);
+    _defaultHandler = std::move(handler);
   }
 
   /// \brief Starts the server. Throws on error.
@@ -455,27 +493,36 @@ public:
     // Give a brief moment for in-flight requests to see the shutdown flag
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    std::lock_guard<std::mutex> lock(_mutex);
+    // SR-22: _mutex MUST NOT be held across the drain loop. An in-flight worker
+    // re-acquires _mutex (for sendRaw/closeSession/sendRawForSse and the
+    // deferred send-block close); holding _mutex across the drain wait would
+    // deadlock it until the timeout (and drop its close). So: take _mutex
+    // briefly to stop the transport, release it across the drain wait, then
+    // re-acquire it solely for the reset.
 
+    // Phase 1 (brief lock): stop the transport so it accepts no new connections.
     iora::core::Logger::debug("HttpServer::stop() - Stopping transport to "
                               "prevent new connections");
-    // Stop transport first to prevent new connections and data
-    if (_transport)
     {
-      _transport->stop();
-      iora::core::Logger::debug("HttpServer::stop() - Transport stopped gracefully");
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_transport)
+      {
+        _transport->stop();
+        iora::core::Logger::debug("HttpServer::stop() - Transport stopped gracefully");
+      }
     }
 
-    // Clear session information
+    // Clear session information (standalone _sessionMutex scope, no _mutex held).
     {
       std::lock_guard<std::mutex> sessionLock(_sessionMutex);
       _sessionInfo.clear();
       iora::core::Logger::debug("HttpServer::stop() - Cleared session information");
     }
 
-    // Wait for thread pool tasks to complete with a reasonable timeout
+    // Wait for thread pool tasks to complete with a reasonable timeout, holding
+    // NO _mutex so in-flight handlers can acquire it, complete, and drain.
     // Handlers should use getShutdownChecker() to detect shutdown and exit
-    // gracefully
+    // gracefully.
     auto startTime = std::chrono::steady_clock::now();
     const auto maxWaitTime = std::chrono::seconds(2); // Reasonable timeout for production
 
@@ -500,12 +547,18 @@ public:
 
     iora::core::Logger::debug("HttpServer::stop() - Handler wait completed");
 
-    // Now safe to reset the transport since no tasks are using it
-    if (_transport)
+    // Phase 2 (re-acquire): reset the transport. Workers deref _transport only
+    // under _mutex with the _transport && !_shutdown guard, so a straggler
+    // either completed its guarded access before this reset or sees nullptr
+    // after it.
     {
-      iora::core::Logger::debug("HttpServer::stop() - Resetting transport");
-      _transport.reset();
-      iora::core::Logger::debug("HttpServer::stop() - Transport reset complete");
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_transport)
+      {
+        iora::core::Logger::debug("HttpServer::stop() - Resetting transport");
+        _transport.reset();
+        iora::core::Logger::debug("HttpServer::stop() - Transport reset complete");
+      }
     }
 
     iora::core::Logger::debug("HttpServer::stop() - Graceful shutdown complete");
@@ -547,10 +600,42 @@ protected:
   void closeSession(SessionId sid)
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    if (_transport)
+    if (_transport && !_shutdown)
     {
       _transport->close(sid);
     }
+  }
+
+  /// \brief Write raw bytes to a session for an upgraded/SSE stream. Takes
+  /// _mutex briefly itself (like sendRaw) — SAFE because, under the narrowed
+  /// dispatch lock, the calling handler holds no HttpServer lock. The bytes are
+  /// enqueued via the engine per-session write queue and delivered by the I/O
+  /// thread; the completion lambda is capture-only (keeps the buffer alive) and
+  /// MUST NOT re-acquire _mutex, since the engine fires it synchronously on the
+  /// caller's thread. Reached by upgradeToSse / SseStream via the friend grant.
+  void sendRawForSse(SessionId sid, const std::uint8_t *data, std::size_t len)
+  {
+    auto sharedData =
+      std::make_shared<std::string>(reinterpret_cast<const char *>(data), len);
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_transport && !_shutdown)
+    {
+      _transport->sendAsync(sid, sharedData->data(), sharedData->size(),
+                            [sharedData](SessionId, const SendResult &) {});
+    }
+  }
+
+  /// \brief Subclass seam mirroring onUpgradeRequest: return true to suppress
+  /// the dispatcher's terminal response (the handler has taken over the
+  /// session). The in-handler equivalent is Response::_suppressSend. Invoked
+  /// post-dispatch with NO _mutex held, so an override may safely call
+  /// sendRawForSse / markSessionUpgraded / closeSession.
+  virtual bool onResponseSuppressed(SessionId sid, const Request &req, Response &res)
+  {
+    (void)sid;
+    (void)req;
+    (void)res;
+    return false;
   }
 
   /// \brief Handle incoming data from a session
@@ -763,20 +848,25 @@ protected:
       shutdownRes.setHeader("Connection", "close");
 
       auto shutdownResponseData = std::make_shared<std::string>(shutdownRes.toWireFormat());
+      // SR-7: sendAsync fires its completion synchronously on this thread while
+      // _mutex is held, so the completion lambda MUST NOT re-acquire _mutex.
+      // Enqueue under _mutex, then close after the lock_guard releases.
+      bool shutdownSendOk = false;
       {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_transport)
         {
           _transport->sendAsync(sid, shutdownResponseData->data(), shutdownResponseData->size(),
-                                [this, sid](SessionId session, const SendResult &result)
-                                {
-                                  // Always close connection during shutdown
-                                  std::lock_guard<std::mutex> lock(_mutex);
-                                  if (_transport)
-                                  {
-                                    _transport->close(session);
-                                  }
-                                });
+                                [shutdownResponseData](SessionId, const SendResult &) {});
+          shutdownSendOk = true;
+        }
+      }
+      if (shutdownSendOk)
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_transport)
+        {
+          _transport->close(sid);
         }
       }
       return;
@@ -789,6 +879,10 @@ protected:
 
       // Convert to our Request format
       Request req;
+      // Populate the session id once, here, before any dispatch path — so every
+      // path (matched, 405, auto-OPTIONS, OPTIONS *, default-handler, and the
+      // upgrade check) carries the real sid, never the invalid sentinel (RD-22).
+      req.sid = sid;
       req.method = httpReq.method;
       req.path = httpReq.uri;
       req.headers = httpReq.headers;
@@ -919,63 +1013,117 @@ protected:
         }
       }
 
-      // Create response
+      // Tokenize the query-stripped path once; the SAME split rules are used to
+      // compile patterns, so request and pattern tokens align (SR-19).
+      const std::vector<std::string> reqToks = splitPath(req.path);
+
+      // ── ONE under-lock pass: match, classify, copy out, unlock (RD-9/SR-3) ──
+      const DispatchDecision decision = classifyRequest(req.method, req.path, reqToks);
+
+      // Apply captured named-segment params (path wins over a same-named query
+      // param, since this runs AFTER the query parse) and the wildcard suffix
+      // onto the worker-local Request before invocation.
+      for (const auto &kv : decision.paramAdds)
+      {
+        req.params[kv.first] = kv.second;
+      }
+      req.pathRest = decision.pathRest;
+
+      // Create response (default 404; overwritten by the category below).
       Response res;
       res.status = 404;
       res.set_content("Not Found", "text/plain");
 
-      // Find handler with proper HTTP status codes
+      // ── Post-lock dispatch: exhaustive switch, NO server lock held ──
+      bool ranHandler = false; // true iff a user handler was invoked (MATCHED / NO_ROUTE)
+      switch (decision.cat)
       {
-        std::lock_guard<std::mutex> lock(_mutex);
+      case DispatchDecision::Cat::MATCHED:
+        res.status = 200;
+        invokeWithSafetyNet(decision.handler, req, res);
+        ranHandler = true;
+        break;
+      case DispatchDecision::Cat::MATCHED_AS_HEAD:
+        // Run the GET handler; force a bodyless HEAD response by ignoring any
+        // suppression a non-SSE handler set (SR-4). The actual body strip (and
+        // the Content-Length reconciliation for a bodyless status) is applied
+        // uniformly to EVERY HEAD response below (RFC 9110 §9.3.2 / SR-18).
+        res.status = 200;
+        invokeWithSafetyNet(decision.handler, req, res);
+        if (res._suppressSend)
+        {
+          iora::core::Logger::warning(
+            "HttpServer: handler set _suppressSend during a HEAD dispatch; "
+            "ignoring and sending a bodyless HEAD response");
+          res._suppressSend = false;
+        }
+        break;
+      case DispatchDecision::Cat::AUTO_OPTIONS:
+        // Answered directly by routing: 204 No Content, empty body, omit
+        // Content-Length AND the inherited Content-Type, Allow from the routing
+        // data (SR-21).
+        res.status = 204;
+        res.body.clear();
+        res.headers.erase("Content-Length");
+        res.headers.erase("Content-Type");
+        res.headers["Allow"] = decision.allow;
+        break;
+      case DispatchDecision::Cat::OPTIONS_STAR:
+        // Server-wide OPTIONS * — 200 + Content-Length: 0, no Allow, no inherited
+        // Content-Type (SR-1).
+        res.status = 200;
+        res.body.clear();
+        res.headers.erase("Allow");
+        res.headers.erase("Content-Type");
+        res.headers["Content-Length"] = "0";
+        break;
+      case DispatchDecision::Cat::METHOD_NOT_ALLOWED:
+        // Terminal 405; set body via set_content so Content-Length is correct
+        // (SR-5 framing). No handler runs and no suppression check.
+        res.status = 405;
+        res.set_content("Method Not Allowed", "text/plain");
+        res.headers["Allow"] = decision.allow;
+        break;
+      case DispatchDecision::Cat::NO_ROUTE:
+        if (decision.hasHandler)
+        {
+          res.status = 200;
+          invokeWithSafetyNet(decision.handler, req, res);
+          ranHandler = true;
+        }
+        else
+        {
+          res.status = 404;
+          res.set_content("Not Found", "text/plain");
+        }
+        break;
+      }
 
-        // Check if path exists for any method (for 405 Method Not Allowed)
-        bool pathExists = false;
-        for (const auto &[method, pathHandlers] : _handlers)
-        {
-          if (pathHandlers.find(req.path) != pathHandlers.end())
-          {
-            pathExists = true;
-            break;
-          }
-        }
+      // Post-dispatch suppression check (MATCHED / NO_ROUTE-with-handler only, on
+      // normal return). When the handler took over the session (e.g. SSE), send
+      // NOTHING: skip the entire keep-alive/close decision and build/send block
+      // below. A handler that threw had its suppression cleared by the safety
+      // net, so a terminal 500 is still sent.
+      if (ranHandler && (res._suppressSend || onResponseSuppressed(req.sid, req, res)))
+      {
+        iora::core::Logger::debug(
+          "HttpServer::processHttpRequest() - response suppressed for session " +
+          std::to_string(sid) + " (handler took over the connection)");
+        return;
+      }
 
-        auto methodIt = _handlers.find(httpReq.method);
-        if (methodIt != _handlers.end())
+      // RFC 9110 §9.3.2: a HEAD response MUST carry no body on the wire, on
+      // EVERY terminal path (MATCHED_AS_HEAD, 405, NO_ROUTE/404/default). The
+      // body is computed then dropped; Content-Length (reflecting the body a GET
+      // would return) is preserved for a 2xx/4xx representation. For a bodyless
+      // status (304/204) drop any contradictory body Content-Length (SR-18).
+      if (req.method == HttpMethod::HEAD)
+      {
+        res.body.clear();
+        if (res.status == 204 || res.status == 304)
         {
-          auto handlerIt = methodIt->second.find(req.path);
-          if (handlerIt != methodIt->second.end())
-          {
-            // Handler found - execute it
-            res.status = 200;
-            try
-            {
-              handlerIt->second(req, res);
-            }
-            catch (const std::exception &e)
-            {
-              iora::core::Logger::error("HttpServer: Handler exception for " + req.path + ": " +
-                                        e.what());
-              res.status = 500;
-              res.set_content("Internal Server Error", "text/plain");
-            }
-          }
-          else if (pathExists)
-          {
-            // Path exists but method not allowed
-            res.status = 405;
-            res.set_content("Method Not Allowed", "text/plain");
-            res.headers["Allow"] = getAllowedMethods(req.path);
-          }
-          // else: 404 Not Found (default)
+          res.headers.erase("Content-Length");
         }
-        else if (pathExists)
-        {
-          // Path exists but method not allowed
-          res.status = 405;
-          res.set_content("Method Not Allowed", "text/plain");
-          res.headers["Allow"] = getAllowedMethods(req.path);
-        }
-        // else: 404 Not Found (default)
       }
 
       // Determine connection behavior
@@ -1031,7 +1179,12 @@ protected:
       // Create a shared string to keep the data alive during async send
       auto sharedResponseData = std::make_shared<std::string>(std::move(responseData));
 
-      // Check if transport is still available before sending
+      // Check if transport is still available before sending. SR-7: sendAsync
+      // fires its completion synchronously on this thread while _mutex is held,
+      // so the completion lambda only RECORDS the close intent (capture-only);
+      // the actual _transport->close happens after the lock_guard releases.
+      bool sendFailed = false;
+      bool sendSucceeded = false;
       {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_transport && !_shutdown)
@@ -1041,34 +1194,21 @@ protected:
             req.remote_addr + ":" + std::to_string(req.remote_port) + " (session " +
             std::to_string(sid) + ", " + std::to_string(sharedResponseData->size()) + " bytes)");
           _transport->sendAsync(sid, sharedResponseData->data(), sharedResponseData->size(),
-                                [this, sid, shouldCloseConnection,
+                                [&sendFailed, &sendSucceeded,
                                  sharedResponseData](SessionId session, const SendResult &result)
                                 {
                                   if (!result.isOk())
                                   {
                                     iora::core::Logger::error("Failed to send HTTP response: " +
                                                               result.error().message);
-                                    // Close connection on send failure
-                                    std::lock_guard<std::mutex> lock(_mutex);
-                                    if (_transport && !_shutdown)
-                                    {
-                                      _transport->close(session);
-                                    }
+                                    sendFailed = true;
                                   }
                                   else
                                   {
                                     iora::core::Logger::debug("HttpServer - HTTP response "
                                                               "sent successfully for session " +
                                                               std::to_string(session));
-                                    // Close connection if requested
-                                    if (shouldCloseConnection)
-                                    {
-                                      std::lock_guard<std::mutex> lock(_mutex);
-                                      if (_transport && !_shutdown)
-                                      {
-                                        _transport->close(session);
-                                      }
-                                    }
+                                    sendSucceeded = true;
                                   }
                                 });
         }
@@ -1081,6 +1221,17 @@ protected:
                                     ") for session " + std::to_string(sid));
         }
       }
+      // Close the connection (on send failure, or when the response requested
+      // close) AFTER releasing _mutex, re-acquiring it unnested and re-checking
+      // the guard.
+      if (sendFailed || (sendSucceeded && shouldCloseConnection))
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_transport && !_shutdown)
+        {
+          _transport->close(sid);
+        }
+      }
       iora::core::Logger::debug("HttpServer::processHttpRequest() - "
                                 "Completed successfully for session " +
                                 std::to_string(sid));
@@ -1089,7 +1240,11 @@ protected:
     {
       iora::core::Logger::error("Error processing HTTP request: " + std::string(ex.what()));
 
-      // Check if transport is still available before sending error response
+      // Check if transport is still available before sending error response.
+      // SR-7: enqueue under _mutex with a capture-only completion lambda, then
+      // perform the (unconditional) post-error close after the lock_guard
+      // releases — never re-acquire _mutex inside the synchronous completion.
+      bool errorSendOk = false;
       {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_transport && !_shutdown)
@@ -1107,15 +1262,8 @@ protected:
           auto errorResponseData = std::make_shared<std::string>(errorRes.toWireFormat());
           _transport->sendAsync(
             sid, errorResponseData->data(), errorResponseData->size(),
-            [this, sid, errorResponseData](SessionId session, const SendResult &result)
-            {
-              // Close connection after error response is sent
-              std::lock_guard<std::mutex> lock(_mutex);
-              if (_transport && !_shutdown)
-              {
-                _transport->close(session);
-              }
-            });
+            [errorResponseData](SessionId, const SendResult &) {});
+          errorSendOk = true;
         }
         else
         {
@@ -1123,6 +1271,14 @@ protected:
                                     "send (shutdown=" +
                                     std::to_string(_shutdown) + ") for session " +
                                     std::to_string(sid));
+        }
+      }
+      if (errorSendOk)
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_transport && !_shutdown)
+        {
+          _transport->close(sid);
         }
       }
     }
@@ -1182,56 +1338,93 @@ protected:
     return std::string::npos;
   }
 
-  /// \brief Get allowed methods for a path (for 405 responses)
-  std::string getAllowedMethods(const std::string &path) const
+  /// \brief Compute the Allow header value for a request path by evaluating the
+  /// SAME precedence-ordered pattern match used for dispatch. For each method
+  /// with any matching pattern, the method is listed; HEAD is synthesized
+  /// whenever GET matches (auto-HEAD-for-GET), and OPTIONS is self-listed
+  /// whenever the path matches under any method (auto-OPTIONS). Methods are
+  /// emitted in a fixed canonical order so the result is deterministic. Returns
+  /// "" if the path matches no route. MUST be called with _mutex held.
+  std::string getAllowedMethods(const std::vector<std::string> &reqToks) const
   {
-    std::vector<std::string> methods;
-
-    for (const auto &[method, pathHandlers] : _handlers)
+    bool hasGet = false, hasPost = false, hasPut = false, hasPatch = false, hasDelete = false;
+    bool anyMatch = false;
+    for (const auto &methodVec : _handlers)
     {
-      if (pathHandlers.find(path) != pathHandlers.end())
+      for (const auto &entry : methodVec.second)
       {
-        switch (method)
+        std::unordered_map<std::string, std::string> caps;
+        std::string rest;
+        if (patternMatches(entry.first, reqToks, caps, rest))
         {
-        case HttpMethod::GET:
-          methods.push_back("GET");
-          break;
-        case HttpMethod::POST:
-          methods.push_back("POST");
-          break;
-        case HttpMethod::DELETE:
-          methods.push_back("DELETE");
-          break;
-        case HttpMethod::PUT:
-          methods.push_back("PUT");
-          break;
-        case HttpMethod::HEAD:
-          methods.push_back("HEAD");
-          break;
-        case HttpMethod::OPTIONS:
-          methods.push_back("OPTIONS");
-          break;
-        case HttpMethod::PATCH:
-          methods.push_back("PATCH");
-          break;
-        case HttpMethod::CONNECT:
-          methods.push_back("CONNECT");
-          break;
-        case HttpMethod::TRACE:
-          methods.push_back("TRACE");
-          break;
+          anyMatch = true;
+          switch (methodVec.first)
+          {
+          case HttpMethod::GET:
+            hasGet = true;
+            break;
+          case HttpMethod::POST:
+            hasPost = true;
+            break;
+          case HttpMethod::PUT:
+            hasPut = true;
+            break;
+          case HttpMethod::PATCH:
+            hasPatch = true;
+            break;
+          case HttpMethod::DELETE:
+            hasDelete = true;
+            break;
+          default:
+            break; // HEAD/OPTIONS/CONNECT/TRACE are not registrable in v1
+          }
+          break; // one matching pattern per method suffices
         }
       }
     }
+
+    if (!anyMatch)
+    {
+      return "";
+    }
+
+    // Canonical order (SR-2): GET, HEAD, POST, PUT, PATCH, DELETE, [CONNECT,
+    // TRACE,] OPTIONS — HEAD synthesized from GET, OPTIONS self-listed. CONNECT
+    // and TRACE are intentionally never emitted in v1 (the public registration
+    // API exposes no onConnect/onTrace, so they can never match a pattern).
+    std::vector<std::string> methods;
+    if (hasGet)
+    {
+      methods.push_back("GET");
+      methods.push_back("HEAD");
+    }
+    if (hasPost)
+    {
+      methods.push_back("POST");
+    }
+    if (hasPut)
+    {
+      methods.push_back("PUT");
+    }
+    if (hasPatch)
+    {
+      methods.push_back("PATCH");
+    }
+    if (hasDelete)
+    {
+      methods.push_back("DELETE");
+    }
+    methods.push_back("OPTIONS");
 
     std::string result;
     for (std::size_t i = 0; i < methods.size(); ++i)
     {
       if (i > 0)
+      {
         result += ", ";
+      }
       result += methods[i];
     }
-
     return result;
   }
 
@@ -1248,6 +1441,8 @@ protected:
       return "Created";
     case 204:
       return "No Content";
+    case 304:
+      return "Not Modified";
     case 400:
       return "Bad Request";
     case 401:
@@ -1260,6 +1455,8 @@ protected:
       return "Method Not Allowed";
     case 413:
       return "Payload Too Large";
+    case 426:
+      return "Upgrade Required";
     case 500:
       return "Internal Server Error";
     case 501:
@@ -1351,7 +1548,473 @@ protected:
   ///         false to continue with normal route dispatch
   virtual bool onUpgradeRequest(SessionId sid, const Request& req, Response& res) { return false; }
 
+  // RD-17: grant the SSE machinery access to the protected SSE primitives
+  // (sendRawForSse / markSessionUpgraded / closeSession) and the private
+  // _transport — the same reach WebSocketServer gets by subclassing, with no
+  // public transport() leak. SseStream + the upgradeToSse free function are
+  // defined in sse_stream.hpp (a later tier). The upgradeToSse friend is an
+  // UNQUALIFIED in-class declaration (name injected into iora::network) so it
+  // does not require a namespace-scope forward declaration naming the nested
+  // Request/Response types (which are incomplete before this class is defined).
+  friend class SseStream;
+  friend void upgradeToSse(HttpServer &server, const Request &req, Response &res,
+                           std::function<void(std::shared_ptr<SseStream>)> onConnect);
+
 private:
+  // ── Pattern routing (exact / named-segment / trailing-wildcard) ──────────
+
+  /// \brief Kind of a compiled route pattern.
+  enum class PatternKind
+  {
+    EXACT,
+    NAMED,
+    WILDCARD
+  };
+
+  /// \brief One path segment of a compiled pattern. A NAMED segment carries the
+  /// capture name; a literal segment carries its exact text.
+  struct Segment
+  {
+    bool isParam = false;
+    std::string literalOrName;
+  };
+
+  /// \brief Parsed-once representation of a registered path pattern.
+  struct CompiledPattern
+  {
+    PatternKind kind = PatternKind::EXACT;
+    std::string raw; // original registered path (diagnostics + grouping)
+    std::vector<Segment> segments;
+    bool hasTrailingWildcard = false; // '*' is a terminal marker, not a segment
+  };
+
+  /// \brief Split a path on '/', preserving the leading, trailing, AND interior
+  /// empty tokens. So "/users" -> {"","users"} (2) and "/users/" ->
+  /// {"","users",""} (3) differ by segment count — the load-bearing invariant
+  /// for exact-match backward-compat and the wildcard empty-suffix rule. Used
+  /// for BOTH patterns and request paths so they tokenize identically.
+  static std::vector<std::string> splitPath(const std::string &path)
+  {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : path)
+    {
+      if (c == '/')
+      {
+        out.push_back(cur);
+        cur.clear();
+      }
+      else
+      {
+        cur.push_back(c);
+      }
+    }
+    out.push_back(cur);
+    return out;
+  }
+
+  /// \brief True if `s` matches the named-segment identifier grammar
+  /// [A-Za-z_][A-Za-z0-9_]*.
+  static bool isValidIdentifier(const std::string &s)
+  {
+    if (s.empty())
+    {
+      return false;
+    }
+    const unsigned char first = static_cast<unsigned char>(s[0]);
+    if (!(std::isalpha(first) || s[0] == '_'))
+    {
+      return false;
+    }
+    for (std::size_t i = 1; i < s.size(); ++i)
+    {
+      const unsigned char c = static_cast<unsigned char>(s[i]);
+      if (!(std::isalnum(c) || s[i] == '_'))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// \brief Compile a registered path to a CompiledPattern. Throws
+  /// std::invalid_argument on a malformed pattern (non-terminal '*', '*' mixed
+  /// into a segment, or a ':' first-char not followed by a valid identifier).
+  static CompiledPattern compilePattern(const std::string &path)
+  {
+    CompiledPattern cp;
+    cp.raw = path;
+    const std::vector<std::string> toks = splitPath(path);
+    bool hasNamed = false;
+    for (std::size_t i = 0; i < toks.size(); ++i)
+    {
+      const std::string &tok = toks[i];
+      if (tok == "*")
+      {
+        if (i != toks.size() - 1)
+        {
+          throw std::invalid_argument(
+            "HttpServer: '*' wildcard must be the final path segment: " + path);
+        }
+        cp.hasTrailingWildcard = true;
+        continue; // the '*' is a terminal marker, not stored as a segment
+      }
+      if (tok.find('*') != std::string::npos)
+      {
+        throw std::invalid_argument(
+          "HttpServer: '*' may only appear as a standalone final segment: " + path);
+      }
+      if (!tok.empty() && tok[0] == ':')
+      {
+        const std::string name = tok.substr(1);
+        if (!isValidIdentifier(name))
+        {
+          throw std::invalid_argument(
+            "HttpServer: malformed named segment '" + tok + "' in path: " + path);
+        }
+        Segment seg;
+        seg.isParam = true;
+        seg.literalOrName = name;
+        cp.segments.push_back(std::move(seg));
+        hasNamed = true;
+      }
+      else
+      {
+        Segment seg;
+        seg.isParam = false;
+        seg.literalOrName = tok;
+        cp.segments.push_back(std::move(seg));
+      }
+    }
+    if (cp.hasTrailingWildcard)
+    {
+      cp.kind = PatternKind::WILDCARD;
+    }
+    else if (hasNamed)
+    {
+      cp.kind = PatternKind::NAMED;
+    }
+    else
+    {
+      cp.kind = PatternKind::EXACT;
+    }
+    return cp;
+  }
+
+  /// \brief Test whether a compiled pattern matches the request token list. On a
+  /// NAMED match, named captures are written into `paramAdds`; on a WILDCARD
+  /// match the unmatched suffix (possibly empty, joined with '/') is written
+  /// into `pathRest`. Captures are stored RAW (not percent-decoded).
+  static bool patternMatches(const CompiledPattern &cp,
+                             const std::vector<std::string> &reqToks,
+                             std::unordered_map<std::string, std::string> &paramAdds,
+                             std::string &pathRest)
+  {
+    if (cp.kind == PatternKind::WILDCARD)
+    {
+      // Request must have AT LEAST as many leading segments as the literal
+      // prefix ('>=', not '>'), so the suffix may be empty (M-R1).
+      if (reqToks.size() < cp.segments.size())
+      {
+        return false;
+      }
+      for (std::size_t i = 0; i < cp.segments.size(); ++i)
+      {
+        if (reqToks[i] != cp.segments[i].literalOrName)
+        {
+          return false;
+        }
+      }
+      std::string rest;
+      for (std::size_t i = cp.segments.size(); i < reqToks.size(); ++i)
+      {
+        if (i > cp.segments.size())
+        {
+          rest.push_back('/');
+        }
+        rest += reqToks[i];
+      }
+      pathRest = std::move(rest);
+      return true;
+    }
+
+    // EXACT or NAMED: segment counts must match exactly.
+    if (reqToks.size() != cp.segments.size())
+    {
+      return false;
+    }
+    std::unordered_map<std::string, std::string> caps;
+    for (std::size_t i = 0; i < cp.segments.size(); ++i)
+    {
+      const Segment &seg = cp.segments[i];
+      if (seg.isParam)
+      {
+        caps[seg.literalOrName] = reqToks[i];
+      }
+      else if (reqToks[i] != seg.literalOrName)
+      {
+        return false;
+      }
+    }
+    for (auto &kv : caps)
+    {
+      paramAdds[kv.first] = kv.second;
+    }
+    return true;
+  }
+
+  /// \brief Precedence-ordered match within one method's pattern vector: EXACT,
+  /// then NAMED (registration order), then WILDCARD (registration order), STOP
+  /// at first hit. Returns the matching entry index or -1. Must be called with
+  /// _mutex held (reads the vector).
+  static int matchInMethodVector(
+    const std::vector<std::pair<CompiledPattern, Handler>> &vec,
+    const std::vector<std::string> &reqToks,
+    std::unordered_map<std::string, std::string> &paramAdds, std::string &pathRest)
+  {
+    for (PatternKind kind : {PatternKind::EXACT, PatternKind::NAMED, PatternKind::WILDCARD})
+    {
+      for (std::size_t i = 0; i < vec.size(); ++i)
+      {
+        if (vec[i].first.kind != kind)
+        {
+          continue;
+        }
+        std::unordered_map<std::string, std::string> caps;
+        std::string rest;
+        if (patternMatches(vec[i].first, reqToks, caps, rest))
+        {
+          paramAdds = std::move(caps);
+          pathRest = std::move(rest);
+          return static_cast<int>(i);
+        }
+      }
+    }
+    return -1;
+  }
+
+  /// \brief Compile and register a route. Throws std::invalid_argument on a
+  /// malformed pattern (before any table mutation). EXACT re-registration
+  /// overwrites the prior handler for the same path; NAMED/WILDCARD append
+  /// (registration order is the within-precedence tie-break).
+  void registerHandler(HttpMethod method, const std::string &path, Handler handler)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    CompiledPattern cp = compilePattern(path);
+    auto &vec = _handlers[method];
+    if (cp.kind == PatternKind::EXACT)
+    {
+      for (auto &entry : vec)
+      {
+        if (entry.first.kind == PatternKind::EXACT && entry.first.raw == path)
+        {
+          entry.second = std::move(handler);
+          return;
+        }
+      }
+    }
+    vec.emplace_back(std::move(cp), std::move(handler));
+  }
+
+  /// \brief True if the path matches a pattern under any method. Must be called
+  /// with _mutex held.
+  bool pathMatchesAnyMethod(const std::vector<std::string> &reqToks) const
+  {
+    for (const auto &methodVec : _handlers)
+    {
+      for (const auto &entry : methodVec.second)
+      {
+        std::unordered_map<std::string, std::string> caps;
+        std::string rest;
+        if (patternMatches(entry.first, reqToks, caps, rest))
+        {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// \brief True if the path matches a pattern under some method OTHER than
+  /// `exclude` (used for the 405 decision). Must be called with _mutex held.
+  bool pathExistsExcludingMethod(const std::vector<std::string> &reqToks,
+                                 HttpMethod exclude) const
+  {
+    for (const auto &methodVec : _handlers)
+    {
+      if (methodVec.first == exclude)
+      {
+        continue;
+      }
+      for (const auto &entry : methodVec.second)
+      {
+        std::unordered_map<std::string, std::string> caps;
+        std::string rest;
+        if (patternMatches(entry.first, reqToks, caps, rest))
+        {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// \brief Outcome of the single under-lock dispatch pass: the category, a
+  /// copied-out Handler (for MATCHED / MATCHED_AS_HEAD / NO_ROUTE-with-default),
+  /// the Allow string (for METHOD_NOT_ALLOWED / AUTO_OPTIONS), and the captured
+  /// named-segment params + wildcard suffix. Everything is copied by value, so
+  /// it stays valid after _mutex is released.
+  struct DispatchDecision
+  {
+    enum class Cat
+    {
+      MATCHED,
+      MATCHED_AS_HEAD,
+      AUTO_OPTIONS,
+      OPTIONS_STAR,
+      METHOD_NOT_ALLOWED,
+      NO_ROUTE
+    } cat = Cat::NO_ROUTE;
+    Handler handler;
+    bool hasHandler = false;
+    std::string allow;
+    std::unordered_map<std::string, std::string> paramAdds;
+    std::string pathRest;
+  };
+
+  /// \brief The ONE under-lock pass (RD-9): acquire _mutex once, run the SR-3
+  /// decision ladder (OPTIONS * -> auto-OPTIONS -> HEAD-as-GET -> matched ->
+  /// 405 -> NO_ROUTE), copy out the resolved handler / Allow / captures, and
+  /// release. No relock; getAllowedMethods and the default-handler copy all
+  /// happen under this single acquisition. The returned handler is invoked by
+  /// the caller with NO lock held.
+  DispatchDecision classifyRequest(HttpMethod method, const std::string &reqPath,
+                                   const std::vector<std::string> &reqToks)
+  {
+    DispatchDecision d;
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    // (1) Asterisk-form OPTIONS * — server-wide capability probe (SR-1).
+    if (method == HttpMethod::OPTIONS && reqPath == "*")
+    {
+      d.cat = DispatchDecision::Cat::OPTIONS_STAR;
+      return d;
+    }
+
+    // (2) OPTIONS — answered directly if the path matches under any method.
+    if (method == HttpMethod::OPTIONS)
+    {
+      if (pathMatchesAnyMethod(reqToks))
+      {
+        d.cat = DispatchDecision::Cat::AUTO_OPTIONS;
+        d.allow = getAllowedMethods(reqToks);
+        return d;
+      }
+      // Fall through to NO_ROUTE within this same acquisition (copy out the
+      // default handler so an OPTIONS on a no-route path can invoke it).
+      d.cat = DispatchDecision::Cat::NO_ROUTE;
+      if (_defaultHandler)
+      {
+        d.handler = _defaultHandler;
+        d.hasHandler = true;
+      }
+      return d;
+    }
+
+    // (3) HEAD — fall back to the GET route (auto-HEAD-for-GET, RD-23). The
+    // HEAD pattern vector is always empty in v1; check GET. If no GET matches,
+    // continue to the generic classification below (so HEAD on a POST-only path
+    // becomes a 405, not a wrong 404).
+    if (method == HttpMethod::HEAD)
+    {
+      auto git = _handlers.find(HttpMethod::GET);
+      if (git != _handlers.end())
+      {
+        const int idx =
+          matchInMethodVector(git->second, reqToks, d.paramAdds, d.pathRest);
+        if (idx >= 0)
+        {
+          d.cat = DispatchDecision::Cat::MATCHED_AS_HEAD;
+          d.handler = git->second[static_cast<std::size_t>(idx)].second;
+          d.hasHandler = true;
+          return d;
+        }
+      }
+    }
+
+    // (4) Match the request method.
+    auto mit = _handlers.find(method);
+    if (mit != _handlers.end())
+    {
+      const int idx = matchInMethodVector(mit->second, reqToks, d.paramAdds, d.pathRest);
+      if (idx >= 0)
+      {
+        d.cat = DispatchDecision::Cat::MATCHED;
+        d.handler = mit->second[static_cast<std::size_t>(idx)].second;
+        d.hasHandler = true;
+        return d;
+      }
+    }
+
+    // (5) 405 — the path matches under some OTHER method (Allow under the same
+    // lock).
+    if (pathExistsExcludingMethod(reqToks, method))
+    {
+      d.cat = DispatchDecision::Cat::METHOD_NOT_ALLOWED;
+      d.allow = getAllowedMethods(reqToks);
+      return d;
+    }
+
+    // (6) NO_ROUTE — copy out the default handler if set (same acquisition).
+    d.cat = DispatchDecision::Cat::NO_ROUTE;
+    if (_defaultHandler)
+    {
+      d.handler = _defaultHandler;
+      d.hasHandler = true;
+    }
+    return d;
+  }
+
+  /// \brief Invoke a copied-out handler with the request-level safety net, run
+  /// with NO _mutex held. Both catch clauses set a production-safe 500 and CLEAR
+  /// any suppression (so a partially-suppressing handler that then threw still
+  /// gets a terminal 500). The verbose dev-mode body is produced by the
+  /// Application layer; HttpServer's net is the last line of defense.
+  void invokeWithSafetyNet(const Handler &handler, Request &req, Response &res)
+  {
+    try
+    {
+      handler(req, res);
+    }
+    catch (const std::exception &e)
+    {
+      iora::core::Logger::error("HttpServer: Handler exception for " + req.path + ": " +
+                                e.what());
+      res.status = 500;
+      res.set_content("Internal Server Error", "text/plain");
+      res._suppressSend = false;
+    }
+    catch (...)
+    {
+      iora::core::Logger::error("HttpServer: Handler unknown exception for " + req.path);
+      res.status = 500;
+      res.set_content("Internal Server Error", "text/plain");
+      res._suppressSend = false;
+    }
+  }
+
+  // Lock ordering (HttpServer): when more than one of these is co-held, the
+  // total order is _wsMutex/_sseMutex (subclass/friend, OUTER, e.g.
+  // WebSocketServer holds _wsMutex across sendRaw which takes _mutex) ->
+  // _mutex (HttpServer, inner) -> _sessionMutex (inner). _mutex and
+  // _sessionMutex ARE co-held in sendErrorResponse (the synchronous sendAsync
+  // completion lambda does _transport->close then _sessionInfo.erase under
+  // _sessionMutex while _mutex is still held — order _mutex -> _sessionMutex);
+  // there is NO reverse _sessionMutex -> _mutex edge. No HttpServer code holding _mutex may call a
+  // subclass/friend (SseStream/upgradeToSse) method that re-takes a higher
+  // lock — the dispatch narrowing copies the handler out and invokes it with
+  // no lock held. (_sseMutex is PROSPECTIVE — owned by SseStream/sse_stream.hpp,
+  // not declared here; the friend grant only makes that edge possible.)
   mutable std::mutex _mutex;
   mutable std::mutex _sessionMutex;
 
@@ -1383,8 +2046,13 @@ private:
   // Session tracking for incomplete requests and peer info
   std::unordered_map<SessionId, SessionInfo> _sessionInfo;
 
-  // Handler storage: method -> path -> handler
-  std::unordered_map<HttpMethod, std::unordered_map<std::string, Handler>> _handlers;
+  // Handler storage: method -> ordered vector of (compiled pattern, handler).
+  // Ordered per method so registration order is preserved for the within-
+  // precedence tie-break (an unordered_map cannot provide that).
+  std::unordered_map<HttpMethod, std::vector<std::pair<CompiledPattern, Handler>>> _handlers;
+
+  // Fallback handler for unmatched routes (NO_ROUTE), set via setDefaultHandler.
+  Handler _defaultHandler;
 
   // Sessions that have been upgraded (e.g., to WebSocket).
   // Data for these sessions is routed to onUpgradedData() instead of HTTP parsing.
