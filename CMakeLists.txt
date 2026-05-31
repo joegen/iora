@@ -122,3 +122,19 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/IoraConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Iora
 )
+
+# Install the iora_embed_assets() CMake module + its build-time generator,
+# co-located with the package config so find_package(Iora) consumers get
+# iora_embed_assets() in scope (H-6/R-14, asset_pipeline.json).
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/IoraEmbedAssets.cmake"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/IoraEmbedAssetsGen.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Iora
+)
+
+# Vendor the pinned htmx.min.js so iora_embed_assets() can self-host it
+# (LD-10, no CDN). Consumers locate it via IORA_VENDORED_WEB_DIR.
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/share/iora/web/htmx.min.js"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/iora/web
+)

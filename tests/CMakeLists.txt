@@ -137,6 +137,7 @@ set(WEB_TESTS
     web/test_routing_extensions
     web/test_base64_decode
     web/test_http_auth
+    web/test_assets
 )
 
 # Combine enabled tests based on options
@@ -350,4 +351,16 @@ if(IORA_BUILD_WEB_TESTS)
     if(TARGET test_service_registry_crossso AND TARGET web_test_registry_plugin)
         add_dependencies(test_service_registry_crossso web_test_registry_plugin)
     endif()
+
+    # Out-of-tree iora_embed_assets() consumer test (asset_pipeline H-6/R-14).
+    # Hermetically installs the current build to a test-controlled prefix and
+    # drives a real find_package(Iora) consumer (configure/build-bound, kept
+    # serial with -j1 per the web-test convention).
+    add_test(NAME web::test_embed_assets
+        COMMAND ${CMAKE_COMMAND}
+            -DIORA_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DCONSUMER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/web/cmake/test_embed_assets
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/embed_assets_work
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/web/cmake/run_embed_assets_test.cmake
+    )
 endif()
