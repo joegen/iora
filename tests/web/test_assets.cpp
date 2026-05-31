@@ -15,6 +15,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 using iora::web::Assets;
 using iora::web::EmbeddedAsset;
@@ -71,7 +72,14 @@ constexpr std::string_view kCssBytes = "body{color:red}";
 constexpr std::string_view kCssEtag = "0123456789abcdef0123456789abcdef";
 constexpr std::string_view kJsBytes = "console.log(1)";
 constexpr std::string_view kJsEtag = "fedcba9876543210fedcba9876543210";
-constexpr std::string_view kJsGzip = "\x1f\x8b\x08gzipped-js";
+// M-6: declare binary gzip fixture with an EXPLICIT length (and an embedded NUL)
+// so a string_view-from-literal cannot silently truncate at the NUL — mirroring
+// how the real generator emits string_view(ptr, byteLen).
+constexpr char kJsGzipData[] = {'\x1f', '\x8b', '\x08', '\x00', 'z', 'j', 's'};
+constexpr std::string_view kJsGzip(kJsGzipData, sizeof(kJsGzipData));
+// Embedded etags are OPAQUE registry literals (the codegen emits a build-time
+// SHA-256; Assets does NOT recompute them at runtime). These hand-written values
+// only test pass-through + rawEtag/gzipEtag distinctness, not the hash itself.
 constexpr std::string_view kJsGzipEtag = "aaaa1111bbbb2222cccc3333dddd4444";
 
 const EmbeddedAsset kStatics[] = {
@@ -125,6 +133,13 @@ TEST_CASE("Assets::mimeForExtension covers the RD-5 table", "[assets][mime]")
   REQUIRE(Assets::mimeForExtension("a.unknownext") == "application/octet-stream");
   REQUIRE(Assets::mimeForExtension("noextension") == "application/octet-stream");
   REQUIRE(Assets::mimeForExtension("css/sub/app.css") == "text/css");
+  // web M-1 edge cases: double extension uses the last; dotfile + trailing dot
+  // + dot-in-directory have no leaf extension -> octet-stream.
+  REQUIRE(Assets::mimeForExtension("app.min.js") == "text/javascript");
+  REQUIRE(Assets::mimeForExtension("archive.tar.gz") == "application/octet-stream");
+  REQUIRE(Assets::mimeForExtension(".gitignore") == "application/octet-stream");
+  REQUIRE(Assets::mimeForExtension("app.") == "application/octet-stream");
+  REQUIRE(Assets::mimeForExtension("dir.with.dot/file") == "application/octet-stream");
 }
 
 TEST_CASE("fromEmbedded getTemplate/getStatic basic behavior", "[assets][embedded]")
@@ -338,6 +353,12 @@ TEST_CASE("RD-11 embedded-external fallback reads from EXTERNAL_DIR (model A)", 
   REQUIRE(a2.getStatic("gone.png").status == GetStaticResult::Status::NotFound);
 }
 
+// SANITIZER GATE (asset_pipeline.json sanitizerBuildNote): the [assets][concurrency]
+// cases below are designed to be run under TSAN and ASAN. iora has no built-in
+// sanitizer target; build a separate dir with -fsanitize=thread / -fsanitize=address
+// and (WSL2) run via `setarch $(uname -m) -R <exe>` to disable ASLR. Worker threads
+// record outcomes into std::atomic flags; all Catch2 assertions run on the main
+// thread after join() (Catch2 v2 macros are NOT thread-safe).
 TEST_CASE("Concurrent cold-miss double-populate same path (thread M-3)", "[assets][concurrency]")
 {
   TempTree tree("coldmiss");
@@ -372,6 +393,14 @@ TEST_CASE("Concurrent cold-miss double-populate same path (thread M-3)", "[asset
     REQUIRE(bytesSeen[i] == "shared-content-xyz");
     REQUIRE(etagsSeen[i] == etagsSeen[0]);
   }
+  // thread M-1: the double-checked locking must leave EXACTLY ONE cached entry
+  // (not a last-writer-wins overwrite or a per-thread duplicate). Two post-join
+  // reads must return the SAME underlying StaticCacheEntry pointer, proving a
+  // single shared cached entry rather than a freshly-rebuilt one.
+  GetStaticResult p1 = a.getStatic("shared.txt");
+  GetStaticResult p2 = a.getStatic("shared.txt");
+  REQUIRE(p1.blob._entry != nullptr);
+  REQUIRE(p1.blob._entry.get() == p2.blob._entry.get());
 }
 
 TEST_CASE("Reader + reload() stress on same path (RD-20, no UAF)", "[assets][concurrency]")
@@ -382,6 +411,9 @@ TEST_CASE("Reader + reload() stress on same path (RD-20, no UAF)", "[assets][con
 
   std::atomic<bool> stop{false};
   std::atomic<int> reads{0};
+  // Catch2 v2 assertion macros are NOT thread-safe — worker threads record into
+  // atomics; ALL assertions run on the main thread after join().
+  std::atomic<bool> bad{false};
 
   std::thread reader([&]() {
     while (!stop.load())
@@ -393,8 +425,10 @@ TEST_CASE("Reader + reload() stress on same path (RD-20, no UAF)", "[assets][con
         // the held _entry shared_ptr must keep the buffer alive (no UAF).
         std::string copyBytes(r.blob.bytes);
         std::string copyEtag(r.blob.rawEtag);
-        REQUIRE(copyBytes.size() == r.blob.bytes.size());
-        REQUIRE_FALSE(copyEtag.empty());
+        if (copyBytes.size() != r.blob.bytes.size() || copyEtag.empty())
+        {
+          bad.store(true);
+        }
         ++reads;
       }
     }
@@ -406,10 +440,15 @@ TEST_CASE("Reader + reload() stress on same path (RD-20, no UAF)", "[assets][con
     }
   });
   writer.join();
-  // let the reader run a bit past the writer
-  while (reads.load() < 50) {}
+  // Wait (BOUNDED — can never hang) for the reader to have done at least one
+  // successful read before stopping, so the liveness assertion is meaningful.
+  for (int g = 0; reads.load() == 0 && g < 2000000; ++g)
+  {
+    std::this_thread::yield();
+  }
   stop.store(true);
   reader.join();
+  REQUIRE_FALSE(bad.load());
   REQUIRE(reads.load() > 0);
 }
 
@@ -452,12 +491,15 @@ TEST_CASE("Embedded getStatic + reload() concurrently is lock-free safe (M-7)", 
   EmbeddedAssetRegistry reg = makeRegistry();
   Assets a = Assets::fromEmbedded(reg);
   std::atomic<bool> stop{false};
+  std::atomic<bool> bad{false}; // Catch2 macros are main-thread-only
   std::thread reader([&]() {
     while (!stop.load())
     {
       GetStaticResult r = a.getStatic("app.css");
-      REQUIRE(r.status == GetStaticResult::Status::Found);
-      REQUIRE(r.blob._entry == nullptr); // zero-copy, static-storage views
+      if (r.status != GetStaticResult::Status::Found || r.blob._entry != nullptr)
+      {
+        bad.store(true); // expect Found + zero-copy (_entry null)
+      }
     }
   });
   for (int i = 0; i < 500; ++i)
@@ -466,6 +508,7 @@ TEST_CASE("Embedded getStatic + reload() concurrently is lock-free safe (M-7)", 
   }
   stop.store(true);
   reader.join();
+  REQUIRE_FALSE(bad.load());
 }
 
 TEST_CASE("getTemplate copy-before-reload contract (H-5)", "[assets][filesystem][template]")
@@ -482,6 +525,174 @@ TEST_CASE("getTemplate copy-before-reload contract (H-5)", "[assets][filesystem]
   auto v2 = a.getTemplate("p.html");
   REQUIRE(v2.has_value());
   REQUIRE(*v2 == "<b>changed</b>");
+}
+
+TEST_CASE("Filesystem-mode traversal rejection (OQ-9/M-d/M-e, exercises isContained)",
+          "[assets][traversal][filesystem]")
+{
+  TempTree tree("fstraversal");
+  tree.writeStatic("ok/real.css", "ok");
+  Assets a = Assets::fromDirectory(tree.root);
+
+  // control: a legitimate nested file is served
+  REQUIRE(a.getStatic("ok/real.css").status == GetStaticResult::Status::Found);
+
+  // lexical vectors reach filesystem mode and are Rejected
+  REQUIRE(a.getStatic("../etc/passwd").status == GetStaticResult::Status::Rejected);
+  REQUIRE(a.getStatic("ok/../../bar").status == GetStaticResult::Status::Rejected);
+  REQUIRE(a.getStatic("/abs").status == GetStaticResult::Status::Rejected);
+  // a benign non-existent file is NotFound, not Rejected
+  REQUIRE(a.getStatic("ok/missing.css").status == GetStaticResult::Status::NotFound);
+
+  // M-e symlink escape + M-d sibling-prefix escape — exercised via on-disk
+  // symlinks (the only way to reach isContained's weakly_canonical backstop).
+  // Guarded: skip the symlink assertions if the platform/privilege disallows them.
+  std::error_code ec;
+  fs::create_directories(tree.root / "secret");
+  std::ofstream(tree.root / "secret" / "s.txt", std::ios::binary) << "TOPSECRET";
+  fs::create_directory_symlink(tree.root / "secret", tree.root / "static" / "leak", ec);
+  if (!ec)
+  {
+    // symlink inside static/ pointing OUTSIDE static/ -> escapes root -> Rejected
+    REQUIRE(a.getStatic("leak/s.txt").status == GetStaticResult::Status::Rejected);
+  }
+  else
+  {
+    WARN("symlink creation unsupported here; skipping symlink-escape assertion");
+  }
+  fs::create_directories(tree.root / "static-evil");
+  std::ofstream(tree.root / "static-evil" / "e.txt", std::ios::binary) << "EVIL";
+  fs::create_directory_symlink(tree.root / "static-evil", tree.root / "static" / "sib", ec);
+  if (!ec)
+  {
+    // sibling dir sharing the root's name PREFIX (static vs static-evil) ->
+    // component-wise containment rejects it (a string starts_with would not).
+    REQUIRE(a.getStatic("sib/e.txt").status == GetStaticResult::Status::Rejected);
+  }
+  // web M-3: a LEGITIMATE within-root symlink asset must STILL serve — the
+  // O_NOFOLLOW open is on the resolved canonical target, not the symlink itself.
+  fs::create_symlink(tree.root / "static" / "ok" / "real.css",
+                     tree.root / "static" / "alias.css", ec);
+  if (!ec)
+  {
+    GetStaticResult aliased = a.getStatic("alias.css");
+    REQUIRE(aliased.status == GetStaticResult::Status::Found);
+    REQUIRE(aliased.blob.bytes == "ok");
+  }
+}
+
+TEST_CASE("Filesystem gzip sibling variant + distinct gzipEtag", "[assets][filesystem][gzip]")
+{
+  TempTree tree("fsgzip");
+  tree.writeStatic("a.css", "body{color:green}");
+  tree.writeStatic("a.css.gz", std::string("\x1f\x8b\x08", 3) + "fake-gz");
+  tree.writeStatic("b.css", "h1{}"); // no .gz sibling
+
+  Assets a = Assets::fromDirectory(tree.root);
+  GetStaticResult ra = a.getStatic("a.css");
+  REQUIRE(ra.status == GetStaticResult::Status::Found);
+  REQUIRE(ra.blob.gzipVariantExists);
+  REQUIRE(ra.blob.gzipBytes.has_value());
+  REQUIRE(ra.blob.gzipEtag.size() == 22); // 16-byte base64url, no pad
+  REQUIRE(std::string(ra.blob.gzipEtag) != std::string(ra.blob.rawEtag));
+
+  GetStaticResult rb = a.getStatic("b.css");
+  REQUIRE(rb.status == GetStaticResult::Status::Found);
+  REQUIRE_FALSE(rb.blob.gzipVariantExists);
+  REQUIRE_FALSE(rb.blob.gzipBytes.has_value());
+  REQUIRE(rb.blob.gzipEtag.empty());
+}
+
+TEST_CASE("Zero-byte asset is served with a stable etag (L-6)", "[assets][filesystem]")
+{
+  TempTree tree("zerobyte");
+  tree.writeStatic("empty.txt", "");
+  Assets a = Assets::fromDirectory(tree.root);
+  GetStaticResult r = a.getStatic("empty.txt");
+  REQUIRE(r.status == GetStaticResult::Status::Found);
+  REQUIRE(r.blob.bytes.empty());
+  REQUIRE_FALSE(r.blob.rawEtag.empty()); // SHA-256 of "" is well-defined
+}
+
+TEST_CASE("Populate-vs-reload race on initially-empty cache (thread M-4)", "[assets][concurrency]")
+{
+  TempTree tree("popvsreload");
+  tree.writeStatic("a.txt", "racey");
+  Assets a = Assets::fromDirectory(tree.root); // cache starts empty
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> reads{0};
+  std::atomic<bool> bad{false}; // Catch2 macros are main-thread-only
+  std::thread reader([&]() {
+    while (!stop.load())
+    {
+      GetStaticResult r = a.getStatic("a.txt"); // may be a cold miss racing reload
+      if (r.status == GetStaticResult::Status::Found)
+      {
+        std::string b(r.blob.bytes); // full-byte read
+        if (b.empty())
+        {
+          bad.store(true);
+        }
+        ++reads;
+      }
+    }
+  });
+  std::thread writer([&]() {
+    for (int i = 0; i < 300; ++i)
+    {
+      a.reload(); // repeatedly clears the cache while the reader populates it
+    }
+  });
+  writer.join();
+  // Wait (BOUNDED — can never hang) for at least one successful read.
+  for (int g = 0; reads.load() == 0 && g < 2000000; ++g)
+  {
+    std::this_thread::yield();
+  }
+  stop.store(true);
+  reader.join();
+  REQUIRE_FALSE(bad.load());
+  REQUIRE(reads.load() > 0);
+}
+
+TEST_CASE("RD-11 embedded-external concurrent read + reload (model A, lock-free)",
+          "[assets][concurrency][external]")
+{
+  TempTree tree("extconc");
+  fs::path extDir = tree.root / "ext";
+  fs::create_directories(extDir);
+  std::ofstream(extDir / "img.png", std::ios::binary) << "PNGBYTES";
+  std::string extDirStr = extDir.string();
+  std::string_view extPaths[] = {"img.png"};
+
+  EmbeddedAssetRegistry reg = makeRegistry();
+  reg.externalDir = extDirStr;
+  reg.externalPaths = extPaths;
+  reg.externalPathsCount = 1;
+  Assets a = Assets::fromEmbedded(reg);
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> bad{false}; // Catch2 macros are main-thread-only
+  std::thread reader([&]() {
+    while (!stop.load())
+    {
+      GetStaticResult r = a.getStatic("img.png");
+      if (r.status != GetStaticResult::Status::Found ||
+          std::string(r.blob.bytes) != "PNGBYTES" || // full-byte read
+          r.blob._entry == nullptr)                   // owned per-request handle
+      {
+        bad.store(true);
+      }
+    }
+  });
+  for (int i = 0; i < 300; ++i)
+  {
+    a.reload(); // no-op in embedded mode, must not race the external reads
+  }
+  stop.store(true);
+  reader.join();
+  REQUIRE_FALSE(bad.load());
 }
 
 TEST_CASE("Assets is copyable and movable (M-a value-type contract)", "[assets][value]")

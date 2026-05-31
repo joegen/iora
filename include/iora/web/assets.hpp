@@ -23,6 +23,26 @@
 // bytes + identity etag + gzip bytes + gzip etag together; all four string_view
 // fields view into that single handle, so one shared_ptr copy keeps every view
 // valid for the response lifetime and across a concurrent reload().
+//
+// SECURITY (web M-3, TOCTOU): the filesystem and EXTERNAL_DIR read paths
+// resolve a path (weakly_canonical), verify component-wise containment, then
+// open it. weakly_canonical defeats symlinks present at check time (an escaping
+// symlink is rejected by containment); the check-then-open RACE (an attacker who
+// can write into the root swapping the checked file for an escaping symlink
+// before the open) is closed by readFile opening the canonical leaf with
+// O_NOFOLLOW on POSIX (a swapped-in symlink leaf is refused atomically). A
+// legitimate within-root symlink asset still serves because the path opened is
+// the already-resolved canonical target. Residuals: Windows lacks O_NOFOLLOW
+// (falls back to the documented trust-boundary contract — root not writable by
+// less-trusted principals); intermediate-component swaps would need openat()
+// chains (out of v1 scope).
+//
+// getTemplate cross-thread (H-5/N-5): getTemplate's filesystem-mode return is a
+// bare std::string_view into the template cache and is NOT ownership-protected
+// against a CONCURRENT reload() on another thread — callers MUST copy it into an
+// owning std::string before any reload boundary (the PartialResolver bridge
+// copies immediately; rendering is synchronous on the handler thread). Only
+// getStatic's StaticBlob is reload-safe via _entry.
 
 #pragma once
 
@@ -37,9 +57,16 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include <iora/crypto/secure_rng.hpp>
 #include <iora/util/base64.hpp>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace iora
 {
@@ -173,8 +200,20 @@ public:
     a._mode = Mode::Filesystem;
     auto state = std::make_shared<FsState>();
     state->root = canonicalRoot;
-    state->templatesRoot = canonicalRoot / "templates";
-    state->staticsRoot = canonicalRoot / "static";
+    // Canonicalize the two roots ONCE at construction (thread L-2 / perf): the
+    // request hot path then uses these as the containment base directly, instead
+    // of re-running weakly_canonical on the root on every getStatic call.
+    std::error_code rootEc;
+    state->templatesRoot = std::filesystem::weakly_canonical(canonicalRoot / "templates", rootEc);
+    if (rootEc)
+    {
+      state->templatesRoot = canonicalRoot / "templates";
+    }
+    state->staticsRoot = std::filesystem::weakly_canonical(canonicalRoot / "static", rootEc);
+    if (rootEc)
+    {
+      state->staticsRoot = canonicalRoot / "static";
+    }
     state->perRequestRead = perRequestRead;
     a._fs = std::move(state);
     return a;
@@ -410,8 +449,53 @@ private:
 
   // ---- file / etag helpers ----------------------------------------------
 
+  // Reads an ALREADY-CANONICALIZED, containment-checked path. web M-3 (TOCTOU):
+  // on POSIX the leaf is opened with O_NOFOLLOW so a file that was swapped for a
+  // symlink between the containment check and the open is refused atomically —
+  // closing the check-then-open race. Because the path passed here is the
+  // weakly_canonical result (symlinks already resolved), a LEGITIMATE within-root
+  // symlink asset still serves: it was resolved to its canonical non-symlink
+  // target before this open. (Windows lacks O_NOFOLLOW -> documented residual;
+  // intermediate-component swaps would additionally need openat() chains.)
   static std::optional<std::string> readFile(const std::filesystem::path &p)
   {
+#if defined(__unix__) || defined(__APPLE__)
+    int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+    {
+      return std::nullopt; // ELOOP (symlinked leaf), ENOENT, EACCES, ...
+    }
+    // RAII guard: close the fd on every exit path, including an exception from
+    // std::string growth (L-1 exception-safety).
+    struct FdGuard
+    {
+      int fd;
+      ~FdGuard() { ::close(fd); }
+    } guard{fd};
+    std::string data;
+    std::vector<char> buf(65536); // heap, not a 64 KB stack frame
+    for (;;)
+    {
+      ssize_t n = ::read(fd, buf.data(), buf.size());
+      if (n > 0)
+      {
+        data.append(buf.data(), static_cast<std::size_t>(n));
+      }
+      else if (n == 0)
+      {
+        break; // EOF
+      }
+      else if (errno == EINTR)
+      {
+        continue;
+      }
+      else
+      {
+        return std::nullopt;
+      }
+    }
+    return data;
+#else
     std::ifstream f(p, std::ios::binary);
     if (!f)
     {
@@ -423,6 +507,7 @@ private:
       return std::nullopt;
     }
     return data;
+#endif
   }
 
   /// \brief Runtime ETag: 16-byte-truncated SHA-256, Base64Url-encoded, unquoted.
@@ -551,7 +636,7 @@ private:
       fs::path base = fs::weakly_canonical(externalDir, ec);
       if (ec)
       {
-        base = externalDir;
+        return {GetStaticResult::Status::NotFound, {}};
       }
       fs::path candidate = externalDir / fs::path(std::string(path));
       fs::path resolved = fs::weakly_canonical(candidate, ec);
@@ -583,11 +668,8 @@ private:
   {
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path base = fs::weakly_canonical(_fs->staticsRoot, ec);
-    if (ec)
-    {
-      base = _fs->staticsRoot;
-    }
+    // staticsRoot was canonicalized once at construction (the containment base).
+    const fs::path &base = _fs->staticsRoot;
     fs::path candidate = _fs->staticsRoot / fs::path(std::string(path));
     fs::path resolved = fs::weakly_canonical(candidate, ec);
     if (ec)
@@ -651,11 +733,8 @@ private:
   {
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::path base = fs::weakly_canonical(_fs->templatesRoot, ec);
-    if (ec)
-    {
-      base = _fs->templatesRoot;
-    }
+    // templatesRoot was canonicalized once at construction (the containment base).
+    const fs::path &base = _fs->templatesRoot;
     fs::path candidate = _fs->templatesRoot / fs::path(std::string(name));
     fs::path resolved = fs::weakly_canonical(candidate, ec);
     if (ec || !isContained(base, resolved))

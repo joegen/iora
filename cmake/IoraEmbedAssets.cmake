@@ -83,12 +83,20 @@ function(iora_embed_assets)
   set(_manifest_lines "")
   set(_dep_files "")
   set(_total_bytes 0)
+  set(_size_breakdown "")
   set(_consumer_has_htmx FALSE)
 
   foreach(_rel IN LISTS _static_rel)
     set(_abs "${IEA_STATIC_DIR}/${_rel}")
     if(IS_DIRECTORY "${_abs}")
       continue()
+    endif()
+    # M-2: reject path characters that would corrupt the manifest grammar
+    # (|, ;, newline) or the emitted C++ string literal (", \) or break the
+    # ASCII-sorted binary_search at runtime (non-ASCII). Fail fast and clearly.
+    if(_rel MATCHES "[\"\\\\;|\n]" OR _rel MATCHES "[^\t -~]")
+      message(FATAL_ERROR "iora_embed_assets: unsupported character in asset path '${_rel}' "
+                          "(paths must be printable ASCII without \" \\ ; | or newline)")
     endif()
     if(_rel STREQUAL "htmx.min.js")
       set(_consumer_has_htmx TRUE)
@@ -125,6 +133,7 @@ function(iora_embed_assets)
 
     file(SIZE "${_abs}" _sz)
     math(EXPR _total_bytes "${_total_bytes} + ${_sz}")
+    list(APPEND _size_breakdown "    ${_rel}: ${_sz} bytes")
     list(APPEND _manifest_lines "STATIC|${_rel}|${_abs}|${_gzipflag}")
     list(APPEND _dep_files "${_abs}")
   endforeach()
@@ -133,6 +142,10 @@ function(iora_embed_assets)
     set(_abs "${IEA_TEMPLATES_DIR}/${_rel}")
     if(IS_DIRECTORY "${_abs}")
       continue()
+    endif()
+    if(_rel MATCHES "[\"\\\\;|\n]" OR _rel MATCHES "[^\t -~]")
+      message(FATAL_ERROR "iora_embed_assets: unsupported character in template path '${_rel}' "
+                          "(paths must be printable ASCII without \" \\ ; | or newline)")
     endif()
     list(APPEND _manifest_lines "TEMPLATE|${_rel}|${_abs}")
     list(APPEND _dep_files "${_abs}")
@@ -160,7 +173,8 @@ function(iora_embed_assets)
 
   # ---- MAX_EMBEDDED_SIZE soft cap (warn only; does not fail the build) ------
   if(IEA_MAX_EMBEDDED_SIZE AND _total_bytes GREATER IEA_MAX_EMBEDDED_SIZE)
-    message(WARNING "iora_embed_assets: embedded size ${_total_bytes} bytes exceeds MAX_EMBEDDED_SIZE ${IEA_MAX_EMBEDDED_SIZE}; consider EXTERNAL_PATTERNS for large/volatile binaries")
+    string(REPLACE ";" "\n" _breakdown_text "${_size_breakdown}")
+    message(WARNING "iora_embed_assets: embedded size ${_total_bytes} bytes exceeds MAX_EMBEDDED_SIZE ${IEA_MAX_EMBEDDED_SIZE}; consider EXTERNAL_PATTERNS for large/volatile binaries.\nPer-file breakdown:\n${_breakdown_text}")
   endif()
 
   # ---- write the manifest + wire the build-time generator -------------------

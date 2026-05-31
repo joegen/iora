@@ -28,6 +28,14 @@ function(_iea_hex_to_init hex out_var)
   set(${out_var} "${_init}" PARENT_SCOPE)
 endfunction()
 
+# Escape a string for a C++ double-quoted literal (defense-in-depth: the module
+# already rejects \ and " in asset paths, but the generator may run standalone).
+function(_iea_cstr in out_var)
+  string(REPLACE "\\" "\\\\" _e "${in}")
+  string(REPLACE "\"" "\\\"" _e "${_e}")
+  set(${out_var} "${_e}" PARENT_SCOPE)
+endfunction()
+
 # Emit a `static const unsigned char <ident>[] = {...};` for a file's bytes and
 # return the C++ string_view expression naming it (or an empty string_view for a
 # zero-byte file). Appends the array definition to the named accumulator.
@@ -93,11 +101,13 @@ foreach(_line IN LISTS _lines)
         file(SHA256 "${_tmpgz}" _gzsha)
         string(SUBSTRING "${_gzsha}" 0 32 _gzipetag)
         set(_gzipview "std::optional<std::string_view>(${_gzbytesview})")
-        file(REMOVE "${_tmpgz}")
       endif()
+      # Clean up the scratch .gz on every path (success or partial failure).
+      file(REMOVE "${_tmpgz}")
     endif()
 
-    set(_entry "  { \"${_key}\", ${_bytesview}, \"${_etag}\", ${_gzipview}, \"${_gzipetag}\" },")
+    _iea_cstr("${_key}" _keyc)
+    set(_entry "  { \"${_keyc}\", ${_bytesview}, \"${_etag}\", ${_gzipview}, \"${_gzipetag}\" },")
     list(APPEND _statics_sortable "${_key}###${_entry}")
 
   elseif(_type STREQUAL "TEMPLATE")
@@ -106,12 +116,14 @@ foreach(_line IN LISTS _lines)
     math(EXPR _ident_counter "${_ident_counter} + 1")
     string(MAKE_C_IDENTIFIER "iea_${GEN_REGISTRY}_t${_ident_counter}" _ident)
     _iea_emit_bytes("${_ident}_b" "${_abspath}" _arrays _bytesview)
-    set(_entry "  { \"${_name}\", ${_bytesview} },")
+    _iea_cstr("${_name}" _namec)
+    set(_entry "  { \"${_namec}\", ${_bytesview} },")
     list(APPEND _templates_sortable "${_name}###${_entry}")
 
   elseif(_type STREQUAL "EXTERNAL")
     list(GET _parts 1 _relpath)
-    list(APPEND _external_sortable "${_relpath}###  std::string_view(\"${_relpath}\"),")
+    _iea_cstr("${_relpath}" _relpathc)
+    list(APPEND _external_sortable "${_relpath}###  std::string_view(\"${_relpathc}\"),")
   endif()
 endforeach()
 
@@ -142,10 +154,11 @@ string(APPEND _h "#pragma once\n")
 string(APPEND _h "#include <iora/web/assets.hpp>\n")
 string(APPEND _h "#include <optional>\n")
 string(APPEND _h "#include <string_view>\n\n")
-string(APPEND _h "namespace iora_embedded_detail_${GEN_REGISTRY}\n{\n")
-string(APPEND _h "${_arrays}")
-string(APPEND _h "} // namespace iora_embedded_detail_${GEN_REGISTRY}\n\n")
-string(APPEND _h "using namespace iora_embedded_detail_${GEN_REGISTRY};\n\n")
+# Byte arrays + registry tables/instance are emitted at file scope with internal
+# linkage (static); the header is single-TU-by-contract. No `using namespace`
+# (avoids the in-header using-directive anti-pattern); the table initializers
+# reference the file-scope array identifiers directly.
+string(APPEND _h "${_arrays}\n")
 
 if(_templates_count GREATER 0)
   string(APPEND _h "static const iora::web::EmbeddedTemplate ${GEN_REGISTRY}_templates[] = {\n${_templates_block}};\n\n")
@@ -168,10 +181,11 @@ else()
   set(_external_ptr "nullptr")
 endif()
 
+_iea_cstr("${GEN_EXTERNAL_DIR}" _extdirc)
 string(APPEND _h "static const iora::web::EmbeddedAssetRegistry ${GEN_REGISTRY} = {\n")
 string(APPEND _h "  ${_templates_ptr}, ${_templates_count},\n")
 string(APPEND _h "  ${_statics_ptr}, ${_statics_count},\n")
-string(APPEND _h "  std::string_view(\"${GEN_EXTERNAL_DIR}\"),\n")
+string(APPEND _h "  std::string_view(\"${_extdirc}\"),\n")
 string(APPEND _h "  ${_external_ptr}, ${_external_count},\n")
 string(APPEND _h "};\n")
 

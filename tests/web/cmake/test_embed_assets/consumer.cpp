@@ -37,6 +37,22 @@ int main()
   check(js.blob.rawEtag.size() == 32, "embedded etag is 32 hex chars");
   check(js.blob.rawEtag.front() != '"' && js.blob.rawEtag.back() != '"',
         "etag is unquoted");
+  // M-7: the PRECOMPRESS gzip build-time path produces a distinct gzipEtag.
+  check(js.blob.gzipVariantExists, "app.js has a gzip variant (PRECOMPRESS gzip)");
+  check(js.blob.gzipEtag.size() == 32, "gzipEtag is 32 hex chars");
+  check(std::string(js.blob.gzipEtag) != std::string(js.blob.rawEtag),
+        "gzipEtag distinct from rawEtag (per-representation validator)");
+
+  // M-4: image/font assets are embedded with correct MIME and are NOT gzipped
+  // (already-compressed formats are skipped at build time).
+  iora::web::GetStaticResult png = a.getStatic("logo.png");
+  check(png.status == iora::web::GetStaticResult::Status::Found, "logo.png Found");
+  check(png.blob.mime == "image/png", "logo.png mime image/png");
+  check(!png.blob.gzipVariantExists, "logo.png not gzip-precompressed (skip-list)");
+  iora::web::GetStaticResult font = a.getStatic("font.woff2");
+  check(font.status == iora::web::GetStaticResult::Status::Found, "font.woff2 Found");
+  check(font.blob.mime == "font/woff2", "font.woff2 mime font/woff2");
+  check(!font.blob.gzipVariantExists, "font.woff2 not gzip-precompressed (skip-list)");
 
   check(a.getTemplate("index.html").has_value(), "index.html template present");
   check(a.getStatic("missing.css").status ==

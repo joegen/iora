@@ -49,6 +49,19 @@ _run(DESC "install iora to test-controlled prefix"
 # the checked-in fixture).
 file(COPY "${CONSUMER_SRC}/" DESTINATION "${_src}")
 
+# M-4 / matrixNote: generate a ~256KB binary fixture so the file(READ HEX)
+# large-blob codegen path is actually exercised (perf watch-item). Built here
+# (not committed) to keep the repo lean. 3.14-safe (no string(REPEAT)).
+set(_chunk "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF")
+foreach(_i RANGE 1 4) # 64 -> 1024 bytes
+  string(APPEND _chunk "${_chunk}")
+endforeach()
+set(_big "")
+foreach(_i RANGE 1 256) # 1024 * 256 = 256 KiB
+  string(APPEND _big "${_chunk}")
+endforeach()
+file(WRITE "${_src}/static/big.bin" "${_big}")
+
 # ---- (1)+(2) default build: in-scope, compiles, runs --------------------------
 set(_b1 "${WORK_DIR}/build_default")
 _run(DESC "configure consumer (default, vendored htmx) — proves iora_embed_assets in scope"
@@ -88,5 +101,19 @@ endif()
 _run(DESC "build consumer (override)" CMD ${CMAKE_COMMAND} --build "${_b3}")
 _run(DESC "run consumer (override)" CMD "${_b3}/consumer")
 message(STATUS "ok: consumer-provided htmx override honored (STATUS emitted)")
+
+# ---- (5) negative: an unsafe asset-path character fails configure (M-2) --------
+# A backslash in an asset filename (legal on POSIX) must be rejected at
+# classification with a FATAL_ERROR, not silently emitted into a C++ literal.
+file(WRITE "${_src}/static/bad\\name.css" "x")
+set(_bneg "${WORK_DIR}/build_badname")
+execute_process(COMMAND ${CMAKE_COMMAND} -S "${_src}" -B "${_bneg}"
+                        "-DCMAKE_PREFIX_PATH=${_prefix}"
+                RESULT_VARIABLE _negrc OUTPUT_VARIABLE _negout ERROR_VARIABLE _negerr)
+file(REMOVE "${_src}/static/bad\\name.css")
+if(_negrc EQUAL 0)
+  message(FATAL_ERROR "expected configure to FAIL for an unsafe asset path (backslash), but it succeeded")
+endif()
+message(STATUS "ok: unsafe asset-path character rejected at configure (M-2)")
 
 message(STATUS "web::test_embed_assets: ALL out-of-tree assertions passed")
