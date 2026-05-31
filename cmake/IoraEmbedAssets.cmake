@@ -96,7 +96,7 @@ function(iora_embed_assets)
     # ASCII-sorted binary_search at runtime (non-ASCII). Fail fast and clearly.
     if(_rel MATCHES "[\"\\\\;|\n]" OR _rel MATCHES "[^\t -~]")
       message(FATAL_ERROR "iora_embed_assets: unsupported character in asset path '${_rel}' "
-                          "(paths must be printable ASCII without \" \\ ; | or newline)")
+                          "(paths must be tab or printable ASCII without \" \\ ; | or newline)")
     endif()
     if(_rel STREQUAL "htmx.min.js")
       set(_consumer_has_htmx TRUE)
@@ -145,7 +145,7 @@ function(iora_embed_assets)
     endif()
     if(_rel MATCHES "[\"\\\\;|\n]" OR _rel MATCHES "[^\t -~]")
       message(FATAL_ERROR "iora_embed_assets: unsupported character in template path '${_rel}' "
-                          "(paths must be printable ASCII without \" \\ ; | or newline)")
+                          "(paths must be tab or printable ASCII without \" \\ ; | or newline)")
     endif()
     list(APPEND _manifest_lines "TEMPLATE|${_rel}|${_abs}")
     list(APPEND _dep_files "${_abs}")
