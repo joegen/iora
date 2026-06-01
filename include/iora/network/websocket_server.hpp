@@ -56,25 +56,65 @@ public:
 
   // ── Session Send Methods ───────────────────────────────────────────────
 
-  /// \brief Send a text message to a WebSocket session.
-  void sendText(SessionId sid, const std::string& text)
+  /// \brief Returns true iff the session is present AND its CLOSE frame has not
+  /// been sent — a CHEAP liveness early-out for WsChannel.publish (web-M7, OQ-6).
+  /// Best-effort: a true result can go stale immediately. The data-after-close
+  /// GUARANTEE is the closeSent recheck inside sendText/sendBinary/sendPing.
+  /// Virtual so a WsChannel test double can simulate session liveness; an
+  /// override MUST preserve the closeSent-aware semantics.
+  virtual bool isSessionActive(SessionId sid) const
   {
+    std::lock_guard<std::mutex> lock(_wsMutex);
+    auto it = _sessions.find(sid);
+    return it != _sessions.end() && !it->second.closeSent;
+  }
+
+  /// \brief Send a text message to a WebSocket session. AUTHORITATIVE
+  /// data-after-close prevention (web-M7, RFC 6455 §5.5.1): the closeSent recheck
+  /// and the send are ATOMIC under _wsMutex w.r.t. sendClose / the inbound-CLOSE
+  /// echo (which flip closeSent under _wsMutex), so a DATA frame can NEVER follow
+  /// a CLOSE frame. Holds _wsMutex across sendRaw (which takes HttpServer::_mutex)
+  /// — the SAME _wsMutex -> _mutex order as the inbound-CLOSE echo; no new cycle.
+  /// Virtual so a WsChannel test double can capture sends; an override MUST
+  /// preserve the closeSent recheck.
+  virtual void sendText(SessionId sid, const std::string& text)
+  {
+    std::lock_guard<std::mutex> lock(_wsMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second.closeSent)
+    {
+      return; // drop: unknown or closing session
+    }
     auto frame = WebSocketFrame::makeText(text);
     auto wire = frame.serialize(false); // server does NOT mask
     sendRaw(sid, wire.data(), wire.size());
   }
 
-  /// \brief Send a binary message to a WebSocket session.
-  void sendBinary(SessionId sid, const std::vector<std::uint8_t>& data)
+  /// \brief Send a binary message to a WebSocket session (see sendText for the
+  /// web-M7 send-boundary closeSent recheck contract). Virtual for testability.
+  virtual void sendBinary(SessionId sid, const std::vector<std::uint8_t>& data)
   {
+    std::lock_guard<std::mutex> lock(_wsMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second.closeSent)
+    {
+      return; // drop: unknown or closing session
+    }
     auto frame = WebSocketFrame::makeBinary(data);
     auto wire = frame.serialize(false);
     sendRaw(sid, wire.data(), wire.size());
   }
 
-  /// \brief Send a Ping to a WebSocket session.
-  void sendPing(SessionId sid, const std::vector<std::uint8_t>& payload = {})
+  /// \brief Send a Ping to a WebSocket session (see sendText for the web-M7
+  /// send-boundary closeSent recheck contract). Virtual for testability.
+  virtual void sendPing(SessionId sid, const std::vector<std::uint8_t>& payload = {})
   {
+    std::lock_guard<std::mutex> lock(_wsMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second.closeSent)
+    {
+      return; // drop: unknown or closing session
+    }
     auto frame = WebSocketFrame::makePing(payload);
     auto wire = frame.serialize(false);
     sendRaw(sid, wire.data(), wire.size());
@@ -428,7 +468,7 @@ private:
     bool closeSent = false; // prevents double close-frame echo
   };
 
-  std::mutex _wsMutex;
+  mutable std::mutex _wsMutex; // mutable so the const isSessionActive can lock it
   std::unordered_map<SessionId, WsSessionState> _sessions;
   std::size_t _maxFrameSize;
 

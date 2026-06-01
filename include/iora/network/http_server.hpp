@@ -205,6 +205,24 @@ public:
     _bindAddress = bindAddress;
   }
 
+  /// \brief Sets the per-connection idle timeout applied at the next start()
+  /// (default 600s). The engine GC reaps a session idle longer than this; a long-
+  /// lived SSE stream stays alive only while its heartbeat keeps writing (M-3).
+  /// Lower values are used by tests to exercise idle reaping in bounded time.
+  void setIdleTimeout(std::chrono::seconds timeout)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _idleTimeout = timeout;
+  }
+
+  /// \brief Sets the transport GC sweep interval applied at the next start()
+  /// (default 5s) — how often idle/stalled sessions are checked.
+  void setGcInterval(std::chrono::seconds interval)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _gcInterval = interval;
+  }
+
   /// \brief Gets the current port.
   int getPort() const
   {
@@ -381,7 +399,8 @@ public:
       // Configure transport
       TransportConfig config;
       config.protocol = Protocol::TCP;
-      config.idleTimeout = std::chrono::seconds(600);
+      config.idleTimeout = _idleTimeout;
+      config.gcInterval = _gcInterval;
       config.maxPendingSyncOps = 32;
       config.defaultSyncTimeout = std::chrono::milliseconds(30000);
       config.enableTcpNoDelay = true;
@@ -596,8 +615,9 @@ protected:
     }
   }
 
-  /// \brief Close a session's TCP connection.
-  void closeSession(SessionId sid)
+  /// \brief Close a session's TCP connection. Virtual so the SSE test double can
+  /// record explicit-close (RD-19) calls without a live transport.
+  virtual void closeSession(SessionId sid)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     if (_transport && !_shutdown)
@@ -610,19 +630,32 @@ protected:
   /// _mutex briefly itself (like sendRaw) — SAFE because, under the narrowed
   /// dispatch lock, the calling handler holds no HttpServer lock. The bytes are
   /// enqueued via the engine per-session write queue and delivered by the I/O
-  /// thread; the completion lambda is capture-only (keeps the buffer alive) and
-  /// MUST NOT re-acquire _mutex, since the engine fires it synchronously on the
-  /// caller's thread. Reached by upgradeToSse / SseStream via the friend grant.
-  void sendRawForSse(SessionId sid, const std::uint8_t *data, std::size_t len)
+  /// thread. Returns true iff the transport is up and the send command was
+  /// ENQUEUED onto the engine command queue — NOT a delivery acknowledgement, and
+  /// NOT a per-session liveness check (an enqueue to an already-closed session
+  /// still returns true; the I/O thread drops it later). It therefore returns
+  /// false only when the transport is down/shutting down. This is the SSE
+  /// primitive's SECONDARY write-failure signal (the PRIMARY disconnect signal is
+  /// the Transport::observe callback) — SseStream::writeEvent flips its advisory
+  /// _open to false when this returns false. The completion lambda
+  /// fires SYNCHRONOUSLY on the caller's thread; it keeps the buffer alive and
+  /// records delivery into a stack local — it MUST NOT re-acquire _mutex.
+  /// Virtual so the SSE test double can capture bytes / simulate failure without
+  /// a live transport. Reached by upgradeToSse / SseStream via the friend grant.
+  virtual bool sendRawForSse(SessionId sid, const std::uint8_t *data, std::size_t len)
   {
     auto sharedData =
       std::make_shared<std::string>(reinterpret_cast<const char *>(data), len);
     std::lock_guard<std::mutex> lock(_mutex);
     if (_transport && !_shutdown)
     {
+      bool delivered = false;
       _transport->sendAsync(sid, sharedData->data(), sharedData->size(),
-                            [sharedData](SessionId, const SendResult &) {});
+                            [sharedData, &delivered](SessionId, const SendResult &r)
+                            { delivered = r.isOk(); });
+      return delivered;
     }
+    return false;
   }
 
   /// \brief Subclass seam mirroring onUpgradeRequest: return true to suppress
@@ -2020,6 +2053,8 @@ private:
 
   std::string _bindAddress;
   int _port;
+  std::chrono::seconds _idleTimeout{600}; // applied at start(); SSE M-3 survival
+  std::chrono::seconds _gcInterval{5};    // applied at start(); engine GC sweep
   std::optional<TlsConfig> _tlsConfig;
   std::unique_ptr<Transport> _transport;
   ListenerId _listenerId{0};

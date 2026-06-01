@@ -138,6 +138,10 @@ set(WEB_TESTS
     web/test_base64_decode
     web/test_http_auth
     web/test_assets
+    web/test_sse_stream
+    web/test_channels
+    web/test_channels_concurrency
+    web/test_application_integration
 )
 
 # Combine enabled tests based on options
