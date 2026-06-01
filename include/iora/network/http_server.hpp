@@ -694,6 +694,7 @@ protected:
     std::string dataStr(reinterpret_cast<const char *>(data), len);
 
     // Append to session buffer with size limits
+    bool bufferLimitExceeded = false;
     {
       std::lock_guard<std::mutex> lock(_sessionMutex);
       auto it = _sessionInfo.find(sid);
@@ -707,12 +708,25 @@ protected:
       {
         iora::core::Logger::error("HttpServer: Buffer size limit exceeded for session " +
                                   std::to_string(sid) + " - closing connection");
-        _transport->close(sid);
-        return;
+        // Capture-then-close: closeSession takes _mutex, and the documented lock
+        // order is _mutex -> _sessionMutex, so it MUST NOT be called while
+        // _sessionMutex is held. Defer the close to after this scope. On this
+        // limit path the incoming data is intentionally NOT appended to the
+        // buffer (the connection is about to be closed).
+        bufferLimitExceeded = true;
       }
-
-      it->second.buffer += dataStr;
-      dataStr = it->second.buffer; // Work with complete buffer
+      else
+      {
+        it->second.buffer += dataStr;
+        dataStr = it->second.buffer; // Work with complete buffer
+      }
+    }
+    if (bufferLimitExceeded)
+    {
+      // closeSession guards '_transport && !_shutdown' under _mutex (no unguarded
+      // raw _transport deref vs stop()'s reset), with _sessionMutex NOT held.
+      closeSession(sid);
+      return;
     }
 
     // Process all complete requests in the buffer (support pipelining)
@@ -729,7 +743,9 @@ protected:
       {
         iora::core::Logger::error("HttpServer: Header size limit exceeded for session " +
                                   std::to_string(sid) + " - closing connection");
-        _transport->close(sid);
+        // No lock held here; closeSession guards '_transport && !_shutdown' under
+        // _mutex (was an unguarded raw _transport->close — UAF risk vs stop()).
+        closeSession(sid);
         return;
       }
 
@@ -771,7 +787,8 @@ protected:
               {
                 iora::core::Logger::error("HttpServer: Body size limit exceeded for session " +
                                           std::to_string(sid) + " - closing connection");
-                _transport->close(sid);
+                // No lock held; guarded close (was unguarded raw _transport->close).
+                closeSession(sid);
                 return;
               }
             }
@@ -780,7 +797,8 @@ protected:
               iora::core::Logger::error("HttpServer: Invalid "
                                         "content-length header for session " +
                                         std::to_string(sid) + " - closing connection");
-              _transport->close(sid);
+              // No lock held; guarded close (was unguarded raw _transport->close).
+              closeSession(sid);
               return;
             }
           }
@@ -1563,7 +1581,11 @@ protected:
       iora::core::Logger::error("HttpServer: Exception while sending "
                                 "error response to session " +
                                 std::to_string(sid) + ": " + e.what());
-      // Force close the connection if error response fails
+      // Force close the connection if error response fails. The '!_shutdown'
+      // half of the canonical guard is intentionally omitted here: this is a
+      // best-effort force-close on the error path that must run even during
+      // shutdown. Safe — it holds _mutex and null-checks _transport, and
+      // stop()'s _transport.reset() is also under _mutex, so no dangling deref.
       std::lock_guard<std::mutex> lock(_mutex);
       if (_transport)
       {

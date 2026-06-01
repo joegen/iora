@@ -178,6 +178,30 @@ public:
     return std::string(tmp, static_cast<std::size_t>(n));
   }
 
+  // Returns true iff the peer (server) closed the connection — recv() returns 0
+  // (EOF), distinct from a timeout (n<0). Drains any pending server bytes first
+  // (the size-limit close paths send nothing, so EOF arrives promptly). Bounded
+  // by the socket SO_RCVTIMEO so a hung server fails the assertion rather than
+  // blocking the suite.
+  bool peerClosed()
+  {
+    char tmp[4096];
+    for (;;)
+    {
+      ssize_t n = ::recv(_fd, tmp, sizeof(tmp), 0);
+      if (n == 0)
+      {
+        return true; // EOF — server closed the connection
+      }
+      if (n < 0)
+      {
+        return false; // timeout (server still holding the connection open)
+      }
+      // n > 0: server sent bytes (none expected for limit closes) — keep reading
+      // until EOF or timeout.
+    }
+  }
+
   // Parse one HTTP response. Body-length rules: HEAD / 204 / 304 carry no body;
   // otherwise read Content-Length bytes (or until close if absent).
   RawResponse readResponse(const std::string &method)
@@ -743,6 +767,83 @@ TEST_CASE("routing: handler closeSession/sendRawForSse on its own session does n
     }
   }
   REQUIRE(done); // handler completed (no self-deadlock) within ~2s
+
+  srv.stop();
+}
+
+// ---------------------------------------------------------------------------
+// handleIncomingData size-limit / parse-error close paths (tracker 2026-05-30-2):
+// each must close the connection through the GUARDED closeSession (was an
+// unguarded raw _transport->close — UAF risk vs stop(); the buffer-limit site
+// also ran under _sessionMutex, so the fix defers the close to outside that lock
+// to avoid a _sessionMutex->_mutex inversion). The server must CLEANLY close the
+// socket (EOF), not hang.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("routing: invalid Content-Length closes the connection", "[routing][limits]")
+{
+  TestServer srv;
+  srv.onPost("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  c.sendRaw("POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: notanumber\r\n\r\n");
+  REQUIRE(c.peerClosed()); // closeSession ran (loop site, no lock held)
+
+  srv.stop();
+}
+
+TEST_CASE("routing: Content-Length over MAX_BODY_SIZE closes the connection", "[routing][limits]")
+{
+  TestServer srv;
+  srv.onPost("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  // 20 MB declared (> MAX_BODY_SIZE 10 MB); the header alone triggers the close
+  // before any body is sent.
+  c.sendRaw("POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 20000000\r\n\r\n");
+  REQUIRE(c.peerClosed());
+
+  srv.stop();
+}
+
+TEST_CASE("routing: header block over MAX_HEADER_SIZE closes the connection", "[routing][limits]")
+{
+  TestServer srv;
+  srv.onGet("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  // > 64 KB of header bytes before the terminator (loop site, no lock held).
+  std::string req = "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+  req += "X-Big: ";
+  req += std::string(70 * 1024, 'a');
+  req += "\r\n\r\n";
+  c.sendRaw(req);
+  REQUIRE(c.peerClosed());
+
+  srv.stop();
+}
+
+TEST_CASE("routing: per-session buffer over MAX_BUFFER_SIZE closes without deadlock",
+          "[routing][limits]")
+{
+  TestServer srv;
+  srv.onGet("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  // > 1 MB with NO "\r\n\r\n" terminator, so it accumulates in the per-session
+  // buffer and trips MAX_BUFFER_SIZE — the site that runs under _sessionMutex.
+  // The capture-then-close fix must close the socket cleanly (no inversion/hang).
+  c.sendRaw("GET /x HTTP/1.1\r\n");
+  c.sendRaw(std::string(1024 * 1024 + 4096, 'Z'));
+  REQUIRE(c.peerClosed()); // closed via the deferred guarded closeSession
 
   srv.stop();
 }

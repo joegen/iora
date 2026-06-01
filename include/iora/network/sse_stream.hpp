@@ -468,25 +468,30 @@ inline void upgradeToSse(HttpServer &server, const HttpServer::Request &req,
   // parsed-then-ignored, not drained).
   server.markSessionUpgraded(req.sid);
 
-  // Step 4 (M-3): stop app-data reads on this write-only session. NOTE this does
-  // NOT exempt the 600s idleTimeout — the 15s heartbeat keeps the session alive.
-  // _transport is dereferenced without _mutex here (unlike sendRaw/closeSession):
-  // safe because upgradeToSse runs inside a live request handler, and _transport
-  // is only reset in HttpServer::stop() AFTER all in-flight handlers have drained
-  // — so it cannot be torn down underneath this call (cpp17-L4).
-  if (server._transport)
+  // Steps 4-5: take _mutex and re-check '_transport && !_shutdown' before
+  // dereferencing the private _transport — the SAME invariant sendRaw /
+  // closeSession use. A worker running upgradeToSse can straggle past stop()'s
+  // bounded drain wait and race _transport.reset() (also under _mutex), so an
+  // unguarded raw deref here would be a use-after-free (the defect class of
+  // tracker 2026-05-30-2). _mutex is the outermost lock; setReadMode/observe take
+  // only the transport's own internal locks, so no inversion. The observer
+  // closure must NOT be invoked under _mutex — but observe() only REGISTERS it
+  // (the engine dispatches markClosed later, lock-free), so registration under
+  // _mutex is safe.
   {
-    server._transport->setReadMode(req.sid, ReadMode::Disabled);
-  }
-
-  // Step 5 (thread-H1/H2/M3): register the disconnect observer. The closure
-  // captures the shared_ptr BY VALUE (strong ref) so the stream survives an
-  // in-flight publish; the engine auto-purges per-session observers on close, so
-  // no explicit unobserve is needed.
-  if (server._transport)
-  {
-    server._transport->observe(
-      req.sid, [stream](SessionId, const TransportErrorInfo &) { stream->markClosed(); });
+    std::lock_guard<std::mutex> lock(server._mutex);
+    if (server._transport && !server._shutdown)
+    {
+      // Step 4 (M-3): stop app-data reads on this write-only session. NOTE this
+      // does NOT exempt the 600s idleTimeout — the 15s heartbeat keeps it alive.
+      server._transport->setReadMode(req.sid, ReadMode::Disabled);
+      // Step 5 (thread-H1/H2/M3): register the disconnect observer. The closure
+      // captures the shared_ptr BY VALUE (strong ref) so the stream survives an
+      // in-flight publish; the engine auto-purges per-session observers on close,
+      // so no explicit unobserve is needed. The returned ObserverId is discarded.
+      server._transport->observe(
+        req.sid, [stream](SessionId, const TransportErrorInfo &) { stream->markClosed(); });
+    }
   }
 
   // Step 6 (RD-1/H-5): suppress the worker's terminal response — clean
