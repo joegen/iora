@@ -13,7 +13,7 @@
 #   - CORE: Logging, threading, timers (6 tests)
 #   - PARSERS: JSON and XML parsing (2 tests)
 #   - SERVICE: Plugin system and main framework (4 tests)
-#   - STORAGE: Persistent storage (1 test)
+#   - STORAGE: Persistent storage (2 tests)
 #   - UTIL: Caching and utilities (1 test)
 #   - DEBUG: Debug and helper tests (2 tests)
 #
@@ -110,6 +110,7 @@ set(UTIL_TESTS
 # Storage namespace tests
 set(STORAGE_TESTS
     storage/iora_test_state
+    storage/iora_test_kvstore
 )
 
 # Service/Plugin system tests
@@ -209,6 +210,13 @@ foreach(test_path ${ALL_TESTS})
         create_individual_test(${test_path})
     endif()
 endforeach()
+
+# Suppress a known GCC false-positive (-Wfree-nonheap-object) triggered by
+# vector::reserve inlined from KVStore::writeLogEntry. Matches the suppression
+# the former mod_kvstore target carried.
+if(TARGET iora_test_kvstore)
+    target_compile_options(iora_test_kvstore PRIVATE -Wno-free-nonheap-object)
+endif()
 
 # Create a test target that runs all enabled individual tests
 if(ALL_TESTS)

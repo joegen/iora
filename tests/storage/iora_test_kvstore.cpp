@@ -4,7 +4,7 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
-#include "iora/iora.hpp"
+#define CATCH_CONFIG_MAIN
 #include "iora/storage/kvstore.hpp"
 
 // Use namespaced types
@@ -17,7 +17,6 @@ using iora::storage::MAX_VALUE_LENGTH;
 #include <catch2/catch.hpp>
 #include <chrono>
 #include <cstdio>
-#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -745,55 +744,4 @@ TEST_CASE("KVStore handles shutdown and cleanup", "[kvstore][cleanup][shutdown]"
 
   std::remove(file.c_str());
   std::remove((file + ".log").c_str());
-}
-
-TEST_CASE("KVStore plugin API set/get via IoraService (full integration)",
-          "[kvstore][plugin][api][integration]")
-{
-  // Setup IoraService config
-  iora::IoraService::Config config;
-  config.server.port = 8131;
-  config.state.file = "ioraservice_kvstore_state.json";
-  config.log.file = "ioraservice_kvstore_log";
-
-  // Initialize service with CLI args
-  iora::IoraService::init(config);
-  iora::IoraService &svc = iora::IoraService::instanceRef();
-  iora::IoraService::AutoServiceShutdown autoShutdown(svc);
-
-  auto pluginPathOpt =
-    iora::util::resolveRelativePath(iora::util::getExecutableDir(), "../") + "/mod_kvstore.so";
-  std::cout << "Plugin path: " << pluginPathOpt << std::endl;
-  REQUIRE(std::filesystem::exists(pluginPathOpt));
-  REQUIRE(svc.loadSingleModule(pluginPathOpt));
-
-  SECTION("callExportedApi: set/get")
-  {
-    std::string key = "plugin_key";
-    std::vector<uint8_t> value = {42, 43, 44};
-    svc.callExportedApi<void, const std::string &, const std::vector<uint8_t> &>("kvstore.set", key,
-                                                                                 value);
-    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string &>(
-      "kvstore.get", key);
-    REQUIRE(got.has_value());
-    REQUIRE(got.value() == value);
-  }
-
-  SECTION("Plugin reload: unload and reload shared library, data persists")
-  {
-    std::string key = "reload_key";
-    std::vector<uint8_t> value = {99, 100, 101};
-    svc.callExportedApi<void, const std::string &, const std::vector<uint8_t> &>("kvstore.set", key,
-                                                                                 value);
-    REQUIRE(svc.unloadSingleModule("mod_kvstore.so"));
-    REQUIRE(svc.loadSingleModule(pluginPathOpt));
-    auto got = svc.callExportedApi<std::optional<std::vector<uint8_t>>, const std::string &>(
-      "kvstore.get", key);
-    REQUIRE(got.has_value());
-    REQUIRE(got.value() == value);
-  }
-
-  iora::util::removeFilesContainingAny({"ioraservice_kvstore_log", "ioraservice_kvstore_state.json",
-                                        "test_kvstore_plugin_api.bin",
-                                        "test_kvstore_plugin_api.bin.log"});
 }

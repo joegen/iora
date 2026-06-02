@@ -3471,21 +3471,7 @@ void robustServiceManagement() {
 
 ## 🔌 Available Plugins
 
-Iora ships with three production-ready plugins, with more planned:
-
-### 🗄️ **KVStore Plugin** (`mod_kvstore`)
-High-performance binary key-value storage with advanced features:
-- **Binary-optimized storage** with WAL (Write-Ahead Logging)
-- **Background compaction** for optimal performance  
-- **Configurable caching** with LRU eviction
-- **Atomic operations** and crash recovery
-- **Batch operations** for high-throughput scenarios
-
-**API Methods:**
-- `kvstore.get(key)` → `std::optional<std::vector<uint8_t>>`
-- `kvstore.set(key, value)` → `void`
-- `kvstore.setBatch(batch)` → `void` 
-- `kvstore.getBatch(keys)` → `std::vector<std::optional<std::vector<uint8_t>>>`
+Iora ships with two production-ready plugins, with more planned:
 
 ### 🌐 **JSON-RPC Server Plugin** (`mod_jsonrpc_server`)
 Full JSON-RPC 2.0 specification compliance with enterprise features:
