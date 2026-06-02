@@ -142,6 +142,7 @@ set(WEB_TESTS
     web/test_channels
     web/test_channels_concurrency
     web/test_application_integration
+    web/test_htmx_helpers
 )
 
 # Combine enabled tests based on options
