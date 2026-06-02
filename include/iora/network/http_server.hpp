@@ -119,6 +119,18 @@ public:
       headers["Content-Length"] = std::to_string(content.size());
     }
 
+    /// \brief Move overload: lets a caller hand off an already-materialized body
+    /// (e.g. serveStatic's std::string(view) temporary) without an extra copy.
+    /// Content-Length is read from content.size() BEFORE the move (a moved-from
+    /// string has unspecified length). Existing lvalue callers bind to the
+    /// const& overload above; an rvalue temporary binds here automatically.
+    void set_content(std::string &&content, const std::string &contentType)
+    {
+      headers["Content-Type"] = contentType;
+      headers["Content-Length"] = std::to_string(content.size());
+      body = std::move(content);
+    }
+
     void set_header(const std::string &key, const std::string &value) { headers[key] = value; }
   };
 
@@ -1517,6 +1529,8 @@ protected:
       return "Method Not Allowed";
     case 413:
       return "Payload Too Large";
+    case 414:
+      return "URI Too Long";
     case 426:
       return "Upgrade Required";
     case 500:

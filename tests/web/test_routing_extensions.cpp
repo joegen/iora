@@ -724,6 +724,139 @@ TEST_CASE("http_message: parseMethod case-sensitive + RFC 9110 token validation 
 }
 
 // ---------------------------------------------------------------------------
+// Tracker 2026-06-02-1 — request-line single-SP strictness (RFC 9112 §3) +
+// request-target octet/length validation (CTL/DEL -> 400, over-length -> 414,
+// non-ASCII accepted). Unit-level via HttpRequest::fromWireFormat.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("http_message: request-line single-SP + request-target octet validation (unit)",
+          "[parser][requestline]")
+{
+  using iora::network::HttpRequest;
+  using iora::network::HttpRequestError;
+
+  // Returns 0 if the request line parses, else the thrown HttpRequestError status.
+  auto status = [](const std::string &requestLine) -> int
+  {
+    std::string data = requestLine + "\r\nHost: 127.0.0.1\r\n\r\n";
+    try
+    {
+      HttpRequest::fromWireFormat(data);
+      return 0;
+    }
+    catch (const HttpRequestError &e)
+    {
+      return e.status();
+    }
+  };
+
+  // Positive control: a normal request line parses unchanged.
+  REQUIRE(status("GET /path?q=1 HTTP/1.1") == 0);
+
+  // Whitespace strictness (RFC 9112 §3) -> 400.
+  REQUIRE(status("GET  /x HTTP/1.1") == 400);       // double SP (empty target)
+  REQUIRE(status("GET /x  HTTP/1.1") == 400);       // double SP (leading SP in version)
+  REQUIRE(status(" GET /x HTTP/1.1") == 400);       // leading SP (empty method)
+  REQUIRE(status("GET /x HTTP/1.1 ") == 400);       // trailing SP
+  REQUIRE(status("GET\t/x HTTP/1.1") == 400);       // tab as separator
+  REQUIRE(status("GET /x HTTP/1.1 extra") == 400);  // 4th field (extra-token subsumed)
+  REQUIRE(status("GET /x") == 400);                 // missing version (2 fields)
+  REQUIRE(status("GET") == 400);                    // single field
+  REQUIRE(status("") == 400);                       // empty line
+  REQUIRE(status("GET  HTTP/1.1") == 400);          // empty target
+  REQUIRE(status(std::string("GET /x") + char(0x0d) + "y HTTP/1.1") == 400); // embedded CR in target
+
+  // Non-SP control bytes in the method / version fields exercise the per-field
+  // byte-loops (a non-SP CTL never reaches them via the SP-structural checks).
+  REQUIRE(status(std::string("GE") + char(0x0b) + "T /x HTTP/1.1") == 400);  // VT in method
+  REQUIRE(status(std::string("GE") + char(0x0c) + "T /x HTTP/1.1") == 400);  // FF in method
+  REQUIRE(status(std::string("GET") + char(0x0d) + "/x HTTP/1.1") == 400);   // bare CR in method region (one-SP structural reject)
+  REQUIRE(status(std::string("GET /x HT") + char(0x01) + "TP/1.1") == 400);  // CTL in version field
+
+  // Request-target octet validation.
+  REQUIRE(status(std::string("GET /a") + char(0x01) + " HTTP/1.1") == 400); // CTL in target
+  REQUIRE(status(std::string("GET /a") + char(0x7f) + " HTTP/1.1") == 400); // DEL in target
+  // 414 length bound. target length = 1 ('/') + N. Exact boundary: 8192 parses, 8193 -> 414.
+  REQUIRE(status("GET /" + std::string(8191, 'a') + " HTTP/1.1") == 0);     // target len 8192 (at limit)
+  REQUIRE(status("GET /" + std::string(8192, 'a') + " HTTP/1.1") == 414);   // target len 8193 (over)
+  REQUIRE(status("GET /" + std::string(9000, 'a') + " HTTP/1.1") == 414);   // clearly over -> 414
+  REQUIRE(status("GET /" + std::string(8000, 'a') + " HTTP/1.1") == 0);     // clearly under -> parses
+
+  // Negative controls — MUST NOT be rejected (over-rejection guard).
+  REQUIRE(status("OPTIONS * HTTP/1.1") == 0);                 // asterisk-form (SR-1)
+  REQUIRE(status("CONNECT example.com:443 HTTP/1.1") == 0);   // authority-form
+  REQUIRE(status("GET /a%20b HTTP/1.1") == 0);                // percent-encoded
+  REQUIRE(status("GET /a%zz HTTP/1.1") == 0);                 // malformed percent accepted at parse
+  REQUIRE(status(std::string("GET /caf") + char(0xc3) + char(0xa9) + " HTTP/1.1") == 0); // raw UTF-8
+}
+
+// ---------------------------------------------------------------------------
+// Tracker 2026-06-02-2 — Response::set_content move overload (avoids one copy).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("http_server: Response::set_content move overload (unit)", "[parser][response][setcontent]")
+{
+  // Move overload: body populated, Content-Length == PRE-move length (the
+  // size-before-move guard — a moved-from string has unspecified length).
+  {
+    Response res;
+    std::string src("PAYLOAD"); // 7 bytes
+    res.set_content(std::move(src), "text/plain");
+    REQUIRE(res.body == "PAYLOAD");
+    REQUIRE(res.headers["Content-Type"] == "text/plain");
+    REQUIRE(res.headers["Content-Length"] == "7");
+  }
+  // const& overload unchanged: an lvalue still binds to the copy overload and
+  // the source is left untouched.
+  {
+    Response res;
+    std::string lv("X");
+    res.set_content(lv, "text/plain");
+    REQUIRE(res.body == "X");
+    REQUIRE(lv == "X"); // not moved-from
+    REQUIRE(res.headers["Content-Length"] == "1");
+  }
+}
+
+TEST_CASE("routing: malformed request line -> 400, over-long target -> 414 on the wire",
+          "[routing][requestline]")
+{
+  TestServer srv;
+  srv.onGet("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  // Malformed request lines must be sent raw (rawRequest composes a well-formed
+  // line); each reaches the processHttpRequest catch -> 400 on the wire.
+  auto wireStatus = [&](const std::string &requestLine) -> int
+  {
+    RawConn c;
+    REQUIRE(c.open(port));
+    c.sendRaw(requestLine + "\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    return c.readResponse("GET").status;
+  };
+  REQUIRE(wireStatus("GET  /x  HTTP/1.1") == 400);                            // double SP
+  REQUIRE(wireStatus("GET\t/x HTTP/1.1") == 400);                            // tab separator
+  REQUIRE(wireStatus(std::string("GET /x") + char(0x01) + "y HTTP/1.1") == 400); // CTL in target
+  REQUIRE(wireStatus("GET  HTTP/1.1") == 400);                               // empty target
+
+  // Over-long request-target -> 414 URI Too Long (RFC 9112 §3 MUST), reason phrase on the wire.
+  {
+    RawConn c;
+    REQUIRE(c.open(port));
+    std::string target = "/" + std::string(9000, 'a');
+    c.sendRaw("GET " + target + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    auto r = c.readResponse("GET");
+    REQUIRE(r.status == 414);
+    REQUIRE(r.rawHead.find("414 URI Too Long") != std::string::npos);
+  }
+
+  // Positive control over the wire: a valid request still routes.
+  REQUIRE(rawRequest(port, "GET", "/x").status == 200);
+
+  srv.stop();
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3.4 / 3.5.4 + 3.5.5 — SSE suppression primitives, sid population,
 // no-self-deadlock, suppression cleared on throw.
 // ---------------------------------------------------------------------------

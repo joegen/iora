@@ -433,21 +433,74 @@ public:
   }
 
 private:
+  /// \brief Max request-target length (RFC 9112 §3): over-length -> 414. Kept
+  /// well below SessionInfo::MAX_HEADER_SIZE (64 KB) so the deterministic 414
+  /// fires before the transport's silent header-size close. (Tracker 2026-06-02-1.)
+  static constexpr std::size_t MAX_REQUEST_TARGET_SIZE = 8192;
+
   static void parseRequestLine(const std::string &line, HttpRequest &request)
   {
-    std::istringstream iss(line);
-    std::string methodStr, versionStr;
-    iss >> methodStr >> request.uri >> versionStr;
-
-    // RFC 9112 §3: the request-line is EXACTLY three space-delimited fields
-    // (method SP request-target SP HTTP-version). Any trailing token is a
-    // malformed request-line -> 400 Bad Request (RFC 9110 §15.5.1).
-    std::string extra;
-    if (iss >> extra)
+    // RFC 9112 §3: request-line = method SP request-target SP HTTP-version, with
+    // EXACTLY one SP (0x20) between the three fields. Lenient whitespace handling
+    // is a §3 MAY but enables request smuggling across multiple recipients, so
+    // iora enforces strict single-SP and rejects any other inter-field/in-field
+    // whitespace with 400 (§3 SHOULD). Explicit SP-index split — NOT
+    // std::istringstream, which collapses whitespace runs and skips leading/
+    // trailing whitespace. (Tracker 2026-06-02-1.) The caller has already stripped
+    // a single trailing CR, so an embedded CR/LF is rejected by the byte checks.
+    const std::size_t p1 = line.find(' ');
+    const std::size_t p2 = (p1 == std::string::npos) ? std::string::npos : line.find(' ', p1 + 1);
+    if (p1 == std::string::npos || p2 == std::string::npos || p1 == 0 || p2 == p1 + 1 ||
+        p2 + 1 >= line.size())
     {
-      throw HttpRequestError(400, "Malformed request line (unexpected extra token)");
+      // Missing/extra SP, empty method/target/version, or no version field.
+      throw HttpRequestError(400,
+                             "Malformed request line (RFC 9112 §3: method SP target SP version)");
+    }
+    const std::string methodStr = line.substr(0, p1);
+    std::string target = line.substr(p1 + 1, p2 - (p1 + 1));
+    const std::string versionStr = line.substr(p2 + 1);
+
+    // No other whitespace/CTL inside the method or version fields. A SP in the
+    // version field (a 3rd separator / 4th token / trailing SP) is rejected here,
+    // subsuming the former extra-token check. Locale-independent unsigned-char
+    // range test (never std::iscntrl/isspace).
+    for (char c : methodStr)
+    {
+      if (static_cast<unsigned char>(c) < 0x21)
+      {
+        throw HttpRequestError(400, "Malformed request line (whitespace/control in method)");
+      }
+    }
+    for (char c : versionStr)
+    {
+      if (static_cast<unsigned char>(c) < 0x21)
+      {
+        throw HttpRequestError(400, "Malformed request line (whitespace/control in version)");
+      }
     }
 
+    // Request-target octet validation (RFC 9112 §3.2 / RFC 3986). Length first
+    // (RFC 9112 §3 MUST: over-long request-target -> 414 URI Too Long), then
+    // reject CTL (<0x20) and DEL (0x7F) -> 400 (log/response-splitting surface).
+    // Non-ASCII bytes (0x80-0xFF) are ACCEPTED as opaque octets — browsers/curl
+    // send raw UTF-8 in the path and iora routing is byte-exact; bytes are never
+    // transformed. Request-target FORM (origin/absolute/authority/asterisk) is
+    // NOT structurally validated, so 'OPTIONS *' and 'CONNECT host:port' parse.
+    if (target.size() > MAX_REQUEST_TARGET_SIZE)
+    {
+      throw HttpRequestError(414, "Request-target too long");
+    }
+    for (char c : target)
+    {
+      const unsigned char u = static_cast<unsigned char>(c);
+      if (u < 0x20 || u == 0x7F)
+      {
+        throw HttpRequestError(400, "Malformed request-target (control character)");
+      }
+    }
+
+    request.uri = std::move(target);
     request.method = parseMethod(methodStr); // throws HttpRequestError(400/501)
     // A malformed or missing HTTP-version in the request line is a client error
     // (400 Bad Request, RFC 9110 §15.5.1 / RFC 9112 §2.3), NOT a 500 (web-M3).
