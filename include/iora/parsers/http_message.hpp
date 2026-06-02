@@ -74,32 +74,98 @@ inline std::string toString(HttpMethod method)
   }
 }
 
-/// \brief Convert string to HttpMethod
+/// \brief Parse error carrying the HTTP status the origin server should return.
+/// Thrown by the request parser so the server can answer the RFC-appropriate
+/// status (400 Bad Request for a malformed token, 501 Not Implemented for a
+/// well-formed but unsupported method) instead of a blanket 500.
+class HttpRequestError : public std::runtime_error
+{
+public:
+  HttpRequestError(int status, const std::string &message)
+      : std::runtime_error(message), _status(status)
+  {
+  }
+  int status() const noexcept { return _status; }
+
+private:
+  int _status;
+};
+
+/// \brief True iff `s` is a non-empty RFC 9110 §5.6.2 token (1*tchar): every
+/// character is a tchar (ALPHA / DIGIT / "!#$%&'*+-.^_`|~"). Used to distinguish
+/// a malformed method token (400) from a well-formed unsupported one (501).
+inline bool isHttpToken(const std::string &s)
+{
+  if (s.empty())
+  {
+    return false;
+  }
+  static const std::string kTcharPunct = "!#$%&'*+-.^_`|~";
+  for (unsigned char c : s)
+  {
+    // Locale-INDEPENDENT ASCII classification: std::isalnum is locale-sensitive
+    // and a non-C LC_CTYPE could classify high bytes (e.g. Latin-1 0xC0-0xFF) as
+    // alpha, over-accepting non-tchar bytes (web-M1). The tchar grammar is pure
+    // ASCII, so test ranges directly.
+    const bool tchar = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                       (c >= '0' && c <= '9') ||
+                       (kTcharPunct.find(static_cast<char>(c)) != std::string::npos);
+    if (!tchar)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// \brief Convert a request method token to HttpMethod. Method names are
+/// CASE-SENSITIVE per RFC 9110 §9.1 (registered methods are uppercase). A
+/// well-formed but unrecognized token throws HttpRequestError(501); a malformed
+/// token throws HttpRequestError(400).
 inline HttpMethod parseMethod(const std::string &method)
 {
-  std::string upperMethod = method;
-  std::transform(upperMethod.begin(), upperMethod.end(), upperMethod.begin(), ::toupper);
-
-  if (upperMethod == "GET")
+  if (method == "GET")
+  {
     return HttpMethod::GET;
-  if (upperMethod == "POST")
+  }
+  if (method == "POST")
+  {
     return HttpMethod::POST;
-  if (upperMethod == "PUT")
+  }
+  if (method == "PUT")
+  {
     return HttpMethod::PUT;
-  if (upperMethod == "DELETE")
+  }
+  if (method == "DELETE")
+  {
     return HttpMethod::DELETE;
-  if (upperMethod == "HEAD")
+  }
+  if (method == "HEAD")
+  {
     return HttpMethod::HEAD;
-  if (upperMethod == "OPTIONS")
+  }
+  if (method == "OPTIONS")
+  {
     return HttpMethod::OPTIONS;
-  if (upperMethod == "PATCH")
+  }
+  if (method == "PATCH")
+  {
     return HttpMethod::PATCH;
-  if (upperMethod == "CONNECT")
+  }
+  if (method == "CONNECT")
+  {
     return HttpMethod::CONNECT;
-  if (upperMethod == "TRACE")
+  }
+  if (method == "TRACE")
+  {
     return HttpMethod::TRACE;
+  }
 
-  throw std::invalid_argument("Unknown HTTP method: " + method);
+  if (!isHttpToken(method))
+  {
+    throw HttpRequestError(400, "Malformed HTTP method token");
+  }
+  throw HttpRequestError(501, "Unsupported HTTP method: " + method);
 }
 
 /// \brief HTTP version representation
@@ -115,31 +181,41 @@ struct HttpVersion
 
   static HttpVersion parse(const std::string &version)
   {
-    if (version.substr(0, 5) != "HTTP/")
+    // RFC 9112 §2.3: HTTP-version = "HTTP" "/" DIGIT "." DIGIT — EXACTLY one
+    // DIGIT per component (8 chars total), no sign/whitespace/leading-zero/
+    // multi-digit/trailing junk. std::stoi is far too lenient (it skips leading
+    // whitespace, accepts a sign, accepts multi-digit, and silently ignores
+    // trailing non-digits), which both over-accepts malformed versions (e.g.
+    // "HTTP/1.1xyz" -> 1.1) and misroutes them (e.g. "HTTP/11.0" -> major 11 ->
+    // 505 instead of the correct 400). Parse the two digits explicitly.
+    if (version.size() != 8 || version.compare(0, 5, "HTTP/") != 0 ||
+        version[5] < '0' || version[5] > '9' || version[6] != '.' ||
+        version[7] < '0' || version[7] > '9')
     {
-      throw std::invalid_argument("Invalid HTTP version format");
+      throw std::invalid_argument("Malformed HTTP-version");
     }
-
-    auto dotPos = version.find('.', 5);
-    if (dotPos == std::string::npos)
-    {
-      throw std::invalid_argument("Invalid HTTP version format");
-    }
-
     HttpVersion result;
-    result.major = std::stoi(version.substr(5, dotPos - 5));
-    result.minor = std::stoi(version.substr(dotPos + 1));
+    result.major = version[5] - '0';
+    result.minor = version[7] - '0';
     return result;
   }
 };
 
-/// \brief Case-insensitive string comparison for headers
+/// \brief Case-insensitive string comparison for headers. HTTP field names are
+/// US-ASCII tokens (RFC 9110 §5.1), so fold case with a locale-INDEPENDENT ASCII
+/// fold — std::tolower(char) is locale-sensitive and is UB for a negative char
+/// (bytes >= 0x80), which would mis-order or mis-compare non-ASCII header bytes.
 struct CaseInsensitiveCompare
 {
+  static char asciiLower(unsigned char c)
+  {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : static_cast<char>(c);
+  }
   bool operator()(const std::string &a, const std::string &b) const
   {
-    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(), [](char a, char b)
-                                        { return std::tolower(a) < std::tolower(b); });
+    return std::lexicographical_compare(
+      a.begin(), a.end(), b.begin(), b.end(), [](char x, char y)
+      { return asciiLower(static_cast<unsigned char>(x)) < asciiLower(static_cast<unsigned char>(y)); });
   }
 };
 
@@ -363,8 +439,42 @@ private:
     std::string methodStr, versionStr;
     iss >> methodStr >> request.uri >> versionStr;
 
-    request.method = parseMethod(methodStr);
-    request.version = HttpVersion::parse(versionStr);
+    // RFC 9112 §3: the request-line is EXACTLY three space-delimited fields
+    // (method SP request-target SP HTTP-version). Any trailing token is a
+    // malformed request-line -> 400 Bad Request (RFC 9110 §15.5.1).
+    std::string extra;
+    if (iss >> extra)
+    {
+      throw HttpRequestError(400, "Malformed request line (unexpected extra token)");
+    }
+
+    request.method = parseMethod(methodStr); // throws HttpRequestError(400/501)
+    // A malformed or missing HTTP-version in the request line is a client error
+    // (400 Bad Request, RFC 9110 §15.5.1 / RFC 9112 §2.3), NOT a 500 (web-M3).
+    // HttpVersion::parse throws std::invalid_argument/std::out_of_range; the
+    // response parser also uses it, so map to 400 HERE (request path only) rather
+    // than changing HttpVersion::parse globally.
+    try
+    {
+      request.version = HttpVersion::parse(versionStr);
+    }
+    catch (const HttpRequestError &)
+    {
+      throw; // already carries a request status
+    }
+    catch (const std::exception &)
+    {
+      throw HttpRequestError(400, "Malformed or missing HTTP version in request line");
+    }
+
+    // RFC 9110 §15.5.6: a well-formed but unsupported HTTP MAJOR version ->
+    // 505 HTTP Version Not Supported. iora speaks HTTP/1.x only, so any major
+    // other than 1 (e.g. HTTP/0.9, HTTP/2.0, HTTP/3.0) is rejected; the minor
+    // version is forward-compatible (1.0 and 1.1 both accepted).
+    if (request.version.major != 1)
+    {
+      throw HttpRequestError(505, "Unsupported HTTP major version");
+    }
   }
 
   static void parseHeaderLine(const std::string &line, HttpHeaders &headers)

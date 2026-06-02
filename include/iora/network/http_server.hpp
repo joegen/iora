@@ -1291,6 +1291,16 @@ protected:
     {
       iora::core::Logger::error("Error processing HTTP request: " + std::string(ex.what()));
 
+      // RFC 9110: a request-parse failure maps to a specific status — 400 Bad
+      // Request for a malformed method token, 501 Not Implemented for a
+      // well-formed but unsupported method (HttpRequestError carries it). Any
+      // other exception is a genuine 500.
+      int errStatus = 500;
+      if (auto *reqErr = dynamic_cast<const HttpRequestError *>(&ex))
+      {
+        errStatus = reqErr->status();
+      }
+
       // Check if transport is still available before sending error response.
       // SR-7: enqueue under _mutex with a capture-only completion lambda, then
       // perform the (unconditional) post-error close after the lock_guard
@@ -1305,9 +1315,10 @@ protected:
                                     std::to_string(sid));
 
           // Send error response
-          HttpResponse errorRes(500, "Internal Server Error");
+          HttpResponse errorRes(errStatus, getStatusText(errStatus));
           errorRes.setHeader("Content-Type", "text/plain");
-          errorRes.body = "Internal Server Error";
+          errorRes.setHeader("Connection", "close"); // this path closes the socket after sending
+          errorRes.body = getStatusText(errStatus);
           errorRes.setHeader("Content-Length", std::to_string(errorRes.body.size()));
 
           auto errorResponseData = std::make_shared<std::string>(errorRes.toWireFormat());
@@ -1516,6 +1527,8 @@ protected:
       return "Bad Gateway";
     case 503:
       return "Service Unavailable";
+    case 505:
+      return "HTTP Version Not Supported";
     default:
       return "Unknown";
     }

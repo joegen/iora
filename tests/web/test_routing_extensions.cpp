@@ -635,23 +635,92 @@ TEST_CASE("routing: HEAD x 304 -> bodyless, no contradictory Content-Length (SR-
   srv.stop();
 }
 
-TEST_CASE("routing: method tokens are case-insensitive; unknown method -> 500 (SR-20)", "[routing][method]")
+TEST_CASE("routing: method tokens are case-sensitive; unknown -> 501, malformed -> 400 (RFC 9110)",
+          "[routing][method]")
 {
   TestServer srv;
   srv.onGet("/x", [](const Request &, Response &res) { res.set_content("X", "text/plain"); });
   int port = startOn(srv);
 
-  // parseMethod upper-cases the token, so lowercase 'get' dispatches GET.
-  REQUIRE(rawRequest(port, "get", "/x").body == "X");
-  // Lowercase 'head' triggers auto-HEAD-for-GET (bodyless, Content-Length:1).
-  auto h = rawRequest(port, "head", "/x");
-  REQUIRE(h.status == 200);
-  REQUIRE(h.body.empty());
-  // An unknown method currently yields 500 (outer parse catch). Documented v1
-  // behavior; RFC fix (501) tracked in backlog 2026-05-30-1.
-  REQUIRE(rawRequest(port, "FOOBAR", "/x").status == 500);
+  // Canonical uppercase GET dispatches (the only conformant spelling).
+  REQUIRE(rawRequest(port, "GET", "/x").body == "X");
+  // RFC 9110 §9.1: method names are CASE-SENSITIVE. Lowercase 'get'/'head' and
+  // MIXED-case 'Get' are well-formed tokens but NOT the registered methods ->
+  // 501 Not Implemented. ('Get' is the key regression pin: the old code
+  // upper-cased and dispatched it as GET.)
+  REQUIRE(rawRequest(port, "get", "/x").status == 501);
+  REQUIRE(rawRequest(port, "head", "/x").status == 501);
+  REQUIRE(rawRequest(port, "Get", "/x").status == 501);
+  REQUIRE(rawRequest(port, "Post", "/x").status == 501);
+  // A well-formed but unsupported method -> 501 Not Implemented (RFC 9110 §15.6.2).
+  REQUIRE(rawRequest(port, "FOOBAR", "/x").status == 501);
+  REQUIRE(rawRequest(port, "PROPFIND", "/x").status == 501);
+  // A malformed method token (illegal non-tchar char per RFC 9110 §5.6.2) -> 400.
+  REQUIRE(rawRequest(port, "G@T", "/x").status == 400);
+  REQUIRE(rawRequest(port, "BAD(METHOD)", "/x").status == 400);
+
+  // Request-line robustness (same parser), each over a fresh connection:
+  auto rawStatus = [&](const std::string &requestLineAndRest) -> int
+  {
+    RawConn vc;
+    REQUIRE(vc.open(port));
+    vc.sendRaw(requestLineAndRest);
+    return vc.readResponse("GET").status;
+  };
+  // Malformed HTTP-version (syntax error) -> 400 (web-M3, RFC 9110 §15.5.1).
+  REQUIRE(rawStatus("GET /x HTTP/x.y\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
+  // Missing HTTP-version -> 400.
+  REQUIRE(rawStatus("GET /x\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
+  // Extra token on the request line -> 400 (RFC 9112 §3, exactly 3 fields).
+  REQUIRE(rawStatus("GET /x HTTP/1.1 junk\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
+  // Well-formed but UNSUPPORTED major version -> 505 (RFC 9110 §15.5.6).
+  REQUIRE(rawStatus("GET /x HTTP/2.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 505);
+  REQUIRE(rawStatus("GET /x HTTP/0.9\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 505);
+  REQUIRE(rawStatus("GET /x HTTP/3.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 505);
+  // HTTP/1.0 (major 1, older minor) is still accepted and dispatches normally.
+  REQUIRE(rawStatus("GET /x HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 200);
+  // RFC 9112 §2.3: HTTP-version is EXACTLY one DIGIT per component. Multi-digit,
+  // leading-zero, sign, or trailing-junk versions are MALFORMED (400), NOT 505 —
+  // std::stoi would have accepted/misrouted these.
+  REQUIRE(rawStatus("GET /x HTTP/11.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
+  REQUIRE(rawStatus("GET /x HTTP/01.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
+  REQUIRE(rawStatus("GET /x HTTP/1.1xyz\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
+  REQUIRE(rawStatus("GET /x HTTP/+1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") == 400);
 
   srv.stop();
+}
+
+TEST_CASE("http_message: parseMethod case-sensitive + RFC 9110 token validation (unit)",
+          "[parser][method]")
+{
+  using iora::network::HttpMethod;
+  using iora::network::HttpRequestError;
+  using iora::network::parseMethod;
+
+  REQUIRE(parseMethod("GET") == HttpMethod::GET);
+  REQUIRE(parseMethod("TRACE") == HttpMethod::TRACE);
+
+  auto expectStatus = [](const std::string &m, int status)
+  {
+    bool threw = false;
+    try
+    {
+      parseMethod(m);
+    }
+    catch (const HttpRequestError &e)
+    {
+      threw = true;
+      REQUIRE(e.status() == status);
+    }
+    REQUIRE(threw);
+  };
+
+  expectStatus("Get", 501);    // mixed-case recognized name -> unsupported
+  expectStatus("get", 501);    // lowercase recognized name -> unsupported
+  expectStatus("FOOBAR", 501); // well-formed unknown -> unsupported
+  expectStatus("", 400);       // empty -> not a token (isHttpToken("") false)
+  expectStatus("G@T", 400);    // delimiter '@' -> malformed token
+  expectStatus(std::string("G\xC0T"), 400); // high byte 0xC0 -> not an ASCII tchar (web-M1 pin)
 }
 
 // ---------------------------------------------------------------------------
