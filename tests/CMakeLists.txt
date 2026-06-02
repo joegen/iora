@@ -141,6 +141,7 @@ set(WEB_TESTS
     web/test_sse_stream
     web/test_channels
     web/test_channels_concurrency
+    web/test_sse_integration
     web/test_application_integration
     web/test_htmx_helpers
 )
