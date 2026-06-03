@@ -21,6 +21,7 @@
 #include <fstream>
 #include <map>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -222,6 +223,63 @@ struct CaseInsensitiveCompare
 /// \brief HTTP headers with case-insensitive keys
 using HttpHeaders = std::map<std::string, std::string, CaseInsensitiveCompare>;
 
+namespace detail
+{
+/// \brief Whether a header field is a comma-separated list (RFC 9110 §5.3) whose
+/// repeated field-lines may be combined with ", ".
+///
+/// Only fields whose ABNF defines them as a #list are combinable. Combining a
+/// non-list field that carries intrinsic commas (Set-Cookie, Retry-After's HTTP-date,
+/// WWW-Authenticate, Date/Expires/Last-Modified) would corrupt it, so this is an
+/// ALLOW-LIST (safe-by-default: an unknown header keeps last-wins, never corrupted).
+/// X-Forwarded-Host / X-Forwarded-Proto are deliberately EXCLUDED — they are
+/// single-valued-per-hop, do not accumulate, and the protocol-correct handling of
+/// duplicates is ignore, not comma-join.
+inline bool isListValuedHeader(const std::string &name)
+{
+  static const std::set<std::string, CaseInsensitiveCompare> kListValued = {
+    "X-Forwarded-For", "Forwarded", "Via"};
+  return kListValued.count(name) != 0;
+}
+
+/// \brief Insert a parsed header, or combine a repeated field-line.
+///
+/// RFC 9110 §5.3: repeated field-lines of a comma-list field are combined by appending
+/// each subsequent value, in order, separated by ", ". Non-list fields keep last-wins
+/// (preserving the prior behavior). PRECONDITION: \p value is already OWS-trimmed by the
+/// caller (parseHeaderLine), so an all-whitespace value arrives as "" and the empty
+/// element is skipped (RFC 9110 §5.3 allows empty list elements; we drop them).
+inline void addOrCombineHeader(HttpHeaders &headers, const std::string &key,
+                               const std::string &value)
+{
+  auto it = headers.find(key);
+  if (it == headers.end())
+  {
+    headers.emplace(key, value);
+    return;
+  }
+  if (isListValuedHeader(key))
+  {
+    if (value.empty())
+    {
+      return; // skip empty list element (keep existing combined value)
+    }
+    if (it->second.empty())
+    {
+      it->second = value;
+    }
+    else
+    {
+      it->second.append(", ").append(value);
+    }
+  }
+  else
+  {
+    it->second = value; // non-list field: last-wins (prior behavior)
+  }
+}
+} // namespace detail
+
 /// \brief URL parsing structure
 struct ParsedUrl
 {
@@ -410,6 +468,7 @@ public:
     std::string line;
     bool firstLine = true;
 
+    int hostCount = 0;
     while (std::getline(headerStream, line))
     {
       // Remove \r if present
@@ -422,10 +481,56 @@ public:
       {
         parseRequestLine(line, request);
         firstLine = false;
+        continue;
       }
-      else if (!line.empty())
+      if (line.empty())
       {
-        parseHeaderLine(line, request.headers);
+        continue;
+      }
+      // RFC 9112 §5.2: obsolete line folding (a header field-line beginning with SP
+      // or HTAB, continuing the previous field) MUST be rejected by a server.
+      if (line.front() == ' ' || line.front() == '\t')
+      {
+        throw HttpRequestError(400, "Obsolete line folding (obs-fold) is not allowed");
+      }
+      // RFC 9112 §3.2 / RFC 9110 §7.2: count Host field-lines (a request MUST contain
+      // exactly one Host; the single-value headers map would otherwise hide a duplicate).
+      const auto colonPos = line.find(':');
+      if (colonPos != std::string::npos)
+      {
+        std::string name = line.substr(0, colonPos);
+        name.erase(0, name.find_first_not_of(" \t"));
+        name.erase(name.find_last_not_of(" \t") + 1);
+        static const CaseInsensitiveCompare ci;
+        if (!ci(name, "Host") && !ci("Host", name)) // case-insensitive equality
+        {
+          ++hostCount;
+        }
+      }
+      parseHeaderLine(line, request.headers);
+    }
+
+    // RFC 9112 §3.2: more than one Host field-line -> 400 (host-confusion / smuggling).
+    if (hostCount > 1)
+    {
+      throw HttpRequestError(400, "Multiple Host header fields");
+    }
+    // RFC 9110 §7.2 / RFC 9112 §3.2: HTTP/1.1+ requests MUST send a Host. HTTP/1.0
+    // (minor == 0) is exempt.
+    if (request.version.minor >= 1 && hostCount == 0)
+    {
+      throw HttpRequestError(400, "Missing Host header field (required for HTTP/1.1)");
+    }
+    // RFC 9112 §3.2: a Host header field with an invalid (here: empty) field value is
+    // a 400. The stored value is already OWS-trimmed by parseHeaderLine, so an
+    // OWS-only value reaches here as "". Checked regardless of version (an empty
+    // authority is meaningless).
+    if (hostCount >= 1)
+    {
+      auto hostIt = request.headers.find("Host");
+      if (hostIt != request.headers.end() && hostIt->second.empty())
+      {
+        throw HttpRequestError(400, "Empty Host header field value");
       }
     }
 
@@ -544,7 +649,7 @@ private:
       value.erase(0, value.find_first_not_of(" \t"));
       value.erase(value.find_last_not_of(" \t") + 1);
 
-      headers[key] = value;
+      detail::addOrCombineHeader(headers, key, value);
     }
   }
 };
@@ -699,7 +804,7 @@ private:
       value.erase(0, value.find_first_not_of(" \t"));
       value.erase(value.find_last_not_of(" \t") + 1);
 
-      headers[key] = value;
+      detail::addOrCombineHeader(headers, key, value);
     }
   }
 
