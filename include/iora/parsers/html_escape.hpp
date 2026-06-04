@@ -107,6 +107,33 @@ inline std::string percentDecode(std::string_view in, bool plusIsSpace)
   return out;
 }
 
+inline std::string percentEncode(std::string_view in, bool spaceAsPlus)
+{
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(in.size());
+  for (unsigned char c : in)
+  {
+    // RFC 3986 section 2.3: unreserved = ALPHA / DIGIT / '-' / '.' / '_' / '~'
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~')
+    {
+      out += static_cast<char>(c);
+    }
+    else if (spaceAsPlus && c == 0x20)
+    {
+      out += '+';
+    }
+    else
+    {
+      out += '%';
+      out += kHex[c >> 4];
+      out += kHex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
 }  // namespace detail
 
 inline std::string urlDecode(std::string_view in)
@@ -117,6 +144,19 @@ inline std::string urlDecode(std::string_view in)
 inline std::string formDecode(std::string_view in)
 {
   return detail::percentDecode(in, true);
+}
+
+/// \brief Percent-encode per RFC 3986 (space -> %20). Inverse of urlDecode.
+inline std::string urlEncode(std::string_view in)
+{
+  return detail::percentEncode(in, false);
+}
+
+/// \brief Form-encode per WHATWG application/x-www-form-urlencoded (space -> +).
+/// Inverse of formDecode.
+inline std::string formEncode(std::string_view in)
+{
+  return detail::percentEncode(in, true);
 }
 
 inline std::unordered_map<std::string, std::string> parseFormBody(std::string_view body)

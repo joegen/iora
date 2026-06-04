@@ -13,8 +13,10 @@
 
 using iora::parsers::escapeHtml;
 using iora::parsers::formDecode;
+using iora::parsers::formEncode;
 using iora::parsers::parseFormBody;
 using iora::parsers::urlDecode;
+using iora::parsers::urlEncode;
 
 // ---------------------------------------------------------------------------
 // escapeHtml (task-2.2)
@@ -277,6 +279,128 @@ TEST_CASE("parseFormBody is total on adversarial input (L-2)", "[html_escape][fo
   const auto m2 = parseFormBody("===&&&===");
   REQUIRE(m2.size() == 1);
   REQUIRE(m2.at("") == "==");
+}
+
+// ---------------------------------------------------------------------------
+// urlEncode
+// ---------------------------------------------------------------------------
+
+TEST_CASE("urlEncode passes through unreserved characters", "[html_escape][urlencode]")
+{
+  REQUIRE(urlEncode("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~") ==
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~");
+}
+
+TEST_CASE("urlEncode encodes reserved and special characters", "[html_escape][urlencode]")
+{
+  REQUIRE(urlEncode("/") == "%2F");
+  REQUIRE(urlEncode("?") == "%3F");
+  REQUIRE(urlEncode("=") == "%3D");
+  REQUIRE(urlEncode("&") == "%26");
+  REQUIRE(urlEncode("#") == "%23");
+  REQUIRE(urlEncode("+") == "%2B");
+  REQUIRE(urlEncode(":") == "%3A");
+  REQUIRE(urlEncode("@") == "%40");
+}
+
+TEST_CASE("urlEncode encodes space as %20 (not '+')", "[html_escape][urlencode]")
+{
+  REQUIRE(urlEncode(" ") == "%20");
+  REQUIRE(urlEncode("hello world") == "hello%20world");
+}
+
+TEST_CASE("urlEncode on empty input returns empty", "[html_escape][urlencode]")
+{
+  REQUIRE(urlEncode("").empty());
+}
+
+TEST_CASE("urlEncode encodes multi-byte UTF-8 byte-wise", "[html_escape][urlencode]")
+{
+  // 'São' = S + 0xC3 0xA3 + o
+  REQUIRE(urlEncode("S\xC3\xA3o") == "S%C3%A3o");
+}
+
+TEST_CASE("urlEncode uses uppercase hex", "[html_escape][urlencode]")
+{
+  // 0x0a = newline -> %0A (not %0a)
+  REQUIRE(urlEncode("\n") == "%0A");
+  REQUIRE(urlEncode("\xff") == "%FF");
+}
+
+TEST_CASE("urlEncode encodes NUL byte as %00", "[html_escape][urlencode]")
+{
+  const std::string input("a\0b", 3);
+  REQUIRE(urlEncode(input) == "a%00b");
+}
+
+TEST_CASE("urlEncode encodes '%' itself as %25", "[html_escape][urlencode]")
+{
+  REQUIRE(urlEncode("%") == "%25");
+  REQUIRE(urlEncode("100%done") == "100%25done");
+}
+
+TEST_CASE("urlEncode realistic ?next= use case", "[html_escape][urlencode]")
+{
+  REQUIRE(urlEncode("/dashboard?tab=settings&page=1") ==
+          "%2Fdashboard%3Ftab%3Dsettings%26page%3D1");
+}
+
+// ---------------------------------------------------------------------------
+// formEncode
+// ---------------------------------------------------------------------------
+
+TEST_CASE("formEncode encodes space as '+'", "[html_escape][formencode]")
+{
+  REQUIRE(formEncode(" ") == "+");
+  REQUIRE(formEncode("hello world") == "hello+world");
+}
+
+TEST_CASE("formEncode encodes '+' as %2B (not space)", "[html_escape][formencode]")
+{
+  REQUIRE(formEncode("+") == "%2B");
+}
+
+TEST_CASE("formEncode matches urlEncode for non-space characters", "[html_escape][formencode]")
+{
+  REQUIRE(formEncode("/") == "%2F");
+  REQUIRE(formEncode("?") == "%3F");
+  REQUIRE(formEncode("ABC123-._~") == "ABC123-._~");
+}
+
+// ---------------------------------------------------------------------------
+// Round-trip symmetry
+// ---------------------------------------------------------------------------
+
+TEST_CASE("urlDecode(urlEncode(x)) == x for all byte values", "[html_escape][roundtrip]")
+{
+  // Build a string with all 256 byte values.
+  std::string allBytes;
+  allBytes.reserve(256);
+  for (int i = 0; i < 256; ++i)
+  {
+    allBytes += static_cast<char>(i);
+  }
+  REQUIRE(urlDecode(urlEncode(allBytes)) == allBytes);
+}
+
+TEST_CASE("formDecode(formEncode(x)) == x for all byte values", "[html_escape][roundtrip]")
+{
+  std::string allBytes;
+  allBytes.reserve(256);
+  for (int i = 0; i < 256; ++i)
+  {
+    allBytes += static_cast<char>(i);
+  }
+  REQUIRE(formDecode(formEncode(allBytes)) == allBytes);
+}
+
+TEST_CASE("urlEncode vs formEncode differ only on space (differential)", "[html_escape][roundtrip]")
+{
+  // With a raw space: the two functions differ.
+  REQUIRE(urlEncode("a b") == "a%20b");
+  REQUIRE(formEncode("a b") == "a+b");
+  // Without a space: identical.
+  REQUIRE(urlEncode("a/b?c=d") == formEncode("a/b?c=d"));
 }
 
 // ---------------------------------------------------------------------------
