@@ -43,6 +43,16 @@ namespace network
 ///   - Supports both synchronous and asynchronous operations
 ///   - Connection pooling with automatic cleanup
 ///   - TLS/HTTPS support via transport layer
+///
+/// THREADING CONTRACT (sync request path): a single HttpClient instance issues
+/// ONE request at a time. getConnection() returns a cached per-host SessionId
+/// under _mutex, but the subsequent send/receive run with _mutex released, so two
+/// threads issuing concurrent requests to the SAME host on the SAME instance would
+/// interleave on one socket (and one thread's failure-path dropConnection() could
+/// close a session another is mid-request on). For concurrent work, use one
+/// HttpClient per thread (or HttpClientPool). An exclusive per-connection lease
+/// that would make a shared instance safe for concurrent same-host requests is
+/// tracked as a separate enhancement.
 class HttpClient
 {
 public:
@@ -503,6 +513,37 @@ private:
     return sessionId;
   }
 
+  /// \brief Close \p sessionId and evict it from the connection cache.
+  ///
+  /// The cache (getConnection) hands out a cached connection whenever one exists
+  /// for the host:port and is within the idle timeout — independent of
+  /// reuseConnections. Two cases require explicit eviction or a later request
+  /// would reuse a dead socket (manifesting as "connection closed" then a run of
+  /// "HTTP response timeout"):
+  ///   1. reuseConnections == false: the request was sent with "Connection:
+  ///      close", so the server closes the socket after responding. The cached
+  ///      entry must be dropped so the next request opens a fresh connection.
+  ///   2. a send/receive/parse failure: the peer may have closed the connection,
+  ///      so it must not be reused (and a retry must get a fresh socket).
+  ///
+  /// SAFETY (async close vs. id reuse): _transport->close() only enqueues the
+  /// teardown on the I/O thread, but SessionId is a monotonically increasing
+  /// uint64 counter (tcp_engine/udp_engine: _nextSessionId{1}, post-increment) and
+  /// is NEVER reused, so a still-pending close for this evicted id cannot tear
+  /// down a later connection that happens to reuse the value. This is the same
+  /// guarantee getConnection's idle-eviction close relies on.
+  void dropConnection(const std::string &hostPort, SessionId sessionId)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _connections.find(hostPort);
+    if (it != _connections.end() && it->second == sessionId)
+    {
+      _connections.erase(it);
+    }
+    _connectionLastUsed.erase(sessionId);
+    _transport->close(sessionId);
+  }
+
   /// \brief Check if string is an IP address
   bool isIPAddress(const std::string &str) const
   {
@@ -567,6 +608,7 @@ private:
                           const std::map<std::string, std::string> &headers)
   {
     auto parsedUrl = parseUrl(url);
+    const std::string hostPort = parsedUrl.getHostPort();
 
     // Use normal timeout - optimization will be handled at transport level
     std::chrono::milliseconds sendTimeout = _config.requestTimeout;
@@ -614,7 +656,9 @@ private:
       sendTimeout);
     if (sendResult.isErr())
     {
-      _transport->setReadMode(sessionId, ReadMode::Async);
+      // The connection is unusable — evict it so it is never reused / so a retry
+      // opens a fresh socket.
+      dropConnection(hostPort, sessionId);
       throw std::runtime_error("Failed to send HTTP request: " + sendResult.error().message);
     }
 
@@ -653,14 +697,27 @@ private:
         // already, so continue
       }
 
-      // Reset read mode back to async for connection reuse
-      _transport->setReadMode(sessionId, ReadMode::Async);
-      return parseHttpResponse(responseData);
+      Response resp = parseHttpResponse(responseData);
+      if (_config.reuseConnections)
+      {
+        // Keep the connection warm (async mode) for the next request.
+        _transport->setReadMode(sessionId, ReadMode::Async);
+      }
+      else
+      {
+        // Single-use request ("Connection: close"): the server closes the socket
+        // after responding, so evict the cached entry — otherwise the next
+        // request reuses a dead socket and times out.
+        dropConnection(hostPort, sessionId);
+      }
+      return resp;
     }
     catch (...)
     {
-      // Reset read mode on any exception
-      _transport->setReadMode(sessionId, ReadMode::Async);
+      // A receive/parse failure means the connection is suspect (the peer may
+      // have closed it). Evict it so no later request — including a retry —
+      // reuses a dead socket.
+      dropConnection(hostPort, sessionId);
       throw;
     }
   }

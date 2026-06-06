@@ -650,20 +650,34 @@ inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::si
     }
     return ReceiveResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
   }
+  // Drain any buffered bytes FIRST, even if the peer has also closed. A peer can
+  // deliver the final bytes and the FIN together (the transport may set `data`
+  // and `closed` from the same notification), so returning PeerClosed before
+  // these bytes would silently lose the tail of the response — e.g. a complete
+  // "Connection: close" response whose body arrives with the close. PeerClosed
+  // is reported only once the buffer is fully drained.
+  if (!buf->data.empty())
+  {
+    std::size_t copyLen = std::min(len, buf->data.size());
+    std::memcpy(buffer, buf->data.data(), copyLen);
+    buf->data.erase(buf->data.begin(), buf->data.begin() + static_cast<std::ptrdiff_t>(copyLen));
+    buf->hasData = !buf->data.empty();
+    len = copyLen;
+    return ReceiveResult::ok(copyLen);
+  }
+
   if (buf->closed)
   {
-    // Clean up tombstone to prevent unbounded receiveBuffers growth
+    // Buffer fully drained and the peer has closed — signal EOF now and clean up
+    // the tombstone to prevent unbounded receiveBuffers growth.
     _impl->receiveBuffers.erase(sid);
     _impl->readModes.erase(sid);
     return ReceiveResult::err(TransportErrorInfo{TransportError::PeerClosed, "session closed"});
   }
 
-  std::size_t copyLen = std::min(len, buf->data.size());
-  std::memcpy(buffer, buf->data.data(), copyLen);
-  buf->data.erase(buf->data.begin(), buf->data.begin() + static_cast<std::ptrdiff_t>(copyLen));
-  buf->hasData = !buf->data.empty();
-  len = copyLen;
-  return ReceiveResult::ok(copyLen);
+  // Woke without data and without close (spurious) — report a zero-length read.
+  len = 0;
+  return ReceiveResult::ok(0);
 }
 
 // ── Read Modes ───────────────────────────────────────────────────────────────
