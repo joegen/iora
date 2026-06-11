@@ -1519,7 +1519,19 @@ private:
       s->ssl = ::SSL_new(_sslCli);
       if (!s->ssl)
       {
+        // Fire onClose for the sid the caller already received from connect()
+        // (consistent with the other doConnect failure paths, e.g. cfd<0 above).
+        // Without this, a connectSync parked on this sid never gets a terminal
+        // event and its pendingConnects entry would be orphaned (the session was
+        // never inserted into _sessions, so a later doClose finds nothing).
+        decltype(_cbs.onClose) closeCb;
+        { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+        if (closeCb)
+        {
+          closeCb(cr.sid, TransportErrorInfo{TransportError::TLSHandshake, "SSL_new(client) failed"});
+        }
         err(TransportError::TLSHandshake, "SSL_new(client) failed");
+        cancelConnectTimeout(s.get()); // release the timer scheduled at connect start (L-2)
         ::close(cfd);
         return false; // not inserted yet => no tags to clean
       }

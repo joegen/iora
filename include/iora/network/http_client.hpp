@@ -689,12 +689,21 @@ private:
         {
           throw std::runtime_error("HTTP response timeout");
         }
+        else if (recvResult.isErr() && recvResult.error().code == TransportError::BufferOverflow)
+        {
+          throw std::runtime_error("HTTP response exceeded sync receive buffer (overflow)");
+        }
+        else if (recvResult.isErr() && recvResult.error().code == TransportError::ShuttingDown)
+        {
+          throw std::runtime_error("HTTP transport shutting down before response complete");
+        }
         else if (recvResult.isErr())
         {
           throw std::runtime_error("Connection closed before receiving complete HTTP response");
         }
-        // If len == 0, the receiveSync will have waited for the timeout
-        // already, so continue
+        // receiveSync no longer returns ok(0): with the spurious-wake fold-back
+        // it returns only on data / Timeout / PeerClosed / BufferOverflow /
+        // ShuttingDown, all handled above. (len==0 on an ok result cannot occur.)
       }
 
       Response resp = parseHttpResponse(responseData);

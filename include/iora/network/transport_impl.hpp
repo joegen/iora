@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -81,14 +83,32 @@ struct Transport::Impl
   std::mutex userDataMutex;
   std::unordered_map<SessionId, UserData> sessionData;
 
-  // Lock order 2: Protects sync operation state (_pendingConnects, _readModes,
-  //   _receiveBuffers).
-  // Acquired by: connectSync (to register/check pending ops), receiveSync
-  //   (to access receive buffer), setReadMode (to update mode and flush),
-  //   getReadMode (to read current mode), and I/O thread data handler
-  //   (to check mode and buffer data).
-  // NEVER held during user callback invocation. setReadMode releases
-  //   syncMutex before flushing buffered data via onData callback.
+  // Lock order 2: Protects sync operation state and the teardown handshake.
+  //   syncMutex guards: pendingConnects, readModes, receiveBuffers, every
+  //   SyncReceiveBuffer field ({data, hasData, closed, waiters, flushing,
+  //   overflow}), every SyncConnectOp field ({done, result}), and the
+  //   teardown state {shuttingDown, activeFlushes, activeConnects}.
+  // Acquired by: connectSync (register/wait), receiveSync (buffer access/wait),
+  //   setReadMode (mode update + flush), getReadMode (read mode), the I/O
+  //   thread data/close handlers, and the teardown handshake in ~Transport /
+  //   operator=.
+  // NEVER held during user callback invocation. setReadMode releases syncMutex
+  //   before flushing buffered data via the onData callback.
+  //
+  // TEARDOWN HANDSHAKE (INV-5/INV-7): three classes of EXTERNAL (non-I/O)
+  // thread park while holding syncMutex across a lock release and must be
+  // waited out before _impl is destroyed, or destroying syncMutex /
+  // receiveBuffers / pendingConnects under them is a use-after-free:
+  //   (a) receiveSync waiters on a SyncReceiveBuffer::cv  -> counted by `waiters`
+  //   (b) connectSync waiters on a SyncConnectOp::cv       -> counted by `activeConnects`
+  //   (c) setReadMode Sync->Async flushers (release the lock for onData)
+  //                                                        -> counted by `activeFlushes`
+  // An exhaustive grep proves these are the only such classes (exactly two
+  // condition_variable members + the flush lock-release; getReadMode /
+  // non-flush setReadMode / sendSync take the lock single-shot, no CV wait).
+  // Teardown sets `shuttingDown` (as the FIRST action, an ENTRY FENCE per
+  // INV-8), notifies every parked CV, then waits on teardownCv until
+  // waiters==0 && activeConnects==0 && activeFlushes==0.
   struct SyncConnectOp
   {
     std::condition_variable cv;
@@ -101,15 +121,186 @@ struct Transport::Impl
   // Read modes (protected by syncMutex)
   std::unordered_map<SessionId, ReadMode> readModes;
 
-  // Sync receive buffers (protected by syncMutex)
+  // Sync receive buffers (protected by syncMutex).
+  // INV-1: hasData == !data.empty() at all observable points.
+  // INV-2: a buffer's MAP ENTRY survives as long as a waiter is parked on it
+  //   (the `waiters` count gates GC; never use shared_ptr::use_count()).
   struct SyncReceiveBuffer
   {
     std::vector<std::uint8_t> data;
     std::condition_variable cv;
     bool hasData{false};
     bool closed{false};
+    std::size_t waiters{0}; // parked receiveSync callers (INV-2/INV-6)
+    bool flushing{false};   // an in-progress setReadMode Sync->Async flush owns this entry (C-1)
+    bool overflow{false};   // a Sync-mode append exceeded maxSyncReceiveBuffer (N-2).
+                            // TERMINAL for the buffer: once set it is never cleared
+                            // (dropped bytes corrupt the stream irrecoverably), so a
+                            // retry on the same session re-reports BufferOverflow.
+                            // The caller must close the session. The closed entry is
+                            // still GC-reclaimable (overflow does not block the GC gate).
   };
   std::unordered_map<SessionId, std::shared_ptr<SyncReceiveBuffer>> receiveBuffers;
+
+  // Teardown handshake state (all guarded by syncMutex except teardownCv).
+  // `activeReceives` is the Impl-level AGGREGATE of parked receiveSync waiters
+  // (the per-buffer SyncReceiveBuffer::waiters drives the GC gate; this drives
+  // the teardown gate). receiveSync bumps BOTH under the lock.
+  bool shuttingDown{false};   // entry fence + wake signal during teardown (INV-5/INV-8)
+  std::size_t activeReceives{0}; // parked receiveSync waiters, aggregate (INV-5)
+  std::size_t activeFlushes{0}; // in-progress setReadMode flushers (INV-5)
+  std::size_t activeConnects{0}; // parked connectSync waiters (INV-5/C-4)
+  std::condition_variable teardownCv; // signalled by each guard's destructor when its counter hits the gate
+
+  // RAII guard for a parked receiveSync / connectSync caller. The owner MUST
+  // hold syncMutex continuously for the guard's whole lifetime (both calls park
+  // on a CV that atomically releases/re-acquires syncMutex). On destruction —
+  // under the still-held lock — it decrements its counter and wakes the teardown
+  // handshake. Declare AFTER the unique_lock so it destructs FIRST (decrement
+  // runs while the lock is still held). Balanced on every exit incl. throw.
+  struct ParkGuard
+  {
+    std::size_t &counter;
+    std::condition_variable &teardownCv;
+    ParkGuard(std::size_t &c, std::condition_variable &tcv) : counter(c), teardownCv(tcv) { ++counter; }
+    ~ParkGuard()
+    {
+      --counter;
+      teardownCv.notify_one(); // single teardown waiter (L-3/L6-1)
+    }
+    ParkGuard(const ParkGuard &) = delete;
+    ParkGuard &operator=(const ParkGuard &) = delete;
+  };
+
+  // RAII guard for an in-progress setReadMode Sync->Async flush. The CTOR assumes
+  // the caller already holds syncMutex (it is constructed inside the same locked
+  // scope that fetched `buf`, so marking `flushing` happens with no gap in which
+  // GC could erase the entry — closes the pre-guard window) and sets
+  // flushing + ++activeFlushes. The DTOR takes the lock itself (the flush loop
+  // releases syncMutex for the onData callback, so no lock is held at scope exit)
+  // and clears flushing / decrements activeFlushes / wakes teardown. Increment and
+  // decrement are thus owned by ONE object (no leak gap, L-2). The dtor's lock
+  // scope is independent of the loop's per-iteration locks — no double-lock.
+  struct FlushGuard
+  {
+    std::mutex &m;
+    std::size_t &activeFlushes;
+    std::condition_variable &teardownCv;
+    std::shared_ptr<SyncReceiveBuffer> buf;
+    // Precondition: caller holds `mm`.
+    FlushGuard(std::mutex &mm, std::size_t &af, std::condition_variable &tcv,
+               std::shared_ptr<SyncReceiveBuffer> b)
+      : m(mm), activeFlushes(af), teardownCv(tcv), buf(std::move(b))
+    {
+      buf->flushing = true;
+      ++activeFlushes;
+    }
+    ~FlushGuard()
+    {
+      std::lock_guard<std::mutex> lk(m);
+      buf->flushing = false;
+      --activeFlushes;
+      teardownCv.notify_one();
+    }
+    FlushGuard(const FlushGuard &) = delete;
+    FlushGuard &operator=(const FlushGuard &) = delete;
+  };
+
+  // Run the teardown handshake under the assumption the caller is about to
+  // destroy/replace _impl. Sets shuttingDown (entry fence), wakes every parked
+  // CV, and blocks until all three external-thread counters reach zero so no
+  // thread is still touching _impl. `notifyReceive` controls whether the
+  // receiveSync CVs are woken here: on the NORMAL teardown path the caller
+  // passes false and lets engine->stop()'s onClose drain+wake parked receiveSync
+  // waiters first (preserves drain-before-close, INV-5b); the ALREADY-STOPPED
+  // and EMERGENCY-DETACH paths pass true (no onClose will fire). connectSync
+  // CVs are ALWAYS woken (connectSync has no data to drain).
+  void teardownWaitOut(bool notifyReceive)
+  {
+    std::unique_lock<std::mutex> lk(syncMutex);
+    shuttingDown = true; // set-then-notify under the lock (mirrors `closed`)
+    for (auto &kv : pendingConnects)
+    {
+      kv.second->cv.notify_all();
+    }
+    if (notifyReceive)
+    {
+      for (auto &kv : receiveBuffers)
+      {
+        kv.second->cv.notify_all();
+      }
+    }
+    teardownCv.wait(lk, [this]
+                    { return activeReceives == 0 && activeConnects == 0 && activeFlushes == 0; });
+  }
+
+  // Set the entry fence (shuttingDown) and wake parked connectSync waiters, but
+  // NOT receiveSync waiters. Used on the NORMAL teardown path so engine->stop()'s
+  // onClose can deliver+drain a parked receiveSync's tail bytes before it sees
+  // the teardown signal (drain-before-close, INV-5b). connectSync has no data to
+  // drain, so it is always safe to wake here.
+  void setTeardownFence()
+  {
+    std::lock_guard<std::mutex> lk(syncMutex);
+    shuttingDown = true;
+    for (auto &kv : pendingConnects)
+    {
+      kv.second->cv.notify_all();
+    }
+  }
+
+  // Full teardown for the current _impl, covering all paths (INV-5a/5b). The
+  // caller (Transport::~Transport / operator=) guarantees `engine` is present.
+  // Gated on engine PRESENCE, never on isRunning() — a parked waiter/flusher/
+  // connector can outlive isRunning()==false, and destroying _impl under it is a
+  // use-after-free.
+  void performTeardown()
+  {
+    // Thread identity MUST be computed independently of running-state (C-1): a
+    // shutdownDrain-fired onClose runs on the I/O thread with isRunning()==false,
+    // so gating onIoThread on `running` would route an I/O-thread destruction to
+    // the blocking ALREADY-STOPPED path and either deadlock the I/O thread or let
+    // ~Impl free engine/syncMutex while the drain is still on the stack (UAF).
+    // getIoThreadId() returns the live _loop id until join/detach, so this
+    // comparison is valid even when !running.
+    const bool onIoThread = std::this_thread::get_id() == engine->getIoThreadId();
+
+    if (onIoThread)
+    {
+      // EMERGENCY DETACH (Transport destroyed/move-assigned from inside a
+      // callback on the I/O thread). We must NOT block this thread on a join or
+      // on stop() (can't join self) and detach fires no onClose, so the handshake
+      // wakes receiveSync CVs too (notifyReceive=true). Parked waiters run on
+      // OTHER (user) threads — they wake via the notify and decrement
+      // independently, so teardownWaitOut does not deadlock here. Undelivered
+      // in-kernel bytes are lost — accepted for emergency teardown.
+      std::fprintf(stderr, "WARNING: Transport destroyed from I/O thread. "
+                           "Waking sync waiters and detaching I/O thread to prevent deadlock. "
+                           "Fix: ensure Transport outlives all callbacks.\n");
+      teardownWaitOut(/*notifyReceive=*/true);
+      engine->detachForTermination();
+      return;
+    }
+    if (!engine->isRunning())
+    {
+      // ALREADY-STOPPED (on a non-I/O thread): onClose already fired externally
+      // for sessions that had one; wake any still-parked waiter and wait everyone
+      // out. No stop()/detach needed (a stop() would be a CAS no-op, L-2).
+      teardownWaitOut(/*notifyReceive=*/true);
+      return;
+    }
+    // NORMAL (running, non-I/O thread): fence first (wakes connectSync, NOT
+    // receiveSync), then engine->stop() WITHOUT holding syncMutex (shutdownDrain's
+    // onClose needs it) so already-parked receiveSync waiters wake via `closed`,
+    // DRAIN THEIR TAIL, and return PeerClosed (drain-before-close, INV-5b). Then
+    // wait everyone out WITHOUT re-notifying the receive CVs (notifyReceive=false,
+    // H-1): re-notifying here would let a parked waiter wake on `shuttingDown` and
+    // skip the drain when stop() degenerated to a CAS no-op. connectSync waiters
+    // were already woken by the fence; the gate still counts them.
+    setTeardownFence();
+    engine->stop();
+    teardownWaitOut(/*notifyReceive=*/false);
+  }
 
   void setupEngineCallbacks()
   {
@@ -180,13 +371,28 @@ struct Transport::Impl
           auto bufIt = receiveBuffers.find(sid);
           if (bufIt != receiveBuffers.end())
           {
+            // During teardown, only skip the append when NO waiter will drain
+            // it (H-A). If a receiveSync is parked (waiters>0), we MUST buffer so
+            // it can drain its tail before close — the NORMAL teardown path sets
+            // shuttingDown before stop(), and stop()'s shutdownDrain delivers the
+            // final bytes through here; dropping them would defeat the
+            // drain-before-close guarantee (INV-5b/H-1).
+            if (shuttingDown && bufIt->second->waiters == 0)
+            {
+              return; // M-3: don't grow a buffer no one will drain
+            }
             if (bufIt->second->data.size() + data.size() > config.maxSyncReceiveBuffer)
             {
-              return; // Drop — buffer full. Prevents unbounded memory growth.
+              // Overflow: surface a distinct error to the parked waiter instead
+              // of silently dropping (which would only fail at the caller's
+              // timeout with no diagnostic). N-2.
+              bufIt->second->overflow = true;
+              bufIt->second->cv.notify_all();
+              return;
             }
             bufIt->second->data.insert(bufIt->second->data.end(), data.data(),
                                        data.data() + data.size());
-            bufIt->second->hasData = true;
+            bufIt->second->hasData = true; // INV-1: hasData == !data.empty()
             bufIt->second->cv.notify_one();
           }
           return;
@@ -293,7 +499,10 @@ struct Transport::Impl
         if (bufIt != receiveBuffers.end())
         {
           bufIt->second->closed = true;
-          bufIt->second->cv.notify_one();
+          // notify_all (not _one): a closed session must wake every parked
+          // waiter even though the single-waiter contract normally means one.
+          // M-5.
+          bufIt->second->cv.notify_all();
         }
         else
         {
@@ -303,15 +512,18 @@ struct Transport::Impl
         }
         readModes.erase(sid);
 
-        // GC stale tombstones when map grows beyond threshold.
-        // Stale = closed with no pending data and no waiters (hasData==false).
-        // This caps memory to O(threshold + concurrent closes between GCs).
+        // GC stale tombstones when map grows beyond threshold. A tombstone is
+        // reclaimable only if closed, drained (!hasData), with NO parked waiter
+        // (waiters==0) and NO in-progress flush (!flushing) — erasing a buffer
+        // a waiter/flusher still references via the map would orphan it and
+        // drop a not-yet-delivered onData (M-2/C-1).
         const std::size_t gcThreshold = config.syncBufferGcThreshold;
         if (receiveBuffers.size() > gcThreshold)
         {
           for (auto it = receiveBuffers.begin(); it != receiveBuffers.end();)
           {
-            if (it->first != sid && it->second->closed && !it->second->hasData)
+            if (it->first != sid && it->second->closed && !it->second->hasData &&
+                it->second->waiters == 0 && !it->second->flushing)
             {
               it = receiveBuffers.erase(it);
             }
@@ -390,27 +602,12 @@ inline Transport::~Transport()
   {
     return;
   }
-  if (!_impl->engine->isRunning())
-  {
-    return;
-  }
-  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
-  {
-    // PROGRAMMING ERROR: Transport destroyed from the I/O thread (e.g.,
-    // last shared_ptr dropped inside a callback). Cannot stop/join the
-    // I/O thread from itself.
-    // Safety net: detach the I/O thread so the engine destructor's stop()
-    // becomes a no-op (CAS on _running fails, _loop is not joinable).
-    // The detached I/O thread will exit its loop naturally when it sees
-    // _running == false.
-    std::fprintf(stderr,
-      "WARNING: Transport destroyed from I/O thread. "
-      "Detaching I/O thread to prevent deadlock. "
-      "Fix: ensure Transport outlives all callbacks.\n");
-    _impl->engine->detachForTermination();
-    return;
-  }
-  _impl->engine->stop();
+  // Teardown handshake dominates all destruction exits and is gated on engine
+  // PRESENCE (not isRunning()): a parked receiveSync/connectSync waiter or an
+  // in-progress setReadMode flush — all on external threads — must be waited out
+  // before ~Impl frees syncMutex/receiveBuffers/pendingConnects, or those
+  // threads re-lock/touch freed state (use-after-free). INV-5/INV-5a/INV-5b.
+  _impl->performTeardown();
 }
 
 inline Transport::Transport(Transport &&other) noexcept
@@ -426,23 +623,22 @@ inline Transport &Transport::operator=(Transport &&other) noexcept
 {
   if (this != &other)
   {
-    if (_impl && _impl->engine && _impl->engine->isRunning())
+    // Wait out all external sync waiters/flushers on the OLD _impl before it is
+    // destroyed by the move-assign, for the same reason as ~Transport. Gated on
+    // engine presence, not isRunning() (INV-5a).
+    if (_impl && _impl->engine)
     {
-      if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
-      {
-        std::fprintf(stderr,
-          "WARNING: Transport move-assigned from I/O thread. "
-          "Detaching old I/O thread to prevent deadlock.\n");
-        _impl->engine->detachForTermination();
-      }
-      else
-      {
-        _impl->engine->stop();
-      }
+      _impl->performTeardown();
     }
     _impl = std::move(other._impl);
     if (_impl && _impl->engine)
     {
+      // Move hygiene (L-4): a live, never-torn-down source must not carry a
+      // stuck shuttingDown/active* state that would instantly fail every
+      // subsequent sync op on this object.
+      assert(!_impl->shuttingDown && _impl->activeReceives == 0 &&
+             _impl->activeConnects == 0 && _impl->activeFlushes == 0 &&
+             "move-assigned from a torn-down Transport");
       _impl->setupEngineCallbacks();
     }
   }
@@ -563,29 +759,96 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   // (which atomically releases syncMutex). engine->connect() only acquires
   // the engine's internal _cmdMutex (atomic++ + push + eventfd write ≈ μs),
   // not syncMutex — no AB-BA deadlock risk, no convoy under concurrency.
+  // Acquire syncMutex BEFORE calling engine->connect() and hold it CONTINUOUSLY
+  // through entry into wait_for (INV-8). This serializes connectSync against the
+  // teardown handshake on the same mutex: teardown either wins the lock first
+  // (we then hit the entry fence below and never call engine->connect()) or we
+  // win first (we register + park + are counted in activeConnects before
+  // teardown's notify), so connectSync is never both uncounted and unreachable,
+  // and engine->connect() is never issued on a torn-down engine (engine->connect
+  // has no _running guard). Do NOT narrow this lock scope (M-NEW-2/M-A).
   auto op = std::make_shared<Impl::SyncConnectOp>();
   std::unique_lock<std::mutex> lk(_impl->syncMutex);
+
+  // Entry fence (INV-8): reject before engine->connect() and before counting.
+  if (_impl->shuttingDown)
+  {
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
+  }
 
   auto result = _impl->engine->connect(host, port, tls);
   if (result.isErr())
   {
+    // Defensive: the current TcpEngine::connect() always returns ok(sid) and
+    // reports failures asynchronously via onClose, so this branch is unreachable
+    // for TCP today. It guards future engines / a connect() that gains a
+    // synchronous-failure mode. Returns before the connect guard is constructed,
+    // so a synchronous failure is never parked and never counted (M-NEW-1/L-5/L-A).
     return result;
   }
   SessionId sid = result.value();
 
   _impl->pendingConnects[sid] = op;
-  if (op->cv.wait_for(lk, timeout, [&op] { return op->done; }))
+  // Count this parked connectSync for the teardown gate. The guard is
+  // constructed ONLY here, on the success path after registration, and must
+  // OUTLIVE the timeout-path engine->close(sid) below so _impl->engine stays
+  // alive during that call (its dtor — the activeConnects decrement — is the
+  // LAST _impl-touching action of connectSync, L6-1). Declared after `lk` so it
+  // destructs first (decrement under the still-held lock).
+  Impl::ParkGuard connectGuard(_impl->activeConnects, _impl->teardownCv);
+
+  // Wait predicate adds shuttingDown so teardown wakes a parked connectSync even
+  // on the emergency-detach path (which fires no onClose). C-4.
+  op->cv.wait_for(lk, timeout, [&op, this] { return op->done || _impl->shuttingDown; });
+
+  if (op->done)
   {
     return std::move(op->result);
+  }
+
+  if (_impl->shuttingDown)
+  {
+    // Woken by teardown. Do NOT erase pendingConnects (teardown owns and is
+    // iterating the maps, L-NEW-1) and do NOT touch engine->close (engine is
+    // being torn down, M-1). The guard decrements activeConnects on return.
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
   }
 
   // Timeout — keep pendingConnects[sid] entry so onClose finds it and suppresses
   // the global onClose callback (the user never received this sid). The entry's
   // shared_ptr<SyncConnectOp> keeps op alive until the I/O thread's onClose
-  // handler erases it — the local op going out of scope here is safe.
-  // Release syncMutex BEFORE calling engine methods to avoid AB-BA deadlock.
+  // handler erases it. NO LEAK (M-2/H-1): a sid returned by engine->connect()
+  // always receives an onClose — either (a) doConnect FAILED, in which case every
+  // failure path fires onClose directly (incl. the SSL_new path, fixed in
+  // tcp_engine.hpp), which erases pendingConnects[sid] and wakes us (we then
+  // return via the op->done branch above, not here); or (b) doConnect SUCCEEDED
+  // and inserted the session, so this Close (FIFO-ordered after the Connect) is
+  // found by doClose -> closeNow -> onClose, erasing pendingConnects[sid]. The
+  // only no-onClose case is the engine already being stopped (teardown), where
+  // the handshake + ~Impl reap the entry. Release syncMutex BEFORE calling engine
+  // methods to avoid
+  // AB-BA deadlock. connectGuard is still in scope (activeConnects>0) across the
+  // close() call, keeping _impl->engine alive (L6-1). RE-ACQUIRE the lock before
+  // returning so connectGuard's dtor (the activeConnects decrement, a syncMutex-
+  // guarded mutation) runs UNDER the lock — it destructs before `lk` because it
+  // is declared after it.
   lk.unlock();
   _impl->engine->close(sid);
+  lk.lock();
+  // We have ISSUED engine->close(sid) — the session is being torn down. Even if a
+  // late onConnect set op->done==true in the unlock window, we MUST NOT return
+  // ok(sid) for a session we just closed (H-1/M-A): that would hand the caller a
+  // live-looking handle to a dead session. Report the truthful outcome: timeout
+  // (the connect did not complete within the deadline and was closed), or
+  // ShuttingDown if teardown began. The pre-close op->done check above already
+  // returned ok for a connect that genuinely succeeded before the timeout.
+  if (_impl->shuttingDown)
+  {
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
+  }
   return ConnectResult::err(TransportErrorInfo{TransportError::Timeout, "connectSync timed out"});
 }
 
@@ -623,13 +886,25 @@ inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::si
                            "Use ReadMode::Async with onData() callback instead.");
   }
 
+  // Single continuous lock acquisition: find-or-create, the entry-fence/
+  // single-waiter checks, the parked wait, and the drain all happen under one
+  // unique_lock (M-3). The CV wait atomically releases/re-acquires it. No user
+  // callback is invoked here (drain is a memcpy), so HR-6 is preserved.
+  std::unique_lock<std::mutex> lk(_impl->syncMutex);
+
+  // Entry fence (INV-8): if teardown has begun, reject before parking so the
+  // teardown handshake's gate cannot be re-armed by a fresh waiter.
+  if (_impl->shuttingDown)
+  {
+    return ReceiveResult::err(
+      TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
+  }
+
   std::shared_ptr<Impl::SyncReceiveBuffer> buf;
   {
-    std::lock_guard<std::mutex> lk(_impl->syncMutex);
     auto it = _impl->receiveBuffers.find(sid);
     if (it == _impl->receiveBuffers.end())
     {
-      // Create buffer on first receiveSync for this session
       buf = std::make_shared<Impl::SyncReceiveBuffer>();
       _impl->receiveBuffers[sid] = buf;
     }
@@ -639,45 +914,84 @@ inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::si
     }
   }
 
-  std::unique_lock<std::mutex> lk(_impl->syncMutex);
-  if (!buf->cv.wait_for(lk, timeout, [&buf] { return buf->hasData || buf->closed; }))
+  // Single-waiter contract (INV-6): reject a second concurrent waiter on the
+  // same session loudly rather than relying on notify_one to reach it. Also
+  // reject overlap with an in-progress Sync->Async flush on this session (M-2).
+  if (buf->waiters > 0 || buf->flushing)
   {
-    // Clean up tombstone on timeout to prevent leak
-    if (buf->closed)
-    {
-      _impl->receiveBuffers.erase(sid);
-      _impl->readModes.erase(sid);
-    }
+    return ReceiveResult::err(TransportErrorInfo{
+      TransportError::Cancelled,
+      buf->flushing ? "receiveSync overlaps a setReadMode flush on this session"
+                    : "receiveSync already in progress for this session (single-waiter contract)"});
+  }
+
+  // Park: bump the per-buffer GC gate (buf->waiters) AND the Impl-level teardown
+  // gate (activeReceives) TOGETHER. These two counters MUST be incremented and
+  // decremented in lockstep — the teardown gate (activeReceives==0) and the GC
+  // gate (waiters==0) diverging is a latent UAF vector (INV-7/M-1). Every
+  // receiveSync park site must construct BOTH guards; do not add a park path that
+  // bumps only one. Both destruct (decrement + wake teardown) under the still-held
+  // lock because they are declared after `lk` (implGuard first, then bufGuard).
+  Impl::ParkGuard bufGuard(buf->waiters, _impl->teardownCv);
+  Impl::ParkGuard implGuard(_impl->activeReceives, _impl->teardownCv);
+  assert(buf->waiters == 1 && "single-waiter contract (INV-6): exactly one receiveSync parks");
+
+  // Fold the spurious-wake case back into the wait loop (L-1): wait_until with a
+  // fixed deadline returns only on data/close/overflow/shuttingDown or timeout.
+  // A past deadline returns immediately with the predicate's current value, so
+  // there is no negative-duration and no infinite loop.
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  const bool signalled = buf->cv.wait_until(lk, deadline,
+                                            [&buf, this]
+                                            {
+                                              return buf->hasData || buf->closed ||
+                                                     buf->overflow || _impl->shuttingDown;
+                                            });
+  if (!signalled)
+  {
+    // Pure timeout (predicate false under the lock — the old `if (buf->closed)`
+    // cleanup branch here was dead code and is removed, M-1). The buffer is left
+    // in the map; the onClose GC reclaims it once the session closes.
     return ReceiveResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
   }
-  // Drain any buffered bytes FIRST, even if the peer has also closed. A peer can
-  // deliver the final bytes and the FIN together (the transport may set `data`
-  // and `closed` from the same notification), so returning PeerClosed before
-  // these bytes would silently lose the tail of the response — e.g. a complete
-  // "Connection: close" response whose body arrives with the close. PeerClosed
-  // is reported only once the buffer is fully drained.
+
+  // Drain any buffered bytes FIRST, even if the peer has also closed or teardown
+  // has begun. A peer can deliver the final bytes and the FIN together, so
+  // returning PeerClosed/teardown before these bytes would silently lose the
+  // tail of the response. PeerClosed is reported only once fully drained.
   if (!buf->data.empty())
   {
     std::size_t copyLen = std::min(len, buf->data.size());
     std::memcpy(buffer, buf->data.data(), copyLen);
     buf->data.erase(buf->data.begin(), buf->data.begin() + static_cast<std::ptrdiff_t>(copyLen));
     buf->hasData = !buf->data.empty();
+    assert(buf->hasData == !buf->data.empty()); // INV-1
     len = copyLen;
     return ReceiveResult::ok(copyLen);
   }
 
+  // Buffer drained. Surface overflow before close so callers can distinguish a
+  // dropped-data condition from a clean EOF (N-2).
+  if (buf->overflow)
+  {
+    return ReceiveResult::err(TransportErrorInfo{TransportError::BufferOverflow,
+                                                 "sync receive buffer overflow (data dropped)"});
+  }
+
   if (buf->closed)
   {
-    // Buffer fully drained and the peer has closed — signal EOF now and clean up
-    // the tombstone to prevent unbounded receiveBuffers growth.
+    // Fully drained and the peer has closed — signal EOF and reclaim the entry.
+    // Safe to erase: this is the only/last waiter (INV-6), and the guards will
+    // decrement after this scope. buf (shared_ptr) keeps the object alive.
     _impl->receiveBuffers.erase(sid);
     _impl->readModes.erase(sid);
     return ReceiveResult::err(TransportErrorInfo{TransportError::PeerClosed, "session closed"});
   }
 
-  // Woke without data and without close (spurious) — report a zero-length read.
-  len = 0;
-  return ReceiveResult::ok(0);
+  // Woken by teardown with nothing buffered (do NOT erase — teardown owns the
+  // maps and the teardownWaitOut loop is iterating them, INV-5/L-NEW-1).
+  return ReceiveResult::err(
+    TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
 }
 
 // ── Read Modes ───────────────────────────────────────────────────────────────
@@ -725,17 +1039,54 @@ inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
     cb = _impl->onDataCb;
   }
 
+  // Fetch the buffer and mark it as being flushed UNDER THE SAME LOCK (no gap in
+  // which GC could erase the entry before it is marked `flushing`). Marking
+  // `flushing` excludes the entry from GC (C-1) and bumping `activeFlushes` makes
+  // the teardown handshake wait this flusher out before destroying _impl
+  // (C-3b/INV-5) — the flush releases syncMutex for the onData callback below and
+  // re-acquires it, so it is an external thread touching _impl. FlushGuard is
+  // cleanup-only (its dtor clears flushing / decrements activeFlushes).
+  std::shared_ptr<Impl::SyncReceiveBuffer> buf;
+  std::unique_ptr<Impl::FlushGuard> flushGuard;
+  {
+    std::lock_guard<std::mutex> lk(_impl->syncMutex);
+    if (_impl->shuttingDown)
+    {
+      return false; // entry fence (INV-8): no flush during teardown
+    }
+    auto bufIt = _impl->receiveBuffers.find(sid);
+    if (bufIt == _impl->receiveBuffers.end())
+    {
+      _impl->readModes[sid] = ReadMode::Async; // nothing buffered to flush
+      return true;
+    }
+    buf = bufIt->second;
+    // Construct the guard UNDER the fetch lock (its ctor sets flushing +
+    // ++activeFlushes with no GC window) — increment and decrement owned by one
+    // RAII object (L-2). It outlives this scope via the unique_ptr; its dtor
+    // re-acquires the lock to clean up.
+    flushGuard =
+      std::make_unique<Impl::FlushGuard>(_impl->syncMutex, _impl->activeFlushes,
+                                         _impl->teardownCv, buf);
+  }
+
   for (;;)
   {
     std::vector<std::uint8_t> flushData;
     {
       std::lock_guard<std::mutex> lk(_impl->syncMutex);
-      auto bufIt = _impl->receiveBuffers.find(sid);
-      if (bufIt != _impl->receiveBuffers.end() && !bufIt->second->data.empty())
+      // Bail if teardown began mid-flush: the handshake is waiting on
+      // activeFlushes==0 and will own the maps. The FlushGuard dtor clears
+      // flushing/activeFlushes and wakes it.
+      if (_impl->shuttingDown)
       {
-        flushData = std::move(bufIt->second->data);
-        bufIt->second->data.clear();
-        bufIt->second->hasData = false;
+        return false;
+      }
+      if (!buf->data.empty())
+      {
+        flushData = std::move(buf->data);
+        buf->data.clear();
+        buf->hasData = false; // INV-1
       }
       else
       {

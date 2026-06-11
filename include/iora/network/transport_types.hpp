@@ -67,6 +67,8 @@ enum class TransportError
   GCClosed,
   Cancelled,
   Timeout,
+  BufferOverflow, // Sync receive buffer exceeded maxSyncReceiveBuffer (data dropped)
+  ShuttingDown,   // Transport is being torn down; sync op released without completing
   Unknown
 };
 
