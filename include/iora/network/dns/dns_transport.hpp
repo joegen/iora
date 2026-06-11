@@ -76,7 +76,11 @@ public:
   using QueryCallback =
     std::function<void(const DnsResult &result, const std::exception_ptr &error)>;
 
-  /// \brief Constructor with configuration
+  /// \brief Constructor with configuration.
+  /// \warning A DnsTransport MUST be owned by a std::shared_ptr (construct via
+  ///          std::make_shared<DnsTransport>(...)). start() calls shared_from_this()
+  ///          when wiring the underlying Transport's callbacks; a stack- or
+  ///          unique_ptr-owned instance throws std::bad_weak_ptr from start().
   explicit DnsTransport(const DnsConfig &config = {});
 
   /// \brief Destructor
@@ -667,24 +671,28 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
 inline std::shared_ptr<Transport> DnsTransport::createUdpTransport()
 {
   TransportConfig config;
-  config.protocol = Protocol::UDP;
 
-  auto transport = std::make_shared<Transport>(config);
+  auto transport = Transport::udp(config); // S-3: shared_ptr factory (sets protocol internally)
 
-  // Set up callbacks with shared_ptr capture for lifetime safety
-  auto self = shared_from_this();
+  // Capture a WEAK ref (not an owning shared_from_this()) and promote per-use. The
+  // Transport is OWNED by this DnsTransport (udpTransport_/tcpTransport_), so an owning
+  // capture here would form a DnsTransport<->Transport reference cycle that never
+  // collects (~DnsTransport — which resets the transports — could never run). The arch
+  // reference-cycle designPrinciple requires a weak_ptr promoted per-use. lock() also
+  // makes a late callback during teardown a clean no-op.
+  std::weak_ptr<DnsTransport> weak = shared_from_this();
   transport->onData(
-    [self](SessionId sid, iora::core::BufferView data,
+    [weak](SessionId sid, iora::core::BufferView data,
            std::chrono::steady_clock::time_point receiveTime)
-    { self->handleUdpData(sid, data, receiveTime); });
+    { if (auto self = weak.lock()) { self->handleUdpData(sid, data, receiveTime); } });
   transport->onConnect(
-    [self](SessionId sid, const TransportAddress &addr)
-    { self->handleConnect(sid, addr); });
+    [weak](SessionId sid, const TransportAddress &addr)
+    { if (auto self = weak.lock()) { self->handleConnect(sid, addr); } });
   transport->onClose(
-    [self](SessionId sid, const TransportErrorInfo &reason)
-    { self->handleClose(sid, reason); });
+    [weak](SessionId sid, const TransportErrorInfo &reason)
+    { if (auto self = weak.lock()) { self->handleClose(sid, reason); } });
   transport->onError(
-    [self](TransportError, const std::string &)
+    [weak](TransportError, const std::string &)
     {
       // Handle transport-level errors
     });
@@ -695,24 +703,24 @@ inline std::shared_ptr<Transport> DnsTransport::createUdpTransport()
 inline std::shared_ptr<Transport> DnsTransport::createTcpTransport()
 {
   TransportConfig config;
-  config.protocol = Protocol::TCP;
 
-  auto transport = std::make_shared<Transport>(config);
+  auto transport = Transport::tcp(config); // S-3: shared_ptr factory (sets protocol internally)
 
-  // Set up callbacks with shared_ptr capture for lifetime safety
-  auto self = shared_from_this();
+  // Weak capture + per-use lock() — see createUdpTransport for the reference-cycle
+  // rationale (DnsTransport owns the Transport; an owning self-capture would leak).
+  std::weak_ptr<DnsTransport> weak = shared_from_this();
   transport->onData(
-    [self](SessionId sid, iora::core::BufferView data,
+    [weak](SessionId sid, iora::core::BufferView data,
            std::chrono::steady_clock::time_point receiveTime)
-    { self->handleTcpData(sid, data, receiveTime); });
+    { if (auto self = weak.lock()) { self->handleTcpData(sid, data, receiveTime); } });
   transport->onConnect(
-    [self](SessionId sid, const TransportAddress &addr)
-    { self->handleConnect(sid, addr); });
+    [weak](SessionId sid, const TransportAddress &addr)
+    { if (auto self = weak.lock()) { self->handleConnect(sid, addr); } });
   transport->onClose(
-    [self](SessionId sid, const TransportErrorInfo &reason)
-    { self->handleClose(sid, reason); });
+    [weak](SessionId sid, const TransportErrorInfo &reason)
+    { if (auto self = weak.lock()) { self->handleClose(sid, reason); } });
   transport->onError(
-    [self](TransportError, const std::string &)
+    [weak](TransportError, const std::string &)
     {
       // Handle transport-level errors
     });
@@ -874,6 +882,13 @@ inline void DnsTransport::handleUdpData(SessionId sessionId, iora::core::BufferV
 inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferView data,
                                         std::chrono::steady_clock::time_point)
 {
+  // F-2 (RESOLVED-SAFE): the tcpTransport_->close(sessionId) calls below run from
+  // inside this onData callback (the I/O thread). This is SAFE because
+  // Transport::close(sid) is ENQUEUE-ONLY — TcpEngine::close() is
+  // `return enqueue(Command::close(sid));` (detail/tcp_engine.hpp), taking no
+  // dispatch-path lock; the close is processed on the next loop iteration. No
+  // re-entrant lock, no deadlock. If a future engine change makes close()
+  // synchronous, revisit these in-onData close sites.
   // TCP DNS messages are length-prefixed, may arrive in fragments
   {
     std::lock_guard<std::mutex> lock(tcpBuffersMutex_);

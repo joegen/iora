@@ -19,6 +19,7 @@
 
 #include "iora/network/transport.hpp"
 #include "iora/network/transport_impl.hpp"
+#include "transport_test_seam.hpp" // S-3 custom-deleter seam (C1-CLOSED observation)
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -132,10 +133,10 @@ SessionId connectToPeer(Transport &t, RawPeer &peer)
   return r.isOk() ? r.value() : SessionId{0};
 }
 
-Transport startedTcp()
+std::shared_ptr<Transport> startedTcp()
 {
-  auto t = Transport::tcp(TransportConfig{});
-  auto s = t.start();
+  auto t = Transport::tcp(TransportConfig{}); // S-3: shared_ptr<Transport>
+  auto s = t->start();
   CHECK(s.isOk());
   return t;
 }
@@ -148,22 +149,22 @@ void s1_drain_before_close()
 {
   auto t = startedTcp();
   RawPeer peer;
-  SessionId sid = connectToPeer(t, peer);
-  CHECK(t.setReadMode(sid, ReadMode::Sync));
+  SessionId sid = connectToPeer(*t, peer);
+  CHECK(t->setReadMode(sid, ReadMode::Sync));
 
   peer.send("HELLO");
   peer.closeConn();
 
   char buf[64];
   std::size_t len = sizeof(buf);
-  auto r = t.receiveSync(sid, buf, len, 1000ms);
+  auto r = t->receiveSync(sid, buf, len, 1000ms);
   CHECK(r.isOk());
   CHECK(len == 5);
   CHECK(std::string(buf, len) == "HELLO");
 
   // Next call drains remaining (none) and reports PeerClosed.
   len = sizeof(buf);
-  auto r2 = t.receiveSync(sid, buf, len, 1000ms);
+  auto r2 = t->receiveSync(sid, buf, len, 1000ms);
   CHECK(r2.isErr());
   CHECK(r2.error().code == TransportError::PeerClosed);
 }
@@ -174,16 +175,16 @@ void s5_overflow()
   TransportConfig cfg;
   cfg.maxSyncReceiveBuffer = 8; // tiny
   auto t = Transport::tcp(cfg);
-  CHECK(t.start().isOk());
+  CHECK(t->start().isOk());
   RawPeer peer;
-  SessionId sid = connectToPeer(t, peer);
-  CHECK(t.setReadMode(sid, ReadMode::Sync));
+  SessionId sid = connectToPeer(*t, peer);
+  CHECK(t->setReadMode(sid, ReadMode::Sync));
 
   peer.send(std::string(64, 'x')); // exceeds 8
 
   char buf[128];
   std::size_t len = sizeof(buf);
-  auto r = t.receiveSync(sid, buf, len, 1000ms);
+  auto r = t->receiveSync(sid, buf, len, 1000ms);
   CHECK(r.isErr());
   CHECK(r.error().code == TransportError::BufferOverflow);
 }
@@ -193,8 +194,8 @@ void s7_two_waiters()
 {
   auto t = startedTcp();
   RawPeer peer;
-  SessionId sid = connectToPeer(t, peer);
-  CHECK(t.setReadMode(sid, ReadMode::Sync));
+  SessionId sid = connectToPeer(*t, peer);
+  CHECK(t->setReadMode(sid, ReadMode::Sync));
 
   std::atomic<bool> firstParked{false};
   std::thread w1(
@@ -203,7 +204,7 @@ void s7_two_waiters()
       char b[16];
       std::size_t l = sizeof(b);
       firstParked = true;
-      t.receiveSync(sid, b, l, 500ms); // parks then times out
+      t->receiveSync(sid, b, l, 500ms); // parks then times out
     });
   while (!firstParked)
   {
@@ -213,7 +214,7 @@ void s7_two_waiters()
 
   char b2[16];
   std::size_t l2 = sizeof(b2);
-  auto r = t.receiveSync(sid, b2, l2, 200ms);
+  auto r = t->receiveSync(sid, b2, l2, 200ms);
   CHECK(r.isErr());
   CHECK(r.error().code == TransportError::Cancelled); // single-waiter rejection
   w1.join();
@@ -228,13 +229,13 @@ void s9_timeout()
 {
   auto t = startedTcp();
   RawPeer peer;
-  SessionId sid = connectToPeer(t, peer);
-  CHECK(t.setReadMode(sid, ReadMode::Sync));
+  SessionId sid = connectToPeer(*t, peer);
+  CHECK(t->setReadMode(sid, ReadMode::Sync));
 
   char buf[16];
   std::size_t len = sizeof(buf);
   auto start = std::chrono::steady_clock::now();
-  auto r = t.receiveSync(sid, buf, len, 150ms);
+  auto r = t->receiveSync(sid, buf, len, 150ms);
   auto elapsed = std::chrono::steady_clock::now() - start;
   CHECK(r.isErr());
   CHECK(r.error().code == TransportError::Timeout); // never ok(0)
@@ -251,7 +252,7 @@ void s3f_receive_entry_fence_under_stress()
 {
   for (int i = 0; i < 50; ++i)
   {
-    auto t = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+    auto t = Transport::tcp(TransportConfig{});
     CHECK(t->start().isOk());
     RawPeer peer;
     SessionId sid = connectToPeer(*t, peer);
@@ -286,7 +287,7 @@ void s3b_destroy_during_park_stress()
 {
   for (int i = 0; i < 80; ++i)
   {
-    auto t = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+    auto t = Transport::tcp(TransportConfig{});
     CHECK(t->start().isOk());
     RawPeer peer;
     SessionId sid = connectToPeer(*t, peer);
@@ -322,7 +323,7 @@ void s3c_connect_during_teardown_stress()
 {
   for (int i = 0; i < 80; ++i)
   {
-    auto t = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+    auto t = Transport::tcp(TransportConfig{});
     CHECK(t->start().isOk());
 
     // Connect to a port with no listener -> connectSync parks until timeout.
@@ -354,11 +355,11 @@ void s2_gc_during_park()
   TransportConfig cfg;
   cfg.syncBufferGcThreshold = 8; // small so GC triggers quickly
   auto t = Transport::tcp(cfg);
-  CHECK(t.start().isOk());
+  CHECK(t->start().isOk());
 
   RawPeer peerA;
-  SessionId sidA = connectToPeer(t, peerA);
-  CHECK(t.setReadMode(sidA, ReadMode::Sync));
+  SessionId sidA = connectToPeer(*t, peerA);
+  CHECK(t->setReadMode(sidA, ReadMode::Sync));
 
   std::atomic<bool> parked{false};
   std::string got;
@@ -368,7 +369,7 @@ void s2_gc_during_park()
       char b[64];
       std::size_t l = sizeof(b);
       parked = true;
-      auto r = t.receiveSync(sidA, b, l, 2000ms);
+      auto r = t->receiveSync(sidA, b, l, 2000ms);
       if (r.isOk())
       {
         got.assign(b, l);
@@ -385,8 +386,8 @@ void s2_gc_during_park()
   for (int i = 0; i < 16; ++i)
   {
     auto p = std::make_unique<RawPeer>();
-    SessionId s = connectToPeer(t, *p);
-    t.setReadMode(s, ReadMode::Sync);
+    SessionId s = connectToPeer(*t, *p);
+    t->setReadMode(s, ReadMode::Sync);
     p->closeConn(); // triggers onClose -> tombstone -> GC pressure
     peers.push_back(std::move(p));
     std::this_thread::sleep_for(2ms);
@@ -407,7 +408,7 @@ void s2_gc_during_park()
 // balance; the synchronous-isErr branch is defensive/unreachable for TCP.
 void s3d_connect_sync_fail_balance()
 {
-  auto t = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+  auto t = Transport::tcp(TransportConfig{});
   CHECK(t->start().isOk());
   for (int i = 0; i < 20; ++i)
   {
@@ -434,7 +435,7 @@ void s6_gc_during_flush()
   std::atomic<int> delivered{0};
   std::atomic<bool> inCb{false};
   std::atomic<bool> release{false};
-  t.onData(
+  t->onData(
     [&](SessionId, iora::core::BufferView d, std::chrono::steady_clock::time_point)
     {
       inCb = true;
@@ -444,14 +445,14 @@ void s6_gc_during_flush()
         std::this_thread::sleep_for(1ms);
       }
     });
-  CHECK(t.start().isOk());
+  CHECK(t->start().isOk());
   RawPeer peer;
-  SessionId sid = connectToPeer(t, peer);
-  CHECK(t.setReadMode(sid, ReadMode::Sync));
+  SessionId sid = connectToPeer(*t, peer);
+  CHECK(t->setReadMode(sid, ReadMode::Sync));
   peer.send("PAYLOAD"); // 7 bytes buffered in Sync mode
   std::this_thread::sleep_for(5ms);
 
-  std::thread flusher([&] { t.setReadMode(sid, ReadMode::Async); });
+  std::thread flusher([&] { t->setReadMode(sid, ReadMode::Async); });
   while (!inCb)
   {
     std::this_thread::yield();
@@ -461,8 +462,8 @@ void s6_gc_during_flush()
   for (int i = 0; i < 16; ++i)
   {
     auto p = std::make_unique<RawPeer>();
-    SessionId s = connectToPeer(t, *p);
-    t.setReadMode(s, ReadMode::Sync);
+    SessionId s = connectToPeer(*t, *p);
+    t->setReadMode(s, ReadMode::Sync);
     p->closeConn();
     peers.push_back(std::move(p));
     std::this_thread::sleep_for(1ms);
@@ -487,7 +488,7 @@ void s3e_connect_entry_fence_stress()
 {
   for (int i = 0; i < 40; ++i)
   {
-    auto t = std::make_shared<Transport>(Transport::tcp(TransportConfig{}));
+    auto t = Transport::tcp(TransportConfig{});
     CHECK(t->start().isOk());
     std::atomic<bool> launched{false};
     std::thread w(
@@ -515,7 +516,7 @@ void s6b_teardown_during_flush_stress()
 {
   for (int i = 0; i < 40; ++i)
   {
-    auto t = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+    auto t = Transport::tcp(TransportConfig{});
     std::atomic<bool> inCallback{false};
     std::atomic<bool> release{false};
     // onData callback blocks (simulating a slow consumer) so the Sync->Async
@@ -565,8 +566,8 @@ void s6b_teardown_during_flush_stress()
 // deletes it (on the I/O thread) when the peer closes.
 void s4_destroy_from_onclose()
 {
-  auto *holder = new std::unique_ptr<Transport>();
-  *holder = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+  auto *holder = new std::shared_ptr<Transport>();
+  *holder = Transport::tcp(TransportConfig{});
   Transport *t = holder->get();
   std::atomic<bool> destroyed{false};
   t->onClose([holder, &destroyed](SessionId, const TransportErrorInfo &)
@@ -591,8 +592,8 @@ void s4_destroy_from_onclose()
 // the I/O thread while data is being delivered.
 void s4b_destroy_from_ondata()
 {
-  auto *holder = new std::unique_ptr<Transport>();
-  *holder = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+  auto *holder = new std::shared_ptr<Transport>();
+  *holder = Transport::tcp(TransportConfig{});
   Transport *t = holder->get();
   std::atomic<bool> destroyed{false};
   t->onData([holder, &destroyed](SessionId, iora::core::BufferView,
@@ -627,22 +628,22 @@ void s4e_setreadmode_from_iothread_throws()
   std::atomic<bool> threw{false};
   std::atomic<bool> ran{false};
   SessionId seen{0};
-  t.onData([&](SessionId sid, iora::core::BufferView, std::chrono::steady_clock::time_point)
+  t->onData([&](SessionId sid, iora::core::BufferView, std::chrono::steady_clock::time_point)
            {
              ran = true;
              seen = sid;
              try
              {
-               t.setReadMode(sid, ReadMode::Async); // on the I/O thread -> must throw
+               t->setReadMode(sid, ReadMode::Async); // on the I/O thread -> must throw
              }
              catch (const std::logic_error &)
              {
                threw = true;
              }
            });
-  CHECK(t.start().isOk());
+  CHECK(t->start().isOk());
   RawPeer peer;
-  SessionId sid = connectToPeer(t, peer);
+  SessionId sid = connectToPeer(*t, peer);
   (void)sid;
   peer.send("X"); // -> onData on the I/O thread
   for (int i = 0; i < 2000 && !ran; ++i)
@@ -653,31 +654,228 @@ void s4e_setreadmode_from_iothread_throws()
   CHECK(threw); // setReadMode on the I/O thread threw logic_error
 }
 
-// S4c: move-assign-from-callback (MANDATORY — operator= is a primary destruction
-// entry point). A heap Transport whose onClose move-assigns a fresh Transport over
-// itself ON THE I/O THREAD; the old _impl is deferred-released, the new impl
-// installed. Assert no UAF and the reassigned Transport is usable.
-void s4c_moveassign_from_callback()
+// S4c-REPLACEMENT (s4c_replacement_H3): the original S4c exercised move-assign-from-
+// callback; move-assign is DELETED under S-3, so it is replaced by a SOLE-OWNER
+// reset-in-callback scenario with PINNED assertions. A sole-owning shared_ptr is
+// dropped from inside its own onClose (on the I/O thread) -> ~Transport runs on the
+// I/O thread and takes the deferred-self-destruct: ~Impl is deleted on the DETACHED
+// I/O thread's post-loop epilogue, NOT synchronously inside ~Transport. We observe
+// via a HEAP-OWNED, test-owned, std::atomic Obs block: the Transport holder is
+// captured only as a RAW pointer (cycle invariant), while the NON-Transport Recorder
+// and Obs are captured as owning shared_ptrs (not Transports -> no self-cycle).
+// Under IORA_DISABLE_SELFDESTRUCT_DEFERRAL this exact scenario ASan-faults (task-5.1).
+struct S4cObs
 {
-  auto *t = new Transport(Transport::tcp(TransportConfig{}));
-  std::atomic<bool> done{false};
-  t->onClose([t, &done](SessionId, const TransportErrorInfo &)
+  std::atomic<bool> onCloseFired{false};
+  std::atomic<bool> dtorRan{false};
+  std::atomic<bool> dtorOnIoThread{false}; // ~Transport ran on the I/O thread (sole-owner path)
+  std::atomic<std::thread::id> ioThreadId{}; // thread onClose ran on (the I/O thread)
+};
+void s4c_sole_owner_reset_in_callback()
+{
+  auto obs = std::make_shared<S4cObs>();
+
+  // SOLE-owning heap holder. Constructed with a CUSTOM DELETER (test seam) that runs
+  // exactly when the last ref drops — i.e. inside onClose's holder->reset() on the I/O
+  // thread — so it deterministically records the thread on which ~Transport runs. The
+  // deleter's `delete p` triggers ~Transport, which (on the I/O thread) takes the
+  // deferred-self-destruct: ~Impl is scheduled onto the detached I/O thread's post-loop
+  // epilogue, NOT run synchronously here. Under IORA_DISABLE_SELFDESTRUCT_DEFERRAL the
+  // synchronous ~Impl UAFs (ASan), which is the deferral proof (task-5.1).
+  auto *holder = new std::shared_ptr<Transport>();
+  *holder = test::TransportEngineInjector::tcpWithDeleter(
+    TransportConfig{},
+    [obs](Transport *p)
+    {
+      if (obs->ioThreadId.load() == std::this_thread::get_id())
+      {
+        obs->dtorOnIoThread.store(true);
+      }
+      delete p; // -> ~Transport on the I/O thread -> deferred ~Impl on the detached thread
+      obs->dtorRan.store(true);
+    });
+  Transport *t = holder->get();
+
+  // onClose drops the SOLE ref on the I/O thread. Captures only the RAW holder ptr
+  // (NOT an owning shared_ptr<Transport> -> cycle invariant) plus the owning obs.
+  t->onClose([holder, obs](SessionId, const TransportErrorInfo &)
              {
-               *t = Transport::tcp(TransportConfig{}); // operator= on the I/O thread
-               done = true;
+               obs->ioThreadId.store(std::this_thread::get_id());
+               obs->onCloseFired.store(true);
+               holder->reset(); // drop the LAST ref -> deleter runs ~Transport on the I/O thread
              });
   CHECK(t->start().isOk());
   RawPeer peer;
   SessionId sid = connectToPeer(*t, peer);
   (void)sid;
-  peer.closeConn(); // onClose on the I/O thread -> move-assign over *t
-  for (int i = 0; i < 2000 && !done; ++i)
+  peer.closeConn(); // peer EOF -> onClose on the I/O thread -> sole-owner reset -> deferral
+
+  for (int i = 0; i < 3000 && !obs->dtorRan.load(); ++i)
   {
     std::this_thread::sleep_for(1ms);
   }
-  CHECK(done);
-  CHECK(t->start().isOk()); // the newly-installed impl is functional
-  delete t;                 // normal destruction (off I/O thread)
+  CHECK(obs->onCloseFired.load());    // onClose ran on the I/O thread
+  CHECK(obs->dtorRan.load());         // ~Transport actually ran (no leak / no hang)
+  CHECK(obs->dtorOnIoThread.load());  // ~Transport ran on the I/O thread (sole-owner self-destruct)
+  delete holder;
+}
+
+// C1-CLOSED (HR-9): permanent regression promoting /tmp/c1_repro.cpp Variant B. EVERY
+// thread that touches the Transport holds an owning shared_ptr<Transport>; the I/O-
+// thread onClose drops a NON-last ref (main's, via a raw holder pointer); a worker
+// co-owns and calls stop(); a peer-close races. Because a co-owner always exists across
+// the onClose, the onClose drop is NEVER the last ref -> ~Transport CANNOT run on the
+// I/O thread. ~Transport's exact thread is observed via a CUSTOM DELETER (test seam);
+// asserted never the I/O thread over N stress iters, ASan-clean, watchdog on hang.
+struct C1Obs
+{
+  std::atomic<bool> destroyed{false};
+  std::atomic<bool> destroyedOnIoThread{false};
+  std::atomic<bool> ioIdKnown{false};
+  std::atomic<std::thread::id> ioThreadId{};
+};
+void c1_closed_shared_ownership_stress()
+{
+  const int kIters = 200; // ts step-0 L-3: concrete stress count
+  for (int i = 0; i < kIters; ++i)
+  {
+    auto obs = std::make_shared<C1Obs>();
+    // Custom deleter records the thread on which ~Transport finally runs. Captures only
+    // the owning obs (a NON-Transport) -> no reference cycle.
+    auto t = test::TransportEngineInjector::tcpWithDeleter(
+      TransportConfig{},
+      [obs](Transport *p)
+      {
+        if (obs->ioIdKnown.load() && std::this_thread::get_id() == obs->ioThreadId.load())
+        {
+          obs->destroyedOnIoThread.store(true);
+        }
+        delete p;
+        obs->destroyed.store(true);
+      });
+
+    // Record the I/O-thread id from a callback (no owning capture of the Transport).
+    t->onData([obs](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point)
+              {
+                obs->ioThreadId.store(std::this_thread::get_id());
+                obs->ioIdKnown.store(true);
+              });
+    // main's owning ref lives on the heap; onClose drops it via a RAW holder pointer
+    // (NOT an owning shared_ptr<Transport> -> cycle invariant).
+    auto *holder = new std::shared_ptr<Transport>(t);
+    t->onClose([obs, holder](SessionId, const TransportErrorInfo &)
+               {
+                 obs->ioThreadId.store(std::this_thread::get_id());
+                 obs->ioIdKnown.store(true);
+                 std::this_thread::yield(); // widen the contended window (ts step-0 L-3)
+                 holder->reset();           // drop main's ref — NOT last (worker co-owns)
+               });
+    CHECK(t->start().isOk());
+    RawPeer peer;
+    (void)connectToPeer(*t, peer);
+
+    std::thread worker([t] { t->stop(); }); // worker co-owns across the entire stop()
+    peer.closeConn();                        // race the peer-close onClose against stop()
+    t.reset();                               // drop the local; main's other ref is in *holder
+    worker.join();                           // worker's owning copy drops here -> ~Transport off I/O thread
+
+    holder->reset(); // if onClose never fired, drop main's ref now
+    delete holder;
+
+    for (int s = 0; s < 3000 && !obs->destroyed.load(); ++s)
+    {
+      std::this_thread::sleep_for(1ms);
+    }
+    CHECK(obs->destroyed.load());             // destroyed (no leak / no hang)
+    // Non-vacuity guard: a callback MUST have recorded the I/O-thread id this iteration
+    // (peer.closeConn() always drives onClose), otherwise the "never on I/O thread"
+    // assertion below would pass without ever observing the I/O thread (ts step-4 L-1).
+    CHECK(obs->ioIdKnown.load());
+    CHECK(!obs->destroyedOnIoThread.load());  // ~Transport NEVER ran on the I/O thread (C-1 CLOSED)
+  }
+}
+
+// Guard-gating (HR-5/DQ-4): the four sync ops (connectSync/sendSync/receiveSync/
+// setReadMode) throw std::logic_error when called on the I/O thread REGARDLESS of
+// _running (thread-id-only guard). POSITIVE: invoked from onData (_running==true) AND
+// from a stop()-driven shutdownDrain onClose (_running==FALSE). NEGATIVE: invoked from
+// a non-I/O thread on a stopped transport -> the guard does NOT false-fire (DQ-4).
+void guard_gating_io_thread()
+{
+  TransportConfig cfg;
+  cfg.allowReadModeSwitch = true;
+  auto t = Transport::tcp(cfg);
+
+  std::atomic<int> threwOnData{0};  // of 4 ops, how many threw from onData (running==true)
+  std::atomic<int> threwOnClose{0}; // of 4 ops, how many threw from onClose (running==false)
+  std::atomic<bool> dataRan{false}, closeRan{false};
+
+  auto probe = [](Transport *tp, SessionId sid, std::atomic<int> &counter)
+  {
+    char buf[8];
+    std::size_t len = sizeof(buf);
+    const std::uint8_t one = 'x';
+    auto count = [&](auto fn) { try { fn(); } catch (const std::logic_error &) { ++counter; } };
+    count([&] { tp->connectSync("127.0.0.1", 9, TlsMode::None, 100ms); });
+    count([&] { tp->sendSync(sid, iora::core::BufferView{&one, 1}, 100ms); });
+    count([&] { tp->receiveSync(sid, buf, len, 100ms); });
+    count([&] { tp->setReadMode(sid, ReadMode::Async); });
+  };
+
+  t->onData([&](SessionId sid, iora::core::BufferView, std::chrono::steady_clock::time_point)
+            {
+              probe(t.get(), sid, threwOnData);
+              dataRan = true;
+            });
+  t->onClose([&](SessionId sid, const TransportErrorInfo &)
+             {
+               probe(t.get(), sid, threwOnClose);
+               closeRan = true;
+             });
+  CHECK(t->start().isOk());
+  RawPeer peer;
+  SessionId sid = connectToPeer(*t, peer);
+  peer.send("X"); // -> onData on the I/O thread (running==true)
+  for (int i = 0; i < 2000 && !dataRan; ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(dataRan);
+  CHECK(threwOnData.load() == 4); // all 4 sync ops threw on the I/O thread (running==true)
+
+  // stop() clears _running ON the I/O thread, then shutdownDrain fires onClose with
+  // _running==FALSE — exercising the thread-id-only guard in the _running==false case.
+  t->stop();
+  for (int i = 0; i < 2000 && !closeRan; ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(closeRan);
+  CHECK(threwOnClose.load() == 4); // all 4 threw on the I/O thread even with _running==false
+
+  // NEGATIVE: from a NON-I/O thread on the stopped/detached transport, none of the 4
+  // throws the I/O-thread logic_error (getIoThreadId()==default id post-stop, so a real
+  // off-I/O caller never matches it — DQ-4). They may fail for other reasons, not the guard.
+  std::atomic<int> falseThrows{0};
+  std::thread off(
+    [&]
+    {
+      char buf[8];
+      std::size_t len = sizeof(buf);
+      const std::uint8_t one = 'x';
+      auto noGuardThrow = [&](auto fn)
+      {
+        try { fn(); }
+        catch (const std::logic_error &) { ++falseThrows; }
+        catch (...) {}
+      };
+      noGuardThrow([&] { t->connectSync("127.0.0.1", 9, TlsMode::None, 50ms); });
+      noGuardThrow([&] { t->sendSync(1, iora::core::BufferView{&one, 1}, 50ms); });
+      noGuardThrow([&] { t->receiveSync(1, buf, len, 50ms); });
+      noGuardThrow([&] { t->setReadMode(1, ReadMode::Async); });
+    });
+  off.join();
+  CHECK(falseThrows.load() == 0); // the thread-id guard does not false-fire off the I/O thread
 }
 
 // Hard watchdog: a self-deadlock regression (e.g. the setReadMode I/O-thread
@@ -718,8 +916,10 @@ int main()
   run("s6b_teardown_during_flush_stress", s6b_teardown_during_flush_stress);
   run("s4_destroy_from_onclose", s4_destroy_from_onclose);
   run("s4b_destroy_from_ondata", s4b_destroy_from_ondata);
-  run("s4c_moveassign_from_callback", s4c_moveassign_from_callback);
+  run("s4c_sole_owner_reset_in_callback", s4c_sole_owner_reset_in_callback);
   run("s4e_setreadmode_from_iothread_throws", s4e_setreadmode_from_iothread_throws);
+  run("c1_closed_shared_ownership_stress", c1_closed_shared_ownership_stress);
+  run("guard_gating_io_thread", guard_gating_io_thread);
 
   std::printf("\n%d scenario(s), %d check failure(s)\n", g_run, g_failures);
   return g_failures == 0 ? 0 : 1;

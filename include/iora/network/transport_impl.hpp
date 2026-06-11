@@ -557,7 +557,7 @@ struct Transport::Impl
 // Transport method definitions
 // ══════════════════════════════════════════════════════════════════════════════
 
-inline Transport::Transport(TransportConfig config)
+inline Transport::Transport(PrivateTag, TransportConfig config)
   : _impl(std::make_unique<Impl>())
 {
   _impl->config = std::move(config);
@@ -572,7 +572,8 @@ inline Transport::Transport(TransportConfig config)
   _impl->setupEngineCallbacks();
 }
 
-inline Transport::Transport(std::unique_ptr<detail::EngineBase> engine, TransportConfig config)
+inline Transport::Transport(PrivateTag, std::unique_ptr<detail::EngineBase> engine,
+                            TransportConfig config)
   : _impl(std::make_unique<Impl>())
 {
   _impl->config = std::move(config);
@@ -586,46 +587,46 @@ inline Transport::~Transport()
   {
     return;
   }
-  // I/O-THREAD SELF-DESTRUCTION (destroyed from within one of our own callbacks):
-  // ~Impl would free the engine + syncMutex + maps while the I/O thread is still
-  // unwinding the engine's dispatch on its own stack (UAF). Defer Impl deletion to
-  // the detached engine thread's post-loop() epilogue (delete-this-at-thread-end).
-  // First wait out all EXTERNAL sync waiters (they run on user threads, wake via
-  // notify, exit independently), then release _impl, hand it to the engine to
-  // delete after loop() returns, and detach. Gated on isRunning() && id-match:
-  // if !isRunning() the I/O thread is gone so we can't be on it.
+  // I/O-THREAD SELF-DESTRUCTION: reached ONLY by dropping the LAST
+  // shared_ptr<Transport> reference from within one of our own I/O-thread
+  // callbacks — i.e. a SOLE owner (single-threaded). ~Impl would free the engine +
+  // syncMutex + maps while the I/O thread is still unwinding the engine's dispatch
+  // on its own stack (UAF), so we defer Impl deletion to the detached engine
+  // thread's post-loop() epilogue (delete-this-at-thread-end): wait out external
+  // sync waiters, release _impl, hand it to the engine to delete after loop()
+  // returns, and detach.
+  //
+  // The branch is gated on thread-identity ALONE. There is intentionally NO
+  // isRunning() assert in EITHER polarity, because BOTH _running values are
+  // legitimate here:
+  //   (a) shutdownDrain path  — the Shutdown command clears _running ON the I/O
+  //       thread (tcp_engine.hpp:1130-1131) BEFORE shutdownDrain fires onClose
+  //       (tcp_engine.hpp:1076), so _running == FALSE.
+  //   (b) peer-close-while-running path — closeNow (tcp_engine.hpp:1170) and the
+  //       connect-error sites (tcp_engine.hpp:1607/1641/1654) fire the same onClose
+  //       with _running still TRUE.
+  // An assert(isRunning()) would spuriously abort (a); an assert(!isRunning())
+  // would spuriously abort (b). The branch condition (we are on the I/O thread) is
+  // the only invariant.
+  //
+  // The genuinely CONCURRENT C-1 race (another thread mid-stop()) is excluded
+  // STRUCTURALLY by shared ownership, NOT by _running: a concurrent stopper is
+  // blocked in engine->stop()/_loop.join() holding its OWN shared_ptr<Transport>
+  // across the entire onClose, so this onClose drop can never be the LAST reference
+  // while a stopper exists — therefore ~Transport never runs on the I/O thread
+  // concurrently with another thread's call (join-ordering co-ownership).
   if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
-    // We are on the I/O thread (destroyed from within one of our own callbacks).
-    if (!_impl->engine->isRunning())
-    {
-      // UNSUPPORTED (C-1): _running was cleared by a CONCURRENT stop()/teardown
-      // on ANOTHER thread (the only way _running goes false on the I/O thread
-      // before our own detach). That other thread holds an in-flight reference
-      // into this Transport (e.g. it is blocked in engine->stop()/_loop.join()),
-      // so the engine is being torn down by two conflicting paths — join-vs-detach
-      // and the other thread's use of the about-to-be-freed engine cannot be
-      // reconciled. Deleting a Transport from a callback while another thread
-      // concurrently operates on it violates the object's lifetime contract.
-      // Fail loudly rather than corrupt memory (silent UAF in release builds).
-      std::fprintf(stderr, "FATAL: Transport destroyed from its own I/O thread while "
-                           "another thread is concurrently stopping/destroying it. "
-                           "Unsupported: the Transport must outlive all concurrent "
-                           "method calls. Aborting to avoid memory corruption.\n");
-      std::abort();
-    }
 #ifdef IORA_DISABLE_SELFDESTRUCT_DEFERRAL
     // RETAINED NEGATIVE CONTROL (test-only): synchronous teardown on the I/O
     // thread reproduces the heap-use-after-free (engine freed under its own
-    // running dispatch). A build with this macro MUST fail S4 under ASan —
-    // proving the deferral below is what prevents the UAF (guards TD-INV-4).
+    // running dispatch). A build with this macro MUST ASan-fault on the sole-owner
+    // reset-in-callback scenario — proving the deferral below is what prevents the
+    // UAF (guards TD-INV-4).
     _impl->teardownWaitOut(/*notifyReceive=*/true);
     _impl->engine->detachForTermination();
     return; // ~Impl runs now -> UAF
 #else
-    std::fprintf(stderr, "WARNING: Transport destroyed from I/O thread. Deferring "
-                         "destruction to the detached I/O thread. "
-                         "Fix: ensure Transport outlives all callbacks.\n");
     _impl->teardownWaitOut(/*notifyReceive=*/true);
     Impl *raw = _impl.release();              // ~Impl must NOT run now
     raw->engine->scheduleSelfDestruct([raw] { delete raw; }); // run post-loop()
@@ -638,74 +639,28 @@ inline Transport::~Transport()
   _impl->performTeardown();
 }
 
-inline Transport::Transport(Transport &&other) noexcept
-  : _impl(std::move(other._impl))
-{
-  if (_impl && _impl->engine)
-  {
-    _impl->setupEngineCallbacks(); // Re-register callbacks to point to this object's Impl
-  }
-}
+// Move and copy are deleted (HR-1/HR-2): Transport is shared-ownership-only. The
+// former move-ctor and move-assignment teardown paths (and the operator= interim
+// std::abort) no longer exist — a Transport is never moved, only shared.
 
-inline Transport &Transport::operator=(Transport &&other) noexcept
-{
-  if (this != &other)
-  {
-    // Tear down the OLD _impl before the move overwrites it (same hazards as
-    // ~Transport). On the I/O thread, defer its deletion (delete-this-at-thread-end)
-    // and fall through — NO early return — to install the new impl. Off the I/O
-    // thread, performTeardown waits out waiters and the subsequent move runs ~Impl
-    // synchronously.
-    if (_impl && _impl->engine)
-    {
-      if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
-      {
-        if (!_impl->engine->isRunning())
-        {
-          // UNSUPPORTED (C-1): concurrent stop()/teardown from another thread —
-          // see the matching ~Transport branch. Fail loudly, not silent UAF.
-          std::fprintf(stderr, "FATAL: Transport move-assigned from its own I/O thread while "
-                               "another thread is concurrently stopping/destroying it. "
-                               "Unsupported. Aborting to avoid memory corruption.\n");
-          std::abort();
-        }
-        std::fprintf(stderr, "WARNING: Transport move-assigned from I/O thread. "
-                             "Deferring old-impl destruction to the detached I/O thread.\n");
-        _impl->teardownWaitOut(/*notifyReceive=*/true);
-        Impl *raw = _impl.release();
-        raw->engine->scheduleSelfDestruct([raw] { delete raw; });
-        raw->engine->detachForTermination();
-      }
-      else
-      {
-        _impl->performTeardown();
-      }
-    }
-    _impl = std::move(other._impl);
-    if (_impl && _impl->engine)
-    {
-      // Move hygiene (L-4): a live, never-torn-down source must not carry a
-      // stuck shuttingDown/active* state that would instantly fail every
-      // subsequent sync op on this object.
-      assert(!_impl->shuttingDown && _impl->activeReceives == 0 &&
-             _impl->activeConnects == 0 && _impl->activeFlushes == 0 &&
-             "move-assigned from a torn-down Transport");
-      _impl->setupEngineCallbacks();
-    }
-  }
-  return *this;
-}
-
-inline Transport Transport::tcp(TransportConfig config)
+inline std::shared_ptr<Transport> Transport::tcp(TransportConfig config)
 {
   config.protocol = Protocol::TCP;
-  return Transport(std::move(config));
+  // make_shared (single allocation; enable_shared_from_this-compatible). PrivateTag
+  // is nameable here (this is a Transport member), so the tag-gated ctor is callable.
+  return std::make_shared<Transport>(PrivateTag{}, std::move(config));
 }
 
-inline Transport Transport::udp(TransportConfig config)
+inline std::shared_ptr<Transport> Transport::udp(TransportConfig config)
 {
   config.protocol = Protocol::UDP;
-  return Transport(std::move(config));
+  return std::make_shared<Transport>(PrivateTag{}, std::move(config));
+}
+
+inline std::shared_ptr<Transport> Transport::withEngine(std::unique_ptr<detail::EngineBase> engine,
+                                                        TransportConfig config)
+{
+  return std::make_shared<Transport>(PrivateTag{}, std::move(engine), std::move(config));
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -791,8 +746,12 @@ inline void Transport::sendAsync(SessionId sid, iora::core::BufferView data,
 inline ConnectResult Transport::connectSync(const std::string &host, std::uint16_t port,
                                             TlsMode tls, std::chrono::milliseconds timeout)
 {
-  if (_impl->engine->isRunning() &&
-      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  // Guard on thread-identity ALONE (HR-5/DQ-4): getIoThreadId()==_loop.get_id() is
+  // the default std::thread::id pre-start/post-detach, so it matches only the real
+  // running I/O thread. Dropping the isRunning() conjunct closes the window where
+  // _running==false but an I/O-thread callback (during shutdownDrain) still calls a
+  // guarded op that would deadlock.
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
     throw std::logic_error("connectSync() called from I/O thread — would deadlock. "
                            "Use connect() (async) instead, or post to a worker thread.");
@@ -908,8 +867,8 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
 inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data,
                                       std::chrono::milliseconds timeout)
 {
-  if (_impl->engine->isRunning() &&
-      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  // Guard on thread-identity ALONE (HR-5/DQ-4) — see connectSync for rationale.
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
     throw std::logic_error("sendSync() called from I/O thread — would deadlock. "
                            "Use send() (async) instead.");
@@ -930,8 +889,8 @@ inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data
 inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::size_t &len,
                                             std::chrono::milliseconds timeout)
 {
-  if (_impl->engine->isRunning() &&
-      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  // Guard on thread-identity ALONE (HR-5/DQ-4) — see connectSync for rationale.
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
     throw std::logic_error("receiveSync() called from I/O thread — would deadlock. "
                            "Use ReadMode::Async with onData() callback instead.");
@@ -1054,8 +1013,8 @@ inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
   // teardown handshake would then wait on activeFlushes==0 for THIS thread's own
   // flush -> self-deadlock. Reject on the I/O thread, like the other sync ops.
   // MUST precede the allowReadModeSwitch check so the throw is reached regardless.
-  if (_impl->engine->isRunning() &&
-      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  // Guard on thread-identity ALONE (HR-5/DQ-4) — see connectSync for rationale.
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
     throw std::logic_error("setReadMode() called from I/O thread — not permitted. "
                            "Switch read mode from a non-I/O thread.");

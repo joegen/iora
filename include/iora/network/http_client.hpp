@@ -130,7 +130,7 @@ private:
       transportConfig.clientTls.defaultMode = TlsMode::Client;
       transportConfig.clientTls.verifyPeer = _tlsConfig.verifyPeer;
 
-      _transport = std::make_unique<Transport>(transportConfig);
+      _transport = Transport::tcp(transportConfig); // HTTP client is TCP (S-3: shared_ptr factory)
       auto startResult = _transport->start();
       if (startResult.isErr())
       {
@@ -148,7 +148,7 @@ private:
   TlsConfig _tlsConfig;
 
   // Transport and DNS client (initialized lazily)
-  mutable std::unique_ptr<Transport> _transport;
+  mutable std::shared_ptr<Transport> _transport;
   mutable std::unique_ptr<DnsClient> _dnsClient;
 
   // Simple connection pool: host:port -> SessionId

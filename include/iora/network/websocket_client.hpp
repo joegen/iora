@@ -235,7 +235,7 @@ private:
     config.protocol = Protocol::TCP;
     config.enableTcpNoDelay = true;
 
-    _transport = std::make_unique<Transport>(config);
+    _transport = Transport::tcp(config); // WS is TCP (S-3: shared_ptr factory)
     {
       std::lock_guard<std::mutex> lock(_dataMutex);
       _buffer.clear();
@@ -624,8 +624,13 @@ private:
   std::string _path;
   Options _options;
 
-  // Transport
-  std::unique_ptr<Transport> _transport;
+  // Transport (S-3: shared_ptr-only ownership; the existing spawn-join-per-disconnect
+  // reconnect code is KEPT here — the unique_ptr->shared_ptr type change is
+  // race-neutral. NOTE: a PRE-EXISTING data race between sendRawBytes() (user thread,
+  // reads _transport/_sessionId unlocked) and the reconnect worker (resets them on
+  // another thread) is NOT fixed in this tracker; it is owned by the phase-2 F-1
+  // tracker 2026-06-11-4 (member_sync_H1NEW + companion_sessionId_M1).
+  std::shared_ptr<Transport> _transport;
   SessionId _sessionId;
 
   // State

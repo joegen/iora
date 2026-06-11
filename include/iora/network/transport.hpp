@@ -36,6 +36,16 @@ namespace detail
 class EngineBase;
 } // namespace detail
 
+// Test-only DI seam (DQ-8): forward declaration ONLY. Transport befriends this
+// struct so engine-level fault-injection tests can reach the private withEngine()
+// factory. Its DEFINITION lives in a test-only header (e.g.
+// tests/network/transport_test_seam.hpp) that includes transport.hpp — production
+// headers must NEVER include the test header.
+namespace test
+{
+struct TransportEngineInjector;
+} // namespace test
+
 // CancellationToken and ReadMode are defined in transport_types.hpp (included above).
 
 /// \brief Abstract transport interface — the single public API contract.
@@ -146,32 +156,56 @@ public:
 /// \brief Concrete transport implementation — single protocol per instance.
 ///
 /// Owns an internal engine (TcpEngine or UdpEngine) via unique_ptr<EngineBase>.
-/// Implements ITransport. Non-copyable, movable.
+/// Implements ITransport.
 ///
-/// Construction:
-///   Transport(TransportConfig config)                          — normal construction
-///   Transport(std::unique_ptr<detail::EngineBase> engine,
-///             TransportConfig config)                          — engine injection (testing)
+/// SHARED-OWNERSHIP-ONLY (S-3): a Transport exists ONLY inside a
+/// std::shared_ptr<Transport>. Constructors are tag-gated private; the only
+/// handles are the factories' shared_ptr returns; move and copy are deleted; the
+/// class derives from std::enable_shared_from_this<Transport>. Any thread invoking
+/// a method on a Transport therefore co-owns it for the call's duration, so an
+/// I/O-thread callback can never drop the LAST reference mid-call — ~Transport can
+/// never run on the I/O thread concurrently with another thread's call (closes C-1
+/// structurally). The lone I/O-thread ~Transport path is a SOLE owner dropping its
+/// last ref inside its own callback (single-threaded; handled by deferred-self-destruct).
+///
+/// Reference-cycle invariant: a callback (engine or user) must NEVER capture an
+/// owning std::shared_ptr<Transport> of its OWN Transport — that makes the Transport
+/// own itself. Capture the Impl `this` (as today) or a std::weak_ptr promoted per-use.
+///
+/// Construction (shared_ptr-returning factories; never start or bind):
 ///   Transport::tcp(TransportConfig config = {})                — TCP factory
 ///   Transport::udp(TransportConfig config = {})                — UDP factory
 ///
 /// Method definitions are in transport_impl.hpp (include in exactly one TU).
-class Transport final : public ITransport
+class Transport final : public ITransport, public std::enable_shared_from_this<Transport>
 {
+private:
+  // Passkey (DQ-1): makes the constructors effectively private — only Transport's
+  // own factory members can name PrivateTag — while still permitting
+  // std::make_shared (single allocation; enable_shared_from_this-compatible).
+  struct PrivateTag
+  {
+  };
+
 public:
-  explicit Transport(TransportConfig config);
-  Transport(std::unique_ptr<detail::EngineBase> engine, TransportConfig config);
+  // Tag-gated constructors: callable only where PrivateTag is nameable, i.e. inside
+  // Transport's own factory members (tcp/udp/withEngine in transport_impl.hpp). This
+  // is NOT a public construction surface — use the factories.
+  Transport(PrivateTag, TransportConfig config);
+  Transport(PrivateTag, std::unique_ptr<detail::EngineBase> engine, TransportConfig config);
   ~Transport();
 
-  Transport(Transport &&other) noexcept;
-  Transport &operator=(Transport &&other) noexcept;
+  // Shared-ownership only (HR-1/HR-2): move and copy are deleted. Deleting move
+  // assignment removes the entire operator= teardown path (the most hazardous code).
+  Transport(Transport &&) = delete;
+  Transport &operator=(Transport &&) = delete;
   Transport(const Transport &) = delete;
   Transport &operator=(const Transport &) = delete;
 
-  // Factory methods — protocol-only, never start or bind (HR-3).
-  // SIP presets are on TransportConfig::forSipTcp(), etc.
-  static Transport tcp(TransportConfig config = {});
-  static Transport udp(TransportConfig config = {});
+  // Factory methods — return std::shared_ptr<Transport>; protocol-only, never start
+  // or bind (HR-3). SIP presets are on TransportConfig::forSipTcp(), etc.
+  static std::shared_ptr<Transport> tcp(TransportConfig config = {});
+  static std::shared_ptr<Transport> udp(TransportConfig config = {});
 
   // ===== ITransport Implementation =====
   StartResult start() override;
@@ -228,6 +262,18 @@ public:
   Protocol getProtocol() const override;
 
 private:
+  // DI / fault-injection seam (DQ-8): PRIVATE factory returning shared_ptr —
+  // replaces the old public engine-injection constructor. Reached by engine-level
+  // fault-injection tests via the friend accessor below; production code uses
+  // tcp()/udp().
+  static std::shared_ptr<Transport> withEngine(std::unique_ptr<detail::EngineBase> engine,
+                                               TransportConfig config);
+
+  // Test-only accessor for the private withEngine() factory. The struct itself is
+  // forward-declared above and defined only in a test-only header — production
+  // headers never include it.
+  friend struct iora::network::test::TransportEngineInjector;
+
   struct Impl;
   std::unique_ptr<Impl> _impl;
 };

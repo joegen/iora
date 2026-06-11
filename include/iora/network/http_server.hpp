@@ -431,7 +431,7 @@ public:
         config.serverTls.verifyPeer = tlsCfg.requireClientCert;
       }
 
-      _transport = std::make_unique<Transport>(config);
+      _transport = Transport::tcp(config); // HTTP server is TCP (S-3: shared_ptr factory)
 
       // Set up callbacks before starting
 
@@ -2105,7 +2105,7 @@ private:
   std::chrono::seconds _idleTimeout{600}; // applied at start(); SSE M-3 survival
   std::chrono::seconds _gcInterval{5};    // applied at start(); engine GC sweep
   std::optional<TlsConfig> _tlsConfig;
-  std::unique_ptr<Transport> _transport;
+  std::shared_ptr<Transport> _transport;
   ListenerId _listenerId{0};
   std::atomic<bool> _shutdown;
 
