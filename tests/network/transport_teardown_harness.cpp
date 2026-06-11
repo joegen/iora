@@ -556,10 +556,154 @@ void s6b_teardown_during_flush_stress()
   }
 }
 
+// ── Self-destruction-from-I/O-thread scenarios (tracker 2026-06-11-1) ─────────
+// A Transport destroyed/move-assigned from INSIDE its own I/O-thread callback.
+// Against pre-fix code these UAF (engine freed under its own running dispatch);
+// with the deferred-self-destruct fix they must run clean under ASan.
+
+// S4: destroy-from-onClose. A heap-owned Transport whose global onClose callback
+// deletes it (on the I/O thread) when the peer closes.
+void s4_destroy_from_onclose()
+{
+  auto *holder = new std::unique_ptr<Transport>();
+  *holder = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+  Transport *t = holder->get();
+  std::atomic<bool> destroyed{false};
+  t->onClose([holder, &destroyed](SessionId, const TransportErrorInfo &)
+             {
+               holder->reset(); // ~Transport on the I/O thread (deferred self-destruct)
+               destroyed = true;
+             });
+  CHECK(t->start().isOk());
+  RawPeer peer;
+  SessionId sid = connectToPeer(*t, peer);
+  (void)sid;
+  peer.closeConn(); // peer EOF -> onClose fires on the I/O thread -> deletes t
+  for (int i = 0; i < 2000 && !destroyed; ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(destroyed);
+  delete holder; // the unique_ptr was reset; free the holder itself
+}
+
+// S4b: destroy-from-onData. The global onData callback deletes the Transport on
+// the I/O thread while data is being delivered.
+void s4b_destroy_from_ondata()
+{
+  auto *holder = new std::unique_ptr<Transport>();
+  *holder = std::make_unique<Transport>(Transport::tcp(TransportConfig{}));
+  Transport *t = holder->get();
+  std::atomic<bool> destroyed{false};
+  t->onData([holder, &destroyed](SessionId, iora::core::BufferView,
+                                 std::chrono::steady_clock::time_point)
+            {
+              if (!destroyed.exchange(true))
+              {
+                holder->reset(); // ~Transport on the I/O thread
+              }
+            });
+  CHECK(t->start().isOk());
+  RawPeer peer;
+  SessionId sid = connectToPeer(*t, peer);
+  (void)sid;
+  peer.send("HELLO"); // -> onData on the I/O thread -> deletes t
+  for (int i = 0; i < 2000 && !destroyed; ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(destroyed);
+  delete holder;
+}
+
+// S4e: setReadMode from the I/O thread must throw std::logic_error (TD-INV-5),
+// NOT enter a flush that could self-deadlock teardown. Fixture allows read-mode
+// switching so the throw (not the allowReadModeSwitch early-return) is reached.
+void s4e_setreadmode_from_iothread_throws()
+{
+  TransportConfig cfg;
+  cfg.allowReadModeSwitch = true;
+  auto t = Transport::tcp(cfg);
+  std::atomic<bool> threw{false};
+  std::atomic<bool> ran{false};
+  SessionId seen{0};
+  t.onData([&](SessionId sid, iora::core::BufferView, std::chrono::steady_clock::time_point)
+           {
+             ran = true;
+             seen = sid;
+             try
+             {
+               t.setReadMode(sid, ReadMode::Async); // on the I/O thread -> must throw
+             }
+             catch (const std::logic_error &)
+             {
+               threw = true;
+             }
+           });
+  CHECK(t.start().isOk());
+  RawPeer peer;
+  SessionId sid = connectToPeer(t, peer);
+  (void)sid;
+  peer.send("X"); // -> onData on the I/O thread
+  for (int i = 0; i < 2000 && !ran; ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(ran);
+  CHECK(threw); // setReadMode on the I/O thread threw logic_error
+}
+
+// S4c: move-assign-from-callback (MANDATORY — operator= is a primary destruction
+// entry point). A heap Transport whose onClose move-assigns a fresh Transport over
+// itself ON THE I/O THREAD; the old _impl is deferred-released, the new impl
+// installed. Assert no UAF and the reassigned Transport is usable.
+void s4c_moveassign_from_callback()
+{
+  auto *t = new Transport(Transport::tcp(TransportConfig{}));
+  std::atomic<bool> done{false};
+  t->onClose([t, &done](SessionId, const TransportErrorInfo &)
+             {
+               *t = Transport::tcp(TransportConfig{}); // operator= on the I/O thread
+               done = true;
+             });
+  CHECK(t->start().isOk());
+  RawPeer peer;
+  SessionId sid = connectToPeer(*t, peer);
+  (void)sid;
+  peer.closeConn(); // onClose on the I/O thread -> move-assign over *t
+  for (int i = 0; i < 2000 && !done; ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(done);
+  CHECK(t->start().isOk()); // the newly-installed impl is functional
+  delete t;                 // normal destruction (off I/O thread)
+}
+
+// Hard watchdog: a self-deadlock regression (e.g. the setReadMode I/O-thread
+// guard removed) would HANG rather than fail a CHECK. Abort loudly instead.
+void startWatchdog(int seconds)
+{
+  std::thread(
+    [seconds]
+    {
+      for (int i = 0; i < seconds * 10; ++i)
+      {
+        std::this_thread::sleep_for(100ms);
+      }
+      std::fprintf(stderr, "\nWATCHDOG: harness exceeded %ds — likely a teardown "
+                           "self-deadlock. Aborting.\n",
+                   seconds);
+      std::abort();
+    })
+    .detach();
+}
+
 } // namespace
 
 int main()
 {
+  startWatchdog(180);
   run("s1_drain_before_close", s1_drain_before_close);
   run("s2_gc_during_park", s2_gc_during_park);
   run("s5_overflow", s5_overflow);
@@ -572,6 +716,10 @@ int main()
   run("s3b_destroy_during_park_stress", s3b_destroy_during_park_stress);
   run("s3c_connect_during_teardown_stress", s3c_connect_during_teardown_stress);
   run("s6b_teardown_during_flush_stress", s6b_teardown_during_flush_stress);
+  run("s4_destroy_from_onclose", s4_destroy_from_onclose);
+  run("s4b_destroy_from_ondata", s4b_destroy_from_ondata);
+  run("s4c_moveassign_from_callback", s4c_moveassign_from_callback);
+  run("s4e_setreadmode_from_iothread_throws", s4e_setreadmode_from_iothread_throws);
 
   std::printf("\n%d scenario(s), %d check failure(s)\n", g_run, g_failures);
   return g_failures == 0 ? 0 : 1;

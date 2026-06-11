@@ -20,6 +20,8 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -111,6 +113,15 @@ public:
     }
   }
 
+  /// \brief Deferred self-destruction; see EngineBase. Called ONLY on the I/O
+  /// thread, before detachForTermination(); same-thread write/read, no lock.
+  void scheduleSelfDestruct(std::function<void()> deleter) override
+  {
+    assert(std::this_thread::get_id() == _loop.get_id() &&
+           "scheduleSelfDestruct must be called on the I/O thread");
+    _selfDestruct = std::move(deleter);
+  }
+
   void setCallbacks(detail::EngineBase::Callbacks cbs) override
   {
     std::lock_guard<std::mutex> g(_cbMutex);
@@ -162,7 +173,22 @@ public:
       sigemptyset(&sigpipeSet);
       sigaddset(&sigpipeSet, SIGPIPE);
       pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
-      loop();
+      // try/catch so the deferred self-destruct deleter runs on EVERY loop()
+      // exit; moved to a local and invoked LAST (delete-this-at-thread-end).
+      try
+      {
+        loop();
+      }
+      catch (...)
+      {
+        std::fprintf(stderr, "WARNING: UdpEngine I/O loop terminated by exception.\n");
+      }
+      std::function<void()> sd;
+      sd.swap(_selfDestruct);
+      if (sd)
+      {
+        sd();
+      }
     });
     return StartResult::ok();
   }
@@ -1597,6 +1623,9 @@ private:
   std::atomic<bool> _running{false};
   int _epollFd{-1}, _eventFd{-1}, _timerFd{-1};
   std::thread _loop;
+  // Deferred self-destruct deleter (delete-this-at-thread-end). Written/read
+  // ONLY on the I/O thread (set pre-detach, run post-loop()); no synchronization.
+  std::function<void()> _selfDestruct;
   // Lock ordering: _cbMutex and _sessionRwMutex are never held simultaneously.
   // _cbMutex protects callback copies (acquired/released before any _sessionRwMutex use).
   // _sessionRwMutex protects session/listener maps (shared_lock for reads, unique_lock for mutations).

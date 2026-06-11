@@ -25,6 +25,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -122,6 +123,17 @@ public:
     }
   }
 
+  /// \brief Register a deleter run by the detached I/O thread after loop()
+  /// returns (deferred self-destruction; see EngineBase). Called ONLY on the
+  /// I/O thread, before detachForTermination() — the write and the epilogue
+  /// read are same-thread, so no synchronization is used.
+  void scheduleSelfDestruct(std::function<void()> deleter) override
+  {
+    assert(std::this_thread::get_id() == _loop.get_id() &&
+           "scheduleSelfDestruct must be called on the I/O thread");
+    _selfDestruct = std::move(deleter);
+  }
+
   /// \brief Install callbacks (may be called before or after start()).
   void setCallbacks(detail::EngineBase::Callbacks cbs) override
   {
@@ -200,7 +212,25 @@ public:
         sigemptyset(&sigpipeSet);
         sigaddset(&sigpipeSet, SIGPIPE);
         pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
-        loop();
+        // try/catch so the deferred self-destruct deleter runs on EVERY loop()
+        // exit, incl. an exception escaping loop()/shutdownDrain (else the owning
+        // Impl would leak). The deleter is moved to a local and invoked LAST:
+        // it deletes the owning object (which contains this engine), so nothing
+        // may touch `this` or any member after it runs (delete-this-at-thread-end).
+        try
+        {
+          loop();
+        }
+        catch (...)
+        {
+          std::fprintf(stderr, "WARNING: TcpEngine I/O loop terminated by exception.\n");
+        }
+        std::function<void()> sd;
+        sd.swap(_selfDestruct);
+        if (sd)
+        {
+          sd();
+        }
       });
     }
     catch (const std::exception &ex)
@@ -2630,6 +2660,10 @@ private:
   std::atomic<bool> _running{false};
   int _epollFd{-1}, _eventFd{-1}, _timerFd{-1};
   std::thread _loop;
+  // Deferred self-destruct deleter (delete-this-at-thread-end). Written and read
+  // ONLY on the I/O thread (set in scheduleSelfDestruct pre-detach; run in the
+  // loop-lambda epilogue post-loop()); no synchronization — see EngineBase.
+  std::function<void()> _selfDestruct;
 
   // Lock ordering: _cbMutex and _sessionRwMutex are never held simultaneously.
   // _cbMutex protects callback copies (acquired/released before any _sessionRwMutex use).

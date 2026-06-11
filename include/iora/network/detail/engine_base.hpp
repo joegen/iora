@@ -94,6 +94,15 @@ public:
   // Sets _running=false and detaches the I/O thread so that the engine's
   // destructor doesn't deadlock trying to join the current thread.
   virtual void detachForTermination() = 0;
+
+  // Deferred self-destruction (for Transport destroyed from within its own
+  // I/O-thread callback). Registers a deleter that the detached I/O thread runs
+  // in its post-loop() epilogue, AFTER all in-flight dispatch has unwound — so
+  // freeing the owning object (which contains this engine) does not occur under
+  // the engine's own running stack frame. MUST be called ONLY on the I/O thread,
+  // before detachForTermination(); the deleter and its read are same-thread, so
+  // no synchronization is used.
+  virtual void scheduleSelfDestruct(std::function<void()> deleter) = 0;
 };
 
 } // namespace detail

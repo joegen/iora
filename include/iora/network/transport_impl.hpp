@@ -256,31 +256,15 @@ struct Transport::Impl
   // use-after-free.
   void performTeardown()
   {
-    // Thread identity MUST be computed independently of running-state (C-1): a
-    // shutdownDrain-fired onClose runs on the I/O thread with isRunning()==false,
-    // so gating onIoThread on `running` would route an I/O-thread destruction to
-    // the blocking ALREADY-STOPPED path and either deadlock the I/O thread or let
-    // ~Impl free engine/syncMutex while the drain is still on the stack (UAF).
-    // getIoThreadId() returns the live _loop id until join/detach, so this
-    // comparison is valid even when !running.
-    const bool onIoThread = std::this_thread::get_id() == engine->getIoThreadId();
+    // performTeardown handles ONLY the non-I/O-thread teardown paths. The
+    // I/O-thread (self-destruction) case is handled by Transport::~Transport /
+    // operator= via deferred self-destruction (they own the unique_ptr and can
+    // release it). If performTeardown were ever entered on the I/O thread it
+    // would self-join on engine->stop() (NORMAL) or self-wait on teardownCv
+    // (ALREADY-STOPPED) — so assert against it.
+    assert(std::this_thread::get_id() != engine->getIoThreadId() &&
+           "performTeardown must not run on the I/O thread — ~Transport/operator= handle that");
 
-    if (onIoThread)
-    {
-      // EMERGENCY DETACH (Transport destroyed/move-assigned from inside a
-      // callback on the I/O thread). We must NOT block this thread on a join or
-      // on stop() (can't join self) and detach fires no onClose, so the handshake
-      // wakes receiveSync CVs too (notifyReceive=true). Parked waiters run on
-      // OTHER (user) threads — they wake via the notify and decrement
-      // independently, so teardownWaitOut does not deadlock here. Undelivered
-      // in-kernel bytes are lost — accepted for emergency teardown.
-      std::fprintf(stderr, "WARNING: Transport destroyed from I/O thread. "
-                           "Waking sync waiters and detaching I/O thread to prevent deadlock. "
-                           "Fix: ensure Transport outlives all callbacks.\n");
-      teardownWaitOut(/*notifyReceive=*/true);
-      engine->detachForTermination();
-      return;
-    }
     if (!engine->isRunning())
     {
       // ALREADY-STOPPED (on a non-I/O thread): onClose already fired externally
@@ -602,11 +586,55 @@ inline Transport::~Transport()
   {
     return;
   }
-  // Teardown handshake dominates all destruction exits and is gated on engine
-  // PRESENCE (not isRunning()): a parked receiveSync/connectSync waiter or an
-  // in-progress setReadMode flush — all on external threads — must be waited out
-  // before ~Impl frees syncMutex/receiveBuffers/pendingConnects, or those
-  // threads re-lock/touch freed state (use-after-free). INV-5/INV-5a/INV-5b.
+  // I/O-THREAD SELF-DESTRUCTION (destroyed from within one of our own callbacks):
+  // ~Impl would free the engine + syncMutex + maps while the I/O thread is still
+  // unwinding the engine's dispatch on its own stack (UAF). Defer Impl deletion to
+  // the detached engine thread's post-loop() epilogue (delete-this-at-thread-end).
+  // First wait out all EXTERNAL sync waiters (they run on user threads, wake via
+  // notify, exit independently), then release _impl, hand it to the engine to
+  // delete after loop() returns, and detach. Gated on isRunning() && id-match:
+  // if !isRunning() the I/O thread is gone so we can't be on it.
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    // We are on the I/O thread (destroyed from within one of our own callbacks).
+    if (!_impl->engine->isRunning())
+    {
+      // UNSUPPORTED (C-1): _running was cleared by a CONCURRENT stop()/teardown
+      // on ANOTHER thread (the only way _running goes false on the I/O thread
+      // before our own detach). That other thread holds an in-flight reference
+      // into this Transport (e.g. it is blocked in engine->stop()/_loop.join()),
+      // so the engine is being torn down by two conflicting paths — join-vs-detach
+      // and the other thread's use of the about-to-be-freed engine cannot be
+      // reconciled. Deleting a Transport from a callback while another thread
+      // concurrently operates on it violates the object's lifetime contract.
+      // Fail loudly rather than corrupt memory (silent UAF in release builds).
+      std::fprintf(stderr, "FATAL: Transport destroyed from its own I/O thread while "
+                           "another thread is concurrently stopping/destroying it. "
+                           "Unsupported: the Transport must outlive all concurrent "
+                           "method calls. Aborting to avoid memory corruption.\n");
+      std::abort();
+    }
+#ifdef IORA_DISABLE_SELFDESTRUCT_DEFERRAL
+    // RETAINED NEGATIVE CONTROL (test-only): synchronous teardown on the I/O
+    // thread reproduces the heap-use-after-free (engine freed under its own
+    // running dispatch). A build with this macro MUST fail S4 under ASan —
+    // proving the deferral below is what prevents the UAF (guards TD-INV-4).
+    _impl->teardownWaitOut(/*notifyReceive=*/true);
+    _impl->engine->detachForTermination();
+    return; // ~Impl runs now -> UAF
+#else
+    std::fprintf(stderr, "WARNING: Transport destroyed from I/O thread. Deferring "
+                         "destruction to the detached I/O thread. "
+                         "Fix: ensure Transport outlives all callbacks.\n");
+    _impl->teardownWaitOut(/*notifyReceive=*/true);
+    Impl *raw = _impl.release();              // ~Impl must NOT run now
+    raw->engine->scheduleSelfDestruct([raw] { delete raw; }); // run post-loop()
+    raw->engine->detachForTermination();
+    return;
+#endif
+  }
+  // Non-I/O-thread teardown: handshake (gated on engine PRESENCE, not isRunning())
+  // waits out external sync waiters, then ~Impl frees state synchronously here.
   _impl->performTeardown();
 }
 
@@ -623,12 +651,35 @@ inline Transport &Transport::operator=(Transport &&other) noexcept
 {
   if (this != &other)
   {
-    // Wait out all external sync waiters/flushers on the OLD _impl before it is
-    // destroyed by the move-assign, for the same reason as ~Transport. Gated on
-    // engine presence, not isRunning() (INV-5a).
+    // Tear down the OLD _impl before the move overwrites it (same hazards as
+    // ~Transport). On the I/O thread, defer its deletion (delete-this-at-thread-end)
+    // and fall through — NO early return — to install the new impl. Off the I/O
+    // thread, performTeardown waits out waiters and the subsequent move runs ~Impl
+    // synchronously.
     if (_impl && _impl->engine)
     {
-      _impl->performTeardown();
+      if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
+      {
+        if (!_impl->engine->isRunning())
+        {
+          // UNSUPPORTED (C-1): concurrent stop()/teardown from another thread —
+          // see the matching ~Transport branch. Fail loudly, not silent UAF.
+          std::fprintf(stderr, "FATAL: Transport move-assigned from its own I/O thread while "
+                               "another thread is concurrently stopping/destroying it. "
+                               "Unsupported. Aborting to avoid memory corruption.\n");
+          std::abort();
+        }
+        std::fprintf(stderr, "WARNING: Transport move-assigned from I/O thread. "
+                             "Deferring old-impl destruction to the detached I/O thread.\n");
+        _impl->teardownWaitOut(/*notifyReceive=*/true);
+        Impl *raw = _impl.release();
+        raw->engine->scheduleSelfDestruct([raw] { delete raw; });
+        raw->engine->detachForTermination();
+      }
+      else
+      {
+        _impl->performTeardown();
+      }
     }
     _impl = std::move(other._impl);
     if (_impl && _impl->engine)
@@ -998,6 +1049,18 @@ inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::si
 
 inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
 {
+  // I/O-thread guard (TD-INV-5): a Sync->Async flush invokes the user onData
+  // callback, which could delete the Transport on the I/O thread; the resulting
+  // teardown handshake would then wait on activeFlushes==0 for THIS thread's own
+  // flush -> self-deadlock. Reject on the I/O thread, like the other sync ops.
+  // MUST precede the allowReadModeSwitch check so the throw is reached regardless.
+  if (_impl->engine->isRunning() &&
+      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  {
+    throw std::logic_error("setReadMode() called from I/O thread — not permitted. "
+                           "Switch read mode from a non-I/O thread.");
+  }
+
   if (!_impl->config.allowReadModeSwitch)
   {
     return false;
