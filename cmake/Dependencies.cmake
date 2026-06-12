@@ -80,7 +80,19 @@ function(configure_iora_dependencies)
     #     INCLUDE_DIR NLOHMANN_JSON_INCLUDE_DIR
     # )
     
-    # Catch2 (for testing) - Using v2 for compatibility
+    # Catch2 (for testing) - Using v2 for compatibility.
+    #
+    # The test targets link Catch2::Catch2WithMain (cmake/IoraTargets.cmake): a
+    # STATIC library whose main() object the linker pulls only for the test
+    # executables that do NOT define their own (the ones using CATCH_CONFIG_MAIN
+    # supply their own main and the archive's main is simply not pulled — no
+    # collision). Catch2 v2.13.10 only DEFINES that target under
+    # CATCH_BUILD_STATIC_LIBRARY, which defaults OFF — so on the FetchContent
+    # fallback path (no system Catch2 installed) the target would be missing and
+    # every test would fail to configure. Force it ON before the fetch so the
+    # build is self-contained and reproducible without a system Catch2 package.
+    set(CATCH_BUILD_STATIC_LIBRARY ON CACHE BOOL
+        "Build Catch2 compiled-main static lib (provides Catch2::Catch2WithMain)" FORCE)
     find_or_fetch_dependency(
         NAME Catch2
         PACKAGE_NAME Catch2

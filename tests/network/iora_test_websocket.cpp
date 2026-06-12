@@ -59,19 +59,19 @@ TEST_CASE("WS Integration: client connects and upgrades", "[ws][integration]")
   server.start();
   std::this_thread::sleep_for(100ms);
 
-  WebSocketClient client;
+  auto client = WebSocketClient::create();
   std::atomic<bool> clientConnected{false};
 
-  client.setOnConnect([&](const std::string&)
+  client->setOnConnect([&](const std::string&)
   {
     clientConnected.store(true);
   });
 
-  REQUIRE(client.connect("127.0.0.1", port));
-  REQUIRE(client.getState() == WebSocketState::CONNECTED);
+  REQUIRE(client->connect("127.0.0.1", port));
+  REQUIRE(client->getState() == WebSocketState::CONNECTED);
   REQUIRE(waitFor([&]() { return serverGotConnect.load(); }));
 
-  client.disconnect();
+  client->disconnect();
   server.stop();
 }
 
@@ -93,21 +93,21 @@ TEST_CASE("WS Integration: text echo", "[ws][integration]")
   server.start();
   std::this_thread::sleep_for(100ms);
 
-  WebSocketClient client;
+  auto client = WebSocketClient::create();
   std::string received;
   std::mutex mtx;
   std::condition_variable cv;
 
-  client.setOnTextMessage([&](const std::string& msg)
+  client->setOnTextMessage([&](const std::string& msg)
   {
     std::lock_guard lock(mtx);
     received = msg;
     cv.notify_one();
   });
 
-  REQUIRE(client.connect("127.0.0.1", port));
+  REQUIRE(client->connect("127.0.0.1", port));
 
-  client.sendText("Hello WebSocket!");
+  client->sendText("Hello WebSocket!");
 
   {
     std::unique_lock lock(mtx);
@@ -115,7 +115,7 @@ TEST_CASE("WS Integration: text echo", "[ws][integration]")
   }
   REQUIRE(received == "Hello WebSocket!");
 
-  client.disconnect();
+  client->disconnect();
   server.stop();
 }
 
@@ -136,22 +136,22 @@ TEST_CASE("WS Integration: binary echo", "[ws][integration]")
   server.start();
   std::this_thread::sleep_for(100ms);
 
-  WebSocketClient client;
+  auto client = WebSocketClient::create();
   std::vector<std::uint8_t> received;
   std::mutex mtx;
   std::condition_variable cv;
 
-  client.setOnBinaryMessage([&](const std::vector<std::uint8_t>& data)
+  client->setOnBinaryMessage([&](const std::vector<std::uint8_t>& data)
   {
     std::lock_guard lock(mtx);
     received = data;
     cv.notify_one();
   });
 
-  REQUIRE(client.connect("127.0.0.1", port));
+  REQUIRE(client->connect("127.0.0.1", port));
 
   std::vector<std::uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF};
-  client.sendBinary(payload);
+  client->sendBinary(payload);
 
   {
     std::unique_lock lock(mtx);
@@ -159,7 +159,7 @@ TEST_CASE("WS Integration: binary echo", "[ws][integration]")
   }
   REQUIRE(received == payload);
 
-  client.disconnect();
+  client->disconnect();
   server.stop();
 }
 
@@ -183,17 +183,17 @@ TEST_CASE("WS Integration: close handshake", "[ws][integration]")
   server.start();
   std::this_thread::sleep_for(100ms);
 
-  WebSocketClient client;
+  auto client = WebSocketClient::create();
   std::atomic<bool> clientGotClose{false};
 
-  client.setOnClose([&](std::uint16_t, const std::string&)
+  client->setOnClose([&](std::uint16_t, const std::string&)
   {
     clientGotClose.store(true);
   });
 
-  REQUIRE(client.connect("127.0.0.1", port));
+  REQUIRE(client->connect("127.0.0.1", port));
 
-  client.disconnect(1000, "normal close");
+  client->disconnect(1000, "normal close");
   REQUIRE(waitFor([&]() { return serverGotClose.load(); }, 3000ms));
   REQUIRE(closeCode.load() == 1000);
 
@@ -228,22 +228,22 @@ TEST_CASE("WS Integration: subprotocol negotiation", "[ws][integration]")
   server.start();
   std::this_thread::sleep_for(100ms);
 
-  WebSocketClient client;
+  auto client = WebSocketClient::create();
   std::string clientProtocol;
 
-  client.setOnConnect([&](const std::string& proto)
+  client->setOnConnect([&](const std::string& proto)
   {
     clientProtocol = proto;
   });
 
   WebSocketClient::Options opts;
   opts.subprotocols = {"sip", "xmpp"};
-  REQUIRE(client.connect("127.0.0.1", port, "/", opts));
+  REQUIRE(client->connect("127.0.0.1", port, "/", opts));
   REQUIRE(waitFor([&]() { return !clientProtocol.empty(); }));
   REQUIRE(clientProtocol == "sip");
   REQUIRE(serverProtocol == "sip");
 
-  client.disconnect();
+  client->disconnect();
   server.stop();
 }
 
@@ -267,12 +267,12 @@ TEST_CASE("WS Integration: multiple concurrent clients", "[ws][integration]")
   std::this_thread::sleep_for(100ms);
 
   constexpr int numClients = 3;
-  std::vector<std::unique_ptr<WebSocketClient>> clients;
+  std::vector<std::shared_ptr<WebSocketClient>> clients;
   std::atomic<int> responses{0};
 
   for (int i = 0; i < numClients; ++i)
   {
-    auto c = std::make_unique<WebSocketClient>();
+    auto c = WebSocketClient::create();
     c->setOnTextMessage([&](const std::string&)
     {
       responses.fetch_add(1);

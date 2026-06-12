@@ -428,19 +428,19 @@ TEST_CASE("integration: WebSocketServer drops sendText after sendClose (web-M7)"
   server.start();
   std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-  iora::network::WebSocketClient client;
+  auto client = iora::network::WebSocketClient::create();
   std::mutex mtx;
   std::vector<std::string> received;
   std::atomic<bool> sawBinaryAfterClose{false};
-  client.setOnTextMessage(
+  client->setOnTextMessage(
     [&](const std::string &m)
     {
       std::lock_guard<std::mutex> lk(mtx);
       received.push_back(m);
     });
-  client.setOnBinaryMessage(
+  client->setOnBinaryMessage(
     [&](const std::vector<std::uint8_t> &) { sawBinaryAfterClose.store(true); });
-  REQUIRE(client.connect("127.0.0.1", port));
+  REQUIRE(client->connect("127.0.0.1", port));
   REQUIRE(waitFor([&]() { return sid.load() != 0; }));
   const SessionId s = sid.load();
 
@@ -481,7 +481,7 @@ TEST_CASE("integration: WebSocketServer drops sendText after sendClose (web-M7)"
   // sendText to an UNKNOWN sid is a safe no-op (absent from _sessions).
   server.sendText(999999u, "nobody");
 
-  client.disconnect();
+  client->disconnect();
   server.stop();
 }
 
@@ -495,16 +495,16 @@ TEST_CASE("integration: WsChannel publish skips a closed real WS session (web-M7
   server.start();
   std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-  iora::network::WebSocketClient client;
+  auto client = iora::network::WebSocketClient::create();
   std::mutex mtx;
   std::vector<std::string> received;
-  client.setOnTextMessage(
+  client->setOnTextMessage(
     [&](const std::string &m)
     {
       std::lock_guard<std::mutex> lk(mtx);
       received.push_back(m);
     });
-  REQUIRE(client.connect("127.0.0.1", port));
+  REQUIRE(client->connect("127.0.0.1", port));
   REQUIRE(waitFor([&]() { return sid.load() != 0; }));
   const SessionId s = sid.load();
 
@@ -541,6 +541,6 @@ TEST_CASE("integration: WsChannel publish skips a closed real WS session (web-M7
   }
   REQUIRE(channel.subscriberCount() == 0); // pruned
 
-  client.disconnect();
+  client->disconnect();
   server.stop();
 }

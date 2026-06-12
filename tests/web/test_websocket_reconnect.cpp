@@ -5,27 +5,60 @@
 // S-3 phase-2 F-1 / H-1 regression guard. Tracker:
 // 2026-06-11-4 (transport-shared-ownership phase 2); architecture:
 // transport_shared_ownership.json, component "WebSocketClient reconnect worker
-// (F-1 fix)".
+// (F-1 fix) — OPTION C (shared_ptr-managed client)".
 //
-// Exercises the single CV-driven reconnect worker end-to-end over a live
-// WebSocketServer + WebSocketClient:
+// OPTION C model (the contract these tests exercise):
+//   * WebSocketClient is shared_ptr-managed: enable_shared_from_this + a private
+//     ctor + a static create() -> shared_ptr; copy AND move are deleted. A client
+//     exists only inside a shared_ptr — hence WebSocketClient::create(), never a
+//     stack value / make_unique / make_shared with a public ctor.
+//   * Every transport callback (onData/onClose/onError) and the single long-lived
+//     CV-driven reconnect worker capture std::weak_ptr<WebSocketClient> and
+//     promote `self = weak.lock(); if (!self) return;` BEFORE touching any member
+//     (weak_from_this only; shared_from_this is forbidden — UB at refcount 0).
+//   * The worker holds its promoted `self` across the WHOLE attempt (and the I/O
+//     callback across the whole frame), so the client cannot be destroyed
+//     mid-use — destroy-from-own-callback is deferred until the frame unwinds.
+//   * _transportMutex guards the {_transport,_sessionId,_rc,_reconnectWorker}
+//     member group (copy-then-invoke; orthogonal to esft lifetime). Teardown
+//     routes through a noexcept teardownTransport() that gates stop() OFF the I/O
+//     thread (the last-Transport-ref drop terminates the loop via ~Transport).
+//   * USER-CALLBACK CONTRACT (HR-11): user callbacks MUST weak-capture the client,
+//     never an owning shared_ptr — a self-owning cycle leaks the client + worker.
+//     Every onClose/onConnect below weak-captures and promotes per call.
+//
+// Exercises the worker end-to-end over a live WebSocketServer + WebSocketClient:
 //   (a) F-1 deadlock — a reconnect in-flight (blocked in Transport::stop()) while
 //       a fresh transport-level disconnect fires on that transport's I/O thread
-//       and the I/O thread join()s the reconnect thread (pre-fix: deadlock).
-//   (b) disconnect()-from-onClose — the client's WS-close callback calls
-//       client.disconnect(); the teardown guard must keep it off the I/O-thread
-//       worker-join (pre-fix: relocated deadlock / stop()-on-I/O-thread throw).
+//       (pre-fix: deadlock / rapid-cycle SIGABRT on a joinable std::thread).
+//   (b) disconnect()-from-onClose — the client's WS-close callback (weak-captured)
+//       calls disconnect() on the I/O thread; teardown must keep the worker-join
+//       off the I/O thread and stop() off the I/O thread (pre-fix: relocated
+//       deadlock / stop()-on-I/O-thread throw).
 //   (c) reconnect-success — a transport-level drop is followed by an automatic
-//       reconnect to the same live server within a bound.
+//       reconnect to the same live server within a bound (positive control).
 //   (d) concurrent-send-during-reconnect — sendText() racing repeated
-//       disconnect/reconnect under ASan + watchdog (member-sync H-1-NEW / M-5).
+//       disconnect/reconnect under ASan + watchdog (member-sync AP-16).
 //   (e) connect-after-disconnect-from-callback lifecycle — connect (autoReconnect)
 //       -> disconnect()-from-onClose (skips the join) -> connect() again on the
 //       main thread; auto-reconnect must still function (reap-then-respawn).
+//   (f) destroy-from-own-callback (I/O thread) — a weak-captured onClose drops the
+//       last external shared_ptr<WebSocketClient> while a close is in flight;
+//       ~client must be deferred to after the I/O callback unwinds (no UAF, no
+//       hang). The promoted self in the transport callback pins the client.
+//   (f2) destroy-from-own-callback (worker thread) — a weak-captured onConnect,
+//       fired by the WORKER during an auto-reconnect attempt, drops the last
+//       external ref; the worker's loop-frame self pins the client through the
+//       end of the attempt, so ~client runs on the worker only after the attempt
+//       fully returns (no UAF, no hang).
 //
-// NOTE (supersedes the "no Catch2" note in tests/transport/transport_teardown_harness.cpp:6-9):
-// per the architecture testStrategy these reconnect/teardown scenarios ARE covered
-// by Catch2 web tests with bounded watchdogs, not only the standalone harness.
+// NEGATIVE BASELINE (established step-1 against PRE-FIX code): scenario (a) rapid
+// drop/reconnect cycling SIGABRTed ("terminate called without an active
+// exception" — the std::thread was joinable at destruction); scenario (b)
+// disconnect()-from-onClose THREW at _transport->stop() on the I/O thread
+// (Transport::stop() self-joins/throws, transport_impl.hpp:677-682). Option C
+// closes both: a single guarded worker + universal-reaper noexcept dtor (a), and
+// stop() gated off the I/O thread (b).
 //
 // Every scenario that could deadlock runs inside completesWithin(): the body runs
 // on a worker thread that is DETACHED (intentionally leaked) on timeout, so a
@@ -35,9 +68,9 @@
 //
 // ASan substitutes for TSan here (TSan is unavailable — the ASLR personality is
 // blocked in this environment). ASan + the stress loops + the watchdog are a
-// best-effort data-race probe; they do NOT PROVE race-freedom. Correctness rests
-// on the _transportMutex copy-then-invoke discipline and the control-block (A')
-// safety gate (block-only predicate, clientAlive-first) applied exactly.
+// best-effort data-race / UAF probe; they do NOT PROVE race-freedom. Correctness
+// rests on the _transportMutex copy-then-invoke discipline + the per-callback
+// weak.lock() gate + the onIo-gated teardown applied exactly.
 //
 // ctest runs -j1 (web tests bind fixed loopback ports).
 
@@ -51,6 +84,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <iora/network/websocket_client.hpp>
@@ -60,6 +94,20 @@ using iora::network::SessionId;
 using iora::network::WebSocketClient;
 using iora::network::WebSocketServer;
 using iora::network::WebSocketState;
+
+// esft enforcement (task-4.3 / arch testStrategy): a WebSocketClient cannot be
+// default-, copy-, or move-constructed — only WebSocketClient::create() yields
+// one. NOTE: these traits reflect BOTH the explicit =delete of copy/move AND the
+// non-movable members (std::thread/mutex/condition_variable); the AUTHORITATIVE
+// enforcement of "only create() constructs" is the PRIVATE constructor, which
+// makes every value / make_unique / make_shared instantiation a hard compile
+// break (proven by the migrated call sites in task-4.1), not these traits alone.
+static_assert(!std::is_default_constructible<WebSocketClient>::value,
+              "WebSocketClient must not be default-constructible (use create())");
+static_assert(!std::is_copy_constructible<WebSocketClient>::value,
+              "WebSocketClient must not be copy-constructible");
+static_assert(!std::is_move_constructible<WebSocketClient>::value,
+              "WebSocketClient must not be move-constructible");
 
 namespace
 {
@@ -183,7 +231,7 @@ TEST_CASE("ws-reconnect: transport drop triggers a successful auto-reconnect (c)
     [port]()
     {
       WsTestServer srv(port);
-      auto client = std::make_shared<WebSocketClient>();
+      auto client = WebSocketClient::create();
       REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
       REQUIRE(waitFor([&]() { return srv.connectCount.load() >= 1; }));
 
@@ -212,15 +260,21 @@ TEST_CASE("ws-reconnect: disconnect() invoked from the onClose callback does not
     [port]()
     {
       WsTestServer srv(port);
-      auto client = std::make_shared<WebSocketClient>();
+      auto client = WebSocketClient::create();
       auto closed = std::make_shared<std::atomic<bool>>(false);
 
       // onClose runs on the client I/O thread (WS CLOSE-frame path). Calling
-      // disconnect() from here is the H-1 teardown scenario.
+      // disconnect() from here is the H-1 teardown scenario. Weak-capture the
+      // client (HR-11: never an owning shared_ptr in a stored user callback) and
+      // promote per call.
+      std::weak_ptr<WebSocketClient> weak = client;
       client->setOnClose(
-        [client, closed](std::uint16_t, const std::string &)
+        [weak, closed](std::uint16_t, const std::string &)
         {
-          client->disconnect();
+          if (auto self = weak.lock())
+          {
+            self->disconnect();
+          }
           closed->store(true);
         });
 
@@ -252,7 +306,7 @@ TEST_CASE("ws-reconnect: rapid drop/reconnect cycling never deadlocks (a F-1)",
     [port]()
     {
       WsTestServer srv(port);
-      auto client = std::make_shared<WebSocketClient>();
+      auto client = WebSocketClient::create();
       // Near-zero reconnect delay maximizes the chance a reconnect is mid-stop()
       // when the next drop's handleDisconnect fires on that transport's I/O
       // thread (the F-1 window).
@@ -289,7 +343,7 @@ TEST_CASE("ws-reconnect: concurrent send during repeated reconnect is race-clean
     [port]()
     {
       WsTestServer srv(port);
-      auto client = std::make_shared<WebSocketClient>();
+      auto client = WebSocketClient::create();
       REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 10)));
       REQUIRE(waitFor([&]() { return srv.connectCount.load() >= 1; }));
 
@@ -338,17 +392,22 @@ TEST_CASE("ws-reconnect: connect again after disconnect-from-callback still auto
     [port]()
     {
       WsTestServer srv(port);
-      auto client = std::make_shared<WebSocketClient>();
+      auto client = WebSocketClient::create();
       auto firstClosed = std::make_shared<std::atomic<bool>>(false);
 
+      // Weak-capture the client (HR-11) and promote per call.
+      std::weak_ptr<WebSocketClient> weak = client;
       client->setOnClose(
-        [client, firstClosed](std::uint16_t, const std::string &)
+        [weak, firstClosed](std::uint16_t, const std::string &)
         {
           // Only the first (server-initiated) close drives the teardown-from-
           // callback path; later closes are normal.
           if (!firstClosed->exchange(true))
           {
-            client->disconnect();
+            if (auto self = weak.lock())
+            {
+              self->disconnect();
+            }
           }
         });
 
@@ -374,5 +433,235 @@ TEST_CASE("ws-reconnect: connect again after disconnect-from-callback still auto
       client->disconnect();
     },
     30000);
+  REQUIRE(finished);
+}
+
+// ── (f) destroy-from-own-callback (I/O thread) ───────────────────────────────
+// A weak-captured onClose drops the LAST external shared_ptr<WebSocketClient>
+// from inside the I/O-thread close callback while a close is in flight. Under
+// Option C the transport callback's promoted self pins the client across the
+// whole frame, so the last-ref drop merely decrements — ~WebSocketClient is
+// deferred until the I/O callback unwinds, then runs on the I/O thread (the
+// dtor's onIo branch: reap-skip + stop()-skip + ~Transport deferred-self-
+// destruct). Assert: no hang (watchdog), no UAF (ASan), and the client really
+// is destroyed afterward (no self-owning-cycle leak).
+//
+// The only strong ref after our local is released lives in a heap slot captured
+// by the onClose lambda — a deliberate (client -> _onClose -> slot -> client)
+// cycle that is broken inside the callback by slot->reset(). This is a TEST
+// device to force the last-ref drop on the I/O thread; production callbacks must
+// weak-capture and never form such a cycle (HR-11).
+TEST_CASE("ws-reconnect: dropping the last client ref from onClose (I/O thread) is UAF-free (f)",
+          "[ws][reconnect][integration][f][destroy-from-callback]")
+{
+  const int port = nextPort();
+  auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
+  bool finished = completesWithin(
+    [port, weakProbe]()
+    {
+      WsTestServer srv(port);
+      auto client = WebSocketClient::create();
+      *weakProbe = client;
+      auto destroyed = std::make_shared<std::atomic<bool>>(false);
+      // Heap slot holding the only strong ref once our local is released.
+      auto slot = std::make_shared<std::shared_ptr<WebSocketClient>>(client);
+      std::weak_ptr<WebSocketClient> weak = client;
+
+      client->setOnClose(
+        [weak, slot, destroyed](std::uint16_t, const std::string &)
+        {
+          if (auto self = weak.lock())
+          {
+            // Drop the last external strong ref from inside the I/O-thread
+            // callback. `self` (this frame) + the promoted self in the transport
+            // callback still pin the client, so ~WebSocketClient is deferred
+            // until the callback unwinds — then runs on the I/O thread.
+            slot->reset();
+          }
+          destroyed->store(true);
+        });
+
+      // No auto-reconnect: isolate the destroy-from-I/O-callback path.
+      REQUIRE(client->connect("127.0.0.1", port));
+      REQUIRE(waitFor([&]() { return srv.lastSid.load() != 0; }));
+
+      client.reset(); // `slot` now holds the only strong ref to the client
+
+      // Graceful close -> onClose on the I/O thread -> drops the last ref.
+      srv.server.sendClose(srv.lastSid.load(), 1000, "bye");
+      REQUIRE(waitFor([&]() { return destroyed->load(); }, 8000));
+    },
+    20000);
+  REQUIRE(finished);
+  // The client must actually have been destroyed (no leaked self-owning cycle).
+  REQUIRE(waitFor([&]() { return weakProbe->expired(); }, 5000));
+}
+
+// ── (f2) destroy-from-own-callback (WORKER thread) ───────────────────────────
+// Drops the LAST external shared_ptr<WebSocketClient> from a callback that
+// genuinely fires ON THE WORKER THREAD, exercising the dtor's onWorker branch
+// (invariant 13). The right hook is onStateChange's CONNECTING transition: it
+// fires on the connect() thread for the INITIAL connect, but on the reconnect
+// WORKER thread for each auto-reconnect attempt (doConnect -> setState(CONNECTING)
+// runs inside reconnectAttempt on the worker). (onConnect, by contrast, fires in
+// handleData on the I/O thread — using it would merely duplicate scenario (f).)
+//
+// The worker holds its promoted self in the LOOP frame (never moved into
+// reconnectAttempt), so dropping the external ref mid-attempt merely decrements;
+// ~WebSocketClient runs on the worker only after the attempt returns and self
+// drops at end-of-iteration — where reapWorker takes the onWorker DETACH path
+// (never self-join). We prove the drop ran on the worker (a thread distinct from
+// the connect()/body thread) via a captured std::thread::id. The server is kept
+// alive until the client is actually destroyed so the reconnect handshake can
+// complete deterministically. Same heap-slot test device as (f).
+TEST_CASE("ws-reconnect: dropping the last client ref from a worker callback (onStateChange) is UAF-free (f2)",
+          "[ws][reconnect][integration][f2][destroy-from-callback]")
+{
+  const int port = nextPort();
+  auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
+  auto bodyThreadId = std::make_shared<std::atomic<std::thread::id>>();
+  auto destroyThreadId = std::make_shared<std::atomic<std::thread::id>>();
+  auto ioThreadId = std::make_shared<std::atomic<std::thread::id>>();
+  bool finished = completesWithin(
+    [port, weakProbe, bodyThreadId, destroyThreadId, ioThreadId]()
+    {
+      bodyThreadId->store(std::this_thread::get_id());
+      WsTestServer srv(port);
+      auto client = WebSocketClient::create();
+      *weakProbe = client;
+      auto destroyed = std::make_shared<std::atomic<bool>>(false);
+      auto slot = std::make_shared<std::shared_ptr<WebSocketClient>>(client);
+      auto connecting = std::make_shared<std::atomic<int>>(0);
+      std::weak_ptr<WebSocketClient> weak = client;
+
+      // onConnect fires inside handleData on the I/O thread — capture that id so
+      // we can prove the destroy did NOT run on the I/O thread.
+      client->setOnConnect(
+        [ioThreadId](const std::string &)
+        { ioThreadId->store(std::this_thread::get_id()); });
+
+      client->setOnStateChange(
+        [weak, slot, destroyed, connecting, destroyThreadId](WebSocketState st)
+        {
+          if (st != WebSocketState::CONNECTING) return;
+          // 0 == initial connect (connect() thread); 1 == the first auto-reconnect
+          // attempt's CONNECTING, which runs on the WORKER thread.
+          if (connecting->fetch_add(1) == 1)
+          {
+            destroyThreadId->store(std::this_thread::get_id());
+            if (auto self = weak.lock())
+            {
+              // Drop the last external ref ON THE WORKER, mid-attempt. The
+              // worker's loop-frame self still pins the client, so ~client is
+              // deferred to end-of-iteration — then runs on the worker.
+              slot->reset();
+            }
+            destroyed->store(true);
+          }
+        });
+
+      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
+      REQUIRE(waitFor([&]() { return connecting->load() >= 1; })); // initial CONNECTING
+      client.reset(); // `slot` now holds the only strong ref
+
+      // Force a transport drop -> worker reconnects -> CONNECTING (#2) on the
+      // worker drops the last ref mid-attempt.
+      srv.dropLast();
+      REQUIRE(waitFor([&]() { return destroyed->load(); }, 10000));
+      // Keep the server alive until ~client actually runs on the worker (the
+      // reconnect succeeds, then the worker's self drops) — so the handshake is
+      // not racing srv teardown.
+      REQUIRE(waitFor([&]() { return weak.expired(); }, 10000));
+    },
+    25000);
+  REQUIRE(finished);
+  REQUIRE(waitFor([&]() { return weakProbe->expired(); }, 5000));
+  // Prove the destroy ran on the reconnect WORKER thread — a thread distinct from
+  // BOTH the connect()/body thread AND the transport I/O thread (the worker
+  // setState(CONNECTING) precedes the new transport's I/O thread even starting).
+  REQUIRE(destroyThreadId->load() != std::thread::id{});
+  REQUIRE(destroyThreadId->load() != bodyThreadId->load());
+  REQUIRE(ioThreadId->load() != std::thread::id{}); // onConnect did fire (I/O thread seen)
+  REQUIRE(destroyThreadId->load() != ioThreadId->load());
+}
+
+// ── (g) no self-owning-cycle leak (HR-11 / R-8) ──────────────────────────────
+// The ONE non-structural Option C residual: a user callback that captures an
+// OWNING shared_ptr<WebSocketClient> forms a self-owning cycle that leaks the
+// client + its worker thread. This test installs ONLY weak-capturing callbacks,
+// holds the sole shared_ptr, drops it, and asserts the client is actually
+// destroyed (weak_ptr expires) and the worker exits within a bound — i.e. no
+// cycle. autoReconnect=true so a worker thread exists and ~WebSocketClient must
+// reap it: if ~client never ran (a cycle) the weak_ptr would not expire; if the
+// worker did not exit, ~client's reap would block and the watchdog would fire.
+TEST_CASE("ws-reconnect: weak-only callbacks leave no self-owning cycle (g leak)",
+          "[ws][reconnect][integration][g][leak]")
+{
+  const int port = nextPort();
+  auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
+  bool finished = completesWithin(
+    [port, weakProbe]()
+    {
+      WsTestServer srv(port);
+      auto client = WebSocketClient::create();
+      *weakProbe = client;
+      std::weak_ptr<WebSocketClient> weak = client;
+
+      // Weak-only user callbacks (HR-11): none captures an owning shared_ptr.
+      client->setOnConnect([weak](const std::string &) { (void)weak; });
+      client->setOnClose([weak](std::uint16_t, const std::string &) { (void)weak; });
+
+      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
+      REQUIRE(waitFor(
+        [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+
+      client.reset(); // drop the SOLE strong ref
+    },
+    20000);
+  REQUIRE(finished);
+  // No leaked cycle: ~WebSocketClient ran (refcount hit 0) and the worker exited.
+  REQUIRE(waitFor([&]() { return weakProbe->expired(); }, 5000));
+}
+
+// ── (h) teardown interrupts a long backoff sleep promptly ────────────────────
+// The reconnect worker's backoff between attempts is an INTERRUPTIBLE wait on
+// the control-block CV (predicate !shouldRun), not a plain sleep_for. With a very
+// large backoff delay, a transport drop parks the worker in that backoff; a
+// subsequent disconnect() must wake it (shouldRun=false + notify) and return
+// promptly — far under the backoff delay. If the backoff were a non-interruptible
+// sleep, disconnect()'s reapWorker join would block for the full delay and the
+// watchdog would fire. This guards the interruptible-backoff invariant against
+// regression (it is otherwise asserted only by construction).
+TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (h)",
+          "[ws][reconnect][integration][h][backoff]")
+{
+  const int port = nextPort();
+  bool finished = completesWithin(
+    [port]()
+    {
+      WsTestServer srv(port);
+      auto client = WebSocketClient::create();
+      // Very large backoff: a non-interruptible sleep would block teardown ~30s.
+      WebSocketClient::Options o;
+      o.autoReconnect = true;
+      o.initialReconnectDelay = std::chrono::milliseconds(30000);
+      o.maxReconnectDelay = std::chrono::milliseconds(30000);
+      REQUIRE(client->connect("127.0.0.1", port, "/", o));
+      REQUIRE(waitFor(
+        [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+
+      // Drop -> worker wakes (requested) and parks in the 30s backoff sleep
+      // before its first reconnect attempt.
+      srv.dropLast();
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+      // disconnect() must wake the backoff-parked worker and return promptly,
+      // NOT block for the 30s backoff.
+      auto t0 = std::chrono::steady_clock::now();
+      client->disconnect();
+      auto elapsed = std::chrono::steady_clock::now() - t0;
+      REQUIRE(elapsed < std::chrono::seconds(5));
+    },
+    20000);
   REQUIRE(finished);
 }
