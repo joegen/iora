@@ -44,6 +44,10 @@ struct Transport::Impl
   // In practice, no code path acquires more than one Transport-level lock.
   // Each lock is acquired briefly (to copy data), then released BEFORE
   // invoking any user callback. This is the core invariant (HR-6).
+  // Specifically: no path holds both callbackMutex and syncMutex simultaneously —
+  // callbacks are copied under callbackMutex and released before syncMutex is taken
+  // (and vice-versa) — so the ordering above is a defensive convention, never a
+  // live constraint.
   //
   // Engine-internal locks (held by I/O thread) may be active when engine
   // callbacks fire. Transport callback handlers then acquire Transport locks

@@ -2,11 +2,17 @@
 // connect / teardown buffer-lifecycle hardening (tracker
 // IORA-TRANSPORT-RECVSYNC-LIFECYCLE).
 //
-// WHY STANDALONE: this container has no system Catch2 and iora's fetched
-// Catch2 v2.13.10 does not provide Catch2::Catch2WithMain, so iora's own ctest
-// cannot build here. The transport + engine are header-only, so this single TU
-// compiles the whole stack directly. Build (ASan; TSan cannot run here — the
-// container blocks the personality(ADDR_NO_RANDOMIZE) change TSan needs):
+// WHY STANDALONE: this harness is built as a single self-contained TU with a
+// custom -D IORA_DISABLE_SELFDESTRUCT_DEFERRAL toggle for the negative-control
+// build, independent of the Catch2 test tier. The transport + engine are
+// header-only, so this single TU compiles the whole stack directly. (Historical
+// note: this was originally standalone because the container had no system
+// Catch2 and the fetched Catch2 v2.13.10 did not expose Catch2::Catch2WithMain;
+// that is now fixed — CATCH_BUILD_STATIC_LIBRARY=ON in cmake/Dependencies.cmake
+// builds Catch2WithMain on the FetchContent path — but the standalone +
+// negative-control-toggle build remains the right shape for this harness.)
+// Build (ASan; TSan cannot run here — the container blocks the
+// personality(ADDR_NO_RANDOMIZE) change TSan needs):
 //
 //   g++ -std=c++17 -fsanitize=address -g -O1 -pthread \
 //       -I/workspace/iora/include \
@@ -720,6 +726,98 @@ void s4c_sole_owner_reset_in_callback()
   delete holder;
 }
 
+// S4d (TD-INV-6): the protective ORDERING — shutdownDrain() stays INSIDE loop() so it
+// unwinds (and fires the user onClose for a still-open session) on the RELEASED-BUT-
+// STILL-ALIVE Impl BEFORE the post-loop epilogue runs the deferred ~Impl. Scenario: a
+// sole-owning holder self-destructs in onData WHILE A SESSION IS STILL OPEN (the peer is
+// NOT closed), so the engine has not yet closed the session; ~Transport on the I/O thread
+// releases _impl and DEFERS ~Impl. The loop then exits (_running cleared by
+// detachForTermination) and shutdownDrain() closes the still-open session, firing the
+// registered USER onClose on the I/O thread — touching the released-but-alive Impl. This
+// is the exact path TD-INV-6 guards, and it is DISTINCT from s4/s4c (where onClose fires
+// via the closeNow/peer-EOF path with _running==true, NOT via shutdownDrain). Under
+// IORA_DISABLE_SELFDESTRUCT_DEFERRAL the synchronous ~Impl inside onData frees the engine
+// under its own dispatch -> ASan heap-use-after-free, proving the deferral is load-bearing
+// on the shutdownDrain path too (the negative control otherwise only exercises the
+// closeNow path). (step4_iteration_2, cpp17 M-1.)
+struct S4dObs
+{
+  std::atomic<bool> onDataFired{false};
+  std::atomic<bool> userOnCloseFired{false};
+  std::atomic<bool> dtorRan{false};
+  std::atomic<bool> dtorOnIoThread{false};
+  std::atomic<std::thread::id> ioThreadId{};      // thread onData (the self-destruct) ran on
+  std::atomic<std::thread::id> onCloseThreadId{}; // thread the user onClose ran on (shutdownDrain)
+};
+
+void s4d_user_onclose_during_shutdowndrain()
+{
+  auto obs = std::make_shared<S4dObs>();
+
+  // SOLE-owning heap holder via the custom-deleter seam, so ~Transport's thread is
+  // observed deterministically.
+  auto *holder = new std::shared_ptr<Transport>();
+  *holder = test::TransportEngineInjector::tcpWithDeleter(
+    TransportConfig{},
+    [obs](Transport *p)
+    {
+      if (obs->ioThreadId.load() == std::this_thread::get_id())
+      {
+        obs->dtorOnIoThread.store(true);
+      }
+      delete p; // ~Transport on the I/O thread -> deferred ~Impl on the detached thread
+      obs->dtorRan.store(true);
+    });
+  Transport *t = holder->get();
+
+  // A registered USER onClose. It does NOT drop the Transport (the sole owner is being
+  // self-destructed in onData); it only records that it fired and on which thread, i.e.
+  // it READS the released-but-still-alive Impl during shutdownDrain. Captures only the
+  // owning obs (not a Transport -> no self-cycle).
+  t->onClose([obs](SessionId, const TransportErrorInfo &)
+             {
+               obs->onCloseThreadId.store(std::this_thread::get_id());
+               obs->userOnCloseFired.store(true);
+             });
+
+  // onData drops the SOLE ref on the I/O thread WHILE THE SESSION IS STILL OPEN.
+  t->onData([holder, obs](SessionId, iora::core::BufferView,
+                          std::chrono::steady_clock::time_point)
+            {
+              if (!obs->onDataFired.exchange(true))
+              {
+                obs->ioThreadId.store(std::this_thread::get_id());
+                holder->reset(); // last ref -> ~Transport (I/O thread) -> deferral; session still open
+              }
+            });
+  CHECK(t->start().isOk());
+  RawPeer peer;
+  SessionId sid = connectToPeer(*t, peer);
+  (void)sid;
+  peer.send("X"); // -> onData on the I/O thread -> self-destruct; the peer is NOT closed
+
+  // Gate on the LAST asserted observable: the user onClose fired by shutdownDrain.
+  // It is set strictly AFTER dtorRan (shutdownDrain runs after ~Transport returns, on
+  // the SAME I/O thread, in program order), so waiting on it guarantees every
+  // post-condition below is visible. dtorRan alone would be a racy gate (it is set
+  // inside the deleter, before the loop unwinds into shutdownDrain). A genuine
+  // never-fires regression is caught by the watchdog (startWatchdog -> abort).
+  for (int i = 0; i < 3000 && !obs->userOnCloseFired.load(); ++i)
+  {
+    std::this_thread::sleep_for(1ms);
+  }
+  CHECK(obs->onDataFired.load());
+  CHECK(obs->dtorRan.load());        // ~Transport returned (no leak / no hang)
+  CHECK(obs->dtorOnIoThread.load()); // ~Transport ran on the I/O thread (sole-owner self-destruct)
+  // The user onClose fired during shutdownDrain, on the I/O thread, touching the
+  // released-but-still-alive Impl (the deferred ~Impl runs later, in the post-loop
+  // epilogue — dtorRan only marks ~Transport returning, not the ~Impl delete). ASan
+  // proves no UAF on that access.
+  CHECK(obs->userOnCloseFired.load());
+  CHECK(obs->onCloseThreadId.load() == obs->ioThreadId.load());
+  delete holder;
+}
+
 // C1-CLOSED (HR-9): permanent regression promoting /tmp/c1_repro.cpp Variant B. EVERY
 // thread that touches the Transport holds an owning shared_ptr<Transport>; the I/O-
 // thread onClose drops a NON-last ref (main's, via a raw holder pointer); a worker
@@ -917,6 +1015,7 @@ int main()
   run("s4_destroy_from_onclose", s4_destroy_from_onclose);
   run("s4b_destroy_from_ondata", s4b_destroy_from_ondata);
   run("s4c_sole_owner_reset_in_callback", s4c_sole_owner_reset_in_callback);
+  run("s4d_user_onclose_during_shutdowndrain", s4d_user_onclose_during_shutdowndrain);
   run("s4e_setreadmode_from_iothread_throws", s4e_setreadmode_from_iothread_throws);
   run("c1_closed_shared_ownership_stress", c1_closed_shared_ownership_stress);
   run("guard_gating_io_thread", guard_gating_io_thread);
