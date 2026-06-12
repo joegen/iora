@@ -146,6 +146,7 @@ set(WEB_TESTS
     web/test_sse_integration
     web/test_application_integration
     web/test_htmx_helpers
+    web/test_websocket_reconnect
 )
 
 # Combine enabled tests based on options
