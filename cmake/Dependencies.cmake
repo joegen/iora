@@ -5,12 +5,13 @@ include(FetchContent)
 
 # Helper function to check for system libraries and fall back to FetchContent
 function(find_or_fetch_dependency)
-    set(options REQUIRED)
-    set(oneValueArgs 
-        NAME 
-        PACKAGE_NAME 
+    set(options REQUIRED EXACT)
+    set(oneValueArgs
+        NAME
+        PACKAGE_NAME
         TARGET_NAME
-        GIT_REPOSITORY 
+        VERSION
+        GIT_REPOSITORY
         GIT_TAG
         INCLUDE_DIR
         SYSTEM_INCLUDE_HINTS
@@ -28,26 +29,61 @@ function(find_or_fetch_dependency)
         set(FIND_OR_FETCH_TARGET_NAME ${FIND_OR_FETCH_NAME})
     endif()
     
-    # Try to find the system-installed package first
+    # Build the version constraint passed to find_package(). When VERSION is given,
+    # find_package() rejects a system package that does not satisfy it (and with
+    # EXACT, only an exact match is accepted) — forcing the FetchContent fallback,
+    # rather than silently building against a mismatched system version.
+    set(_fof_version_args "")
+    if(FIND_OR_FETCH_VERSION)
+        list(APPEND _fof_version_args ${FIND_OR_FETCH_VERSION})
+        if(FIND_OR_FETCH_EXACT)
+            list(APPEND _fof_version_args EXACT)
+        endif()
+    endif()
+
+    # Try to find the system-installed package first (version-matched)
     if(FIND_OR_FETCH_COMPONENTS)
-        find_package(${FIND_OR_FETCH_PACKAGE_NAME} QUIET COMPONENTS ${FIND_OR_FETCH_COMPONENTS})
+        find_package(${FIND_OR_FETCH_PACKAGE_NAME} ${_fof_version_args} QUIET COMPONENTS ${FIND_OR_FETCH_COMPONENTS})
     else()
-        find_package(${FIND_OR_FETCH_PACKAGE_NAME} QUIET)
+        find_package(${FIND_OR_FETCH_PACKAGE_NAME} ${_fof_version_args} QUIET)
     endif()
     
-    # Check if the package was found
+    # Determine whether a USABLE system package was found (D-7): it must be FOUND
+    # (version-matched) AND the requested TARGET_NAME must be available — exists
+    # directly, or can be aliased from the package's own target. A version-matched
+    # system package may still lack the requested target (e.g. a header-only Catch2
+    # install exports Catch2::Catch2 but NOT Catch2::Catch2WithMain). Version match
+    # does not imply target availability.
+    set(_fof_found FALSE)
     if(${FIND_OR_FETCH_PACKAGE_NAME}_FOUND OR ${FIND_OR_FETCH_NAME}_FOUND)
-        message(STATUS "Using system-installed ${FIND_OR_FETCH_NAME}")
-        
-        # Create an alias target if it doesn't exist
-        if(NOT TARGET ${FIND_OR_FETCH_TARGET_NAME} AND TARGET ${FIND_OR_FETCH_PACKAGE_NAME})
+        set(_fof_found TRUE)
+    endif()
+    set(_fof_use_system FALSE)
+    if(_fof_found)
+        if(TARGET ${FIND_OR_FETCH_TARGET_NAME})
+            set(_fof_use_system TRUE)
+        elseif(TARGET ${FIND_OR_FETCH_PACKAGE_NAME})
             add_library(${FIND_OR_FETCH_TARGET_NAME} ALIAS ${FIND_OR_FETCH_PACKAGE_NAME})
+            set(_fof_use_system TRUE)
         endif()
-        
+    endif()
+
+    if(_fof_use_system)
+        message(STATUS "Using system-installed ${FIND_OR_FETCH_NAME} (version ${${FIND_OR_FETCH_PACKAGE_NAME}_VERSION}) via target ${FIND_OR_FETCH_TARGET_NAME}")
     else()
-        # Fall back to FetchContent
-        message(STATUS "${FIND_OR_FETCH_NAME} not found in system, using FetchContent")
-        
+        # A version-matched package WAS found but does not provide the requested
+        # target. Do NOT FetchContent over it — the imported target would collide
+        # with the fetched build's target. Fail clearly with remediation instead.
+        if(_fof_found)
+            message(FATAL_ERROR "${FIND_OR_FETCH_NAME}: system package found (version ${${FIND_OR_FETCH_PACKAGE_NAME}_VERSION}) but it does not provide the required target '${FIND_OR_FETCH_TARGET_NAME}'. Rebuild/reinstall it with that target enabled (Catch2 v2: CATCH_BUILD_STATIC_LIBRARY=ON), or uninstall the system package so the pinned version is fetched instead.")
+        endif()
+        # Fall back to FetchContent (not found, or version mismatch)
+        if(FIND_OR_FETCH_VERSION)
+            message(STATUS "${FIND_OR_FETCH_NAME} ${FIND_OR_FETCH_VERSION} not found in system (or version mismatch), using FetchContent")
+        else()
+            message(STATUS "${FIND_OR_FETCH_NAME} not found in system, using FetchContent")
+        endif()
+
         if(NOT FIND_OR_FETCH_GIT_REPOSITORY OR NOT FIND_OR_FETCH_GIT_TAG)
             message(FATAL_ERROR "GIT_REPOSITORY and GIT_TAG must be specified for ${FIND_OR_FETCH_NAME}")
         endif()
@@ -59,7 +95,16 @@ function(find_or_fetch_dependency)
         )
         
         FetchContent_MakeAvailable(${FIND_OR_FETCH_NAME})
-        
+
+        # Propagate the fetched source dir (lowercased per FetchContent convention)
+        # to the caller, so callers can locate package-shipped CMake helpers (e.g.
+        # Catch2's contrib/Catch.cmake) on the fetch path. Set ONLY when fetched —
+        # callers use 'if(DEFINED <lc>_SOURCE_DIR)' to distinguish fetch vs find.
+        string(TOLOWER "${FIND_OR_FETCH_NAME}" _fof_lc_name)
+        if(DEFINED ${_fof_lc_name}_SOURCE_DIR)
+            set(${_fof_lc_name}_SOURCE_DIR "${${_fof_lc_name}_SOURCE_DIR}" PARENT_SCOPE)
+        endif()
+
         # Set include directory variable for backwards compatibility
         if(FIND_OR_FETCH_INCLUDE_DIR)
             set(${FIND_OR_FETCH_INCLUDE_DIR} "${CMAKE_BINARY_DIR}/_deps/${FIND_OR_FETCH_NAME}-src/include" PARENT_SCOPE)
@@ -97,6 +142,8 @@ function(configure_iora_dependencies)
         NAME Catch2
         PACKAGE_NAME Catch2
         TARGET_NAME Catch2::Catch2WithMain
+        VERSION 2.13.10
+        EXACT
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
         GIT_TAG v2.13.10
         INCLUDE_DIR CATCH2_INCLUDE_DIR
