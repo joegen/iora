@@ -34,6 +34,13 @@ option(IORA_BUILD_DEBUG_TESTS "Build debug/helper tests" OFF)
 option(IORA_BUILD_WEB_TESTS "Build web namespace tests" OFF)
 option(IORA_BUILD_ALL_TESTS "Build all test groups (overrides individual options)" OFF)
 
+# Opt-in sanitizer build path for the concurrency tests (default OFF so normal
+# builds are unaffected). TtlMap's teardown/UAF and 100x100k soak tests REQUIRE
+# a sanitizer build to prove race-freedom (a non-TSan soak on x86 TSO cannot).
+# TSan and ASan are mutually exclusive; TSan takes precedence if both are set.
+option(IORA_ENABLE_TSAN "Build sanitized test targets with ThreadSanitizer" OFF)
+option(IORA_ENABLE_ASAN "Build sanitized test targets with AddressSanitizer" OFF)
+
 # If BUILD_ALL_TESTS is ON, enable all test groups
 if(IORA_BUILD_ALL_TESTS)
     set(IORA_BUILD_NETWORK_TESTS ON)
@@ -106,6 +113,7 @@ set(PARSERS_TESTS
 set(UTIL_TESTS
     util/iora_test_expiring_cache
     util/iora_test_shell_runner
+    util/iora_test_ttl_map
 )
 
 # Storage namespace tests
@@ -218,6 +226,25 @@ endforeach()
 # the former mod_kvstore target carried.
 if(TARGET iora_test_kvstore)
     target_compile_options(iora_test_kvstore PRIVATE -Wno-free-nonheap-object)
+endif()
+
+# Apply the opt-in sanitizer to the concurrency-sensitive TtlMap test target.
+# All of TtlMap's + TimerService's concurrency logic is header-only and compiled
+# into this test TU, so per-target instrumentation covers the race surface.
+if(TARGET iora_test_ttl_map)
+    if(IORA_ENABLE_TSAN)
+        message(STATUS "iora_test_ttl_map: ThreadSanitizer enabled")
+        target_compile_options(iora_test_ttl_map PRIVATE -fsanitize=thread -g -O1)
+        target_link_options(iora_test_ttl_map PRIVATE -fsanitize=thread)
+    elseif(IORA_ENABLE_ASAN)
+        message(STATUS "iora_test_ttl_map: AddressSanitizer enabled")
+        target_compile_options(iora_test_ttl_map PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer -g -O1
+            # Suppress a GCC 12 libstdc++ <regex> false positive surfaced by
+            # ASan's -O1 in Catch2's test-name matching (not our code).
+            -Wno-maybe-uninitialized)
+        target_link_options(iora_test_ttl_map PRIVATE -fsanitize=address)
+    endif()
 endif()
 
 # Create a test target that runs all enabled individual tests
