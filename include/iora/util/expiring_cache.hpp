@@ -9,10 +9,14 @@
 
 #include "iora/core/logger.hpp"
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace iora
 {
@@ -82,29 +86,38 @@ public:
   /// \brief Gets a value by key from the cache.
   std::optional<V> get(const K &key)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _cache.find(key);
-    if (it != _cache.end())
+    // HR-3 (copy-then-invoke): capture the evicted entry under the lock, erase,
+    // release the lock, then fire the eviction callback. Invoking a user callback
+    // while _mutex is held deadlocks if the callback re-enters get/set/remove.
+    std::optional<std::pair<K, V>> evicted;
     {
-      if (it->second.expiration > std::chrono::steady_clock::now())
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto it = _cache.find(key);
+      if (it != _cache.end())
       {
-        iora::core::Logger::debug("ExpiringCache: Cache hit for key");
-        return it->second.value;
+        if (it->second.expiration > std::chrono::steady_clock::now())
+        {
+          iora::core::Logger::debug("ExpiringCache: Cache hit for key");
+          return it->second.value;
+        }
+        else
+        {
+          iora::core::Logger::debug("ExpiringCache: Cache miss - entry expired for key");
+          if (_evictionCallback)
+          {
+            evicted.emplace(it->first, it->second.value);
+          }
+          _cache.erase(it); // Remove expired entry
+        }
       }
       else
       {
-        iora::core::Logger::debug("ExpiringCache: Cache miss - entry expired for key");
-        // Invoke eviction callback before removing
-        if (_evictionCallback)
-        {
-          _evictionCallback(it->first, it->second.value);
-        }
-        _cache.erase(it); // Remove expired entry
+        iora::core::Logger::debug("ExpiringCache: Cache miss - key not found");
       }
     }
-    else
+    if (evicted)
     {
-      iora::core::Logger::debug("ExpiringCache: Cache miss - key not found");
+      _evictionCallback(evicted->first, evicted->second);
     }
     return std::nullopt;
   }
@@ -112,22 +125,30 @@ public:
   /// \brief Removes a key from the cache.
   void remove(const K &key)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
-    auto it = _cache.find(key);
-    if (it != _cache.end())
+    // HR-3 (copy-then-invoke): erase under the lock, fire the eviction callback
+    // after release so a re-entrant callback cannot deadlock on _mutex.
+    std::optional<std::pair<K, V>> evicted;
     {
-      // Invoke eviction callback before removing
-      if (_evictionCallback)
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto it = _cache.find(key);
+      if (it != _cache.end())
       {
-        _evictionCallback(it->first, it->second.value);
+        if (_evictionCallback)
+        {
+          evicted.emplace(it->first, it->second.value);
+        }
+        _cache.erase(it);
+        iora::core::Logger::debug("ExpiringCache: Removed cache entry (remaining entries: " +
+                                  std::to_string(_cache.size()) + ")");
       }
-      _cache.erase(it);
-      iora::core::Logger::debug("ExpiringCache: Removed cache entry (remaining entries: " +
-                                std::to_string(_cache.size()) + ")");
+      else
+      {
+        iora::core::Logger::debug("ExpiringCache: Attempted to remove non-existent key");
+      }
     }
-    else
+    if (evicted)
     {
-      iora::core::Logger::debug("ExpiringCache: Attempted to remove non-existent key");
+      _evictionCallback(evicted->first, evicted->second);
     }
   }
 
@@ -166,6 +187,11 @@ private:
         iora::core::Logger::debug("ExpiringCache: Purge thread running");
         while (true)
         {
+          // HR-3 (copy-then-invoke): collect evicted entries under the lock, then
+          // fire the eviction callbacks AFTER releasing _mutex so a re-entrant
+          // callback cannot deadlock and the purge does not hold the lock across
+          // arbitrary user code.
+          std::vector<std::pair<K, V>> evicted;
           // P0 FIX: Wait first, then purge
           // Use condition variable wait instead of sleep_for for immediate shutdown
           {
@@ -184,10 +210,9 @@ private:
             {
               if (it->second.expiration <= now)
               {
-                // Invoke eviction callback before removing
                 if (_evictionCallback)
                 {
-                  _evictionCallback(it->first, it->second.value);
+                  evicted.emplace_back(it->first, it->second.value);
                 }
                 it = _cache.erase(it);
                 purgedCount++;
@@ -204,7 +229,26 @@ private:
                                         std::to_string(_cache.size()) + ")");
             }
           }
-          // Mutex released here, allowing other threads to access cache
+          // Mutex released here. Fire eviction callbacks outside the lock.
+          // Guard against a throwing user callback: this runs on the purge thread,
+          // which has no caller — an escaping exception would call std::terminate
+          // and abort the process. Log and continue.
+          for (auto &kv : evicted)
+          {
+            try
+            {
+              _evictionCallback(kv.first, kv.second);
+            }
+            catch (const std::exception &e)
+            {
+              iora::core::Logger::error(std::string("ExpiringCache: eviction callback threw: ") +
+                                        e.what());
+            }
+            catch (...)
+            {
+              iora::core::Logger::error("ExpiringCache: eviction callback threw a non-std exception");
+            }
+          }
         }
       });
   }
