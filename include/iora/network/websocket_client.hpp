@@ -171,9 +171,18 @@ public:
 
   // ── Callbacks ──────────────────────────────────────────────────────────
   //
-  // Set these BEFORE connect(). User callbacks MUST weak-capture the client
-  // (HR-11): capturing an owning shared_ptr<WebSocketClient> forms a self-owning
-  // cycle that leaks the client and its worker thread.
+  // PRECONDITION (M-1): these setters MUST be called BEFORE connect() and never
+  // mutated afterward. The callback members are std::function and are read
+  // lock-free from the I/O and reconnect-worker threads (handleData/handleFrame/
+  // handleDisconnect/setState); installing them before connect() establishes the
+  // happens-before (connect() synchronizes-with the I/O/worker threads it
+  // spawns). Mutating a callback after connect() is a data race (UB) — there is
+  // no synchronization on these members by design, as the set-once-before-connect
+  // contract makes one unnecessary.
+  //
+  // User callbacks MUST weak-capture the client (HR-11): capturing an owning
+  // shared_ptr<WebSocketClient> forms a self-owning cycle that leaks the client
+  // and its worker thread.
 
   void setOnConnect(ConnectCallback cb) { _onConnect = std::move(cb); }
   void setOnTextMessage(TextCallback cb) { _onTextMessage = std::move(cb); }
@@ -225,6 +234,17 @@ public:
         oldRc->shouldRun.store(false);
       }
       oldRc->cv.notify_one();
+      // Wake an old worker parked in the handshake-settle wait (_connectCv, not
+      // oldRc->cv) so the join below is prompt, not bounded by
+      // kHandshakeSettleTimeout (H-3). The empty _connectMutex critical section
+      // before notify closes the lost-wakeup window (H-3-R2): it forces this
+      // notify to be ordered AFTER a racing worker has either re-read shouldRun
+      // (set above) or fully blocked on _connectCv. No lock held here (oldRc->m
+      // scope closed), so it nests nothing.
+      {
+        std::lock_guard<std::mutex> lk(_connectMutex);
+      }
+      _connectCv.notify_all();
     }
     // (4) join the moved-out worker OUTSIDE any lock.
     if (reap.joinable())
@@ -248,7 +268,11 @@ public:
       _rc = std::make_shared<ReconnectControl>();
     }
 
-    // (7) initial attempt on the calling thread.
+    // (7) initial attempt on the calling thread. doConnect's bool return is
+    //     intentionally not consulted (H-2): every failure path inside doConnect
+    //     calls setState(DISCONNECTED) first, which the _connectCv predicate at
+    //     step (9) observes — the CV-settled _state is the authoritative result,
+    //     and a failed initial connect is reaped via the !connected branch below.
     std::shared_ptr<ReconnectControl> rc;
     {
       std::lock_guard<std::mutex> lk(_transportMutex);
@@ -340,6 +364,10 @@ public:
 
   void sendClose(std::uint16_t code = 1000, const std::string& reason = "")
   {
+    // Intentionally NO _state==CONNECTED advisory early-out (unlike sendText/etc.):
+    // a CLOSE must be attempt-able during CLOSED/teardown. The authoritative gate
+    // is still the {_transport,_sessionId} snapshot in sendRawBytes() — a null
+    // transport no-ops, so this is safe to call from any state.
     auto frame = WebSocketFrame::makeClose(code, reason);
     generateMaskKey(frame.maskKey);
     auto wire = frame.serialize(true);
@@ -458,16 +486,22 @@ private:
     if (!doConnect(rc)) return false;
 
     // Wait for the upgrade response to settle the state. _connectMutex is NOT
-    // held across any stop()/teardown.
+    // held across any stop()/teardown. The predicate ALSO observes
+    // rc->shouldRun: a concurrent disconnect()/dtor/connect() clears shouldRun
+    // and notifies _connectCv (see reapWorker / connect() reap), so this wait is
+    // interruptible — it does not block the closer for the full
+    // kHandshakeSettleTimeout against a half-open server that accepts TCP but
+    // never sends the 101 (H-3).
     {
       std::unique_lock<std::mutex> lock(_connectMutex);
-      _connectCv.wait_for(lock, kHandshakeSettleTimeout, [this]()
+      _connectCv.wait_for(lock, kHandshakeSettleTimeout, [this, &rc]()
       {
         auto s = _state.load();
         return s == WebSocketState::CONNECTED || s == WebSocketState::DISCONNECTED
-            || s == WebSocketState::CLOSED;
+            || s == WebSocketState::CLOSED || !rc->shouldRun.load();
       });
     }
+    if (!rc->shouldRun.load()) return false;
     return _state.load() == WebSocketState::CONNECTED;
   }
 
@@ -478,6 +512,16 @@ private:
   /// was sent (the handshake then completes asynchronously via onData); false on
   /// any failure or if the publish was abandoned. \param rc the control block
   /// whose shouldRun arms the publish gate (resurrect-after-disconnect guard).
+  ///
+  /// THREAD CONTEXT (invariant 14 reconciliation): doConnect runs ONLY on the
+  /// connect() user thread (initial attempt) or the reconnect WORKER thread —
+  /// NEVER the engine I/O thread (t->sendSync below blocks the caller on the I/O
+  /// thread, so the caller cannot be it). The published member is a COPY of the
+  /// local `t`, so the local co-owns the transport until this function returns;
+  /// that is safe because the local always drops off the I/O thread, so it can
+  /// never be the I/O-thread last-ref drop that the loop-termination path
+  /// (~Transport deferred-self-destruct) depends on — that last-ref drop only
+  /// ever happens in teardownTransport via the member reset.
   bool doConnect(const std::shared_ptr<ReconnectControl>& rc)
   {
     setState(WebSocketState::CONNECTING);
@@ -488,6 +532,9 @@ private:
 
     auto t = Transport::tcp(config); // WS is TCP; build into a LOCAL (S-3 publish)
 
+    // The prior teardownTransport (in reconnectAttempt / connect()) stopped+joined
+    // any old transport's I/O thread BEFORE this runs, so no concurrent I/O-thread
+    // reader of these buffers/flags exists when they are reset here (M-4).
     {
       std::lock_guard<std::mutex> lock(_dataMutex);
       _buffer.clear();
@@ -495,6 +542,7 @@ private:
       _fragmentOpcode = WsOpcode::CONTINUATION;
     }
     _upgradeComplete.store(false);
+    _closeEchoed.store(false); // re-arm the one-shot CLOSE echo for this connection
 
     // Register the global callbacks on the LOCAL transport. Each weak-captures
     // the client (NEVER an owning shared_ptr<Transport> of its own _transport —
@@ -795,8 +843,12 @@ private:
     {
       auto [code, reason] = frame.closePayload();
 
-      // Echo close frame back per RFC 6455 (if we haven't already sent one)
-      if (_state.load() != WebSocketState::CLOSING)
+      // Echo the CLOSE frame back per RFC 6455 §5.5.1 EXACTLY ONCE. A one-shot
+      // atomic CAS is the authoritative gate (M-2): the prior `_state != CLOSING`
+      // check was dead (CLOSING is never stored), so a peer that sent two CLOSE
+      // frames in one TCP segment would have been echoed twice. _closeEchoed is
+      // reset per connection in doConnect().
+      if (!_closeEchoed.exchange(true))
       {
         sendClose(code, reason);
       }
@@ -873,13 +925,22 @@ private:
   void handleDisconnect()
   {
     auto prevState = _state.load();
-    if (prevState == WebSocketState::CLOSING || prevState == WebSocketState::CLOSED)
+    // CLOSED means we already initiated/completed a close: a subsequent transport
+    // drop must NOT trigger auto-reconnect. (WebSocketState::CLOSING is a reserved
+    // enumerator that is never stored, so it is not tested here — see L-3.)
+    if (prevState == WebSocketState::CLOSED)
     {
       setState(WebSocketState::CLOSED);
       return;
     }
 
     setState(WebSocketState::DISCONNECTED);
+    // _options is read lock-free here on the I/O thread (M-3). It is written only
+    // by connect() (single-controller), which first tears down + stop()+joins the
+    // OLD transport's I/O thread before rewriting _options — so the old I/O thread
+    // that runs this handler has finished before any rewrite. The new connection's
+    // I/O thread is spawned after the write, giving the happens-before. This read
+    // is therefore race-free under the single-controller connect() precondition.
     if (_options.autoReconnect)
     {
       requestReconnect();
@@ -949,7 +1010,9 @@ private:
 
       // Best-effort CLOSE frame, then the transport-level close, then (off-IO)
       // stop(). ORDER: CLOSE frame enqueue BEFORE close(sid) so the FIN follows
-      // the close-frame enqueue.
+      // the close-frame enqueue. The _state read here is a best-effort advisory
+      // (L-2): a stale value at worst sends/skips a courtesy CLOSE frame — the
+      // transport teardown below is unconditional and authoritative.
       if (gracefulClose && _state.load() == WebSocketState::CONNECTED && sid != 0)
       {
         auto frame = WebSocketFrame::makeClose(code, reason);
@@ -1001,6 +1064,22 @@ private:
         }
         rc->cv.notify_one();
       }
+      // Also wake a worker parked in reconnectAttempt's handshake-settle wait
+      // (it blocks on _connectCv, NOT rc->cv) so the join below cannot stall for
+      // kHandshakeSettleTimeout against a half-open server (H-3). The settle-wait
+      // predicate reads rc->shouldRun (cleared above, under rc->m), but the wait
+      // blocks on _connectMutex. Since shouldRun is published BEFORE the empty
+      // _connectMutex critical section below, that empty CS is sufficient to
+      // close the lost-wakeup window (H-3-R2): it orders this notify either
+      // before the waiter's predicate re-check (it then reads shouldRun==false
+      // and never blocks) or after the waiter is fully blocked (notify
+      // delivered). Holding _connectMutex ACROSS the notify is not required (and
+      // would only force the woken worker to re-block on it). No lock is held
+      // here (the _transportMutex and rc->m scopes above have closed).
+      {
+        std::lock_guard<std::mutex> lk(_connectMutex);
+      }
+      _connectCv.notify_all();
 
       // (2) Reap, gated off the I/O and worker threads.
       std::thread reap;
@@ -1126,6 +1205,10 @@ private:
   mutable std::mutex _dataMutex; // LEAF lock — independent of _transportMutex/rc->m.
   std::vector<std::uint8_t> _buffer;
   std::atomic<bool> _upgradeComplete{false};
+  // One-shot CLOSE-echo gate (M-2): set via exchange(true) the first time a peer
+  // CLOSE is echoed, re-armed in doConnect() per connection. Replaces the dead
+  // _state==CLOSING guard (CLOSING is never stored — it is a reserved state).
+  std::atomic<bool> _closeEchoed{false};
 
   // Fragment reassembly (protected by _dataMutex)
   std::vector<std::uint8_t> _fragmentBuffer;

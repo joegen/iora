@@ -87,6 +87,11 @@
 #include <type_traits>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <iora/network/websocket_client.hpp>
 #include <iora/network/websocket_server.hpp>
 
@@ -205,6 +210,70 @@ struct WsTestServer
     {
       server.dropSession(s);
     }
+  }
+};
+
+// A raw TCP listener that ACCEPTS connections and holds them open WITHOUT ever
+// responding (a "half-open" server). Pointing the reconnect worker at it makes
+// each reconnect's TCP connect succeed but the WS upgrade never complete, so the
+// worker parks in reconnectAttempt's handshake-settle wait (kHandshakeSettleTimeout
+// ~10s) — the exact state H-3 is about.
+struct HalfOpenListener
+{
+  int listenFd{-1};
+  int port;
+  std::thread acceptThread;
+  std::atomic<bool> stop{false};
+  std::atomic<int> accepted{0};
+  std::mutex heldMutex;
+  std::vector<int> heldFds;
+
+  explicit HalfOpenListener(int p) : port(p)
+  {
+    listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(listenFd >= 0); // runs on the test body thread (not the accept thread)
+    int one = 1;
+    ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+    addr.sin_port = htons(static_cast<std::uint16_t>(port));
+    REQUIRE(::bind(listenFd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+    REQUIRE(::listen(listenFd, 16) == 0);
+    acceptThread = std::thread(
+      [this]()
+      {
+        while (!stop.load())
+        {
+          int fd = ::accept(listenFd, nullptr, nullptr);
+          if (fd < 0)
+          {
+            if (stop.load()) break;
+            // Avoid a tight busy-spin on a persistent accept() error.
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+          }
+          {
+            std::lock_guard<std::mutex> lk(heldMutex);
+            heldFds.push_back(fd);
+          }
+          accepted.fetch_add(1);
+          // Hold the connection open, never respond (no 101).
+        }
+      });
+  }
+
+  ~HalfOpenListener()
+  {
+    stop.store(true);
+    if (listenFd >= 0)
+    {
+      ::shutdown(listenFd, SHUT_RDWR); // unblock accept()
+      ::close(listenFd);
+    }
+    if (acceptThread.joinable()) acceptThread.join();
+    std::lock_guard<std::mutex> lk(heldMutex);
+    for (int fd : heldFds) ::close(fd);
   }
 };
 
@@ -663,5 +732,91 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (
       REQUIRE(elapsed < std::chrono::seconds(5));
     },
     20000);
+  REQUIRE(finished);
+}
+
+// ── (h2) disconnect() interrupts a parked HANDSHAKE-SETTLE wait promptly (H-3) ─
+// Distinct from (h), which covers the rc->cv BACKOFF wait. Here the worker is
+// parked in reconnectAttempt's _connectCv handshake-settle wait against a
+// half-open server (TCP accepts, no 101). reapWorker signals rc->shouldRun on
+// rc->cv — but the worker is on _connectCv, so without the H-3 fix the
+// reap-join would block for the full kHandshakeSettleTimeout (~10s). The fix
+// adds !shouldRun to the settle-wait predicate and notify_all's _connectCv from
+// reapWorker / connect()'s reap, so disconnect() returns promptly. Pre-fix
+// baseline: ~10s stall; post-fix: well under it.
+TEST_CASE("ws-reconnect: disconnect() interrupts a parked handshake-settle wait promptly (h2 H-3)",
+          "[ws][reconnect][integration][h2][negative-baseline]")
+{
+  const int port = nextPort();
+  bool finished = completesWithin(
+    [port]()
+    {
+      auto client = WebSocketClient::create();
+      {
+        WsTestServer srv(port);
+        REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(5, 50)));
+        REQUIRE(waitFor(
+          [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+        // srv destructs here: the server stops, frees the port, and drops the
+        // client's connection — the worker begins auto-reconnecting.
+      }
+
+      // Half-open listener on the SAME port: the worker's reconnect attempts now
+      // TCP-connect successfully but never receive a 101, parking the worker in
+      // the handshake-settle wait.
+      HalfOpenListener half(port);
+      REQUIRE(waitFor([&]() { return half.accepted.load() >= 1; }, 10000));
+      // Let the worker enter the settle-wait after its TCP connect + upgrade send.
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+      auto t0 = std::chrono::steady_clock::now();
+      client->disconnect();
+      auto elapsed = std::chrono::steady_clock::now() - t0;
+      REQUIRE(elapsed < std::chrono::seconds(5));
+    },
+    25000);
+  REQUIRE(finished);
+}
+
+// ── (h3) disconnect() racing the worker's ENTRY into the settle-wait (H-3-R2) ─
+// h2 sleeps 300ms before disconnect, so the worker is already blocked — it does
+// NOT exercise the lost-wakeup WINDOW (the gap between the worker's predicate
+// re-check and its kernel block inside wait_for). h3 disconnects with a tiny,
+// varied delay right after the worker TCP-connects to the half-open listener, to
+// probabilistically land in that window across cycles. With the H-3-R2 fix (the
+// _connectCv notify is serialized by an empty _connectMutex critical section)
+// every disconnect is prompt; a lost wakeup would stall one iteration for ~the
+// handshake-settle timeout and trip the per-call bound (or the watchdog). This is
+// a best-effort probabilistic guard, not a deterministic window hit.
+TEST_CASE("ws-reconnect: disconnect() racing settle-wait entry stays prompt across cycles (h3 H-3-R2)",
+          "[ws][reconnect][integration][h3]")
+{
+  bool finished = completesWithin(
+    []()
+    {
+      for (int i = 0; i < 8; ++i)
+      {
+        const int port = nextPort();
+        auto client = WebSocketClient::create();
+        {
+          WsTestServer srv(port);
+          REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 5)));
+          REQUIRE(waitFor(
+            [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+        } // srv stops -> drops the client -> the worker begins reconnecting
+        HalfOpenListener half(port);
+        // Worker has TCP-connected to the half-open listener (now at/near the
+        // settle-wait entry); disconnect with a tiny varied delay to race it.
+        // A missed accept is acceptable (best-effort window setup): the disconnect
+        // is still prompt via the rc->cv-covered backoff/top wait, so this cycle
+        // just contributes less window coverage — explicitly discard the result.
+        (void)waitFor([&]() { return half.accepted.load() >= 1; }, 8000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(i % 4)); // 0..3ms
+        auto t0 = std::chrono::steady_clock::now();
+        client->disconnect();
+        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+      }
+    },
+    60000);
   REQUIRE(finished);
 }
