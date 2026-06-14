@@ -70,6 +70,17 @@ function(find_or_fetch_dependency)
 
     if(_fof_use_system)
         message(STATUS "Using system-installed ${FIND_OR_FETCH_NAME} (version ${${FIND_OR_FETCH_PACKAGE_NAME}_VERSION}) via target ${FIND_OR_FETCH_TARGET_NAME}")
+        # FIND path: a package's config dir often ships CMake helper modules beside
+        # its <Pkg>Config.cmake (e.g. Catch2's Catch.cmake, which provides
+        # catch_discover_tests). find_package() does NOT add that dir to
+        # CMAKE_MODULE_PATH, so a later include(<Helper>) fails on the find path
+        # (it only works on the fetch path, where <lc>_SOURCE_DIR/contrib is added).
+        # Export the config dir onto CMAKE_MODULE_PATH so include() of such helpers
+        # resolves identically on both the find and fetch paths.
+        if(DEFINED ${FIND_OR_FETCH_PACKAGE_NAME}_DIR AND IS_DIRECTORY "${${FIND_OR_FETCH_PACKAGE_NAME}_DIR}")
+            list(APPEND CMAKE_MODULE_PATH "${${FIND_OR_FETCH_PACKAGE_NAME}_DIR}")
+            set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" PARENT_SCOPE)
+        endif()
     else()
         # A version-matched package WAS found but does not provide the requested
         # target. Do NOT FetchContent over it — the imported target would collide
