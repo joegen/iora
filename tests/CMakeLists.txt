@@ -63,6 +63,7 @@ set(NETWORK_TESTS
     network/iora_test_http
     network/iora_test_http_client_pool
     network/iora_test_tcp_engine
+    network/iora_test_tcp_engine_teardown_race
     network/iora_test_tcp_rapid_send
     network/iora_test_tcp_engine_timers
     network/iora_test_udp_engine
@@ -228,24 +229,38 @@ if(TARGET iora_test_kvstore)
     target_compile_options(iora_test_kvstore PRIVATE -Wno-free-nonheap-object)
 endif()
 
-# Apply the opt-in sanitizer to the concurrency-sensitive TtlMap test target.
-# All of TtlMap's + TimerService's concurrency logic is header-only and compiled
-# into this test TU, so per-target instrumentation covers the race surface.
-if(TARGET iora_test_ttl_map)
-    if(IORA_ENABLE_TSAN)
-        message(STATUS "iora_test_ttl_map: ThreadSanitizer enabled")
-        target_compile_options(iora_test_ttl_map PRIVATE -fsanitize=thread -g -O1)
-        target_link_options(iora_test_ttl_map PRIVATE -fsanitize=thread)
-    elseif(IORA_ENABLE_ASAN)
-        message(STATUS "iora_test_ttl_map: AddressSanitizer enabled")
-        target_compile_options(iora_test_ttl_map PRIVATE
-            -fsanitize=address -fno-omit-frame-pointer -g -O1
-            # Suppress a GCC 12 libstdc++ <regex> false positive surfaced by
-            # ASan's -O1 in Catch2's test-name matching (not our code).
-            -Wno-maybe-uninitialized)
-        target_link_options(iora_test_ttl_map PRIVATE -fsanitize=address)
+# Apply the opt-in sanitizer to the concurrency-sensitive test targets. Each of
+# these exercises header-only concurrency logic (TtlMap/TimerService, Transport
+# + TCP/UDP engines, WebSocketClient reconnect worker, ExpiringCache purge
+# thread) compiled directly into the test TU, so per-target instrumentation
+# covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
+set(IORA_SANITIZED_TEST_TARGETS
+    iora_test_ttl_map
+    iora_test_expiring_cache
+    iora_test_transport
+    iora_test_transport_improvements
+    iora_test_tcp_engine
+    iora_test_tcp_engine_teardown_race
+    iora_test_udp_engine
+    test_websocket_reconnect
+)
+foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
+    if(TARGET ${_san_target})
+        if(IORA_ENABLE_TSAN)
+            message(STATUS "${_san_target}: ThreadSanitizer enabled")
+            target_compile_options(${_san_target} PRIVATE -fsanitize=thread -g -O1)
+            target_link_options(${_san_target} PRIVATE -fsanitize=thread)
+        elseif(IORA_ENABLE_ASAN)
+            message(STATUS "${_san_target}: AddressSanitizer enabled")
+            target_compile_options(${_san_target} PRIVATE
+                -fsanitize=address -fno-omit-frame-pointer -g -O1
+                # Suppress a GCC 12 libstdc++ <regex> false positive surfaced by
+                # ASan's -O1 in Catch2's test-name matching (not our code).
+                -Wno-maybe-uninitialized)
+            target_link_options(${_san_target} PRIVATE -fsanitize=address)
+        endif()
     endif()
-endif()
+endforeach()
 
 # Create a test target that runs all enabled individual tests
 if(ALL_TESTS)

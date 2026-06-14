@@ -152,6 +152,20 @@ public:
         TransportErrorInfo{TransportError::Config, "already running"});
     }
 
+    // Reopen the command queue (a prior stop()->shutdownDrain() set this true to
+    // reject post-teardown enqueues — see DD-5). A fresh _eventFd is created
+    // below, so the queue accepts commands again for this run.
+    // LIFECYCLE CONTRACT: start()/stop() are not concurrent with each other or
+    // with enqueue() (the _running CAS gates the lifecycle; callers do not
+    // enqueue during start/restart). So the brief interval between this reset
+    // (_cmdsClosed=false) and the _eventFd recreation below — where the queue is
+    // open but _eventFd is still -1 from the prior shutdownDrain — is not
+    // reachable by a concurrent enqueuer.
+    {
+      std::lock_guard<std::mutex> g(_cmdMutex);
+      _cmdsClosed = false;
+    }
+
     if (!initTls())
     {
       _running.store(false);
@@ -275,10 +289,34 @@ public:
       // is ready to accept connections when this method returns.
       auto ready = std::make_shared<std::promise<bool>>();
       auto fut = ready->get_future();
-      enqueue(Command::addListener(lc, std::move(ready)));
-      bool ok = fut.get(); // blocks until I/O thread processes the command
+      // Pass a COPY of the promise into the command (do NOT move it away): the
+      // _running.load() above and the enqueue below are not atomic, so the
+      // engine may be torn down in between. If enqueue() returns false the queue
+      // is closed and the command was NOT queued — the (now-gone) loop would
+      // never fulfill the promise, so we must still hold `ready` to fail the
+      // future locally and avoid blocking forever in fut.get() (DD-5/DD-13,
+      // tracker 2026-06-14-1). On the success path the I/O thread fulfills the
+      // promise (bind result), or shutdownDrain()'s drain-and-fail step fails it
+      // if teardown raced after a successful push.
+      if (!enqueue(Command::addListener(lc, ready)))
+      {
+        return ListenResult::err(
+          TransportErrorInfo{TransportError::ShuttingDown,
+            "addListener: transport shutting down"});
+      }
+      bool ok = fut.get(); // I/O thread fulfills it (bind result or shutdown-fail)
       if (!ok)
       {
+        // The promise is failed either by a real bind failure (I/O thread, while
+        // running) or by shutdownDrain's drain-and-fail on a teardown race (after
+        // stop() cleared _running). Distinguish so the caller gets ShuttingDown
+        // rather than a misleading Bind on teardown (cpp17 L-1).
+        if (!_running.load())
+        {
+          return ListenResult::err(
+            TransportErrorInfo{TransportError::ShuttingDown,
+              "addListener: transport shutting down"});
+        }
         return ListenResult::err(
           TransportErrorInfo{TransportError::Bind,
             "bind/listen failed on " + bind + ":" + std::to_string(port)});
@@ -287,7 +325,12 @@ public:
     }
     else
     {
-      enqueue(Command::addListener(lc));
+      if (!enqueue(Command::addListener(lc)))
+      {
+        return ListenResult::err(
+          TransportErrorInfo{TransportError::ShuttingDown,
+            "addListener: transport shutting down"});
+      }
     }
     return ListenResult::ok(lc.id);
   }
@@ -297,7 +340,15 @@ public:
   {
     SessionId sid = _nextSessionId++;
     ConnectReq cr{sid, host, port, tls};
-    enqueue(Command::connect(cr));
+    // Surface the closed-queue reject (DD-5): if the transport is tearing down,
+    // enqueue() returns false and the connect command is dropped — returning
+    // ok(sid) here would promise a connection that will never complete or fire
+    // onConnect/onClose (lost-completion). Mirror send()/close() and report it.
+    if (!enqueue(Command::connect(cr)))
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::ShuttingDown, "connect: transport shutting down"});
+    }
     return ConnectResult::ok(sid);
   }
 
@@ -622,6 +673,10 @@ private:
     ::timerfd_settime(_timerFd, 0, &its, nullptr);
   }
 
+  // Start-failure cleanup. Runs on the caller's thread DURING start(), BEFORE
+  // the I/O loop thread is launched, so it is single-threaded w.r.t. the engine
+  // and the _eventFd close here cannot race enqueue() — no _cmdMutex needed
+  // (unlike shutdownDrain's close, which races live enqueuers). DD-6.
   void cleanupStartFail()
   {
     if (_timerFd >= 0)
@@ -742,17 +797,32 @@ private:
     }
   };
 
+  // Push a command and wake the I/O loop. The deque push, the _cmdsClosed
+  // check, and the _eventFd wakeup ::write all happen UNDER _cmdMutex so they
+  // are atomic w.r.t. shutdownDrain()'s `close(_eventFd); _eventFd=-1` (which
+  // also runs under _cmdMutex). Returns false WITHOUT pushing if the queue has
+  // been closed by teardown (DD-1/DD-2/DD-5, tracker 2026-06-14-1). The wakeup
+  // write is held under the lock safely because _eventFd is EFD_NONBLOCK.
+  // NOTE: on the exception path the onError callback is invoked synchronously on
+  // the CALLER's thread (copy-then-invoke, outside _cbMutex), not the I/O thread.
   bool enqueue(const Command &cmd)
   {
     try
     {
       {
         std::lock_guard<std::mutex> g(_cmdMutex);
+        if (_cmdsClosed)
+        {
+          return false;
+        }
         _cmds.push_back(cmd);
         _atomicStats.commands++;
+        if (_eventFd >= 0)
+        {
+          std::uint64_t one = 1;
+          (void)::write(_eventFd, &one, sizeof(one));
+        }
       }
-      std::uint64_t one = 1;
-      (void)::write(_eventFd, &one, sizeof(one));
       return true;
     }
     catch (const std::exception &ex)
@@ -772,11 +842,18 @@ private:
     {
       {
         std::lock_guard<std::mutex> g(_cmdMutex);
+        if (_cmdsClosed)
+        {
+          return false;
+        }
         _cmds.push_back(std::move(cmd));
         _atomicStats.commands++;
+        if (_eventFd >= 0)
+        {
+          std::uint64_t one = 1;
+          (void)::write(_eventFd, &one, sizeof(one));
+        }
       }
-      std::uint64_t one = 1;
-      (void)::write(_eventFd, &one, sizeof(one));
       return true;
     }
     catch (const std::exception &ex)
@@ -966,6 +1043,14 @@ private:
 
   void shutdownDrain()
   {
+    // INVARIANT: shutdownDrain runs only on the I/O loop thread (called from
+    // loopUnbatched/loopBatched at the end of loop()). It is NOT asserted via
+    // _loop.get_id()/getIoThreadId(): on the self-destruct teardown path,
+    // detachForTermination() detaches _loop from inside the onClose callback
+    // BEFORE the loop exits and reaches shutdownDrain, so _loop.get_id() is the
+    // null id here and such an assert would spuriously fire (DD-12). The I/O-
+    // thread confinement of _timerFd/_epollFd and the _eventFd-close serialization
+    // below rely on this invariant.
     // Draining on shutdown
     process();
     // Collect sessions to close to avoid iterator invalidation
@@ -1021,11 +1106,32 @@ private:
       ::close(_timerFd);
       _timerFd = -1;
     }
-    if (_eventFd >= 0)
+    // Close _eventFd and the command queue together under _cmdMutex so the
+    // close is mutually exclusive with enqueue()'s wakeup ::write (DD-1) and no
+    // further command can be queued after teardown (DD-5). Any promise-bearing
+    // command still queued here (pushed after the process() above but before the
+    // queue closed) is drained and its promise FAILED outside the lock, so a
+    // synchronous addListener caller's fut.get() returns instead of blocking
+    // forever (DD-5/DD-13). _cmdMutex stays a leaf: we swap under the lock and
+    // fulfill promises after releasing (set_value runs no user code).
+    std::deque<Command> residual;
     {
-      delEpoll(_eventFd);
-      ::close(_eventFd);
-      _eventFd = -1;
+      std::lock_guard<std::mutex> g(_cmdMutex);
+      _cmdsClosed = true;
+      residual.swap(_cmds);
+      if (_eventFd >= 0)
+      {
+        delEpoll(_eventFd);
+        ::close(_eventFd);
+        _eventFd = -1;
+      }
+    }
+    for (auto &c : residual)
+    {
+      if (c.listenerReady)
+      {
+        try { c.listenerReady->set_value(false); } catch (...) {}
+      }
     }
     if (_epollFd >= 0)
     {
@@ -2658,6 +2764,13 @@ private:
   mutable AtomicStats _atomicStats{};
 
   std::atomic<bool> _running{false};
+  // _eventFd is the ONLY descriptor written off the I/O thread (the enqueue()
+  // wakeup ::write). Its write and the shutdownDrain() ::close are serialized
+  // under _cmdMutex (see enqueue/shutdownDrain); it is created EFD_NONBLOCK so
+  // the wakeup write held under _cmdMutex is bounded and cannot block. _timerFd
+  // and _epollFd are I/O-thread-confined (all accessors run on the loop thread)
+  // and therefore need no lock; do not add an off-thread accessor for them
+  // without revisiting this invariant.
   int _epollFd{-1}, _eventFd{-1}, _timerFd{-1};
   std::thread _loop;
   // Deferred self-destruct deleter (delete-this-at-thread-end). Written and read
@@ -2665,9 +2778,18 @@ private:
   // loop-lambda epilogue post-loop()); no synchronization — see EngineBase.
   std::function<void()> _selfDestruct;
 
-  // Lock ordering: _cbMutex and _sessionRwMutex are never held simultaneously.
-  // _cbMutex protects callback copies (acquired/released before any _sessionRwMutex use).
-  // _sessionRwMutex protects session/listener maps (shared_lock for reads, unique_lock for mutations).
+  // Lock ordering: _cmdMutex, _cbMutex, _sessionRwMutex and _fatalMx are all
+  // mutually-exclusive LEAVES — at most one is held at a time; no nesting.
+  // - _cbMutex protects callback copies (copy-then-invoke: acquired/released
+  //   before any callback fires and before any _sessionRwMutex use).
+  // - _sessionRwMutex protects session/listener maps (shared for reads, unique
+  //   for mutations).
+  // - _cmdMutex protects the command queue (_cmds) AND serializes the _eventFd
+  //   wakeup-write (enqueue) against the _eventFd close (shutdownDrain), plus
+  //   the _cmdsClosed teardown flag. process() swaps _cmds out under _cmdMutex
+  //   then RELEASES before dispatching handlers, so command handlers never run
+  //   with _cmdMutex held. NEVER acquire another lock while holding _cmdMutex.
+  // - _fatalMx protects the sticky-fatal slot.
   std::mutex _cbMutex;
   detail::EngineBase::Callbacks _cbs{};
 
@@ -2675,6 +2797,11 @@ private:
 
   std::mutex _cmdMutex;
   std::deque<Command> _cmds;
+  // Set true under _cmdMutex by shutdownDrain() once the I/O loop has exited and
+  // the command queue is being torn down. enqueue() observes it under _cmdMutex
+  // and refuses to push (and skips the wakeup write) so no command is queued
+  // that the (now-gone) loop will never process — see DD-5 in tracker 2026-06-14-1.
+  bool _cmdsClosed{false};
 
   std::unordered_map<ListenerId, std::unique_ptr<Listener>> _listeners;
   std::unordered_map<SessionId, std::unique_ptr<Session>> _sessions;
