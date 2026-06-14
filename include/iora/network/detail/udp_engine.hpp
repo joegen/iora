@@ -133,6 +133,17 @@ public:
     bool exp = false;
     if (!_running.compare_exchange_strong(exp, true))
       return StartResult::err(TransportErrorInfo{TransportError::Config, "already running"});
+    // Reopen the command queue (a prior stop()->shutdownDrain() set this true to
+    // reject post-teardown enqueues — DD-5). A fresh _eventFd is created below.
+    // LIFECYCLE CONTRACT: start()/stop() are not concurrent with each other or
+    // with enqueue() (the _running CAS gates the lifecycle; callers do not
+    // enqueue during start/restart), so the brief interval between this reset
+    // and the _eventFd recreation — queue open but _eventFd still -1 — is not
+    // reachable by a concurrent enqueuer.
+    {
+      std::lock_guard<std::mutex> g(_qmx);
+      _qClosed = false;
+    }
     _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
     if (_epollFd < 0)
     {
@@ -219,10 +230,31 @@ public:
     {
       auto ready = std::make_shared<std::promise<bool>>();
       auto fut = ready->get_future();
-      enqueue(Cmd::addListener(lc, std::move(ready)));
-      bool ok = fut.get();
+      // Pass a COPY of the promise into the command (do NOT move it away): the
+      // _running.load() above and the enqueue below are not atomic, so the
+      // engine may be torn down in between. If enqueue() returns false the queue
+      // is closed and the command was NOT queued — the (now-gone) loop would
+      // never fulfill the promise, so we must still hold `ready` and return
+      // locally without blocking in fut.get() (DD-5/DD-13). On the success path
+      // the I/O thread fulfills the promise (bind result), or shutdownDrain's
+      // drain-and-fail fails it if teardown raced after a successful push.
+      if (!enqueue(Cmd::addListener(lc, ready)))
+      {
+        return ListenResult::err(
+          TransportErrorInfo{TransportError::ShuttingDown,
+            "addListener: transport shutting down"});
+      }
+      bool ok = fut.get(); // I/O thread fulfills it (bind result or shutdown-fail)
       if (!ok)
       {
+        // Distinguish a real bind failure (while running) from a teardown-race
+        // drain-fail (after stop() cleared _running) — cpp17 L-1 analog.
+        if (!_running.load())
+        {
+          return ListenResult::err(
+            TransportErrorInfo{TransportError::ShuttingDown,
+              "addListener: transport shutting down"});
+        }
         return ListenResult::err(
           TransportErrorInfo{TransportError::Bind,
             "bind/listen failed on " + bind + ":" + std::to_string(port)});
@@ -231,7 +263,14 @@ public:
     }
     else
     {
-      enqueue(Cmd::addListener(lc));
+      // _running already false: surface the closed-queue reject rather than
+      // returning ok for a listener that will never bind (lost-completion).
+      if (!enqueue(Cmd::addListener(lc)))
+      {
+        return ListenResult::err(
+          TransportErrorInfo{TransportError::ShuttingDown,
+            "addListener: transport shutting down"});
+      }
     }
     return ListenResult::ok(lc.id);
   }
@@ -248,14 +287,27 @@ public:
     cr.sid = sid;
     cr.host = host;
     cr.port = port;
-    enqueue(Cmd::connect(cr));
+    // Surface the closed-queue reject (DD-5): returning ok(sid) when the command
+    // was dropped would promise a connection that never completes/fires onConnect.
+    if (!enqueue(Cmd::connect(cr)))
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::ShuttingDown, "connect: transport shutting down"});
+    }
     return ConnectResult::ok(sid);
   }
   ConnectResult connectViaListener(ListenerId lid, const std::string &host, std::uint16_t port) override
   {
     SessionId sid = _nextSessionId++;
     ViaReq vr{sid, lid, host, port};
-    enqueue(Cmd::via(vr));
+    // Same closed-queue reject surface as connect() (DD-5). UDP-specific: unlike
+    // TCP (a not-supported stub), connectViaListener genuinely enqueues here.
+    if (!enqueue(Cmd::via(vr)))
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::ShuttingDown,
+          "connectViaListener: transport shutting down"});
+    }
     return ConnectResult::ok(sid);
   }
   bool send(SessionId sid, const void *p, std::size_t n) override
@@ -630,26 +682,46 @@ private:
       return x;
     }
   };
+  // Push a command and wake the I/O loop. The deque push, the _qClosed check,
+  // and the _eventFd wakeup ::write all happen UNDER _qmx so they are atomic
+  // w.r.t. shutdownDrain()'s `close(_eventFd); _eventFd=-1` (which also runs
+  // under _qmx). Returns false WITHOUT pushing if the queue has been closed by
+  // teardown (DD-1/DD-2/DD-5, tracker 2026-06-14-1). The wakeup write is held
+  // under the lock safely because _eventFd is EFD_NONBLOCK (bounded counter
+  // increment). UDP enqueue has no try/catch by long-standing design: a throwing
+  // push_back propagates to the caller (engine virtuals are not noexcept) rather
+  // than routing to onError — unchanged by this fix (the TcpEngine sibling's
+  // catch only adds an onError + false-return, no stronger guarantee).
   bool enqueue(const Cmd &c)
   {
+    std::lock_guard<std::mutex> g(_qmx);
+    if (_qClosed)
     {
-      std::lock_guard<std::mutex> g(_qmx);
-      _q.push_back(c);
-      _atomicStats.commands++;
+      return false;
     }
-    std::uint64_t one = 1;
-    (void)::write(_eventFd, &one, sizeof(one));
+    _q.push_back(c);
+    _atomicStats.commands++;
+    if (_eventFd >= 0)
+    {
+      std::uint64_t one = 1;
+      (void)::write(_eventFd, &one, sizeof(one));
+    }
     return true;
   }
   bool enqueue(Cmd &&c)
   {
+    std::lock_guard<std::mutex> g(_qmx);
+    if (_qClosed)
     {
-      std::lock_guard<std::mutex> g(_qmx);
-      _q.push_back(std::move(c));
-      _atomicStats.commands++;
+      return false;
     }
-    std::uint64_t one = 1;
-    (void)::write(_eventFd, &one, sizeof(one));
+    _q.push_back(std::move(c));
+    _atomicStats.commands++;
+    if (_eventFd >= 0)
+    {
+      std::uint64_t one = 1;
+      (void)::write(_eventFd, &one, sizeof(one));
+    }
     return true;
   }
   void drainEvt()
@@ -728,6 +800,13 @@ private:
 
   void shutdownDrain()
   {
+    // INVARIANT: shutdownDrain runs only on the I/O loop thread (called at the
+    // end of loop()). It is NOT asserted via _loop.get_id()/getIoThreadId(): on
+    // the self-destruct teardown path, detachForTermination() detaches _loop
+    // from inside the onClose callback BEFORE the loop exits and reaches
+    // shutdownDrain, so _loop.get_id() is the null id here and such an assert
+    // would spuriously fire (DD-12). The _timerFd/_epollFd confinement and the
+    // _eventFd-close serialization below rely on this invariant.
     process();
     // Collect sessions to close to avoid iterator invalidation
     std::vector<Session *> toClose;
@@ -783,11 +862,32 @@ private:
       ::close(_timerFd);
       _timerFd = -1;
     }
-    if (_eventFd >= 0)
+    // Close _eventFd and the command queue together under _qmx so the close is
+    // mutually exclusive with enqueue()'s wakeup ::write (DD-1) and no further
+    // command can be queued after teardown (DD-5). Any promise-bearing command
+    // still queued here (pushed after the process() above but before the queue
+    // closed) is drained and its promise FAILED outside the lock, so a
+    // synchronous addListener caller's fut.get() returns instead of blocking
+    // forever (DD-5/DD-13). _qmx stays a leaf: swap under the lock and fulfill
+    // promises after releasing (set_value runs no user code).
+    std::deque<Cmd> residual;
     {
-      delEpoll(_eventFd);
-      ::close(_eventFd);
-      _eventFd = -1;
+      std::lock_guard<std::mutex> g(_qmx);
+      _qClosed = true;
+      residual.swap(_q);
+      if (_eventFd >= 0)
+      {
+        delEpoll(_eventFd);
+        ::close(_eventFd);
+        _eventFd = -1;
+      }
+    }
+    for (auto &c : residual)
+    {
+      if (c.listenerReady)
+      {
+        try { c.listenerReady->set_value(false); } catch (...) {}
+      }
     }
     if (_epollFd >= 0)
     {
@@ -1590,6 +1690,10 @@ private:
     }
   }
 
+  // Start-failure cleanup. Runs on the caller's thread DURING start(), BEFORE
+  // the I/O loop thread is launched, so it is single-threaded w.r.t. the engine
+  // and the _eventFd close here cannot race enqueue() — no _qmx needed (unlike
+  // shutdownDrain's close, which races live enqueuers). DD-6.
   void cleanupFail()
   {
     if (_timerFd >= 0)
@@ -1621,20 +1725,43 @@ private:
   TransportConfig _config{};
   mutable AtomicStats _atomicStats{};
   std::atomic<bool> _running{false};
+  // _eventFd is the ONLY descriptor WRITTEN off the I/O thread (the enqueue()
+  // wakeup ::write). That off-thread write and the shutdownDrain() ::close are
+  // serialized under _qmx (see enqueue/shutdownDrain); it is created EFD_NONBLOCK
+  // so the wakeup write held under _qmx is bounded and cannot block. The I/O
+  // thread's own ::read of _eventFd in drainEvt() is NOT under _qmx — it is
+  // I/O-thread-confined (same thread that closes it), so it cannot race. _timerFd
+  // and _epollFd are likewise I/O-thread-confined (all accessors run on the loop
+  // thread) and need no lock; do not add an off-thread accessor for any of them
+  // without revisiting this invariant.
   int _epollFd{-1}, _eventFd{-1}, _timerFd{-1};
   std::thread _loop;
   // Deferred self-destruct deleter (delete-this-at-thread-end). Written/read
   // ONLY on the I/O thread (set pre-detach, run post-loop()); no synchronization.
   std::function<void()> _selfDestruct;
-  // Lock ordering: _cbMutex and _sessionRwMutex are never held simultaneously.
-  // _cbMutex protects callback copies (acquired/released before any _sessionRwMutex use).
-  // _sessionRwMutex protects session/listener maps (shared_lock for reads, unique_lock for mutations).
+  // Lock ordering: _qmx, _cbMutex, _sessionRwMutex and _errorMutex are all
+  // mutually-exclusive LEAVES — at most one is held at a time, never nested.
+  // - _cbMutex protects callback copies (copy-then-invoke: acquired/released
+  //   before any callback fires and before any _sessionRwMutex use).
+  // - _sessionRwMutex protects session/listener maps (shared for reads, unique
+  //   for mutations).
+  // - _qmx protects the command queue (_q) AND serializes the _eventFd wakeup-
+  //   write (enqueue) against the _eventFd close (shutdownDrain), plus the
+  //   _qClosed teardown flag. process() swaps _q out under _qmx then RELEASES
+  //   before dispatching handlers, so command handlers never run with _qmx held.
+  //   NEVER acquire another lock while holding _qmx.
+  // - _errorMutex protects the sticky last-error string.
   std::mutex _cbMutex;
   detail::EngineBase::Callbacks _cbs{};
 
   mutable std::shared_mutex _sessionRwMutex;
   std::mutex _qmx;
   std::deque<Cmd> _q;
+  // Set true under _qmx by shutdownDrain() once the I/O loop has exited and the
+  // command queue is being torn down. enqueue() observes it under _qmx and
+  // refuses to push (and skips the wakeup write) so no command is queued that
+  // the (now-gone) loop will never process — see DD-5 in tracker 2026-06-14-1.
+  bool _qClosed{false};
   std::unordered_map<ListenerId, std::unique_ptr<Listener>> _listeners;
   std::unordered_map<SessionId, std::unique_ptr<Session>> _sessions;
   std::unordered_map<std::string, SessionId> _peerIndex;
