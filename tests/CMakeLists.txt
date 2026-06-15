@@ -63,6 +63,7 @@ set(NETWORK_TESTS
     network/iora_test_http
     network/iora_test_http_client_pool
     network/iora_test_http_client_lease
+    network/iora_test_http_client_response_framing
     network/iora_test_tcp_engine
     network/iora_test_tcp_engine_teardown_race
     network/iora_test_tcp_rapid_send
@@ -246,6 +247,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race
     iora_test_http_client_lease
+    iora_test_http_client_response_framing
     test_websocket_reconnect
 )
 foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
