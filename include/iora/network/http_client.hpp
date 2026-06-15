@@ -7,8 +7,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <ctime>
 #include <fstream>
 #include <functional>
@@ -16,12 +18,14 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "iora/network/dns_client.hpp"
 #include "iora/network/transport_impl.hpp"
@@ -33,8 +37,6 @@ namespace iora
 namespace network
 {
 
-// Use the std::map<std::string, std::string> from http_message.hpp which has
-// case-insensitive comparison
 
 /// \brief Modern HTTP client using hybrid transport for sync/async operations
 /// \details
@@ -44,15 +46,23 @@ namespace network
 ///   - Connection pooling with automatic cleanup
 ///   - TLS/HTTPS support via transport layer
 ///
-/// THREADING CONTRACT (sync request path): a single HttpClient instance issues
-/// ONE request at a time. getConnection() returns a cached per-host SessionId
-/// under _mutex, but the subsequent send/receive run with _mutex released, so two
-/// threads issuing concurrent requests to the SAME host on the SAME instance would
-/// interleave on one socket (and one thread's failure-path dropConnection() could
-/// close a session another is mid-request on). For concurrent work, use one
-/// HttpClient per thread (or HttpClientPool). An exclusive per-connection lease
-/// that would make a shared instance safe for concurrent same-host requests is
-/// tracked as a separate enhancement.
+/// THREADING CONTRACT (sync request path): concurrent same-host requests on a
+/// SHARED HttpClient instance are SAFE but SERIALIZED. Each request acquires an
+/// exclusive per-host:port connection lease (ConnectionLease) that spans the
+/// ENTIRE request/response exchange (connect, send, receive, parse, eviction);
+/// a second thread targeting the same host:port blocks until the first releases
+/// the lease (bounded by Config::leaseAcquireTimeout). This matches RFC 7230
+/// §6.3 (Persistence): without pipelining, a persistent connection carries one
+/// request/response exchange at a time, so serializing same-host requests onto a
+/// single cached connection is the correct single-connection model. It prevents
+/// the request/response interleaving and use-after-evict that a naive shared
+/// instance would suffer. Requests to DIFFERENT host:port values run
+/// concurrently. For real same-host parallelism (multiple simultaneous
+/// connections), use HttpClientPool, which gives each worker an independent
+/// HttpClient.
+///
+/// dropConnection() relies on SessionId monotonicity (never reused) so an
+/// async transport close for an evicted id cannot tear down a later reused id.
 class HttpClient
 {
 public:
@@ -70,7 +80,14 @@ public:
   {
     int statusCode = 0;
     std::string statusText;
-    std::map<std::string, std::string> headers;
+    /// HTTP version from the response status line (e.g. "1.1", "1.0"). Used to
+    /// apply the version-default connection-persistence rule (RFC 7230 §6.3):
+    /// HTTP/1.0 defaults to close unless it sent "Connection: keep-alive".
+    std::string httpVersion;
+    // Case-insensitive per RFC 7230 §3.2 (field names are case-insensitive): a
+    // server may send "connection:" / "Content-Length:" in any case, so lookups
+    // (e.g. responseRequestsClose, body framing) MUST be case-insensitive.
+    std::map<std::string, std::string, CaseInsensitiveCompare> headers;
     std::string body;
     bool success() const { return statusCode >= 200 && statusCode < 300; }
   };
@@ -93,12 +110,16 @@ public:
     std::string userAgent;
     bool reuseConnections;
     std::chrono::seconds connectionIdleTimeout;
+    /// Maximum time a request blocks waiting to acquire the exclusive per-host
+    /// connection lease before failing with a distinct timeout error. Zero (the
+    /// default) means wait indefinitely, preserving pre-lease blocking semantics.
+    std::chrono::milliseconds leaseAcquireTimeout;
     JsonConfig jsonConfig; // JSON parsing configuration
 
     Config()
         : connectTimeout(2000), requestTimeout(3000), maxRedirects(5), followRedirects(true),
           userAgent("Iora-HttpClient/1.0"), reuseConnections(true), connectionIdleTimeout(300),
-          jsonConfig{}
+          leaseAcquireTimeout(0), jsonConfig{}
     {
     }
 
@@ -151,9 +172,25 @@ private:
   mutable std::shared_ptr<Transport> _transport;
   mutable std::unique_ptr<DnsClient> _dnsClient;
 
-  // Simple connection pool: host:port -> SessionId
-  mutable std::unordered_map<std::string, SessionId> _connections;
-  mutable std::unordered_map<SessionId, std::chrono::steady_clock::time_point> _connectionLastUsed;
+  /// \brief Cached live connection for a host:port.
+  struct ConnectionEntry
+  {
+    SessionId id{0};
+    std::chrono::steady_clock::time_point lastUsed{};
+  };
+
+  // Connection cache: host:port -> live cached connection. Mutated ONLY under
+  // _mutex.
+  mutable std::unordered_map<std::string, ConnectionEntry> _connections;
+  // Hosts (host:port) whose connection slot is currently leased by an in-flight
+  // exchange. Exactly one lease per host:port at a time (LEASE-1: single writer
+  // per connection). Mutated ONLY under _mutex.
+  mutable std::unordered_set<std::string> _leasedHosts;
+  // Signals lease release (and shutdown) to threads blocked in acquireLease.
+  mutable std::condition_variable _cv;
+  // Set by cleanup()/~HttpClient so blocked lease waiters wake and fail rather
+  // than deadlock (DD-A8).
+  mutable bool _closing{false};
 
   /// \brief URL parsing structure
   struct ParsedUrl
@@ -174,6 +211,66 @@ private:
     std::string getHostPort() const { return host + ":" + std::to_string(port); }
   };
 
+  /// \brief Move-only RAII guard for an exclusive per-host:port connection lease.
+  ///
+  /// Acquired in executeRequest right after acquireLease and held for the entire
+  /// exchange. Its destructor releases the lease (clears the leased flag and
+  /// notifies waiters) on EVERY scope exit — normal return AND every exception
+  /// path — so a throwing request can never leave a host's lease permanently
+  /// held (which would deadlock all future same-host requests). The lease is
+  /// released here and ONLY here (no hand-placed release elsewhere). noexcept
+  /// so it is safe to run during stack unwinding.
+  class ConnectionLease
+  {
+  public:
+    ConnectionLease() = default;
+    ConnectionLease(HttpClient *owner, std::string hostPort)
+        : _owner(owner), _hostPort(std::move(hostPort))
+    {
+    }
+
+    ConnectionLease(ConnectionLease &&other) noexcept
+        : _owner(other._owner), _hostPort(std::move(other._hostPort))
+    {
+      other._owner = nullptr;
+    }
+
+    ConnectionLease &operator=(ConnectionLease &&other) noexcept
+    {
+      if (this != &other)
+      {
+        release();
+        _owner = other._owner;
+        _hostPort = std::move(other._hostPort);
+        other._owner = nullptr;
+      }
+      return *this;
+    }
+
+    ConnectionLease(const ConnectionLease &) = delete;
+    ConnectionLease &operator=(const ConnectionLease &) = delete;
+
+    ~ConnectionLease() { release(); }
+
+    void release() noexcept
+    {
+      if (_owner)
+      {
+        // releaseLease locks _mutex; std::mutex::lock can in principle throw
+        // (std::system_error) but only on unrecoverable mutex corruption /
+        // deadlock detection. Letting that terminate() is preferable to leaking
+        // the lease (which would permanently deadlock all future same-host
+        // requests), so release() is correctly noexcept.
+        _owner->releaseLease(_hostPort);
+        _owner = nullptr;
+      }
+    }
+
+  private:
+    HttpClient *_owner{nullptr};
+    std::string _hostPort;
+  };
+
 public:
   /// \brief Constructor with optional configuration
   explicit HttpClient(const Config &config = Config{}) : _config(config)
@@ -184,13 +281,16 @@ public:
 
   ~HttpClient() { cleanup(); }
 
-  // Delete copy operations to prevent issues with transport ownership
+  // HttpClient is non-copyable AND non-movable: it owns a std::mutex,
+  // std::condition_variable, and live lease/connection state. A std::mutex/CV
+  // member is itself non-movable, so a `= default` move would be implicitly
+  // DELETED anyway — declaring `= delete` makes the non-movability explicit and
+  // avoids a misleading interface. Heap-store via std::shared_ptr<HttpClient>
+  // (as HttpClientPool does) when movability is needed.
   HttpClient(const HttpClient &) = delete;
   HttpClient &operator=(const HttpClient &) = delete;
-
-  // Allow move operations
-  HttpClient(HttpClient &&) = default;
-  HttpClient &operator=(HttpClient &&) = default;
+  HttpClient(HttpClient &&) = delete;
+  HttpClient &operator=(HttpClient &&) = delete;
 
   /// \brief Set TLS configuration
   void setTlsConfig(const TlsConfig &config)
@@ -370,23 +470,35 @@ public:
     return std::move(result.value);
   }
 
-  /// \brief Cleanup connections and resources
+  /// \brief Cleanup connections and resources.
+  ///
+  /// PRECONDITION: callers must not invoke cleanup() (or destroy the client)
+  /// while requests are still in flight on OTHER threads. cleanup() wakes
+  /// threads blocked in acquireLease (they fail fast), but a thread already past
+  /// the lease and mid-I/O (connectSync/sendSync/receiveSync) will have its
+  /// transport stopped underneath it — it surfaces an error rather than crashing,
+  /// but join all request threads before cleanup/destruction for clean shutdown.
   void cleanup()
   {
     std::lock_guard<std::mutex> lock(_mutex);
 
-    // Close all connections
-    for (const auto &[hostPort, sessionId] : _connections)
-    {
-      _transport->close(sessionId);
-    }
-    _connections.clear();
-    _connectionLastUsed.clear();
+    // Wake any threads blocked in acquireLease so a destruct/cleanup during a
+    // contended wait fails fast instead of deadlocking (DD-A8).
+    _closing = true;
+    _cv.notify_all();
 
+    // Close all connections. Guard on _transport for consistency with stop()
+    // below (a non-empty cache implies an initialized transport, but keep the
+    // guard so the loop and stop() agree).
     if (_transport)
     {
+      for (const auto &[hostPort, entry] : _connections)
+      {
+        _transport->close(entry.id);
+      }
       _transport->stop();
     }
+    _connections.clear();
 
     if (_dnsClient)
     {
@@ -395,17 +507,39 @@ public:
   }
 
 private:
+  /// \brief Immutable, compile-once regexes shared by all requests.
+  ///
+  /// std::regex compilation invokes std::ctype<char>::narrow, which lazily fills
+  /// a per-facet cache on first use; two threads compiling regexes concurrently
+  /// race on that cache (value-benign but a real data race flagged by TSan).
+  /// Compiling each regex exactly once inside a function-local static — whose
+  /// initialization is serialized by the C++11 "magic static" guard — warms the
+  /// ctype cache on a single thread and avoids per-request recompilation. All
+  /// subsequent uses are const reads (regex_match/regex_search on a const regex
+  /// is thread-safe).
+  struct CompiledRegexes
+  {
+    std::regex url{
+      R"(^(https?):\/\/([^:\/\s]+)(?::(\d+))?(\/?[^?\s]*)(?:\?([^#\s]*))?(?:#.*)?$)"};
+    std::regex ipv4{R"(^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$)"};
+    std::regex contentLength{R"(Content-Length:\s*(\d+))", std::regex_constants::icase};
+    std::regex chunked{R"(Transfer-Encoding:\s*chunked)", std::regex_constants::icase};
+    std::regex status{R"(HTTP/(\d\.\d)\s+(\d+)\s*(.*))"};
+  };
+
+  static const CompiledRegexes &compiledRegexes()
+  {
+    static const CompiledRegexes regexes;
+    return regexes;
+  }
+
   /// \brief Parse URL into components
   ParsedUrl parseUrl(const std::string &url) const
   {
     ParsedUrl parsed;
 
-    // Simple regex-based URL parsing
-    std::regex urlRegex(
-      R"(^(https?):\/\/([^:\/\s]+)(?::(\d+))?(\/?[^?\s]*)(?:\?([^#\s]*))?(?:#.*)?$)");
     std::smatch match;
-
-    if (!std::regex_match(url, match, urlRegex))
+    if (!std::regex_match(url, match, compiledRegexes().url))
     {
       throw std::invalid_argument("Invalid URL format: " + url);
     }
@@ -432,68 +566,133 @@ private:
     return parsed;
   }
 
-  /// \brief Get or create connection to host
-  SessionId getConnection(const ParsedUrl &parsedUrl)
+  /// \brief Acquire the exclusive connection lease for \p hostPort.
+  ///
+  /// Blocks until no other thread holds the lease for this host:port (or the
+  /// client is shutting down). The wait uses a predicate loop (LEASE-2:
+  /// spurious-wakeup safe) and is bounded by Config::leaseAcquireTimeout when
+  /// that is non-zero (LEASE/INV-5), surfacing a DISTINCT timeout error rather
+  /// than hanging. Returns an RAII guard whose destruction releases the lease.
+  /// \throws std::runtime_error on lease-acquire timeout or on shutdown.
+  ConnectionLease acquireLease(const std::string &hostPort)
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::unique_lock<std::mutex> lock(_mutex);
+    auto available = [&] { return _closing || _leasedHosts.find(hostPort) == _leasedHosts.end(); };
 
-    std::string hostPort = parsedUrl.getHostPort();
-
-    // Check for existing connection
-    auto it = _connections.find(hostPort);
-    if (it != _connections.end())
+    if (_config.leaseAcquireTimeout.count() > 0)
     {
-      auto sessionId = it->second;
-      auto now = std::chrono::steady_clock::now();
-      auto lastUsed = _connectionLastUsed[sessionId];
-
-      if (now - lastUsed < _config.connectionIdleTimeout)
+      if (!_cv.wait_for(lock, _config.leaseAcquireTimeout, available))
       {
-        _connectionLastUsed[sessionId] = now;
-        return sessionId;
-      }
-
-      // Connection is idle, remove it
-      _transport->close(sessionId);
-      _connections.erase(it);
-      _connectionLastUsed.erase(sessionId);
-    }
-
-    // Resolve hostname if needed
-    std::string resolvedHost = parsedUrl.host;
-    if (!isIPAddress(parsedUrl.host))
-    {
-      // Handle localhost specially
-      if (parsedUrl.host == "localhost")
-      {
-        resolvedHost = "127.0.0.1";
-      }
-      else
-      {
-        try
-        {
-          auto result = _dnsClient->resolveHost(parsedUrl.host);
-          if (!result.ipv4.empty())
-          {
-            resolvedHost = result.ipv4[0]; // Use first IPv4 address
-          }
-          else if (!result.ipv6.empty())
-          {
-            resolvedHost = result.ipv6[0]; // Use first IPv6 address
-          }
-        }
-        catch (const std::exception &e)
-        {
-          // DNS resolution failed, try connecting with hostname directly
-          // The transport layer might handle this
-        }
+        throw std::runtime_error("HttpClient: timed out acquiring connection lease for " +
+                                 hostPort);
       }
     }
+    else
+    {
+      _cv.wait(lock, available);
+    }
 
-    // Create new connection synchronously
+    if (_closing)
+    {
+      throw std::runtime_error("HttpClient: shutting down; cannot acquire connection lease for " +
+                               hostPort);
+    }
+
+    _leasedHosts.insert(hostPort);
+    return ConnectionLease(this, hostPort);
+  }
+
+  /// \brief Release the lease for \p hostPort and wake waiters.
+  /// Called ONLY from ConnectionLease's destructor/move (RAII). noexcept.
+  ///
+  /// MUST be notify_all, NOT notify_one: a single _cv serves waiters for ALL
+  /// host:port values. notify_one could wake a waiter for a DIFFERENT,
+  /// still-leased host (whose predicate is false), which re-parks, while the
+  /// waiter for the just-freed host is never woken — a lost wakeup. notify_all
+  /// wakes every waiter so the one(s) blocked on this host re-evaluate.
+  void releaseLease(const std::string &hostPort) noexcept
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _leasedHosts.erase(hostPort);
+    }
+    _cv.notify_all();
+  }
+
+  /// \brief Resolve \p parsedUrl's host to an address string (lock-free).
+  ///
+  /// DnsClient is internally synchronized (its cache uses an ExpiringCache with
+  /// its own mutex), so this is safe to call without _mutex held — required by
+  /// LEASE-7 (do not hold _mutex across I/O). Falls back to the literal hostname
+  /// if resolution fails (the transport layer may still resolve it).
+  std::string resolveHostAddress(const ParsedUrl &parsedUrl) const
+  {
+    if (isIPAddress(parsedUrl.host))
+    {
+      return parsedUrl.host;
+    }
+    if (parsedUrl.host == "localhost")
+    {
+      return "127.0.0.1";
+    }
+    try
+    {
+      auto result = _dnsClient->resolveHost(parsedUrl.host);
+      if (!result.ipv4.empty())
+      {
+        return result.ipv4[0]; // Use first IPv4 address
+      }
+      if (!result.ipv6.empty())
+      {
+        return result.ipv6[0]; // Use first IPv6 address
+      }
+    }
+    catch (const std::exception &)
+    {
+      // DNS resolution failed; fall through to the literal hostname.
+    }
+    return parsedUrl.host;
+  }
+
+  /// \brief Reuse a cached connection for \p parsedUrl, or open a fresh one.
+  ///
+  /// MUST be called while holding the lease for parsedUrl.getHostPort(): the
+  /// lease guarantees this thread is the sole owner of the host's connection
+  /// slot, so _mutex is taken only for short bookkeeping (cache lookup/publish)
+  /// and is RELEASED across DNS resolution and connectSync (LEASE-7 — the lease,
+  /// not the mutex, serializes same-host work; holding _mutex across I/O would
+  /// block lease releases and other hosts' bookkeeping).
+  SessionId acquireConnection(const ParsedUrl &parsedUrl)
+  {
+    const std::string hostPort = parsedUrl.getHostPort();
+
+    // (1) Reuse a live, non-idle cached connection (short critical section).
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      auto it = _connections.find(hostPort);
+      if (it != _connections.end())
+      {
+        auto now = std::chrono::steady_clock::now();
+        if (now - it->second.lastUsed < _config.connectionIdleTimeout)
+        {
+          it->second.lastUsed = now;
+          return it->second.id;
+        }
+        // Idle: close and evict, then fall through to reconnect.
+        _transport->close(it->second.id);
+        _connections.erase(it);
+      }
+    }
+
+    // (2) Resolve the hostname (no _mutex held — LEASE-7).
+    std::string resolvedHost = resolveHostAddress(parsedUrl);
+
+    // (3) Open a new connection synchronously (no _mutex held — LEASE-7). Safe
+    //     because the lease makes this thread the exclusive owner of hostPort's
+    //     slot, so no other thread races this connect/publish.
     TlsMode tlsMode = parsedUrl.isHttps() ? TlsMode::Client : TlsMode::None;
 
-    // Use shorter timeout for localhost — connection refused should be instant
+    // Use shorter timeout for localhost — connection refused should be instant.
     auto timeout = (resolvedHost == "127.0.0.1" || resolvedHost == "::1")
       ? std::min(_config.connectTimeout, std::chrono::milliseconds(200))
       : _config.connectTimeout;
@@ -506,41 +705,50 @@ private:
     }
     SessionId sessionId = connectResult.value();
 
-    // Store connection
-    _connections[hostPort] = sessionId;
-    _connectionLastUsed[sessionId] = std::chrono::steady_clock::now();
+    // (4) Publish the new connection (short critical section).
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _connections[hostPort] = ConnectionEntry{sessionId, std::chrono::steady_clock::now()};
+    }
 
     return sessionId;
   }
 
   /// \brief Close \p sessionId and evict it from the connection cache.
   ///
-  /// The cache (getConnection) hands out a cached connection whenever one exists
-  /// for the host:port and is within the idle timeout — independent of
-  /// reuseConnections. Two cases require explicit eviction or a later request
+  /// The cache (acquireConnection) hands out a cached connection whenever one
+  /// exists for the host:port and is within the idle timeout — independent of
+  /// reuseConnections. Three cases require explicit eviction or a later request
   /// would reuse a dead socket (manifesting as "connection closed" then a run of
   /// "HTTP response timeout"):
   ///   1. reuseConnections == false: the request was sent with "Connection:
   ///      close", so the server closes the socket after responding. The cached
   ///      entry must be dropped so the next request opens a fresh connection.
-  ///   2. a send/receive/parse failure: the peer may have closed the connection,
+  ///   2. the server's response signalled "Connection: close" (DD-A9).
+  ///   3. a send/receive/parse failure: the peer may have closed the connection,
   ///      so it must not be reused (and a retry must get a fresh socket).
   ///
   /// SAFETY (async close vs. id reuse): _transport->close() only enqueues the
-  /// teardown on the I/O thread, but SessionId is a monotonically increasing
+  /// teardown on the I/O thread (it does NOT block on I/O), which is why calling
+  /// it while _mutex is held here — and on the idle-eviction path in
+  /// acquireConnection — does not violate LEASE-7. SessionId is a monotonically increasing
   /// uint64 counter (tcp_engine/udp_engine: _nextSessionId{1}, post-increment) and
   /// is NEVER reused, so a still-pending close for this evicted id cannot tear
   /// down a later connection that happens to reuse the value. This is the same
-  /// guarantee getConnection's idle-eviction close relies on.
+  /// guarantee acquireConnection's idle-eviction close relies on.
+  /// NOTE (lease interaction): dropConnection evicts the cached CONNECTION only;
+  /// it does NOT touch the host's lease. The caller still holds the lease via
+  /// its ConnectionLease guard and releases it exactly once on scope exit
+  /// (RAII). After eviction, the next lease holder for this host finds no cached
+  /// connection and opens a FRESH one (LEASE-4: drop-then-reconnect).
   void dropConnection(const std::string &hostPort, SessionId sessionId)
   {
     std::lock_guard<std::mutex> lock(_mutex);
     auto it = _connections.find(hostPort);
-    if (it != _connections.end() && it->second == sessionId)
+    if (it != _connections.end() && it->second.id == sessionId)
     {
       _connections.erase(it);
     }
-    _connectionLastUsed.erase(sessionId);
     _transport->close(sessionId);
   }
 
@@ -548,8 +756,7 @@ private:
   bool isIPAddress(const std::string &str) const
   {
     // Simple IPv4 check (could be enhanced for IPv6)
-    std::regex ipv4Regex(R"(^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$)");
-    return std::regex_match(str, ipv4Regex);
+    return std::regex_match(str, compiledRegexes().ipv4);
   }
 
   /// \brief Perform HTTP request with retry logic
@@ -594,8 +801,16 @@ private:
                                   std::to_string(attempt + 1) + "/" + std::to_string(retries + 1) +
                                   "): " + e.what());
 
-        // Exponential backoff with jitter
-        int backoffMs = (1 << attempt) * 100 + (rand() % 100);
+        // Exponential backoff with jitter. Use a thread-local PRNG so concurrent
+        // retries on a shared instance do not race on a global PRNG and do not
+        // draw identical backoff sequences (which would re-synchronize retry
+        // storms) — DD-A10.
+        static thread_local std::mt19937 jitterRng(
+          std::random_device{}() ^
+          static_cast<std::mt19937::result_type>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id())));
+        std::uniform_int_distribution<int> jitterDist(0, 99);
+        int backoffMs = (1 << attempt) * 100 + jitterDist(jitterRng);
         std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
         attempt++;
       }
@@ -613,12 +828,24 @@ private:
     // Use normal timeout - optimization will be handled at transport level
     std::chrono::milliseconds sendTimeout = _config.requestTimeout;
 
-    auto sessionId = getConnection(parsedUrl);
+    // Acquire the exclusive per-host connection lease for the WHOLE exchange
+    // (INV-2: connect, send, receive, parse, eviction). The RAII guard releases
+    // it on every scope exit, including any throw below or from acquireConnection.
+    //
+    // DD-A7 (no self-deadlock): executeRequest acquires the lease exactly once
+    // and never re-enters acquireLease for the same host (HttpClient does not
+    // follow redirects). The retry loop lives in performRequest, which calls
+    // executeRequest afresh per attempt, so the lease is fully released between
+    // attempts and a retry never blocks on a lease this thread already holds.
+    ConnectionLease lease = acquireLease(hostPort);
+
+    auto sessionId = acquireConnection(parsedUrl);
 
     // Set session to sync mode BEFORE sending request so response data gets
     // buffered correctly
     if (!_transport->setReadMode(sessionId, ReadMode::Sync))
     {
+      dropConnection(hostPort, sessionId);
       throw std::runtime_error("Failed to set session to sync read mode");
     }
 
@@ -707,16 +934,24 @@ private:
       }
 
       Response resp = parseHttpResponse(responseData);
-      if (_config.reuseConnections)
+      if (_config.reuseConnections && !responseRequestsClose(resp))
       {
-        // Keep the connection warm (async mode) for the next request.
-        _transport->setReadMode(sessionId, ReadMode::Async);
+        // Keep the connection warm (async mode) for the next request. If the
+        // mode switch fails the socket is suspect — evict rather than cache a
+        // known-bad connection that the next reuse would have to discover.
+        if (!_transport->setReadMode(sessionId, ReadMode::Async))
+        {
+          dropConnection(hostPort, sessionId);
+        }
       }
       else
       {
-        // Single-use request ("Connection: close"): the server closes the socket
-        // after responding, so evict the cached entry — otherwise the next
-        // request reuses a dead socket and times out.
+        // Evict the cached entry — otherwise the next request reuses a dead
+        // socket and times out. Two cases:
+        //   - client requested "Connection: close" (reuseConnections == false);
+        //   - the server's RESPONSE carried "Connection: close" (or an HTTP/1.0
+        //     response without keep-alive). Per RFC 7230 §6.6, a recipient that
+        //     sees a close signal MUST NOT reuse the connection (DD-A9).
         dropConnection(hostPort, sessionId);
       }
       return resp;
@@ -729,6 +964,64 @@ private:
       dropConnection(hostPort, sessionId);
       throw;
     }
+  }
+
+  /// \brief Decide whether a parsed response signals the connection must close.
+  ///
+  /// RFC 7230 §6.1/§6.6: the "Connection" header is a comma-separated token
+  /// list; a "close" token means the sender will close after this message and
+  /// the recipient MUST NOT reuse the connection. An explicit "keep-alive"
+  /// token keeps it open. Absent any Connection header, HTTP/1.1 defaults to
+  /// persistent and HTTP/1.0 defaults to close (DD-A9).
+  bool responseRequestsClose(const Response &resp) const
+  {
+    auto it = resp.headers.find("Connection");
+    if (it != resp.headers.end())
+    {
+      // Connection is a comma-separated list of tokens (RFC 7230 §6.1); match on
+      // tokenized, OWS-trimmed, ASCII-case-folded EQUALITY — never a substring
+      // search, which would false-match "close" inside another option token such
+      // as "X-Close-Hint". ASCII-only folding (not std::tolower, which reads the
+      // global C locale) keeps this locale-independent and race-free.
+      bool sawKeepAlive = false;
+      const std::string &value = it->second;
+      std::size_t pos = 0;
+      while (pos <= value.size())
+      {
+        std::size_t comma = value.find(',', pos);
+        std::size_t end = (comma == std::string::npos) ? value.size() : comma;
+        std::size_t a = value.find_first_not_of(" \t", pos);
+        std::size_t b = value.find_last_not_of(" \t", end == 0 ? 0 : end - 1);
+        if (a != std::string::npos && a < end && b != std::string::npos && b >= a)
+        {
+          std::string token = value.substr(a, b - a + 1);
+          std::transform(token.begin(), token.end(), token.begin(),
+                         [](char c)
+                         { return CaseInsensitiveCompare::asciiLower(
+                             static_cast<unsigned char>(c)); });
+          if (token == "close")
+          {
+            return true; // a "close" token wins outright
+          }
+          if (token == "keep-alive")
+          {
+            sawKeepAlive = true;
+          }
+        }
+        if (comma == std::string::npos)
+        {
+          break;
+        }
+        pos = comma + 1;
+      }
+      if (sawKeepAlive)
+      {
+        return false;
+      }
+    }
+    // No explicit Connection directive: HTTP/1.0 defaults to close, HTTP/1.1
+    // defaults to persistent (RFC 7230 §6.3).
+    return resp.httpVersion == "1.0";
   }
 
   /// \brief Check if we have a complete HTTP response
@@ -746,17 +1039,15 @@ private:
     std::string body = data.substr(headerEnd + 4);
 
     // Look for Content-Length
-    std::regex contentLengthRegex(R"(Content-Length:\s*(\d+))", std::regex_constants::icase);
     std::smatch match;
-    if (std::regex_search(headers, match, contentLengthRegex))
+    if (std::regex_search(headers, match, compiledRegexes().contentLength))
     {
       std::size_t contentLength = std::stoul(match[1].str());
       return body.size() >= contentLength;
     }
 
     // Look for Transfer-Encoding: chunked
-    std::regex chunkedRegex(R"(Transfer-Encoding:\s*chunked)", std::regex_constants::icase);
-    if (std::regex_search(headers, chunkedRegex))
+    if (std::regex_search(headers, compiledRegexes().chunked))
     {
       // Simple chunked detection - look for final chunk (0\r\n\r\n)
       return data.find("0\r\n\r\n") != std::string::npos;
@@ -792,13 +1083,13 @@ private:
       statusLine.pop_back();
     }
 
-    // Parse status code and text
-    std::regex statusRegex(R"(HTTP/\d\.\d\s+(\d+)\s*(.*))");
+    // Parse HTTP version, status code, and text
     std::smatch statusMatch;
-    if (std::regex_match(statusLine, statusMatch, statusRegex))
+    if (std::regex_match(statusLine, statusMatch, compiledRegexes().status))
     {
-      response.statusCode = std::stoi(statusMatch[1].str());
-      response.statusText = statusMatch[2].str();
+      response.httpVersion = statusMatch[1].str();
+      response.statusCode = std::stoi(statusMatch[2].str());
+      response.statusText = statusMatch[3].str();
     }
     else
     {
