@@ -62,6 +62,21 @@ public:
   explicit HttpFramingError(const std::string &what) : std::runtime_error(what) {}
 };
 
+/// \brief Thrown when a request failed BEFORE any byte was transmitted (a
+/// connect/DNS resolution failure, or a sync-read-mode set failure — all of
+/// which occur before the request is built or sent). Per RFC 9110 §9.2.2 such a
+/// request was provably not processed, so the retry loop may safely re-send it
+/// for ANY method (idempotent or not).
+///
+/// INVARIANT: this is a DIRECT subclass of std::runtime_error, never a subclass
+/// of HttpFramingError. performRequest catches HttpFramingError first, so a
+/// not-sent error must not be reachable through that branch.
+class HttpRequestNotSentError : public std::runtime_error
+{
+public:
+  explicit HttpRequestNotSentError(const std::string &what) : std::runtime_error(what) {}
+};
+
 /// THREADING CONTRACT (sync request path): concurrent same-host requests on a
 /// SHARED HttpClient instance are SAFE but SERIALIZED. Each request acquires an
 /// exclusive per-host:port connection lease (ConnectionLease) that spans the
@@ -383,6 +398,20 @@ public:
     std::lock_guard<std::mutex> lock(_mutex);
     ensureInitialized();
     return _dnsClient->getDnsServers();
+  }
+
+  /// \brief Classify whether an HTTP method is idempotent per RFC 9110 §9.2.2.
+  /// \details GET, HEAD, PUT, DELETE, OPTIONS, and TRACE are idempotent; every
+  ///   other token — POST, PATCH, CONNECT, extension methods, and any
+  ///   non-canonical casing — is treated as non-idempotent (the safe default).
+  ///   The match is EXACT and case-sensitive: RFC 9110 §9.1 declares the method
+  ///   token case-sensitive, and HttpClient emits the caller's method verbatim,
+  ///   so a non-canonical token (e.g. "get") is a distinct, unregistered method
+  ///   and must not be assumed idempotent. Pure and stateless.
+  static bool isIdempotentMethod(const std::string &method)
+  {
+    return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" ||
+           method == "OPTIONS" || method == "TRACE";
   }
 
   /// \brief Perform synchronous GET request
@@ -859,6 +888,23 @@ private:
       }
       catch (const std::exception &e)
       {
+        // Only retry when it is safe: the method is idempotent (RFC 9110 §9.2.2),
+        // OR the request provably never reached the wire (HttpRequestNotSentError
+        // from the pre-send region). A non-idempotent method that failed once the
+        // request may have been transmitted must NOT be auto-retried — the server
+        // may have already processed it, and re-sending would double-submit
+        // (duplicate orders/charges/state mutations).
+        const bool retryEligible =
+          isIdempotentMethod(method) || (dynamic_cast<const HttpRequestNotSentError *>(&e) != nullptr);
+        if (!retryEligible)
+        {
+          iora::core::Logger::warning(
+            "HttpClient: " + method + " " + url +
+            " failed after the request may have been sent; not auto-retried "
+            "(non-idempotent method, RFC 9110 §9.2.2): " + e.what());
+          throw;
+        }
+
         if (attempt >= retries)
         {
           iora::core::Logger::error("HttpClient: Request to " + url + " failed after " +
@@ -909,14 +955,38 @@ private:
     // attempts and a retry never blocks on a lease this thread already holds.
     ConnectionLease lease = acquireLease(hostPort);
 
-    auto sessionId = acquireConnection(parsedUrl);
-
-    // Set session to sync mode BEFORE sending request so response data gets
-    // buffered correctly
-    if (!_transport->setReadMode(sessionId, ReadMode::Sync))
+    // Pre-send region (INVARIANT: transmits NO request byte — the request is not
+    // even built until below). A failure here — connect/DNS resolution, or the
+    // sync-mode toggle — means the request was provably not sent, so it is safe
+    // to retry for ANY method (RFC 9110 §9.2.2). Rethrow such failures as
+    // HttpRequestNotSentError so performRequest can distinguish them from
+    // possibly-sent failures. The HttpFramingError guard comes FIRST so a (today
+    // impossible) framing error in this region is never downgraded to retryable.
+    // NOTE: parseUrl and acquireLease (above) sit BEFORE this wrap deliberately —
+    // a throw from either is left possibly-sent, which fails safe: parseUrl is
+    // deterministic (a retry re-fails identically) and acquireLease never touched
+    // the wire, so neither risks a double-submit. Re-verify this invariant if
+    // acquireConnection/setReadMode ever change.
+    SessionId sessionId{};
+    try
     {
-      dropConnection(hostPort, sessionId);
-      throw std::runtime_error("Failed to set session to sync read mode");
+      sessionId = acquireConnection(parsedUrl);
+
+      // Set session to sync mode BEFORE sending request so response data gets
+      // buffered correctly
+      if (!_transport->setReadMode(sessionId, ReadMode::Sync))
+      {
+        dropConnection(hostPort, sessionId);
+        throw std::runtime_error("Failed to set session to sync read mode");
+      }
+    }
+    catch (const HttpFramingError &)
+    {
+      throw;
+    }
+    catch (const std::exception &e)
+    {
+      throw HttpRequestNotSentError(e.what());
     }
 
     // Build HTTP request
