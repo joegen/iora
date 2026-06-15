@@ -149,6 +149,9 @@ public:
     if (data.asyncMode && !data.workerThread.joinable())
     {
       data.workerThread = std::thread(runWorker);
+      // Publish the worker thread id under the lock so clear/setExternalHandler
+      // can identify a self-call (handler re-entering on the worker thread).
+      data.workerThreadId = data.workerThread.get_id();
     }
   }
 
@@ -168,15 +171,35 @@ public:
       auto timestampFmt = data.timestampFormat;
       auto handler = data.externalHandler;
 
+      // Gate-check, handler copy, and the in-flight increment form one
+      // indivisible critical section: once a tear-out (clear/setExternalHandler)
+      // nulls the gate fields, no new invocation can pass the gate and increment.
+      ++data.externalHandlerInflight;
       lock.unlock();
 
-      std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
-      if (handler)
+      try
       {
-        handler(level, formattedMessage, rawMessage);
+        std::string formattedMessage =
+          formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+        if (handler)
+        {
+          handler(level, formattedMessage, rawMessage);
+        }
+      }
+      catch (...)
+      {
+        // Restore the in-flight count under the re-acquired EXISTING lock (never
+        // a fresh lock_guard) so a throwing handler cannot strand a drain-waiter,
+        // then rethrow to the synchronous flush() caller.
+        lock.lock();
+        --data.externalHandlerInflight;
+        data.externalHandlerDone.notify_all();
+        throw;
       }
 
       lock.lock();
+      --data.externalHandlerInflight;
+      data.externalHandlerDone.notify_all();
     }
 
     // Always flush queue for both sync and async modes
@@ -241,25 +264,48 @@ public:
   static void setExternalHandler(ExternalHandler handler)
   {
     auto &data = getData();
-    std::lock_guard<std::mutex> lock(data.mutex);
-    data.externalHandler = std::move(handler);
-    data.useExternalHandler = true;
+    std::unique_lock<std::mutex> lock(data.mutex);
 
-    // Close file stream when external handler is active
+    // Drain any in-flight invocation of a PREVIOUS handler before swapping it
+    // out — the same tear-out UAF as clearExternalHandler. Null both gate fields
+    // first (no new invocation starts), then wait (self-call -> inflight==1,
+    // else inflight==0). Messages logged during this swap window take the normal
+    // queue/file path and are not delivered to either handler (accepted).
+    data.externalHandler = nullptr;
+    data.useExternalHandler = false;
+    const int target = (std::this_thread::get_id() == data.workerThreadId) ? 1 : 0;
+    data.externalHandlerDone.wait(lock, [&] { return data.externalHandlerInflight == target; });
+
+    // Close file stream AFTER the drain (so a racing normal-queue drain never
+    // wrote to a half-torn ofstream), then install the new handler.
     if (data.fileStream && data.fileStream->is_open())
     {
       data.fileStream->close();
       data.fileStream.reset();
     }
+
+    data.externalHandler = std::move(handler);
+    data.useExternalHandler = true;
   }
 
   /// \brief Remove external log handler and restore normal logging
   static void clearExternalHandler()
   {
     auto &data = getData();
-    std::lock_guard<std::mutex> lock(data.mutex);
+    std::unique_lock<std::mutex> lock(data.mutex);
+    // Null both gate fields together so no NEW invocation can start (runWorker
+    // and flush() gate on them under the lock), then drain any in-flight
+    // invocation before returning — so a [this]-capturing handler's object can
+    // never be destroyed mid-call.
     data.externalHandler = nullptr;
     data.useExternalHandler = false;
+    // A self-call (a handler re-entering on the worker thread) is itself one
+    // in-flight invocation, so wait for inflight==1 (drain the OTHERS, not its
+    // own — waiting for 0 would self-deadlock); otherwise wait for inflight==0.
+    // Never an unconditional skip: a concurrent flush() may be invoking the
+    // same captured object on another thread.
+    const int target = (std::this_thread::get_id() == data.workerThreadId) ? 1 : 0;
+    data.externalHandlerDone.wait(lock, [&] { return data.externalHandlerInflight == target; });
     // File logging will be restored on next log call via rotateLogFileIfNeeded
   }
 
@@ -577,6 +623,20 @@ public:
     std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
     ExternalHandler externalHandler;
     bool useExternalHandler = false;
+    /// In-flight count of external-handler invocations currently executing in
+    /// their unlocked window (runWorker + any concurrent flush()). Plain int,
+    /// mutated and read ONLY under `mutex` (the mutex supplies happens-before).
+    /// clear/setExternalHandler drain on this before tearing out the handler so a
+    /// [this]-capturing handler's object cannot be destroyed mid-invocation.
+    int externalHandlerInflight = 0;
+    /// Signalled (notify_all) on every decrement of externalHandlerInflight.
+    /// Dedicated CV (not `cv`) so drain-waiters never consume worker wakeups.
+    std::condition_variable externalHandlerDone;
+    /// Id of the async worker thread, captured under `mutex` when the worker is
+    /// spawned in init(). Read only under `mutex`. Lets clear/setExternalHandler
+    /// detect a self-call (handler re-entering on the worker thread) and wait for
+    /// inflight==1 (drain OTHER invocations, not its own) instead of deadlocking.
+    std::thread::id workerThreadId;
     /// Original log format string (for getLogFormat())
     std::string _logFormat = "[%T] [%L] %m";
     /// Pre-compiled format segments for fast formatting
@@ -591,7 +651,14 @@ public:
       // Ensure clean shutdown during static destruction
       try
       {
-        exit = true;
+        // Set the predicate UNDER the mutex (as shutdown() does): mutating a CV
+        // predicate without the wait mutex — even an atomic one — can lose the
+        // wakeup if the worker is between its predicate check and parking,
+        // hanging join() at teardown.
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          exit = true;
+        }
         cv.notify_all();
         if (workerThread.joinable())
         {
@@ -636,17 +703,46 @@ public:
         auto timestampFmt = data.timestampFormat;
         auto handler = data.externalHandler;
 
+        // Gate-check, handler copy, and increment form one indivisible critical
+        // section; a tear-out that nulls the gate cannot then increment.
+        ++data.externalHandlerInflight;
+
         // CRITICAL: Unlock before formatting and calling handler to avoid deadlock.
         lock.unlock();
 
-        std::string formattedMessage = formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
-        if (handler)
+        try
         {
-          handler(level, formattedMessage, rawMessage);
+          std::string formattedMessage =
+            formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+          if (handler)
+          {
+            handler(level, formattedMessage, rawMessage);
+          }
+        }
+        catch (const std::exception &ex)
+        {
+          // A throwing log sink must not std::terminate the worker/process.
+          // Restore the in-flight count under the re-acquired EXISTING lock,
+          // report to stderr, and keep draining.
+          lock.lock();
+          --data.externalHandlerInflight;
+          data.externalHandlerDone.notify_all();
+          std::cerr << "Logger: external handler threw: " << ex.what() << std::endl;
+          continue;
+        }
+        catch (...)
+        {
+          lock.lock();
+          --data.externalHandlerInflight;
+          data.externalHandlerDone.notify_all();
+          std::cerr << "Logger: external handler threw a non-std exception" << std::endl;
+          continue;
         }
 
         // Re-lock for next iteration
         lock.lock();
+        --data.externalHandlerInflight;
+        data.externalHandlerDone.notify_all();
       }
 
       // Process normal logging queue

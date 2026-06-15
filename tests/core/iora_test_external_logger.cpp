@@ -9,6 +9,7 @@
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,10 +23,15 @@ struct LogCapture
 };
 
 std::vector<LogCapture> capturedLogs;
+// The handler can be invoked concurrently by the async worker AND by a flush()
+// on another thread (both drain the external-handler queue), so the shared
+// vector must be synchronized — otherwise the two push_back calls race.
+std::mutex capturedLogsMutex;
 
 void externalLogHandler(iora::core::Logger::Level level, const std::string &formattedMessage,
                         const std::string &rawMessage)
 {
+  std::lock_guard<std::mutex> lock(capturedLogsMutex);
   capturedLogs.push_back({level, formattedMessage, rawMessage});
 }
 } // namespace

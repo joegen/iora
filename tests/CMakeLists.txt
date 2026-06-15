@@ -89,6 +89,7 @@ set(CORE_TESTS
     core/iora_test_event_queue
     core/iora_test_external_logger
     core/iora_test_logger
+    core/iora_test_logger_external_handler_race
     core/iora_test_threadpool
     core/iora_test_threadpool_cleanup
     core/iora_test_threadpool_lifecycle
@@ -250,6 +251,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_http_client_lease
     iora_test_http_client_response_framing
     iora_test_http_client_retry
+    iora_test_logger_external_handler_race
     test_websocket_reconnect
 )
 foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
