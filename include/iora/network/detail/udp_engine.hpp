@@ -10,6 +10,7 @@
 #error "Linux-only (epoll/eventfd/timerfd)"
 #endif
 
+#include "iora/core/errno_utils.hpp"
 #include "iora/network/circuit_breaker.hpp"
 #include "iora/network/connection_health.hpp"
 #include "iora/network/detail/engine_base.hpp"
@@ -511,21 +512,7 @@ public:
   }
 
 private:
-  static std::string lastErr()
-  {
-    int e = errno;
-    char buf[256] = {0};
-#if defined(__GLIBC__) && !defined(__APPLE__)
-    // GNU strerror_r returns a char* that MAY be a static string and MAY leave
-    // buf untouched — the result MUST be taken from the return value, never from
-    // buf (constructing std::string(buf) on the untouched buffer reads
-    // uninitialized memory with no NUL terminator -> strlen overruns -> heap
-    // corruption).
-    return std::string(::strerror_r(e, buf, sizeof(buf)));
-#else
-    return std::string(std::strerror(e));
-#endif
-  }
+  static std::string lastErr() { return iora::core::errnoMessage(errno); }
   bool addEpoll(int fd, std::uint32_t ev)
   {
     epoll_event e{};

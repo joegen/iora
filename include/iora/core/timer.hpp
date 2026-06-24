@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include <iora/common/i_lifecycle_managed.hpp>
+#include <iora/core/errno_utils.hpp>
 
 namespace iora
 {
@@ -63,7 +64,7 @@ public:
     if (errno_val != 0)
     {
       _message +=
-        " (errno: " + std::to_string(errno_val) + " - " + std::string(strerror(errno_val)) + ")";
+        " (errno: " + std::to_string(errno_val) + " - " + errnoMessage(errno_val) + ")";
     }
   }
 
@@ -245,7 +246,7 @@ public:
 
     if (errno_val != 0)
     {
-      std::printf(" (errno: %d - %s)", errno_val, strerror(errno_val));
+      std::printf(" (errno: %d - %s)", errno_val, errnoMessage(errno_val).c_str());
     }
 
     std::printf("\n");

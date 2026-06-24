@@ -53,6 +53,7 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+#include "iora/core/errno_utils.hpp"
 #include "iora/core/logger.hpp"
 #include "iora/core/timer.hpp"
 #include "iora/network/detail/engine_base.hpp"
@@ -599,21 +600,7 @@ protected:
 private:
   // ===== helpers =====
 
-  static std::string lastErr()
-  {
-    int e = errno;
-    char buf[256] = {0};
-#if defined(__GLIBC__) && !defined(__APPLE__)
-    // GNU strerror_r returns a char* that MAY be a static string and MAY leave
-    // buf untouched — the result MUST be taken from the return value, never from
-    // buf (constructing std::string(buf) on the untouched buffer reads
-    // uninitialized memory with no NUL terminator -> strlen overruns -> heap
-    // corruption).
-    return std::string(::strerror_r(e, buf, sizeof(buf)));
-#else
-    return std::string(std::strerror(e));
-#endif
-  }
+  static std::string lastErr() { return iora::core::errnoMessage(errno); }
 
   bool addEpoll(int fd, std::uint32_t ev)
   {
@@ -1715,7 +1702,7 @@ private:
         IORA_LOG_ERROR("[IMMEDIATE-CONNECT] getsockopt() failed for sid=" << cr.sid
                        << ", errno=" << gso_errno);
         closeNow(sPtr, TransportError::Socket,
-                 std::string("getsockopt failed: ") + std::strerror(gso_errno), gso_errno);
+                 std::string("getsockopt failed: ") + iora::core::errnoMessage(gso_errno), gso_errno);
         return true;
       }
       else if (err == 0)
@@ -1748,7 +1735,7 @@ private:
           {
             IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] getpeername() detected connection failure for sid="
                            << cr.sid << ", errno=" << gp_errno);
-            closeNow(sPtr, TransportError::Connect, std::strerror(gp_errno), gp_errno);
+            closeNow(sPtr, TransportError::Connect, iora::core::errnoMessage(gp_errno), gp_errno);
             return true;
           }
           // else ENOTCONN or other transient error - connection not yet established, wait for epoll/timeout
@@ -1759,9 +1746,9 @@ private:
       else
       {
         IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] SO_ERROR indicates connection failed for sid=" << cr.sid
-                       << ", error=" << std::strerror(err));
+                       << ", error=" << iora::core::errnoMessage(err));
         // Connection failed immediately - clean up and invoke failure callback
-        closeNow(sPtr, TransportError::Connect, std::strerror(err), err);
+        closeNow(sPtr, TransportError::Connect, iora::core::errnoMessage(err), err);
         return true;
       }
     }
@@ -1789,9 +1776,9 @@ private:
       socklen_t el = sizeof(err);
       if (::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0)
       {
-        IORA_LOG_DEBUG("[EPOLL-EVENT] Connection error detected: " << std::strerror(err));
+        IORA_LOG_DEBUG("[EPOLL-EVENT] Connection error detected: " << iora::core::errnoMessage(err));
         errno = err; // Ensure closeNow's savedErrno captures the SO_ERROR value
-        closeNow(s, TransportError::Connect, std::strerror(err), 0);
+        closeNow(s, TransportError::Connect, iora::core::errnoMessage(err), 0);
         return;
       }
       IORA_LOG_DEBUG("[EPOLL-EVENT] No connection errors detected");
@@ -1837,7 +1824,7 @@ private:
             IORA_LOG_ERROR("[EPOLL-EVENT] getsockopt() failed for sid=" << s->id
                            << ", errno=" << gso_errno);
             closeNow(s, TransportError::Socket,
-                     std::string("getsockopt failed: ") + std::strerror(gso_errno), gso_errno);
+                     std::string("getsockopt failed: ") + iora::core::errnoMessage(gso_errno), gso_errno);
             return;
           }
           else if (err == 0)
@@ -1869,7 +1856,7 @@ private:
               {
                 IORA_LOG_DEBUG("[EPOLL-EVENT] getpeername() detected connection failure for sid="
                                << s->id << ", errno=" << gp_errno);
-                closeNow(s, TransportError::Connect, std::strerror(gp_errno), gp_errno);
+                closeNow(s, TransportError::Connect, iora::core::errnoMessage(gp_errno), gp_errno);
                 return;
               }
               // else ENOTCONN or other transient error - connection not yet established, wait for timeout
@@ -1881,8 +1868,8 @@ private:
           {
             // SO_ERROR indicates connection failed
             IORA_LOG_DEBUG("[EPOLL-EVENT] SO_ERROR indicates connection failed for sid=" << s->id
-                           << ", error=" << std::strerror(err));
-            closeNow(s, TransportError::Connect, std::strerror(err), err);
+                           << ", error=" << iora::core::errnoMessage(err));
+            closeNow(s, TransportError::Connect, iora::core::errnoMessage(err), err);
             return;
           }
         }
