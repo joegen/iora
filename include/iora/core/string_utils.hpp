@@ -118,7 +118,10 @@ struct StringUtils
     return input.substr(0, end + 1);
   }
 
-  /// \brief Case-insensitive string comparison (ASCII only).
+  /// \brief Case-insensitive string comparison (ASCII only, locale-independent).
+  /// Bytes >= 0x80 are compared verbatim, so the result is identical across
+  /// processes/locales — safe for cross-site / cross-process agreement (e.g. a
+  /// codec-name or User-Agent match that must be byte-identical between peers).
   static bool iequals(std::string_view a, std::string_view b) noexcept
   {
     if (a.size() != b.size())
@@ -135,7 +138,8 @@ struct StringUtils
     return true;
   }
 
-  /// \brief Convert string to lowercase (ASCII only). Returns new string.
+  /// \brief Convert string to lowercase (ASCII only, locale-independent).
+  /// Bytes >= 0x80 pass through unchanged. Returns new string.
   static std::string toLower(std::string_view input)
   {
     std::string result;
@@ -147,15 +151,15 @@ struct StringUtils
     return result;
   }
 
-  /// \brief Convert string to uppercase (ASCII only). Returns new string.
+  /// \brief Convert string to uppercase (ASCII only, locale-independent).
+  /// Bytes >= 0x80 pass through unchanged. Returns new string.
   static std::string toUpper(std::string_view input)
   {
     std::string result;
     result.reserve(input.size());
     for (char c : input)
     {
-      result += static_cast<char>(
-        std::toupper(static_cast<unsigned char>(c)));
+      result += toUpperChar(c);
     }
     return result;
   }
@@ -173,8 +177,7 @@ struct StringUtils
       for (char c : key)
       {
         h = h * 31 + static_cast<std::size_t>(
-          static_cast<unsigned char>(
-            std::tolower(static_cast<unsigned char>(c))));
+          static_cast<unsigned char>(toLowerChar(c)));
       }
       return h;
     }
@@ -193,11 +196,21 @@ struct StringUtils
   };
 
 private:
-  /// \brief Safe ASCII tolower with unsigned char cast.
+  /// \brief Locale-independent ASCII lowercase. Bytes outside A-Z (incl. all
+  /// bytes >= 0x80) pass through unchanged — deliberately NOT std::tolower,
+  /// which is locale-dependent for bytes >= 0x80 and would make the "ASCII only"
+  /// contract non-deterministic across processes/locales.
   static char toLowerChar(char c) noexcept
   {
-    return static_cast<char>(
-      std::tolower(static_cast<unsigned char>(c)));
+    const auto u = static_cast<unsigned char>(c);
+    return (u >= 'A' && u <= 'Z') ? static_cast<char>(u + 0x20) : c;
+  }
+
+  /// \brief Locale-independent ASCII uppercase (companion to toLowerChar).
+  static char toUpperChar(char c) noexcept
+  {
+    const auto u = static_cast<unsigned char>(c);
+    return (u >= 'a' && u <= 'z') ? static_cast<char>(u - 0x20) : c;
   }
 };
 
