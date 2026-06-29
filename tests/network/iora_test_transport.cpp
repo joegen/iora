@@ -16,6 +16,12 @@
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <openssl/ssl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 using namespace iora::network;
 using namespace std::chrono_literals;
 
@@ -1714,6 +1720,79 @@ TEST_CASE("TLS connection via Transport API", "[transport][tls]")
 
   client->stop();
   server->stop();
+}
+
+// Tracker 2026-06-28-1 (DOM-L1, client-side floor): an iora TLS CLIENT must
+// refuse to negotiate below TLS 1.2. Stand up a RAW OpenSSL server pinned to
+// MAX TLS 1.1 and assert the iora client never completes a handshake to it.
+// (If the local OpenSSL cannot even offer TLS 1.1, the handshake still fails —
+// the security property "no sub-1.2 connection" holds either way.)
+TEST_CASE("TLS client enforces a TLS 1.2 floor (rejects a TLS 1.1-only server)",
+          "[transport][tls][floor]")
+{
+  std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
+  std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
+  {
+    FILE *f = std::fopen(certFile.c_str(), "r");
+    if (!f) { WARN("TLS certs not available — skipping client-floor test"); return; }
+    std::fclose(f);
+  }
+
+  auto port = testnet::getFreePortTCP();
+
+  int lsock = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(lsock >= 0);
+  int one = 1;
+  ::setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  timeval acceptTo{};
+  acceptTo.tv_sec = 4; // bound accept() so the worker never hangs the test
+  ::setsockopt(lsock, SOL_SOCKET, SO_RCVTIMEO, &acceptTo, sizeof(acceptTo));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+  addr.sin_port = htons(port);
+  REQUIRE(::bind(lsock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  REQUIRE(::listen(lsock, 1) == 0);
+
+  std::atomic<bool> serverHandshakeOk{false};
+  std::thread srv([&]() {
+    int csock = ::accept(lsock, nullptr, nullptr);
+    if (csock < 0) { return; }
+    SSL_CTX *ctx = ::SSL_CTX_new(TLS_server_method());
+    if (ctx)
+    {
+      ::SSL_CTX_set_max_proto_version(ctx, TLS1_1_VERSION);
+      ::SSL_CTX_use_certificate_file(ctx, certFile.c_str(), SSL_FILETYPE_PEM);
+      ::SSL_CTX_use_PrivateKey_file(ctx, keyFile.c_str(), SSL_FILETYPE_PEM);
+      SSL *ssl = ::SSL_new(ctx);
+      ::SSL_set_fd(ssl, csock);
+      if (::SSL_accept(ssl) == 1) { serverHandshakeOk = true; }
+      ::SSL_shutdown(ssl);
+      ::SSL_free(ssl);
+      ::SSL_CTX_free(ctx);
+    }
+    ::close(csock);
+  });
+
+  TransportConfig clientCfg;
+  clientCfg.clientTls.enabled = true;
+  clientCfg.clientTls.defaultMode = TlsMode::Client;
+  clientCfg.clientTls.verifyPeer = false;
+  auto client = Transport::tcp(std::move(clientCfg));
+  std::atomic<bool> connected{false};
+  client->onConnect([&](SessionId, const TransportAddress &) { connected = true; });
+  REQUIRE(client->start().isOk());
+  client->connect("127.0.0.1", port, TlsMode::Client);
+
+  // No common protocol version (client floor 1.2 vs server max 1.1) => the TLS
+  // handshake must NOT complete on either side.
+  std::this_thread::sleep_for(1500ms);
+  CHECK_FALSE(connected.load());
+  CHECK_FALSE(serverHandshakeOk.load());
+
+  client->stop();
+  ::close(lsock);
+  if (srv.joinable()) { srv.join(); }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

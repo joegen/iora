@@ -61,6 +61,7 @@
 #include "iora/network/transport_types.hpp"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 namespace iora
 {
@@ -2531,6 +2532,16 @@ private:
     }
   }
 
+  // Apply a HARD TLS 1.2 minimum-version floor to a context: an operator may
+  // RAISE the minimum (e.g. TLS 1.3) but never lower it below 1.2 (BCP 195 /
+  // RFC 9325). configuredMin == 0 (unset) floors to 1.2; a positive value below
+  // 1.2 is clamped up.
+  static void applyTls12Floor(::SSL_CTX *ctx, int configuredMin)
+  {
+    const int minVer = configuredMin < TLS1_2_VERSION ? TLS1_2_VERSION : configuredMin;
+    ::SSL_CTX_set_min_proto_version(ctx, minVer);
+  }
+
   bool initTls()
   {
     // Server
@@ -2572,6 +2583,34 @@ private:
           err(TransportError::Config, "load server cert/key");
           return false;
         }
+        // Fail fast on a server cert/key MISMATCH (each file loaded but the
+        // private key does not match the leaf certificate). The client context
+        // already does this; without it a mismatch would bind a listener that
+        // fails every handshake instead of failing at startup.
+        if (::SSL_CTX_check_private_key(_sslSrv) != 1)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config, "server cert/key mismatch"));
+          err(TransportError::Config, "server cert/key mismatch");
+          return false;
+        }
+        // Fail fast on an EXPIRED server certificate (validity is otherwise
+        // load-time-invisible — it would only surface at the first handshake).
+        // X509_cmp_time(t, nullptr) compares t against the current time and
+        // returns 0 on a parse error, so treat 0 (unparseable) and <0 (notAfter
+        // already in the past) as failure. (Not-yet-valid / notBefore is handled
+        // separately — see tracker 2026-06-29-4 — to avoid a boot clock-skew
+        // foot-gun.)
+        if (X509 *serverCert = ::SSL_CTX_get0_certificate(_sslSrv))
+        {
+          int cmp = ::X509_cmp_time(::X509_get0_notAfter(serverCert), nullptr);
+          if (cmp == 0 || cmp < 0)
+          {
+            setLastFatal(IoResult::failure(TransportError::Config,
+              "server cert expired or has an unparseable notAfter"));
+            err(TransportError::Config, "server cert expired/unparseable notAfter");
+            return false;
+          }
+        }
       }
       if (_config.serverTls.verifyPeer)
       {
@@ -2589,17 +2628,22 @@ private:
         }
         else
         {
-          ::SSL_CTX_set_default_verify_paths(_sslSrv);
+          // Server-side client-cert verification (mTLS) with no explicit trust
+          // anchor would silently fall back to the system root store, accepting
+          // any publicly-rooted client cert. Fail fast — this is a
+          // misconfiguration. (Client-side verification against system roots is
+          // legitimate and is left unchanged below.)
+          setLastFatal(IoResult::failure(TransportError::Config,
+            "server verifyPeer set with no CA file/path"));
+          err(TransportError::Config, "server verifyPeer with no CA");
+          return false;
         }
       }
       if (_config.serverTls.verifyDepth > 0)
       {
         ::SSL_CTX_set_verify_depth(_sslSrv, _config.serverTls.verifyDepth);
       }
-      if (_config.serverTls.minVersion > 0)
-      {
-        ::SSL_CTX_set_min_proto_version(_sslSrv, _config.serverTls.minVersion);
-      }
+      applyTls12Floor(_sslSrv, _config.serverTls.minVersion);
       if (!_config.serverTls.alpn.empty())
       {
         _alpnPref.clear();
@@ -2714,10 +2758,7 @@ private:
       {
         ::SSL_CTX_set_verify_depth(_sslCli, _config.clientTls.verifyDepth);
       }
-      if (_config.clientTls.minVersion > 0)
-      {
-        ::SSL_CTX_set_min_proto_version(_sslCli, _config.clientTls.minVersion);
-      }
+      applyTls12Floor(_sslCli, _config.clientTls.minVersion);
       if (!_config.clientTls.alpn.empty())
       {
         std::vector<unsigned char> wire;
