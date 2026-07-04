@@ -405,3 +405,177 @@ TEST_CASE("Integration: write with BufferWriter, read with BufferView", "[buffer
   REQUIRE(v.readU32BE(3) == 0xDEADBEEF);
   REQUIRE(v.readU64BE(7) == 0x0102030405060708ULL);
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MutableBufferView
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("MutableBufferView: default construction — empty", "[buffer][mutable]")
+{
+  MutableBufferView v;
+  REQUIRE(v.data() == nullptr);
+  REQUIRE(v.size() == 0);
+  REQUIRE(v.capacity() == 0);
+  REQUIRE(v.tailroom() == 0);
+  REQUIRE(v.empty());
+}
+
+TEST_CASE("MutableBufferView: construction exposes size, capacity, tailroom",
+          "[buffer][mutable]")
+{
+  std::uint8_t buf[32] = {};
+  MutableBufferView v(buf, 12, 32);
+  REQUIRE(v.size() == 12);
+  REQUIRE(v.capacity() == 32);
+  REQUIRE(v.tailroom() == 20);
+
+  MutableBufferView noRoom(buf, 8);
+  REQUIRE(noRoom.capacity() == 8);
+  REQUIRE(noRoom.tailroom() == 0);
+}
+
+TEST_CASE("MutableBufferView: bounded offset writes within content",
+          "[buffer][mutable]")
+{
+  std::uint8_t buf[16] = {};
+  MutableBufferView v(buf, 15, 16);
+
+  REQUIRE(v.writeU8(0, 0x42));
+  REQUIRE(v.writeU16BE(1, 0x1234));
+  REQUIRE(v.writeU32BE(3, 0xDEADBEEF));
+  REQUIRE(v.writeU64BE(7, 0x0102030405060708ULL));
+
+  BufferView r = v.view();
+  REQUIRE(r.readU8(0) == 0x42);
+  REQUIRE(r.readU16BE(1) == 0x1234);
+  REQUIRE(r.readU32BE(3) == 0xDEADBEEF);
+  REQUIRE(r.readU64BE(7) == 0x0102030405060708ULL);
+}
+
+TEST_CASE("MutableBufferView: little-endian offset writes", "[buffer][mutable]")
+{
+  std::uint8_t buf[16] = {};
+  MutableBufferView v(buf, 16);
+
+  REQUIRE(v.writeU16LE(0, 0x1234));
+  REQUIRE(buf[0] == 0x34);
+  REQUIRE(buf[1] == 0x12);
+  REQUIRE(v.writeU32LE(2, 0xDEADBEEF));
+  REQUIRE(buf[2] == 0xEF);
+  REQUIRE(v.writeU64LE(6, 0x0102030405060708ULL));
+  REQUIRE(buf[6] == 0x08);
+  REQUIRE(buf[13] == 0x01);
+}
+
+TEST_CASE("MutableBufferView: writes past the content size fail without "
+          "modifying the buffer",
+          "[buffer][mutable]")
+{
+  std::uint8_t buf[16] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+                          0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+  MutableBufferView v(buf, 4, 16); // 12 bytes tailroom, content is 4
+
+  REQUIRE_FALSE(v.writeU8(4, 0x01));
+  REQUIRE_FALSE(v.writeU16BE(3, 0x0102));
+  REQUIRE_FALSE(v.writeU32BE(1, 0x01020304));
+  REQUIRE_FALSE(v.writeU64BE(0, 0x0102030405060708ULL));
+  const std::uint8_t src[2] = {0x01, 0x02};
+  REQUIRE_FALSE(v.writeBytes(3, src, 2));
+
+  for (std::size_t i = 0; i < sizeof(buf); ++i)
+  {
+    REQUIRE(buf[i] == 0xAA);
+  }
+}
+
+TEST_CASE("MutableBufferView: append grows into tailroom, fails past it",
+          "[buffer][mutable]")
+{
+  std::uint8_t buf[8] = {};
+  MutableBufferView v(buf, 4, 8);
+  const std::uint8_t tag[4] = {0xC0, 0xC1, 0xC2, 0xC3};
+
+  REQUIRE(v.append(tag, 4));
+  REQUIRE(v.size() == 8);
+  REQUIRE(v.tailroom() == 0);
+  REQUIRE(v[4] == 0xC0);
+  REQUIRE(v[7] == 0xC3);
+
+  REQUIRE_FALSE(v.append(tag, 1));
+  REQUIRE(v.size() == 8);
+}
+
+TEST_CASE("MutableBufferView: append from a BufferView", "[buffer][mutable]")
+{
+  std::uint8_t src[3] = {0x01, 0x02, 0x03};
+  std::uint8_t buf[8] = {};
+  MutableBufferView v(buf, 2, 8);
+
+  REQUIRE(v.append(BufferView(src, 3)));
+  REQUIRE(v.size() == 5);
+  REQUIRE(v[2] == 0x01);
+  REQUIRE(v[4] == 0x03);
+}
+
+TEST_CASE("MutableBufferView: resize within capacity only", "[buffer][mutable]")
+{
+  std::uint8_t buf[8] = {};
+  MutableBufferView v(buf, 8, 8);
+
+  REQUIRE(v.resize(3)); // shrink (e.g. stripping an auth tag)
+  REQUIRE(v.size() == 3);
+  REQUIRE(v.tailroom() == 5);
+
+  REQUIRE(v.resize(8)); // regrow to capacity
+  REQUIRE(v.size() == 8);
+
+  REQUIRE_FALSE(v.resize(9));
+  REQUIRE(v.size() == 8);
+}
+
+TEST_CASE("MutableBufferView: writeBytes overwrites within content",
+          "[buffer][mutable]")
+{
+  std::uint8_t buf[6] = {0, 1, 2, 3, 4, 5};
+  MutableBufferView v(buf, 6);
+  const std::uint8_t src[2] = {0xEE, 0xFF};
+
+  REQUIRE(v.writeBytes(2, src, 2));
+  REQUIRE(buf[2] == 0xEE);
+  REQUIRE(buf[3] == 0xFF);
+  REQUIRE(buf[4] == 4);
+
+  const std::uint8_t viewSrc[2] = {0x10, 0x20};
+  REQUIRE(v.writeBytes(4, BufferView(viewSrc, 2)));
+  REQUIRE(buf[4] == 0x10);
+  REQUIRE(buf[5] == 0x20);
+  REQUIRE_FALSE(v.writeBytes(5, BufferView(viewSrc, 2)));
+}
+
+TEST_CASE("MutableBufferView: in-place transform round-trip (build, append "
+          "tag, strip tag)",
+          "[buffer][mutable][integration]")
+{
+  // The SRTP shape: build a packet with BufferWriter into storage that
+  // reserves tailroom, wrap it mutable, append a 16-byte tag in place, then
+  // strip it — no reallocation anywhere.
+  std::uint8_t storage[32] = {};
+  BufferWriter w(storage, sizeof(storage));
+  w.writeU32BE(0xDEADBEEF);
+  w.writeU32BE(0xCAFEBABE);
+
+  MutableBufferView v(storage, w.bytesWritten(), sizeof(storage));
+  REQUIRE(v.tailroom() == 24);
+
+  std::uint8_t tag[16];
+  for (std::size_t i = 0; i < sizeof(tag); ++i)
+  {
+    tag[i] = static_cast<std::uint8_t>(i);
+  }
+  REQUIRE(v.append(tag, sizeof(tag)));
+  REQUIRE(v.size() == 24);
+
+  REQUIRE(v.resize(v.size() - sizeof(tag)));
+  REQUIRE(v.view() == BufferView(storage, 8));
+  REQUIRE(v.view().readU32BE(0) == 0xDEADBEEF);
+}

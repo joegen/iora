@@ -400,6 +400,12 @@ public:
     {
       return false;
     }
+    if (len == 0)
+    {
+      // memcpy requires valid pointers even for n == 0; an empty BufferView
+      // carries nullptr.
+      return true;
+    }
     std::memcpy(_data + _pos, data, len);
     _pos += len;
     return true;
@@ -420,6 +426,225 @@ private:
   std::uint8_t* _data;
   std::size_t _capacity;
   std::size_t _pos;
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MutableBufferView — Non-owning mutable view with explicit tailroom
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// \brief Non-owning mutable view over a contiguous byte range with an
+/// explicit capacity beyond the current size. The in-place transform
+/// primitive: a consumer can rewrite bytes within the current content
+/// (bounded offset writes) and grow into the reserved tailroom
+/// (capacity - size) without reallocation — e.g. appending an SRTP auth tag
+/// to a built packet. All mutating methods are bounds-checked and return
+/// false on violation without modifying the buffer.
+class MutableBufferView
+{
+public:
+  /// \brief Default constructor — empty view.
+  constexpr MutableBufferView() noexcept : _data(nullptr), _size(0), _capacity(0)
+  {
+  }
+
+  /// \brief View over @p size valid bytes with @p capacity total writable
+  /// bytes at @p data (tailroom = capacity - size). Precondition:
+  /// size <= capacity (clamped in release builds).
+  MutableBufferView(std::uint8_t* data, std::size_t size,
+                    std::size_t capacity) noexcept
+    : _data(data), _size(size), _capacity(capacity)
+  {
+    assert(size <= capacity && "MutableBufferView: size exceeds capacity");
+    if (_size > _capacity)
+    {
+      _size = _capacity;
+    }
+  }
+
+  /// \brief View with no tailroom (capacity == size).
+  MutableBufferView(std::uint8_t* data, std::size_t size) noexcept
+    : MutableBufferView(data, size, size)
+  {
+  }
+
+  // ── Accessors ────────────────────────────────────────────────────────────
+
+  std::uint8_t* data() noexcept { return _data; }
+  const std::uint8_t* data() const noexcept { return _data; }
+  constexpr std::size_t size() const noexcept { return _size; }
+  constexpr std::size_t capacity() const noexcept { return _capacity; }
+  constexpr std::size_t tailroom() const noexcept { return _capacity - _size; }
+  constexpr bool empty() const noexcept { return _size == 0; }
+
+  std::uint8_t& operator[](std::size_t i)
+  {
+    assert(i < _size && "MutableBufferView::operator[] index out of bounds");
+    return _data[i];
+  }
+
+  std::uint8_t operator[](std::size_t i) const
+  {
+    assert(i < _size && "MutableBufferView::operator[] index out of bounds");
+    return _data[i];
+  }
+
+  /// \brief Read-only view over the current content.
+  BufferView view() const noexcept { return BufferView(_data, _size); }
+
+  // ── Size Adjustment (within capacity) ────────────────────────────────────
+
+  /// \brief Sets the content size. Fails (returns false) when @p newSize
+  /// exceeds the capacity. Growing exposes previously written or
+  /// uninitialized tailroom bytes as content; shrinking never touches bytes.
+  bool resize(std::size_t newSize) noexcept
+  {
+    if (newSize > _capacity)
+    {
+      return false;
+    }
+    _size = newSize;
+    return true;
+  }
+
+  // ── Bounded Writes Within the Current Content ────────────────────────────
+
+  bool writeU8(std::size_t offset, std::uint8_t value) noexcept
+  {
+    if (offset >= _size)
+    {
+      return false;
+    }
+    _data[offset] = value;
+    return true;
+  }
+
+  bool writeU16BE(std::size_t offset, std::uint16_t value) noexcept
+  {
+    if (offset > _size || _size - offset < 2)
+    {
+      return false;
+    }
+    _data[offset] = static_cast<std::uint8_t>(value >> 8);
+    _data[offset + 1] = static_cast<std::uint8_t>(value);
+    return true;
+  }
+
+  bool writeU16LE(std::size_t offset, std::uint16_t value) noexcept
+  {
+    if (offset > _size || _size - offset < 2)
+    {
+      return false;
+    }
+    _data[offset] = static_cast<std::uint8_t>(value);
+    _data[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+    return true;
+  }
+
+  bool writeU32BE(std::size_t offset, std::uint32_t value) noexcept
+  {
+    if (offset > _size || _size - offset < 4)
+    {
+      return false;
+    }
+    _data[offset] = static_cast<std::uint8_t>(value >> 24);
+    _data[offset + 1] = static_cast<std::uint8_t>(value >> 16);
+    _data[offset + 2] = static_cast<std::uint8_t>(value >> 8);
+    _data[offset + 3] = static_cast<std::uint8_t>(value);
+    return true;
+  }
+
+  bool writeU32LE(std::size_t offset, std::uint32_t value) noexcept
+  {
+    if (offset > _size || _size - offset < 4)
+    {
+      return false;
+    }
+    _data[offset] = static_cast<std::uint8_t>(value);
+    _data[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+    _data[offset + 2] = static_cast<std::uint8_t>(value >> 16);
+    _data[offset + 3] = static_cast<std::uint8_t>(value >> 24);
+    return true;
+  }
+
+  bool writeU64BE(std::size_t offset, std::uint64_t value) noexcept
+  {
+    if (offset > _size || _size - offset < 8)
+    {
+      return false;
+    }
+    for (std::size_t i = 0; i < 8; ++i)
+    {
+      _data[offset + i] = static_cast<std::uint8_t>(value >> (56 - i * 8));
+    }
+    return true;
+  }
+
+  bool writeU64LE(std::size_t offset, std::uint64_t value) noexcept
+  {
+    if (offset > _size || _size - offset < 8)
+    {
+      return false;
+    }
+    for (std::size_t i = 0; i < 8; ++i)
+    {
+      _data[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+    }
+    return true;
+  }
+
+  /// \brief Overwrites @p len bytes at @p offset within the current content.
+  bool writeBytes(std::size_t offset, const std::uint8_t* src,
+                  std::size_t len) noexcept
+  {
+    if (offset > _size || _size - offset < len)
+    {
+      return false;
+    }
+    if (len == 0)
+    {
+      // memcpy requires valid pointers even for n == 0; an empty BufferView
+      // carries nullptr.
+      return true;
+    }
+    std::memcpy(_data + offset, src, len);
+    return true;
+  }
+
+  bool writeBytes(std::size_t offset, BufferView src) noexcept
+  {
+    return writeBytes(offset, src.data(), src.size());
+  }
+
+  // ── Append Into the Tailroom ─────────────────────────────────────────────
+
+  /// \brief Appends @p len bytes after the current content, growing the size
+  /// into the tailroom. Fails (returns false) when tailroom() < len.
+  bool append(const std::uint8_t* src, std::size_t len) noexcept
+  {
+    if (tailroom() < len)
+    {
+      return false;
+    }
+    if (len == 0)
+    {
+      // memcpy requires valid pointers even for n == 0; an empty BufferView
+      // carries nullptr.
+      return true;
+    }
+    std::memcpy(_data + _size, src, len);
+    _size += len;
+    return true;
+  }
+
+  bool append(BufferView src) noexcept
+  {
+    return append(src.data(), src.size());
+  }
+
+private:
+  std::uint8_t* _data;
+  std::size_t _size;
+  std::size_t _capacity;
 };
 
 } // namespace core
