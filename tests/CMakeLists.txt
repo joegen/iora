@@ -56,6 +56,7 @@ endif()
 # Network namespace tests
 set(NETWORK_TESTS
     network/iora_test_batch_processor
+    network/iora_test_sockaddr_utils
     network/iora_test_dns_basic
     network/iora_test_dns_timer_cancellation
     network/iora_test_dns_async

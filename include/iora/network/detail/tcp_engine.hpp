@@ -58,6 +58,7 @@
 #include "iora/core/timer.hpp"
 #include "iora/network/detail/engine_base.hpp"
 #include "iora/network/event_batch_processor.hpp"
+#include "iora/network/sockaddr_utils.hpp"
 #include "iora/network/transport_types.hpp"
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -636,25 +637,11 @@ private:
     return {};
   }
 
+  /// Forwards to the shared iora::network::addressFromSockaddr (see the
+  /// udp_engine twin — both were byte-identical private copies).
   static TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
   {
-    TransportAddress addr;
-    char host[NI_MAXHOST]{};
-    if (ss.ss_family == AF_INET)
-    {
-      auto *sa4 = reinterpret_cast<const sockaddr_in *>(&ss);
-      ::inet_ntop(AF_INET, &sa4->sin_addr, host, sizeof(host));
-      addr.host = host;
-      addr.port = ntohs(sa4->sin_port);
-    }
-    else if (ss.ss_family == AF_INET6)
-    {
-      auto *sa6 = reinterpret_cast<const sockaddr_in6 *>(&ss);
-      ::inet_ntop(AF_INET6, &sa6->sin6_addr, host, sizeof(host));
-      addr.host = host;
-      addr.port = ntohs(sa6->sin6_port);
-    }
-    return addr;
+    return iora::network::addressFromSockaddr(ss);
   }
 
   void armGc(std::chrono::seconds sec)
