@@ -241,6 +241,7 @@ endif()
 # thread) compiled directly into the test TU, so per-target instrumentation
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
+    iora_test_logger
     iora_test_ttl_map
     iora_test_expiring_cache
     iora_test_transport

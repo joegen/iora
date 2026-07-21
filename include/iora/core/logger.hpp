@@ -94,6 +94,38 @@ namespace detail
   }
 } // namespace detail
 
+// Source-location capture for the direct level functions
+// (trace/debug/info/warning/error/fatal). __builtin_FILE/__builtin_LINE/
+// __builtin_FUNCTION evaluate at the CALL SITE when used as default-argument
+// values — the C++17-compatible backport of C++20 std::source_location.
+// Guard carefully: __has_builtin was only added in GCC 10, but these builtins
+// have existed since GCC 4.8, so a naive
+// `defined(__has_builtin) && __has_builtin(__builtin_FILE)` guard would wrongly
+// disable capture on GCC 7/8/9. Probe all three builtins (MSVC >= 16.6 also
+// provides them via __has_builtin).
+#if defined(__has_builtin)
+  #if __has_builtin(__builtin_FILE) && __has_builtin(__builtin_LINE) &&        \
+    __has_builtin(__builtin_FUNCTION)
+    #define IORA_HAS_SRC_LOC 1
+  #endif
+#elif defined(__GNUC__)
+  // GCC < 10 lacks __has_builtin but has had these builtins since 4.8. A
+  // non-GCC compiler defining __GNUC__ in compat mode yet predating the
+  // builtins is outside iora's GCC/Clang Linux CI (modern Intel icx is
+  // Clang-based and takes the __has_builtin branch above).
+  #define IORA_HAS_SRC_LOC 1
+#endif
+
+#if defined(IORA_HAS_SRC_LOC)
+  #define IORA_SRC_FILE __builtin_FILE()
+  #define IORA_SRC_LINE __builtin_LINE()
+  #define IORA_SRC_FUNC __builtin_FUNCTION()
+#else
+  #define IORA_SRC_FILE ""
+  #define IORA_SRC_LINE 0
+  #define IORA_SRC_FUNC ""
+#endif
+
 // Forward declaration
 class LoggerStream;
 
@@ -128,8 +160,8 @@ public:
     auto &data = getData();
     std::lock_guard<std::mutex> lock(data.mutex);
 
-    data.minLevel = level;
-    data.asyncMode = async;
+    data.minLevel.store(level, std::memory_order_relaxed);
+    data.asyncMode.store(async, std::memory_order_relaxed);
     data.exit = false;
     // If no filePath provided, log to console only (no file)
     data.logBasePath = filePath;
@@ -146,12 +178,9 @@ public:
 
     rotateLogFileIfNeeded();
 
-    if (data.asyncMode && !data.workerThread.joinable())
+    if (data.asyncMode.load(std::memory_order_relaxed) && !data.workerThread.joinable())
     {
       data.workerThread = std::thread(runWorker);
-      // Publish the worker thread id under the lock so clear/setExternalHandler
-      // can identify a self-call (handler re-entering on the worker thread).
-      data.workerThreadId = data.workerThread.get_id();
     }
   }
 
@@ -160,46 +189,30 @@ public:
     auto &data = getData();
     std::unique_lock<std::mutex> lock(data.mutex);
 
-    // Flush external handler queue first
-    while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler)
+    // Flush external handler queue first. Gated on handlerReentryDepth()==0 (like
+    // logDispatch): a handler that itself calls flush() — e.g. via
+    // LoggerStream::flush() when it logs through the stream proxy — must NOT
+    // re-invoke the handler on the already-queued entries (that is unbounded
+    // recursion, O(backlog) stack frames). At depth > 0 the entries are left for
+    // the outer flush()/worker running at depth 0.
+    while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler &&
+           handlerReentryDepth() == 0)
     {
       auto [level, rawMessage] = data.rawQueue.front();
       data.rawQueue.pop();
 
-      // Capture everything needed BEFORE unlocking
+      // Capture everything needed BEFORE unlocking — a tear-out
+      // (clear/setExternalHandler) can null the gate fields once the lock is
+      // released. The gate-check (loop condition), handler copy, and the
+      // in-flight increment inside runHandlerUnlocked form one indivisible
+      // critical section under the still-held lock.
       auto segments = data._compiledFormat;
       auto timestampFmt = data.timestampFormat;
       auto handler = data.externalHandler;
 
-      // Gate-check, handler copy, and the in-flight increment form one
-      // indivisible critical section: once a tear-out (clear/setExternalHandler)
-      // nulls the gate fields, no new invocation can pass the gate and increment.
-      ++data.externalHandlerInflight;
-      lock.unlock();
-
-      try
-      {
-        std::string formattedMessage =
-          formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
-        if (handler)
-        {
-          handler(level, formattedMessage, rawMessage);
-        }
-      }
-      catch (...)
-      {
-        // Restore the in-flight count under the re-acquired EXISTING lock (never
-        // a fresh lock_guard) so a throwing handler cannot strand a drain-waiter,
-        // then rethrow to the synchronous flush() caller.
-        lock.lock();
-        --data.externalHandlerInflight;
-        data.externalHandlerDone.notify_all();
-        throw;
-      }
-
-      lock.lock();
-      --data.externalHandlerInflight;
-      data.externalHandlerDone.notify_all();
+      // Drains/rethrows to the synchronous flush() caller (already re-locked).
+      runHandlerUnlocked(lock, data,
+        [&] { formatAndInvokeRawHandler(level, rawMessage, segments, timestampFmt, handler); });
     }
 
     // Always flush queue for both sync and async modes
@@ -228,8 +241,25 @@ public:
 
   static void shutdown()
   {
-    flush();
     auto &data = getData();
+    // A throwing sink during the final drain must not prevent shutdown from
+    // setting exit and joining the worker (the worker's own drain already
+    // swallows sink exceptions); otherwise a throwing handler could leave the
+    // worker running until static destruction. Swallow-and-continue here too.
+    try
+    {
+      flush();
+    }
+    catch (const std::exception &ex)
+    {
+      std::cerr << "Logger: external handler threw during shutdown flush: " << ex.what()
+                << std::endl;
+    }
+    catch (...)
+    {
+      std::cerr << "Logger: external handler threw a non-std exception during shutdown flush"
+                << std::endl;
+    }
     {
       std::lock_guard<std::mutex> lock(data.mutex);
       data.exit = true;
@@ -245,8 +275,7 @@ public:
   static void setLevel(Level level)
   {
     auto &data = getData();
-    std::lock_guard<std::mutex> lock(data.mutex);
-    data.minLevel = level;
+    data.minLevel.store(level, std::memory_order_relaxed);
   }
 
   /// \brief Get the current minimum log level
@@ -254,8 +283,8 @@ public:
   static Level getLevel()
   {
     auto &data = getData();
-    std::lock_guard<std::mutex> lock(data.mutex);
-    return data.minLevel;
+    // minLevel is atomic; no lock needed (matches the lock-free log() gate).
+    return data.minLevel.load(std::memory_order_relaxed);
   }
 
   /// \brief Register an external log handler
@@ -273,8 +302,25 @@ public:
     // queue/file path and are not delivered to either handler (accepted).
     data.externalHandler = nullptr;
     data.useExternalHandler = false;
-    const int target = (std::this_thread::get_id() == data.workerThreadId) ? 1 : 0;
+    // Self-call detection via the calling thread's handler-reentry depth. Each
+    // handler invocation pairs ++externalHandlerInflight with ++depth, so this
+    // thread OWNS exactly `depth` of the in-flight count (all pinned on its own
+    // stack and unable to drain while it waits). Drain to `depth` — waiting out
+    // every OTHER thread's invocation without waiting on our own. (target 0 when
+    // not inside a handler; a hard-coded 1 would deadlock at nested depth >= 2.)
+    const int target = handlerReentryDepth();
     data.externalHandlerDone.wait(lock, [&] { return data.externalHandlerInflight == target; });
+
+    // Discard any entries still queued for the PREVIOUS handler. Rerouting them to
+    // the normal sink would print to cout while the NEW handler is active (which
+    // disables console/file output), and delivering them to the new handler would
+    // be misdelivery — so, consistent with the swap-window "not delivered to either
+    // handler" semantics above, they are dropped. Emptying rawQueue here also
+    // prevents the orphaned-queue busy-spin (an alternative to the predicate gate).
+    while (!data.rawQueue.empty())
+    {
+      data.rawQueue.pop();
+    }
 
     // Close file stream AFTER the drain (so a racing normal-queue drain never
     // wrote to a half-torn ofstream), then install the new handler.
@@ -299,13 +345,21 @@ public:
     // never be destroyed mid-call.
     data.externalHandler = nullptr;
     data.useExternalHandler = false;
-    // A self-call (a handler re-entering on the worker thread) is itself one
-    // in-flight invocation, so wait for inflight==1 (drain the OTHERS, not its
-    // own — waiting for 0 would self-deadlock); otherwise wait for inflight==0.
-    // Never an unconditional skip: a concurrent flush() may be invoking the
-    // same captured object on another thread.
-    const int target = (std::this_thread::get_id() == data.workerThreadId) ? 1 : 0;
+    // A handler re-entering to clear itself owns `depth` of the in-flight count
+    // (each invocation pairs ++inflight with ++depth), all pinned on its own stack
+    // and unable to drain while it waits, so drain to `depth` — the OTHERS, not its
+    // own nested invocations. Covers the sync log(), flush(), and async-worker
+    // paths. Never an unconditional skip: a concurrent flush()/log() may be
+    // invoking the same captured object on another thread. (A hard-coded 1 would
+    // deadlock at nested depth >= 2.)
+    const int target = handlerReentryDepth();
     data.externalHandlerDone.wait(lock, [&] { return data.externalHandlerInflight == target; });
+
+    // Reroute any entries still queued for the removed handler so they are not
+    // orphaned in rawQueue (which would busy-spin the worker) and not lost — they
+    // land on the normal queue for file/console.
+    rerouteRawQueueToNormalQueueLocked(data);
+    data.cv.notify_one(); // wake the worker to drain the rerouted normal-queue entries
     // File logging will be restored on next log call via rotateLogFileIfNeeded
   }
 
@@ -325,7 +379,11 @@ public:
   /// \note Format is pre-compiled for performance; parsing happens only on this call.
   /// \note Empty format strings are ignored.
   /// \note Thread ID is formatted as hex hash with platform-specific width for consistency.
-  /// \note Source location placeholders (%F, %l, %f) require using IORA_LOG_* macros.
+  /// \note The direct level functions (trace/debug/info/warning/error/fatal)
+  ///       capture source location implicitly, so %F/%l/%f render for them
+  ///       without a macro. The printf-style *f family and the LoggerStream /
+  ///       Logger<<Level proxy path still require the IORA_LOG_* macros for
+  ///       source location placeholders (%F, %l, %f).
   static void setLogFormat(const std::string &format)
   {
     if (format.empty())
@@ -374,12 +432,54 @@ public:
     data._enableConsoleColors = enable && data._isTTY;
   }
 
-  static void trace(const std::string &message) { log(Level::Trace, message); }
-  static void debug(const std::string &message) { log(Level::Debug, message); }
-  static void info(const std::string &message) { log(Level::Info, message); }
-  static void warning(const std::string &message) { log(Level::Warning, message); }
-  static void error(const std::string &message) { log(Level::Error, message); }
-  static void fatal(const std::string &message) { log(Level::Fatal, message); }
+  /// \brief Direct level-logging functions.
+  /// These capture the caller's source location implicitly via defaulted
+  /// compiler-builtin arguments (IORA_SRC_FILE/LINE/FUNC), so the %F/%l/%f
+  /// format placeholders render without needing an IORA_LOG_* macro at the
+  /// call site. On a compiler lacking the builtins the location falls back to
+  /// empty file, line 0, empty function.
+  /// \note Source location reaches a synchronous external handler's
+  /// formattedMessage argument, but not an async handler (which re-formats
+  /// from the raw {level, message} queue and therefore renders blank location).
+  static void trace(const std::string &message, const char *file = IORA_SRC_FILE,
+                    int line = IORA_SRC_LINE, const char *function = IORA_SRC_FUNC)
+  {
+    log(Level::Trace, message, file, line, function);
+  }
+  static void debug(const std::string &message, const char *file = IORA_SRC_FILE,
+                    int line = IORA_SRC_LINE, const char *function = IORA_SRC_FUNC)
+  {
+    log(Level::Debug, message, file, line, function);
+  }
+  static void info(const std::string &message, const char *file = IORA_SRC_FILE,
+                   int line = IORA_SRC_LINE, const char *function = IORA_SRC_FUNC)
+  {
+    log(Level::Info, message, file, line, function);
+  }
+  static void warning(const std::string &message, const char *file = IORA_SRC_FILE,
+                      int line = IORA_SRC_LINE, const char *function = IORA_SRC_FUNC)
+  {
+    log(Level::Warning, message, file, line, function);
+  }
+  static void error(const std::string &message, const char *file = IORA_SRC_FILE,
+                    int line = IORA_SRC_LINE, const char *function = IORA_SRC_FUNC)
+  {
+    log(Level::Error, message, file, line, function);
+  }
+  static void fatal(const std::string &message, const char *file = IORA_SRC_FILE,
+                    int line = IORA_SRC_LINE, const char *function = IORA_SRC_FUNC)
+  {
+    log(Level::Fatal, message, file, line, function);
+  }
+
+// These are implementation detail of the six default arguments above and are not
+// part of the public API — undefine them so they do not leak into downstream TUs
+// that include this header. Nothing consumes IORA_HAS_SRC_LOC either, so it is
+// undefined too rather than left as macro-namespace surface.
+#undef IORA_SRC_FILE
+#undef IORA_SRC_LINE
+#undef IORA_SRC_FUNC
+#undef IORA_HAS_SRC_LOC
 
   /// \brief Printf-style logging methods with automatic buffer sizing
   /// These methods support printf-style formatting with no message length limit.
@@ -459,61 +559,11 @@ public:
   static void log(Level level, const std::string &message)
   {
     auto &data = getData();
-    if (level < data.minLevel)
+    if (level < data.minLevel.load(std::memory_order_relaxed))
     {
       return;
     }
-
-    std::string output = formatLogMessage(level, message);
-
-    if (data.asyncMode)
-    {
-      {
-        std::lock_guard<std::mutex> lock(data.mutex);
-        if (data.useExternalHandler)
-        {
-          data.rawQueue.push({level, message});
-        }
-        else
-        {
-          // Colorize output before queuing if writing to console
-          // This preserves color info since level is lost after queuing
-          if (!data.fileStream && data._enableConsoleColors)
-          {
-            data.queue.push(colorizeOutput(output, level));
-          }
-          else
-          {
-            data.queue.push(std::move(output));
-          }
-        }
-      }
-      data.cv.notify_one();
-    }
-    else
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-
-      if (data.useExternalHandler && data.externalHandler)
-      {
-        data.externalHandler(level, output, message);
-      }
-      else
-      {
-        rotateLogFileIfNeeded();
-
-        if (data.fileStream)
-        {
-          (*data.fileStream) << output;
-          data.fileStream->flush();
-        }
-        else
-        {
-          // Colorize output for console if colors enabled
-          std::cout << colorizeOutput(output, level);
-        }
-      }
-    }
+    logDispatch(data, level, message, formatLogMessage(level, message));
   }
 
   /// \brief Log a message with source location information
@@ -526,61 +576,11 @@ public:
                   const char *file, int line, const char *function)
   {
     auto &data = getData();
-    if (level < data.minLevel)
+    if (level < data.minLevel.load(std::memory_order_relaxed))
     {
       return;
     }
-
-    std::string output = formatLogMessage(level, message, file, line, function);
-
-    if (data.asyncMode)
-    {
-      {
-        std::lock_guard<std::mutex> lock(data.mutex);
-        if (data.useExternalHandler)
-        {
-          data.rawQueue.push({level, message});
-        }
-        else
-        {
-          // Colorize output before queuing if writing to console
-          // This preserves color info since level is lost after queuing
-          if (!data.fileStream && data._enableConsoleColors)
-          {
-            data.queue.push(colorizeOutput(output, level));
-          }
-          else
-          {
-            data.queue.push(std::move(output));
-          }
-        }
-      }
-      data.cv.notify_one();
-    }
-    else
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-
-      if (data.useExternalHandler && data.externalHandler)
-      {
-        data.externalHandler(level, output, message);
-      }
-      else
-      {
-        rotateLogFileIfNeeded();
-
-        if (data.fileStream)
-        {
-          (*data.fileStream) << output;
-          data.fileStream->flush();
-        }
-        else
-        {
-          // Colorize output for console if colors enabled
-          std::cout << colorizeOutput(output, level);
-        }
-      }
-    }
+    logDispatch(data, level, message, formatLogMessage(level, message, file, line, function));
   }
 
 public:
@@ -614,8 +614,12 @@ public:
     std::queue<std::pair<Level, std::string>> rawQueue; // For external handlers
     std::thread workerThread;
     std::atomic<bool> exit{false};
-    bool asyncMode = false;
-    Level minLevel = Level::Info;
+    // atomic: read on the hot log() gate/branch without holding `mutex`; written
+    // in init()/setLevel(). Plain scalars here were a data race. relaxed ordering
+    // is sufficient — neither flag publishes non-atomic data (the queue/handler
+    // handoff is carried by `mutex`), so no cross-atomic ordering is required.
+    std::atomic<bool> asyncMode{false};
+    std::atomic<Level> minLevel{Level::Info};
     std::unique_ptr<std::ofstream> fileStream;
     std::string logBasePath;
     std::string currentLogDate;
@@ -632,11 +636,6 @@ public:
     /// Signalled (notify_all) on every decrement of externalHandlerInflight.
     /// Dedicated CV (not `cv`) so drain-waiters never consume worker wakeups.
     std::condition_variable externalHandlerDone;
-    /// Id of the async worker thread, captured under `mutex` when the worker is
-    /// spawned in init(). Read only under `mutex`. Lets clear/setExternalHandler
-    /// detect a self-call (handler re-entering on the worker thread) and wait for
-    /// inflight==1 (drain OTHER invocations, not its own) instead of deadlocking.
-    std::thread::id workerThreadId;
     /// Original log format string (for getLogFormat())
     std::string _logFormat = "[%T] [%L] %m";
     /// Pre-compiled format segments for fast formatting
@@ -682,67 +681,227 @@ public:
   }
 #endif
 
+  /// \brief Per-thread external-handler reentrancy depth.
+  /// A thread executing a user log handler in its unlocked window has depth > 0.
+  /// clear/setExternalHandler read this to detect a self-call — a handler that
+  /// re-enters to swap or clear the handler — and drain to inflight == 1 (its own
+  /// invocation) instead of hanging. Replaces the former workerThreadId
+  /// self-detection, which could go stale once the worker was joined (a later
+  /// thread reusing that OS id would misfire) and never covered handler
+  /// invocations on the sync log() path or the flush() thread at all.
+  static int &handlerReentryDepth()
+  {
+    static thread_local int depth = 0;
+    return depth;
+  }
+
+  /// \brief RAII marker: the current thread is executing an external handler for
+  /// the duration of the (unlocked) callback, so a self-call into
+  /// clear/setExternalHandler is detected. Exception-safe.
+  struct HandlerInvocationScope
+  {
+    HandlerInvocationScope() { ++handlerReentryDepth(); }
+    ~HandlerInvocationScope() { --handlerReentryDepth(); }
+    HandlerInvocationScope(const HandlerInvocationScope &) = delete;
+    HandlerInvocationScope &operator=(const HandlerInvocationScope &) = delete;
+  };
+
+  /// \brief Run an external-handler invocation outside `data.mutex` with
+  /// inflight-drain bookkeeping. Precondition: `lock` is HELD and the gate-check
+  /// + handler copy were already done under it. Increments the in-flight count
+  /// (still locked), releases the lock, runs `invoke()`, then re-acquires the
+  /// lock, decrements, and notifies drain-waiters. On exception it performs the
+  /// same teardown and rethrows — and has ALREADY re-acquired the lock — so the
+  /// caller (flush/log propagate; runWorker swallows+continues) must not re-lock.
+  /// Never holds `mutex` across the callback; balances inflight on every path.
+  /// \note If the re-acquire `lock.lock()` itself throws (std::system_error), the
+  /// `--inflight` cannot run and a drain-waiter would hang — but a mutex whose
+  /// lock() throws is an unrecoverable/terminal condition, so this is accepted
+  /// (the same assumption every other lock site in this class already makes).
+  template <typename Invoke>
+  static void runHandlerUnlocked(std::unique_lock<std::mutex> &lock, LoggerData &data,
+                                 Invoke &&invoke)
+  {
+    ++data.externalHandlerInflight;
+    lock.unlock();
+    try
+    {
+      invoke();
+    }
+    catch (...)
+    {
+      lock.lock();
+      --data.externalHandlerInflight;
+      data.externalHandlerDone.notify_all();
+      throw;
+    }
+    lock.lock();
+    --data.externalHandlerInflight;
+    data.externalHandlerDone.notify_all();
+  }
+
+  /// \brief Re-format a raw-queue entry and invoke the external handler under a
+  /// HandlerInvocationScope. Runs inside runHandlerUnlocked's unlocked window;
+  /// shared verbatim by flush() and runWorker(). `handler` is the caller's
+  /// on-stack copy, taken under the lock while the loop gate required
+  /// externalHandler non-null, so it is guaranteed non-null here.
+  static void formatAndInvokeRawHandler(Level level, const std::string &rawMessage,
+                                        const std::vector<FormatSegment> &segments,
+                                        const std::string &timestampFmt,
+                                        const ExternalHandler &handler)
+  {
+    std::string formattedMessage =
+      formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+    HandlerInvocationScope inv;
+    handler(level, formattedMessage, rawMessage);
+  }
+
+  /// \brief Reroute any entries still queued for a REMOVED external handler from
+  /// rawQueue to the normal queue, formatted with the current compiled format.
+  /// Called under `mutex` by clearExternalHandler AFTER the in-flight drain (after
+  /// a clear there is no handler, so console/file output is restored — the correct
+  /// sink for these). Prevents (a) message loss and (b) an ORPHANED non-empty
+  /// rawQueue that would busy-spin the worker (its cv predicate stays satisfied
+  /// while the drain loop is gated off by useExternalHandler==false). rawQueue is
+  /// only ever populated in async mode, so this is a no-op in sync mode.
+  /// (setExternalHandler DROPS its old backlog instead — see there.)
+  static void rerouteRawQueueToNormalQueueLocked(LoggerData &data)
+  {
+    while (!data.rawQueue.empty())
+    {
+      auto [level, rawMessage] = data.rawQueue.front();
+      data.rawQueue.pop();
+      std::string formatted =
+        formatLogMessageInternal(level, rawMessage, data._compiledFormat, data.timestampFormat);
+      // Match logDispatch's colorization: colorize before queuing when writing to
+      // a color-enabled console (the level is lost once queued as a plain string).
+      if (!data.fileStream && data._enableConsoleColors)
+      {
+        data.queue.push(colorizeOutput(formatted, level));
+      }
+      else
+      {
+        data.queue.push(std::move(formatted));
+      }
+    }
+  }
+
+  /// \brief Post-format dispatch shared by both log() overloads: route a
+  /// fully-formatted `output` (with the raw `message` for the handler/rawQueue)
+  /// to the async queue, the external handler, or the file/console path.
+  /// \note A re-entrant call from INSIDE an external handler (handlerReentryDepth
+  /// > 0) is NOT routed back to the handler — sync re-invocation would recurse
+  /// unboundedly (stack overflow) and async would refeed rawQueue (worker
+  /// livelock); such a message takes the normal queue/file/console path instead.
+  static void logDispatch(LoggerData &data, Level level, const std::string &message,
+                          std::string output)
+  {
+    if (data.asyncMode.load(std::memory_order_relaxed))
+    {
+      {
+        std::lock_guard<std::mutex> lock(data.mutex);
+        if (data.useExternalHandler && data.externalHandler && handlerReentryDepth() == 0)
+        {
+          data.rawQueue.push({level, message});
+        }
+        else if (!data.fileStream && data._enableConsoleColors)
+        {
+          // Colorize before queuing (level is lost once queued).
+          data.queue.push(colorizeOutput(output, level));
+        }
+        else
+        {
+          data.queue.push(std::move(output));
+        }
+      }
+      data.cv.notify_one();
+      return;
+    }
+
+    std::unique_lock<std::mutex> lock(data.mutex);
+    if (data.useExternalHandler && data.externalHandler && handlerReentryDepth() == 0)
+    {
+      // Copy-then-invoke: never hold `mutex` across a user callback (a handler
+      // that re-enters Logger would self-deadlock on the non-recursive mutex);
+      // the inflight-drain lets a concurrent clear/setExternalHandler wait the
+      // invocation out instead of tearing the captured object out mid-call.
+      auto handler = data.externalHandler;
+      runHandlerUnlocked(lock, data,
+                         [&]
+                         {
+                           HandlerInvocationScope inv;
+                           handler(level, output, message);
+                         });
+    }
+    else
+    {
+      rotateLogFileIfNeeded();
+
+      if (data.fileStream)
+      {
+        (*data.fileStream) << output;
+        data.fileStream->flush();
+      }
+      else
+      {
+        std::cout << colorizeOutput(output, level);
+      }
+    }
+  }
+
   static void runWorker()
   {
     auto &data = getData();
     while (true)
     {
       std::unique_lock<std::mutex> lock(data.mutex);
+      // The rawQueue term is gated on useExternalHandler: an orphaned non-empty
+      // rawQueue (handler cleared before drain) must not keep the predicate true
+      // while the drain loop is disabled — that would busy-spin. clear/set reroute
+      // such entries to the normal queue, so this is also defense-in-depth.
       data.cv.wait(lock,
-                   [&data] { return !data.queue.empty() || !data.rawQueue.empty() || data.exit; });
+                   [&data]
+                   {
+                     return !data.queue.empty() ||
+                            (!data.rawQueue.empty() && data.useExternalHandler) || data.exit;
+                   });
 
-      // Process external handler queue
-      while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler)
+      // Process external handler queue. handlerReentryDepth()==0 is defensive and
+      // consistent with flush()/logDispatch — the worker's loop condition is only
+      // ever evaluated at depth 0 (between invocations), so it never wrongly stops
+      // the drain, but it keeps every handler-dispatch site uniformly gated.
+      while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler &&
+             handlerReentryDepth() == 0)
       {
         auto [level, rawMessage] = data.rawQueue.front();
         data.rawQueue.pop();
 
         // Capture everything needed BEFORE unlocking — clearExternalHandler()
-        // can null data.externalHandler while the lock is released.
+        // can null data.externalHandler while the lock is released. The gate,
+        // handler copy, and inflight increment (inside runHandlerUnlocked) form
+        // one indivisible critical section under the still-held lock.
         auto segments = data._compiledFormat;
         auto timestampFmt = data.timestampFormat;
         auto handler = data.externalHandler;
 
-        // Gate-check, handler copy, and increment form one indivisible critical
-        // section; a tear-out that nulls the gate cannot then increment.
-        ++data.externalHandlerInflight;
-
-        // CRITICAL: Unlock before formatting and calling handler to avoid deadlock.
-        lock.unlock();
-
         try
         {
-          std::string formattedMessage =
-            formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
-          if (handler)
-          {
-            handler(level, formattedMessage, rawMessage);
-          }
+          // On normal return AND on rethrow, runHandlerUnlocked has already
+          // re-acquired the lock and decremented inflight — the catch clauses
+          // must NOT re-lock; a throwing sink must not std::terminate the worker.
+          runHandlerUnlocked(lock, data,
+            [&] { formatAndInvokeRawHandler(level, rawMessage, segments, timestampFmt, handler); });
         }
         catch (const std::exception &ex)
         {
-          // A throwing log sink must not std::terminate the worker/process.
-          // Restore the in-flight count under the re-acquired EXISTING lock,
-          // report to stderr, and keep draining.
-          lock.lock();
-          --data.externalHandlerInflight;
-          data.externalHandlerDone.notify_all();
           std::cerr << "Logger: external handler threw: " << ex.what() << std::endl;
           continue;
         }
         catch (...)
         {
-          lock.lock();
-          --data.externalHandlerInflight;
-          data.externalHandlerDone.notify_all();
           std::cerr << "Logger: external handler threw a non-std exception" << std::endl;
           continue;
         }
-
-        // Re-lock for next iteration
-        lock.lock();
-        --data.externalHandlerInflight;
-        data.externalHandlerDone.notify_all();
       }
 
       // Process normal logging queue
@@ -1113,7 +1272,7 @@ public:
   static void logFormatted(Level level, const char *fmt, va_list args)
   {
     auto &data = getData();
-    if (level < data.minLevel)
+    if (level < data.minLevel.load(std::memory_order_relaxed))
     {
       return;
     }
