@@ -418,8 +418,9 @@ void s3d_connect_sync_fail_balance()
   CHECK(t->start().isOk());
   for (int i = 0; i < 20; ++i)
   {
-    // Port 1 with no listener -> ECONNREFUSED delivered via onClose; the connect
-    // parks briefly then releases. The point is activeConnects returns to 0.
+    // Port 1 with no listener -> connect fails (ECONNREFUSED on Linux, or a
+    // connect-timeout on hosts that black-hole the SYN e.g. WSL2); either way the
+    // connect parks briefly then releases. The point is activeConnects returns to 0.
     auto r = t->connectSync("127.0.0.1", 1, TlsMode::None, 200ms);
     CHECK(r.isErr());
   }
@@ -501,7 +502,8 @@ void s3e_connect_entry_fence_stress()
       [t, &launched]
       {
         launched = true;
-        // Fast ECONNREFUSED target (returns quickly); the worker holds an owning
+        // Connect fails quickly (ECONNREFUSED on Linux, or a short connect-timeout
+        // on hosts that black-hole the SYN e.g. WSL2); the worker holds an owning
         // ref so the object outlives the call — no UAF.
         auto r = t->connectSync("127.0.0.1", 1, TlsMode::None, 100ms);
         CHECK(r.isErr());

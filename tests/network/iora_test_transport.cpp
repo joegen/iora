@@ -1485,9 +1485,10 @@ TEST_CASE("connectSync ECONNREFUSED returns err, no global onClose", "[transport
   client->onConnect([&](SessionId, const TransportAddress &) { globalConnectCount++; });
   REQUIRE(client->start().isOk());
 
-  // Connect to a port with no listener — ECONNREFUSED
-  auto port = testnet::getFreePortTCP();
-  auto result = client->connectSync("127.0.0.1", port, TlsMode::None, 2000ms);
+  // Connect to a bound-but-not-listening port — deterministic ECONNREFUSED on
+  // both Linux and WSL2 (an unbound port black-holes the SYN on WSL2).
+  testnet::RefusingEndpoint refuser;
+  auto result = client->connectSync("127.0.0.1", refuser.port(), TlsMode::None, 2000ms);
   REQUIRE(result.isErr());
 
   // Flush the I/O queue: do a successful connectSync round-trip to ensure
@@ -1522,11 +1523,13 @@ TEST_CASE("connectSync ECONNREFUSED does not leak pending entry", "[transport][c
   auto client = Transport::tcp();
   REQUIRE(client->start().isOk());
 
-  // Multiple sequential connectSync failures should not leak state
-  auto port = testnet::getFreePortTCP();
+  // Multiple sequential connectSync failures should not leak state. A
+  // bound-but-not-listening port refuses deterministically on both Linux and
+  // WSL2 (an unbound port black-holes the SYN on WSL2).
+  testnet::RefusingEndpoint refuser;
   for (int i = 0; i < 10; ++i)
   {
-    auto result = client->connectSync("127.0.0.1", port, TlsMode::None, 500ms);
+    auto result = client->connectSync("127.0.0.1", refuser.port(), TlsMode::None, 500ms);
     REQUIRE(result.isErr());
   }
 

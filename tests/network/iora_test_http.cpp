@@ -8,6 +8,8 @@
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
 
+#include "iora_test_net_utils.hpp"
+
 using namespace iora::test;
 
 TEST_CASE("HttpClient and WebhookServer integration tests")
@@ -292,7 +294,10 @@ TEST_CASE("HTTP Client BSD Socket Timeout Tests", "[http][timeout][bsd]")
 
   SECTION("Test 3: Connection refused - bogus port")
   {
-    uint16_t bogusPort = 49999; // Unlikely to be in use
+    // Bound-but-not-listening port -> deterministic ECONNREFUSED on both Linux
+    // and WSL2 (an unbound port black-holes the SYN on WSL2). Held open for the
+    // section's lifetime.
+    testnet::RefusingEndpoint refuser;
     HttpClient client;
 
     auto startTime = std::chrono::steady_clock::now();
@@ -300,7 +305,8 @@ TEST_CASE("HTTP Client BSD Socket Timeout Tests", "[http][timeout][bsd]")
 
     try
     {
-      auto response = client.get("http://127.0.0.1:" + std::to_string(bogusPort) + "/test");
+      auto response =
+        client.get("http://127.0.0.1:" + std::to_string(refuser.port()) + "/test");
       FAIL("Should have been refused");
     }
     catch (const std::exception &e)
@@ -308,16 +314,14 @@ TEST_CASE("HTTP Client BSD Socket Timeout Tests", "[http][timeout][bsd]")
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startTime);
 
-      // Should fail immediately (within 500ms for local connection)
+      // Refusal is now deterministic, so the prompt-failure bound is meaningful.
       REQUIRE(elapsed.count() < 500);
 
       std::string error = e.what();
-      // Check that it's a connection refused error
+      // Must be a genuine connection error (refused), not a timeout description.
       bool isRefused = (error.find("refused") != std::string::npos) ||
                        (error.find("Connection") != std::string::npos) ||
-                       (error.find("Failed") != std::string::npos) ||
-                       (error.find("taking too long") != std::string::npos) ||
-                       (error.find("fail immediately") != std::string::npos);
+                       (error.find("Failed") != std::string::npos);
       REQUIRE(isRefused);
       refused = true;
     }
@@ -559,7 +563,10 @@ TEST_CASE("HTTPS Client BSD Socket Timeout Tests with TLS", "[https][timeout][bs
 
   SECTION("TLS Test 3: Connection refused - bogus TLS port")
   {
-    uint16_t bogusPort = 19998; // Unlikely to be in use
+    // Bound-but-not-listening port -> deterministic ECONNREFUSED at the TCP layer
+    // (before any TLS handshake) on both Linux and WSL2. Held open for the
+    // section's lifetime.
+    testnet::RefusingEndpoint refuser;
     HttpClient client;
 
     // Configure TLS
@@ -572,7 +579,8 @@ TEST_CASE("HTTPS Client BSD Socket Timeout Tests with TLS", "[https][timeout][bs
 
     try
     {
-      auto response = client.get("https://127.0.0.1:" + std::to_string(bogusPort) + "/test");
+      auto response =
+        client.get("https://127.0.0.1:" + std::to_string(refuser.port()) + "/test");
       FAIL("Should have been refused");
     }
     catch (const std::exception &e)
@@ -580,14 +588,14 @@ TEST_CASE("HTTPS Client BSD Socket Timeout Tests with TLS", "[https][timeout][bs
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - startTime);
 
-      // Should fail immediately (within 500ms for local connection)
+      // Refusal is now deterministic, so the prompt-failure bound is meaningful.
       REQUIRE(elapsed.count() < 500);
 
       std::string error = e.what();
+      // Must be a genuine connection error (refused), not a timeout description.
       bool isRefused = (error.find("refused") != std::string::npos) ||
                        (error.find("Connection") != std::string::npos) ||
-                       (error.find("Failed") != std::string::npos) ||
-                       (error.find("fail immediately") != std::string::npos);
+                       (error.find("Failed") != std::string::npos);
       REQUIRE(isRefused);
       refused = true;
     }

@@ -280,8 +280,11 @@ TEST_CASE("TCP failed connection handling", "[tcp][error]")
   TcpFixture f;
   REQUIRE(f.tx.start().isOk());
 
-  // Try to connect to non-existent server
-  auto cr = f.tx.connect("127.0.0.1", 12345, TlsMode::None);
+  // Connect to a bound-but-not-listening port: the kernel RSTs it -> ECONNREFUSED
+  // deterministically on both standard Linux and WSL2 (a truly-unbound port
+  // black-holes the SYN on WSL2). Held open for the whole test scope.
+  testnet::RefusingEndpoint refuser;
+  auto cr = f.tx.connect("127.0.0.1", refuser.port(), TlsMode::None);
   REQUIRE(cr.isOk());
 
   // Connect failures now come through onClose, not onConnect

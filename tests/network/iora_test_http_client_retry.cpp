@@ -19,6 +19,7 @@
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
 
+#include "iora_test_net_utils.hpp"
 #include <iora/network/http_client.hpp>
 
 #include <arpa/inet.h>
@@ -433,10 +434,12 @@ TEST_CASE("connect-fail POST is retried; the retry adds one backoff (provably un
   };
 
   // Measure the retried case first (absorbs cold-start connect cost), then the
-  // single-attempt case. Both ports have no listener -> connect refused ->
-  // HttpRequestNotSentError -> retried even for POST.
-  auto withRetry = measure(/*retries=*/1, 19111);
-  auto noRetry = measure(/*retries=*/0, 19112);
+  // single-attempt case. A bound-but-not-listening port refuses deterministically
+  // on both Linux and WSL2 (an unbound port black-holes the SYN on WSL2) ->
+  // connect refused -> HttpRequestNotSentError -> retried even for POST.
+  testnet::RefusingEndpoint refuser;
+  auto withRetry = measure(/*retries=*/1, refuser.port());
+  auto noRetry = measure(/*retries=*/0, refuser.port());
 
   // A retry definitely slept one backoff window.
   CHECK(withRetry >= 90);

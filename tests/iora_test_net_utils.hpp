@@ -98,6 +98,58 @@ inline std::uint16_t getFreePortUDP(std::uint16_t minPort = 0, std::uint16_t max
   return port;
 }
 
+/// \brief A TCP endpoint that is BOUND but NOT listening: a connect() to it gets
+/// an immediate RST -> ECONNREFUSED, deterministically, on both standard Linux
+/// AND WSL2. A truly-unbound loopback port instead black-holes the SYN in some
+/// sandboxes (WSL2 mirrored networking swallows the RST), so connect() sits in
+/// SYN-retry and only fails via a long connect-timeout — which is what made the
+/// dead-port "connection refused" tests environment-dependent. Binding (but not
+/// listening) makes the REFUSED outcome deterministic across platforms.
+/// RAII: the socket is held open for the endpoint's lifetime and closed on dtor,
+/// so declare the object at a scope that outlives the connect and its wait.
+/// Non-copyable AND non-movable: the trivial int fd must have exactly one owner
+/// (a move would leave both objects closing the same fd -> double-close).
+class RefusingEndpoint
+{
+public:
+  RefusingEndpoint()
+  {
+    _fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(_fd >= 0);
+    int reuse = 1;
+    ::setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    REQUIRE(::bind(_fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) == 0);
+    socklen_t len = sizeof(sa);
+    REQUIRE(::getsockname(_fd, reinterpret_cast<sockaddr *>(&sa), &len) == 0);
+    _port = ntohs(sa.sin_port);
+    // Intentionally NO listen() — the kernel RSTs connects to a bound-not-listening
+    // port, yielding ECONNREFUSED rather than a black-holed timeout.
+  }
+
+  ~RefusingEndpoint()
+  {
+    if (_fd >= 0)
+    {
+      ::close(_fd);
+    }
+  }
+
+  RefusingEndpoint(const RefusingEndpoint &) = delete;
+  RefusingEndpoint &operator=(const RefusingEndpoint &) = delete;
+  RefusingEndpoint(RefusingEndpoint &&) = delete;
+  RefusingEndpoint &operator=(RefusingEndpoint &&) = delete;
+
+  std::uint16_t port() const { return _port; }
+
+private:
+  int _fd{-1};
+  std::uint16_t _port{0};
+};
+
 } // namespace testnet
 
 // RAII helper for epoll fd
