@@ -650,12 +650,20 @@ public:
   struct LoggerData
   {
     /// LOCK DISCIPLINE (single source of truth for this class):
-    ///  - `mutex` is the ONLY mutex in the logger, and it is a LEAF: no other lock
-    ///    is ever acquired while it is held. (Callers may and do hold their own
-    ///    locks across a log call — that is safe precisely BECAUSE it is a leaf.
-    ///    The converse statement, that `mutex` is never taken while another lock is
-    ///    held, is neither true nor enforceable.) Keep it a leaf if a second lock
-    ///    is ever added.
+    ///  - `mutex` is the ONLY mutex in the logger and the LOWEST logger-owned lock:
+    ///    the only locks acquired beneath it are the stream/stdio locks of the sink
+    ///    (see the sink-I/O bullet below). Keep it lowest if a second lock is ever
+    ///    added. The converse statement, that `mutex` is never taken while another
+    ///    lock is held, is neither true nor enforceable.
+    ///    CAVEAT — this does NOT make "log while holding your own lock"
+    ///    unconditionally safe. It is safe with respect to `mutex`, but in SYNC mode
+    ///    logDispatch invokes the external handler ON THE CALLER'S STACK with the
+    ///    caller's lock still held, creating a lock-order edge callerLock ->
+    ///    (every lock the handler takes) that this class cannot see. A handler that
+    ///    acquires the very lock the logging call site holds self-deadlocks on it;
+    ///    cross-thread, the ABBA against another site that takes them in the other
+    ///    order is equally reachable. Copy-then-invoke closes the LIBRARY's lock,
+    ///    not the CALLER's. Do not log under a lock the handler may also acquire.
     ///  - `workerThread` is assigned under `mutex` by init(), so shutdown() and
     ///    ~LoggerData MOVE it out under the lock and join the local copy — reading
     ///    or joining the member unlocked races init() and can double-join.
@@ -670,9 +678,20 @@ public:
     ///    across the DESTRUCTION of a user callback: clear/setExternalHandler and
     ///    both teardown paths move the doomed std::function into a caller-owned
     ///    local destroyed after unlocking, and the dispatch sites destroy their
-    ///    in-flight copy inside the unlocked window via HandlerCopyDropper. (The
-    ///    remaining under-lock user code is the COPY itself — tracked in backlog
-    ///    2026-07-22-3, whose fix makes it a refcount bump.)
+    ///    in-flight copy inside the unlocked window via HandlerCopyDropper. A catch
+    ///    site inside a locked scope either routes through reportAndReleaseUnlocked
+    ///    or stashes into an exception_ptr declared ABOVE the lock (flush(),
+    ///    teardownAndReapWorker) — ex.what() and the destruction of a caught
+    ///    exception object are user code too.
+    ///    STILL under-lock user code, and NOT a complete close-out on its own:
+    ///      (a) the handler COPY (dispatch sites), the tear-out SWAP
+    ///          (tearOutGateAndDrainInflightLocked) and the handler INSTALL
+    ///          (setExternalHandler's move-assign) — backlog 2026-07-22-3 reduces
+    ///          these to a refcount bump;
+    ///      (b) sink and diagnostic I/O through a user streambuf on cout/cerr —
+    ///          see the sink-I/O bullet above; OUTSIDE that backlog's scope.
+    ///    Do not restate a narrower claim here; docs/iora/logger_external_handlers.md
+    ///    enumerates every site.
     ///  - `externalHandlerInflight` and `externalHandlerFrozen` are mutated AND read
     ///    only under it.
     ///  - `cv` has exactly ONE waiter (the worker), so notify_one is correct.
@@ -1000,6 +1019,17 @@ private:
       }
     }
 
+    // Declared BEFORE the lock, exactly as flush() does, so they are destroyed
+    // AFTER it: an exception_ptr holding a USER exception object must never be
+    // released with data.mutex held. Reporting happens after the locked scope
+    // closes, so the block below is ONE uninterrupted critical section — an
+    // earlier version reported inline via reportAndReleaseUnlocked, whose
+    // unlock/relock silently invalidated the "worker is reaped" conclusion that
+    // waitForWorkerExitLocked establishes at the top of it (a racing init() could
+    // spawn a new worker in that window, and ~LoggerData would then destroy this
+    // object under a live worker).
+    std::exception_ptr sinkError;
+    std::exception_ptr flushError;
     {
       std::unique_lock<std::mutex> lock(data.mutex);
       // A worker we could not join (detached here, or by an earlier self-teardown)
@@ -1018,24 +1048,19 @@ private:
       // the two teardown paths were merged, shutdown() guarded this and
       // ~LoggerData relied on its own catch(...) — keeping the guard HERE keeps the
       // two paths identical, which is the point of sharing the implementation.
+      // Stash, then report+release with the lock RELEASED. Handling the catch
+      // INLINE here would run ex.what() and the USER exception object's destructor
+      // under data.mutex — the hazard reportAndReleaseUnlocked exists to remove on
+      // the worker path, and that flush() avoids by declaring its exception_ptr
+      // above the lock. A user streambuf on cout can throw here, so this path is
+      // reachable; a what() or exception destructor that logs would self-deadlock.
       try
       {
         drainNormalQueueLocked(data);
       }
-      catch (const std::exception &ex)
-      {
-        if (report)
-        {
-          std::cerr << "Logger: sink threw during the teardown drain: " << ex.what() << std::endl;
-        }
-      }
       catch (...)
       {
-        if (report)
-        {
-          std::cerr << "Logger: sink threw a non-std exception during the teardown drain"
-                    << std::endl;
-        }
+        sinkError = std::current_exception();
       }
       // Runs even when the drain threw, so buffered output still reaches the sink.
       try
@@ -1044,8 +1069,14 @@ private:
       }
       catch (...)
       {
+        flushError = std::current_exception();
       }
     }
+    // Lock released. Report and release the USER exception objects here: noexcept,
+    // so this cannot escape ~LoggerData or shutdown() (both run from destructors,
+    // atexit and noexcept teardown, where an escape is std::terminate).
+    reportAndReleaseNoLock(sinkError, "sink threw during the teardown drain", report);
+    reportAndReleaseNoLock(flushError, "sink threw during the teardown flush", report);
   }
 
   /// \brief Report a caught exception and release it with `lock` RELEASED.
@@ -1055,24 +1086,52 @@ private:
   /// that user code under the non-recursive mutex — the same hazard already fixed
   /// for the handler itself (invocation, copy and destruction). An exception whose
   /// destructor or what() logs would otherwise self-deadlock here.
+  /// A catch site inside a locked scope must EITHER route through here OR apply the
+  /// equivalent structural rule — declare the exception_ptr ABOVE the unique_lock
+  /// and report/release after the scope closes, as flush() and teardownAndReapWorker
+  /// do. What is never acceptable is handling it inline under the lock.
+  /// `report=false` (static destruction) still needs the unlock, because releasing
+  /// the last exception_ptr reference destroys the USER exception object; only the
+  /// diagnostic is suppressed.
+  /// Core of the above, holding NO lock. `noexcept` is load-bearing, not decorative:
+  /// both runWorker call sites invoke the reporter OUTSIDE the try/catch that keeps
+  /// exceptions off the worker std::thread, so a throwing reporter would escape
+  /// runWorker and std::terminate — defeating the very guard that wraps the drain.
+  /// `ex.what()` is user virtual code and a stream with an exceptions mask rethrows,
+  /// so the report genuinely can throw. Swallowing keeps the release+return
+  /// unconditional. No-op on a null `err`, so callers need not pre-check.
+  static void reportAndReleaseNoLock(std::exception_ptr &err, const char *context,
+                                     bool report) noexcept
+  {
+    if (!err)
+    {
+      return;
+    }
+    if (report)
+    {
+      try
+      {
+        std::rethrow_exception(err);
+      }
+      catch (const std::exception &ex)
+      {
+        std::cerr << "Logger: " << context << ": " << ex.what() << std::endl;
+      }
+      catch (...)
+      {
+        std::cerr << "Logger: " << context << " (non-std exception)" << std::endl;
+      }
+    }
+    err = nullptr; // release the last reference to the USER object, unlocked
+  }
+
   static void reportAndReleaseUnlocked(std::unique_lock<std::mutex> &lock,
-                                       std::exception_ptr &err, const char *context)
+                                       std::exception_ptr &err, const char *context,
+                                       bool report = true)
   {
     lock.unlock();
-    try
-    {
-      std::rethrow_exception(err);
-    }
-    catch (const std::exception &ex)
-    {
-      std::cerr << "Logger: " << context << ": " << ex.what() << std::endl;
-    }
-    catch (...)
-    {
-      std::cerr << "Logger: " << context << " (non-std exception)" << std::endl;
-    }
-    err = nullptr; // release the last reference to the user object, still unlocked
-    lock.lock();
+    reportAndReleaseNoLock(err, context, report);
+    lock.lock(); // only throw site left is a terminal std::system_error
   }
 
   /// \brief Wait for the worker identified by `workerId` to publish its exit.
@@ -1096,11 +1155,17 @@ private:
   /// Given `lock` HELD on `data.mutex`. The removed handler is MOVED into `doomed`
   /// (rather than destroyed here) because destroying a std::function runs arbitrary
   /// user capture destructors — the caller owns `doomed` and destroys it with the
-  /// mutex released. Nulling the gate here, not at the call site, is what makes
-  /// `externalHandlerInflight` monotone non-increasing during the wait (no NEW
-  /// invocation can start: runWorker/flush()/log() all gate on useExternalHandler
-  /// under the lock), so that precondition is code-enforced, not a caller
-  /// obligation.
+  /// mutex released. Nulling the gate here, not at the call site, is what prevents
+  /// any new invocation OF THE TORN-OUT HANDLER from starting (runWorker/flush()/
+  /// log() all gate on useExternalHandler under the lock), so that precondition is
+  /// code-enforced, not a caller obligation. The depth-0 predicate inflight == 0 is
+  /// therefore a global quiescent point and is UAF-safe.
+  /// It does NOT make `externalHandlerInflight` monotone non-increasing during the
+  /// wait: the wait releases the mutex, so a racing setExternalHandler can re-arm
+  /// the gate and invocations of the NEW handler can raise inflight again. That is
+  /// the drain-STARVATION limitation (accepted; see the tracker's
+  /// accepted_limitations), not a safety hole — the safety argument rests on what
+  /// observing the predicate means, never on monotonicity.
   ///
   /// Deadlock-free AND use-after-free-free under concurrent self-tear-out
   /// (tracker 2026-07-21-3, Option 2 frozen-inflight accounting):
