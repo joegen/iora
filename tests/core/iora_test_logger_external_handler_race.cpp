@@ -9,8 +9,11 @@
 // invocation (runWorker + concurrent flush()) before returning, so a handler that
 // captures [this]/[obj] cannot have its captured object destroyed mid-invocation
 // (use-after-free). Idempotent of the worker-vs-flush count (can exceed 1); a
-// worker self-call waits inflight==1 (drains OTHERS, not itself); a throwing
-// handler is swallowed on the worker (no std::terminate) and rethrown by flush().
+// self-tearing invocation waits the LIVE predicate inflight==externalHandlerFrozen
+// (drains every NON-frozen invocation, not its own pinned frames, and not peers
+// equally parked in a tear-out — tracker 2026-07-21-3), while an external (depth-0)
+// caller waits a genuine full drain inflight==0; a throwing handler is swallowed on
+// the worker (no std::terminate) and rethrown by flush().
 //
 // FORCED RENDEZVOUS: every race test blocks the handler on a gate and drives the
 // tear-out only after the handler has provably entered its window — never a timing
@@ -21,6 +24,7 @@
 
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
+#include "logger_race_harness.hpp"
 #include <catch2/catch.hpp>
 
 #include <iora/core/logger.hpp>
@@ -34,76 +38,42 @@
 #include <thread>
 
 using iora::core::Logger;
+using iora::test::CaptureTarget;
+using iora::test::RaceCtl;
+using iora::test::CounterPtr;
+using iora::test::CtlPtr;
+using iora::test::FlagPtr;
+using iora::test::makeCounter;
+using iora::test::makeCtl;
+using iora::test::makeFlag;
+using iora::test::makeTarget;
+using iora::test::TargetPtr;
 using namespace std::chrono_literals;
 
 namespace
 {
 
-// Object captured by reference in a handler; destroying it during an in-flight
-// handler call is the use-after-free under test. Heap-allocated so the test can
-// free it precisely after the tear-out returns.
-struct CaptureTarget
-{
-  std::atomic<int> touches{0};
-  std::atomic<int> canary{0x5A5A};
-  void touch() { touches.fetch_add(1); }
-};
+// CaptureTarget, RaceCtl and blockingHandlerBody now come from
+// logger_race_harness.hpp (shared with iora_test_logger_self_clear_deadlock.cpp).
+// blockingHandlerBody does touch/enter/wait-gate/touch/EXIT — callers must NOT
+// signal onExit() again (double-counting `exited` silently weakens every
+// `exitedCount() >= N` drain discriminator). A case that must record state
+// between the gate and the exit inlines the body instead — see T9(b).
+//
+// LIFETIME (same rule as the sibling deadlock suite): every object a parked
+// handler touches is heap-owned and captured BY VALUE, so a test frame unwound by
+// a failing assertion cannot leave a handler dereferencing a destroyed stack
+// object. Assertions taken while a std::thread is live are CHECK, never REQUIRE —
+// a throw would destroy a joinable thread and call std::terminate, erasing the
+// very failure being reported.
 
-// Rendezvous controller shared between the test thread and handler invocations.
-// Lives for the whole test (NOT the UAF target).
-struct RaceCtl
+// The blocking handler used by most cases: park in the window, then signal exit.
+Logger::ExternalHandler makeBlockingHandler(CtlPtr c, TargetPtr t)
 {
-  std::mutex m;
-  std::condition_variable cv;
-  int entered = 0;   // # handler invocations that reached their window
-  int exited = 0;    // # handler invocations that completed
-  bool released = false;
-
-  void onEnter()
+  return [c, t](Logger::Level, const std::string &, const std::string &)
   {
-    std::lock_guard<std::mutex> l(m);
-    ++entered;
-    cv.notify_all();
-  }
-  void onExit()
-  {
-    std::lock_guard<std::mutex> l(m);
-    ++exited;
-    cv.notify_all();
-  }
-  bool waitEntered(int n, std::chrono::milliseconds to = 5s)
-  {
-    std::unique_lock<std::mutex> l(m);
-    return cv.wait_for(l, to, [&] { return entered >= n; });
-  }
-  void releaseAll()
-  {
-    std::lock_guard<std::mutex> l(m);
-    released = true;
-    cv.notify_all();
-  }
-  void waitReleased()
-  {
-    std::unique_lock<std::mutex> l(m);
-    cv.wait(l, [&] { return released; });
-  }
-  int exitedCount()
-  {
-    std::lock_guard<std::mutex> l(m);
-    return exited;
-  }
-};
-
-// A blocking handler body: touch the captured target, signal entered, wait for
-// the gate, touch again (the post-gate access that must complete before any
-// tear-out returns), then signal exit.
-void blockingHandlerBody(CaptureTarget *t, RaceCtl *c)
-{
-  t->touch();
-  c->onEnter();
-  c->waitReleased();
-  t->touch(); // post-gate access — UAF if the target is freed before the drain
-  c->onExit();
+    iora::test::blockingHandlerBody(*c, t.get());
+  };
 }
 
 } // namespace
@@ -127,15 +97,15 @@ TEST_CASE("clearExternalHandler with no in-flight returns immediately",
 TEST_CASE("sync-mode external handler still works and clears", "[logger_race][sync]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/false);
-  std::atomic<int> calls{0};
+  auto calls = iora::test::makeCounter();
   Logger::setExternalHandler(
-    [&](Logger::Level, const std::string &, const std::string &) { calls.fetch_add(1); });
+    [calls](Logger::Level, const std::string &, const std::string &) { calls->fetch_add(1); });
   Logger::info("a");
   Logger::info("b");
-  CHECK(calls.load() == 2);
+  CHECK(calls->load() == 2);
   Logger::clearExternalHandler();
   Logger::info("c"); // no handler now
-  CHECK(calls.load() == 2);
+  CHECK(calls->load() == 2);
   Logger::shutdown();
 }
 
@@ -145,35 +115,43 @@ TEST_CASE("clearExternalHandler drains an in-flight worker invocation (no UAF)",
           "[logger_race][worker]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = std::make_unique<CaptureTarget>();
-  RaceCtl ctl;
+  auto target = makeTarget();
+  auto ctl = makeCtl();
 
-  Logger::setExternalHandler([t = target.get(), c = &ctl](Logger::Level, const std::string &,
-                                                          const std::string &)
-                             { blockingHandlerBody(t, c); });
+  Logger::setExternalHandler(makeBlockingHandler(ctl, target));
 
   Logger::info("trigger"); // worker picks it up and enters the handler window
-  REQUIRE(ctl.waitEntered(1));
+  REQUIRE(ctl->waitEntered(1));
 
-  std::atomic<bool> handlerDoneAtClearReturn{false};
+  auto handlerDoneAtClearReturn = iora::test::makeFlag(); // by-value: may be DETACHED
   std::thread clearThread(
-    [&]
+    [handlerDoneAtClearReturn, ctl]
     {
-      Logger::clearExternalHandler();            // must block until the handler exits
-      handlerDoneAtClearReturn.store(ctl.exitedCount() >= 1);
+      Logger::clearExternalHandler(); // must block until the handler exits
+      handlerDoneAtClearReturn->store(ctl->exitedCount() >= 1);
     });
 
   std::this_thread::sleep_for(50ms); // clear should still be blocked (handler gated)
-  ctl.releaseAll();                  // let the handler finish its post-gate access
-  clearThread.join();
+  ctl->releaseAll();                 // let the handler finish its post-gate access
+  // Bounded: a drain regression must FAIL here, not hang the suite on join().
+  const bool drained = ctl->waitExited(1);
+  CHECK(drained);
+  iora::test::joinOrDetach(drained, {&clearThread});
+  if (!drained)
+  {
+    return;
+  }
 
   // The drain guarantee: clearExternalHandler returned only AFTER the handler
   // completed its post-gate access (without the fix this is false).
-  CHECK(handlerDoneAtClearReturn.load());
+  CHECK(handlerDoneAtClearReturn->load());
   CHECK(target->touches.load() == 2);
   CHECK(target->canary.load() == 0x5A5A);
 
-  target.reset(); // safe: no invocation is in flight
+  // The tear-out destroyed the handler and every in-flight copy, so the test now
+  // holds the only reference — the captured object is provably free to destroy.
+  CHECK(target.use_count() == 1);
+  target.reset();
   Logger::shutdown();
 }
 
@@ -182,31 +160,36 @@ TEST_CASE("setExternalHandler replace drains the previous in-flight invocation",
           "[logger_race][replace]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = std::make_unique<CaptureTarget>();
-  RaceCtl ctl;
+  auto target = makeTarget();
+  auto ctl = makeCtl();
 
-  Logger::setExternalHandler([t = target.get(), c = &ctl](Logger::Level, const std::string &,
-                                                          const std::string &)
-                             { blockingHandlerBody(t, c); });
+  Logger::setExternalHandler(makeBlockingHandler(ctl, target));
 
   Logger::info("trigger");
-  REQUIRE(ctl.waitEntered(1));
+  REQUIRE(ctl->waitEntered(1));
 
-  std::atomic<bool> handlerDoneAtSetReturn{false};
+  auto handlerDoneAtSetReturn = iora::test::makeFlag();
   std::thread setThread(
-    [&]
+    [handlerDoneAtSetReturn, ctl]
     {
       Logger::setExternalHandler(
         [](Logger::Level, const std::string &, const std::string &) {}); // handler B
-      handlerDoneAtSetReturn.store(ctl.exitedCount() >= 1);
+      handlerDoneAtSetReturn->store(ctl->exitedCount() >= 1);
     });
 
   std::this_thread::sleep_for(50ms);
-  ctl.releaseAll();
-  setThread.join();
+  ctl->releaseAll();
+  const bool drained = ctl->waitExited(1);
+  CHECK(drained);
+  iora::test::joinOrDetach(drained, {&setThread});
+  if (!drained)
+  {
+    return;
+  }
 
-  CHECK(handlerDoneAtSetReturn.load()); // replace waited for handler A to finish
-  target.reset();                       // safe: handler A fully drained
+  CHECK(handlerDoneAtSetReturn->load()); // replace waited for handler A to finish
+  CHECK(target.use_count() == 1); // handler A and its in-flight copies are gone
+  target.reset();
   Logger::shutdown();
 }
 
@@ -218,35 +201,48 @@ TEST_CASE("clear waits for BOTH a worker and a concurrent flush invocation (coun
           "[logger_race][concurrent][t3]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = std::make_unique<CaptureTarget>();
-  RaceCtl ctl;
+  auto target = makeTarget();
+  auto ctl = makeCtl();
 
-  Logger::setExternalHandler([t = target.get(), c = &ctl](Logger::Level, const std::string &,
-                                                          const std::string &)
-                             { blockingHandlerBody(t, c); });
+  Logger::setExternalHandler(makeBlockingHandler(ctl, target));
 
   Logger::info("1"); // worker enters handler #1 and blocks
-  REQUIRE(ctl.waitEntered(1));
+  REQUIRE(ctl->waitEntered(1));
 
   Logger::info("2");                                       // queued; worker is busy
-  std::thread flushThread([] { Logger::flush(); });        // flush drains "2" -> handler #2
-  REQUIRE(ctl.waitEntered(2));                             // inflight == 2 now
+  std::thread flushThread([] { Logger::flush(); }); // flush drains "2" -> handler #2
+  // CHECK + bail while a thread is live: a REQUIRE throw would destroy a joinable
+  // std::thread and call std::terminate, erasing the failure report.
+  const bool bothIn = ctl->waitEntered(2); // inflight == 2 now
+  CHECK(bothIn);
+  if (!bothIn)
+  {
+    ctl->releaseAll();
+    flushThread.detach();
+    return;
+  }
 
-  std::atomic<bool> bothDoneAtClearReturn{false};
+  auto bothDoneAtClearReturn = iora::test::makeFlag();
   std::thread clearThread(
-    [&]
+    [bothDoneAtClearReturn, ctl]
     {
-      Logger::clearExternalHandler();                      // waits inflight == 0
-      bothDoneAtClearReturn.store(ctl.exitedCount() >= 2);
+      Logger::clearExternalHandler(); // waits inflight == 0
+      bothDoneAtClearReturn->store(ctl->exitedCount() >= 2);
     });
 
   std::this_thread::sleep_for(50ms);
-  ctl.releaseAll();
-  flushThread.join();
-  clearThread.join();
+  ctl->releaseAll();
+  const bool bothDrained = ctl->waitExited(2);
+  CHECK(bothDrained);
+  iora::test::joinOrDetach(bothDrained, {&flushThread, &clearThread});
+  if (!bothDrained)
+  {
+    return;
+  }
 
-  CHECK(bothDoneAtClearReturn.load());        // clear drained BOTH invocations
+  CHECK(bothDoneAtClearReturn->load());        // clear drained BOTH invocations
   CHECK(target->touches.load() == 4);         // 2 invocations x 2 touches
+  CHECK(target.use_count() == 1); // no handler copy survives the tear-out
   target.reset();
   Logger::shutdown();
 }
@@ -256,38 +252,49 @@ TEST_CASE("clear waits for N>2 concurrent invocations (worker + 2 flushes)",
           "[logger_race][concurrent][n3]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = std::make_unique<CaptureTarget>();
-  RaceCtl ctl;
+  auto target = makeTarget();
+  auto ctl = makeCtl();
 
-  Logger::setExternalHandler([t = target.get(), c = &ctl](Logger::Level, const std::string &,
-                                                          const std::string &)
-                             { blockingHandlerBody(t, c); });
+  Logger::setExternalHandler(makeBlockingHandler(ctl, target));
 
   Logger::info("1"); // worker -> handler #1, blocks
-  REQUIRE(ctl.waitEntered(1));
+  REQUIRE(ctl->waitEntered(1));
 
   Logger::info("2");
   Logger::info("3");
   std::thread f1([] { Logger::flush(); }); // drains one of "2"/"3"
   std::thread f2([] { Logger::flush(); }); // drains the other
-  REQUIRE(ctl.waitEntered(3));             // inflight == 3
+  const bool allIn = ctl->waitEntered(3);  // inflight == 3
+  CHECK(allIn);
+  if (!allIn)
+  {
+    ctl->releaseAll();
+    f1.detach();
+    f2.detach();
+    return;
+  }
 
-  std::atomic<bool> allDoneAtClearReturn{false};
+  auto allDoneAtClearReturn = iora::test::makeFlag();
   std::thread clearThread(
-    [&]
+    [allDoneAtClearReturn, ctl]
     {
       Logger::clearExternalHandler();
-      allDoneAtClearReturn.store(ctl.exitedCount() >= 3);
+      allDoneAtClearReturn->store(ctl->exitedCount() >= 3);
     });
 
   std::this_thread::sleep_for(50ms);
-  ctl.releaseAll();
-  f1.join();
-  f2.join();
-  clearThread.join();
+  ctl->releaseAll();
+  const bool allDrained = ctl->waitExited(3);
+  CHECK(allDrained);
+  iora::test::joinOrDetach(allDrained, {&f1, &f2, &clearThread});
+  if (!allDrained)
+  {
+    return;
+  }
 
-  CHECK(allDoneAtClearReturn.load());
+  CHECK(allDoneAtClearReturn->load());
   CHECK(target->touches.load() == 6);
+  CHECK(target.use_count() == 1); // no handler copy survives the tear-out
   target.reset();
   Logger::shutdown();
 }
@@ -300,16 +307,16 @@ TEST_CASE("flush rethrows a throwing handler and does not strand the drain",
           "[logger_race][throw][flush]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = std::make_unique<CaptureTarget>();
-  RaceCtl ctl;
-  std::atomic<int> invocation{0};
+  auto target = makeTarget();
+  auto ctl = makeCtl();
 
+  auto invocationCount = makeCounter();
   Logger::setExternalHandler(
-    [&, t = target.get(), c = &ctl](Logger::Level, const std::string &, const std::string &)
+    [target, ctl, invocationCount](Logger::Level, const std::string &, const std::string &)
     {
-      if (invocation.fetch_add(1) == 0)
+      if (invocationCount->fetch_add(1) == 0)
       {
-        blockingHandlerBody(t, c); // worker: occupy and block
+        iora::test::blockingHandlerBody(*ctl, target.get()); // worker: occupy and block
       }
       else
       {
@@ -318,12 +325,12 @@ TEST_CASE("flush rethrows a throwing handler and does not strand the drain",
     });
 
   Logger::info("1"); // worker -> invocation 0, blocks
-  REQUIRE(ctl.waitEntered(1));
+  REQUIRE(ctl->waitEntered(1));
 
   Logger::info("2"); // queued; worker busy
-  std::atomic<bool> flushRethrew{false};
+  auto flushRethrew = iora::test::makeFlag();
   std::thread flushThread(
-    [&]
+    [flushRethrew]
     {
       try
       {
@@ -331,24 +338,36 @@ TEST_CASE("flush rethrows a throwing handler and does not strand the drain",
       }
       catch (const std::runtime_error &)
       {
-        flushRethrew.store(true);
+        flushRethrew->store(true);
       }
     });
-  flushThread.join();
-  CHECK(flushRethrew.load()); // flush() propagated the handler exception to its caller
+  // Bounded: a stranded drain must FAIL here, not hang the suite on join().
+  const bool flushReturned = iora::test::waitFor([flushRethrew] { return flushRethrew->load(); });
+  CHECK(flushReturned); // flush() propagated the handler exception to its caller
+  iora::test::joinOrDetach(flushReturned, {&flushThread});
+  if (!flushReturned)
+  {
+    return;
+  }
 
   // Release the worker, then a clearExternalHandler must NOT hang (the throwing
   // flush invocation restored the in-flight counter before rethrowing).
-  ctl.releaseAll();
-  std::atomic<bool> cleared{false};
+  ctl->releaseAll();
+  auto cleared = iora::test::makeFlag();
   std::thread clearThread(
-    [&]
+    [cleared]
     {
       Logger::clearExternalHandler();
-      cleared.store(true);
+      cleared->store(true);
     });
-  clearThread.join();
-  CHECK(cleared.load());
+  const bool clearReturned = iora::test::waitFor([cleared] { return cleared->load(); });
+  CHECK(clearReturned);
+  iora::test::joinOrDetach(clearReturned, {&clearThread});
+  if (!clearReturned)
+  {
+    return;
+  }
+  CHECK(target.use_count() == 1); // no handler copy survives the tear-out
   target.reset();
   Logger::shutdown();
 }
@@ -359,32 +378,38 @@ TEST_CASE("worker swallows a throwing handler and keeps running", "[logger_race]
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
 
-  std::atomic<int> throwingCalls{0};
+  auto throwingCalls = iora::test::makeCounter();
   Logger::setExternalHandler(
-    [&](Logger::Level, const std::string &, const std::string &)
+    [throwingCalls](Logger::Level, const std::string &, const std::string &)
     {
-      throwingCalls.fetch_add(1);
+      throwingCalls->fetch_add(1);
       throw std::runtime_error("boom-on-worker");
     });
 
   Logger::info("first");
   // Give the worker time to drain + throw + swallow.
-  for (int i = 0; i < 200 && throwingCalls.load() == 0; ++i)
+  const bool threw = iora::test::waitFor([throwingCalls] { return throwingCalls->load() > 0; },
+                                         400ms);
+  CHECK(threw); // worker invoked it and did NOT terminate
+  if (!threw)
   {
-    std::this_thread::sleep_for(2ms);
+    // A wedged worker must not fall through to the unbounded teardown drain below,
+    // or a bounded FAIL becomes a hung suite.
+    return;
   }
-  CHECK(throwingCalls.load() >= 1); // worker invoked it and did NOT terminate
 
   // The worker survived: install a non-throwing handler and confirm delivery.
-  std::atomic<int> okCalls{0};
+  auto okCalls = iora::test::makeCounter();
   Logger::setExternalHandler(
-    [&](Logger::Level, const std::string &, const std::string &) { okCalls.fetch_add(1); });
+    [okCalls](Logger::Level, const std::string &, const std::string &) { okCalls->fetch_add(1); });
   Logger::info("second");
-  for (int i = 0; i < 200 && okCalls.load() == 0; ++i)
+  const bool delivered = iora::test::waitFor([okCalls] { return okCalls->load() > 0; }, 400ms);
+  CHECK(delivered);
+  if (!delivered)
   {
-    std::this_thread::sleep_for(2ms);
+    return;
   }
-  CHECK(okCalls.load() >= 1);
+  CHECK(okCalls->load() >= 1);
 
   Logger::clearExternalHandler(); // must not hang (counter not stranded)
   Logger::shutdown();
@@ -396,7 +421,7 @@ TEST_CASE("handler self-calling clearExternalHandler does not deadlock (sole in-
           "[logger_race][selfcall]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  std::atomic<bool> selfClearReturned{false};
+  auto selfClearReturned = iora::test::makeFlag();
   std::atomic<int> calls{0};
 
   Logger::setExternalHandler(
@@ -407,70 +432,97 @@ TEST_CASE("handler self-calling clearExternalHandler does not deadlock (sole in-
         // Self-call on the worker thread: target == inflight (1, our own) ->
         // returns without deadlock.
         Logger::clearExternalHandler();
-        selfClearReturned.store(true);
+        selfClearReturned->store(true);
       }
     });
 
   Logger::info("trigger");
-  for (int i = 0; i < 500 && !selfClearReturned.load(); ++i)
+  const bool selfCleared = iora::test::waitFor([selfClearReturned]
+                                              { return selfClearReturned->load(); });
+  CHECK(selfCleared);
+  if (!selfCleared)
   {
-    std::this_thread::sleep_for(2ms);
+    return;
   }
-  CHECK(selfClearReturned.load());
+  CHECK(selfClearReturned->load());
   Logger::shutdown();
 }
 
 // ── T9(b): worker self-call WHILE a concurrent flush invocation is live must
-//    BLOCK until the flush invocation exits (corrected inflight==1 predicate).
-//    With an unconditional skip this returns early -> the assertion fails. ─────
+//    BLOCK until the flush invocation exits. The self-tearer waits the LIVE
+//    predicate inflight==externalHandlerFrozen; the flush invocation is NOT
+//    frozen (it never tears out), so it must be drained. With a skip-based fix
+//    the self-call returns early and the assertion fails. ──────────────────────
 TEST_CASE("worker self-call waits for a concurrent flush invocation to drain",
           "[logger_race][selfcall][concurrent]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = std::make_unique<CaptureTarget>();
-  RaceCtl ctl;
-  std::atomic<int> invocation{0};
-  std::atomic<bool> flushExitedAtSelfClear{false};
+  auto target = makeTarget();
+  // SEPARATE gates so the self-clearer can be committed to its wait BEFORE the
+  // flush invocation is allowed to exit. A single shared gate releases both at
+  // once, which lets `flushExitedAtSelfClear` read true by luck even under a
+  // skip-based (rejected) implementation — a non-discriminating test.
+  auto selfCtl = makeCtl();
+  auto flushCtl = makeCtl();
+  auto which = makeCounter();
+  auto flushExitedAtSelfClear = makeFlag();
 
   Logger::setExternalHandler(
-    [&, t = target.get(), c = &ctl](Logger::Level, const std::string &, const std::string &)
+    [target, selfCtl, flushCtl, which, flushExitedAtSelfClear](
+      Logger::Level, const std::string &, const std::string &)
     {
-      int which = invocation.fetch_add(1);
-      if (which == 0)
+      if (which->fetch_add(1) == 0)
       {
         // Worker invocation: enter, wait for the test to proceed, then self-clear.
-        t->touch();
-        c->onEnter();
-        c->waitReleased();
-        Logger::clearExternalHandler(); // self-call: must wait inflight==1 (flush drained)
-        flushExitedAtSelfClear.store(c->exitedCount() >= 1);
-        c->onExit();
+        target->touch();
+        selfCtl->onEnter();
+        if (selfCtl->waitReleased())
+        {
+          Logger::clearExternalHandler(); // must drain the non-frozen flush invocation
+          flushExitedAtSelfClear->store(flushCtl->exitedCount() >= 1);
+        }
+        selfCtl->onExit();
       }
       else
       {
-        // flush invocation: a plain blocking body.
-        blockingHandlerBody(t, c);
+        // flush invocation: a plain blocking body (never tears out -> not frozen).
+        iora::test::blockingHandlerBody(*flushCtl, target.get());
       }
     });
 
   Logger::info("1"); // worker -> invocation 0, enters, waits on release
-  REQUIRE(ctl.waitEntered(1));
+  REQUIRE(selfCtl->waitEntered(1));
 
   Logger::info("2");
   std::thread flushThread([] { Logger::flush(); }); // invocation 1 (flush), blocks
-  REQUIRE(ctl.waitEntered(2));                       // inflight == 2
-
-  // Let the worker proceed to its self-clear; it must block until the flush
-  // invocation exits. Release a moment later so the ordering is forced.
-  ctl.releaseAll();
-  flushThread.join();
-
-  // Drain: wait for the worker's self-clear to have completed.
-  for (int i = 0; i < 1000 && ctl.exitedCount() < 2; ++i)
+  const bool flushIn = flushCtl->waitEntered(1);    // inflight == 2
+  CHECK(flushIn);
+  if (!flushIn)
   {
-    std::this_thread::sleep_for(2ms);
+    selfCtl->releaseAll();
+    flushCtl->releaseAll();
+    flushThread.detach();
+    return;
   }
-  CHECK(flushExitedAtSelfClear.load()); // self-call observed the flush invocation drained
+
+  // Release the self-clearer FIRST and give it time to commit to its drain wait,
+  // then release the flush invocation: the self-clear must provably wait it out.
+  selfCtl->releaseAll();
+  std::this_thread::sleep_for(50ms);
+  flushCtl->releaseAll();
+
+  const bool flushDrained = flushCtl->waitExited(1);
+  const bool selfDrained = selfCtl->waitExited(1);
+  CHECK(flushDrained);
+  CHECK(selfDrained);
+  iora::test::joinOrDetach(flushDrained && selfDrained, {&flushThread});
+  if (!(flushDrained && selfDrained))
+  {
+    return;
+  }
+
+  CHECK(flushExitedAtSelfClear->load()); // self-call observed the flush invocation drained
+  CHECK(target.use_count() == 1); // no handler copy survives the tear-out
   target.reset();
   Logger::shutdown();
 }

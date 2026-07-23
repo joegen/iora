@@ -28,6 +28,30 @@ TEST_CASE("Dynamic loading of testplugin shared library")
   REQUIRE(std::filesystem::exists(pluginPathOpt));
   REQUIRE(svc.loadSingleModule(pluginPathOpt));
 
+  // Catch2 re-runs this whole body once per SECTION leaf, so the modules loaded
+  // above MUST be unloaded on every exit path — including a leaf abandoned by a
+  // failed REQUIRE or a throw. A trailing unloadAllModules() at the end of the
+  // body is skipped in exactly those cases, and the next leaf then dies at the
+  // load above with "Plugin already loaded", masking the original failure.
+  struct UnloadAllOnExit
+  {
+    iora::IoraService &svc;
+    ~UnloadAllOnExit()
+    {
+      // Destructors are implicitly noexcept. This one runs while a failed
+      // REQUIRE's exception is propagating, so letting unloadAllModules() throw
+      // here would call std::terminate and MASK the original failure — the exact
+      // outcome this guard exists to prevent.
+      try
+      {
+        svc.unloadAllModules();
+      }
+      catch (...)
+      {
+      }
+    }
+  } unloadAllOnExit{svc};
+
   SECTION("callExportedApi: add")
   {
     int sum = svc.callExportedApi<int, int, int>("testplugin.add", 2, 3);
@@ -353,9 +377,13 @@ TEST_CASE("Dynamic loading of testplugin shared library")
     // Safe API should be faster than callExportedApi (which does lookup each time)
     REQUIRE(safeNsPerCall < callNsPerCall);
 
+#ifdef NDEBUG
     // Performance should be reasonable - safe API overhead should be under 50ns per call
     // The percentage can be high if the base unsafe call is very fast (few nanoseconds)
+    // Absolute ns budgets are only meaningful in an optimized build; at -O0 the
+    // figure above is still printed, but not asserted against.
     REQUIRE(safeOverheadNs < 50.0); // Less than 50ns absolute overhead per call
+#endif
   }
 
   SECTION("Performance: Safe API cache invalidation cost")
@@ -398,12 +426,15 @@ TEST_CASE("Dynamic loading of testplugin shared library")
               << avgRefreshNs << " ns" << std::endl;
     std::cout << "This cost is only paid on first call after module reload" << std::endl;
 
-    // Cache refresh should complete within reasonable time (typically < 10μs)
+#ifdef NDEBUG
+    // Cache refresh should complete within reasonable time (typically < 10μs).
+    // Absolute ns budget: optimized builds only (see the benchmark section above).
     REQUIRE(avgRefreshNs < 50000.0); // Less than 50μs for cache refresh
+#endif
   }
 
-  // Clean up between sections by unloading modules instead of shutting down service
-  svc.unloadAllModules();
+  // Modules are unloaded by unloadAllOnExit (declared at the top of this body)
+  // so every SECTION leaf is cleaned up, including abandoned ones.
 }
 
 int main(int argc, char *argv[])

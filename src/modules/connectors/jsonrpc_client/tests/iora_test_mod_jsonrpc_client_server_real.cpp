@@ -808,11 +808,15 @@ TEST_CASE("HTTP Client Connection Timeout Test", "[integration][timeout]")
 
       // Verify the exception message indicates a timeout or connection failure
       std::string errorMsg = e.what();
+      // Narrow on purpose: a bare "failed" matches nearly every error this client
+      // can produce, which would make this assertion pass for an unrelated
+      // failure. Accept only the connect/timeout vocabulary of the path under
+      // test (e.g. "connectSync timed out", "Connection failed to <host>").
       bool isTimeoutError = (errorMsg.find("timeout") != std::string::npos) ||
-                            (errorMsg.find("connection") != std::string::npos) ||
-                            (errorMsg.find("connect") != std::string::npos) ||
-                            (errorMsg.find("failed") != std::string::npos) ||
-                            (errorMsg.find("callback") != std::string::npos);
+                            (errorMsg.find("timed out") != std::string::npos) ||
+                            (errorMsg.find("Connection failed") != std::string::npos) ||
+                            (errorMsg.find("connectSync") != std::string::npos);
+      INFO("unexpected error message: " << errorMsg);
       REQUIRE(isTimeoutError);
     }
   }
@@ -860,25 +864,11 @@ int main(int argc, char *argv[])
   auto &svc = createTestService();
   iora::IoraService::AutoServiceShutdown autoShutdown(svc);
 
-  // Resolve paths for plugins
-  std::string execPath = iora::util::getExecutablePath();
-  std::string modulesPath = iora::util::resolveRelativePath(execPath, "../../../../");
-  std::string clientPluginPath = modulesPath + "/connectors/jsonrpc_client/mod_jsonrpc_client.so";
-  std::string serverPluginPath = modulesPath + "/endpoints/jsonrpc_server/mod_jsonrpc_server.so";
-
-  std::cout << "Loading server plugin from: " << serverPluginPath << std::endl;
-  std::cout << "Loading client plugin from: " << clientPluginPath << std::endl;
-
-  assert(std::filesystem::exists(serverPluginPath));
-  assert(std::filesystem::exists(clientPluginPath));
-
-  // Load JSON-RPC server module
-  assert(svc.loadSingleModule(serverPluginPath));
-  std::cout << "✓ JSON-RPC server module loaded" << std::endl;
-
-  // Load JSON-RPC client module
-  assert(svc.loadSingleModule(clientPluginPath));
-  std::cout << "✓ JSON-RPC client module loaded" << std::endl;
+  // The modules are loaded by the first TEST_CASE (and stay loaded for the
+  // later ones). They are deliberately NOT loaded here: doing it from main()
+  // inside assert() made the load a side effect that -DNDEBUG compiles out, so
+  // Release never loaded them while Debug loaded them twice ("Plugin already
+  // loaded" at the TEST_CASE load site).
 
   return Catch::Session().run(argc, argv);
 }

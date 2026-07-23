@@ -142,11 +142,36 @@ struct TempTree
   }
   void writeStatic(const std::string &rel, const std::string &content)
   {
-    std::ofstream(root / "static" / rel, std::ios::trunc) << content;
+    writeAtomic(root / "static" / rel, content);
   }
   void writeTemplate(const std::string &rel, const std::string &content)
   {
-    std::ofstream(root / "templates" / rel, std::ios::trunc) << content;
+    writeAtomic(root / "templates" / rel, content);
+  }
+
+  // Write-then-rename, NOT an in-place ofstream(trunc): truncating in place
+  // leaves the file ZERO-LENGTH between the truncate and the flush, so a reader
+  // racing a rewrite reads an empty file and the server correctly serves
+  // 200 + Content-Length: 0. That is a harness artifact, not a server defect —
+  // it made the concurrent-reload test fail under CPU load (which widens the
+  // window). rename(2) within a directory is atomic: a reader sees either the
+  // old or the new content, never an empty intermediate.
+  static void writeAtomic(const std::filesystem::path &target, const std::string &content)
+  {
+    std::filesystem::path tmp = target;
+    tmp += ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::trunc | std::ios::binary);
+      out << content;
+      out.close(); // close BEFORE testing: a failure can surface only at close
+      // Fail loudly here: renaming a failed/partial write into place would surface
+      // later as a confusing content assertion instead of a harness error.
+      if (!out)
+      {
+        throw std::runtime_error("writeAtomic: failed writing " + tmp.string());
+      }
+    }
+    std::filesystem::rename(tmp, target);
   }
 };
 

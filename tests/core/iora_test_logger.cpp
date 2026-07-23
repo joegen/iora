@@ -5,6 +5,7 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 
 #define CATCH_CONFIG_MAIN
+#include "logger_race_harness.hpp"
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
 #include <regex>
@@ -715,27 +716,44 @@ TEST_CASE("Logger Handler May Clear Itself Without Hanging", "[logger][handler][
 {
   // Self-call detection (handler-reentry depth, replacing the former
   // workerThreadId scheme): a handler that tears itself out via
-  // clearExternalHandler from inside its own invocation must drain to inflight==1
-  // (its own) rather than 0, or it would wait forever on its own in-flight count.
+  // clearExternalHandler from inside its own invocation takes the self-tearer
+  // branch (wait inflight == externalHandlerFrozen) rather than the external full
+  // drain, or it would wait forever on its own pinned in-flight frame.
   // Exercised on both the sync path (handler runs on the calling thread) and the
   // async path (handler runs on the worker or the flushing thread).
-  // NOTE: this covers a SINGLE in-flight invocation. The case of TWO concurrent
-  // invocations of a self-clearing handler (worker + shutdown-flush) is a known
-  // pre-existing deadlock tracked in backlog 2026-07-21-3 (P0) — not exercised
-  // here on purpose (single message => single invocation).
+  // ORDERING IS LOAD-BEARING: the second message must be logged only AFTER the
+  // first invocation's self-clear has committed. Logging both up front is a race
+  // in async mode — shutdown()'s flush() can dispatch the second entry (gate
+  // checked, handler copied, inflight incremented) BEFORE the worker's first
+  // invocation clears the gate, giving TWO invocations. That is correct behavior
+  // by design (a tear-out drains committed invocations; it cannot un-dispatch
+  // one), so asserting calls==1 without ordering is a racy expectation, not a
+  // code defect. It is also exactly the two-concurrent-self-clearers shape that
+  // deadlocked before tracker 2026-07-21-3 — which this suite hit intermittently
+  // as a HANG. That shape is now covered deliberately, and bounded, by
+  // iora_test_logger_self_clear_deadlock.cpp; here we test the single-invocation
+  // self-clear deterministically.
   auto selfClearing = [](bool async)
   {
     std::atomic<int> calls{0};
+    std::atomic<bool> selfClearReturned{false};
     iora::core::Logger::init(iora::core::Logger::Level::Info, "", async);
     iora::core::Logger::setLogFormat("[%L] %m");
     iora::core::Logger::setExternalHandler(
-      [&calls](iora::core::Logger::Level, const std::string &, const std::string &)
+      [&calls, &selfClearReturned](iora::core::Logger::Level, const std::string &,
+                                   const std::string &)
       {
         ++calls;
         iora::core::Logger::clearExternalHandler(); // self-tear-out, must not hang
+        selfClearReturned.store(true);
       });
 
-    iora::core::Logger::info("first");  // invokes handler, which clears itself
+    iora::core::Logger::info("first"); // invokes handler, which clears itself
+    // Bounded: a false return means the self-clear hung (the P0 regressed) and
+    // fails the assertion below — never raised to mask a hang.
+    const bool cleared = iora::test::waitFor([&] { return selfClearReturned.load(); });
+    CHECK(cleared);
+
     iora::core::Logger::info("second"); // handler already cleared -> not invoked
     iora::core::Logger::shutdown();
     iora::core::Logger::clearExternalHandler(); // idempotent safety net
@@ -756,8 +774,9 @@ TEST_CASE("Logger Self-Logging Handler Does Not Recurse Unbounded",
   // gates on handlerReentryDepth()==0, routing a re-entrant handler-bound message
   // to the normal queue/console path, so the handler runs exactly once for one
   // outer message. Because all dispatch sites are gated, a handler cannot trigger
-  // a nested handler invocation (depth stays <= 1); `target = handlerReentryDepth()`
-  // remains the correct general drain form regardless.
+  // a nested handler invocation (depth stays <= 1), so the tear-out drain's
+  // self-tearer branch (wait inflight==externalHandlerFrozen) sees frozen as a
+  // plain count of parked self-tearers — tracker 2026-07-21-3.
   auto selfLogging = [](bool async)
   {
     std::atomic<int> calls{0};
@@ -836,44 +855,47 @@ TEST_CASE("Logger Clear External Handler With Async Backlog Does Not Orphan rawQ
   // reroutes the backlog to the normal queue and gates the predicate, so clear +
   // shutdown complete promptly and the removed handler does not receive the
   // backlog. A latch holds the first invocation so a backlog reliably accumulates.
-  std::mutex m;
-  std::condition_variable cv;
-  bool release = false;
-  std::atomic<int> handlerCalls{0};
+  // Shared harness, captured BY VALUE, with a BOUNDED park: this handler parks, so
+  // a by-reference capture of these frame locals would be a use-after-scope the
+  // moment an assertion below throws, and an unbounded park would wedge the worker
+  // and hang shutdown() and static destruction — turning a reported failure into a
+  // CI timeout. Same rule the other two logger suites already follow.
+  auto ctl = iora::test::makeCtl();
+  auto handlerCalls = iora::test::makeCounter();
 
   iora::core::Logger::init(iora::core::Logger::Level::Info, "", true); // async
   iora::core::Logger::setLogFormat("[%L] %m");
   iora::core::Logger::setExternalHandler(
-    [&](iora::core::Logger::Level, const std::string &, const std::string &)
+    [ctl, handlerCalls](iora::core::Logger::Level, const std::string &, const std::string &)
     {
-      if (++handlerCalls == 1)
+      if (handlerCalls->fetch_add(1) == 0)
       {
         // Block the first invocation so m2..m4 pile up in rawQueue behind it.
-        std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return release; });
+        ctl->waitReleased();
       }
     });
 
   iora::core::Logger::info("m1");
-  while (handlerCalls.load() == 0) // wait until the worker is inside the blocked handler
+  const bool entered = iora::test::waitFor([handlerCalls] { return handlerCalls->load() > 0; });
+  CHECK(entered);
+  if (!entered)
   {
-    std::this_thread::yield();
+    ctl->releaseAll(); // never leave the worker parked on a failure path
+    iora::core::Logger::clearExternalHandler();
+    iora::core::Logger::shutdown();
+    return;
   }
   iora::core::Logger::info("m2"); // queued behind the blocked handler
   iora::core::Logger::info("m3");
   iora::core::Logger::info("m4");
 
-  {
-    std::lock_guard<std::mutex> lk(m);
-    release = true;
-  }
-  cv.notify_all();
+  ctl->releaseAll();
   iora::core::Logger::clearExternalHandler(); // reroutes the backlog; must not spin/hang
   iora::core::Logger::shutdown();             // completes promptly (no orphaned-queue spin)
 
   // m1 reached the handler; the backlog (m2..m4) was rerouted, not re-delivered.
   // (The exact count depends on the clear-vs-worker race, but is bounded to the
   // four messages and must include at least m1 — never a phantom re-invocation.)
-  REQUIRE(handlerCalls.load() >= 1);
-  REQUIRE(handlerCalls.load() <= 4);
+  REQUIRE(handlerCalls->load() >= 1);
+  REQUIRE(handlerCalls->load() <= 4);
 }

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <string>
@@ -154,11 +156,50 @@ public:
   };
   static inline constexpr Endl endl{};
 
+  /// \brief (Re)initialize the logger. NOT concurrency-safe against active
+  /// logging: init() clears the queues and resets mode/level under the lock but
+  /// does NOT drain in-flight handler invocations, so calling it concurrently
+  /// with live logging can silently drop queued raw entries. Call it once at
+  /// startup (or while quiescent), not as live reconfiguration.
   static void init(Level level = Level::Info, const std::string &filePath = "", bool async = false,
                    int retentionDays = 7, const std::string &timeFormat = "%Y-%m-%d %H:%M:%S")
   {
     auto &data = getData();
-    std::lock_guard<std::mutex> lock(data.mutex);
+    std::unique_lock<std::mutex> lock(data.mutex);
+
+    // A teardown may be in flight. Clearing `exit` under a worker that has already
+    // been told to stop makes it park again forever, hanging that teardown's
+    // join(); and returning while a stopping worker still holds `workerRunning`
+    // would leave async mode with no drainer (the spawn gate below would skip).
+    if (data.exit && data.workerRunning)
+    {
+      if (data.workerThreadId == std::this_thread::get_id())
+      {
+        // We ARE the stopping worker (init() from inside a handler). We cannot
+        // wait for ourselves, and clearing `exit` would CANCEL the stop request a
+        // teardown is already blocked on in join() — that join would never return.
+        // The pending teardown wins; a later init() from a normal thread will
+        // re-initialize.
+        std::cerr << "Logger: init() called from the logger worker thread while a shutdown is "
+                     "in flight; the pending shutdown wins (logger not re-initialized)"
+                  << std::endl;
+        return;
+      }
+      // A depth>0 caller's own handler frame is pinned in externalHandlerInflight
+      // for the whole wait. It MUST register that frame in `frozen` exactly as the
+      // teardown paths do — otherwise a worker parked in its own self-clear can
+      // never satisfy inflight == frozen, and we are waiting for that worker:
+      // circular wait. Declared after `lock`, so it is released under the mutex.
+      std::optional<FrozenScope> frozen;
+      const int depth = handlerReentryDepth();
+      if (depth > 0)
+      {
+        frozen.emplace(data, depth);
+        data.externalHandlerDone.notify_all(); // required — see the drain helper
+      }
+      const unsigned stoppingGeneration = data.workerGeneration;
+      waitForWorkerExitLocked(lock, data, stoppingGeneration);
+    }
 
     data.minLevel.store(level, std::memory_order_relaxed);
     data.asyncMode.store(async, std::memory_order_relaxed);
@@ -173,78 +214,74 @@ public:
     // Clear any leftover queued messages from a prior session to prevent
     // cross-session leaks (e.g., rawQueue entries left after shutdown when
     // useExternalHandler was already cleared).
-    while (!data.queue.empty()) data.queue.pop();
-    while (!data.rawQueue.empty()) data.rawQueue.pop();
+    data.queue = {};
+    data.rawQueue = {};
 
     rotateLogFileIfNeeded();
 
-    if (data.asyncMode.load(std::memory_order_relaxed) && !data.workerThread.joinable())
+    // Gate on workerRunning, NOT joinable(): after a teardown moved the thread
+    // object out (or detached it), joinable() is false while that worker may still
+    // be running. Spawning a second one here would leave two workers draining the
+    // same queues, and the first would never observe `exit` again.
+    if (data.asyncMode.load(std::memory_order_relaxed) && !data.workerRunning)
     {
+      // Publish AFTER successful construction: std::thread's ctor can throw
+      // (EAGAIN). Publishing first would leave workerRunning==true with no worker
+      // — every later init() would refuse to spawn one, and ~LoggerData would wait
+      // forever for an exit that can never be published. Safe to publish after,
+      // because init() holds the mutex across the spawn and runWorker's first act
+      // is to acquire it.
+      assert(!data.workerThread.joinable()); // teardown always moves it out first
       data.workerThread = std::thread(runWorker);
+      data.workerThreadId = data.workerThread.get_id();
+      data.workerRunning = true;
+      ++data.workerGeneration;
     }
   }
 
   static void flush()
   {
     auto &data = getData();
+    // Declared BEFORE the lock so it is destroyed AFTER it: if the sink drain
+    // throws (bad_alloc, or cout with exceptions enabled), unwinding would
+    // otherwise release the stashed USER exception object — running its
+    // destructor — while data.mutex is still held.
+    std::exception_ptr handlerError;
     std::unique_lock<std::mutex> lock(data.mutex);
 
-    // Flush external handler queue first. Gated on handlerReentryDepth()==0 (like
-    // logDispatch): a handler that itself calls flush() — e.g. via
-    // LoggerStream::flush() when it logs through the stream proxy — must NOT
-    // re-invoke the handler on the already-queued entries (that is unbounded
-    // recursion, O(backlog) stack frames). At depth > 0 the entries are left for
-    // the outer flush()/worker running at depth 0.
-    while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler &&
-           handlerReentryDepth() == 0)
+    // Flush the external-handler queue first. A handler exception propagates to
+    // this synchronous caller, but must NOT skip the normal-queue/file flush
+    // below — stash it and rethrow after the sinks are flushed.
+    try
     {
-      auto [level, rawMessage] = data.rawQueue.front();
-      data.rawQueue.pop();
-
-      // Capture everything needed BEFORE unlocking — a tear-out
-      // (clear/setExternalHandler) can null the gate fields once the lock is
-      // released. The gate-check (loop condition), handler copy, and the
-      // in-flight increment inside runHandlerUnlocked form one indivisible
-      // critical section under the still-held lock.
-      auto segments = data._compiledFormat;
-      auto timestampFmt = data.timestampFormat;
-      auto handler = data.externalHandler;
-
-      // Drains/rethrows to the synchronous flush() caller (already re-locked).
-      runHandlerUnlocked(lock, data,
-        [&] { formatAndInvokeRawHandler(level, rawMessage, segments, timestampFmt, handler); });
+      while (deliverOneRawEntryLocked(lock, data))
+      {
+      }
+    }
+    catch (...)
+    {
+      handlerError = std::current_exception();
     }
 
     // Always flush queue for both sync and async modes
-    while (!data.queue.empty())
-    {
-      rotateLogFileIfNeeded();
-      const std::string &entry = data.queue.front();
+    drainNormalQueueLocked(data);
+    flushSinkLocked(data);
 
-      if (data.fileStream)
-      {
-        (*data.fileStream) << entry;
-        data.fileStream->flush();
-      }
-      else
-      {
-        std::cout << entry;
-      }
-      data.queue.pop();
-    }
-    // Also flush file stream if open
-    if (data.fileStream)
+    if (handlerError)
     {
-      data.fileStream->flush();
+      // Release first: rethrowing under the lock would touch the user exception
+      // object (and run its destructor on the unwind path) with data.mutex held.
+      lock.unlock();
+      std::rethrow_exception(handlerError);
     }
   }
 
   static void shutdown()
   {
     auto &data = getData();
-    // A throwing sink during the final drain must not prevent shutdown from
-    // setting exit and joining the worker (the worker's own drain already
-    // swallows sink exceptions); otherwise a throwing handler could leave the
+    // A throwing handler or sink during the final drain must not prevent shutdown
+    // from stopping and reaping the worker (the worker's own loop swallows both
+    // handler and sink exceptions); otherwise a throwing handler could leave the
     // worker running until static destruction. Swallow-and-continue here too.
     try
     {
@@ -260,16 +297,8 @@ public:
       std::cerr << "Logger: external handler threw a non-std exception during shutdown flush"
                 << std::endl;
     }
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-      data.exit = true;
-    }
-    data.cv.notify_one();
 
-    if (data.workerThread.joinable())
-    {
-      data.workerThread.join();
-    }
+    teardownAndReapWorker(data, /*report=*/true);
   }
 
   static void setLevel(Level level)
@@ -293,74 +322,86 @@ public:
   static void setExternalHandler(ExternalHandler handler)
   {
     auto &data = getData();
-    std::unique_lock<std::mutex> lock(data.mutex);
-
-    // Drain any in-flight invocation of a PREVIOUS handler before swapping it
-    // out — the same tear-out UAF as clearExternalHandler. Null both gate fields
-    // first (no new invocation starts), then wait (self-call -> inflight==1,
-    // else inflight==0). Messages logged during this swap window take the normal
-    // queue/file path and are not delivered to either handler (accepted).
-    data.externalHandler = nullptr;
-    data.useExternalHandler = false;
-    // Self-call detection via the calling thread's handler-reentry depth. Each
-    // handler invocation pairs ++externalHandlerInflight with ++depth, so this
-    // thread OWNS exactly `depth` of the in-flight count (all pinned on its own
-    // stack and unable to drain while it waits). Drain to `depth` — waiting out
-    // every OTHER thread's invocation without waiting on our own. (target 0 when
-    // not inside a handler; a hard-coded 1 would deadlock at nested depth >= 2.)
-    const int target = handlerReentryDepth();
-    data.externalHandlerDone.wait(lock, [&] { return data.externalHandlerInflight == target; });
-
-    // Discard any entries still queued for the PREVIOUS handler. Rerouting them to
-    // the normal sink would print to cout while the NEW handler is active (which
-    // disables console/file output), and delivering them to the new handler would
-    // be misdelivery — so, consistent with the swap-window "not delivered to either
-    // handler" semantics above, they are dropped. Emptying rawQueue here also
-    // prevents the orphaned-queue busy-spin (an alternative to the predicate gate).
-    while (!data.rawQueue.empty())
+    // Declared BEFORE the lock so the PREVIOUS handler — and everything it
+    // captured — is destroyed AFTER the mutex is released. Destroying a
+    // std::function under data.mutex runs arbitrary user destructors under a
+    // non-recursive lock; a capture whose destructor logs would re-enter
+    // logDispatch and self-deadlock.
+    ExternalHandler doomed;
     {
-      data.rawQueue.pop();
-    }
+      std::unique_lock<std::mutex> lock(data.mutex);
+      // Declared AFTER the lock so the frozen registration is released while
+      // data.mutex is still held. A normal tear-out is pinned only for its own
+      // wait, unlike the teardown paths (see the helper's doc).
+      std::optional<FrozenScope> frozen;
 
-    // Close file stream AFTER the drain (so a racing normal-queue drain never
-    // wrote to a half-torn ofstream), then install the new handler.
-    if (data.fileStream && data.fileStream->is_open())
-    {
-      data.fileStream->close();
-      data.fileStream.reset();
-    }
+      // Null the gate and drain any in-flight invocation of the PREVIOUS handler
+      // before swapping it out — the same tear-out UAF as clearExternalHandler.
+      // Messages logged during this swap window are not delivered to either
+      // handler (accepted). They take the normal queue path, whose sink is the
+      // CONSOLE here — file logging is off while a handler is installed. See
+      // tearOutGateAndDrainInflightLocked for the deadlock-freedom / UAF-safety
+      // argument (self-tearer vs external drain predicates).
+      tearOutGateAndDrainInflightLocked(lock, data, doomed, frozen);
 
-    data.externalHandler = std::move(handler);
-    data.useExternalHandler = true;
+      // Discard any entries still queued for the PREVIOUS handler. Rerouting them
+      // to the normal sink would print to cout while the NEW handler is active
+      // (which disables console/file output), and delivering them to the new
+      // handler would be misdelivery — so, consistent with the swap-window "not
+      // delivered to either handler" semantics above, they are dropped. Emptying
+      // rawQueue here also prevents the orphaned-queue busy-spin.
+      data.rawQueue = {};
+
+      // Close file stream AFTER the drain (so a racing normal-queue drain never
+      // wrote to a half-torn ofstream), then install the new handler.
+      if (data.fileStream && data.fileStream->is_open())
+      {
+        data.fileStream->close();
+        data.fileStream.reset();
+      }
+
+      data.externalHandler = std::move(handler);
+      data.useExternalHandler = true;
+    }
   }
 
-  /// \brief Remove external log handler and restore normal logging
+  /// \brief Remove external log handler and restore normal logging.
+  ///
+  /// POSTCONDITION (precise): on return, no invocation of the handler that was
+  /// installed when this call began is still running, and this call nulled the
+  /// gate. It does NOT guarantee that no handler is installed on return: a
+  /// concurrent setExternalHandler may reinstall one while this call is parked in
+  /// the drain, so a caller must not race clear against set and then treat the
+  /// gate as closed. It also does NOT wait out PEER SELF-TEARERS when called from
+  /// inside the handler — see tearOutGateAndDrainInflightLocked for the exact
+  /// guarantee each caller class receives.
   static void clearExternalHandler()
   {
     auto &data = getData();
-    std::unique_lock<std::mutex> lock(data.mutex);
-    // Null both gate fields together so no NEW invocation can start (runWorker
-    // and flush() gate on them under the lock), then drain any in-flight
-    // invocation before returning — so a [this]-capturing handler's object can
-    // never be destroyed mid-call.
-    data.externalHandler = nullptr;
-    data.useExternalHandler = false;
-    // A handler re-entering to clear itself owns `depth` of the in-flight count
-    // (each invocation pairs ++inflight with ++depth), all pinned on its own stack
-    // and unable to drain while it waits, so drain to `depth` — the OTHERS, not its
-    // own nested invocations. Covers the sync log(), flush(), and async-worker
-    // paths. Never an unconditional skip: a concurrent flush()/log() may be
-    // invoking the same captured object on another thread. (A hard-coded 1 would
-    // deadlock at nested depth >= 2.)
-    const int target = handlerReentryDepth();
-    data.externalHandlerDone.wait(lock, [&] { return data.externalHandlerInflight == target; });
+    // Declared BEFORE the lock — see setExternalHandler: the removed handler's
+    // captured state must be destroyed with data.mutex released.
+    ExternalHandler doomed;
+    {
+      std::unique_lock<std::mutex> lock(data.mutex);
+      std::optional<FrozenScope> frozen; // released under the lock at scope exit
+      // Null the gate and drain any in-flight invocation before returning — so a
+      // [this]-capturing handler's object can never be destroyed mid-call. Covers
+      // the sync log(), flush(), and async-worker paths.
+      tearOutGateAndDrainInflightLocked(lock, data, doomed, frozen);
 
-    // Reroute any entries still queued for the removed handler so they are not
-    // orphaned in rawQueue (which would busy-spin the worker) and not lost — they
-    // land on the normal queue for file/console.
-    rerouteRawQueueToNormalQueueLocked(data);
-    data.cv.notify_one(); // wake the worker to drain the rerouted normal-queue entries
-    // File logging will be restored on next log call via rotateLogFileIfNeeded
+      // Reroute any entries still queued for the removed handler so they are not
+      // orphaned in rawQueue (which would busy-spin the worker) and not lost —
+      // they land on the normal queue for file/console. SKIPPED when a racing
+      // setExternalHandler reinstalled a handler while we were parked: those
+      // entries belong to the NEW handler, and rerouting them would print to cout
+      // while an external handler is active (console output is meant to be off).
+      if (!data.useExternalHandler)
+      {
+        rerouteRawQueueToNormalQueueLocked(data);
+        data.cv.notify_one(); // wake the worker to drain the rerouted entries
+      }
+      // File logging will be restored on next log call via rotateLogFileIfNeeded
+    }
   }
 
   /// \brief Set the log format string (thread-safe)
@@ -608,11 +649,45 @@ public:
 
   struct LoggerData
   {
+    /// LOCK DISCIPLINE (single source of truth for this class):
+    ///  - `mutex` is the ONLY mutex in the logger, and it is a LEAF: no other lock
+    ///    is ever acquired while it is held. (Callers may and do hold their own
+    ///    locks across a log call — that is safe precisely BECAUSE it is a leaf.
+    ///    The converse statement, that `mutex` is never taken while another lock is
+    ///    held, is neither true nor enforceable.) Keep it a leaf if a second lock
+    ///    is ever added.
+    ///  - `workerThread` is assigned under `mutex` by init(), so shutdown() and
+    ///    ~LoggerData MOVE it out under the lock and join the local copy — reading
+    ///    or joining the member unlocked races init() and can double-join.
+    ///  - Sink I/O (rotateLogFileIfNeeded, ofstream/cout writes) and the drain
+    ///    stall diagnostics ARE performed under `mutex`: ordering of log lines is
+    ///    the deliberate priority over the latency cost of holding the lock across
+    ///    file I/O. This orders the stream/stdio locks BELOW `mutex`, so no code
+    ///    may take `mutex` while holding a stream lock — a user streambuf on
+    ///    cout/cerr that logs would self-deadlock on this non-recursive mutex.
+    ///  - It is NEVER held across a user callback (copy-then-invoke: every dispatch
+    ///    site copies the handler under the lock, unlocks, then invokes) and never
+    ///    across the DESTRUCTION of a user callback: clear/setExternalHandler and
+    ///    both teardown paths move the doomed std::function into a caller-owned
+    ///    local destroyed after unlocking, and the dispatch sites destroy their
+    ///    in-flight copy inside the unlocked window via HandlerCopyDropper. (The
+    ///    remaining under-lock user code is the COPY itself — tracked in backlog
+    ///    2026-07-22-3, whose fix makes it a refcount bump.)
+    ///  - `externalHandlerInflight` and `externalHandlerFrozen` are mutated AND read
+    ///    only under it.
+    ///  - `cv` has exactly ONE waiter (the worker), so notify_one is correct.
+    ///    `externalHandlerDone` can have MANY waiters (concurrent drainers), so it
+    ///    requires notify_all — notify_one there would lose wakeups.
     std::mutex mutex;
     std::condition_variable cv;
     std::queue<std::string> queue;
     std::queue<std::pair<Level, std::string>> rawQueue; // For external handlers
     std::thread workerThread;
+    /// Worker-stop predicate. Atomic only as defence in depth: it is written AND
+    /// read exclusively under `mutex` on every path, and it MUST stay that way —
+    /// an unlocked write can be lost if the worker is between its predicate check
+    /// and parking, hanging join() at teardown. The mutex, not the atomicity, is
+    /// what makes the wakeup safe.
     std::atomic<bool> exit{false};
     // atomic: read on the hot log() gate/branch without holding `mutex`; written
     // in init()/setLevel(). Plain scalars here were a data race. relaxed ordering
@@ -633,9 +708,41 @@ public:
     /// clear/setExternalHandler drain on this before tearing out the handler so a
     /// [this]-capturing handler's object cannot be destroyed mid-invocation.
     int externalHandlerInflight = 0;
-    /// Signalled (notify_all) on every decrement of externalHandlerInflight.
-    /// Dedicated CV (not `cv`) so drain-waiters never consume worker wakeups.
+    /// Sum of the reentry-depth contributions of self-tearing invocations
+    /// currently BLOCKED in a clear/setExternalHandler drain wait (a handler that
+    /// re-enters to clear/swap itself). Plain int, mutated and read ONLY under
+    /// `mutex` (never a lockless atomic). Invariant:
+    /// 0 <= externalHandlerFrozen <= externalHandlerInflight always — each frozen
+    /// unit corresponds to a distinct pinned in-flight frame. External (depth-0)
+    /// callers NEVER touch it. The deadlock-freedom / UAF-safety argument lives in
+    /// ONE place: tearOutGateAndDrainInflightLocked. Do not restate it here.
+    int externalHandlerFrozen = 0;
+    /// Signalled (notify_all) on every decrement of externalHandlerInflight, and
+    /// when the worker clears `workerRunning`. Dedicated CV (not `cv`) so
+    /// drain-waiters never consume worker wakeups.
     std::condition_variable externalHandlerDone;
+    /// TRUE from the moment init() spawns the worker until the worker's LAST
+    /// action before returning. Guarded by `mutex`. Distinct from
+    /// workerThread.joinable(): teardown MOVES the thread object out (and the
+    /// self-teardown path detaches it), so joinable() goes false while the worker
+    /// is still running and still touching this object. Two things depend on the
+    /// distinction: init() must not spawn a SECOND worker alongside a live one,
+    /// and ~LoggerData must not destroy this object while a detached worker is
+    /// still inside its loop.
+    bool workerRunning = false;
+    /// Incremented under `mutex` on every spawn. `workerRunning` alone is
+    /// LEVEL-triggered: a racing init() can spawn a NEW worker that re-asserts it,
+    /// and a waiter for the OLD worker would then block for one it never asked to
+    /// stop. Every "wait for the worker to exit" predicate is therefore stamped
+    /// with the generation it cares about. (A thread id would mostly work but can
+    /// be recycled after the old worker exits; a counter cannot.)
+    unsigned workerGeneration = 0;
+    /// Id of the live worker, valid only while `workerRunning`. Guarded by
+    /// `mutex`. Used ONLY to answer "am I the worker?" on teardown paths, so a
+    /// thread cannot wait for itself to exit. (It is cleared when the worker
+    /// exits, so it cannot go stale across thread-id reuse the way the removed
+    /// handler-self-detection scheme could.)
+    std::thread::id workerThreadId;
     /// Original log format string (for getLogFormat())
     std::string _logFormat = "[%T] [%L] %m";
     /// Pre-compiled format segments for fast formatting
@@ -647,22 +754,13 @@ public:
 
     ~LoggerData()
     {
-      // Ensure clean shutdown during static destruction
+      // Static destruction: same protocol as shutdown(), silent. Sharing ONE
+      // implementation is deliberate — the two copies of this sequence drifted
+      // apart twice during review (a hand-inlined depth-0 predicate that hung at
+      // exit, and a frozen-release timing that deadlocked the join).
       try
       {
-        // Set the predicate UNDER the mutex (as shutdown() does): mutating a CV
-        // predicate without the wait mutex — even an atomic one — can lose the
-        // wakeup if the worker is between its predicate check and parking,
-        // hanging join() at teardown.
-        {
-          std::lock_guard<std::mutex> lock(mutex);
-          exit = true;
-        }
-        cv.notify_all();
-        if (workerThread.joinable())
-        {
-          workerThread.join();
-        }
+        Logger::teardownAndReapWorker(*this, /*report=*/false);
       }
       catch (...)
       {
@@ -684,20 +782,51 @@ public:
   /// \brief Per-thread external-handler reentrancy depth.
   /// A thread executing a user log handler in its unlocked window has depth > 0.
   /// clear/setExternalHandler read this to detect a self-call — a handler that
-  /// re-enters to swap or clear the handler — and drain to inflight == 1 (its own
-  /// invocation) instead of hanging. Replaces the former workerThreadId
+  /// re-enters to swap or clear the handler — and take the frozen-inflight
+  /// self-tearer branch (wait inflight == externalHandlerFrozen) instead of the
+  /// external full drain; see tearOutGateAndDrainInflightLocked for why. Replaces
+  /// the former workerThreadId
   /// self-detection, which could go stale once the worker was joined (a later
   /// thread reusing that OS id would misfire) and never covered handler
   /// invocations on the sync log() path or the flush() thread at all.
+  /// \note CROSS-.so ABI PRECONDITION (R-12): the frozen-inflight drain
+  /// (tearOutGateAndDrainInflightLocked) selects the self-tearer vs external
+  /// branch on this depth, so correctness requires ONE `thread_local` instance
+  /// process-wide. In the shared build that is ENFORCED by defining this function
+  /// once in libiora_core.so (above), not left to vague-linkage merging.
+  /// iora_test_plugin_isolation asserts the INSTANCE — `&handlerReentryDepth()` —
+  /// is identical host<->plugin, because that is the property the drain's depth
+  /// branch actually depends on and it survives any future re-inlining. (History:
+  /// while this was header-inline, a Release build emitted a per-.so copy of the
+  /// FUNCTION — the addresses differed while the instances matched — so a
+  /// function-symbol assertion failed under -O3 without indicating any real
+  /// hazard. Out-of-lining removed the ambiguity; the instance check is kept
+  /// because it is the stronger statement.)
+#if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)
+  // Declared here, DEFINED ONCE in src/core/iora_core.cpp — the same out-of-line
+  // singleton pattern as getData(). Header-inline would leave the single-instance
+  // property to vague-linkage merging, which is not guaranteed under the
+  // RTLD_LOCAL dlopen the plugin loader uses: the COMDAT lands in libiora_core.so
+  // only if some TU there incidentally odr-uses it. If that ever lapsed, a
+  // plugin's self-clear would read depth==0, take the external inflight==0 branch,
+  // and self-deadlock on its own pinned frame — silently, in Release.
+  static int &handlerReentryDepth();
+#else
   static int &handlerReentryDepth()
   {
     static thread_local int depth = 0;
     return depth;
   }
+#endif
 
+private:
   /// \brief RAII marker: the current thread is executing an external handler for
   /// the duration of the (unlocked) callback, so a self-call into
-  /// clear/setExternalHandler is detected. Exception-safe.
+  /// clear/setExternalHandler is detected. Exception-safe. PRIVATE: constructing
+  /// one outside a real invocation would raise handlerReentryDepth() without a
+  /// matching in-flight frame, breaking the frozen <= inflight invariant — a
+  /// later self-clear from that thread would then wait on an unsatisfiable
+  /// predicate (release builds do not carry the assert).
   struct HandlerInvocationScope
   {
     HandlerInvocationScope() { ++handlerReentryDepth(); }
@@ -705,6 +834,362 @@ public:
     HandlerInvocationScope(const HandlerInvocationScope &) = delete;
     HandlerInvocationScope &operator=(const HandlerInvocationScope &) = delete;
   };
+
+  // Tear-out drain internals. NOT API: constructing a FrozenScope or calling the
+  // drain/delivery helpers from outside would corrupt the frozen <= inflight
+  // invariant (which is only assert-checked in debug builds). getData() and
+  // handlerReentryDepth() stay public above — both are taken by address across the
+  // plugin ABI boundary.
+
+  /// \brief RAII marker: a self-tearing invocation registers its reentry-depth
+  /// contribution into externalHandlerFrozen for the duration of its drain wait in
+  /// clear/setExternalHandler. Two properties are unique to this guard (the WHY of
+  /// the protocol itself lives in tearOutGateAndDrainInflightLocked):
+  ///  - It MUST be constructed and destroyed while `data.mutex` is held. It is
+  ///    declared inside the drain helper, whose `lock` parameter is held for the
+  ///    guard's whole lifetime (condition_variable::wait re-acquires the lock even
+  ///    when it propagates an exception), so `frozen -= depth` provably runs under
+  ///    the mutex on the normal AND the throwing path.
+  ///  - It NEVER notifies. See the no-park-notify proof in the drain helper.
+  struct FrozenScope
+  {
+    FrozenScope(LoggerData &data, int depth) : _data(data), _depth(depth)
+    {
+      _data.externalHandlerFrozen += _depth;
+      assert(_data.externalHandlerFrozen >= 0 &&
+             _data.externalHandlerFrozen <= _data.externalHandlerInflight);
+    }
+    ~FrozenScope()
+    {
+      _data.externalHandlerFrozen -= _depth;
+      assert(_data.externalHandlerFrozen >= 0 &&
+             _data.externalHandlerFrozen <= _data.externalHandlerInflight);
+    }
+    FrozenScope(const FrozenScope &) = delete;
+    FrozenScope &operator=(const FrozenScope &) = delete;
+
+  private:
+    LoggerData &_data;
+    int _depth;
+  };
+
+  /// \brief Releases a caller-held FrozenScope UNDER `data.mutex`, on every exit
+  /// path including an exception. Teardown keeps its frozen registration alive
+  /// past the locked scope (across the worker join), so the release cannot simply
+  /// ride the scope of the unique_lock the way clear/setExternalHandler's does.
+  struct FrozenReleaser
+  {
+    // Explicit ctor, NOT aggregate initialization: a class with a user-DECLARED
+    // (even deleted) constructor stops being an aggregate in C++20, so
+    // `FrozenReleaser r{data, slot};` would break on the next standard bump.
+    FrozenReleaser(LoggerData &data, std::optional<FrozenScope> &slot)
+        : _data(data), _slot(slot)
+    {
+    }
+    ~FrozenReleaser()
+    {
+      if (_slot)
+      {
+        std::lock_guard<std::mutex> lock(_data.mutex);
+        _slot.reset();
+      }
+    }
+    FrozenReleaser(const FrozenReleaser &) = delete;
+    FrozenReleaser &operator=(const FrozenReleaser &) = delete;
+
+  private:
+    LoggerData &_data;
+    std::optional<FrozenScope> &_slot;
+  };
+
+  /// \brief Wait for `pred` on externalHandlerDone, emitting a periodic diagnostic
+  /// while it is unsatisfied. It NEVER gives up and proceeds: a bounded
+  /// wait-then-tear-out would destroy the handler's captured state while an
+  /// invocation is still running (a use-after-free — strictly worse than a hang,
+  /// and explicitly rejected for this protocol). The diagnostic exists because
+  /// these drains now also gate shutdown() and static destruction: a handler
+  /// wedged on a user lock would otherwise hang process exit with no output at
+  /// all. `lock` is held on entry and on return.
+  /// `what` names the thing being waited for — this helper serves several
+  /// predicates (handler drain, worker exit), and a stall message that names the
+  /// wrong subsystem is worse than none, since it is the ONLY output a wedged
+  /// process produces. `kStallReportInterval` is DIAGNOSTIC ONLY: no correctness
+  /// property may depend on it (every satisfying state change notifies).
+  template <typename Predicate>
+  static void waitWithStallDiagnosticLocked(std::unique_lock<std::mutex> &lock, LoggerData &data,
+                                            const char *what, Predicate pred)
+  {
+    constexpr auto kStallReportInterval = std::chrono::seconds(5);
+    while (!data.externalHandlerDone.wait_for(lock, kStallReportInterval, pred))
+    {
+      std::cerr << "Logger: still waiting for " << what << " (inflight="
+                << data.externalHandlerInflight << ", frozen=" << data.externalHandlerFrozen
+                << ", workerRunning=" << (data.workerRunning ? "yes" : "no")
+                << "); still waiting — proceeding early would be unsafe" << std::endl;
+    }
+  }
+
+  /// \brief Stop and reap the worker, then drain what is left. ONE implementation
+  /// shared by shutdown() and ~LoggerData: these two sequences drifted apart twice
+  /// during review, each time producing a hang (a hand-inlined depth-0 predicate
+  /// that could not be satisfied at depth > 0, and a frozen-release timing that
+  /// deadlocked the join). `report` selects operator diagnostics (shutdown) versus
+  /// silence (static destruction).
+  ///
+  /// DEPTH MATTERS. Reached from inside a handler (shutdown() called by a handler,
+  /// or std::exit() running static destructors on that thread) this runs at depth
+  /// 1 with its own frame pinned in externalHandlerInflight for the whole
+  /// sequence — including the join. The frozen registration is therefore held
+  /// until AFTER the join and released under the mutex by FrozenReleaser;
+  /// releasing it at the end of the drain wait would leave a peer parked in its
+  /// own tear-out unsatisfiable while we block in join() — a circular wait.
+  static void teardownAndReapWorker(LoggerData &data, bool report)
+  {
+    // `doomed` outlives every lock scope: destroying a handler runs user capture
+    // destructors, which must not happen under data.mutex.
+    ExternalHandler doomed;
+    std::thread worker;
+    std::optional<FrozenScope> frozen;
+    FrozenReleaser frozenReleaser(data, frozen); // releases it UNDER the mutex
+    bool selfIsWorker = false;
+    unsigned stoppedGeneration = 0;
+    {
+      std::unique_lock<std::mutex> lock(data.mutex);
+      tearOutGateAndDrainInflightLocked(lock, data, doomed, frozen);
+      // Entries queued for the handler after the drain would otherwise be silently
+      // dropped (the worker gates rawQueue on useExternalHandler, now false).
+      // UNGUARDED, unlike clearExternalHandler: at teardown, printing a racing
+      // reinstall's entries to the console beats losing them.
+      rerouteRawQueueToNormalQueueLocked(data);
+      data.exit = true;
+      stoppedGeneration = data.workerGeneration;
+      selfIsWorker = (data.workerThreadId == std::this_thread::get_id());
+      worker = std::move(data.workerThread);
+    }
+    data.cv.notify_one(); // `cv` has exactly one waiter — see LOCK DISCIPLINE
+
+    if (worker.joinable())
+    {
+      if (selfIsWorker)
+      {
+        if (report)
+        {
+          std::cerr << "Logger: shutdown() called from the logger worker thread; "
+                       "skipping self-join"
+                    << std::endl;
+        }
+        worker.detach();
+      }
+      else
+      {
+        // A throwing join would leave `worker` joinable, and ~thread would then
+        // call std::terminate during unwinding — erasing the real diagnosis.
+        try
+        {
+          worker.join();
+        }
+        catch (const std::exception &ex)
+        {
+          if (report)
+          {
+            std::cerr << "Logger: join of the worker thread failed: " << ex.what()
+                      << "; detaching" << std::endl;
+          }
+          worker.detach();
+        }
+      }
+    }
+
+    {
+      std::unique_lock<std::mutex> lock(data.mutex);
+      // A worker we could not join (detached here, or by an earlier self-teardown)
+      // is still inside its loop touching this object after every drain predicate
+      // is satisfied. Wait for ITS exit publication — keyed on the generation, so a
+      // racing init() that spawns a NEW worker cannot strand us waiting for one we
+      // never asked to stop. Skipped when WE are that worker.
+      if (!selfIsWorker)
+      {
+        waitForWorkerExitLocked(lock, data, stoppedGeneration);
+      }
+      // Nothing will ever drain what the reroute above put on the normal queue once
+      // the worker is gone — write it out rather than destroy it. Swallow a
+      // throwing sink: shutdown() is routinely called from destructors, atexit and
+      // noexcept teardown, where an escaping exception is std::terminate. Before
+      // the two teardown paths were merged, shutdown() guarded this and
+      // ~LoggerData relied on its own catch(...) — keeping the guard HERE keeps the
+      // two paths identical, which is the point of sharing the implementation.
+      try
+      {
+        drainNormalQueueLocked(data);
+      }
+      catch (const std::exception &ex)
+      {
+        if (report)
+        {
+          std::cerr << "Logger: sink threw during the teardown drain: " << ex.what() << std::endl;
+        }
+      }
+      catch (...)
+      {
+        if (report)
+        {
+          std::cerr << "Logger: sink threw a non-std exception during the teardown drain"
+                    << std::endl;
+        }
+      }
+      // Runs even when the drain threw, so buffered output still reaches the sink.
+      try
+      {
+        flushSinkLocked(data);
+      }
+      catch (...)
+      {
+      }
+    }
+  }
+
+  /// \brief Report a caught exception and release it with `lock` RELEASED.
+  /// Both `ex.what()` and the destruction of the exception object at the end of a
+  /// catch block are USER code. runHandlerUnlocked rethrows with data.mutex
+  /// RE-ACQUIRED (and the sink drains run under it), so reporting inline would run
+  /// that user code under the non-recursive mutex — the same hazard already fixed
+  /// for the handler itself (invocation, copy and destruction). An exception whose
+  /// destructor or what() logs would otherwise self-deadlock here.
+  static void reportAndReleaseUnlocked(std::unique_lock<std::mutex> &lock,
+                                       std::exception_ptr &err, const char *context)
+  {
+    lock.unlock();
+    try
+    {
+      std::rethrow_exception(err);
+    }
+    catch (const std::exception &ex)
+    {
+      std::cerr << "Logger: " << context << ": " << ex.what() << std::endl;
+    }
+    catch (...)
+    {
+      std::cerr << "Logger: " << context << " (non-std exception)" << std::endl;
+    }
+    err = nullptr; // release the last reference to the user object, still unlocked
+    lock.lock();
+  }
+
+  /// \brief Wait for the worker identified by `workerId` to publish its exit.
+  /// Waiting on the bare `!workerRunning` flag is WRONG: a racing init() can spawn
+  /// a NEW worker between the join and this wait, and the waiter would then block
+  /// for a worker it never asked to stop (a hang). Bind the wait to the identity.
+  /// No-ops when there is nothing to wait for, or when WE are that worker.
+  static void waitForWorkerExitLocked(std::unique_lock<std::mutex> &lock, LoggerData &data,
+                                      unsigned generation)
+  {
+    waitWithStallDiagnosticLocked(
+      lock, data, "the logger worker thread to exit",
+      [&data, generation]
+      { return !data.workerRunning || data.workerGeneration != generation; });
+  }
+
+  /// \brief Null the external-handler gate fields and drain in-flight invocations
+  /// before a tear-out (clear/setExternalHandler). THIS IS THE ONE PLACE the drain
+  /// protocol is argued; other sites point here rather than restating it.
+  ///
+  /// Given `lock` HELD on `data.mutex`. The removed handler is MOVED into `doomed`
+  /// (rather than destroyed here) because destroying a std::function runs arbitrary
+  /// user capture destructors — the caller owns `doomed` and destroys it with the
+  /// mutex released. Nulling the gate here, not at the call site, is what makes
+  /// `externalHandlerInflight` monotone non-increasing during the wait (no NEW
+  /// invocation can start: runWorker/flush()/log() all gate on useExternalHandler
+  /// under the lock), so that precondition is code-enforced, not a caller
+  /// obligation.
+  ///
+  /// Deadlock-free AND use-after-free-free under concurrent self-tear-out
+  /// (tracker 2026-07-21-3, Option 2 frozen-inflight accounting):
+  ///  - Self-tearer (handlerReentryDepth() > 0): registers `depth` into
+  ///    externalHandlerFrozen (RAII, under the lock) and waits the LIVE predicate
+  ///    inflight == frozen — draining every NON-frozen invocation. When two
+  ///    self-tearers block concurrently, the one whose registration closes the gap
+  ///    self-observes it under the same held lock and does not park; it then drives
+  ///    a notifying --inflight that releases the peer. A park-site notify_all IS
+  ///    required on the frozen registration: a TEARDOWN caller self-catches and
+  ///    then blocks in worker.join() while still holding its registration, so it
+  ///    does NOT promptly drive the notifying --inflight that clear/set do — a peer
+  ///    it just satisfied would otherwise wait out kStallReportInterval. The
+  ///    FrozenScope DESTRUCTOR still needs no notify: since frozen <= inflight
+  ///    always, a frozen decrement can only falsify inflight == frozen, and it
+  ///    never affects inflight == 0. notify_all (never notify_one) on every
+  ///    --inflight remains sufficient AND required.
+  ///  - External caller (depth == 0): may destroy the handler's captured object, so
+  ///    it MUST wait a genuine full drain inflight == 0 and NEVER subtracts frozen.
+  ///
+  /// GUARANTEE DELIVERED, precisely — the two callers get DIFFERENT strengths:
+  ///  - depth == 0: no invocation of the torn-out handler is running on return.
+  ///    This is the only safe basis for destroying an object the handler captured.
+  ///  - depth  > 0 (self-tear-out): only every NON-self-tearing invocation has
+  ///    exited. PEER invocations that are themselves tearing out may still be
+  ///    executing handler code — and will still dereference their captures after
+  ///    their own tear-out returns. This is the unavoidable price of deadlock
+  ///    freedom (waiting on a peer that is equally pinned is the circular wait this
+  ///    fix exists to remove). NEVER destroy a captured object on the strength of a
+  ///    self-clear; route lifetime-critical teardown through a depth-0 call.
+  ///
+  /// Depth is provably 0 or 1 (every dispatch site gates handlerReentryDepth()==0),
+  /// so frozen reduces to a count of parked self-tearers; handlerReentryDepth() is
+  /// retained over a literal 1 only as defensive self-documentation.
+  /// `frozenSlot` receives the self-tearer's frozen registration when
+  /// handlerReentryDepth() > 0. It is NOT released when this function returns: the
+  /// caller owns it and MUST destroy it under `data.mutex`. This matters because
+  /// `frozen` means "pinned frames that can never decrement", and a caller's frame
+  /// stays pinned for as long as the caller is inside the handler — which for a
+  /// TEARDOWN caller is longer than its own wait: it goes on to set `exit` and
+  /// JOIN the worker. Releasing the registration at the end of the wait (as an
+  /// earlier version did) makes a peer parked in its own tear-out unsatisfiable
+  /// while this thread blocks in join() — a circular wait, this task's own P0 on
+  /// the teardown path. clear/setExternalHandler destroy the slot at the end of
+  /// their locked scope; shutdown()/~LoggerData keep it until after the join.
+  static void tearOutGateAndDrainInflightLocked(std::unique_lock<std::mutex> &lock,
+                                                LoggerData &data, ExternalHandler &doomed,
+                                                std::optional<FrozenScope> &frozenSlot)
+  {
+    // Null both gate fields together so no NEW invocation can start, THEN drain.
+    // SWAP (not move-then-null): a moved-from std::function is "valid but
+    // unspecified", so a `= nullptr` afterwards could, in principle, destroy a live
+    // target — running user destructors under data.mutex, the very hazard `doomed`
+    // exists to prevent. swap() avoids that on libstdc++ (a bytewise swap of the
+    // stored callable), but the standard does not GUARANTEE a swap runs no user
+    // code: libc++ move-constructs and destroys small-buffer targets. The portable
+    // close-out is holding the handler as shared_ptr<const ExternalHandler> so the
+    // under-lock operation is a refcount bump — tracked in backlog 2026-07-22-3,
+    // whose acceptance criterion is exactly "no user code runs under data.mutex on
+    // ANY path". The caller destroys `doomed` after unlocking.
+    data.externalHandler.swap(doomed);
+    data.useExternalHandler = false;
+    const int depth = handlerReentryDepth();
+    if (depth > 0)
+    {
+      frozenSlot.emplace(data, depth);
+      // REQUIRED, not belt-and-braces. A frozen increment can SATISFY a peer
+      // already parked on inflight == frozen. The original proof said no notify
+      // was needed because the incrementer self-catches and then promptly drives a
+      // notifying --inflight — true while the only self-tearers were clear/set,
+      // which return into the handler body. It is FALSE for a TEARDOWN caller:
+      // it self-catches, keeps its registration, and then blocks in worker.join()
+      // WITHOUT decrementing, so the peer it just satisfied has no wakeup event.
+      // Measured before this notify: every depth>0 teardown stalled for exactly
+      // kStallReportInterval (5.0s/iteration), i.e. liveness rested on a timer
+      // documented as diagnostic-only — and reverting that wait to an untimed
+      // wait() would have restored the P0 deadlock outright.
+      data.externalHandlerDone.notify_all();
+      waitWithStallDiagnosticLocked(
+        lock, data, "in-flight external-handler invocations to drain",
+        [&] { return data.externalHandlerInflight == data.externalHandlerFrozen; });
+    }
+    else
+    {
+      waitWithStallDiagnosticLocked(lock, data,
+                                    "in-flight external-handler invocations to drain",
+                                    [&] { return data.externalHandlerInflight == 0; });
+    }
+  }
 
   /// \brief Run an external-handler invocation outside `data.mutex` with
   /// inflight-drain bookkeeping. Precondition: `lock` is HELD and the gate-check
@@ -748,12 +1233,165 @@ public:
   static void formatAndInvokeRawHandler(Level level, const std::string &rawMessage,
                                         const std::vector<FormatSegment> &segments,
                                         const std::string &timestampFmt,
-                                        const ExternalHandler &handler)
+                                        std::optional<ExternalHandler> &handler)
   {
+    HandlerInvocationScope inv;          // declared FIRST -> destroyed LAST
+    HandlerCopyDropper dropper(handler); // destroyed FIRST, i.e. still at depth 1
+    // Formatting sits INSIDE both guards deliberately: it allocates and can throw.
+    // If it threw BEFORE the dropper existed, the unwind would pass through
+    // runHandlerUnlocked's catch — which RE-ACQUIRES data.mutex — and the caller
+    // would then destroy the handler copy with the mutex held and at depth 0,
+    // running user capture destructors under the non-recursive lock. Formatting
+    // dispatches nothing and takes no lock, so doing it at depth 1 is
+    // behaviour-preserving. RULE: everything throwable belongs inside the guards.
     std::string formattedMessage =
       formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
-    HandlerInvocationScope inv;
-    handler(level, formattedMessage, rawMessage);
+    (*handler)(level, formattedMessage, rawMessage);
+    // ORDER IS LOAD-BEARING (and it keeps the post-scope window free of user code:
+    // once the dropper is destroyed here, nothing user-supplied runs between
+    // ~HandlerInvocationScope and runHandlerUnlocked's --inflight).
+    // The copy's destruction runs USER capture destructors,
+    // so it must happen (a) with data.mutex released — hence inside this unlocked
+    // window — AND (b) while handlerReentryDepth() is still 1. Between
+    // ~HandlerInvocationScope (depth -> 0) and runHandlerUnlocked's --inflight this
+    // thread is at depth 0 with its own frame STILL pinned in inflight: a capture
+    // destructor calling clear/setExternalHandler there would take the depth-0
+    // branch and wait inflight == 0 on its own pinned frame — unsatisfiable. With
+    // the dropper destroyed first, that same destructor takes the self-tearer
+    // branch (inflight == frozen) and returns immediately. Keep the post-scope
+    // window free of logger re-entry.
+  }
+
+  /// \brief Write every entry on the NORMAL queue to its sink (file if open, else
+  /// console), rotating as needed. Precondition: `data.mutex` HELD. Shared by
+  /// flush() and runWorker() — the sibling of deliverOneRawEntryLocked, extracted
+  /// for the same reason: one home for the sink-selection and rotation policy so
+  /// the two drain sites cannot drift apart.
+  static void drainNormalQueueLocked(LoggerData &data)
+  {
+    while (!data.queue.empty())
+    {
+      rotateLogFileIfNeeded();
+      const std::string &entry = data.queue.front();
+
+      if (data.fileStream)
+      {
+        (*data.fileStream) << entry;
+        data.fileStream->flush();
+      }
+      else
+      {
+        std::cout << entry;
+      }
+      data.queue.pop();
+    }
+  }
+
+  /// \brief Make the SELECTED sink observable to a reader: the file stream if one
+  /// is open, otherwise std::cout — which is fully buffered when stdout is
+  /// redirected, so without this an explicit flush()/shutdown() would not surface
+  /// console output until static destruction. One home for the rule; called from
+  /// flush() and teardownAndReapWorker()'s final drain.
+  static void flushSinkLocked(LoggerData &data)
+  {
+    if (data.fileStream)
+    {
+      data.fileStream->flush();
+    }
+    else
+    {
+      std::cout.flush();
+    }
+  }
+
+  /// \brief Destroys an in-flight handler copy inside runHandlerUnlocked's
+  /// UNLOCKED window AND while handlerReentryDepth() is still >= 1 (declare it
+  /// AFTER the HandlerInvocationScope so it is destroyed BEFORE it). Both
+  /// properties are required: unlocked so the user's capture destructors do not
+  /// run under data.mutex, and at depth >= 1 so a destructor that re-enters the
+  /// logger is depth-gated (a log() goes to the normal queue instead of
+  /// re-dispatching unboundedly) and a destructor that calls
+  /// clear/setExternalHandler takes the SELF-TEARER branch — at depth 0 it would
+  /// take the external branch and wait inflight == 0 on its own pinned frame,
+  /// which is unsatisfiable. Necessary
+  /// because runHandlerUnlocked re-acquires `data.mutex` before returning: a
+  /// handler copy left to die at the enclosing scope's exit would run the user's
+  /// capture destructors under the lock — and after a concurrent tear-out moved
+  /// the stored handler into `doomed`, this in-flight copy is frequently the LAST
+  /// reference, so it is the one that destroys the captured object. Same hazard
+  /// the caller-owned `doomed` local fixes for clear/set/shutdown.
+  struct HandlerCopyDropper
+  {
+    // Explicit ctor for the same reason as FrozenReleaser: a user-declared (even
+    // deleted) constructor stops this being an aggregate in C++20.
+    explicit HandlerCopyDropper(std::optional<ExternalHandler> &slot) : _slot(slot) {}
+    ~HandlerCopyDropper()
+    {
+      // Implicitly noexcept, and _slot.reset() runs USER capture destructors. If
+      // one of those throws (e.g. it logs and the sink throws), letting it escape
+      // would std::terminate and erase the diagnosis.
+      try
+      {
+        _slot.reset();
+      }
+      catch (...)
+      {
+      }
+    }
+    HandlerCopyDropper(const HandlerCopyDropper &) = delete;
+    HandlerCopyDropper &operator=(const HandlerCopyDropper &) = delete;
+
+  private:
+    std::optional<ExternalHandler> &_slot;
+  };
+
+  /// \brief Deliver ONE rawQueue entry to the external handler outside
+  /// `data.mutex`. Precondition: `lock` HELD. Returns false — with the lock still
+  /// held and nothing delivered — when the queue is empty or the gate is closed.
+  ///
+  /// The gate check, the three capture copies, and the in-flight increment inside
+  /// runHandlerUnlocked form ONE indivisible critical section under the still-held
+  /// lock: a tear-out (clear/setExternalHandler) can null the gate the moment the
+  /// lock is released, so everything the invocation needs must be copied first.
+  /// This is the invariant the whole tear-out drain rests on, which is why the two
+  /// drain sites (flush() and runWorker()) share this one implementation rather
+  /// than each keeping a copy.
+  ///
+  /// handlerReentryDepth()==0 gates the dispatch (as at every other dispatch site):
+  /// a handler that itself calls flush() must not re-invoke the handler on the
+  /// already-queued entries (unbounded recursion, O(backlog) stack frames); those
+  /// entries are left for the outer flush()/worker running at depth 0.
+  ///
+  /// A handler exception propagates to the caller with the lock RE-ACQUIRED and
+  /// inflight already decremented (runHandlerUnlocked guarantees both). Callers
+  /// differ only in policy: flush() propagates it, runWorker() swallows and
+  /// continues.
+  static bool deliverOneRawEntryLocked(std::unique_lock<std::mutex> &lock, LoggerData &data)
+  {
+    if (data.rawQueue.empty() || !data.useExternalHandler || !data.externalHandler ||
+        handlerReentryDepth() != 0)
+    {
+      return false;
+    }
+
+    // Named locals, NOT structured bindings: the lambda below captures them, and
+    // capturing a structured binding is ill-formed in C++17 (only allowed from
+    // C++20, P1091R3 — GCC accepts it silently, Clang warns, and it is an error
+    // under -pedantic-errors).
+    const Level level = data.rawQueue.front().first;
+    std::string rawMessage = std::move(data.rawQueue.front().second);
+    data.rawQueue.pop();
+
+    auto segments = data._compiledFormat;
+    auto timestampFmt = data.timestampFormat;
+    std::optional<ExternalHandler> handler(data.externalHandler);
+
+    runHandlerUnlocked(lock, data,
+                       [&] {
+                         formatAndInvokeRawHandler(level, rawMessage, segments, timestampFmt,
+                                                   handler);
+                       });
+    return true;
   }
 
   /// \brief Reroute any entries still queued for a REMOVED external handler from
@@ -786,6 +1424,7 @@ public:
     }
   }
 
+public:
   /// \brief Post-format dispatch shared by both log() overloads: route a
   /// fully-formatted `output` (with the raw `message` for the handler/rawQueue)
   /// to the async queue, the external handler, or the file/console path.
@@ -825,12 +1464,13 @@ public:
       // that re-enters Logger would self-deadlock on the non-recursive mutex);
       // the inflight-drain lets a concurrent clear/setExternalHandler wait the
       // invocation out instead of tearing the captured object out mid-call.
-      auto handler = data.externalHandler;
+      std::optional<ExternalHandler> handler(data.externalHandler);
       runHandlerUnlocked(lock, data,
                          [&]
                          {
-                           HandlerInvocationScope inv;
-                           handler(level, output, message);
+                           HandlerInvocationScope inv;          // destroyed LAST
+                           HandlerCopyDropper dropper(handler); // destroyed at depth 1
+                           (*handler)(level, output, message);
                          });
     }
     else
@@ -866,64 +1506,57 @@ public:
                             (!data.rawQueue.empty() && data.useExternalHandler) || data.exit;
                    });
 
-      // Process external handler queue. handlerReentryDepth()==0 is defensive and
-      // consistent with flush()/logDispatch — the worker's loop condition is only
-      // ever evaluated at depth 0 (between invocations), so it never wrongly stops
-      // the drain, but it keeps every handler-dispatch site uniformly gated.
-      while (!data.rawQueue.empty() && data.useExternalHandler && data.externalHandler &&
-             handlerReentryDepth() == 0)
+      // Process external handler queue. Unlike flush(), the worker SWALLOWS a
+      // handler exception and keeps draining — a throwing sink must not terminate
+      // the worker. (On normal return AND on rethrow, deliverOneRawEntryLocked has
+      // already re-acquired the lock and decremented inflight, so the catch
+      // clauses must NOT re-lock.)
+      bool delivered = true;
+      while (delivered)
       {
-        auto [level, rawMessage] = data.rawQueue.front();
-        data.rawQueue.pop();
-
-        // Capture everything needed BEFORE unlocking — clearExternalHandler()
-        // can null data.externalHandler while the lock is released. The gate,
-        // handler copy, and inflight increment (inside runHandlerUnlocked) form
-        // one indivisible critical section under the still-held lock.
-        auto segments = data._compiledFormat;
-        auto timestampFmt = data.timestampFormat;
-        auto handler = data.externalHandler;
-
+        std::exception_ptr handlerError;
         try
         {
-          // On normal return AND on rethrow, runHandlerUnlocked has already
-          // re-acquired the lock and decremented inflight — the catch clauses
-          // must NOT re-lock; a throwing sink must not std::terminate the worker.
-          runHandlerUnlocked(lock, data,
-            [&] { formatAndInvokeRawHandler(level, rawMessage, segments, timestampFmt, handler); });
-        }
-        catch (const std::exception &ex)
-        {
-          std::cerr << "Logger: external handler threw: " << ex.what() << std::endl;
-          continue;
+          delivered = deliverOneRawEntryLocked(lock, data);
         }
         catch (...)
         {
-          std::cerr << "Logger: external handler threw a non-std exception" << std::endl;
-          continue;
+          // `delivered` keeps its prior value (true), so the drain continues.
+          handlerError = std::current_exception();
+        }
+        if (handlerError)
+        {
+          reportAndReleaseUnlocked(lock, handlerError, "external handler threw");
         }
       }
 
-      // Process normal logging queue
-      while (!data.queue.empty())
+      // Process normal logging queue. Guarded like the handler drain above: this
+      // path reaches rotateLogFileIfNeeded() (filesystem_error) and stream writes,
+      // and an escape from runWorker is an uncaught exception on a std::thread —
+      // std::terminate. The exit publication below must still run, so the guard
+      // wraps only the drain.
+      std::exception_ptr sinkError;
+      try
       {
-        rotateLogFileIfNeeded();
-        const std::string &entry = data.queue.front();
-
-        if (data.fileStream)
-        {
-          (*data.fileStream) << entry;
-          data.fileStream->flush();
-        }
-        else
-        {
-          std::cout << entry;
-        }
-        data.queue.pop();
+        drainNormalQueueLocked(data);
+      }
+      catch (...)
+      {
+        sinkError = std::current_exception();
+      }
+      if (sinkError)
+      {
+        reportAndReleaseUnlocked(lock, sinkError, "sink threw in the worker drain");
       }
 
       if (data.exit)
       {
+        // LAST action, still under the lock: publish that this worker is done so
+        // a teardown that could not join it (it detached, or the thread object was
+        // already moved out) can wait for it before destroying LoggerData.
+        data.workerRunning = false;
+        data.workerThreadId = std::thread::id{};
+        data.externalHandlerDone.notify_all();
         break;
       }
     }

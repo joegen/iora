@@ -23,6 +23,15 @@ Logger::LoggerData &Logger::getData()
   return data;
 }
 
+// Single definition of the handler-reentrancy depth (R-12). The frozen-inflight
+// tear-out drain branches on this, so it MUST be one instance process-wide —
+// including across dlopen'd plugins, which are loaded RTLD_LOCAL.
+int &Logger::handlerReentryDepth()
+{
+  static thread_local int depth = 0;
+  return depth;
+}
+
 } // namespace core
 
 // IoraService singleton state — single mutex shared by instancePtr() and destroyInstance()
