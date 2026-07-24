@@ -1042,9 +1042,13 @@ private:
         waitForWorkerExitLocked(lock, data, stoppedGeneration);
       }
       // Nothing will ever drain what the reroute above put on the normal queue once
-      // the worker is gone — write it out rather than destroy it. Swallow a
-      // throwing sink: shutdown() is routinely called from destructors, atexit and
-      // noexcept teardown, where an escaping exception is std::terminate. Before
+      // the worker is gone — write it out rather than destroy it. Contain a
+      // throwing sink (swallow, plus log to cerr when `report`): shutdown() is
+      // routinely called from destructors, atexit and noexcept teardown, where an
+      // escaping exception is std::terminate. `report=false` (static destruction)
+      // silences only THIS thread's diagnostic — a worker still draining at static
+      // destruction reports via its own /*report=*/true sites, so the silence is
+      // not process-wide, only teardown-thread-local. Before
       // the two teardown paths were merged, shutdown() guarded this and
       // ~LoggerData relied on its own catch(...) — keeping the guard HERE keeps the
       // two paths identical, which is the point of sharing the implementation.
@@ -1125,9 +1129,12 @@ private:
     err = nullptr; // release the last reference to the USER object, unlocked
   }
 
+  /// `report` is NOT defaulted: every caller states its diagnostic policy at the
+  /// call site, so a future silent-path caller cannot inherit a `cerr` write by
+  /// omission. The two runWorker sites pass /*report=*/true explicitly.
   static void reportAndReleaseUnlocked(std::unique_lock<std::mutex> &lock,
                                        std::exception_ptr &err, const char *context,
-                                       bool report = true)
+                                       bool report)
   {
     lock.unlock();
     reportAndReleaseNoLock(err, context, report);
@@ -1591,7 +1598,8 @@ public:
         }
         if (handlerError)
         {
-          reportAndReleaseUnlocked(lock, handlerError, "external handler threw");
+          reportAndReleaseUnlocked(lock, handlerError, "external handler threw",
+                                   /*report=*/true);
         }
       }
 
@@ -1611,7 +1619,8 @@ public:
       }
       if (sinkError)
       {
-        reportAndReleaseUnlocked(lock, sinkError, "sink threw in the worker drain");
+        reportAndReleaseUnlocked(lock, sinkError, "sink threw in the worker drain",
+                                 /*report=*/true);
       }
 
       if (data.exit)
@@ -1681,14 +1690,26 @@ public:
     namespace fs = std::filesystem;
     auto logPath = fs::path(data.logBasePath);
     auto logDir = logPath.parent_path();
+    // Use the error_code overloads throughout. This runs UNDER data.mutex on the
+    // SYNC log() path (logDispatch's else branch), where a thrown
+    // std::filesystem_error would escape out of the caller's own Logger::info()
+    // statement — a second, undocumented way a log statement throws besides the
+    // handler. The worker path guards its call in a try/catch, but the sync path
+    // does not; matching deleteOldLogFiles' error_code style keeps a transient
+    // filesystem error non-fatal on both.
+    std::error_code ec;
     // If logDir is empty, use current directory
     if (logDir.empty())
     {
-      logDir = fs::current_path();
+      logDir = fs::current_path(ec);
+      if (ec)
+      {
+        std::cerr << "[Logger] Failed to resolve current path: " << ec.message() << std::endl;
+        return;
+      }
     }
-    if (!fs::exists(logDir))
+    if (!fs::exists(logDir, ec))
     {
-      std::error_code ec;
       fs::create_directories(logDir, ec);
       if (ec)
       {
@@ -1730,7 +1751,14 @@ public:
     auto logDir = logPath.parent_path();
     if (logDir.empty())
     {
-      logDir = fs::current_path();
+      // error_code overload: called under data.mutex from rotateLogFileIfNeeded on
+      // the sync log() path — a throwing current_path() would escape Logger::info().
+      std::error_code cwd_ec;
+      logDir = fs::current_path(cwd_ec);
+      if (cwd_ec)
+      {
+        return; // cannot resolve cwd; nothing to prune
+      }
     }
     std::string baseName = logPath.filename().string();
     std::string prefix = baseName + ".";
@@ -1742,7 +1770,20 @@ public:
       return;
     }
 
-    for (const auto &entry : fs::directory_iterator(logDir, dir_ec))
+    // Drive the iterator with the error_code increment() overload rather than a
+    // range-for: a range-for advances via the THROWING operator++, and
+    // deleteOldLogFiles runs under data.mutex on the sync log() path
+    // (rotateLogFileIfNeeded -> here), where a std::filesystem_error would escape
+    // the caller's own Logger::info(). Keep traversal non-throwing end to end.
+    fs::directory_iterator it(logDir, dir_ec);
+    const fs::directory_iterator end;
+    if (dir_ec)
+    {
+      std::cerr << "[Logger] Failed to open log directory: " << logDir << " - "
+                << dir_ec.message() << std::endl;
+      return;
+    }
+    for (; it != end; it.increment(dir_ec))
     {
       if (dir_ec)
       {
@@ -1750,6 +1791,7 @@ public:
                   << dir_ec.message() << std::endl;
         break;
       }
+      const auto &entry = *it;
       const auto &path = entry.path();
       std::string fname = path.filename().string();
       if (fname.find(prefix) != 0 || fname.size() <= prefix.size())
