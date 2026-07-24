@@ -210,6 +210,10 @@ public:
     data.timestampFormat = timeFormat;
     // Reset current log date so rotateLogFileIfNeeded always opens a new file
     data.currentLogDate.clear();
+    // A fresh init() opens the file via the cleared currentLogDate below, so any
+    // pending reopen from a prior session is moot — reset it for state hygiene so
+    // the flag is never carried across an init().
+    data.fileReopenPending = false;
 
     // Clear any leftover queued messages from a prior session to prevent
     // cross-session leaks (e.g., rawQueue entries left after shutdown when
@@ -316,9 +320,16 @@ public:
     return data.minLevel.load(std::memory_order_relaxed);
   }
 
-  /// \brief Register an external log handler
-  /// When an external handler is registered, file logging and console output are disabled
-  /// \param handler The external handler function to register
+  /// \brief Register an external log handler.
+  /// While a non-empty handler is installed it becomes the SOLE sink: file
+  /// logging and console output are disabled and every record is delivered to the
+  /// handler.
+  /// \note Passing an EMPTY / null handler ({} or nullptr) is treated as an
+  ///       UNINSTALL and behaves identically to clearExternalHandler(): any queued
+  ///       backlog is REROUTED (not dropped) to the file/console — so it is
+  ///       lossless — and file logging resumes on the next log call.
+  ///       clearExternalHandler() is the intent-revealing spelling; prefer it.
+  /// \param handler The external handler function to register (empty == uninstall)
   static void setExternalHandler(ExternalHandler handler)
   {
     auto &data = getData();
@@ -335,6 +346,15 @@ public:
       // wait, unlike the teardown paths (see the helper's doc).
       std::optional<FrozenScope> frozen;
 
+      // Whether a usable callable was actually supplied. Captured BEFORE the
+      // std::move below (reading a moved-from std::function is unspecified). An
+      // EMPTY handler ({} / nullptr) is treated as an UNINSTALL, equivalent to
+      // clearExternalHandler — file logging resumes and any queued backlog is
+      // rerouted (not dropped). This is what makes useExternalHandler honest:
+      // gating file suppression on the flag alone (rotateLogFileIfNeeded) is only
+      // correct because the flag is false for an empty handler (tracker 2026-07-23-3).
+      const bool hasHandler = static_cast<bool>(handler);
+
       // Null the gate and drain any in-flight invocation of the PREVIOUS handler
       // before swapping it out — the same tear-out UAF as clearExternalHandler.
       // Messages logged during this swap window are not delivered to either
@@ -344,24 +364,63 @@ public:
       // argument (self-tearer vs external drain predicates).
       tearOutGateAndDrainInflightLocked(lock, data, doomed, frozen);
 
-      // Discard any entries still queued for the PREVIOUS handler. Rerouting them
-      // to the normal sink would print to cout while the NEW handler is active
-      // (which disables console/file output), and delivering them to the new
-      // handler would be misdelivery — so, consistent with the swap-window "not
-      // delivered to either handler" semantics above, they are dropped. Emptying
-      // rawQueue here also prevents the orphaned-queue busy-spin.
-      data.rawQueue = {};
+      if (hasHandler)
+      {
+        // Discard any entries still queued for the PREVIOUS handler. Rerouting
+        // them to the normal sink would print to cout while the NEW handler is
+        // active (which disables console/file output), and delivering them to the
+        // new handler would be misdelivery — so, consistent with the swap-window
+        // "not delivered to either handler" semantics above, they are dropped.
+        // Emptying rawQueue here also prevents the orphaned-queue busy-spin.
+        data.rawQueue = {};
+      }
+      else if (!data.useExternalHandler)
+      {
+        // EMPTY handler == uninstall: reroute any backlog to the normal file/
+        // console queue (lossless), exactly like clearExternalHandler. The
+        // `!data.useExternalHandler` guard mirrors clearExternalHandler:398 — it
+        // is load-bearing because tearOutGateAndDrainInflightLocked RELEASES the
+        // lock during its inflight-drain wait, so a racing setExternalHandler(real)
+        // may re-arm the gate while we are parked; those rawQueue entries then
+        // belong to the NEW handler and must NOT be rerouted to cout/file.
+        rerouteRawQueueToNormalQueueLocked(data);
+        data.cv.notify_one(); // wake the worker to drain the rerouted entries
+      }
 
-      // Close file stream AFTER the drain (so a racing normal-queue drain never
-      // wrote to a half-torn ofstream), then install the new handler.
-      if (data.fileStream && data.fileStream->is_open())
+      // Close the file stream ONLY when installing a REAL handler (exclusive
+      // semantics: a live handler is the sole sink). An empty-handler uninstall
+      // leaves the stream as-is — if a real handler was previously active the
+      // stream is already null with fileReopenPending set (by that install), so the
+      // next log reopens it; if no handler was active the open stream keeps
+      // running (no spurious close+reopen). Closing AFTER the drain ensures a
+      // racing normal-queue drain never wrote to a half-torn ofstream. Marking the
+      // reopen pending is what lets rotateLogFileIfNeeded reopen the same-day file
+      // once the gate is off (tracker 2026-07-23-5).
+      if (hasHandler && data.fileStream && data.fileStream->is_open())
       {
         data.fileStream->close();
         data.fileStream.reset();
+        data.fileReopenPending = true;
       }
 
-      data.externalHandler = std::move(handler);
-      data.useExternalHandler = true;
+      // swap, NOT move-assign: a plain `externalHandler = std::move(handler)`
+      // would run the destructor of whatever externalHandler currently holds
+      // UNDER data.mutex. That is normally the moved-from husk tearOut already
+      // emptied — but under a racing setExternalHandler(real) that reinstalled a
+      // handler while THIS call was parked in tearOut's inflight-drain wait, the
+      // member holds that racing handler, and destroying it here would run its
+      // user capture destructors under the non-recursive lock (a capture that
+      // logs -> self-deadlock; one that takes a user lock -> ABBA). swap routes
+      // the displaced value out on the by-value `handler` parameter, destroyed at
+      // function return AFTER this lock scope closes — the same guarantee `doomed`
+      // gives the pre-tearOut handler. SAME libc++ caveat as the tearOut swap
+      // (:1353): swap of two NON-EMPTY std::functions is bytewise on libstdc++ (no
+      // user code) but move-constructs+destroys small-buffer targets on libc++, so
+      // the fully-portable close-out is the shared_ptr<const ExternalHandler>
+      // refcount-bump tracked in backlog 2026-07-22-3 (which must enumerate THIS
+      // swap site as well as tearOut and the dispatch copy).
+      data.externalHandler.swap(handler);
+      data.useExternalHandler = hasHandler;
     }
   }
 
@@ -400,7 +459,9 @@ public:
         rerouteRawQueueToNormalQueueLocked(data);
         data.cv.notify_one(); // wake the worker to drain the rerouted entries
       }
-      // File logging will be restored on next log call via rotateLogFileIfNeeded
+      // File logging will be restored on the next log call: the setExternalHandler
+      // that installed the now-removed handler armed fileReopenPending when it
+      // closed the stream, so rotateLogFileIfNeeded reopens the same-day file.
     }
   }
 
@@ -717,6 +778,15 @@ public:
     std::unique_ptr<std::ofstream> fileStream;
     std::string logBasePath;
     std::string currentLogDate;
+    /// One-shot "the file stream was deliberately closed and must be reopened on
+    /// the next log" flag. Set true when setExternalHandler closes the stream to
+    /// install a real handler; consumed (reset to false) at the top of
+    /// rotateLogFileIfNeeded's reopen branch, so a genuine open failure retries at
+    /// most once, matching the per-day rotation cadence. Without this, a stream
+    /// closed for a reason OTHER than date rollover (a handler cycle) would never
+    /// reopen the same calendar day, silently degrading file logging to std::cout
+    /// (tracker 2026-07-23-5). Plain bool: read/written ONLY under `mutex`.
+    bool fileReopenPending = false;
     int retentionDays = 7;
     std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
     ExternalHandler externalHandler;
@@ -1519,33 +1589,46 @@ private:
     return true;
   }
 
+  /// \brief Push a fully-formatted line onto the NORMAL queue, colorizing ONLY in
+  /// pure console-only mode. Precondition: `data.mutex` HELD. The sink is chosen at
+  /// DRAIN time, and fileReopenPending can flip fileStream null->open between
+  /// enqueue and drain, so the colorize decision keys on the STABLE
+  /// `logBasePath.empty()` predicate, never the transient `!fileStream` — a
+  /// configured file must never receive ANSI escape codes (tracker 2026-07-23-5).
+  /// One home for that console-color invariant, so the two enqueue sites (reroute
+  /// and logDispatch's async branch) cannot drift apart.
+  static void enqueueFormattedLocked(LoggerData &data, Level level, std::string formatted)
+  {
+    if (data.logBasePath.empty() && data._enableConsoleColors)
+    {
+      data.queue.push(colorizeOutput(formatted, level));
+    }
+    else
+    {
+      data.queue.push(std::move(formatted));
+    }
+  }
+
   /// \brief Reroute any entries still queued for a REMOVED external handler from
   /// rawQueue to the normal queue, formatted with the current compiled format.
-  /// Called under `mutex` by clearExternalHandler AFTER the in-flight drain (after
-  /// a clear there is no handler, so console/file output is restored — the correct
-  /// sink for these). Prevents (a) message loss and (b) an ORPHANED non-empty
-  /// rawQueue that would busy-spin the worker (its cv predicate stays satisfied
-  /// while the drain loop is gated off by useExternalHandler==false). rawQueue is
-  /// only ever populated in async mode, so this is a no-op in sync mode.
-  /// (setExternalHandler DROPS its old backlog instead — see there.)
+  /// Called under `mutex` after the in-flight drain by clearExternalHandler AND by
+  /// setExternalHandler on an EMPTY-handler uninstall (both leave no handler, so
+  /// console/file output is the correct sink) and by the teardown path. Prevents
+  /// (a) message loss and (b) an ORPHANED non-empty rawQueue that would busy-spin
+  /// the worker (its cv predicate stays satisfied while the drain loop is gated off
+  /// by useExternalHandler==false). rawQueue is only ever populated in async mode,
+  /// so this is a no-op in sync mode. (setExternalHandler DROPS its old backlog
+  /// only when installing a REAL handler — see there.)
   static void rerouteRawQueueToNormalQueueLocked(LoggerData &data)
   {
     while (!data.rawQueue.empty())
     {
-      auto [level, rawMessage] = data.rawQueue.front();
+      const Level level = data.rawQueue.front().first;
+      std::string rawMessage = std::move(data.rawQueue.front().second); // move, as deliverOneRawEntryLocked does
       data.rawQueue.pop();
-      std::string formatted =
-        formatLogMessageInternal(level, rawMessage, data._compiledFormat, data.timestampFormat);
-      // Match logDispatch's colorization: colorize before queuing when writing to
-      // a color-enabled console (the level is lost once queued as a plain string).
-      if (!data.fileStream && data._enableConsoleColors)
-      {
-        data.queue.push(colorizeOutput(formatted, level));
-      }
-      else
-      {
-        data.queue.push(std::move(formatted));
-      }
+      enqueueFormattedLocked(
+        data, level,
+        formatLogMessageInternal(level, rawMessage, data._compiledFormat, data.timestampFormat));
     }
   }
 
@@ -1568,14 +1651,10 @@ public:
         {
           data.rawQueue.push({level, message});
         }
-        else if (!data.fileStream && data._enableConsoleColors)
-        {
-          // Colorize before queuing (level is lost once queued).
-          data.queue.push(colorizeOutput(output, level));
-        }
         else
         {
-          data.queue.push(std::move(output));
+          // Same console-color invariant as the reroute path — one home for it.
+          enqueueFormattedLocked(data, level, std::move(output));
         }
       }
       data.cv.notify_one();
@@ -1609,7 +1688,11 @@ public:
       }
       else
       {
-        std::cout << colorizeOutput(output, level);
+        // Colorize only in pure console-only mode (no file configured). When a
+        // file IS configured but momentarily unopenable, fall back to cout in
+        // PLAIN text — consistent with the async enqueue/reroute decision so a
+        // configured deployment never emits ANSI (tracker 2026-07-23-5 review).
+        std::cout << (data.logBasePath.empty() ? colorizeOutput(output, level) : output);
       }
     }
   }
@@ -1773,9 +1856,17 @@ public:
     }
 
     std::string today = currentDate();
-    if (today != data.currentLogDate)
+    // Reopen when the date rolled over OR when the stream was deliberately closed
+    // by a handler install (fileReopenPending) — the pre-fix date-only guard could
+    // not detect a stream closed for a reason other than rollover, so a same-day
+    // handler cycle left file logging dead (tracker 2026-07-23-5).
+    const bool dateChanged = (today != data.currentLogDate);
+    if (dateChanged || data.fileReopenPending)
     {
       data.currentLogDate = today;
+      // One-shot: cleared unconditionally so a genuine open failure below retries
+      // at most once (matching the pre-fix per-day cadence), never per log call.
+      data.fileReopenPending = false;
       std::string rotatedPath =
         (logDir / (logPath.filename().string() + "." + data.currentLogDate + ".log")).string();
 
@@ -1786,7 +1877,14 @@ public:
         data.fileStream.reset();
       }
 
-      deleteOldLogFiles();
+      // Retention sweep is a date-rollover concern ONLY. Running it on a
+      // reopen-pending pass would re-scan the whole log directory on every log
+      // call while a path stays unopenable — the storm the fileReopenPending
+      // one-shot exists to prevent.
+      if (dateChanged)
+      {
+        deleteOldLogFiles();
+      }
     }
   }
 
