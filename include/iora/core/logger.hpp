@@ -791,10 +791,36 @@ public:
 #if defined(IORA_CORE_SHARED) || defined(IORA_CORE_BUILDING)
   static LoggerData &getData();
 #else
+  // Header-only fallback (iora_core target ABSENT — vendored-include consumers).
+  // IMMORTAL / deliberately-leaked singleton (tracker 2026-07-23-4), same as the
+  // out-of-line getData() in src/core/iora_core.cpp. Never destroyed: the mutex/CVs
+  // must outlive every static that may log from its own destructor (scenario 2 —
+  // a static-destruction-ORDER bug, image-count-independent, so it bites this
+  // header-only build too) and every parked self-tearer at process exit
+  // (scenario 1). Do NOT revert to `static LoggerData data;` and do NOT delete this
+  // pointer — that reopens both UB paths. atexitReapNoDestroy is registered EXACTLY
+  // ONCE, tied to this magic-static initializer. NOTE this does NOT worsen the
+  // multi-instance property already inherent to a header-only build: the singleton
+  // is one copy PER IMAGE here by construction, and making each image's copy
+  // immortal is strictly safer than destroying it — instance count is unchanged.
+  // SYNC HAZARD: this initializer is byte-identical to the out-of-line getData() in
+  // src/core/iora_core.cpp (the shared-build definition). The two are mutually
+  // exclusive (this #else is compiled only when iora_core is ABSENT), but any change
+  // to the registration/return-value-check/message here MUST be mirrored there.
   static LoggerData &getData()
   {
-    static LoggerData data;
-    return data;
+    static LoggerData *data = []
+    {
+      auto *d = new LoggerData();
+      if (std::atexit(&Logger::atexitReapNoDestroy) != 0)
+      {
+        std::cerr << "Logger: std::atexit registration failed; no exit-time flush "
+                     "will run"
+                  << std::endl;
+      }
+      return d;
+    }();
+    return *data;
   }
 #endif
 
@@ -993,7 +1019,7 @@ private:
       {
         if (report)
         {
-          std::cerr << "Logger: shutdown() called from the logger worker thread; "
+          std::cerr << "Logger: teardown called from the logger worker thread; "
                        "skipping self-join"
                     << std::endl;
         }
@@ -1081,6 +1107,33 @@ private:
     // atexit and noexcept teardown, where an escape is std::terminate).
     reportAndReleaseNoLock(sinkError, "sink threw during the teardown drain", report);
     reportAndReleaseNoLock(flushError, "sink threw during the teardown flush", report);
+  }
+
+  /// \brief atexit handler (tracker 2026-07-23-4): reap the worker and flush at
+  /// process exit WITHOUT destroying the immortal LoggerData singleton. Registered
+  /// EXACTLY ONCE from getData()'s initializer (see getData() in
+  /// src/core/iora_core.cpp and the header-only fallback below). Reuses
+  /// teardownAndReapWorker — the six-iteration-hardened, deadlock-free path — which
+  /// under the immortal singleton destroys NOTHING: it reroutes the async
+  /// handler backlog (rerouteRawQueueToNormalQueueLocked), joins the worker at
+  /// depth 0 (or detaches self at depth > 0, i.e. std::exit() running from inside a
+  /// handler), then drains + flushes. This replaces the exit-time drain/flush the
+  /// removed ~LoggerData used to perform, so buffered output still reaches the sink
+  /// at exit. report=true: std::cerr is provably alive at atexit (ios_base::Init is
+  /// constructed before any lazy getData(), so its destructor is sequenced AFTER
+  /// this later-registered handler) and a silent failed final flush would hide data
+  /// loss. noexcept — an atexit handler that throws calls std::terminate; the inner
+  /// try/catch is belt-and-suspenders on top of teardownAndReapWorker's own
+  /// throwing-sink containment.
+  static void atexitReapNoDestroy() noexcept
+  {
+    try
+    {
+      teardownAndReapWorker(getData(), /*report=*/true);
+    }
+    catch (...)
+    {
+    }
   }
 
   /// \brief Report a caught exception and release it with `lock` RELEASED.

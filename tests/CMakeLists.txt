@@ -92,6 +92,9 @@ set(CORE_TESTS
     core/iora_test_logger
     core/iora_test_logger_external_handler_race
     core/iora_test_logger_self_clear_deadlock
+    core/iora_test_logger_immortal_scenario1_exit_from_handler
+    core/iora_test_logger_immortal_scenario2_static_sink_dtor
+    core/iora_test_logger_immortal_exit_flush
     core/iora_test_threadpool
     core/iora_test_threadpool_cleanup
     core/iora_test_threadpool_lifecycle
@@ -236,6 +239,32 @@ if(TARGET iora_test_kvstore)
     target_compile_options(iora_test_kvstore PRIVATE -Wno-free-nonheap-object)
 endif()
 
+# LoggerData-immortal probes (tracker 2026-07-23-4): each drives a process EXIT
+# (std::exit from a handler, static-destruction ordering, or a forked child that
+# exits). Their assertion is a CLEAN EXIT within a bounded time — a regression
+# (teardown deadlock, hang, or crash) must fail via the TIMEOUT rather than wedge
+# the suite. The scenario-1 probe loops the race, so it gets a larger budget.
+set(IORA_LOGGER_IMMORTAL_PROBE_TESTS
+    core::iora_test_logger_immortal_scenario1_exit_from_handler
+    core::iora_test_logger_immortal_scenario2_static_sink_dtor
+    core::iora_test_logger_immortal_exit_flush
+)
+foreach(_probe_test ${IORA_LOGGER_IMMORTAL_PROBE_TESTS})
+    if(TEST ${_probe_test})
+        set_tests_properties(${_probe_test} PROPERTIES TIMEOUT 60)
+        # Under an ASan build these probes exercise the intentional immortal leak
+        # and process-exit paths. LSan's exit-time StopTheWorld hangs on WSL2
+        # (ptrace/internal_waitpid), so disable the leak check (the immortal is
+        # reachable via a live static pointer and is not a real leak anyway), and
+        # keep handle_segv=0 per the WSL2 ASan convention. detect_leaks=0 does NOT
+        # disable use-after-free detection. Harmless in a non-ASan build.
+        if(IORA_ENABLE_ASAN)
+            set_tests_properties(${_probe_test} PROPERTIES
+                ENVIRONMENT "ASAN_OPTIONS=handle_segv=0:detect_leaks=0")
+        endif()
+    endif()
+endforeach()
+
 # Apply the opt-in sanitizer to the concurrency-sensitive test targets. Each of
 # these exercises header-only concurrency logic (TtlMap/TimerService, Transport
 # + TCP/UDP engines, WebSocketClient reconnect worker, ExpiringCache purge
@@ -256,6 +285,9 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_http_client_retry
     iora_test_logger_external_handler_race
     iora_test_logger_self_clear_deadlock
+    iora_test_logger_immortal_scenario1_exit_from_handler
+    iora_test_logger_immortal_scenario2_static_sink_dtor
+    iora_test_logger_immortal_exit_flush
     test_websocket_reconnect
 )
 foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
