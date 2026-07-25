@@ -92,6 +92,7 @@ set(CORE_TESTS
     core/iora_test_logger
     core/iora_test_logger_external_handler_race
     core/iora_test_logger_self_clear_deadlock
+    core/iora_test_logger_format_snapshot
     core/iora_test_logger_handler_file_restore
     core/iora_test_logger_immortal_scenario1_exit_from_handler
     core/iora_test_logger_immortal_scenario2_static_sink_dtor
@@ -286,6 +287,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_http_client_retry
     iora_test_logger_external_handler_race
     iora_test_logger_self_clear_deadlock
+    iora_test_logger_format_snapshot
     iora_test_logger_handler_file_restore
     iora_test_logger_immortal_scenario1_exit_from_handler
     iora_test_logger_immortal_scenario2_static_sink_dtor

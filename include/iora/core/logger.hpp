@@ -207,7 +207,11 @@ public:
     // If no filePath provided, log to console only (no file)
     data.logBasePath = filePath;
     data.retentionDays = retentionDays;
-    data.timestampFormat = timeFormat;
+    // Republish the format snapshot changing ONLY the timestamp format, CARRYING
+    // the current logFormat + segments unchanged: init() historically did not touch
+    // _logFormat/_compiledFormat, so a setLogFormat() issued before init() must
+    // survive it (do not reset the format to default here).
+    republishFormatSnapshotLocked(data, [&](FormatSnapshot &s) { s.timestampFmt = timeFormat; });
     // Reset current log date so rotateLogFileIfNeeded always opens a new file
     data.currentLogDate.clear();
     // A fresh init() opens the file via the cleared currentLogDate below, so any
@@ -333,27 +337,34 @@ public:
   static void setExternalHandler(ExternalHandler handler)
   {
     auto &data = getData();
-    // Declared BEFORE the lock so the PREVIOUS handler — and everything it
-    // captured — is destroyed AFTER the mutex is released. Destroying a
-    // std::function under data.mutex runs arbitrary user destructors under a
-    // non-recursive lock; a capture whose destructor logs would re-enter
-    // logDispatch and self-deadlock.
-    ExternalHandler doomed;
+    // hasHandler is read BEFORE the std::move below — reading a moved-from
+    // std::function is unspecified (libstdc++ yields false, which would silently
+    // turn every install into an uninstall). An EMPTY handler ({} / nullptr) is an
+    // UNINSTALL, equivalent to clearExternalHandler (file logging resumes, backlog
+    // rerouted); this is what keeps useExternalHandler honest — gating file
+    // suppression on the flag alone (rotateLogFileIfNeeded) is only correct because
+    // the flag is false for an empty handler (tracker 2026-07-23-3).
+    const bool hasHandler = static_cast<bool>(handler);
+    // Build the shared_ptr wrapper BEFORE acquiring data.mutex: make_shared
+    // move-constructs the std::function, which on a libc++ small-buffer target runs
+    // the captured object's MOVE-constructor (user code). Doing it under the lock
+    // would run user code under the non-recursive mutex — the very hazard holding
+    // the handler as a shared_ptr exists to remove. Only the pointer swap happens
+    // under the lock. An uninstall builds NO wrapper (stores a null shared_ptr).
+    std::shared_ptr<const ExternalHandler> incoming =
+      hasHandler ? std::make_shared<const ExternalHandler>(std::move(handler)) : nullptr;
+    // Declared BEFORE the lock so the PREVIOUS handler — and everything it captured
+    // — is destroyed AFTER the mutex is released: the displaced shared_ptr's
+    // last-reference drop runs user capture destructors, which must not run under
+    // the non-recursive data.mutex (a capture whose dtor logs would re-enter and
+    // self-deadlock).
+    std::shared_ptr<const ExternalHandler> doomed;
     {
       std::unique_lock<std::mutex> lock(data.mutex);
       // Declared AFTER the lock so the frozen registration is released while
       // data.mutex is still held. A normal tear-out is pinned only for its own
       // wait, unlike the teardown paths (see the helper's doc).
       std::optional<FrozenScope> frozen;
-
-      // Whether a usable callable was actually supplied. Captured BEFORE the
-      // std::move below (reading a moved-from std::function is unspecified). An
-      // EMPTY handler ({} / nullptr) is treated as an UNINSTALL, equivalent to
-      // clearExternalHandler — file logging resumes and any queued backlog is
-      // rerouted (not dropped). This is what makes useExternalHandler honest:
-      // gating file suppression on the flag alone (rotateLogFileIfNeeded) is only
-      // correct because the flag is false for an empty handler (tracker 2026-07-23-3).
-      const bool hasHandler = static_cast<bool>(handler);
 
       // Null the gate and drain any in-flight invocation of the PREVIOUS handler
       // before swapping it out — the same tear-out UAF as clearExternalHandler.
@@ -403,23 +414,17 @@ public:
         data.fileReopenPending = true;
       }
 
-      // swap, NOT move-assign: a plain `externalHandler = std::move(handler)`
-      // would run the destructor of whatever externalHandler currently holds
-      // UNDER data.mutex. That is normally the moved-from husk tearOut already
-      // emptied — but under a racing setExternalHandler(real) that reinstalled a
-      // handler while THIS call was parked in tearOut's inflight-drain wait, the
-      // member holds that racing handler, and destroying it here would run its
-      // user capture destructors under the non-recursive lock (a capture that
-      // logs -> self-deadlock; one that takes a user lock -> ABBA). swap routes
-      // the displaced value out on the by-value `handler` parameter, destroyed at
-      // function return AFTER this lock scope closes — the same guarantee `doomed`
-      // gives the pre-tearOut handler. SAME libc++ caveat as the tearOut swap
-      // (:1353): swap of two NON-EMPTY std::functions is bytewise on libstdc++ (no
-      // user code) but move-constructs+destroys small-buffer targets on libc++, so
-      // the fully-portable close-out is the shared_ptr<const ExternalHandler>
-      // refcount-bump tracked in backlog 2026-07-22-3 (which must enumerate THIS
-      // swap site as well as tearOut and the dispatch copy).
-      data.externalHandler.swap(handler);
+      // swap of two shared_ptr<const ExternalHandler>: a pure pointer/refcount
+      // exchange that runs NO user code under the lock on any platform (the former
+      // std::function swap was bytewise on libstdc++ but move-constructed+destroyed
+      // small-buffer targets on libc++). `incoming` was built above the lock, so the
+      // only work here is the pointer exchange. The displaced value (the racing
+      // handler a concurrent setExternalHandler may have reinstalled while THIS call
+      // was parked in tearOut's drain, else the moved-from husk tearOut emptied) is
+      // routed out on `incoming`, destroyed at function return AFTER this lock scope
+      // closes — the same unlocked-destruction guarantee `doomed` gives the
+      // pre-tearOut handler.
+      data.externalHandler.swap(incoming);
       data.useExternalHandler = hasHandler;
     }
   }
@@ -439,7 +444,7 @@ public:
     auto &data = getData();
     // Declared BEFORE the lock — see setExternalHandler: the removed handler's
     // captured state must be destroyed with data.mutex released.
-    ExternalHandler doomed;
+    std::shared_ptr<const ExternalHandler> doomed;
     {
       std::unique_lock<std::mutex> lock(data.mutex);
       std::optional<FrozenScope> frozen; // released under the lock at scope exit
@@ -467,7 +472,7 @@ public:
 
   /// \brief Set the log format string (thread-safe)
   /// Supported placeholders:
-  ///   %T - timestamp (uses timestampFormat from init())
+  ///   %T - timestamp (uses the published snapshot's timestamp format, set by init())
   ///   %t - thread ID (hex hash: 8 digits on 32-bit, 16 digits on 64-bit)
   ///   %L - log level (e.g., INFO, DEBUG, ERROR)
   ///   %m - message content
@@ -494,17 +499,22 @@ public:
     }
     auto &data = getData();
     std::lock_guard<std::mutex> lock(data.mutex);
-    data._logFormat = format;
-    compileFormat(format, data._compiledFormat);
+    // Republish the whole snapshot changing logFormat + segments, CARRYING the
+    // current timestamp format unchanged (compileFormat clears the cloned segments
+    // first, so the clone's old segments are replaced, not appended).
+    republishFormatSnapshotLocked(data,
+                                  [&](FormatSnapshot &s)
+                                  {
+                                    s.logFormat = format;
+                                    compileFormat(format, s.segments);
+                                  });
   }
 
   /// \brief Get the current log format string
   /// \return The current log format string
   static std::string getLogFormat()
   {
-    auto &data = getData();
-    std::lock_guard<std::mutex> lock(data.mutex);
-    return data._logFormat;
+    return currentFormatSnapshot()->logFormat;
   }
 
   /// \brief Enable or disable ANSI color codes for console output
@@ -708,6 +718,35 @@ public:
     std::string literal;  ///< Only used when token == Literal
   };
 
+  /// \brief Immutable snapshot of the log-format configuration (tracker
+  /// 2026-07-22-3). The original format string, the pre-compiled segments, and the
+  /// timestamp format are ALWAYS read together, so bundling them into one
+  /// object published behind a std::shared_ptr<const FormatSnapshot> lets a reader
+  /// take a single refcount bump under data.mutex instead of deep-copying the
+  /// segment vector + timestamp string on every message — and guarantees a reader
+  /// never sees a torn pair (segments from one publish, timestampFmt from another).
+  /// Publishers (setLogFormat, init) REPLACE the pointer whole under the lock; the
+  /// object itself is never mutated after publication.
+  struct FormatSnapshot
+  {
+    std::string logFormat;                ///< original format string (getLogFormat)
+    std::vector<FormatSegment> segments;  ///< pre-compiled segments
+    std::string timestampFmt;             ///< strftime timestamp format
+  };
+
+  /// \brief Build the default, never-null initial snapshot (default format
+  /// "[%T] [%L] %m", default timestamp "%Y-%m-%d %H:%M:%S", segments pre-compiled).
+  /// Called at LoggerData construction so no reader ever observes a null/empty
+  /// snapshot and the former lazy compile-on-first-use is retired.
+  static std::shared_ptr<const FormatSnapshot> makeDefaultSnapshot()
+  {
+    auto snap = std::make_shared<FormatSnapshot>();
+    snap->logFormat = "[%T] [%L] %m";
+    snap->timestampFmt = "%Y-%m-%d %H:%M:%S";
+    compileFormat(snap->logFormat, snap->segments);
+    return snap;
+  }
+
   struct LoggerData
   {
     /// LOCK DISCIPLINE (single source of truth for this class):
@@ -735,22 +774,28 @@ public:
     ///    may take `mutex` while holding a stream lock — a user streambuf on
     ///    cout/cerr that logs would self-deadlock on this non-recursive mutex.
     ///  - It is NEVER held across a user callback (copy-then-invoke: every dispatch
-    ///    site copies the handler under the lock, unlocks, then invokes) and never
-    ///    across the DESTRUCTION of a user callback: clear/setExternalHandler and
-    ///    both teardown paths move the doomed std::function into a caller-owned
-    ///    local destroyed after unlocking, and the dispatch sites destroy their
-    ///    in-flight copy inside the unlocked window via HandlerCopyDropper. A catch
+    ///    site refcount-bumps the handler shared_ptr under the lock, unlocks, then
+    ///    invokes) and never across the DESTRUCTION of a user callback. The handler
+    ///    is a std::shared_ptr<const ExternalHandler> (tracker 2026-07-22-3), so the
+    ///    under-lock COPY (dispatch sites), the tear-out SWAP
+    ///    (tearOutGateAndDrainInflightLocked) and the INSTALL SWAP (setExternalHandler)
+    ///    are all pointer/refcount exchanges that run NO user code under the lock on
+    ///    any platform; the install-path make_shared that move-constructs the user
+    ///    std::function is built ABOVE the lock. clear/setExternalHandler and both
+    ///    teardown paths move the doomed shared_ptr into a caller-owned local
+    ///    destroyed after unlocking, and the dispatch sites drop their in-flight
+    ///    shared_ptr copy inside the unlocked window via HandlerCopyDropper. A catch
     ///    site inside a locked scope either routes through reportAndReleaseUnlocked
     ///    or stashes into an exception_ptr declared ABOVE the lock (flush(),
     ///    teardownAndReapWorker) — ex.what() and the destruction of a caught
     ///    exception object are user code too.
-    ///    STILL under-lock user code, and NOT a complete close-out on its own:
-    ///      (a) the handler COPY (dispatch sites), the tear-out SWAP
-    ///          (tearOutGateAndDrainInflightLocked) and the handler INSTALL
-    ///          (setExternalHandler's move-assign) — backlog 2026-07-22-3 reduces
-    ///          these to a refcount bump;
-    ///      (b) sink and diagnostic I/O through a user streambuf on cout/cerr —
-    ///          see the sink-I/O bullet above; OUTSIDE that backlog's scope.
+    ///    CAVEAT — the refcount bump removes the under-lock COPY/MOVE-constructor,
+    ///    but the LAST-reference DESTRUCTOR of the handler still runs user capture
+    ///    destructors; it is kept safe (not eliminated) by always dropping the last
+    ///    reference in the UNLOCKED window — at a `doomed` destruction or a
+    ///    HandlerCopyDropper reset (the latter at reentry-depth >= 1). The one
+    ///    remaining under-lock user-code path is (b) sink and diagnostic I/O through
+    ///    a user streambuf on cout/cerr — see the sink-I/O bullet above.
     ///    Do not restate a narrower claim here; docs/iora/logger_external_handlers.md
     ///    enumerates every site.
     ///  - `externalHandlerInflight` and `externalHandlerFrozen` are mutated AND read
@@ -788,8 +833,17 @@ public:
     /// (tracker 2026-07-23-5). Plain bool: read/written ONLY under `mutex`.
     bool fileReopenPending = false;
     int retentionDays = 7;
-    std::string timestampFormat = "%Y-%m-%d %H:%M:%S";
-    ExternalHandler externalHandler;
+    /// Format configuration snapshot (COW, tracker 2026-07-22-3). Replaces the
+    /// former _logFormat, _compiledFormat, and timestampFormat members. NEVER null:
+    /// initialized to the default snapshot at construction and only ever
+    /// WHOLE-replaced under `mutex` (never mutated in place).
+    std::shared_ptr<const FormatSnapshot> _formatSnapshot = makeDefaultSnapshot();
+    /// Installed external handler behind a shared_ptr so the under-lock dispatch
+    /// copy, the tear-out swap, and the install swap are a refcount bump — no user
+    /// copy- OR move-constructor runs under `mutex` on any platform. NULL == no
+    /// handler installed (canonical uninstall form; keeps the useExternalHandler /
+    /// externalHandler gate checks correct as pointer-null tests).
+    std::shared_ptr<const ExternalHandler> externalHandler;
     bool useExternalHandler = false;
     /// In-flight count of external-handler invocations currently executing in
     /// their unlocked window (runWorker + any concurrent flush()). Plain int,
@@ -832,10 +886,6 @@ public:
     /// exits, so it cannot go stale across thread-id reuse the way the removed
     /// handler-self-detection scheme could.)
     std::thread::id workerThreadId;
-    /// Original log format string (for getLogFormat())
-    std::string _logFormat = "[%T] [%L] %m";
-    /// Pre-compiled format segments for fast formatting
-    std::vector<FormatSegment> _compiledFormat;
     /// Enable ANSI color codes for console output
     bool _enableConsoleColors = false;
     /// Cache whether stdout is a TTY
@@ -1062,7 +1112,7 @@ private:
   {
     // `doomed` outlives every lock scope: destroying a handler runs user capture
     // destructors, which must not happen under data.mutex.
-    ExternalHandler doomed;
+    std::shared_ptr<const ExternalHandler> doomed;
     std::thread worker;
     std::optional<FrozenScope> frozen;
     FrozenReleaser frozenReleaser(data, frozen); // releases it UNDER the mutex
@@ -1342,20 +1392,16 @@ private:
   /// the teardown path. clear/setExternalHandler destroy the slot at the end of
   /// their locked scope; shutdown()/~LoggerData keep it until after the join.
   static void tearOutGateAndDrainInflightLocked(std::unique_lock<std::mutex> &lock,
-                                                LoggerData &data, ExternalHandler &doomed,
+                                                LoggerData &data,
+                                                std::shared_ptr<const ExternalHandler> &doomed,
                                                 std::optional<FrozenScope> &frozenSlot)
   {
-    // Null both gate fields together so no NEW invocation can start, THEN drain.
-    // SWAP (not move-then-null): a moved-from std::function is "valid but
-    // unspecified", so a `= nullptr` afterwards could, in principle, destroy a live
-    // target — running user destructors under data.mutex, the very hazard `doomed`
-    // exists to prevent. swap() avoids that on libstdc++ (a bytewise swap of the
-    // stored callable), but the standard does not GUARANTEE a swap runs no user
-    // code: libc++ move-constructs and destroys small-buffer targets. The portable
-    // close-out is holding the handler as shared_ptr<const ExternalHandler> so the
-    // under-lock operation is a refcount bump — tracked in backlog 2026-07-22-3,
-    // whose acceptance criterion is exactly "no user code runs under data.mutex on
-    // ANY path". The caller destroys `doomed` after unlocking.
+    // Null the gate so no NEW invocation can start, THEN drain. The handler is a
+    // shared_ptr<const ExternalHandler>, so this swap is a pure pointer/refcount
+    // exchange — it runs NO user code under data.mutex on any platform. The
+    // displaced pointer lands in `doomed`; its last-reference drop (which runs the
+    // user capture destructors) happens after the caller unlocks. useExternalHandler
+    // is nulled alongside so the gate check and the flag stay consistent.
     data.externalHandler.swap(doomed);
     data.useExternalHandler = false;
     const int depth = handlerReentryDepth();
@@ -1426,9 +1472,8 @@ private:
   /// on-stack copy, taken under the lock while the loop gate required
   /// externalHandler non-null, so it is guaranteed non-null here.
   static void formatAndInvokeRawHandler(Level level, const std::string &rawMessage,
-                                        const std::vector<FormatSegment> &segments,
-                                        const std::string &timestampFmt,
-                                        std::optional<ExternalHandler> &handler)
+                                        const std::shared_ptr<const FormatSnapshot> &snapshot,
+                                        std::shared_ptr<const ExternalHandler> &handler)
   {
     HandlerInvocationScope inv;          // declared FIRST -> destroyed LAST
     HandlerCopyDropper dropper(handler); // destroyed FIRST, i.e. still at depth 1
@@ -1440,7 +1485,7 @@ private:
     // dispatches nothing and takes no lock, so doing it at depth 1 is
     // behaviour-preserving. RULE: everything throwable belongs inside the guards.
     std::string formattedMessage =
-      formatLogMessageInternal(level, rawMessage, segments, timestampFmt);
+      formatLogMessageInternal(level, rawMessage, snapshot->segments, snapshot->timestampFmt);
     (*handler)(level, formattedMessage, rawMessage);
     // ORDER IS LOAD-BEARING (and it keeps the post-scope window free of user code:
     // once the dropper is destroyed here, nothing user-supplied runs between
@@ -1519,12 +1564,14 @@ private:
   {
     // Explicit ctor for the same reason as FrozenReleaser: a user-declared (even
     // deleted) constructor stops this being an aggregate in C++20.
-    explicit HandlerCopyDropper(std::optional<ExternalHandler> &slot) : _slot(slot) {}
+    explicit HandlerCopyDropper(std::shared_ptr<const ExternalHandler> &slot) : _slot(slot) {}
     ~HandlerCopyDropper()
     {
-      // Implicitly noexcept, and _slot.reset() runs USER capture destructors. If
-      // one of those throws (e.g. it logs and the sink throws), letting it escape
-      // would std::terminate and erase the diagnosis.
+      // Implicitly noexcept, and _slot.reset() drops this dispatch copy's reference;
+      // when it is the LAST reference (frequently so, after a concurrent tear-out
+      // moved the stored handler into `doomed`) it runs the USER capture
+      // destructors. If one of those throws (e.g. it logs and the sink throws),
+      // letting it escape would std::terminate and erase the diagnosis.
       try
       {
         _slot.reset();
@@ -1537,16 +1584,16 @@ private:
     HandlerCopyDropper &operator=(const HandlerCopyDropper &) = delete;
 
   private:
-    std::optional<ExternalHandler> &_slot;
+    std::shared_ptr<const ExternalHandler> &_slot;
   };
 
   /// \brief Deliver ONE rawQueue entry to the external handler outside
   /// `data.mutex`. Precondition: `lock` HELD. Returns false — with the lock still
   /// held and nothing delivered — when the queue is empty or the gate is closed.
   ///
-  /// The gate check, the three capture copies, and the in-flight increment inside
-  /// runHandlerUnlocked form ONE indivisible critical section under the still-held
-  /// lock: a tear-out (clear/setExternalHandler) can null the gate the moment the
+  /// The gate check, the snapshot and handler refcount bumps, and the in-flight
+  /// increment inside runHandlerUnlocked form ONE indivisible critical section under
+  /// the still-held lock: a tear-out (clear/setExternalHandler) can null the gate the moment the
   /// lock is released, so everything the invocation needs must be copied first.
   /// This is the invariant the whole tear-out drain rests on, which is why the two
   /// drain sites (flush() and runWorker()) share this one implementation rather
@@ -1577,15 +1624,16 @@ private:
     std::string rawMessage = std::move(data.rawQueue.front().second);
     data.rawQueue.pop();
 
-    auto segments = data._compiledFormat;
-    auto timestampFmt = data.timestampFormat;
-    std::optional<ExternalHandler> handler(data.externalHandler);
+    // COW refcount bumps (no deep copy of the segment vector / timestamp string,
+    // no user copy-ctor): both are taken under the still-held lock and held across
+    // the entire unlocked invoke window (formatAndInvokeRawHandler reads through
+    // them). The handler shared_ptr copy is the in-flight reference the dropper
+    // releases inside that window (see HandlerCopyDropper).
+    auto snapshot = data._formatSnapshot;
+    std::shared_ptr<const ExternalHandler> handler = data.externalHandler;
 
     runHandlerUnlocked(lock, data,
-                       [&] {
-                         formatAndInvokeRawHandler(level, rawMessage, segments, timestampFmt,
-                                                   handler);
-                       });
+                       [&] { formatAndInvokeRawHandler(level, rawMessage, snapshot, handler); });
     return true;
   }
 
@@ -1626,9 +1674,10 @@ private:
       const Level level = data.rawQueue.front().first;
       std::string rawMessage = std::move(data.rawQueue.front().second); // move, as deliverOneRawEntryLocked does
       data.rawQueue.pop();
-      enqueueFormattedLocked(
-        data, level,
-        formatLogMessageInternal(level, rawMessage, data._compiledFormat, data.timestampFormat));
+      enqueueFormattedLocked(data, level,
+                             formatLogMessageInternal(level, rawMessage,
+                                                      data._formatSnapshot->segments,
+                                                      data._formatSnapshot->timestampFmt));
     }
   }
 
@@ -1668,7 +1717,7 @@ public:
       // that re-enters Logger would self-deadlock on the non-recursive mutex);
       // the inflight-drain lets a concurrent clear/setExternalHandler wait the
       // invocation out instead of tearing the captured object out mid-call.
-      std::optional<ExternalHandler> handler(data.externalHandler);
+      std::shared_ptr<const ExternalHandler> handler(data.externalHandler);
       runHandlerUnlocked(lock, data,
                          [&]
                          {
@@ -1772,20 +1821,16 @@ public:
     }
   }
 
-  static std::string timestamp()
+  /// \brief Render the current wall-clock time through `fmt` (strftime), appending
+  /// a millisecond field ONLY when `fmt` contains %S, and returning "[invalid-time]"
+  /// if localtime conversion fails. ONE home for the .mmm rule and the fallback,
+  /// shared by timestamp() and both formatLogMessageInternal overloads
+  /// (tracker 2026-07-22-3). Takes no lock — the caller supplies the format.
+  static std::string renderTimestamp(const std::string &fmt)
   {
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-    // Snapshot timestampFormat under lock to avoid a race with init()
-    auto &data = getData();
-    std::string fmt;
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-      fmt = data.timestampFormat;
-    }
-
     struct tm tmBuf{};
     if (!detail::localTimeReentrant(&t, &tmBuf))
     {
@@ -1798,6 +1843,12 @@ public:
       oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
     }
     return oss.str();
+  }
+
+  static std::string timestamp()
+  {
+    // Refcount-bump the snapshot under the lock (race-free vs init()), render outside.
+    return renderTimestamp(currentFormatSnapshot()->timestampFmt);
   }
 
   static std::string currentDate()
@@ -2189,51 +2240,33 @@ public:
     log(level, std::string(buffer.data(), size));
   }
 
-  /// \brief Internal helper to format log message without locking
-  /// \param level The log level
-  /// \param message The raw message content
-  /// \param segments Pre-compiled format segments
-  /// \param timestampFmt Timestamp format string
-  /// \return Formatted log string with newline
-  /// \note Caller must ensure thread-safety (no locking performed internally)
-  static std::string formatLogMessageInternal(Level level, const std::string &message,
-                                              const std::vector<FormatSegment> &segments,
-                                              const std::string &timestampFmt)
+  /// \brief Core formatter (no locking). Renders `segments` into a line. Source
+  /// location is optional: when `hasLocation` is false, the %F/%l/%f placeholders
+  /// emit NOTHING (an empty field) — NOT "0" for %l. This preserves the historic
+  /// two-overload behaviour where the no-location form omitted the line entirely;
+  /// delegating a no-location call with ("",0,"") would wrongly print 0.
+  /// \note Caller must ensure thread-safety (no locking performed internally).
+  static std::string formatLogMessageImpl(Level level, const std::string &message,
+                                          const std::vector<FormatSegment> &segments,
+                                          const std::string &timestampFmt, const char *file,
+                                          int line, const char *function, bool hasLocation)
   {
-    // Pre-generate timestamp once to avoid redundant time syscalls
+    // Render the timestamp once (only if a %T segment exists) to avoid redundant
+    // time syscalls; the .mmm/%S rule and the [invalid-time] fallback live in
+    // renderTimestamp (one home).
     std::string timestampStr;
-    bool needsTimestamp = false;
     for (const auto &seg : segments)
     {
       if (seg.token == FormatToken::Timestamp)
       {
-        needsTimestamp = true;
+        timestampStr = renderTimestamp(timestampFmt);
         break;
       }
     }
 
-    if (needsTimestamp)
-    {
-      auto now = std::chrono::system_clock::now();
-      auto t = std::chrono::system_clock::to_time_t(now);
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()) % 1000;
-      struct tm tmBuf{};
-      if (!detail::localTimeReentrant(&t, &tmBuf))
-      {
-        timestampStr = "[invalid-time]";
-      }
-      else
-      {
-        std::ostringstream tsOss;
-        tsOss << std::put_time(&tmBuf, timestampFmt.c_str());
-        if (timestampFmt.find("%S") != std::string::npos)
-        {
-          tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-        }
-        timestampStr = tsOss.str();
-      }
-    }
+    // basename returns a const char* into `file`; keep it a pointer (no per-message
+    // std::string allocation on the format hot path).
+    const char *filename = hasLocation ? detail::basename(file) : "";
 
     std::ostringstream oss;
     for (const auto &seg : segments)
@@ -2248,10 +2281,10 @@ public:
         break;
       case FormatToken::ThreadId:
         {
-          // Convert thread ID to numeric hash for consistent formatting across platforms
+          // Convert thread ID to numeric hash for consistent formatting across platforms.
           std::hash<std::thread::id> hasher;
           std::size_t threadHash = hasher(std::this_thread::get_id());
-          // Format as hex with width matching size_t (8 chars on 32-bit, 16 chars on 64-bit)
+          // Format as hex with width matching size_t (8 chars on 32-bit, 16 chars on 64-bit).
           oss << std::hex << std::setfill('0') << std::setw(sizeof(std::size_t) * 2)
               << threadHash << std::dec;
         }
@@ -2263,13 +2296,23 @@ public:
         oss << message;
         break;
       case FormatToken::File:
-        // File placeholder - will be empty unless source location provided
+        if (hasLocation)
+        {
+          oss << filename;
+        }
         break;
       case FormatToken::Line:
-        // Line placeholder - will be empty unless source location provided
+        // Emit NOTHING (not "0") when no source location was supplied.
+        if (hasLocation)
+        {
+          oss << line;
+        }
         break;
       case FormatToken::Function:
-        // Function placeholder - will be empty unless source location provided
+        if (hasLocation)
+        {
+          oss << function;
+        }
         break;
       }
     }
@@ -2277,97 +2320,47 @@ public:
     return oss.str();
   }
 
-  /// \brief Internal helper to format log message with source location (no locking)
-  /// \param level The log level
-  /// \param message The raw message content
-  /// \param file Source file name (from __FILE__)
-  /// \param line Source line number (from __LINE__)
-  /// \param function Function name (from __func__)
-  /// \param segments Pre-compiled format segments
-  /// \param timestampFmt Timestamp format string
-  /// \return Formatted log string with newline
-  /// \note Caller must ensure thread-safety (no locking performed internally)
+  /// \brief Format WITHOUT source location (%F/%l/%f render empty). No locking.
+  static std::string formatLogMessageInternal(Level level, const std::string &message,
+                                              const std::vector<FormatSegment> &segments,
+                                              const std::string &timestampFmt)
+  {
+    return formatLogMessageImpl(level, message, segments, timestampFmt, nullptr, 0, nullptr,
+                                /*hasLocation=*/false);
+  }
+
+  /// \brief Format WITH source location (%F/%l/%f render file/line/function). No locking.
   static std::string formatLogMessageInternal(Level level, const std::string &message,
                                               const char *file, int line, const char *function,
                                               const std::vector<FormatSegment> &segments,
                                               const std::string &timestampFmt)
   {
-    // Pre-generate timestamp once
-    std::string timestampStr;
-    bool needsTimestamp = false;
-    for (const auto &seg : segments)
-    {
-      if (seg.token == FormatToken::Timestamp)
-      {
-        needsTimestamp = true;
-        break;
-      }
-    }
+    return formatLogMessageImpl(level, message, segments, timestampFmt, file, line, function,
+                                /*hasLocation=*/true);
+  }
 
-    if (needsTimestamp)
-    {
-      auto now = std::chrono::system_clock::now();
-      auto t = std::chrono::system_clock::to_time_t(now);
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()) % 1000;
-      struct tm tmBuf{};
-      if (!detail::localTimeReentrant(&t, &tmBuf))
-      {
-        timestampStr = "[invalid-time]";
-      }
-      else
-      {
-        std::ostringstream tsOss;
-        tsOss << std::put_time(&tmBuf, timestampFmt.c_str());
-        if (timestampFmt.find("%S") != std::string::npos)
-        {
-          tsOss << '.' << std::setfill('0') << std::setw(3) << ms.count();
-        }
-        timestampStr = tsOss.str();
-      }
-    }
+  /// \brief Refcount-bump the current immutable format snapshot under the lock and
+  /// return it for reading OUTSIDE the lock. ONE home for the "bump under the lock,
+  /// read the immutable pointee unlocked" invariant shared by every format reader
+  /// (tracker 2026-07-22-3). Never returns null.
+  static std::shared_ptr<const FormatSnapshot> currentFormatSnapshot()
+  {
+    auto &data = getData();
+    std::lock_guard<std::mutex> lock(data.mutex);
+    return data._formatSnapshot;
+  }
 
-    // Extract filename from full path
-    std::string filename = detail::basename(file);
-
-    std::ostringstream oss;
-    for (const auto &seg : segments)
-    {
-      switch (seg.token)
-      {
-      case FormatToken::Literal:
-        oss << seg.literal;
-        break;
-      case FormatToken::Timestamp:
-        oss << timestampStr;
-        break;
-      case FormatToken::ThreadId:
-        {
-          std::hash<std::thread::id> hasher;
-          std::size_t threadHash = hasher(std::this_thread::get_id());
-          oss << std::hex << std::setfill('0') << std::setw(sizeof(std::size_t) * 2)
-              << threadHash << std::dec;
-        }
-        break;
-      case FormatToken::Level:
-        oss << levelToString(level);
-        break;
-      case FormatToken::Message:
-        oss << message;
-        break;
-      case FormatToken::File:
-        oss << filename;
-        break;
-      case FormatToken::Line:
-        oss << line;
-        break;
-      case FormatToken::Function:
-        oss << function;
-        break;
-      }
-    }
-    oss << std::endl;
-    return oss.str();
+  /// \brief Clone-mutate-republish the format snapshot. `mutate` receives a fresh,
+  /// mutable copy of the CURRENT snapshot (so every field it does not touch is
+  /// carried unchanged), and the pointer is WHOLE-replaced — never mutated in place,
+  /// so a concurrent reader never observes a torn pair. ONE home for the COW publish
+  /// sequence shared by init() and setLogFormat(). Precondition: `data.mutex` HELD.
+  template <typename Mutator>
+  static void republishFormatSnapshotLocked(LoggerData &data, Mutator &&mutate)
+  {
+    auto next = std::make_shared<FormatSnapshot>(*data._formatSnapshot);
+    mutate(*next);
+    data._formatSnapshot = std::move(next);
   }
 
   /// \brief Format a log message using pre-compiled format segments
@@ -2375,26 +2368,13 @@ public:
   /// \param message The raw message content
   /// \return Formatted log string with newline
   /// \note Uses pre-compiled segments for optimal performance.
-  ///       Thread-safe: all shared data is copied under lock before formatting.
+  ///       Thread-safe: the immutable format snapshot is refcount-bumped under the
+  ///       lock (no deep copy of the segment vector / timestamp string), then read
+  ///       through the local outside the lock.
   static std::string formatLogMessage(Level level, const std::string &message)
   {
-    auto &data = getData();
-
-    // Copy compiled segments and timestamp format under lock to avoid race conditions
-    std::vector<FormatSegment> segments;
-    std::string timestampFmt;
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-      // Compile on first use if not yet compiled
-      if (data._compiledFormat.empty() && !data._logFormat.empty())
-      {
-        compileFormat(data._logFormat, data._compiledFormat);
-      }
-      segments = data._compiledFormat;
-      timestampFmt = data.timestampFormat;
-    }
-
-    return formatLogMessageInternal(level, message, segments, timestampFmt);
+    auto snap = currentFormatSnapshot();
+    return formatLogMessageInternal(level, message, snap->segments, snap->timestampFmt);
   }
 
   /// \brief Format a log message with source location information
@@ -2407,22 +2387,9 @@ public:
   static std::string formatLogMessage(Level level, const std::string &message,
                                       const char *file, int line, const char *function)
   {
-    auto &data = getData();
-
-    // Copy compiled segments and timestamp format under lock
-    std::vector<FormatSegment> segments;
-    std::string timestampFmt;
-    {
-      std::lock_guard<std::mutex> lock(data.mutex);
-      if (data._compiledFormat.empty() && !data._logFormat.empty())
-      {
-        compileFormat(data._logFormat, data._compiledFormat);
-      }
-      segments = data._compiledFormat;
-      timestampFmt = data.timestampFormat;
-    }
-
-    return formatLogMessageInternal(level, message, file, line, function, segments, timestampFmt);
+    auto snap = currentFormatSnapshot();
+    return formatLogMessageInternal(level, message, file, line, function, snap->segments,
+                                    snap->timestampFmt);
   }
 };
 

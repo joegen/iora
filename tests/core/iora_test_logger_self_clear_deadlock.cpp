@@ -860,91 +860,103 @@ struct LoggingOnDestroy
 };
 } // namespace
 
-TEST_CASE("handler capture destructor may log — in-flight copies die unlocked",
+// ── (l) capture destructor that LOGS. Under the shared_ptr handler model (tracker
+//    2026-07-22-3) the per-dispatch copy is a refcount bump, so NO transient capture
+//    is constructed/destroyed on the delivery path — destructions stays flat across
+//    a delivery. The capture's SOLE instance is destroyed at UNINSTALL, at the
+//    tear-out `doomed` destruction with data.mutex RELEASED; its re-entrant log()
+//    must run there without self-deadlock. The uninstall is driven on a WORKER
+//    thread behind a BOUNDED flag so a (regression) under-lock destruction that
+//    self-deadlocks is a bounded FAIL, never a wedged main thread.
+TEST_CASE("capture destructor may log — no per-delivery copy; runs unlocked once at uninstall",
           "[logger][deadlock][l][uaf]")
 {
-  for (int i = 0; i < kSlowLoopIters; ++i)
+  Logger::init(Logger::Level::Info, "", /*async=*/true);
+  auto destructions = makeCounter();
+  auto delivered = makeCounter();
+  auto armed = makeFlag();
+  auto logBudget = makeCounter(1);
+
+  Logger::setExternalHandler(
+    [probe = LoggingOnDestroy{destructions, armed, logBudget}, delivered](
+      Logger::Level, const std::string &, const std::string &) { delivered->fetch_add(1); });
+  // Arm AFTER installation so the construction-site temporary's (moved-from) dtor
+  // cannot consume the budget.
+  armed->store(true);
+
+  const int beforeDelivery = destructions->load();
+  Logger::info("one");
+  Logger::flush();
+  CHECK(waitFor([delivered] { return delivered->load() >= 1; }));
+  // The delivery path constructs NO transient capture copy under the new model.
+  CHECK(destructions->load() == beforeDelivery);
+
+  // Uninstall on a worker thread behind a bounded flag. The logging capture dtor
+  // runs at the `doomed` destruction (unlocked). A regression that destroyed it
+  // under the lock would self-deadlock here → bounded FAIL, not a wedge.
+  auto uninstallDone = makeFlag();
+  std::thread uninstaller(
+    [uninstallDone] { Logger::clearExternalHandler(); uninstallDone->store(true); });
+  const bool done = waitFor([uninstallDone] { return uninstallDone->load(); });
+  CHECK(done);
+  joinOrDetach(done, {&uninstaller});
+  if (!done)
   {
-    Logger::init(Logger::Level::Info, "", /*async=*/true);
-    auto destructions = makeCounter();
-    auto delivered = makeCounter();
-    auto armed = makeFlag();
-    auto logBudget = makeCounter(1);
-
-    Logger::setExternalHandler(
-      [probe = LoggingOnDestroy{destructions, armed, logBudget}, delivered](
-        Logger::Level, const std::string &, const std::string &) { delivered->fetch_add(1); });
-    // Arm AFTER installation so the construction-site temporary's destruction (which
-    // happens with no lock held) cannot consume the single log budget.
-    armed->store(true);
-
-    const int destructionsBeforeDelivery = destructions->load();
-    Logger::info("one");
-    Logger::flush();
-    // Bounded: if a delivery-path copy were destroyed under the lock, the
-    // re-entrant log() in ~LoggingOnDestroy would self-deadlock and this times out.
-    CHECK(waitFor([delivered] { return delivered->load() >= 1; }));
-
-    Logger::clearExternalHandler(); // destroys the stored copy too (also unlocked)
-    Logger::shutdown();
-    // The delivery path really did construct and destroy at least one copy — so the
-    // armed destructor above really ran where the hazard lives.
-    CHECK(destructions->load() > destructionsBeforeDelivery);
+    return;
   }
+  // The sole instance was destroyed exactly once, at uninstall (its log ran unlocked).
+  CHECK(destructions->load() == beforeDelivery + 1);
+  Logger::shutdown();
 }
 
-// ── (l2) SYNC-mode capture destructor that logs, with NO artificial budget. The
-//    in-flight copy must die while handlerReentryDepth() is still >= 1, so the
-//    re-entrant log() is depth-gated to the normal queue and the sequence
-//    TERMINATES. With the copy destroyed at depth 0 the gate is open and each
-//    delivery's destructor dispatches again — unbounded recursion in sync mode.
-//    A budget would mask exactly that, so this case deliberately has none.
-namespace
-{
-struct LoggingOnDestroyUnbudgeted
-{
-  std::shared_ptr<std::atomic<int>> deliveries;
-  ~LoggingOnDestroyUnbudgeted()
-  {
-    if (deliveries)
-    {
-      Logger::info("unbudgeted capture destructor logging");
-    }
-  }
-};
-} // namespace
-
-TEST_CASE("sync-mode capture destructor logging terminates (copy dies at depth >= 1)",
+// ── (l2) SYNC-mode capture destructor that LOGS, destroyed at UNINSTALL. The
+//    re-entrant log() takes the console path (handler already torn out) and must run
+//    UNLOCKED and terminate — a regression that destroyed the capture under
+//    data.mutex would self-deadlock on the non-recursive mutex (the sync log path
+//    re-acquires it). Bounded on the uninstaller's own flag.
+TEST_CASE("sync-mode capture destructor logging at uninstall runs unlocked and terminates",
           "[logger][deadlock][l2][uaf]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/false);
-  auto deliveries = makeCounter();
+  auto destructions = makeCounter();
+  auto armed = makeFlag();
+  auto logBudget = makeCounter(1);
   Logger::setExternalHandler(
-    [probe = LoggingOnDestroyUnbudgeted{deliveries}, deliveries](Logger::Level,
-                                                                 const std::string &,
-                                                                 const std::string &)
-    { deliveries->fetch_add(1); });
+    [probe = LoggingOnDestroy{destructions, armed, logBudget}](Logger::Level, const std::string &,
+                                                               const std::string &) {});
+  armed->store(true);
+  const int before = destructions->load();
 
-  // Baseline AFTER installation: the temporary built at the setExternalHandler
-  // call site is destroyed once the handler is already installed, so ITS
-  // destructor's log dispatches too. (This same temporary silently made two
-  // earlier probes vacuous — measure deltas, never absolutes.)
-  const int baseline = deliveries->load();
-
-  Logger::info("one");
-  // ONE log must produce exactly ONE further dispatch. If the copy were destroyed
-  // at depth 0, the destructor's log would pass logDispatch's depth gate and
-  // dispatch again, and again — the count runs away (stack overflow in practice).
-  CHECK(deliveries->load() == baseline + 1);
-
-  teardownLogger();
-  CHECK(deliveries->load() == baseline + 1);
+  auto uninstallDone = makeFlag();
+  std::thread uninstaller(
+    [uninstallDone] { Logger::clearExternalHandler(); uninstallDone->store(true); });
+  const bool done = waitFor([uninstallDone] { return uninstallDone->load(); });
+  CHECK(done);
+  joinOrDetach(done, {&uninstaller});
+  if (!done)
+  {
+    return;
+  }
+  // Destroyed exactly once, at uninstall; its re-entrant log ran unlocked.
+  CHECK(destructions->load() == before + 1);
+  Logger::shutdown();
 }
 
-// ── (l3) capture destructor that TEARS THE HANDLER OUT. At depth >= 1 this takes
-//    the self-tearer branch (inflight == frozen) and returns; at depth 0 it takes
-//    the external branch and waits inflight == 0 on its own pinned frame —
-//    unsatisfiable, a permanent hang. Bounded so that hang is a FAILED CHECK.
+// ── (l3) capture destructor that CLEARS the handler. Under the shared_ptr handler
+//    model the capture's sole instance is destroyed at whichever site drops the LAST
+//    reference — and a clearing capture dtor there must never take the depth-0
+//    external branch on its own pinned frame (inflight==0, unsatisfiable → hang).
+//    That last-ref site is path-dependent, so it is covered by TWO cases:
+//      (l3a) EXTERNAL tear-out: the clearer's `doomed` outlives every in-flight
+//            dispatch copy, so the capture dtor runs at `doomed` destruction on the
+//            clearer's thread at depth 0, unlocked, AFTER the drain; its re-entrant
+//            clear finds the member already null and returns.
+//      (l3b) SELF tear-out: the handler body self-clears first (nulling the member),
+//            so the dispatch copy becomes last-ref and the dropper destroys the
+//            capture at reentry-depth >= 1 — its re-entrant clear must take the
+//            self-tearer branch (inflight==frozen).
+//    Both are BOUNDED on the flag of the thread that can hang, so a regression is a
+//    FAILED CHECK, never a wedged join.
 namespace
 {
 struct ClearingOnDestroy
@@ -964,41 +976,153 @@ struct ClearingOnDestroy
 };
 } // namespace
 
-TEST_CASE("capture destructor may clear the handler (copy dies at depth >= 1)",
-          "[logger][deadlock][l3][uaf]")
+TEST_CASE("(l3a) capture destructor clears at the EXTERNAL tear-out (doomed, depth 0) — no deadlock",
+          "[logger][deadlock][l3a][uaf]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
+  auto ctl = makeCtl();
+  auto target = makeTarget();
   auto armed = makeFlag();
   auto cleared = makeFlag();
-  auto delivered = makeCounter();
+
+  // Handler parks in-window so a delivery is provably in flight (dispatch shared_ptr
+  // copy alive) while the external clear runs; the capture clears in its dtor.
   Logger::setExternalHandler(
-    [probe = ClearingOnDestroy{armed, cleared}, delivered](Logger::Level, const std::string &,
-                                                           const std::string &)
-    { delivered->fetch_add(1); });
+    [probe = ClearingOnDestroy{armed, cleared}, ctl, target](Logger::Level, const std::string &,
+                                                             const std::string &)
+    { blockingHandlerBody(*ctl, target.get()); });
   armed->store(true);
 
-  // Run the delivery on its own thread: if the copy is destroyed at depth 0 the
-  // capture destructor's clearExternalHandler() never returns, and we want a
-  // bounded FAIL rather than a wedged suite.
-  auto done = makeFlag();
-  std::thread deliverThread(
-    [done]
+  Logger::info("trigger"); // worker enters the handler and parks
+  const bool entered = ctl->waitEntered(1);
+  CHECK(entered);
+  if (!entered)
+  {
+    teardownLogger();
+    return;
+  }
+
+  // External clear while the delivery is parked, on its OWN thread with its OWN
+  // bounded completion flag: a wedged nested clear must FAIL bounded, not hang the
+  // join. `clearDone` is a shared_ptr flag (by-value) so a DETACHED wedged thread
+  // that later unblocks writes into a live object.
+  auto clearDone = makeFlag();
+  std::thread clearThread(
+    [clearDone]
     {
-      Logger::info("trigger");
-      Logger::flush();
-      done->store(true);
+      Logger::clearExternalHandler();
+      clearDone->store(true);
     });
-  const bool finished = waitFor([done] { return done->load(); });
-  CHECK(finished);
-  joinOrDetach(finished, {&deliverThread});
+
+  ctl->releaseAll(); // let the parked delivery finish so the drain can complete
+  const bool workerDrained = ctl->waitExited(1);
+  const bool clearReturned = waitFor([clearDone] { return clearDone->load(); });
+  CHECK(workerDrained);
+  CHECK(clearReturned); // <- deadlock discriminator: false => nested clear wedged
+  const bool finished = workerDrained && clearReturned;
+  joinOrDetach(finished, {&clearThread});
   if (!finished)
   {
     return;
   }
-  CHECK(delivered->load() >= 1);
-  CHECK(cleared->load()); // the destructor really did run and tear out
 
+  CHECK(cleared->load());                  // the clearing capture dtor really ran (once)
+  CHECK(target->canary.load() == 0x5A5A);  // captured object not corrupted
   teardownLogger();
+}
+
+TEST_CASE("(l3b) capture destructor clears at the DROPPER (depth >= 1, self-tearer) — no deadlock",
+          "[logger][deadlock][l3b][uaf]")
+{
+  Logger::init(Logger::Level::Info, "", /*async=*/true);
+  auto ctl = makeCtl();
+  auto armed = makeFlag();
+  auto cleared = makeFlag();
+  auto handlerDone = makeFlag();
+
+  // The BODY self-clears after release (depth 1) — nulling the member so the
+  // dispatch copy becomes the last reference — AND the capture ALSO clears in its
+  // dtor. On body return the dropper destroys the capture at depth >= 1; that
+  // re-entrant clear must take the self-tearer branch (inflight==frozen), not the
+  // depth-0 external branch on its own pinned frame.
+  Logger::setExternalHandler(
+    [probe = ClearingOnDestroy{armed, cleared}, ctl, handlerDone](Logger::Level,
+                                                                  const std::string &,
+                                                                  const std::string &)
+    {
+      ctl->onEnter();
+      if (ctl->waitReleased())
+      {
+        Logger::clearExternalHandler(); // self-tear from the BODY (depth 1)
+      }
+      ctl->onExit();
+      handlerDone->store(true);
+    });
+  armed->store(true);
+
+  Logger::info("trigger");
+  const bool entered = ctl->waitEntered(1);
+  CHECK(entered);
+  if (!entered)
+  {
+    teardownLogger();
+    return;
+  }
+  ctl->releaseAll();
+
+  // The capture dtor runs on the WORKER at the dropper AFTER the body returns; if it
+  // took the wrong (depth-0) branch it would wait inflight==0 on its own pinned
+  // frame and the worker would wedge — cleared never set. Bounded on the worker's
+  // own effect (cleared), so a regression is a FAILED CHECK.
+  const bool clearedRan = waitFor([cleared] { return cleared->load(); });
+  const bool handlerReturned = waitFor([handlerDone] { return handlerDone->load(); });
+  CHECK(handlerReturned); // body's own self-clear did not hang
+  CHECK(clearedRan);      // capture dtor's clear at the dropper took the self-tearer branch
+  if (!clearedRan || !handlerReturned)
+  {
+    return; // worker may be wedged; do NOT teardown (would hang) — FAIL already recorded
+  }
+  teardownLogger();
+}
+
+// ── (l4) shutdown() (NOT clearExternalHandler) as the uninstall path. The handler
+//    capture is destroyed at teardownAndReapWorker's `doomed`, which ADDITIONALLY
+//    sets exit, reroutes, and reaps the worker — a distinct code path from
+//    clearExternalHandler. The LoggingOnDestroy dtor's re-entrant log must run
+//    UNLOCKED (doomed destroyed after the lock is released) without deadlock, and the
+//    sole instance must die exactly once. Bounded on the shutdown thread's own flag.
+TEST_CASE("shutdown() destroys the handler capture unlocked (teardownAndReapWorker doomed)",
+          "[logger][deadlock][l4][uaf]")
+{
+  Logger::init(Logger::Level::Info, "", /*async=*/true);
+  auto destructions = makeCounter();
+  auto armed = makeFlag();
+  auto logBudget = makeCounter(1);
+  Logger::setExternalHandler(
+    [probe = LoggingOnDestroy{destructions, armed, logBudget}](Logger::Level, const std::string &,
+                                                               const std::string &) {});
+  armed->store(true);
+  const int before = destructions->load();
+
+  // shutdown() on a worker thread behind a bounded flag: a regression that destroyed
+  // the capture under data.mutex (its re-entrant log self-deadlocking) is a bounded
+  // FAIL, not a wedged main thread.
+  auto shutdownDone = makeFlag();
+  std::thread shutter(
+    [shutdownDone]
+    {
+      Logger::shutdown();
+      shutdownDone->store(true);
+    });
+  const bool done = waitFor([shutdownDone] { return shutdownDone->load(); });
+  CHECK(done);
+  joinOrDetach(done, {&shutter});
+  if (!done)
+  {
+    return;
+  }
+  // The sole instance was destroyed exactly once, at teardownAndReapWorker's doomed.
+  CHECK(destructions->load() == before + 1);
 }
 
 // ── (m) WORKER LIFECYCLE: the workerRunning protocol. Covers the two shapes that
