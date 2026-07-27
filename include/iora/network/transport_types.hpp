@@ -317,7 +317,12 @@ struct TransportConfig
     int count{3};
   } tcpKeepalive;
 
-  // === UDP-specific ===
+  /// \brief Maximum concurrent sessions; 0 means unlimited.
+  ///
+  /// Enforced by BOTH the UDP and TCP/TLS engines (the TCP engine rejects the
+  /// accepted fd once the cap is reached). It is the only bound on aggregate
+  /// per-session receive memory, so leaving it at 0 on a stream transport means
+  /// the effective ceiling is the process fd limit.
   std::size_t maxSessions{0};
 
   // === Sync operations ===

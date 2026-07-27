@@ -4,6 +4,10 @@
 #include "iora_test_net_utils.hpp"
 #include "test_helpers.hpp"
 #include <algorithm>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <map>
 #include <numeric>
 #include <vector>
@@ -603,4 +607,165 @@ TEST_CASE("TCP transport restart with existing sessions", "[tcp][restart]")
   // Note: Implementation may handle stale sessions gracefully or asynchronously
 
   f.tx.stop();
+}
+
+// ============================================================================
+// TransportConfig::maxSessions on the ACCEPT path.
+//
+// The cap was UDP-only until 2026-07-26; on TCP/TLS the real ceiling was the
+// process fd limit, which invalidated every aggregate per-session memory bound
+// stated above this layer. Written because the enforcement shipped with zero
+// coverage: `grep maxSessions tests/` matched only UDP, so deleting the check
+// would have passed the entire suite identically.
+//
+// NOTE these build their OWN engine rather than using TcpFixture. TcpEngine takes
+// a COPY of the config in its constructor (tcp_engine.hpp:2793), and the fixture
+// constructs `TcpEngine tx{cfg}` as a member initializer — so mutating f.cfg in a
+// test body never reaches the engine. A first version of this test did exactly
+// that and was VACUOUS; it passed with the cap set to 2 and four live sessions.
+// (The pre-existing UDP cap test at iora_test_udp_engine.cpp:652 sets f.cfg the
+// same way and has the same flaw.)
+// ============================================================================
+
+namespace
+{
+/// Minimal engine harness that fixes the config BEFORE construction.
+struct CappedTcpEngine
+{
+  TransportConfig cfg{};
+  std::unique_ptr<TcpEngine> tx;
+  std::atomic<size_t> acceptCount{0};
+  std::atomic<size_t> errorCount{0};
+  std::mutex mu;
+  std::string lastErrMsg;
+
+  explicit CappedTcpEngine(std::size_t maxSessions)
+  {
+    cfg.maxSessions = maxSessions;
+    tx = std::make_unique<TcpEngine>(cfg);
+    iora::network::detail::EngineBase::Callbacks cbs{};
+    cbs.onAccept = [this](SessionId, const TransportAddress &) { acceptCount++; };
+    cbs.onConnect = [](SessionId, const TransportAddress &) {};
+    cbs.onData = [](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point) {};
+    cbs.onClose = [](SessionId, const TransportErrorInfo &) {};
+    cbs.onError = [this](TransportError, const std::string &msg)
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      lastErrMsg = msg;
+      errorCount++;
+    };
+    tx->setCallbacks(cbs);
+  }
+
+  bool waitFor(std::function<bool()> pred, std::chrono::milliseconds cap = 3000ms)
+  {
+    auto start = std::chrono::steady_clock::now();
+    while (!pred() && (std::chrono::steady_clock::now() - start) < cap)
+    {
+      std::this_thread::sleep_for(5ms);
+    }
+    return pred();
+  }
+};
+} // namespace
+
+TEST_CASE("TCP accept path enforces maxSessions", "[tcp][limits]")
+{
+  // RAW client sockets, deliberately, NOT e.tx->connect(). Both the accept path
+  // (bumpSess at tcp_engine.hpp:1432) and the connect path (:1677) bump the SAME
+  // sessionsCurrent that the accept guard tests, so driving clients through the
+  // engine under test makes the outcome depend on how those two interleave — a
+  // first version of this test did that and failed intermittently (it passed under
+  // a [limits] filter and failed in the full binary). Raw sockets mean ONLY accepts
+  // consume the budget, which is also the case H-6 is actually about.
+  CappedTcpEngine e(2);
+  REQUIRE(e.tx->start().isOk());
+
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(e.tx->addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  auto rawConnect = [&]() -> int
+  {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) != 0)
+    {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  };
+
+  // Two accepted connections fill the cap exactly.
+  std::vector<int> fds;
+  for (int i = 0; i < 2; ++i)
+  {
+    int fd = rawConnect();
+    REQUIRE(fd >= 0);
+    fds.push_back(fd);
+  }
+  REQUIRE(e.waitFor([&]() { return e.acceptCount.load() == 2; }));
+
+  // The third is refused AT ACCEPT: the fd is closed immediately, so no onAccept
+  // fires and an error naming the cap is raised. The TCP handshake itself still
+  // completes (the kernel backlog accepts it), which is why this is observed as an
+  // engine-side rejection rather than a connect() failure.
+  int extra = rawConnect();
+  REQUIRE(e.waitFor([&]() { return e.errorCount.load() > 0; }));
+  {
+    std::lock_guard<std::mutex> lock(e.mu);
+    INFO("last error: " << e.lastErrMsg);
+    REQUIRE(e.lastErrMsg.find("maxSessions") != std::string::npos);
+  }
+
+  // No extra accept was admitted, and the engine neither busy-spun nor died.
+  std::this_thread::sleep_for(200ms);
+  REQUIRE(e.acceptCount.load() == 2);
+  REQUIRE(e.tx->getStats().sessionsCurrent <= e.cfg.maxSessions);
+
+  if (extra >= 0)
+  {
+    ::close(extra);
+  }
+  for (int fd : fds)
+  {
+    ::close(fd);
+  }
+  e.tx->stop();
+}
+
+TEST_CASE("maxSessions of 0 means unlimited on TCP", "[tcp][limits]")
+{
+  // 0 is the default for every consumer that does not opt in, so this is the
+  // branch that must NOT reject. Guards a truthiness slip in the guard.
+  CappedTcpEngine e(0);
+  REQUIRE(e.tx->start().isOk());
+
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(e.tx->addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  std::vector<int> fds;
+  for (int i = 0; i < 5; ++i)
+  {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    ::inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    REQUIRE(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) == 0);
+    fds.push_back(fd);
+  }
+  REQUIRE(e.waitFor([&]() { return e.acceptCount.load() == 5; }));
+  REQUIRE(e.errorCount.load() == 0);
+
+  for (int fd : fds)
+  {
+    ::close(fd);
+  }
+  e.tx->stop();
 }

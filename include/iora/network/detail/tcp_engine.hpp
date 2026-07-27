@@ -1382,6 +1382,17 @@ private:
         err(TransportError::Accept, "accept4: " + lastErr());
         break;
       }
+      // Bound concurrent accepted sessions. Each one owns a receive buffer that a
+      // peer controls the size of, so an unbounded session count makes every
+      // per-session memory cap meaningless in aggregate — the real ceiling would
+      // be the process fd limit. Mirrors the UDP engine's cap; 0 means unlimited.
+      if (_config.maxSessions && _atomicStats.sessionsCurrent.load() >= _config.maxSessions)
+      {
+        ::close(cfd);
+        err(TransportError::Accept, "maxSessions reached; connection rejected");
+        continue;
+      }
+
       applySockOpts(cfd);
 
       SessionId sid = _nextSessionId++;
