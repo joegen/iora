@@ -7,15 +7,21 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <future>
+#include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -34,14 +40,14 @@ namespace connectors
 {
 
 /// \brief Test-only observation seam for the connection pool internals.
-/// \details Forward-declared here and befriended by JsonRpcClient and
-/// detail::EndpointPool so tests can read otherwise-private pool state
-/// (per-connection identity, in-use flags, totals) under the client mutex. The
-/// type itself is defined only in the test translation unit; the declaration is
-/// unconditional (never #ifdef-guarded) so the class layout is identical in
-/// every TU — an #ifdef would make the definition differ between translation
-/// units, an ODR violation the moment any consumer is compiled without the
-/// macro.
+/// \details Forward-declared here and befriended by JsonRpcClient,
+/// JsonRpcClientImpl and detail::EndpointPool so tests can read otherwise-private
+/// pool state (per-connection identity, in-use flags, totals) under the client
+/// mutex. The type itself is defined only in the test translation unit; the
+/// declaration is unconditional (never #ifdef-guarded) so the class layout is
+/// identical in every TU — an #ifdef would make the definition differ between
+/// translation units, an ODR violation the moment any consumer is compiled
+/// without the macro.
 struct JsonRpcClientTestAccess;
 
 /// \brief Base exception for JSON-RPC client errors.
@@ -342,6 +348,17 @@ private:
   std::chrono::steady_clock::time_point _lastTouched;
 };
 
+/// \brief RAII handle to one pooled connection; releases it (under the client
+/// mutex) on destruction.
+/// \details Holds NON-owning raw pointers into the owning JsonRpcClientImpl
+/// (_pool, _mutex) and a notify callback capturing that Impl by raw `this`. It
+/// does NOT extend Impl's lifetime, so a lease MUST NOT outlive the Impl method
+/// frame that created it: in production every lease is a stack local inside
+/// call/notify/callBatch, which run either on the caller thread (facade held by
+/// the caller) or on a worker task that captured a shared_ptr<Impl> — Impl
+/// therefore always outlives the lease. Tests that own a lease via the
+/// observation seam keep the facade alive for at least the lease's lifetime.
+/// task-4.1c converts these raw pointers to a shared_ptr keep-alive.
 class ConnectionLease
 {
 public:
@@ -395,14 +412,28 @@ private:
 };
 } // namespace detail
 
-/// \brief JSON-RPC 2.0 client with per-endpoint connection pooling and
-/// async support.
-class JsonRpcClient
+/// \brief Implementation body of the JSON-RPC 2.0 client (pImpl target).
+/// \details Holds ALL client state and every operation the public facade or an
+/// async task invokes. It derives from std::enable_shared_from_this and is
+/// constructed only via std::make_shared (through create()): async work captures
+/// a std::shared_ptr<JsonRpcClientImpl> by value, so the implementation outlives
+/// any task still referencing it, and a later phase (task-4.1c) can hand a
+/// ConnectionLease a shared_ptr to this object. The private PrivateTag makes
+/// create() the single construction path — a stack or bare-new instance would
+/// break shared_from_this().
+class JsonRpcClientImpl : public std::enable_shared_from_this<JsonRpcClientImpl>
 {
+  // Passkey. PrivateTag is private, so only create() (a member) can name it;
+  // the constructor is public solely so std::make_shared can call it. This
+  // guarantees every JsonRpcClientImpl is heap-owned by a shared_ptr, which
+  // shared_from_this() (and task-4.1c's ConnectionLease) require.
+  struct PrivateTag
+  {
+  };
+
 public:
-  JsonRpcClient(iora::IoraService &service, iora::core::ThreadPool &threadPool, Config config = {})
-      : _service(service), _threadPool(threadPool), _config(std::move(config)), _nextId(1),
-        _totalConnections(0)
+  JsonRpcClientImpl(PrivateTag, iora::core::ThreadPool &threadPool, Config config)
+      : _threadPool(threadPool), _config(std::move(config)), _nextId(1), _totalConnections(0)
   {
     if (!_config.httpClientFactory)
     {
@@ -421,9 +452,17 @@ public:
     }
   }
 
+  /// \brief The only construction path: heap-allocate via make_shared so
+  /// shared_from_this() is well-formed for the lifetime of the object.
+  static std::shared_ptr<JsonRpcClientImpl> create(iora::core::ThreadPool &threadPool,
+                                                   Config config)
+  {
+    return std::make_shared<JsonRpcClientImpl>(PrivateTag{}, threadPool, std::move(config));
+  }
+
   iora::parsers::Json call(const std::string &endpoint, const std::string &method,
-                           const iora::parsers::Json &params = iora::parsers::Json::object(),
-                           const std::vector<std::pair<std::string, std::string>> &headers = {})
+                           const iora::parsers::Json &params,
+                           const std::vector<std::pair<std::string, std::string>> &headers)
   {
     _stats.totalRequests++;
 
@@ -450,8 +489,8 @@ public:
   }
 
   void notify(const std::string &endpoint, const std::string &method,
-              const iora::parsers::Json &params = iora::parsers::Json::object(),
-              const std::vector<std::pair<std::string, std::string>> &headers = {})
+              const iora::parsers::Json &params,
+              const std::vector<std::pair<std::string, std::string>> &headers)
   {
     _stats.totalRequests++;
     _stats.notificationRequests++;
@@ -478,11 +517,15 @@ public:
 
   std::future<iora::parsers::Json>
   callAsync(const std::string &endpoint, const std::string &method,
-            const iora::parsers::Json &params = iora::parsers::Json::object(),
-            const std::vector<std::pair<std::string, std::string>> &headers = {})
+            const iora::parsers::Json &params,
+            const std::vector<std::pair<std::string, std::string>> &headers)
   {
-    auto self = this;
-    return submitToPool_([=]() { return self->call(endpoint, method, params, headers); });
+    // Capture a shared_ptr<Impl> by value: the queued task keeps this
+    // implementation alive even if the owning facade is destroyed first
+    // (thread-safety C-4). No `this`, no `[=]`.
+    auto self = shared_from_this();
+    return submitToPool_([self, endpoint, method, params, headers]()
+                         { return self->call(endpoint, method, params, headers); });
   }
 
   void callAsync(const std::string &endpoint, const std::string &method,
@@ -491,26 +534,24 @@ public:
                  std::function<void(iora::parsers::Json)> onSuccess,
                  std::function<void(std::exception_ptr)> onError)
   {
-    // Use only copyable captures, no mutable, so operator() is const
-    auto self = this;
-    auto successCopy = onSuccess;
-    auto errorCopy = onError;
+    auto self = shared_from_this();
     _threadPool.enqueue(
-      [=]()
+      [self, endpoint, method, params, headers, onSuccess = std::move(onSuccess),
+       onError = std::move(onError)]()
       {
         try
         {
           auto result = self->call(endpoint, method, params, headers);
-          if (successCopy)
+          if (onSuccess)
           {
-            successCopy(result);
+            onSuccess(result);
           }
         }
         catch (...)
         {
-          if (errorCopy)
+          if (onError)
           {
-            errorCopy(std::current_exception());
+            onError(std::current_exception());
           }
         }
       });
@@ -518,7 +559,7 @@ public:
 
   std::vector<iora::parsers::Json>
   callBatch(const std::string &endpoint, const std::vector<BatchItem> &items,
-            const std::vector<std::pair<std::string, std::string>> &headers = {})
+            const std::vector<std::pair<std::string, std::string>> &headers)
   {
     if (items.empty())
     {
@@ -560,10 +601,11 @@ public:
 
   std::future<std::vector<iora::parsers::Json>>
   callBatchAsync(const std::string &endpoint, const std::vector<BatchItem> &items,
-                 const std::vector<std::pair<std::string, std::string>> &headers = {})
+                 const std::vector<std::pair<std::string, std::string>> &headers)
   {
-    auto self = this;
-    return submitToPool_([=]() { return self->callBatch(endpoint, items, headers); });
+    auto self = shared_from_this();
+    return submitToPool_([self, endpoint, items, headers]()
+                         { return self->callBatch(endpoint, items, headers); });
   }
 
   std::size_t purgeIdle()
@@ -774,15 +816,10 @@ private:
                                                   const iora::parsers::Json &params,
                                                   std::uint64_t id)
   {
-    iora::parsers::Json j;
-    j["jsonrpc"] = "2.0";
-    j["method"] = method;
-    // Only include params if not null and not empty object (for wire
-    // compatibility)
-    if (!params.is_null() && !(params.is_object() && params.empty()))
-    {
-      j["params"] = params;
-    }
+    // A request is a notification plus an id: build on the notification form so
+    // the params-inclusion rule lives in exactly one place and the two forms
+    // cannot drift.
+    iora::parsers::Json j = makeNotificationEnvelope_(method, params);
     j["id"] = id;
     return j;
   }
@@ -849,10 +886,9 @@ private:
   {
     if (resp.is_object())
     {
-      const auto &obj = resp;
-      if (obj.contains("error"))
+      if (resp.contains("error"))
       {
-        const auto &err = obj["error"];
+        const auto &err = resp["error"];
         int code = err.contains("code") ? err["code"].get<int>() : -32000;
         std::string message = err.contains("message") ? err["message"].get<std::string>()
                                                       : std::string{"Unknown error"};
@@ -860,9 +896,9 @@ private:
           err.contains("data") ? err["data"] : iora::parsers::Json(nullptr);
         throw RemoteError(code, message, std::move(data));
       }
-      if (obj.contains("result"))
+      if (resp.contains("result"))
       {
-        return obj["result"];
+        return resp["result"];
       }
     }
     return resp;
@@ -1007,12 +1043,11 @@ private:
 
 private:
   // Friendship is not transitive: befriending the test seam on EndpointPool
-  // does not extend here, so JsonRpcClient names it too (for _pools, _mutex,
+  // does not extend here, so JsonRpcClientImpl names it too (for _pools, _mutex,
   // _totalConnections, recalcTotalLocked_ and acquire_). Unqualified is correct
   // here — this class sits directly in namespace connectors.
   friend struct JsonRpcClientTestAccess;
 
-  iora::IoraService &_service;
   iora::core::ThreadPool &_threadPool;
   Config _config;
   ClientStats _stats;
@@ -1023,6 +1058,93 @@ private:
 
   std::atomic<std::uint64_t> _nextId;
   std::size_t _totalConnections;
+};
+
+/// \brief JSON-RPC 2.0 client with per-endpoint connection pooling and
+/// async support.
+/// \details Thin, non-copyable, non-movable facade over a
+/// std::shared_ptr<JsonRpcClientImpl>. Every public operation forwards to the
+/// implementation; the shared_ptr lets async work outlive the facade safely.
+class JsonRpcClient
+{
+public:
+  JsonRpcClient(iora::IoraService &service, iora::core::ThreadPool &threadPool, Config config = {})
+      : _impl(JsonRpcClientImpl::create(threadPool, std::move(config)))
+  {
+    // The service reference is dead state (L-9): the client drives its own
+    // HttpClient instances and never touches the service. The parameter is
+    // retained for API compatibility; tracker -1 removes it (LD-2).
+    (void)service;
+  }
+
+  // A pImpl facade holding only a shared_ptr would otherwise be implicitly
+  // copyable and movable, letting two facades share one Impl with no defined
+  // semantics. Delete all four explicitly (cf. iora::web::Application,
+  // HttpServer, HttpClient).
+  JsonRpcClient(const JsonRpcClient &) = delete;
+  JsonRpcClient &operator=(const JsonRpcClient &) = delete;
+  JsonRpcClient(JsonRpcClient &&) = delete;
+  JsonRpcClient &operator=(JsonRpcClient &&) = delete;
+
+  iora::parsers::Json call(const std::string &endpoint, const std::string &method,
+                           const iora::parsers::Json &params = iora::parsers::Json::object(),
+                           const std::vector<std::pair<std::string, std::string>> &headers = {})
+  {
+    return _impl->call(endpoint, method, params, headers);
+  }
+
+  void notify(const std::string &endpoint, const std::string &method,
+              const iora::parsers::Json &params = iora::parsers::Json::object(),
+              const std::vector<std::pair<std::string, std::string>> &headers = {})
+  {
+    _impl->notify(endpoint, method, params, headers);
+  }
+
+  std::future<iora::parsers::Json>
+  callAsync(const std::string &endpoint, const std::string &method,
+            const iora::parsers::Json &params = iora::parsers::Json::object(),
+            const std::vector<std::pair<std::string, std::string>> &headers = {})
+  {
+    return _impl->callAsync(endpoint, method, params, headers);
+  }
+
+  void callAsync(const std::string &endpoint, const std::string &method,
+                 const iora::parsers::Json &params,
+                 const std::vector<std::pair<std::string, std::string>> &headers,
+                 std::function<void(iora::parsers::Json)> onSuccess,
+                 std::function<void(std::exception_ptr)> onError)
+  {
+    _impl->callAsync(endpoint, method, params, headers, std::move(onSuccess), std::move(onError));
+  }
+
+  std::vector<iora::parsers::Json>
+  callBatch(const std::string &endpoint, const std::vector<BatchItem> &items,
+            const std::vector<std::pair<std::string, std::string>> &headers = {})
+  {
+    return _impl->callBatch(endpoint, items, headers);
+  }
+
+  std::future<std::vector<iora::parsers::Json>>
+  callBatchAsync(const std::string &endpoint, const std::vector<BatchItem> &items,
+                 const std::vector<std::pair<std::string, std::string>> &headers = {})
+  {
+    return _impl->callBatchAsync(endpoint, items, headers);
+  }
+
+  std::size_t purgeIdle() { return _impl->purgeIdle(); }
+
+  const Config &config() const noexcept { return _impl->config(); }
+
+  const ClientStats &getStats() const noexcept { return _impl->getStats(); }
+
+  void resetStats() { _impl->resetStats(); }
+
+private:
+  // The seam reads Impl's members through the facade's _impl handle, so it must
+  // befriend the facade too (for _impl) in addition to JsonRpcClientImpl.
+  friend struct JsonRpcClientTestAccess;
+
+  std::shared_ptr<JsonRpcClientImpl> _impl;
 };
 
 } // namespace connectors

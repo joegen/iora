@@ -40,6 +40,7 @@
 #include <string>
 #include <sys/prctl.h>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace iora;
@@ -78,18 +79,19 @@ struct JsonRpcClientTestAccess
   };
 
   /// \brief Acquire a lease the TEST owns (required by the single-threaded CR-1
-  /// repro, which must construct and dispose leases itself).
+  /// repro, which must construct and dispose leases itself). Pool state now
+  /// lives in JsonRpcClientImpl, reached through the facade's _impl handle.
   static detail::ConnectionLease acquire(JsonRpcClient &c, const std::string &endpoint)
   {
-    return c.acquire_(endpoint);
+    return c._impl->acquire_(endpoint);
   }
 
   /// \brief Snapshot every pool's connections under the client mutex.
   static std::vector<PoolSnapshot> snapshotPools(JsonRpcClient &c)
   {
-    std::lock_guard<std::mutex> guard(c._mutex);
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
     std::vector<PoolSnapshot> out;
-    for (const auto &kv : c._pools)
+    for (const auto &kv : c._impl->_pools)
     {
       PoolSnapshot ps;
       ps.poolKey = kv.first;
@@ -109,14 +111,14 @@ struct JsonRpcClientTestAccess
 
   static std::size_t totalConnections(JsonRpcClient &c)
   {
-    std::lock_guard<std::mutex> guard(c._mutex);
-    return c._totalConnections;
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    return c._impl->_totalConnections;
   }
 
   static std::size_t recalcTotal(JsonRpcClient &c)
   {
-    std::lock_guard<std::mutex> guard(c._mutex);
-    return c.recalcTotalLocked_();
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    return c._impl->recalcTotalLocked_();
   }
 
   /// \brief The connectionId of the connection a live lease references, matched
@@ -143,6 +145,20 @@ struct JsonRpcClientTestAccess
 
 using iora::modules::connectors::JsonRpcClientTestAccess;
 using iora::modules::connectors::detail::ConnectionLease;
+
+// task-2.2 — the pImpl facade must stay non-copyable AND non-movable; a facade
+// that could be copied or moved would share one JsonRpcClientImpl between two
+// objects with no defined semantics. Verified at compile time (a copy/move
+// would otherwise be silently generated because the facade holds only a
+// shared_ptr).
+static_assert(!std::is_copy_constructible<JsonRpcClient>::value,
+              "JsonRpcClient must not be copy-constructible");
+static_assert(!std::is_copy_assignable<JsonRpcClient>::value,
+              "JsonRpcClient must not be copy-assignable");
+static_assert(!std::is_move_constructible<JsonRpcClient>::value,
+              "JsonRpcClient must not be move-constructible");
+static_assert(!std::is_move_assignable<JsonRpcClient>::value,
+              "JsonRpcClient must not be move-assignable");
 
 namespace
 {
