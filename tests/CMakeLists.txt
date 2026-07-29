@@ -66,6 +66,7 @@ set(NETWORK_TESTS
     network/iora_test_http_client_lease
     network/iora_test_http_client_response_framing
     network/iora_test_http_client_retry
+    network/iora_test_http_client_cancel
     network/iora_test_tcp_engine
     network/iora_test_tcp_engine_teardown_race
     network/iora_test_tcp_rapid_send
@@ -285,6 +286,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_http_client_lease
     iora_test_http_client_response_framing
     iora_test_http_client_retry
+    iora_test_http_client_cancel
     iora_test_logger_external_handler_race
     iora_test_logger_self_clear_deadlock
     iora_test_logger_format_snapshot

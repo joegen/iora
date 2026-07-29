@@ -77,6 +77,32 @@ public:
   explicit HttpRequestNotSentError(const std::string &what) : std::runtime_error(what) {}
 };
 
+/// \brief Thrown when an in-flight request is aborted because the HttpClient is
+/// permanently closing (cleanup()/cancelInFlight()/~HttpClient). It is a DIRECT
+/// subclass of std::runtime_error and a SIBLING of HttpFramingError and
+/// HttpRequestNotSentError (never a subclass of either), so the mutual order of
+/// the three catch clauses is irrelevant but ALL must precede any generic
+/// `catch (const std::exception &)` on the propagation path.
+///
+/// TWO contracts:
+///   (1) NEVER-RETRIED: the client is permanently closing, so every retry
+///       re-fails identically. performRequest rethrows it without retrying.
+///   (2) SEND-AMBIGUITY (RFC 9110 §9.2.2): this ONE type is raised both when the
+///       request was PROVABLY NOT SENT (the publish-recheck, the pre-init gate,
+///       and the acquireLease shutdown throw) AND when it MAY have been sent and
+///       processed server-side before the connection was cut (a mid-body
+///       cancel). It makes NO guarantee about whether the request reached or was
+///       processed by the server; a caller MUST treat a cancelled request that
+///       had already been sent as an UNKNOWN server-side outcome and never
+///       assume "not processed". A single type is intentional: the sole consumer
+///       (a client being destroyed) cannot act on the distinction, so the safe
+///       (provably-not-sent) retry is deliberately forgone on those paths.
+class HttpClientCancelledError : public std::runtime_error
+{
+public:
+  using std::runtime_error::runtime_error;
+};
+
 /// THREADING CONTRACT (sync request path): concurrent same-host requests on a
 /// SHARED HttpClient instance are SAFE but SERIALIZED. Each request acquires an
 /// exclusive per-host:port connection lease (ConnectionLease) that spans the
@@ -260,9 +286,22 @@ private:
   mutable std::unordered_set<std::string> _leasedHosts;
   // Signals lease release (and shutdown) to threads blocked in acquireLease.
   mutable std::condition_variable _cv;
-  // Set by cleanup()/~HttpClient so blocked lease waiters wake and fail rather
-  // than deadlock (DD-A8).
-  mutable bool _closing{false};
+  // Set by cleanup()/cancelInFlight()/~HttpClient so blocked lease waiters wake
+  // and fail rather than deadlock (DD-A8). std::atomic so the receive loop and
+  // the pre-send generic catch can read it WITHOUT _mutex (LEASE-7 forbids
+  // holding _mutex across I/O) without a data race. Write-once monotonic
+  // (false->true, never reset). DISCIPLINE (exhaustive, greppable): every STORE
+  // is under _mutex with _cv.notify_all() under the lock (so the acquireLease CV
+  // wait/notify handshake has no lost wakeup); reads that already hold _mutex
+  // (acquireLease predicate/post-wait, performRequest pre-init, acquireConnection
+  // publish-recheck) read it plainly under the lock. The LOCK-FREE reads (no
+  // _mutex held) are exactly two sites, both using
+  // _closing.load(std::memory_order_acquire): (1) executeRequest's pre-send
+  // generic catch (inline, it converts e.what()); (2) executeRequest's local
+  // `throwIfClosing` lambda, which is the single load routed to by all four
+  // exchange-abort exits (send-failure and the receive-loop
+  // PeerClosed/ShuttingDown/catch-all branches).
+  mutable std::atomic<bool> _closing{false};
 
   /// \brief URL parsing structure
   struct ParsedUrl
@@ -564,6 +603,48 @@ public:
     return std::move(result.value);
   }
 
+  /// \brief Cancel all in-flight work WITHOUT tearing down the transport/DNS.
+  ///
+  /// Sets the closing flag (so new work is refused and blocked acquireLease
+  /// waiters wake and fail), wakes lease waiters, and closes every cached
+  /// transport session — which unwinds any thread parked in receiveSync on that
+  /// session (Transport::close is thread-safe and carries no I/O-thread guard).
+  /// It deliberately does NOT stop the transport or DNS client: an in-flight
+  /// thread must still unwind THROUGH them. This is the first half of cleanup().
+  ///
+  /// IDEMPOTENT: tracker 2026-07-26-2's destructor calls this explicitly and then
+  /// again transitively via ~HttpClient -> cleanup(); a second call is a no-op
+  /// (_closing already true, _connections already empty).
+  ///
+  /// noexcept: the only throw source is std::mutex::lock (std::system_error on
+  /// unrecoverable corruption); notify_all, Transport::close (its enqueue
+  /// self-catches) and _connections.clear() do not throw. Terminate-on-corruption
+  /// beats leaking (mirrors ConnectionLease::release()).
+  ///
+  /// DRAIN BOUND: this wakes only threads parked in receiveSync (via the session
+  /// close) and in acquireLease (via the CV). A thread parked in DNS resolution,
+  /// connectSync or sendSync has no published session for the close-loop to see
+  /// and unwinds only on its OWN timeout (DNS / connectTimeout / requestTimeout).
+  void cancelInFlight() noexcept
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    // Refuse new work and wake blocked acquireLease waiters (DD-A8).
+    _closing = true;
+    _cv.notify_all();
+
+    // Close all cached sessions so any thread parked in receiveSync on one
+    // unwinds. Guard on _transport for parity with cleanup()/stop().
+    if (_transport)
+    {
+      for (const auto &[hostPort, entry] : _connections)
+      {
+        _transport->close(entry.id);
+      }
+    }
+    _connections.clear();
+  }
+
   /// \brief Cleanup connections and resources.
   ///
   /// PRECONDITION: callers must not invoke cleanup() (or destroy the client)
@@ -572,27 +653,21 @@ public:
   /// the lease and mid-I/O (connectSync/sendSync/receiveSync) will have its
   /// transport stopped underneath it — it surfaces an error rather than crashing,
   /// but join all request threads before cleanup/destruction for clean shutdown.
+  ///
+  /// This is cancelInFlight() plus the teardown tail. NOTE the tail (stopping the
+  /// transport and DNS client) runs OUTSIDE _mutex — cancelInFlight() releases
+  /// the lock before returning. This narrows the lock scope relative to the
+  /// former single-lock cleanup(), which is safe under the no-concurrent-caller
+  /// precondition above and because _closing (set inside cancelInFlight) already
+  /// gates all new work before the tail runs.
   void cleanup()
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    cancelInFlight();
 
-    // Wake any threads blocked in acquireLease so a destruct/cleanup during a
-    // contended wait fails fast instead of deadlocking (DD-A8).
-    _closing = true;
-    _cv.notify_all();
-
-    // Close all connections. Guard on _transport for consistency with stop()
-    // below (a non-empty cache implies an initialized transport, but keep the
-    // guard so the loop and stop() agree).
     if (_transport)
     {
-      for (const auto &[hostPort, entry] : _connections)
-      {
-        _transport->close(entry.id);
-      }
       _transport->stop();
     }
-    _connections.clear();
 
     if (_dnsClient)
     {
@@ -664,7 +739,8 @@ private:
   /// spurious-wakeup safe) and is bounded by Config::leaseAcquireTimeout when
   /// that is non-zero (LEASE/INV-5), surfacing a DISTINCT timeout error rather
   /// than hanging. Returns an RAII guard whose destruction releases the lease.
-  /// \throws std::runtime_error on lease-acquire timeout or on shutdown.
+  /// \throws std::runtime_error on lease-acquire timeout (retry-eligible for
+  ///   idempotent methods), HttpClientCancelledError on shutdown (never retried).
   ConnectionLease acquireLease(const std::string &hostPort)
   {
     std::unique_lock<std::mutex> lock(_mutex);
@@ -685,8 +761,8 @@ private:
 
     if (_closing)
     {
-      throw std::runtime_error("HttpClient: shutting down; cannot acquire connection lease for " +
-                               hostPort);
+      throw HttpClientCancelledError(
+        "HttpClient: shutting down; cannot acquire connection lease for " + hostPort);
     }
 
     _leasedHosts.insert(hostPort);
@@ -796,9 +872,22 @@ private:
     }
     SessionId sessionId = connectResult.value();
 
-    // (4) Publish the new connection (short critical section).
+    // (4) Publish the new connection (short critical section) with a
+    //     publish-then-recheck against cancellation. Both this publish and
+    //     cancelInFlight()'s close-loop run under _mutex, and _closing is set
+    //     under _mutex before that loop, so serialization admits exactly two
+    //     orders: canceller-first (we observe _closing here, close our own
+    //     just-created session, and throw) or publisher-first (the cancel loop
+    //     then sees the published session and closes it). No interleaving leaves
+    //     a live session. Same register-or-observe-tombstone shape the transport
+    //     uses (transport_impl.hpp).
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      if (_closing)
+      {
+        _transport->close(sessionId);
+        throw HttpClientCancelledError("HttpClient: cancelled during connect for " + hostPort);
+      }
       _connections[hostPort] = ConnectionEntry{sessionId, std::chrono::steady_clock::now()};
     }
 
@@ -857,6 +946,12 @@ private:
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      // Refuse before lazily building a fresh transport: a cancelled client must
+      // not initialise and start a new exchange (read under _mutex, task-1.5).
+      if (_closing)
+      {
+        throw HttpClientCancelledError("HttpClient: cancelled; not issuing " + method + " " + url);
+      }
       ensureInitialized();
     }
 
@@ -884,6 +979,15 @@ private:
         // and, for non-idempotent methods, would be unsafe. Never retry.
         iora::core::Logger::error("HttpClient: Request to " + url +
                                   " failed with a non-retryable framing error: " + e.what());
+        throw;
+      }
+      catch (const HttpClientCancelledError &)
+      {
+        // The client is permanently closing: every retry re-fails identically,
+        // so never retry (task-1.6). This guard MUST precede the generic
+        // catch(std::exception&) below (HttpClientCancelledError IS-A
+        // std::exception); its order relative to the HttpFramingError guard is
+        // irrelevant (siblings).
         throw;
       }
       catch (const std::exception &e)
@@ -955,6 +1059,20 @@ private:
     // attempts and a retry never blocks on a lease this thread already holds.
     ConnectionLease lease = acquireLease(hostPort);
 
+    // Single point of truth for the lock-free cancellation check on the
+    // exchange-abort exits below (send-failure and the receive-loop
+    // PeerClosed/ShuttingDown/catch-all branches). Consolidating the
+    // load(acquire) here means a future edit cannot reintroduce a divergent
+    // memory order at one of the sites. The pre-send generic catch above reads
+    // _closing inline because it converts e.what() and lives in a different try.
+    auto throwIfClosing = [this](const char *msg)
+    {
+      if (_closing.load(std::memory_order_acquire))
+      {
+        throw HttpClientCancelledError(msg);
+      }
+    };
+
     // Pre-send region (INVARIANT: transmits NO request byte — the request is not
     // even built until below). A failure here — connect/DNS resolution, or the
     // sync-mode toggle — means the request was provably not sent, so it is safe
@@ -984,8 +1102,30 @@ private:
     {
       throw;
     }
+    catch (const HttpClientCancelledError &)
+    {
+      // Belt-and-braces (task-1.4 C-1): a cancellation raised at the
+      // publish-recheck (acquireConnection) propagates as-is rather than being
+      // laundered into the retryable HttpRequestNotSentError below. NOTE this is
+      // defense-in-depth and NOT independently mutation-testable: it fires only
+      // when _closing is true, and the generic catch below re-checks _closing
+      // (monotonic) and would rethrow the same cancelled type — so removing this
+      // guard is observationally equivalent for every reachable throw. It is
+      // kept so correctness does not rely on _closing staying monotonic.
+      throw;
+    }
     catch (const std::exception &e)
     {
+      // Publisher-first cancel: the publish succeeded (with _closing still
+      // false), the canceller then closed the just-published session, and this
+      // setReadMode/connect failure is that close surfacing. Surface it as a
+      // (non-retryable) cancellation, not a retryable not-sent (task-1.4 H-3).
+      // Lock-free read — no _mutex held here (enumerated in _closing's
+      // discipline).
+      if (_closing.load(std::memory_order_acquire))
+      {
+        throw HttpClientCancelledError(e.what());
+      }
       throw HttpRequestNotSentError(e.what());
     }
 
@@ -1026,6 +1166,9 @@ private:
       // The connection is unusable — evict it so it is never reused / so a retry
       // opens a fresh socket.
       dropConnection(hostPort, sessionId);
+      // If we are closing, this failure is a cancellation-induced close, not a
+      // retryable transport error (task-1.7).
+      throwIfClosing("HttpClient: cancelled while sending request");
       throw std::runtime_error("Failed to send HTTP request: " + sendResult.error().message);
     }
 
@@ -1075,10 +1218,25 @@ private:
         }
         else if (recvResult.isErr() && recvResult.error().code == TransportError::ShuttingDown)
         {
+          // Defense-in-depth: cancelInFlight() (which does NOT stop the transport)
+          // wakes a parked receiveSync with PeerClosed, so this ShuttingDown guard
+          // is reached only if the transport is being stopped under a parked
+          // receive — the concurrent-teardown scenario cleanup()'s precondition
+          // forbids and tracker 2026-07-26-2's blocking destructor is what makes
+          // safe. Its discriminating test therefore lands with that tracker.
+          throwIfClosing("HttpClient: cancelled (transport shutting down)");
           throw std::runtime_error("HTTP transport shutting down before response complete");
         }
         else if (recvResult.isErr() && recvResult.error().code == TransportError::PeerClosed)
         {
+          // A cancellation-induced close is INDISTINGUISHABLE at the framing
+          // layer from a legitimate close-delimited end-of-body (RFC 9112 §6.3:
+          // "no way to distinguish a successfully completed, close-delimited
+          // message from a partially received message"). The local closing flag
+          // is the only correct discriminator, so guard ALL framing modes BEFORE
+          // the end-of-body test: if we are closing, this close is a
+          // cancellation, never a (possibly truncated) 200 (task-1.7).
+          throwIfClosing("HttpClient: cancelled before response complete (peer closed)");
           // Graceful peer close (receiveSync drains buffered bytes before
           // reporting PeerClosed). For a close-delimited body this IS the
           // end-of-body (RFC 9112 §6.3 rule 8); otherwise it is a truncation.
@@ -1095,7 +1253,19 @@ private:
         }
         else if (recvResult.isErr())
         {
-          throw std::runtime_error("Connection closed before receiving complete HTTP response");
+          // Catch-all for any other transport error code. A cancellation is not
+          // guaranteed to surface as PeerClosed, so guard this exit too
+          // (task-1.7) — otherwise a cancel arriving here escapes as a retryable
+          // generic error. Defense-in-depth: no cancel path observed reaches this
+          // branch today (cancelInFlight wakes receiveSync with PeerClosed), so
+          // like the ShuttingDown guard its discriminating test lands with
+          // tracker 2026-07-26-2. Worst case if unguarded is one ~100 ms backoff
+          // before acquireLease's per-attempt _closing recheck re-classifies it.
+          throwIfClosing("HttpClient: cancelled before response complete (transport error)");
+          throw std::runtime_error(
+            "Connection closed before receiving complete HTTP response (transport error " +
+            std::to_string(static_cast<int>(recvResult.error().code)) + ": " +
+            recvResult.error().message + ")");
         }
       }
 
