@@ -33,6 +33,17 @@ namespace modules
 namespace connectors
 {
 
+/// \brief Test-only observation seam for the connection pool internals.
+/// \details Forward-declared here and befriended by JsonRpcClient and
+/// detail::EndpointPool so tests can read otherwise-private pool state
+/// (per-connection identity, in-use flags, totals) under the client mutex. The
+/// type itself is defined only in the test translation unit; the declaration is
+/// unconditional (never #ifdef-guarded) so the class layout is identical in
+/// every TU — an #ifdef would make the definition differ between translation
+/// units, an ODR violation the moment any consumer is compiled without the
+/// macro.
+struct JsonRpcClientTestAccess;
+
 /// \brief Base exception for JSON-RPC client errors.
 class JsonRpcError : public std::runtime_error
 {
@@ -320,6 +331,12 @@ public:
   const std::string &endpoint() const { return _endpoint; }
 
 private:
+  // Qualified deliberately: an unqualified `friend struct
+  // JsonRpcClientTestAccess;` written inside namespace detail would name
+  // detail::JsonRpcClientTestAccess (nearest-enclosing-namespace rule), a
+  // different, never-defined type — so the test could not read _connections.
+  friend struct ::iora::modules::connectors::JsonRpcClientTestAccess;
+
   std::string _endpoint;
   std::vector<std::unique_ptr<PooledConnection>> _connections;
   std::chrono::steady_clock::time_point _lastTouched;
@@ -989,6 +1006,12 @@ private:
   }
 
 private:
+  // Friendship is not transitive: befriending the test seam on EndpointPool
+  // does not extend here, so JsonRpcClient names it too (for _pools, _mutex,
+  // _totalConnections, recalcTotalLocked_ and acquire_). Unqualified is correct
+  // here — this class sits directly in namespace connectors.
+  friend struct JsonRpcClientTestAccess;
+
   iora::IoraService &_service;
   iora::core::ThreadPool &_threadPool;
   Config _config;
