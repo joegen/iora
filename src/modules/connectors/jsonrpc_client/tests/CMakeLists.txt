@@ -47,11 +47,12 @@ elseif(IORA_ENABLE_ASAN)
     target_link_options(iora_test_jsonrpc_client_pool PRIVATE -fsanitize=address)
 endif()
 
-# Default registration runs ONLY the infrastructure cases (scaffold + seam),
-# which pass at HEAD, so a normal ctest run stays green while the four repros
-# remain deliberately RED (task-1.1(i): TEST name == TARGET name).
+# Default registration runs the infrastructure cases (scaffold + seam + fixture)
+# plus the phase-4 GREEN tests, which all pass. The remaining CR-2/CR-3/CR-4
+# repros stay deliberately RED and are registered separately below
+# (task-1.1(i): TEST name == TARGET name).
 add_test(NAME iora_test_jsonrpc_client_pool
-    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture]")
+    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4]")
 # RESOURCE_LOCK serializes the fixture's fixed-port (18150) bind against any
 # other test that might claim it, independent of the -j1 convention (M2).
 set_tests_properties(iora_test_jsonrpc_client_pool PROPERTIES
@@ -61,12 +62,15 @@ set_tests_properties(iora_test_jsonrpc_client_pool PROPERTIES
 # Each runs the same binary filtered to one repro's Catch2 tag. The four differ
 # in pre-fix signal, so their registration properties differ.
 
-# CR-1 (task-1.4): the assertion half FAILS at HEAD (identity swap). DISABLED
-# until task-4.1c makes release identity-based, which flips it GREEN.
+# CR-1 (task-1.4): identity-based release, GREEN since task-4.1c landed (phase
+# 4). The phase-1 crash companion ([.crash]) is retired, so the tag filter is
+# simply [cr1]. This is the standalone regression guard for the [cr1] case (the
+# default registration above runs [scaffold]/[seam]/[fixture]/[phase4], not
+# [cr1]).
 add_test(NAME jsonrpc_client_pool_cr1_identity
-    COMMAND iora_test_jsonrpc_client_pool "[cr1]~[.crash]")
+    COMMAND iora_test_jsonrpc_client_pool "[cr1]")
 set_tests_properties(jsonrpc_client_pool_cr1_identity PROPERTIES
-    TIMEOUT 60 DISABLED TRUE)
+    TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
 
 # CR-3 (task-1.6): a re-entrant configurer DEADLOCKS the client. A DISABLED test
 # is never executed, so it can never itself expire ctest's TIMEOUT (task-1.1(h),
@@ -77,28 +81,32 @@ add_test(NAME jsonrpc_client_pool_cr3_deadlock
 set_tests_properties(jsonrpc_client_pool_cr3_deadlock PROPERTIES
     TIMEOUT 60 DISABLED TRUE)
 
-# CR-2 (task-1.5) and CR-4 (task-1.7): heap-use-after-free, deterministic ONLY
-# under AddressSanitizer. Under ASan the fault aborts the process (_exit(1)), so
-# WILL_FAIL inverts the verdict to a pass while the bug lives; the fix retires
-# WILL_FAIL. Without ASan the UAF is silent UB, so register DISABLED — visible
-# but never run without the detector. Each runs in isolation (a single-case
-# filter) because the first ASan abort kills the process.
-if(IORA_ENABLE_ASAN)
-    add_test(NAME jsonrpc_client_pool_cr2_freed_pool
-        COMMAND iora_test_jsonrpc_client_pool "[cr2]")
-    set_tests_properties(jsonrpc_client_pool_cr2_freed_pool PROPERTIES
-        TIMEOUT 90 WILL_FAIL TRUE
-        ENVIRONMENT "ASAN_OPTIONS=handle_segv=0:detect_leaks=0:abort_on_error=0:disable_coredump=1")
-    add_test(NAME jsonrpc_client_pool_cr4_freed_client
-        COMMAND iora_test_jsonrpc_client_pool "[cr4]")
-    set_tests_properties(jsonrpc_client_pool_cr4_freed_client PROPERTIES
-        TIMEOUT 90 WILL_FAIL TRUE
-        ENVIRONMENT "ASAN_OPTIONS=handle_segv=0:detect_leaks=0:abort_on_error=0:disable_coredump=1")
-else()
-    add_test(NAME jsonrpc_client_pool_cr2_freed_pool
-        COMMAND iora_test_jsonrpc_client_pool "[cr2]")
-    set_tests_properties(jsonrpc_client_pool_cr2_freed_pool PROPERTIES DISABLED TRUE)
-    add_test(NAME jsonrpc_client_pool_cr4_freed_client
-        COMMAND iora_test_jsonrpc_client_pool "[cr4]")
-    set_tests_properties(jsonrpc_client_pool_cr4_freed_client PROPERTIES DISABLED TRUE)
-endif()
+# CR-2 (task-1.5) and CR-4 (task-1.7): originally heap-use-after-free repros,
+# deterministic ONLY under AddressSanitizer, registered WILL_FAIL so the ASan
+# abort inverted to a pass while the bug lived.
+#
+# Both UAFs are NOW ELIMINATED ahead of their nominal fix phases, verified by
+# running each under ASan (both exit 0, "All tests passed"):
+#   * CR-4's async use-after-free was closed in PHASE 2 — callAsync captures
+#     shared_from_this(), so destroying the facade no longer frees the Impl a
+#     queued task will touch.
+#   * CR-2's freed-pool use-after-free was closed in PHASE 4 — _pools and the
+#     connections are shared_ptr, and acquire_ holds an owning pool handle, so a
+#     pool evicted mid-acquire stays alive instead of being freed under the call.
+# With the UAF gone, a WILL_FAIL registration would report a SPURIOUS FAILURE
+# under ASan (the process now exits 0). The RESIDUAL, non-UAF defects are still
+# real but are owned by later phases and need a different (non-ASan, seam-driven)
+# RED signal that those phases install:
+#   * CR-2 residual: acquire_ still creates a connection on a pool detached from
+#     _pools, and _totalConnections still drifts (H-2) — re-registered by PHASE 5
+#     (task-5.1 allIdle guard, task-5.2 counter integrity) as a seam assertion.
+#   * CR-4 residual: synchronous in-flight accounting — re-registered by PHASE 3
+#     (blocking quiesce) with synchronous-path counting.
+# Until then, register DISABLED under BOTH ASan and non-ASan (visible, never run,
+# no spurious failure). Do NOT restore WILL_FAIL without a live UAF.
+add_test(NAME jsonrpc_client_pool_cr2_freed_pool
+    COMMAND iora_test_jsonrpc_client_pool "[cr2]")
+set_tests_properties(jsonrpc_client_pool_cr2_freed_pool PROPERTIES DISABLED TRUE)
+add_test(NAME jsonrpc_client_pool_cr4_freed_client
+    COMMAND iora_test_jsonrpc_client_pool "[cr4]")
+set_tests_properties(jsonrpc_client_pool_cr4_freed_client PROPERTIES DISABLED TRUE)

@@ -14,11 +14,11 @@
 // Crash-evidence note (task-1.1(e-pre)): this host's core_pattern is a pipe
 // (|/wsl-capture-crash) and core(5) states RLIMIT_CORE is NOT enforced for
 // piped dumps, so a SIGSEGV/SIGABRT would invoke the WSL crash handler for
-// minutes and present to ctest as a TIMEOUT. The only faulting target here is
-// the CR-1 crash half: it calls prctl(PR_SET_DUMPABLE, 0) immediately before
-// the fault so the kernel skips the core path, and it is registered DISABLED so
-// ctest never runs the fault (it is invoked manually for forensic evidence).
-// No target expects std::terminate, so no std::set_terminate is installed.
+// minutes and present to ctest as a TIMEOUT. Phase 1 carried a CR-1 crash half
+// (an out-of-range index release guarded by prctl(PR_SET_DUMPABLE, 0)); it is
+// retired in phase 4 because handle-based release has no index to run out of
+// range, so no faulting target remains here. No target expects std::terminate,
+// so no std::set_terminate is installed.
 
 #define CATCH_CONFIG_RUNNER
 #include "iora/iora.hpp"
@@ -38,7 +38,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <sys/prctl.h>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -138,13 +137,82 @@ struct JsonRpcClientTestAccess
     }
     return 0;
   }
+
+  /// \brief The owning handle of the first connection in `ep`'s pool, or nullptr.
+  /// Used to drive EndpointPool::erase directly in the guard tests.
+  static std::shared_ptr<detail::PooledConnection> firstHandle(JsonRpcClient &c,
+                                                               const std::string &ep)
+  {
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    auto it = c._impl->_pools.find(ep);
+    if (it == c._impl->_pools.end() || it->second->_connections.empty())
+    {
+      return nullptr;
+    }
+    return it->second->_connections.front();
+  }
+
+  /// \brief Drive EndpointPool::erase(handle) on `ep`'s pool under the client
+  /// mutex. Propagates the std::logic_error the guard throws (task-4.2/4.3).
+  static void eraseHandle(JsonRpcClient &c, const std::string &ep,
+                          const std::shared_ptr<detail::PooledConnection> &handle)
+  {
+    // `bin` declared BEFORE `guard` so that on a SUCCESSFUL erase the moved-out
+    // connection is destroyed after the lock releases, mirroring the production
+    // collect-then-destroy discipline (T6-2). (The two guard cases under test —
+    // absent / in-use handle — throw before touching `bin`, but declaring it
+    // first keeps this seam safe for any future test that erases a live handle.)
+    std::vector<std::shared_ptr<detail::PooledConnection>> bin;
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    auto it = c._impl->_pools.find(ep);
+    if (it == c._impl->_pools.end())
+    {
+      throw std::logic_error("test seam: no pool for endpoint");
+    }
+    it->second->erase(handle, bin);
+  }
+
+  /// \brief Remove `ep`'s pool from _pools and RETURN it (kept alive by the
+  /// caller). Drives the CR-1c path the public API cannot reach — a live lease
+  /// keeps its connection in-use, so purge/evict can never empty the pool.
+  static std::shared_ptr<detail::EndpointPool> detachPool(JsonRpcClient &c, const std::string &ep)
+  {
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    auto it = c._impl->_pools.find(ep);
+    if (it == c._impl->_pools.end())
+    {
+      return nullptr;
+    }
+    auto pool = std::move(it->second);
+    c._impl->_pools.erase(it);
+    return pool;
+  }
+
+  /// \brief in-use flag of the first connection of a (possibly detached) pool,
+  /// read under the client mutex so the read has happens-before with any
+  /// releaseConnection_ markFree() on another thread (cheap insurance beyond the
+  /// current single-threaded callers).
+  static bool firstConnInUse(JsonRpcClient &c, const std::shared_ptr<detail::EndpointPool> &pool)
+  {
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    return pool->_connections.front()->inUse();
+  }
+
+  static std::size_t poolConnCount(JsonRpcClient &c,
+                                   const std::shared_ptr<detail::EndpointPool> &pool)
+  {
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    return pool->_connections.size();
+  }
 };
 } // namespace connectors
 } // namespace modules
 } // namespace iora
 
 using iora::modules::connectors::JsonRpcClientTestAccess;
+using iora::modules::connectors::PoolExhaustedError;
 using iora::modules::connectors::detail::ConnectionLease;
+using iora::modules::connectors::detail::PooledConnection;
 
 // task-2.2 — the pImpl facade must stay non-copyable AND non-movable; a facade
 // that could be copied or moved would share one JsonRpcClientImpl between two
@@ -182,7 +250,7 @@ inUseOf(const std::vector<JsonRpcClientTestAccess::PoolSnapshot> &snap, std::uin
 }
 
 /// \brief A Config whose factory hands out a bare HttpClient and never touches
-/// the network — acquire_ only calls the factory (jsonrpc_client.hpp:617), so
+/// the network — acquire_ only calls the factory, so
 /// the pool-lifetime repros need no server at all.
 Config stubFactoryConfig()
 {
@@ -193,7 +261,7 @@ Config stubFactoryConfig()
 }
 
 /// \brief The JSON-RPC 2.0 success envelope the fixtures reply with. No `error`
-/// member, so parseResponseOrThrow_ (jsonrpc_client.hpp:831-845) returns the
+/// member, so parseResponseOrThrow_ returns the
 /// result rather than throwing RemoteError (task-1.3(D)).
 constexpr const char *kJsonRpcSuccessBody = R"({"jsonrpc":"2.0","result":{},"id":1})";
 
@@ -299,9 +367,8 @@ private:
 };
 
 /// \brief Bring up a single process-wide IoraService the client ctor requires.
-/// JsonRpcClient's constructor takes an IoraService& and a core::ThreadPool&
-/// (jsonrpc_client.hpp:386); the service must be initialized exactly once for
-/// the whole binary.
+/// JsonRpcClient's constructor takes an IoraService& and a core::ThreadPool&,
+/// so the service must be initialized exactly once for the whole binary.
 iora::IoraService &testService()
 {
   static bool initialized = false;
@@ -468,14 +535,16 @@ TEST_CASE("fixture: latched HTTP server holds a request until released",
 }
 
 // =========================================================================
-// task-1.4 — CR-1 repro: ConnectionLease identifies its connection by a vector
-// INDEX, which every mid-vector erase invalidates. Single-threaded via the
-// seam (round-4 rewrite): no server, no latch, no 3 s ceiling. The assertion
-// half discriminates on per-connection IDENTITY (the only observable that is
-// not vacuous); the out-of-bounds SIGSEGV half is isolated and hidden.
-// MUST FAIL against the unmodified baseline.
+// task-1.4 / task-4.1c — CR-1 regression guard: a ConnectionLease now holds an
+// owning std::shared_ptr<PooledConnection> handle, so release is keyed on the
+// connection's stable IDENTITY, never a vector index that a mid-vector erase
+// invalidates. Single-threaded via the seam: no server, no latch. This case was
+// RED at HEAD (phase 1) and is GREEN once task-4.1c lands; it now guards against
+// a regression to index-based identity. The out-of-range SIGSEGV companion that
+// phase 1 carried is retired: with handle-based release there is no index to run
+// out of range, so the fault it demonstrated can no longer occur.
 // =========================================================================
-TEST_CASE("CR-1 repro: wrong-connection-free swaps lease identity (RED at HEAD)",
+TEST_CASE("CR-1 fixed: identity-based release frees the leased connection, not a shifted neighbor",
           "[jsonrpc][pool][cr1]")
 {
   auto &svc = testService();
@@ -505,7 +574,7 @@ TEST_CASE("CR-1 repro: wrong-connection-free swaps lease identity (RED at HEAD)"
 
   a.reset();                                             // release(0): conn A -> free
   std::this_thread::sleep_for(std::chrono::milliseconds(60)); // A now idle > idleTimeout
-  client.purgeIdle();                                    // erases A at :272; [B,C] shift down
+  client.purgeIdle();                                    // erases idle A; B and C remain, in use
 
   // Pre-fix: b's stale _index==1 now points at C, so release(1) frees C and
   // leaves B inUse forever. Post-fix (identity-based release): B is freed, C
@@ -518,51 +587,340 @@ TEST_CASE("CR-1 repro: wrong-connection-free swaps lease identity (RED at HEAD)"
   REQUIRE(cInUse.has_value());
   REQUIRE(bInUse.has_value());
   // The discriminating assertion: the connection lease2 (C) still holds must be
-  // inUse; the one lease1 (B) held must be free. FAILS pre-fix, PASSES post-fix.
-  CHECK(cInUse.value() == true);  // pre-fix: C was wrongly freed -> false -> FAILS
-  CHECK(bInUse.value() == false); // pre-fix: B wrongly left inUse -> true -> FAILS
+  // inUse; the one lease1 (B) held must be free. Would FAIL under index-based
+  // release (a regression); PASSES with handle-based identity.
+  CHECK(cInUse.value() == true);
+  CHECK(bInUse.value() == false);
 
-  // Leak C on the heap: never destroy its lease, so the out-of-range release(2)
-  // does not fire in this assertion binary and take the CHECKs with it.
-  (void)c.release();
+  // Destroying c's lease is now well-defined: releaseConnection_ does
+  // conn->markFree() on the still-owned connC, with no index to run out of
+  // range. Let it unwind normally at scope exit (the phase-1 SIGSEGV companion
+  // is retired — the fault it demonstrated cannot occur post-fix).
 }
 
-// The SIGSEGV half of CR-1, isolated and hidden ([.] = not run by default).
-// Destroying C runs release(2) on the size-2 vector -> NULL-deref SIGSEGV.
-// PR_SET_DUMPABLE(0) makes the kernel skip the piped core handler (task-1.1
-// (e-pre)(2)); without it the WSL crash handler burns >9 min and presents as a
-// ctest TIMEOUT. Run manually for forensic evidence.
-TEST_CASE("CR-1 crash half: out-of-range release(idx) faults (isolated)",
-          "[jsonrpc][pool][cr1][.crash]")
+// =========================================================================
+// task-4.3 — release-guard regression: with EVERY connection leased (all
+// in-use), purgeIdle() must evict nothing and every lease must still refer to a
+// live, in-use connection. Guards the three in-use erase gates locked in by
+// task-4.3 (tryAcquireFree, purgeIdle, EndpointPool::erase) against a future
+// edit that erases a leased connection.
+// =========================================================================
+TEST_CASE("task-4.3: purgeIdle evicts nothing while all connections are leased",
+          "[jsonrpc][pool][phase4]")
 {
   auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
-  cfg.idleTimeout = std::chrono::milliseconds(50);
+  cfg.idleTimeout = std::chrono::milliseconds(10); // short, so expiry is not the reason
   JsonRpcClient client(svc, pool, cfg);
   const std::string ep = "http://unit.test/rpc";
 
   auto a = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
   auto b = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
   auto c = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
-  a.reset();
-  std::this_thread::sleep_for(std::chrono::milliseconds(60));
-  client.purgeIdle();
-  b.reset();
+  const auto idA = JsonRpcClientTestAccess::connectionIdOf(client, *a);
+  const auto idB = JsonRpcClientTestAccess::connectionIdOf(client, *b);
+  const auto idC = JsonRpcClientTestAccess::connectionIdOf(client, *c);
+  REQUIRE(idA != 0);
+  REQUIRE(idB != 0);
+  REQUIRE(idC != 0);
 
-  std::cerr << "[cr1-crash] destroying C -> release(2) on size-2 vector" << std::endl;
-  ::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0); // skip the piped core dump on the fault
-  c.reset();                            // release(2): out-of-range -> SIGSEGV
-  FAIL("expected SIGSEGV from out-of-range release() did not occur");
+  // Even well past idleTimeout, in-use connections are NOT expiry-eligible.
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  REQUIRE(client.purgeIdle() == 0);
+
+  const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+  for (auto id : {idA, idB, idC})
+  {
+    const auto st = inUseOf(snap, id);
+    REQUIRE(st.has_value());   // still present — not erased
+    REQUIRE(st.value() == true); // still in use
+  }
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 3);
+}
+
+// =========================================================================
+// task-4.1b — collect-then-destroy exercise: purgeIdle() on a pool of expired
+// idle connections evicts them all, and a concurrent acquire on a DIFFERENT
+// endpoint completes rather than deadlocking. This exercises the eviction path
+// under concurrency and guards against a regression that would hold the client
+// mutex across pooled-connection destruction. NOTE: it does not, and cannot,
+// prove the microsecond-scale "not blocked for the join duration" timing —
+// iora::network::HttpClient is a concrete, non-virtual, fixed-deleter type, so
+// its destructor cannot be instrumented from a test. The declared-before-lock
+// evicted vectors in acquire_/purgeIdle are what structurally guarantee the
+// destruction runs after _mutex is released (T6-2); that is grep-verified.
+// =========================================================================
+TEST_CASE("task-4.1b: purgeIdle evicts idle connections without blocking other endpoints",
+          "[jsonrpc][pool][phase4]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 8;
+  cfg.idleTimeout = std::chrono::milliseconds(40);
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string epEvict = "http://unit.test/evict";
+  const std::string epLive = "http://unit.test/live";
+
+  // Create and free four connections on epEvict, so they become idle.
+  {
+    std::vector<std::unique_ptr<ConnectionLease>> leases;
+    for (int i = 0; i < 4; ++i)
+    {
+      leases.push_back(
+        std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, epEvict)));
+    }
+  } // all released -> four idle connections on epEvict
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 4);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(60)); // epEvict conns now expired
+
+  // While purgeIdle runs on one thread, hammer acquire/release on a DIFFERENT
+  // endpoint on another. Both must finish inside the bound (no deadlock, no
+  // mutex held across the evicting teardown).
+  std::atomic<bool> liveDone{false};
+  std::thread live(
+    [&]()
+    {
+      for (int i = 0; i < 50; ++i)
+      {
+        auto l = JsonRpcClientTestAccess::acquire(client, epLive);
+        (void)l.client();
+      }
+      liveDone.store(true);
+    });
+
+  const std::size_t evicted = client.purgeIdle();
+  live.join();
+
+  REQUIRE(liveDone.load() == true);
+  REQUIRE(evicted == 4); // all four idle epEvict connections gone
+
+  // epEvict pool is emptied and dropped; epLive remains with its idle connection.
+  const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+  for (const auto &ps : snap)
+  {
+    REQUIRE(ps.poolKey != epEvict);
+  }
+  REQUIRE(JsonRpcClientTestAccess::recalcTotal(client) ==
+          JsonRpcClientTestAccess::totalConnections(client));
+}
+
+// =========================================================================
+// task-4.2 / task-4.3 — EndpointPool::erase guards. The guard is an
+// UNCONDITIONAL throw (std::logic_error), never an assert, so it survives
+// NDEBUG — a use-after-free guard must be present in the shipped Release build.
+// Two guarded conditions: (a) a handle not present in the pool (task-4.2), and
+// (b) a handle that is still in use (task-4.3, the one previously-unguarded
+// erase path). Driven directly through the befriended seam.
+// =========================================================================
+TEST_CASE("task-4.2/4.3: EndpointPool::erase throws on an absent or in-use handle",
+          "[jsonrpc][pool][phase4]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 3;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://unit.test/rpc";
+
+  // (b) in-use guard: hold a lease so its connection is in use, then try to
+  // erase that exact handle.
+  {
+    auto lease = JsonRpcClientTestAccess::acquire(client, ep);
+    auto handle = JsonRpcClientTestAccess::firstHandle(client, ep);
+    REQUIRE(handle != nullptr);
+    REQUIRE(handle->inUse() == true);
+    REQUIRE_THROWS_AS(JsonRpcClientTestAccess::eraseHandle(client, ep, handle), std::logic_error);
+    // The leased connection must still be present after the refused erase.
+    REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).at(0).connections.size() == 1);
+  }
+
+  // (a) absent guard: a connection that was never inserted into ep's pool.
+  auto bogus = std::make_shared<PooledConnection>(std::make_unique<iora::network::HttpClient>());
+  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::eraseHandle(client, ep, bogus), std::logic_error);
+}
+
+// =========================================================================
+// task-4.1c — CR-1c composite: a ConnectionLease releases cleanly even when its
+// pool has been removed from _pools while the lease was live. The public API
+// cannot reach this (a live lease keeps its connection in-use, so purge/evict
+// can never empty and drop the pool), so it is driven at the detail:: layer via
+// the seam: detach the pool from the map, keep it alive, then destroy the lease.
+// The lease's shared_ptr<Impl>/<EndpointPool>/<PooledConnection> keep every
+// object it touches alive, so releaseConnection_ does markFree()+touch() on
+// still-owned state — well-defined, no UAF (this is the ASan detector for CR-1c).
+// =========================================================================
+TEST_CASE("task-4.1c CR-1c: a lease releases cleanly into a pool erased from the map",
+          "[jsonrpc][pool][phase4]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 3;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://unit.test/rpc";
+
+  std::shared_ptr<iora::modules::connectors::detail::EndpointPool> detached;
+  {
+    auto lease = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
+    const auto id = JsonRpcClientTestAccess::connectionIdOf(client, *lease);
+    REQUIRE(id != 0);
+
+    // Detach ep's pool from the map while the lease is still live.
+    detached = JsonRpcClientTestAccess::detachPool(client, ep);
+    REQUIRE(detached != nullptr);
+    REQUIRE(JsonRpcClientTestAccess::poolConnCount(client, detached) == 1);
+    REQUIRE(JsonRpcClientTestAccess::firstConnInUse(client, detached) == true);
+    REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).empty()); // gone from the map
+
+    // Release the lease: releaseConnection_ runs against the detached-but-alive
+    // pool and connection. Must not crash / read freed memory.
+    lease.reset();
+  }
+
+  // The connection the detached pool still owns was marked free by the release.
+  REQUIRE(JsonRpcClientTestAccess::poolConnCount(client, detached) == 1);
+  REQUIRE(JsonRpcClientTestAccess::firstConnInUse(client, detached) == false);
+}
+
+// =========================================================================
+// task-4.1b (cpp17 R#7 regression) — an idle pool keyed by an EMPTY-STRING
+// endpoint must be a valid LRU pool-eviction candidate. The old
+// bestKey.empty() sentinel in evictOneIdlePoolLruLocked_ would have skipped it;
+// the iterator sentinel does not. Driven via the maxEndpointPools cap, which
+// triggers idle-pool LRU eviction when a new endpoint needs a pool.
+// =========================================================================
+TEST_CASE("task-4.1b: an idle pool keyed by the empty-string endpoint is LRU-evictable",
+          "[jsonrpc][pool][phase4]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxEndpointPools = 1; // one pool at a time -> a second endpoint forces eviction
+  JsonRpcClient client(svc, pool, cfg);
+
+  // Create and free a connection on the empty-string endpoint -> idle pool "".
+  {
+    auto l = JsonRpcClientTestAccess::acquire(client, "");
+    (void)l;
+  }
+  {
+    auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    REQUIRE(snap[0].poolKey.empty()); // the "" pool exists and is idle
+  }
+
+  // Acquire on a different endpoint: with maxEndpointPools == 1 the only idle
+  // pool ("") is the LRU eviction candidate. A bestKey.empty() sentinel would
+  // have refused to evict it and the "" pool would leak.
+  {
+    auto l2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/other");
+    (void)l2;
+    auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    for (const auto &ps : snap)
+    {
+      REQUIRE(ps.poolKey != ""); // the empty-string pool was evicted
+    }
+  }
+}
+
+// =========================================================================
+// task-4.1b — concurrent throw path vs whole-pool eviction. One thread drives
+// acquire_ to the PoolExhaustedError throw (per-endpoint cap reached, its one
+// slot leased) in a tight loop — the path where the mutex is released by
+// unwinding rather than an explicit unlock(), and where the pre-lock `evicted`
+// bins and the `pool` local destruct after the unlock. Concurrently another
+// thread creates, frees and purges idle connections on other endpoints, so
+// whole-pool eviction (dropping HttpClients) runs against the thrower. Asserts
+// every capped acquire threw, none spuriously succeeded, and neither thread
+// deadlocked. Runs clean under TSan.
+// =========================================================================
+TEST_CASE("task-4.1b: concurrent PoolExhaustedError throw races whole-pool eviction",
+          "[jsonrpc][pool][phase4]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 1; // one slot per endpoint -> deterministic throw
+  cfg.globalMaxConnections = 0;      // unlimited: eviction not forced by global cap
+  cfg.idleTimeout = std::chrono::milliseconds(5);
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string epFull = "http://unit.test/full";
+  const std::string ev[3] = {"http://unit.test/ev0", "http://unit.test/ev1",
+                             "http://unit.test/ev2"};
+
+  // Hold epFull's single slot for the whole test, so acquire(epFull) always
+  // hits the per-endpoint cap and throws.
+  auto held = JsonRpcClientTestAccess::acquire(client, epFull);
+
+  constexpr int kThrows = 100;
+  std::atomic<int> threw{0};
+  std::atomic<int> unexpected{0};
+  std::atomic<bool> evictorDone{false};
+
+  std::thread thrower(
+    [&]()
+    {
+      for (int i = 0; i < kThrows; ++i)
+      {
+        try
+        {
+          auto l = JsonRpcClientTestAccess::acquire(client, epFull);
+          (void)l;
+          unexpected.fetch_add(1); // must never succeed while the slot is leased
+        }
+        catch (const PoolExhaustedError &)
+        {
+          threw.fetch_add(1);
+        }
+        catch (...)
+        {
+          unexpected.fetch_add(1);
+        }
+      }
+    });
+
+  std::thread evictor(
+    [&]()
+    {
+      for (int cycle = 0; cycle < 25; ++cycle)
+      {
+        {
+          std::vector<std::unique_ptr<ConnectionLease>> leases;
+          for (const auto &e : ev)
+          {
+            leases.push_back(
+              std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, e)));
+          }
+        } // freed -> three idle connections in three pools
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // > idleTimeout
+        client.purgeIdle(); // whole-pool eviction, dropping HttpClients
+      }
+      evictorDone.store(true);
+    });
+
+  thrower.join();
+  evictor.join();
+
+  REQUIRE(threw.load() == kThrows);
+  REQUIRE(unexpected.load() == 0);
+  REQUIRE(evictorDone.load() == true);
 }
 
 // =========================================================================
 // task-1.5 — CR-2 repro: an emptied pool is allIdle()==true (vacuously), so
 // acquire_ selects and frees the very pool it holds a reference to, then calls
-// createAndAcquire on the freed EndpointPool (:640). Depends on H-2 counter
-// drift; MUST be run before task-5.2 fixes the counter. Detector is ASan
-// heap-use-after-free — build with -DIORA_ENABLE_ASAN=ON. WILL_FAIL.
+// createAndAcquire on that EndpointPool. NOTE: the heap-use-after-free this once
+// produced was ELIMINATED in phase 4 (shared_ptr pool keep-alive) — see the
+// registration comment in CMakeLists.txt. The residual non-UAF logic bug
+// (acquire on a detached pool + H-2 counter drift) is owned by phase 5, which
+// re-registers this repro with a seam-driven RED signal; DISABLED until then.
 // =========================================================================
 TEST_CASE("CR-2 repro: acquire on a freed EndpointPool (RED under ASan)",
           "[jsonrpc][pool][cr2]")

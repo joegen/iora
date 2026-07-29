@@ -12,6 +12,9 @@
 #include <cassert>
 #include <cctype>
 #include <chrono>
+// Retained deliberately: the next phase (blocking quiesce) re-introduces a
+// condition variable on this class. Kept across phase 4 to avoid churning the
+// include set of a public module header between adjacent phases.
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -49,6 +52,15 @@ namespace connectors
 /// translation units, an ODR violation the moment any consumer is compiled
 /// without the macro.
 struct JsonRpcClientTestAccess;
+
+/// \brief Forward declaration of the implementation body (task-4.1c).
+/// \details detail::ConnectionLease holds a std::shared_ptr<JsonRpcClientImpl>
+/// keep-alive, so it needs the name before the class is defined. The type is
+/// namespace-scope (namespace connectors), so a shared_ptr member to it carries
+/// no enclosing-private-type hazard; the full definition follows the detail
+/// namespace and the lease destructor is defined out of line once it is
+/// complete.
+class JsonRpcClientImpl;
 
 /// \brief Base exception for JSON-RPC client errors.
 class JsonRpcError : public std::runtime_error
@@ -232,87 +244,131 @@ public:
   {
   }
 
-  std::optional<std::size_t> tryAcquireFree(std::chrono::milliseconds idleTimeout)
+  /// \brief Acquire a free connection, returning an owning handle (CR-1: the
+  /// object IS its own identity, so a lease can never be aliased onto a
+  /// different connection by a vector shift). Returns nullptr if none is free.
+  /// \details Idle connections that have expired are removed during the scan.
+  /// Their owning shared_ptr is MOVED into `evicted` rather than destroyed here:
+  /// ~PooledConnection runs ~HttpClient, which joins I/O threads, and this
+  /// method runs under JsonRpcClientImpl::_mutex — so the caller destroys
+  /// `evicted` only after releasing that mutex (thread-safety T6-2, the
+  /// destruction analogue of copy-then-invoke).
+  std::shared_ptr<PooledConnection>
+  tryAcquireFree(std::chrono::milliseconds idleTimeout,
+                 std::vector<std::shared_ptr<PooledConnection>> &evicted)
   {
     const auto now = std::chrono::steady_clock::now();
-    for (std::size_t i = 0; i < _connections.size(); ++i)
+    for (std::size_t i = 0; i < _connections.size();)
     {
       auto &pc = _connections[i];
       if (!pc->inUse())
       {
         if ((now - pc->lastUsed()) > idleTimeout)
         {
+          evicted.push_back(std::move(_connections[i]));
           _connections.erase(_connections.begin() + static_cast<long>(i));
-          --i;
           continue;
         }
         pc->markInUse();
         touch();
-        return i;
+        return pc;
       }
+      ++i;
     }
-    return std::nullopt;
+    return nullptr;
   }
 
-  std::size_t createAndAcquire(
+  std::shared_ptr<PooledConnection> createAndAcquire(
     const std::function<std::unique_ptr<iora::network::HttpClient>(const std::string &)> &factory,
     ClientStats *stats = nullptr)
   {
-    _connections.emplace_back(std::make_unique<PooledConnection>(factory(_endpoint)));
-    _connections.back()->markInUse();
+    auto pc = std::make_shared<PooledConnection>(factory(_endpoint));
+    pc->markInUse();
+    _connections.push_back(pc);
     touch();
     if (stats)
     {
       stats->connectionsCreated++;
     }
-    return _connections.size() - 1;
+    return pc;
   }
 
-  void release(std::size_t idx)
+  /// \brief Mark a leased connection free again. Handle-based (CR-1c): the lease
+  /// owns `handle`, so this is well-defined even if `handle` was already erased
+  /// from _connections by a concurrent purge — it degrades to a plain markFree
+  /// on a still-owned object. Must be called under JsonRpcClientImpl::_mutex
+  /// (thread-safety M-3: _inUse/_lastUsed are plain, read by other threads).
+  void release(const std::shared_ptr<PooledConnection> &handle)
   {
-    _connections[idx]->markFree();
+    handle->markFree();
     touch();
   }
 
-  iora::network::HttpClient &clientAt(std::size_t idx) { return _connections[idx]->client(); }
-
-  std::size_t purgeIdle(std::chrono::milliseconds idleTimeout)
+  std::size_t purgeIdle(std::chrono::milliseconds idleTimeout,
+                        std::vector<std::shared_ptr<PooledConnection>> &evicted)
   {
     const auto now = std::chrono::steady_clock::now();
-    std::size_t evicted = 0;
+    std::size_t count = 0;
 
-    for (std::size_t i = 0; i < _connections.size(); ++i)
+    for (std::size_t i = 0; i < _connections.size();)
     {
       auto &pc = _connections[i];
       if (!pc->inUse() && ((now - pc->lastUsed()) > idleTimeout))
       {
+        // Collect-then-destroy under the caller's mutex (T6-2): move out, erase
+        // the (now-empty) slot, let the caller destroy after unlocking.
+        evicted.push_back(std::move(_connections[i]));
         _connections.erase(_connections.begin() + static_cast<long>(i));
-        ++evicted;
-        --i;
+        ++count;
+      }
+      else
+      {
+        ++i;
       }
     }
-    if (evicted > 0)
+    if (count > 0)
     {
       touch();
     }
-    return evicted;
+    return count;
   }
 
+  /// \brief Visit every idle connection as its owning handle (never a position:
+  /// an index handed out here would be invalidated by any concurrent erase —
+  /// CR-1). `fn` receives (const std::shared_ptr<PooledConnection>&, lastUsed).
   template <typename Fn> void forEachIdle(Fn &&fn)
   {
-    for (std::size_t i = 0; i < _connections.size(); ++i)
+    for (const auto &pc : _connections)
     {
-      const auto &pc = _connections[i];
       if (!pc->inUse())
       {
-        fn(i, pc->lastUsed());
+        fn(pc, pc->lastUsed());
       }
     }
   }
 
-  void eraseAt(std::size_t idx)
+  /// \brief Remove `handle` from this pool, moving its owning reference into
+  /// `evicted` for destruction after the caller releases the mutex (T6-2).
+  /// \details THROWS std::logic_error (never assert — task-4.2: a use-after-free
+  /// guard must survive NDEBUG) when `handle` is not present, and (task-4.3)
+  /// when it is still in use — this is the one erase path that was previously
+  /// unguarded. The other two erase paths gate on !inUse() themselves:
+  /// tryAcquireFree only erases connections it has just tested !inUse(), and
+  /// purgeIdle gates on !pc->inUse() && expired.
+  void erase(const std::shared_ptr<PooledConnection> &handle,
+             std::vector<std::shared_ptr<PooledConnection>> &evicted)
   {
-    _connections.erase(_connections.begin() + static_cast<long>(idx));
+    auto it = std::find(_connections.begin(), _connections.end(), handle);
+    if (it == _connections.end())
+    {
+      throw std::logic_error("EndpointPool::erase: connection handle not present in pool");
+    }
+    if ((*it)->inUse())
+    {
+      throw std::logic_error("EndpointPool::erase: refusing to erase an in-use connection");
+    }
+    evicted.push_back(std::move(*it));
+    _connections.erase(it);
     touch();
   }
 
@@ -344,71 +400,62 @@ private:
   friend struct ::iora::modules::connectors::JsonRpcClientTestAccess;
 
   std::string _endpoint;
-  std::vector<std::unique_ptr<PooledConnection>> _connections;
+  // shared_ptr, not unique_ptr (CR-1/task-4.1a): a ConnectionLease holds an
+  // owning handle to its connection, so identity is the object itself. An erase
+  // drops the pool's reference; a lease that outlives the erase keeps the
+  // connection alive, and markFree() on a detached connection stays well-defined.
+  std::vector<std::shared_ptr<PooledConnection>> _connections;
   std::chrono::steady_clock::time_point _lastTouched;
 };
 
 /// \brief RAII handle to one pooled connection; releases it (under the client
 /// mutex) on destruction.
-/// \details Holds NON-owning raw pointers into the owning JsonRpcClientImpl
-/// (_pool, _mutex) and a notify callback capturing that Impl by raw `this`. It
-/// does NOT extend Impl's lifetime, so a lease MUST NOT outlive the Impl method
-/// frame that created it: in production every lease is a stack local inside
-/// call/notify/callBatch, which run either on the caller thread (facade held by
-/// the caller) or on a worker task that captured a shared_ptr<Impl> — Impl
-/// therefore always outlives the lease. Tests that own a lease via the
-/// observation seam keep the facade alive for at least the lease's lifetime.
-/// task-4.1c converts these raw pointers to a shared_ptr keep-alive.
+/// \details Holds ONLY owning references (task-4.1c): a shared_ptr keep-alive to
+/// the owning JsonRpcClientImpl (which keeps its _mutex and _pools map alive so
+/// the destructor can never touch freed state — CR-1c), the connection's pool,
+/// and the connection itself. No raw pointers, no vector index — so a lease can
+/// never be aliased onto a different connection (CR-1) nor dereference a freed
+/// pool/mutex (CR-1c). Releasing into a pool that no longer contains the
+/// connection reduces to conn->markFree() on a still-owned object plus a
+/// best-effort pool touch.
 class ConnectionLease
 {
 public:
   ConnectionLease() = delete;
 
-  ConnectionLease(EndpointPool &pool, std::size_t index, iora::network::HttpClient &client,
-                  std::mutex &mutex, std::function<void()> notifyReleased)
-      : _pool(&pool), _index(index), _client(&client), _mutex(&mutex),
-        _notifyReleased(std::move(notifyReleased)), _active(true)
+  ConnectionLease(std::shared_ptr<JsonRpcClientImpl> impl, std::shared_ptr<EndpointPool> pool,
+                  std::shared_ptr<PooledConnection> conn)
+      : _impl(std::move(impl)), _pool(std::move(pool)), _conn(std::move(conn))
   {
   }
 
-  ConnectionLease(ConnectionLease &&other) noexcept
-      : _pool(other._pool), _index(other._index), _client(other._client), _mutex(other._mutex),
-        _notifyReleased(std::move(other._notifyReleased)), _active(other._active)
-  {
-    other._active = false;
-    other._pool = nullptr;
-    other._client = nullptr;
-    other._mutex = nullptr;
-  }
-
+  // A moved-from lease is inert because moving _impl leaves the source's _impl
+  // null (guaranteed by shared_ptr's move ctor), and the destructor no-ops on a
+  // null _impl. So the default member-wise move is exactly right — no separate
+  // "active" flag is needed to track liveness.
+  ConnectionLease(ConnectionLease &&) noexcept = default;
   ConnectionLease &operator=(ConnectionLease &&) = delete;
   ConnectionLease(const ConnectionLease &) = delete;
   ConnectionLease &operator=(const ConnectionLease &) = delete;
 
-  ~ConnectionLease()
-  {
-    if (_active && _pool != nullptr && _mutex != nullptr)
-    {
-      {
-        std::lock_guard<std::mutex> guard(*_mutex);
-        _pool->release(_index);
-      }
-      if (_notifyReleased)
-      {
-        _notifyReleased();
-      }
-    }
-  }
+  /// Defined out of line below, once JsonRpcClientImpl is complete: the body
+  /// releases the connection under Impl::_mutex, so it needs the full type.
+  ~ConnectionLease();
 
-  iora::network::HttpClient &client() { return *_client; }
+  iora::network::HttpClient &client() { return _conn->client(); }
 
 private:
-  EndpointPool *_pool;
-  std::size_t _index;
-  iora::network::HttpClient *_client;
-  std::mutex *_mutex;
-  std::function<void()> _notifyReleased;
-  bool _active;
+  // Declaration order is load-bearing (thread-safety L-5 / T5-17). Members are
+  // destroyed in reverse declaration order, AFTER the destructor body runs.
+  //   _impl  FIRST  -> destroyed LAST: the destructor body releases the
+  //          connection under JsonRpcClientImpl::_mutex through _impl, so Impl
+  //          (and its mutex and pool map) must still be alive for the whole body.
+  //   _conn  LAST   -> destroyed FIRST.
+  // Do NOT move the lock acquisition into any member's destructor: the lock must
+  // be taken by the destructor body while _impl is still guaranteed live here.
+  std::shared_ptr<JsonRpcClientImpl> _impl;
+  std::shared_ptr<EndpointPool> _pool;
+  std::shared_ptr<PooledConnection> _conn;
 };
 } // namespace detail
 
@@ -438,7 +485,7 @@ public:
     if (!_config.httpClientFactory)
     {
       _config.httpClientFactory = [](const std::string &)
-      { return std::unique_ptr<iora::network::HttpClient>(new iora::network::HttpClient()); };
+      { return std::make_unique<iora::network::HttpClient>(); };
     }
 
     // Apply default keep-alive and compression settings
@@ -610,6 +657,12 @@ public:
 
   std::size_t purgeIdle()
   {
+    // Declared BEFORE `guard` so the evicted connections/pools are destroyed
+    // AFTER _mutex is released (thread-safety T6-2): ~HttpClient joins I/O
+    // threads and a whole-pool eviction can drop N of them at once, so none of
+    // that blocking teardown may run under the client mutex.
+    std::vector<std::shared_ptr<detail::PooledConnection>> evictedConns;
+    std::vector<std::shared_ptr<detail::EndpointPool>> evictedPools;
     std::lock_guard<std::mutex> guard(_mutex);
     std::size_t evictedTotal = 0;
 
@@ -617,14 +670,14 @@ public:
          /* increment inside */)
     {
       auto &pool = *(it->second);
-      std::size_t evicted = pool.purgeIdle(_config.idleTimeout);
+      std::size_t evicted = pool.purgeIdle(_config.idleTimeout, evictedConns);
       evictedTotal += evicted;
       _stats.connectionsEvicted += evicted;
       _totalConnections = recalcTotalLocked_();
 
       if (pool.size() == 0)
       {
-        it = _pools.erase(it);
+        it = retirePoolLocked_(it, evictedPools);
       }
       else
       {
@@ -641,91 +694,129 @@ public:
   void resetStats() { _stats.reset(); }
 
 private:
+  using PoolMap = std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>>;
+
+  /// \brief Move an emptied/idle pool out of _pools into the caller's evicted
+  /// bin and erase its map node; returns the iterator following the erased node.
+  /// The move (rather than a bare erase) keeps the pool alive until the caller
+  /// destroys the bin AFTER releasing _mutex — one place so no erase site can
+  /// forget to thread the removed pool into the bin (T6-2). Must hold _mutex.
+  PoolMap::iterator retirePoolLocked_(PoolMap::iterator it,
+                                      std::vector<std::shared_ptr<detail::EndpointPool>> &evictedPools)
+  {
+    evictedPools.push_back(std::move(it->second));
+    return _pools.erase(it);
+  }
+
   detail::ConnectionLease acquire_(const std::string &endpoint)
   {
+    // Declared BEFORE `lock` so that on EVERY exit path — normal return or the
+    // PoolExhaustedError throw — these owning references are destroyed AFTER
+    // `lock` releases _mutex. Members/locals are destroyed in reverse
+    // declaration order, so `lock` (declared last) unlocks first, then these
+    // vectors drop the last reference to any evicted connection/pool. Destroying
+    // one runs ~HttpClient, which joins I/O threads and must never happen under
+    // _mutex (thread-safety T6-2). This makes the ordering structural rather
+    // than dependent on threading the destroy after every unlock() call.
+    std::vector<std::shared_ptr<detail::PooledConnection>> evictedConns;
+    std::vector<std::shared_ptr<detail::EndpointPool>> evictedPools;
+    // Declared BEFORE `lock` for the same reason as the evicted bins above:
+    // `pool` is an owning handle, and a later eviction on this same call can
+    // remove it from _pools, making this local the last owner. Destroyed after
+    // `lock` releases, so its ~EndpointPool (which joins I/O threads) can never
+    // run under _mutex — on the throw path too, where the lock is released by
+    // unwinding rather than an explicit unlock() (thread-safety T6-2/T-2).
+    std::shared_ptr<detail::EndpointPool> pool;
     std::unique_lock<std::mutex> lock(_mutex);
+
+    const auto makeClient = [this](const std::string &ep) { return this->makeHttpClient_(ep); };
 
     // Ensure pool exists (respecting maxEndpointPools with LRU idle pool
     // eviction).
-    auto *poolPtr = findPoolPtr_(endpoint);
-    if (poolPtr == nullptr)
+    pool = findPool_(endpoint);
+    if (!pool)
     {
       if (_config.maxEndpointPools > 0 && _pools.size() >= _config.maxEndpointPools)
       {
-        evictOneIdlePoolLruLocked_(); // best-effort
+        evictOneIdlePoolLruLocked_(evictedPools); // best-effort
       }
-      poolPtr = &getOrCreatePoolLocked_(endpoint);
+      // endpoint is guaranteed absent here (findPool_ just missed, and the
+      // eviction above only ever removes a DIFFERENT, LRU-idle pool), so create
+      // unconditionally — a find-or-create helper's lookup would be dead code.
+      pool = _pools.emplace(endpoint, std::make_shared<detail::EndpointPool>(endpoint))
+               .first->second;
     }
-    auto &pool = *poolPtr;
 
     // Try to reuse a free connection first.
-    if (auto idx = pool.tryAcquireFree(_config.idleTimeout))
+    if (auto conn = pool->tryAcquireFree(_config.idleTimeout, evictedConns))
     {
-      auto &ref = pool.clientAt(*idx);
       lock.unlock();
-      return detail::ConnectionLease(pool, *idx, ref, _mutex, [this]() { _released.notify_all(); });
+      return detail::ConnectionLease(shared_from_this(), pool, conn);
     }
 
     // Can we create a new one?
-    const bool underPerEndpointCap = pool.size() < _config.maxConnectionsPerEndpoint;
+    const bool underPerEndpointCap = pool->size() < _config.maxConnectionsPerEndpoint;
     const bool underGlobalCap =
       (_config.globalMaxConnections == 0) || (_totalConnections < _config.globalMaxConnections);
 
     if (underPerEndpointCap && underGlobalCap)
     {
-      const auto idx = pool.createAndAcquire([this](const std::string &ep)
-                                             { return this->makeHttpClient_(ep); }, &_stats);
+      auto conn = pool->createAndAcquire(makeClient, &_stats);
       ++_totalConnections;
-      auto &ref = pool.clientAt(idx);
       lock.unlock();
-      return detail::ConnectionLease(pool, idx, ref, _mutex, [this]() { _released.notify_all(); });
+      return detail::ConnectionLease(shared_from_this(), pool, conn);
     }
 
     // Try global LRU eviction of one idle connection across all pools.
-    if (underPerEndpointCap && tryEvictOneIdleConnLruLocked_())
+    if (underPerEndpointCap && tryEvictOneIdleConnLruLocked_(evictedConns, evictedPools))
     {
-      const auto idx = pool.createAndAcquire([this](const std::string &ep)
-                                             { return this->makeHttpClient_(ep); }, &_stats);
+      auto conn = pool->createAndAcquire(makeClient, &_stats);
       _totalConnections = recalcTotalLocked_();
-      auto &ref = pool.clientAt(idx);
       lock.unlock();
-      return detail::ConnectionLease(pool, idx, ref, _mutex, [this]() { _released.notify_all(); });
+      return detail::ConnectionLease(shared_from_this(), pool, conn);
     }
 
     // As a last resort, try to evict an entire idle pool (LRU) to free
     // capacity.
-    if (underPerEndpointCap && evictOneIdlePoolLruLocked_())
+    if (underPerEndpointCap && evictOneIdlePoolLruLocked_(evictedPools))
     {
-      const auto idx = pool.createAndAcquire([this](const std::string &ep)
-                                             { return this->makeHttpClient_(ep); }, &_stats);
+      auto conn = pool->createAndAcquire(makeClient, &_stats);
       _totalConnections = recalcTotalLocked_();
-      auto &ref = pool.clientAt(idx);
       lock.unlock();
-      return detail::ConnectionLease(pool, idx, ref, _mutex, [this]() { _released.notify_all(); });
+      return detail::ConnectionLease(shared_from_this(), pool, conn);
     }
 
     throw PoolExhaustedError("No available HTTP connections for endpoint: " + endpoint);
   }
 
-  detail::EndpointPool *findPoolPtr_(const std::string &endpoint)
+  std::shared_ptr<detail::EndpointPool> findPool_(const std::string &endpoint)
   {
     auto it = _pools.find(endpoint);
     if (it == _pools.end())
     {
       return nullptr;
     }
-    return it->second.get();
+    return it->second;
   }
 
-  detail::EndpointPool &getOrCreatePoolLocked_(const std::string &endpoint)
+  /// \brief Release a leased connection back to its pool. Called ONLY from
+  /// detail::ConnectionLease's destructor (befriended below). Encapsulates the
+  /// M-3 invariant: markFree() ALWAYS runs under _mutex — even for a connection
+  /// already evicted from _pools — because _inUse/_lastUsed are plain fields
+  /// read by allIdle()/tryAcquireFree()/forEachIdle() on other threads. Only the
+  /// pool touch is best-effort; the connection itself is still owned by the lease.
+  void releaseConnection_(const std::shared_ptr<detail::EndpointPool> &pool,
+                          const std::shared_ptr<detail::PooledConnection> &conn)
   {
-    auto it = _pools.find(endpoint);
-    if (it == _pools.end())
+    std::lock_guard<std::mutex> guard(_mutex);
+    if (pool)
     {
-      auto inserted = _pools.emplace(endpoint, std::make_unique<detail::EndpointPool>(endpoint));
-      return *(inserted.first->second);
+      pool->release(conn); // markFree(conn) + touch(), under _mutex
     }
-    return *(it->second);
+    else
+    {
+      conn->markFree();
+    }
   }
 
   std::size_t recalcTotalLocked_() const
@@ -739,37 +830,44 @@ private:
   }
 
   /// \brief Try to evict the single least-recently-used idle connection
-  /// across all pools.
-  bool tryEvictOneIdleConnLruLocked_()
+  /// across all pools. The removed connection (and, if that empties its pool,
+  /// the pool) is moved into the caller's evicted vectors for destruction after
+  /// _mutex is released (T6-2).
+  bool tryEvictOneIdleConnLruLocked_(
+    std::vector<std::shared_ptr<detail::PooledConnection>> &evictedConns,
+    std::vector<std::shared_ptr<detail::EndpointPool>> &evictedPools)
   {
     std::string bestKey;
-    std::size_t bestIdx = static_cast<std::size_t>(-1);
+    // A null handle is the sentinel (CR-1: replaces the index sentinel
+    // bestIdx == std::size_t(-1), which no longer exists now that identity is
+    // the object rather than a position).
+    std::shared_ptr<detail::PooledConnection> bestHandle;
     auto bestTime = std::chrono::steady_clock::time_point::max();
 
     for (auto &kv : _pools)
     {
-      auto &pool = *kv.second;
-      pool.forEachIdle(
-        [&](std::size_t idx, std::chrono::steady_clock::time_point t)
+      kv.second->forEachIdle(
+        [&](const std::shared_ptr<detail::PooledConnection> &handle,
+            std::chrono::steady_clock::time_point t)
         {
           if (t < bestTime)
           {
             bestTime = t;
-            bestIdx = idx;
+            bestHandle = handle;
             bestKey = kv.first;
           }
         });
     }
 
-    if (bestIdx != static_cast<std::size_t>(-1))
+    if (bestHandle != nullptr)
     {
       auto it = _pools.find(bestKey);
       if (it != _pools.end())
       {
-        it->second->eraseAt(bestIdx);
+        it->second->erase(bestHandle, evictedConns);
         if (it->second->size() == 0)
         {
-          _pools.erase(it);
+          retirePoolLocked_(it, evictedPools);
         }
         _totalConnections = recalcTotalLocked_();
         return true;
@@ -779,35 +877,37 @@ private:
   }
 
   /// \brief Evict the least-recently-used pool that is entirely idle.
-  /// Returns true if evicted.
-  bool evictOneIdlePoolLruLocked_()
+  /// Returns true if evicted. The removed pool is moved into `evictedPools` for
+  /// destruction after _mutex is released (T6-2).
+  bool evictOneIdlePoolLruLocked_(std::vector<std::shared_ptr<detail::EndpointPool>> &evictedPools)
   {
-    std::string bestKey;
+    // The iterator itself is the sentinel (bestIt != _pools.end()), matching the
+    // sibling tryEvictOneIdleConnLruLocked_'s null-handle sentinel. NOT a
+    // bestKey.empty() check: the endpoint key may legitimately be the empty
+    // string (call("", ...) creates a pool keyed by ""), which an empty()
+    // sentinel would never select for eviction (cpp17 R#7).
+    PoolMap::iterator bestIt = _pools.end();
     auto bestTime = std::chrono::steady_clock::time_point::max();
 
-    for (auto &kv : _pools)
+    for (auto it = _pools.begin(); it != _pools.end(); ++it)
     {
-      auto &pool = *kv.second;
+      auto &pool = *it->second;
       if (pool.allIdle())
       {
         const auto t = pool.lastTouched();
         if (t < bestTime)
         {
           bestTime = t;
-          bestKey = kv.first;
+          bestIt = it;
         }
       }
     }
 
-    if (!bestKey.empty())
+    if (bestIt != _pools.end())
     {
-      auto it = _pools.find(bestKey);
-      if (it != _pools.end())
-      {
-        _pools.erase(it);
-        _totalConnections = recalcTotalLocked_();
-        return true;
-      }
+      retirePoolLocked_(bestIt, evictedPools);
+      _totalConnections = recalcTotalLocked_();
+      return true;
     }
     return false;
   }
@@ -1047,18 +1147,36 @@ private:
   // _totalConnections, recalcTotalLocked_ and acquire_). Unqualified is correct
   // here — this class sits directly in namespace connectors.
   friend struct JsonRpcClientTestAccess;
+  // ConnectionLease's out-of-line destructor calls releaseConnection_ (private).
+  friend class detail::ConnectionLease;
 
   iora::core::ThreadPool &_threadPool;
   Config _config;
   ClientStats _stats;
 
-  std::unordered_map<std::string, std::unique_ptr<detail::EndpointPool>> _pools;
+  // shared_ptr, not unique_ptr (CR-1c/task-4.1c): a ConnectionLease holds an
+  // owning handle to its pool, so releasing into a pool that eviction has since
+  // removed from the map stays well-defined instead of dereferencing freed
+  // memory.
+  std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>> _pools;
   std::mutex _mutex;
-  std::condition_variable _released;
 
   std::atomic<std::uint64_t> _nextId;
   std::size_t _totalConnections;
 };
+
+// ConnectionLease's destructor is defined here, where JsonRpcClientImpl is
+// complete, so it can release the connection under Impl::_mutex. The shared_ptr
+// keep-alives it holds guarantee Impl (and thus the mutex and pool map) outlive
+// this body — see the member-order comment on the class.
+inline detail::ConnectionLease::~ConnectionLease()
+{
+  // A moved-from lease has a null _impl and no-ops here.
+  if (_impl)
+  {
+    _impl->releaseConnection_(_pool, _conn);
+  }
+}
 
 /// \brief JSON-RPC 2.0 client with per-endpoint connection pooling and
 /// async support.
