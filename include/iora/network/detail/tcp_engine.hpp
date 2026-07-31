@@ -229,6 +229,9 @@ public:
         sigemptyset(&sigpipeSet);
         sigaddset(&sigpipeSet, SIGPIPE);
         pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
+        // Publish this thread as the I/O thread FIRST, before any dispatch, so
+        // isOnIoThread() is valid for the whole loop lifetime.
+        stampIoThread();
         // try/catch so the deferred self-destruct deleter runs on EVERY loop()
         // exit, incl. an exception escaping loop()/shutdownDrain (else the owning
         // Impl would leak). The deleter is moved to a local and invoked LAST:
@@ -242,6 +245,9 @@ public:
         {
           std::fprintf(stderr, "WARNING: TcpEngine I/O loop terminated by exception.\n");
         }
+        // Clear the I/O-thread stamp AFTER the loop has unwound and BEFORE the
+        // self-destruct deleter runs (it may free the object holding _ioThreadId).
+        clearIoThread();
         std::function<void()> sd;
         sd.swap(_selfDestruct);
         if (sd)

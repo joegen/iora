@@ -213,6 +213,17 @@ public:
   bool isRunning() const override;
   TransportErrorInfo lastError() const override;
 
+  /// \brief True iff the calling thread is this transport's engine I/O thread.
+  ///
+  /// Race-free (reads an atomic stamped at loop entry / cleared at loop exit),
+  /// so it is safe to call from ANY thread concurrently with start()/stop().
+  /// Returns false when there is no running I/O thread (pre-start, post-stop,
+  /// post-detach). Higher layers use this to REFUSE lifecycle mutations that
+  /// would otherwise execute on the I/O thread — e.g. destroying/removing a
+  /// transport from within its own callback (a use-after-free). Transport-
+  /// specific accessor; not part of the ITransport interface.
+  bool isOnIoThread() const noexcept;
+
   ListenResult addListener(const std::string &bindIp, std::uint16_t port,
                            TlsMode tls = TlsMode::None) override;
   ConnectResult connect(const std::string &host, std::uint16_t port,

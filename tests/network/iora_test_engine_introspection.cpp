@@ -515,4 +515,106 @@ TEST_CASE("UDP batching disabled - no batching stats", "[udp][batching]")
   tx.stop();
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// isOnIoThread (DP-8, tracker 2026-07-26-5 foundation)
+// ═══════════════════════════════════════════════════════════════════════
+// The atomic-published I/O-thread id must read false off-thread (pre-start,
+// while running from a foreign thread, and post-stop) and true inside every
+// engine callback (which all run on the I/O thread). Non-vacuous: an always-
+// false bug fails the in-callback REQUIREs; an always-true bug fails the
+// off-thread REQUIRE_FALSEs.
+
+TEST_CASE("TCP isOnIoThread: false off-thread, true inside callbacks", "[tcp][introspection][iothread]")
+{
+  TransportConfig cfg{};
+  TcpEngine tx{cfg};
+
+  std::atomic<bool> acceptOnIo{false};
+  std::atomic<bool> connectOnIo{false};
+  std::atomic<bool> dataOnIo{false};
+  std::atomic<bool> closeOnIo{false};
+  std::atomic<int> acceptCount{0};
+  std::atomic<int> connectCount{0};
+  std::atomic<int> dataCount{0};
+  std::atomic<int> closeCount{0};
+
+  iora::network::detail::EngineBase::Callbacks cbs{};
+  cbs.onAccept = [&](SessionId, const TransportAddress &)
+  { acceptOnIo = tx.isOnIoThread(); acceptCount++; };
+  cbs.onConnect = [&](SessionId, const TransportAddress &)
+  { connectOnIo = tx.isOnIoThread(); connectCount++; };
+  cbs.onData = [&](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point)
+  { dataOnIo = tx.isOnIoThread(); dataCount++; };
+  cbs.onClose = [&](SessionId, const TransportErrorInfo &)
+  { closeOnIo = tx.isOnIoThread(); closeCount++; };
+  cbs.onError = [&](TransportError, const std::string &) {};
+  tx.setCallbacks(cbs);
+
+  // Before start: no I/O thread.
+  REQUIRE_FALSE(tx.isOnIoThread());
+
+  REQUIRE(tx.start().isOk());
+  // From the test thread while running: still false.
+  REQUIRE_FALSE(tx.isOnIoThread());
+
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return acceptCount > 0 && connectCount > 0; }));
+
+  const char msg[] = "ping";
+  REQUIRE(tx.send(cr.value(), msg, sizeof(msg)));
+  REQUIRE(waitFor([&] { return dataCount > 0; }));
+
+  // Force a close so onClose fires on the I/O thread.
+  REQUIRE(tx.close(cr.value()));
+  REQUIRE(waitFor([&] { return closeCount > 0; }));
+
+  REQUIRE(acceptOnIo.load());
+  REQUIRE(connectOnIo.load());
+  REQUIRE(dataOnIo.load());
+  REQUIRE(closeOnIo.load());
+
+  tx.stop();
+  // After stop: the stamp is cleared at loop exit.
+  REQUIRE_FALSE(tx.isOnIoThread());
+}
+
+TEST_CASE("UDP isOnIoThread: false off-thread, true inside data callback", "[udp][introspection][iothread]")
+{
+  TransportConfig cfg{};
+  UdpEngine tx{cfg};
+
+  std::atomic<bool> dataOnIo{false};
+  std::atomic<int> dataCount{0};
+
+  iora::network::detail::EngineBase::Callbacks cbs{};
+  cbs.onAccept = [&](SessionId, const TransportAddress &) {};
+  cbs.onConnect = [&](SessionId, const TransportAddress &) {};
+  cbs.onData = [&](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point)
+  { dataOnIo = tx.isOnIoThread(); dataCount++; };
+  cbs.onClose = [&](SessionId, const TransportErrorInfo &) {};
+  cbs.onError = [&](TransportError, const std::string &) {};
+  tx.setCallbacks(std::move(cbs));
+
+  REQUIRE_FALSE(tx.isOnIoThread());
+  REQUIRE(tx.start().isOk());
+  REQUIRE_FALSE(tx.isOnIoThread());
+
+  auto port = testnet::getFreePortUDP();
+  REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+
+  const char msg[] = "ping";
+  REQUIRE(tx.send(cr.value(), msg, sizeof(msg)));
+  REQUIRE(waitFor([&] { return dataCount > 0; }));
+
+  REQUIRE(dataOnIo.load());
+
+  tx.stop();
+  REQUIRE_FALSE(tx.isOnIoThread());
+}
+
 } // namespace

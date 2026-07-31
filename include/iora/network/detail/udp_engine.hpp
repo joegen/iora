@@ -186,6 +186,8 @@ public:
       sigemptyset(&sigpipeSet);
       sigaddset(&sigpipeSet, SIGPIPE);
       pthread_sigmask(SIG_BLOCK, &sigpipeSet, nullptr);
+      // Publish this thread as the I/O thread FIRST, before any dispatch.
+      stampIoThread();
       // try/catch so the deferred self-destruct deleter runs on EVERY loop()
       // exit; moved to a local and invoked LAST (delete-this-at-thread-end).
       try
@@ -196,6 +198,8 @@ public:
       {
         std::fprintf(stderr, "WARNING: UdpEngine I/O loop terminated by exception.\n");
       }
+      // Clear the I/O-thread stamp AFTER the loop unwinds, BEFORE self-destruct.
+      clearIoThread();
       std::function<void()> sd;
       sd.swap(_selfDestruct);
       if (sd)

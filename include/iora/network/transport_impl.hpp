@@ -693,6 +693,11 @@ inline bool Transport::isRunning() const
   return _impl && _impl->engine && _impl->engine->isRunning();
 }
 
+inline bool Transport::isOnIoThread() const noexcept
+{
+  return _impl && _impl->engine && _impl->engine->isOnIoThread();
+}
+
 inline TransportErrorInfo Transport::lastError() const
 {
   if (!_impl || !_impl->engine)
