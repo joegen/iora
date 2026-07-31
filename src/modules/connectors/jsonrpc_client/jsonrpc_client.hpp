@@ -287,10 +287,20 @@ public:
   /// method runs under JsonRpcClientImpl::_mutex — so the caller destroys
   /// `evicted` only after releasing that mutex (thread-safety T6-2, the
   /// destruction analogue of copy-then-invoke).
+  /// \param evictedCount OUT: the number of idle-expired connections erased here
+  /// (H-2/task-5.2). The caller applies `_totalConnections -= evictedCount` and
+  /// `_stats.connectionsEvicted += evictedCount` unconditionally — a dedicated
+  /// out-parameter, NOT the return value (which carries the reused connection),
+  /// and NOT derived from `evicted` (a shared bin the caller also fills from
+  /// tryEvictOneIdleConnLruLocked_, which would double-subtract — H-4). This
+  /// method never touches _stats itself (it holds none): counting here AND at the
+  /// call site would double-count.
   std::shared_ptr<PooledConnection>
   tryAcquireFree(std::chrono::milliseconds idleTimeout,
-                 std::vector<std::shared_ptr<PooledConnection>> &evicted)
+                 std::vector<std::shared_ptr<PooledConnection>> &evicted,
+                 std::size_t &evictedCount)
   {
+    evictedCount = 0;
     const auto now = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < _connections.size();)
     {
@@ -301,6 +311,7 @@ public:
         {
           evicted.push_back(std::move(_connections[i]));
           _connections.erase(_connections.begin() + static_cast<long>(i));
+          ++evictedCount;
           continue;
         }
         pc->markInUse();
@@ -406,8 +417,20 @@ public:
     touch();
   }
 
+  /// \brief True iff this pool holds at least one connection and none is in use
+  /// (task-5.1, DP-3). The `size() > 0` requirement is load-bearing: an EMPTY
+  /// pool has nothing to reuse, so treating it as "all idle" would make it an
+  /// eviction candidate at both acquire_ eviction sites — letting
+  /// evictOneIdlePoolLruLocked_ select a pool the caller may be mid-acquire on,
+  /// or letting an empty pool linger and occupy a maxEndpointPools slot. See the
+  /// designPrinciple: no size()==0 pool persists across an acquire_/purgeIdleCore_
+  /// return-or-throw (enforced with the Option-A retire at acquire_'s throw).
   bool allIdle() const
   {
+    if (_connections.empty())
+    {
+      return false;
+    }
     for (const auto &pc : _connections)
     {
       if (pc->inUse())
@@ -1090,7 +1113,6 @@ private:
       std::size_t evicted = pool.purgeIdle(_config.idleTimeout, evictedConns);
       evictedTotal += evicted;
       _stats.connectionsEvicted += evicted;
-      _totalConnections = recalcTotalLocked_();
 
       if (pool.size() == 0)
       {
@@ -1101,6 +1123,12 @@ private:
         ++it;
       }
     }
+    // L-7: recalc ONCE after the loop, not per-pool — recalcTotalLocked_ is
+    // itself O(pools), so a per-pool call made this O(pools^2). Still inside the
+    // function-scoped lock_guard, so _totalConnections is only read under _mutex.
+    _totalConnections = recalcTotalLocked_();
+    // task-5.2 exit tripwire (single return under the function-scoped lock).
+    assert(_totalConnections == recalcTotalLocked_());
     return evictedTotal;
   }
 
@@ -1162,6 +1190,26 @@ private:
     return _pools.erase(it);
   }
 
+  /// \brief The single T6-2-critical SUCCESS exit of acquire_ (simpl-1): the
+  /// four success paths (reuse hit + three create paths) all end with the same
+  /// tail — the task-5.2 in-lock tripwire assert, then RELEASE _mutex, then build
+  /// the lease. Centralised so the assert-before-unlock ordering (the exit
+  /// tripwire must run while _mutex is still held) and the unlock-before-lease
+  /// discipline live in ONE audited place rather than four copies that can drift.
+  /// The caller has already applied its counter delta, so the entry assert here
+  /// is a live cross-check. acquire_'s pre-`lock` evicted bins still destruct in
+  /// acquire_'s frame AFTER this returns (i.e. after unlock), preserving T6-2.
+  /// Must be called holding `lock` (an acquire_-owned unique_lock on _mutex).
+  detail::ConnectionLease
+  finishAcquireLocked_(const std::shared_ptr<detail::EndpointPool> &pool,
+                       const std::shared_ptr<detail::PooledConnection> &conn,
+                       std::unique_lock<std::mutex> &lock)
+  {
+    assert(_totalConnections == recalcTotalLocked_()); // task-5.2 exit tripwire
+    lock.unlock();
+    return detail::ConnectionLease(shared_from_this(), pool, conn);
+  }
+
   detail::ConnectionLease acquire_(const std::string &endpoint)
   {
     // Declared BEFORE `lock` so that on EVERY exit path — normal return or the
@@ -1183,6 +1231,13 @@ private:
     std::shared_ptr<detail::EndpointPool> pool;
     std::unique_lock<std::mutex> lock(_mutex);
 
+    // task-5.2 ENTRY tripwire: the invariant _totalConnections == Σ size() holds
+    // at every _mutex-quiescent point, so it must hold on entry. Debug-only
+    // (compiled out under NDEBUG, so recalcTotalLocked_'s O(pools) scan costs
+    // nothing in release). Also covers the _closing exit below, which precedes
+    // every mutation — no separate exit assert is needed there (M2/M-3).
+    assert(_totalConnections == recalcTotalLocked_());
+
     // Refuse under the pool _mutex if the client is closing (task-3.1(f)): an
     // admitted call that reaches here AFTER the destructor's STEP-2 cancel loop
     // must not create a NEW pooled HttpClient the loop already passed. The
@@ -1202,7 +1257,18 @@ private:
     {
       if (_config.maxEndpointPools > 0 && _pools.size() >= _config.maxEndpointPools)
       {
-        evictOneIdlePoolLruLocked_(evictedPools); // best-effort
+        // task-5.3 (HD-7 row 6): ENFORCE the cap. The whole-pool LRU eviction is
+        // best-effort; if no pool is entirely idle it cannot relieve the
+        // overshoot, so REFUSE rather than silently exceed the cap unboundedly.
+        // The `> 0 &&` conjunct above means maxEndpointPools == 0 is UNLIMITED,
+        // so a default-configured client never reaches this throw. task-5.1's
+        // Option-A retire guarantees no empty pool lingers to make this spurious.
+        if (!evictOneIdlePoolLruLocked_(evictedPools))
+        {
+          assert(_totalConnections == recalcTotalLocked_()); // exit tripwire
+          throw PoolExhaustedError(
+            "Max endpoint pools reached and no idle pool to evict for endpoint: " + endpoint);
+        }
       }
       // endpoint is guaranteed absent here (findPool_ just missed, and the
       // eviction above only ever removes a DIFFERENT, LRU-idle pool), so create
@@ -1211,11 +1277,19 @@ private:
                .first->second;
     }
 
-    // Try to reuse a free connection first.
-    if (auto conn = pool->tryAcquireFree(_config.idleTimeout, evictedConns))
+    // Try to reuse a free connection first. tryAcquireFree reports how many
+    // idle-expired connections it erased; apply the counter deltas
+    // UNCONDITIONALLY (both the reuse-hit and the nullptr-fall-through paths
+    // erase), BEFORE branching on the handle and BEFORE the underGlobalCap read
+    // below — this is the H-2 root fix (F-1): the create path must not evaluate
+    // underGlobalCap against a stale-high total (task-5.2).
+    std::size_t reclaimed = 0;
+    auto conn = pool->tryAcquireFree(_config.idleTimeout, evictedConns, reclaimed);
+    _totalConnections -= reclaimed;
+    _stats.connectionsEvicted += reclaimed; // DP-2: count idle-expiry evictions
+    if (conn)
     {
-      lock.unlock();
-      return detail::ConnectionLease(shared_from_this(), pool, conn);
+      return finishAcquireLocked_(pool, conn, lock); // reuse hit
     }
 
     // Can we create a new one?
@@ -1225,31 +1299,51 @@ private:
 
     if (underPerEndpointCap && underGlobalCap)
     {
-      auto conn = pool->createAndAcquire(makeClient, &_stats);
+      auto newConn = pool->createAndAcquire(makeClient, &_stats);
       ++_totalConnections;
-      lock.unlock();
-      return detail::ConnectionLease(shared_from_this(), pool, conn);
+      return finishAcquireLocked_(pool, newConn, lock);
     }
 
-    // Try global LRU eviction of one idle connection across all pools.
+    // Try global LRU eviction of one idle connection across all pools. The helper
+    // reconciles _totalConnections to the exact post-eviction sum before it
+    // returns true, and createAndAcquire adds exactly one connection to `pool`
+    // (never the evicted pool — an empty-or-in-use `pool` is not an allIdle
+    // candidate), so ++ is the exact delta and keeps the exit assert a LIVE
+    // tripwire rather than a recalc-vs-recalc tautology (simpl/ts/cpp17 LOW).
     if (underPerEndpointCap && tryEvictOneIdleConnLruLocked_(evictedConns, evictedPools))
     {
-      auto conn = pool->createAndAcquire(makeClient, &_stats);
-      _totalConnections = recalcTotalLocked_();
-      lock.unlock();
-      return detail::ConnectionLease(shared_from_this(), pool, conn);
+      auto newConn = pool->createAndAcquire(makeClient, &_stats);
+      ++_totalConnections;
+      return finishAcquireLocked_(pool, newConn, lock);
     }
 
     // As a last resort, try to evict an entire idle pool (LRU) to free
-    // capacity.
+    // capacity. Same exact-delta reasoning as the idle-connection path above.
     if (underPerEndpointCap && evictOneIdlePoolLruLocked_(evictedPools))
     {
-      auto conn = pool->createAndAcquire(makeClient, &_stats);
-      _totalConnections = recalcTotalLocked_();
-      lock.unlock();
-      return detail::ConnectionLease(shared_from_this(), pool, conn);
+      auto newConn = pool->createAndAcquire(makeClient, &_stats);
+      ++_totalConnections;
+      return finishAcquireLocked_(pool, newConn, lock);
     }
 
+    // task-5.1 Option A (DP-3): reaching this throw with `pool` empty would leave
+    // a size()==0 pool in _pools (allIdle() now excludes it, so neither eviction
+    // site reclaims it) occupying a maxEndpointPools slot — a later distinct
+    // endpoint could then be refused spuriously. Retire it here, AT THE THROW
+    // ONLY — never eagerly after tryAcquireFree, which would orphan the pool
+    // createAndAcquire then populates. Order (L-2): exit tripwire, then the
+    // Option-A retire (a 0-delta — an empty pool sums to 0 in recalcTotalLocked_),
+    // then throw. The find-by-key LOCATES the pool for retirement; it is not a
+    // re-validation of a stale reference (deferred to phase 6, human DP-1).
+    assert(_totalConnections == recalcTotalLocked_()); // throw exit tripwire
+    if (pool && pool->size() == 0)
+    {
+      auto it = _pools.find(endpoint);
+      if (it != _pools.end() && it->second == pool)
+      {
+        retirePoolLocked_(it, evictedPools);
+      }
+    }
     throw PoolExhaustedError("No available HTTP connections for endpoint: " + endpoint);
   }
 
@@ -1329,6 +1423,7 @@ private:
       if (it != _pools.end())
       {
         it->second->erase(bestHandle, evictedConns);
+        _stats.connectionsEvicted += 1; // DP-2: one idle connection evicted
         if (it->second->size() == 0)
         {
           retirePoolLocked_(it, evictedPools);
@@ -1369,6 +1464,11 @@ private:
 
     if (bestIt != _pools.end())
     {
+      // DP-2: count every connection dropped with the pool. Read size() BEFORE
+      // retirePoolLocked_ moves the pool out (reading after the move reads a
+      // moved-from pool). After the allIdle() size()>0 change an LRU-evicted pool
+      // holds >= 1 idle connection, so this is always a positive delta.
+      _stats.connectionsEvicted += bestIt->second->size();
       retirePoolLocked_(bestIt, evictedPools);
       _totalConnections = recalcTotalLocked_();
       return true;

@@ -52,7 +52,7 @@ endif()
 # repros stay deliberately RED and are registered separately below
 # (task-1.1(i): TEST name == TARGET name).
 add_test(NAME iora_test_jsonrpc_client_pool
-    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3]")
+    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5]")
 # RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152 the
 # phase-3 latched cases) against any other test that might claim them,
 # independent of the -j1 convention (M2).
@@ -103,11 +103,14 @@ set_tests_properties(jsonrpc_client_pool_cr3_deadlock PROPERTIES
 #     (task-5.1 allIdle guard, task-5.2 counter integrity) as a seam assertion.
 #   * CR-4 residual: synchronous in-flight accounting — re-registered by PHASE 3
 #     (blocking quiesce) with synchronous-path counting.
-# Until then, register DISABLED under BOTH ASan and non-ASan (visible, never run,
-# no spurious failure). Do NOT restore WILL_FAIL without a live UAF.
+# PHASE 5 re-armed the CR-2 repro (task-5.1): it is now a seam-driven DETACHMENT
+# test against the LIVE latched fixture (port 18154), asserting acquire_ recovers
+# an idle-expired pool IN PLACE rather than detaching it. Enabled, RESOURCE_LOCK
+# on the shared fixed ports.
 add_test(NAME jsonrpc_client_pool_cr2_freed_pool
     COMMAND iora_test_jsonrpc_client_pool "[cr2]")
-set_tests_properties(jsonrpc_client_pool_cr2_freed_pool PROPERTIES DISABLED TRUE)
+set_tests_properties(jsonrpc_client_pool_cr2_freed_pool PROPERTIES
+    TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
 # CR-4 (task-1.7): the residual — synchronous + queued in-flight accounting — is
 # now CLOSED by PHASE 3's blocking quiesce. The repro was rewritten into the
 # phase-3 "destructor waits for a queued async task" case (tagged [cr4][phase3])

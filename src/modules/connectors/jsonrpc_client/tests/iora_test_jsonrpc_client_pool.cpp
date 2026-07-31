@@ -995,55 +995,391 @@ TEST_CASE("task-4.1b: concurrent PoolExhaustedError throw races whole-pool evict
 }
 
 // =========================================================================
-// task-1.5 — CR-2 repro: an emptied pool is allIdle()==true (vacuously), so
-// acquire_ selects and frees the very pool it holds a reference to, then calls
-// createAndAcquire on that EndpointPool. NOTE: the heap-use-after-free this once
-// produced was ELIMINATED in phase 4 (shared_ptr pool keep-alive) — see the
-// registration comment in CMakeLists.txt. The residual non-UAF logic bug
-// (acquire on a detached pool + H-2 counter drift) is owned by phase 5, which
-// re-registers this repro with a seam-driven RED signal; DISABLED until then.
+// PHASE 5 — pool lifetime under eviction (CR-2) and counter integrity (H-2).
+// tasks 5.1 (allIdle size()>0 + Option-A empty-pool retire), 5.2 (exact
+// _totalConnections via MANDATORY per-mutation deltas + accurate
+// connectionsEvicted), 5.3 (maxEndpointPools enforcement). See the phase-5
+// tasks and phase5_step0_round1/2/3_disposition in tracker 2026-07-26-2.
 // =========================================================================
-TEST_CASE("CR-2 repro: acquire on a freed EndpointPool (RED under ASan)",
+
+// task-5.1 — CR-2, rewritten from the retired ASan-UAF repro into a DETACHMENT-
+// observing test driven against the LIVE latched fixture (a refusing endpoint
+// makes call() always throw, so a "successful call() that recovers in place" is
+// unreachable — step-0 round-1 H1). The CR-2 ladder: a connection is created,
+// used and left idle; it expires; the next call's tryAcquireFree erases it.
+// FIXED, the counter is decremented (task-5.2) so underGlobalCap is true and
+// acquire_ recreates on the SAME pool, still in _pools. PRE-FIX, the counter
+// drifted, underGlobalCap was false, and evictOneIdlePoolLruLocked_ retired the
+// caller's own now-empty pool (allIdle() vacuously true) while createAndAcquire
+// populated it — an orphan snapshotPools can no longer see.
+// =========================================================================
+TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not by detaching it",
           "[jsonrpc][pool][cr2]")
 {
   auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
-  Config cfg = stubFactoryConfig();
-  cfg.globalMaxConnections = 1;
+
+  const std::uint16_t serverPort = 18154;
+  LatchedHttpServer server(serverPort);
+  server.release(); // one-shot OPEN: every request passes straight through
+
+  Config cfg; // real factory -> the client talks to the live fixture
+  cfg.globalMaxConnections = 1;      // the CR-2 ladder gate after idle expiry
   cfg.maxConnectionsPerEndpoint = 8;
-  cfg.idleTimeout = std::chrono::milliseconds(50);
+  cfg.idleTimeout = std::chrono::milliseconds(200);
   cfg.maxRetries = 0;
   JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
-  // Endpoint that refuses instantly, so call() creates the connection then
-  // throws on the POST — the connection stays pooled, _totalConnections==1.
-  const std::string ep = "http://127.0.0.1:1/rpc";
-
-  try
+  // 1) First call succeeds -> one connection created, used and returned idle.
+  REQUIRE(client.call(ep, "ping").is_object());
   {
-    client.call(ep, "ping");
-  }
-  catch (const std::exception &)
-  {
-    // expected: connection refused after the connection was created
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    REQUIRE(snap[0].poolKey == ep);
+    REQUIRE(snap[0].connections.size() == 1);
+    REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 1);
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(60)); // pooled conn now expired
+  // 2) Let the pooled connection expire past idleTimeout.
+  std::this_thread::sleep_for(std::chrono::milliseconds(260));
 
-  // Second call: tryAcquireFree erases the expired conn WITHOUT decrementing
-  // (H-2), pool empties, underGlobalCap==(1<1)==false, then
-  // evictOneIdlePoolLruLocked_ frees the empty pool and createAndAcquire runs
-  // on freed memory. ASan reports heap-use-after-free here.
-  try
+  // 3) The CR-2 ladder: tryAcquireFree erases the expired connection; the fix
+  //    recreates on the same, still-registered pool.
+  REQUIRE(client.call(ep, "ping").is_object());
+
+  // 4) DETACHMENT DISCRIMINATOR: the recovered connection lives in a pool STILL
+  //    in _pools. Pre-fix this snapshot is EMPTY (the ep pool was retired).
+  std::uintptr_t recoveredId = 0;
   {
-    client.call(ep, "ping");
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    REQUIRE(snap[0].poolKey == ep);
+    REQUIRE(snap[0].connections.size() == 1);
+    recoveredId = snap[0].connections[0].connectionId;
   }
-  catch (const std::exception &)
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 1);
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+
+  // 5) A further call REUSES that connection rather than building a duplicate.
+  REQUIRE(client.call(ep, "ping").is_object());
   {
-    // If we get here on a non-ASan build the UAF was silent (UB); the ASan
-    // build is the one that produces the RED evidence.
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    REQUIRE(snap[0].poolKey == ep);
+    REQUIRE(snap[0].connections.size() == 1);
+    REQUIRE(snap[0].connections[0].connectionId == recoveredId);
   }
-  SUCCEED("reached end without ASan abort (non-ASan build); ASan build is the detector");
+
+  // MUTATION (run by reverting production; must turn this RED): revert task-5.2's
+  // `_totalConnections -= reclaimed` -> H-2 drift returns, so at step 3
+  // underGlobalCap stays false, acquire_ reaches its PoolExhaustedError throw, the
+  // Option-A retire (task-5.1) drops the now-empty ep pool, the call throws, and
+  // step 4's snapshot is empty. (With allIdle() size()>0 present the empty pool is
+  // no longer an eviction candidate, so the pool leaves _pools via the Option-A
+  // retire at the throw, not by evictOneIdlePoolLruLocked_ "detaching" it.)
+  // Reverting task-5.1's allIdle() size()>0 ALONE is a no-op here (5.2's exact
+  // counter makes underGlobalCap true before the eviction site) — the Option-A
+  // case below drives that mutation.
+}
+
+// task-5.2 — _totalConnections stays EXACT across an idle-expiry churn, and
+// connectionsEvicted counts idle-expiry evictions (DP-2). The seam-driven
+// discriminator is totalConnections() == recalcTotal(), not "no spurious
+// PoolExhaustedError" (which self-heals — step-0 round-1 M-A).
+// =========================================================================
+TEST_CASE("task-5.2: idle-expiry churn keeps _totalConnections exact and counts connectionsEvicted",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.globalMaxConnections = 4;
+  cfg.maxConnectionsPerEndpoint = 4;
+  cfg.idleTimeout = std::chrono::milliseconds(100);
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://unit.test/counter";
+
+  // Two idle connections on ep.
+  {
+    auto a = JsonRpcClientTestAccess::acquire(client, ep);
+    auto b = JsonRpcClientTestAccess::acquire(client, ep);
+    (void)a;
+    (void)b;
+  }
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 2);
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+  const std::uint64_t evictedBefore = client.getStats().connectionsEvicted;
+
+  // Expire both, then acquire once: tryAcquireFree erases BOTH (counter -= 2) and
+  // one fresh connection is created -> net 1, exact.
+  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+  {
+    auto c = JsonRpcClientTestAccess::acquire(client, ep);
+    (void)c;
+    REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 1);
+    REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+            JsonRpcClientTestAccess::recalcTotal(client));
+  }
+  // connectionsEvicted increased by EXACTLY the two idle-expired connections.
+  REQUIRE(client.getStats().connectionsEvicted == evictedBefore + 2);
+
+  // A churn that evicts NOTHING must not bump connectionsEvicted: the fresh
+  // connection is still within idleTimeout, so the next acquire reuses it.
+  const std::uint64_t evictedMid = client.getStats().connectionsEvicted;
+  {
+    auto d = JsonRpcClientTestAccess::acquire(client, ep); // reuse, no eviction
+    (void)d;
+  }
+  REQUIRE(client.getStats().connectionsEvicted == evictedMid);
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+
+  // MUTATION: remove the tryAcquireFree decrement -> the in-lock tripwire assert
+  // fires in a Debug build (the entry assert of the reuse acquire above, and the
+  // reuse/create exit asserts).
+}
+
+// task-5.2 (DP-2) — evicting an idle LRU POOL counts ALL its connections in
+// connectionsEvicted (read size() BEFORE retirePoolLocked_ moves the pool out).
+// =========================================================================
+TEST_CASE("task-5.2 DP-2: LRU whole-pool eviction counts its connections in connectionsEvicted",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxEndpointPools = 1;         // a second endpoint forces whole-pool eviction
+  cfg.maxConnectionsPerEndpoint = 4;
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string epA = "http://unit.test/A";
+  {
+    auto a1 = JsonRpcClientTestAccess::acquire(client, epA);
+    auto a2 = JsonRpcClientTestAccess::acquire(client, epA);
+    (void)a1;
+    (void)a2;
+  } // pool A: two IDLE connections
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 2);
+  const std::uint64_t evictedBefore = client.getStats().connectionsEvicted;
+
+  // A distinct endpoint B: maxEndpointPools==1 evicts idle pool A (size 2).
+  {
+    auto b = JsonRpcClientTestAccess::acquire(client, "http://unit.test/B");
+    (void)b;
+  }
+  REQUIRE(client.getStats().connectionsEvicted == evictedBefore + 2);
+  {
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    REQUIRE(snap[0].poolKey == "http://unit.test/B");
+  }
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+}
+
+// task-5.2 (DP-2) — evicting a SINGLE idle LRU connection (tryEvictOneIdleConn)
+// counts exactly one in connectionsEvicted.
+// =========================================================================
+TEST_CASE("task-5.2 DP-2: single idle-connection LRU eviction counts one in connectionsEvicted",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.globalMaxConnections = 2;         // saturating forces cross-pool idle-conn eviction
+  cfg.maxConnectionsPerEndpoint = 2;
+  JsonRpcClient client(svc, pool, cfg);
+
+  // One IDLE connection on A (evictable), one IN-USE connection on B (held).
+  {
+    auto a = JsonRpcClientTestAccess::acquire(client, "http://unit.test/A");
+    (void)a;
+  }
+  auto bHold = std::make_unique<ConnectionLease>(
+    JsonRpcClientTestAccess::acquire(client, "http://unit.test/B"));
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 2); // global cap saturated
+  const std::uint64_t evictedBefore = client.getStats().connectionsEvicted;
+
+  // A second connection on B: per-endpoint cap allows it, global cap is full, so
+  // acquire_ evicts the single LRU idle connection (A's) to make room.
+  {
+    auto b2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/B");
+    (void)b2;
+  }
+  REQUIRE(client.getStats().connectionsEvicted == evictedBefore + 1);
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+  bHold.reset();
+}
+
+// task-5.2 (DP-2) — the FOURTH connectionsEvicted path: purgeIdle. The counter
+// must increase by exactly the number of idle-expired connections purgeIdle
+// evicts (arch doc line 156 enumerates purgeIdle among the DP-2 paths).
+// =========================================================================
+TEST_CASE("task-5.2 DP-2: purgeIdle counts every idle-expired connection in connectionsEvicted",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 4;
+  cfg.idleTimeout = std::chrono::milliseconds(40);
+  JsonRpcClient client(svc, pool, cfg);
+
+  // Three idle connections across two endpoints.
+  {
+    auto a1 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/A");
+    auto a2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/A");
+    auto b1 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/B");
+    (void)a1;
+    (void)a2;
+    (void)b1;
+  }
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 3);
+  const std::uint64_t evictedBefore = client.getStats().connectionsEvicted;
+
+  // Expire all, then purge: connectionsEvicted increases by exactly 3.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  REQUIRE(client.purgeIdle() == 3);
+  REQUIRE(client.getStats().connectionsEvicted == evictedBefore + 3);
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 0);
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+}
+
+// task-5.3 — maxEndpointPools==0 means UNLIMITED: a default-configured client
+// never throws on distinct endpoints (step-0: the `> 0 &&` conjunct).
+// =========================================================================
+TEST_CASE("task-5.3: maxEndpointPools==0 is unlimited (default config never refuses)",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  REQUIRE(cfg.maxEndpointPools == 0); // the default
+  JsonRpcClient client(svc, pool, cfg);
+
+  std::vector<std::unique_ptr<ConnectionLease>> leases;
+  for (int i = 0; i < 5; ++i)
+  {
+    REQUIRE_NOTHROW(leases.push_back(std::make_unique<ConnectionLease>(
+      JsonRpcClientTestAccess::acquire(client, "http://unit.test/e" + std::to_string(i)))));
+  }
+  REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 5);
+
+  // MUTATION: drop the `> 0 &&` conjunct -> the first acquire evaluates
+  // `_pools.size()(0) >= maxEndpointPools(0)`, finds nothing to evict and throws.
+}
+
+// task-5.3 — a NON-ZERO cap enforces: with every pool in use it refuses; with an
+// idle pool it evicts to admit the new endpoint.
+// =========================================================================
+TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evict-and-admit)",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+
+  SECTION("all pools in use -> a new endpoint is refused")
+  {
+    Config cfg = stubFactoryConfig();
+    cfg.maxEndpointPools = 2;
+    cfg.maxConnectionsPerEndpoint = 1;
+    JsonRpcClient client(svc, pool, cfg);
+
+    auto l0 = std::make_unique<ConnectionLease>(
+      JsonRpcClientTestAccess::acquire(client, "http://unit.test/p0"));
+    auto l1 = std::make_unique<ConnectionLease>(
+      JsonRpcClientTestAccess::acquire(client, "http://unit.test/p1"));
+
+    REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://unit.test/p2"),
+                      PoolExhaustedError);
+    REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 2);
+    REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+            JsonRpcClientTestAccess::recalcTotal(client));
+  }
+
+  SECTION("an idle pool is evicted to admit the new endpoint")
+  {
+    Config cfg = stubFactoryConfig();
+    cfg.maxEndpointPools = 1;
+    JsonRpcClient client(svc, pool, cfg);
+
+    {
+      auto l = JsonRpcClientTestAccess::acquire(client, "http://unit.test/idle");
+      (void)l;
+    } // idle pool
+    REQUIRE_NOTHROW([&]()
+                    {
+                      auto l2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/new");
+                      (void)l2;
+                    }());
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1);
+    REQUIRE(snap[0].poolKey == "http://unit.test/new");
+  }
+}
+
+// task-5.1 (Option A) — a GLOBAL-cap throw must retire the empty pool it would
+// otherwise strand, so a later DISTINCT endpoint is not spuriously refused by a
+// lingering empty pool occupying a maxEndpointPools slot. This case FAILS against
+// 5.1-without-Option-A (step-0 round-1 DP-3, round-2 L-2).
+// =========================================================================
+TEST_CASE("task-5.1 Option A: a global-cap throw retires the empty pool (no spurious later refusal)",
+          "[jsonrpc][pool][phase5]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.globalMaxConnections = 2;
+  cfg.maxEndpointPools = 2;
+  cfg.maxConnectionsPerEndpoint = 2;
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string epA = "http://unit.test/A";
+  // A holds two IN-USE connections: pool A is never all-idle (not a whole-pool
+  // eviction candidate) and the global cap (2) is saturated.
+  auto a1 = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, epA));
+  auto a2 = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, epA));
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 2);
+
+  // A new endpoint B saturates the global cap with no idle connection or pool to
+  // evict -> acquire_ reaches its PoolExhaustedError throw. Option A retires B's
+  // now-empty pool AT THE THROW; without it, B lingers in _pools.
+  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://unit.test/B"),
+                    PoolExhaustedError);
+  {
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    REQUIRE(snap.size() == 1); // only A; B was retired at the throw
+    REQUIRE(snap[0].poolKey == epA);
+    for (const auto &ps : snap)
+    {
+      REQUIRE(ps.connections.size() > 0); // no zero-size pool persists
+    }
+  }
+  REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
+          JsonRpcClientTestAccess::recalcTotal(client));
+
+  // Free ONE of A's connections: A now has one in-use + one idle connection, so A
+  // is still NOT all-idle (no whole-pool eviction candidate) but has an idle
+  // CONNECTION acquire_'s idle-connection eviction can reclaim.
+  a2.reset();
+
+  // A distinct endpoint C must NOT be spuriously refused: with B retired the
+  // maxEndpointPools gate is below the cap, so acquire_ proceeds to reclaim A's
+  // idle connection and create C. Without Option A the lingering empty B pool
+  // fills the last slot, the whole-pool eviction finds nothing all-idle, and C
+  // throws spuriously.
+  REQUIRE_NOTHROW([&]()
+                  {
+                    auto c = JsonRpcClientTestAccess::acquire(client, "http://unit.test/C");
+                    (void)c;
+                  }());
+
+  a1.reset();
 }
 
 // =========================================================================
@@ -1273,12 +1609,17 @@ TEST_CASE("phase3: destructor cancels and waits for an in-flight synchronous cal
 
   std::atomic<bool> callReturned{false};
   std::exception_ptr callErr;
+  // Capture a STABLE raw pointer (see the retry-backoff case): the caller thread
+  // must not read the `client` unique_ptr variable that main mutates via
+  // client.reset() below, or that read races the reset. `raw` stays valid for
+  // the whole call — the blocking-quiesce destructor waits for it to unwind.
+  JsonRpcClient *const raw = client.get();
   std::thread caller(
-    [&]()
+    [&, raw]()
     {
       try
       {
-        client->call(ep, "ping");
+        raw->call(ep, "ping");
       }
       catch (...)
       {
@@ -1521,21 +1862,23 @@ TEST_CASE("phase3: onError completes before a concurrent destructor returns (enq
   std::atomic<int> onErrorSeq{0};
 
   // Thread A: the callback-overload callAsync whose enqueue fails; its onError
-  // runs synchronously on A.
+  // runs synchronously on A. Capture a STABLE raw pointer so A never reads the
+  // `client` unique_ptr variable that main mutates via client.reset() below.
+  JsonRpcClient *const raw = client.get();
   std::thread callerA(
-    [&]()
+    [&, raw]()
     {
-      client->callAsync(ep, "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
-                        [&](std::exception_ptr)
-                        {
-                          onErrorStarted.store(true);
-                          // Small window so a broken destructor reliably returns
-                          // FIRST; correctness is decided by the seq order, not
-                          // this sleep.
-                          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                          onErrorSeq.store(++seq); // stamp: onError completed
-                          onErrorDone.store(true);
-                        });
+      raw->callAsync(ep, "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
+                     [&](std::exception_ptr)
+                     {
+                       onErrorStarted.store(true);
+                       // Small window so a broken destructor reliably returns
+                       // FIRST; correctness is decided by the seq order, not
+                       // this sleep.
+                       std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                       onErrorSeq.store(++seq); // stamp: onError completed
+                       onErrorDone.store(true);
+                     });
     });
 
   ScopeExit joiner{[&]()
@@ -1592,12 +1935,18 @@ TEST_CASE("phase3: destructor interrupts a call parked in retry backoff",
 
   std::atomic<bool> callReturned{false};
   std::exception_ptr callErr;
+  // Capture a STABLE raw pointer, not the `client` unique_ptr itself: the caller
+  // thread must not read the smart-pointer variable that the main thread mutates
+  // via client.reset() below (that is a data race on `client` — TSan flags it).
+  // `raw` stays valid for the whole call: the blocking-quiesce destructor does
+  // not delete the object until this in-flight call has unwound.
+  JsonRpcClient *const raw = client.get();
   std::thread caller(
-    [&]()
+    [&, raw]()
     {
       try
       {
-        client->call(ep, "ping");
+        raw->call(ep, "ping");
       }
       catch (...)
       {
