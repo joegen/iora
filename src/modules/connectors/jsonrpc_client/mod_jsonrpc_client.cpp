@@ -457,18 +457,21 @@ public:
     service->exportApi(*this, "jsonrpc.client.getStats",
                        [this]() -> iora::parsers::Json
                        {
-                         const auto &stats = _client->getStats();
+                         // getStats() now returns a by-value ClientStatsSnapshot
+                         // of plain integers (tracker 2026-07-26-2 task-3.3(ii)):
+                         // no .load(), and no reference into Impl.
+                         const auto stats = _client->getStats();
                          auto statsJson = iora::parsers::Json::object();
-                         statsJson["totalRequests"] = stats.totalRequests.load();
-                         statsJson["successfulRequests"] = stats.successfulRequests.load();
-                         statsJson["failedRequests"] = stats.failedRequests.load();
-                         statsJson["timeoutRequests"] = stats.timeoutRequests.load();
-                         statsJson["retriedRequests"] = stats.retriedRequests.load();
-                         statsJson["batchRequests"] = stats.batchRequests.load();
-                         statsJson["notificationRequests"] = stats.notificationRequests.load();
-                         statsJson["poolExhaustions"] = stats.poolExhaustions.load();
-                         statsJson["connectionsCreated"] = stats.connectionsCreated.load();
-                         statsJson["connectionsEvicted"] = stats.connectionsEvicted.load();
+                         statsJson["totalRequests"] = stats.totalRequests;
+                         statsJson["successfulRequests"] = stats.successfulRequests;
+                         statsJson["failedRequests"] = stats.failedRequests;
+                         statsJson["timeoutRequests"] = stats.timeoutRequests;
+                         statsJson["retriedRequests"] = stats.retriedRequests;
+                         statsJson["batchRequests"] = stats.batchRequests;
+                         statsJson["notificationRequests"] = stats.notificationRequests;
+                         statsJson["poolExhaustions"] = stats.poolExhaustions;
+                         statsJson["connectionsCreated"] = stats.connectionsCreated;
+                         statsJson["connectionsEvicted"] = stats.connectionsEvicted;
                          return statsJson;
                        });
 

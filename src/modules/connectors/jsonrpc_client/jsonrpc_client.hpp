@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <cctype>
 #include <chrono>
 // Retained deliberately: the next phase (blocking quiesce) re-introduces a
 // condition variable on this class. Kept across phase 4 to avoid churning the
@@ -34,6 +33,9 @@
 #include <vector>
 
 #include "iora/iora.hpp"
+// For iora::core::StringUtils::iequals (ASCII, locale-independent header-name
+// folding in mergeHeaders_ — cpp17 LOW-5); not pulled in transitively by iora.hpp.
+#include "iora/core/string_utils.hpp"
 
 namespace iora
 {
@@ -75,6 +77,18 @@ class PoolExhaustedError : public JsonRpcError
 {
 public:
   explicit PoolExhaustedError(const std::string &what) : JsonRpcError(what) {}
+};
+
+/// \brief Thrown (sync), or delivered via onError / promise.set_exception
+/// (async), when a call is REFUSED or INTERRUPTED because the client is closing
+/// (blocking quiesce, CR-4 / HD-1). A call that has NOT yet begun when the
+/// destructor latches is refused with this; a call already admitted is waited
+/// for, not refused. Derives from JsonRpcError so an existing catch(JsonRpcError)
+/// still classifies it as a failed request.
+class ClientShutdownError : public JsonRpcError
+{
+public:
+  explicit ClientShutdownError(const std::string &what) : JsonRpcError(what) {}
 };
 
 /// \brief Thrown when a JSON-RPC response contains an error object.
@@ -186,6 +200,26 @@ struct ClientStats
     connectionsCreated = 0;
     connectionsEvicted = 0;
   }
+};
+
+/// \brief Plain-integer, copyable snapshot of ClientStats (task-3.3(ii)).
+/// \details getStats() returns this BY VALUE. ClientStats itself holds
+/// std::atomics and is non-copyable, and a reference into JsonRpcClientImpl
+/// cannot safely outlive a concurrent destructor — so the accessor is NOT
+/// counted (task-3.3(ii)) and instead hands back an atomic-free snapshot.
+/// Callers read the plain fields directly (no .load()).
+struct ClientStatsSnapshot
+{
+  std::uint64_t totalRequests{0};
+  std::uint64_t successfulRequests{0};
+  std::uint64_t failedRequests{0};
+  std::uint64_t timeoutRequests{0};
+  std::uint64_t retriedRequests{0};
+  std::uint64_t batchRequests{0};
+  std::uint64_t notificationRequests{0};
+  std::uint64_t poolExhaustions{0};
+  std::uint64_t connectionsCreated{0};
+  std::uint64_t connectionsEvicted{0};
 };
 
 /// \brief Batch request item for efficient bulk operations.
@@ -384,6 +418,18 @@ public:
     return true;
   }
 
+  /// \brief Visit EVERY connection's HttpClient (in-use or idle) — used by the
+  /// blocking-quiesce destructor's STEP 2 to cancelInFlight() each pooled
+  /// client so a request parked in receiveSync/acquireLease unwinds. Must be
+  /// called under JsonRpcClientImpl::_mutex.
+  template <typename Fn> void forEachClient(Fn &&fn)
+  {
+    for (const auto &pc : _connections)
+    {
+      fn(pc->client());
+    }
+  }
+
   void touch() { _lastTouched = std::chrono::steady_clock::now(); }
 
   std::chrono::steady_clock::time_point lastTouched() const { return _lastTouched; }
@@ -478,6 +524,192 @@ class JsonRpcClientImpl : public std::enable_shared_from_this<JsonRpcClientImpl>
   {
   };
 
+  // ==========================================================================
+  // Blocking-quiesce primitive (SHAPE-B, task-3.1 — the single authority).
+  // Compiler+ASan-proven by coding_trackers tools/proofs/quiesce_shapeb_probe.cpp
+  // and inflight_probe.cpp. These three types are IMPLEMENTATION DETAIL of this
+  // header (private nested — round-2 LOW-2): the promoted public surface never
+  // names them; the test seam observes {_inFlight, _closing, _owners} instead.
+  // Their inline bodies reach this class's later-declared quiesce state
+  // (_quiesceMutex/_quiesceCv/_inFlight/_owners/_closing) via a complete-class
+  // context, and — being nested — have access to those private members.
+  // ==========================================================================
+
+  /// \brief The single admission decision, NON-throwing (round-7 T7-4): gate +
+  /// increment are ONE atomic step under _quiesceMutex; a refused guard sets
+  /// _entered=false and never increments (so _inFlight is balanced and never
+  /// underflows to SIZE_MAX). The dtor decrements and notifies UNDER the lock
+  /// (round-2 C-1): the five SYNCHRONOUS entry points hold a bare CountGuard on
+  /// a raw Impl* with NO keep-alive, so notifying after releasing _quiesceMutex
+  /// would let the quiescing destructor free Impl (hence _quiesceCv) in the gap.
+  class CountGuard
+  {
+  public:
+    explicit CountGuard(JsonRpcClientImpl *impl) : _impl(impl)
+    {
+      std::lock_guard<std::mutex> lk(_impl->_quiesceMutex);
+      if (_impl->_closing.load(std::memory_order_relaxed)) // read under _quiesceMutex => relaxed ok
+      {
+        return; // REFUSED: _entered stays false, no increment
+      }
+      ++_impl->_inFlight;
+      _entered = true;
+    }
+    CountGuard(const CountGuard &) = delete;
+    CountGuard &operator=(const CountGuard &) = delete;
+    CountGuard(CountGuard &&) = delete;
+    CountGuard &operator=(CountGuard &&) = delete;
+    ~CountGuard()
+    {
+      if (!_entered)
+      {
+        return;
+      }
+      std::lock_guard<std::mutex> lk(_impl->_quiesceMutex); // notify UNDER the lock (C-1)
+      --_impl->_inFlight;
+      _impl->_quiesceCv.notify_all();
+    }
+    bool entered() const noexcept { return _entered; }
+
+  private:
+    JsonRpcClientImpl *_impl;
+    bool _entered{false};
+  };
+
+  /// \brief Self-destruct discriminator, DECOUPLED from CountGuard (task-3.1(c)).
+  /// Registers the CURRENTLY-executing thread in _owners for the duration of the
+  /// counted work. ALWAYS a body-local of the executing context, so it is
+  /// constructed AND destroyed on the SAME thread — which is what makes
+  /// owners.erase(this_thread) always match.
+  class OwnerScope
+  {
+  public:
+    explicit OwnerScope(JsonRpcClientImpl *impl) : _impl(impl)
+    {
+      std::lock_guard<std::mutex> lk(_impl->_quiesceMutex);
+      _impl->_owners.push_back(std::this_thread::get_id());
+    }
+    OwnerScope(const OwnerScope &) = delete;
+    OwnerScope &operator=(const OwnerScope &) = delete;
+    OwnerScope(OwnerScope &&) = delete;
+    OwnerScope &operator=(OwnerScope &&) = delete;
+    ~OwnerScope()
+    {
+      std::lock_guard<std::mutex> lk(_impl->_quiesceMutex);
+      const auto id = std::this_thread::get_id();
+      auto it = std::find(_impl->_owners.begin(), _impl->_owners.end(), id);
+      if (it != _impl->_owners.end())
+      {
+        _impl->_owners.erase(it);
+      }
+    }
+
+  private:
+    JsonRpcClientImpl *_impl;
+  };
+
+  /// \brief The heap object for an ASYNC counted call. ONE
+  /// shared_ptr<InFlightToken> is captured by the enqueued closure; the token
+  /// holds a shared_ptr<Impl>, so Impl (and its embedded quiesce state) always
+  /// outlives any task that outlives the client — no separate detached quiesce
+  /// struct is needed (SHAPE-B key insight).
+  ///
+  /// DECLARATION ORDER IS LOAD-BEARING (destroyed in reverse): _impl LAST
+  /// (keep-alive through the notify), _guard SECOND (decrement+notify), the
+  /// callables FIRST (C4-1: user-held state torn down BEFORE the waiter is
+  /// released). Templated on the RPC result type so the future-returning
+  /// overloads (round-3 H-1) can plumb a typed std::promise through _onSuccess /
+  /// _onError WITHOUT ThreadPool::enqueueWithResult / packaged_task: the
+  /// overload creates the promise, hands its future to the caller before
+  /// enqueue, and the callables set_value / set_exception. The callback overload
+  /// carries plain user std::functions on the same channels. runBody() is
+  /// nullary — the RPC request travels captured inside _perform (round-2 M-1),
+  /// so the enqueued closure captures ONLY the token.
+  template <typename Result> class InFlightToken
+  {
+  public:
+    InFlightToken(std::shared_ptr<JsonRpcClientImpl> impl,
+                  std::function<Result(JsonRpcClientImpl *)> perform,
+                  std::function<void(Result)> onSuccess,
+                  std::function<void(std::exception_ptr)> onError)
+        : _impl(std::move(impl)), _guard(_impl.get()), _perform(std::move(perform)),
+          _onSuccess(std::move(onSuccess)), _onError(std::move(onError))
+    {
+    }
+    InFlightToken(const InFlightToken &) = delete;
+    InFlightToken &operator=(const InFlightToken &) = delete;
+    InFlightToken(InFlightToken &&) = delete;
+    InFlightToken &operator=(InFlightToken &&) = delete;
+
+    /// \brief Admission result: true if the CountGuard entered (was not refused
+    /// by the closing gate).
+    bool entered() const noexcept { return _guard.entered(); }
+
+    /// \brief Run the RPC body on a worker thread. OwnerScope registers THIS
+    /// worker as an executor for the duration of the body (including the user
+    /// callback), reaching Impl via _impl. The token already counted at
+    /// construction, so runBody() takes NO CountGuard (task-3.3).
+    void runBody()
+    {
+      OwnerScope owner(_impl.get());
+      try
+      {
+        Result r = _perform(_impl.get());
+        // The RPC succeeded; deliver the result with its OWN guard (cpp17 L-1)
+        // so a throwing user onSuccess is NOT misreported as a failed call
+        // routed to onError. Only _perform's exceptions reach the error channel
+        // (the outer catch). A throwing onSuccess is swallowed for the same
+        // reason as onError (TS-4): it must not escape into the worker.
+        if (_onSuccess)
+        {
+          try
+          {
+            _onSuccess(std::move(r));
+          }
+          catch (...)
+          {
+          }
+        }
+      }
+      catch (...)
+      {
+        deliverError_(std::current_exception());
+      }
+    }
+
+    /// \brief Caller-side failure channel (round-3 M-1): route a refusal or an
+    /// enqueue failure through the SAME error callable the body would use. Never
+    /// runs the RPC; never enqueued afterwards.
+    void fail(std::exception_ptr e) { deliverError_(std::move(e)); }
+
+  private:
+    /// \brief Swallow-guarded onError delivery, shared by runBody's error path
+    /// and fail() (simpl round-3 L-1). A throwing user error handler must not
+    /// escape into a ThreadPool worker (runBody) nor out of callAsync (fail) —
+    /// callAsync's contract is "do not throw" (TS-4/TS-7). The future overloads'
+    /// _onError is promise.set_exception (cannot throw on a fresh promise), so
+    /// the guard is inert there.
+    void deliverError_(std::exception_ptr e)
+    {
+      if (_onError)
+      {
+        try
+        {
+          _onError(std::move(e));
+        }
+        catch (...)
+        {
+        }
+      }
+    }
+
+    std::shared_ptr<JsonRpcClientImpl> _impl;                // destroyed LAST (keep-alive)
+    CountGuard _guard;                                       // destroyed SECOND (decrement+notify)
+    std::function<Result(JsonRpcClientImpl *)> _perform;     // the RPC work (captures the request)
+    std::function<void(Result)> _onSuccess;                  // deliver result (set_value / user cb)
+    std::function<void(std::exception_ptr)> _onError;        // destroyed FIRST (C4-1)
+  };
+
 public:
   JsonRpcClientImpl(PrivateTag, iora::core::ThreadPool &threadPool, Config config)
       : _threadPool(threadPool), _config(std::move(config)), _nextId(1), _totalConnections(0)
@@ -507,9 +739,245 @@ public:
     return std::make_shared<JsonRpcClientImpl>(PrivateTag{}, threadPool, std::move(config));
   }
 
+  // -------------------------------------------------------------------------
+  // Counted PUBLIC entry points (task-3.3). Each SYNCHRONOUS entry takes its
+  // CountGuard as the FIRST local (admission), then — call/notify/callBatch,
+  // which can run a user httpClientConfigurer via acquire_ — an OwnerScope so a
+  // callback that destroys the client is detected as self-destruct (task-3.2).
+  // The non-counted *Core_ workers below hold the real logic; the ASYNC path's
+  // runBody() calls the Core directly so admitted work is honored, never
+  // gate-refused mid-queue (task-3.3 admission-at-call semantics).
+  // -------------------------------------------------------------------------
   iora::parsers::Json call(const std::string &endpoint, const std::string &method,
                            const iora::parsers::Json &params,
                            const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    CountGuard guard(this);
+    if (!guard.entered())
+    {
+      throw ClientShutdownError("JsonRpcClient::call: refused; client is closing");
+    }
+    OwnerScope owner(this);
+    return callCore_(endpoint, method, params, headers);
+  }
+
+  void notify(const std::string &endpoint, const std::string &method,
+              const iora::parsers::Json &params,
+              const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    CountGuard guard(this);
+    if (!guard.entered())
+    {
+      throw ClientShutdownError("JsonRpcClient::notify: refused; client is closing");
+    }
+    OwnerScope owner(this);
+    notifyCore_(endpoint, method, params, headers);
+  }
+
+  std::future<iora::parsers::Json>
+  callAsync(const std::string &endpoint, const std::string &method,
+            const iora::parsers::Json &params,
+            const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    return dispatchFuture_<iora::parsers::Json>(
+      callPerform_(endpoint, method, params, headers),
+      "JsonRpcClient::callAsync: refused; client is closing");
+  }
+
+  void callAsync(const std::string &endpoint, const std::string &method,
+                 const iora::parsers::Json &params,
+                 const std::vector<std::pair<std::string, std::string>> &headers,
+                 std::function<void(iora::parsers::Json)> onSuccess,
+                 std::function<void(std::exception_ptr)> onError)
+  {
+    // The user callables ARE the token's delivery channels: runBody() and fail()
+    // already null-check _onSuccess/_onError, so hand them over directly (no
+    // pass-through wrapper lambda — simpl-1). std::function<void(Json)> is
+    // exactly InFlightToken<Json>::_onSuccess's type.
+    auto token = std::make_shared<InFlightToken<iora::parsers::Json>>(
+      shared_from_this(), callPerform_(endpoint, method, params, headers), std::move(onSuccess),
+      std::move(onError));
+    // TS-5: the user's onError may run SYNCHRONOUSLY on THIS thread (refusal or
+    // enqueue failure, both inside dispatchToken_). Register as an owner so a
+    // self-destruct from it is caught by quiesce STEP-1 (terminate) instead of
+    // silently deadlocking STEP-3 with a still-counted token pinned in this
+    // frame. If enqueue succeeds no user code runs here and the scope deregisters
+    // on return; the worker's runBody registers its own OwnerScope. The future
+    // overloads need no such scope — their fail() runs set_exception, not user
+    // code — so this lives here, not in dispatchToken_.
+    OwnerScope owner(this);
+    dispatchToken_(token, "JsonRpcClient::callAsync: refused; client is closing");
+  }
+
+  std::vector<iora::parsers::Json>
+  callBatch(const std::string &endpoint, const std::vector<BatchItem> &items,
+            const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    CountGuard guard(this);
+    if (!guard.entered())
+    {
+      throw ClientShutdownError("JsonRpcClient::callBatch: refused; client is closing");
+    }
+    OwnerScope owner(this);
+    return callBatchCore_(endpoint, items, headers);
+  }
+
+  std::future<std::vector<iora::parsers::Json>>
+  callBatchAsync(const std::string &endpoint, const std::vector<BatchItem> &items,
+                 const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    return dispatchFuture_<std::vector<iora::parsers::Json>>(
+      [endpoint, items, headers](JsonRpcClientImpl *impl)
+      { return impl->callBatchCore_(endpoint, items, headers); },
+      "JsonRpcClient::callBatchAsync: refused; client is closing");
+  }
+
+  /// \brief The single call-perform closure shared by both callAsync overloads
+  /// (simpl LOW-2): captures the request by value and invokes the NON-counted
+  /// callCore_ on the worker's Impl. The token stores it type-erased as
+  /// std::function<Json(Impl*)>, so returning it as such adds no extra erasure.
+  std::function<iora::parsers::Json(JsonRpcClientImpl *)>
+  callPerform_(const std::string &endpoint, const std::string &method,
+               const iora::parsers::Json &params,
+               const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    return [endpoint, method, params, headers](JsonRpcClientImpl *impl)
+    { return impl->callCore_(endpoint, method, params, headers); };
+  }
+
+  std::size_t purgeIdle()
+  {
+    CountGuard guard(this);
+    if (!guard.entered())
+    {
+      return 0; // refused: NO-OP returning 0 (task-3.4(a))
+    }
+    return purgeIdleCore_();
+  }
+
+  /// \brief By-value config snapshot (task-3.3(ii)): NOT counted; noexcept
+  /// removed (Config holds a vector and std::functions, so the copy can throw).
+  Config config() const { return _config; }
+
+  /// \brief By-value, atomic-free stats snapshot (task-3.3(ii)): NOT counted;
+  /// noexcept removed. Must not be called concurrently with destruction.
+  ClientStatsSnapshot getStats() const
+  {
+    ClientStatsSnapshot s;
+    s.totalRequests = _stats.totalRequests.load();
+    s.successfulRequests = _stats.successfulRequests.load();
+    s.failedRequests = _stats.failedRequests.load();
+    s.timeoutRequests = _stats.timeoutRequests.load();
+    s.retriedRequests = _stats.retriedRequests.load();
+    s.batchRequests = _stats.batchRequests.load();
+    s.notificationRequests = _stats.notificationRequests.load();
+    s.poolExhaustions = _stats.poolExhaustions.load();
+    s.connectionsCreated = _stats.connectionsCreated.load();
+    s.connectionsEvicted = _stats.connectionsEvicted.load();
+    return s;
+  }
+
+  void resetStats()
+  {
+    CountGuard guard(this);
+    if (!guard.entered())
+    {
+      return; // refused: NO-OP (task-3.4(a))
+    }
+    _stats.reset();
+  }
+
+  /// \brief Blocking quiesce (task-3.5), run on the DESTROYING (user) thread by
+  /// the facade's ~JsonRpcClient — NEVER by ~JsonRpcClientImpl (which may run on
+  /// a worker holding the last shared_ptr<Impl>). Four SEQUENTIAL, never-nested
+  /// scopes. There is NO timeout, NO watchdog, NO progress counter, NO config
+  /// knob; STEP 2's cancellation makes STEP 3's wait finite (with the honest
+  /// residual bounds enumerated below — not a deadline knob).
+  ///
+  /// WHY STEP 3 TERMINATES: after the latch every counted call is in exactly one
+  /// state, each reaching ~CountGuard in bounded time: (a) not started -> refused
+  /// by the guard; (b) started, pre-postJson -> a permanently-closing HttpClient
+  /// (or acquire_'s own _closing check) throws at first touch; (c) blocked in
+  /// acquireLease -> woken by cancelInFlight()'s notify_all; (d) blocked in the
+  /// receive loop -> its session was closed by STEP 2; (e) in connectSync ->
+  /// bounded by connectTimeout; (f) in DNS -> bounded by the DNS timeout; (g) in
+  /// retry backoff -> woken by STEP 1's notify (interruptible wait); (h) queued
+  /// in the pool -> counted; runs (and hits acquire_'s _closing throw) or is
+  /// discarded (broken_promise). The count is monotone non-increasing after the
+  /// latch.
+  ///
+  /// (i) HONEST RESIDUAL — a call inside makeHttpClient_ (running the user
+  /// httpClientFactory/httpClientConfigurer under the pool _mutex, inside its
+  /// std::async(...).wait_for(30s)) is bounded by that 30 s async wait, and while
+  /// it holds _mutex it also DELAYS STEP 2 (which needs _mutex) by up to the
+  /// same. So STEP 2's start, and hence the whole quiesce, is bounded by
+  /// max(cancellation, an in-progress connection creation) — cancellation cannot
+  /// interrupt a factory/configurer already running under the lock. With the
+  /// default factory this is instant; the general bound is removed in PHASE 6
+  /// (CR-3: task-6.1b builds the client OUTSIDE the lock, task-6.2 deletes the
+  /// std::async wrapper). Enumerated here so the "no deadline" claim stays true:
+  /// the deadline is the pre-existing per-connection-creation bound, tracked for
+  /// removal, not a knob this design adds.
+  void quiesce()
+  {
+    // STEP 1 — LATCH (_quiesceMutex). Self-destruct from inside our own work is
+    // a guaranteed permanent block (this thread's OwnerScope cannot leave
+    // _owners until the callback returns, while we would wait for exactly that):
+    // diagnose and terminate (task-3.2) — the honest analogue of Transport::stop
+    // throwing for the isomorphic I/O-thread case (a destructor cannot throw).
+    {
+      std::unique_lock<std::mutex> lk(_quiesceMutex);
+      if (std::find(_owners.begin(), _owners.end(), std::this_thread::get_id()) != _owners.end())
+      {
+        std::cerr << "fatal: JsonRpcClient destroyed from inside its own callback "
+                     "(self-deadlock); calling std::terminate()\n";
+        std::terminate();
+      }
+      _closing.store(true, std::memory_order_release);
+    }
+    _quiesceCv.notify_all(); // wake retry-backoff waiters, OUTSIDE the lock
+
+    // STEP 2 — CANCEL (pool _mutex alone): cancelInFlight() every pooled client
+    // so a request parked in receiveSync/acquireLease unwinds. This is what
+    // makes STEP 3 finite. Needs stable connection identity (phase 4, task-4.1c).
+    {
+      std::lock_guard<std::mutex> lk(_mutex);
+      for (auto &kv : _pools)
+      {
+        kv.second->forEachClient([](iora::network::HttpClient &c) { c.cancelInFlight(); });
+      }
+    }
+
+    // STEP 3 — WAIT, UNCONDITIONALLY (_quiesceMutex). No predicate on time.
+    {
+      std::unique_lock<std::mutex> lk(_quiesceMutex);
+      _quiesceCv.wait(lk, [this] { return _inFlight == 0; });
+    }
+
+    // STEP 4 — clear _pools (pool _mutex); _inFlight == 0 so no lease is
+    // outstanding. Move the pools out BEFORE unlocking so ~EndpointPool /
+    // ~HttpClient (which join I/O threads) run AFTER _mutex releases (T6-2).
+    std::vector<std::shared_ptr<detail::EndpointPool>> evicted;
+    {
+      std::lock_guard<std::mutex> lk(_mutex);
+      for (auto &kv : _pools)
+      {
+        evicted.push_back(std::move(kv.second));
+      }
+      _pools.clear();
+    }
+  }
+
+private:
+  using PoolMap = std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>>;
+
+  // -------------------------------------------------------------------------
+  // Non-counted CORE workers. The counted public wrappers above hold the
+  // CountGuard/OwnerScope; the async runBody() calls these directly (task-3.3).
+  // -------------------------------------------------------------------------
+  iora::parsers::Json callCore_(const std::string &endpoint, const std::string &method,
+                                const iora::parsers::Json &params,
+                                const std::vector<std::pair<std::string, std::string>> &headers)
   {
     _stats.totalRequests++;
 
@@ -535,9 +1003,9 @@ public:
     }
   }
 
-  void notify(const std::string &endpoint, const std::string &method,
-              const iora::parsers::Json &params,
-              const std::vector<std::pair<std::string, std::string>> &headers)
+  void notifyCore_(const std::string &endpoint, const std::string &method,
+                   const iora::parsers::Json &params,
+                   const std::vector<std::pair<std::string, std::string>> &headers)
   {
     _stats.totalRequests++;
     _stats.notificationRequests++;
@@ -562,51 +1030,9 @@ public:
     }
   }
 
-  std::future<iora::parsers::Json>
-  callAsync(const std::string &endpoint, const std::string &method,
-            const iora::parsers::Json &params,
-            const std::vector<std::pair<std::string, std::string>> &headers)
-  {
-    // Capture a shared_ptr<Impl> by value: the queued task keeps this
-    // implementation alive even if the owning facade is destroyed first
-    // (thread-safety C-4). No `this`, no `[=]`.
-    auto self = shared_from_this();
-    return submitToPool_([self, endpoint, method, params, headers]()
-                         { return self->call(endpoint, method, params, headers); });
-  }
-
-  void callAsync(const std::string &endpoint, const std::string &method,
-                 const iora::parsers::Json &params,
-                 const std::vector<std::pair<std::string, std::string>> &headers,
-                 std::function<void(iora::parsers::Json)> onSuccess,
-                 std::function<void(std::exception_ptr)> onError)
-  {
-    auto self = shared_from_this();
-    _threadPool.enqueue(
-      [self, endpoint, method, params, headers, onSuccess = std::move(onSuccess),
-       onError = std::move(onError)]()
-      {
-        try
-        {
-          auto result = self->call(endpoint, method, params, headers);
-          if (onSuccess)
-          {
-            onSuccess(result);
-          }
-        }
-        catch (...)
-        {
-          if (onError)
-          {
-            onError(std::current_exception());
-          }
-        }
-      });
-  }
-
   std::vector<iora::parsers::Json>
-  callBatch(const std::string &endpoint, const std::vector<BatchItem> &items,
-            const std::vector<std::pair<std::string, std::string>> &headers)
+  callBatchCore_(const std::string &endpoint, const std::vector<BatchItem> &items,
+                 const std::vector<std::pair<std::string, std::string>> &headers)
   {
     if (items.empty())
     {
@@ -646,16 +1072,7 @@ public:
     }
   }
 
-  std::future<std::vector<iora::parsers::Json>>
-  callBatchAsync(const std::string &endpoint, const std::vector<BatchItem> &items,
-                 const std::vector<std::pair<std::string, std::string>> &headers)
-  {
-    auto self = shared_from_this();
-    return submitToPool_([self, endpoint, items, headers]()
-                         { return self->callBatch(endpoint, items, headers); });
-  }
-
-  std::size_t purgeIdle()
+  std::size_t purgeIdleCore_()
   {
     // Declared BEFORE `guard` so the evicted connections/pools are destroyed
     // AFTER _mutex is released (thread-safety T6-2): ~HttpClient joins I/O
@@ -687,14 +1104,51 @@ public:
     return evictedTotal;
   }
 
-  const Config &config() const noexcept { return _config; }
+  /// \brief Deliver an admitted async token, or route its failure. Owns BOTH
+  /// delivery-failure channels (simpl LOW-1): a refused token (gate closed) is
+  /// delivered ClientShutdownError(refuseMsg) via fail(); an admitted token whose
+  /// enqueue throws is delivered the enqueue exception via fail() (task-3.4(a)/
+  /// (b)). The caller frame still holds `token` (passed by const ref) across
+  /// fail(), so onError / set_exception completes BEFORE _inFlight can drop and
+  /// let a concurrent destructor return.
+  template <typename Token>
+  void dispatchToken_(const std::shared_ptr<Token> &token, const char *refuseMsg)
+  {
+    if (!token->entered())
+    {
+      token->fail(std::make_exception_ptr(ClientShutdownError(refuseMsg)));
+      return;
+    }
+    try
+    {
+      _threadPool.enqueue([token]() { token->runBody(); });
+    }
+    catch (...)
+    {
+      token->fail(std::current_exception());
+    }
+  }
 
-  const ClientStats &getStats() const noexcept { return _stats; }
-
-  void resetStats() { _stats.reset(); }
-
-private:
-  using PoolMap = std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>>;
+  /// \brief The shared scaffolding of the two FUTURE-returning async overloads
+  /// (round-3 H-1, simpl-2). OWNS the promise here, hands the future to the
+  /// caller BEFORE enqueue, and routes both refusal and enqueue failure (via
+  /// dispatchToken_) through set_exception. Discarded unrun -> the token's
+  /// callables (sole promise holders) are destroyed -> broken_promise
+  /// (task-3.4(c)). Deliberately does NOT use enqueueWithResult/packaged_task.
+  /// No OwnerScope: fail() here runs set_exception, never user code (TS-5).
+  template <typename Result>
+  std::future<Result> dispatchFuture_(std::function<Result(JsonRpcClientImpl *)> perform,
+                                      const char *refuseMsg)
+  {
+    auto promise = std::make_shared<std::promise<Result>>();
+    std::future<Result> future = promise->get_future();
+    auto token = std::make_shared<InFlightToken<Result>>(
+      shared_from_this(), std::move(perform),
+      [promise](Result r) { promise->set_value(std::move(r)); },
+      [promise](std::exception_ptr e) { promise->set_exception(std::move(e)); });
+    dispatchToken_(token, refuseMsg);
+    return future;
+  }
 
   /// \brief Move an emptied/idle pool out of _pools into the caller's evicted
   /// bin and erase its map node; returns the iterator following the erased node.
@@ -728,6 +1182,16 @@ private:
     // unwinding rather than an explicit unlock() (thread-safety T6-2/T-2).
     std::shared_ptr<detail::EndpointPool> pool;
     std::unique_lock<std::mutex> lock(_mutex);
+
+    // Refuse under the pool _mutex if the client is closing (task-3.1(f)): an
+    // admitted call that reaches here AFTER the destructor's STEP-2 cancel loop
+    // must not create a NEW pooled HttpClient the loop already passed. The
+    // _mutex serialization vs. that loop admits only safe orders. Reading the
+    // atomic (acquire) while holding _mutex is fine — this takes no _quiesceMutex.
+    if (_closing.load(std::memory_order_acquire))
+    {
+      throw ClientShutdownError("JsonRpcClient: cancelled during acquire; client is closing");
+    }
 
     const auto makeClient = [this](const std::string &ep) { return this->makeHttpClient_(ep); };
 
@@ -949,7 +1413,10 @@ private:
       bool replaced = false;
       for (auto &base : out)
       {
-        if (casecmp_(base.first, kv.first))
+        // ASCII-only, locale-independent header-name folding (cpp17 LOW-5):
+        // reuse the iora foundation helper rather than locale-dependent
+        // std::tolower, so the match is byte-stable across processes/locales.
+        if (iora::core::StringUtils::iequals(base.first, kv.first))
         {
           base.second = kv.second;
           replaced = true;
@@ -962,24 +1429,6 @@ private:
       }
     }
     return out;
-  }
-
-  static bool casecmp_(const std::string &a, const std::string &b)
-  {
-    if (a.size() != b.size())
-    {
-      return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i)
-    {
-      char ca = static_cast<char>(std::tolower(static_cast<unsigned char>(a[i])));
-      char cb = static_cast<char>(std::tolower(static_cast<unsigned char>(b[i])));
-      if (ca != cb)
-      {
-        return false;
-      }
-    }
-    return true;
   }
 
   static iora::parsers::Json parseResponseOrThrow_(iora::parsers::Json resp)
@@ -1061,6 +1510,12 @@ private:
 
     while (true)
     {
+      // task-3.1(f): fail fast if the client is closing rather than starting a
+      // fresh attempt against a cancelled transport.
+      if (_closing.load(std::memory_order_acquire))
+      {
+        throw ClientShutdownError("JsonRpcClient: cancelled before send; client is closing");
+      }
       try
       {
         return sendJson_(http, url, payload, headers);
@@ -1078,7 +1533,19 @@ private:
         }
 
         _stats.retriedRequests++;
-        std::this_thread::sleep_for(delay);
+
+        // INTERRUPTIBLE backoff (task-3.1(f)): the destructor's STEP-1 notify
+        // cuts the wait so a retry loop cannot outlast the quiesce. Waiting on
+        // _quiesceCv takes _quiesceMutex only (no pool _mutex held here — the
+        // lease is held but acquire_ released _mutex), honoring task-3.6 rule (i).
+        {
+          std::unique_lock<std::mutex> lk(_quiesceMutex);
+          _quiesceCv.wait_for(lk, delay, [this] { return _closing.load(std::memory_order_acquire); });
+        }
+        if (_closing.load(std::memory_order_acquire))
+        {
+          throw ClientShutdownError("JsonRpcClient: cancelled during retry backoff; client is closing");
+        }
 
         // Exponential backoff with jitter
         delay = std::min(std::chrono::milliseconds(
@@ -1136,11 +1603,6 @@ private:
     return results;
   }
 
-  template <typename Fn> auto submitToPool_(Fn &&fn) -> std::future<std::invoke_result_t<Fn>>
-  {
-    return _threadPool.enqueueWithResult(std::forward<Fn>(fn));
-  }
-
 private:
   // Friendship is not transitive: befriending the test seam on EndpointPool
   // does not extend here, so JsonRpcClientImpl names it too (for _pools, _mutex,
@@ -1159,10 +1621,34 @@ private:
   // removed from the map stays well-defined instead of dereferencing freed
   // memory.
   std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>> _pools;
+  // LOCK ORDERING (task-3.6 / task-8.4), stated here at the declaration:
+  //  (i)   the pool _mutex and Impl::_quiesceMutex are NEVER held simultaneously
+  //        (the quiesce CV must not reuse this mutex — a task blocked in acquire_
+  //        on _mutex and a destructor waiting for it would deadlock).
+  //  (iii) no ConnectionLease/CountGuard/OwnerScope may be constructed OR
+  //        destroyed while this _mutex is held: ~ConnectionLease takes _mutex,
+  //        and ~CountGuard/~OwnerScope take _quiesceMutex — by (i) disjoint.
+  //  (iv)  every counted entry point acquires its CountGuard/token as the FIRST
+  //        local, ABOVE any pool lock, and releases it after _mutex is released.
+  //  (ii)  _quiesceMutex is NEVER held across a call into core::ThreadPool.
+  // The only order between core::ThreadPool::_mutex and _quiesceMutex is
+  // ThreadPool::_mutex -> _quiesceMutex (queued-task discard); the reverse is
+  // forbidden by (ii), so no cycle can form. (Full rule set: task-3.6/task-8.4.)
   std::mutex _mutex;
 
   std::atomic<std::uint64_t> _nextId;
   std::size_t _totalConnections;
+
+  // --- Blocking-quiesce state (CR-4 / HD-1, task-3.1(a)). EMBEDDED here (no
+  // separate detached struct — keep-alive via InFlightToken's shared_ptr<Impl>
+  // suffices). _quiesceMutex is a leaf, DISTINCT from the pool _mutex; task-3.6
+  // rule (i) forbids holding both simultaneously. _closing is write-once
+  // monotonic: STORE under _quiesceMutex (release), lock-free reads use acquire.
+  mutable std::mutex _quiesceMutex;
+  std::condition_variable _quiesceCv;
+  std::size_t _inFlight{0};
+  std::vector<std::thread::id> _owners;
+  std::atomic<bool> _closing{false};
 };
 
 // ConnectionLease's destructor is defined here, where JsonRpcClientImpl is
@@ -1203,6 +1689,26 @@ public:
   JsonRpcClient &operator=(const JsonRpcClient &) = delete;
   JsonRpcClient(JsonRpcClient &&) = delete;
   JsonRpcClient &operator=(JsonRpcClient &&) = delete;
+
+  /// \brief Blocking destructor (CR-4 / HD-1, task-3.5). Runs the quiesce on
+  /// THIS (the destroying user) thread — never in ~JsonRpcClientImpl, which may
+  /// run on a ThreadPool worker holding the last shared_ptr<Impl>. When it
+  /// returns, no user callback is running and no counted call is in flight.
+  /// Residual (HD-8): a worker may hold the last shared_ptr<Impl>, so ~Impl can
+  /// run on that worker AFTER this returns; a dlopen'd module MUST NOT rely on
+  /// this destructor to make dlclose safe. The contract is "no call may BEGIN
+  /// concurrently with destruction; calls already in progress are waited for."
+  ///
+  /// PRECONDITIONS: the core::ThreadPool MUST outlive the client and MUST NOT be
+  /// reset/stopped/drained while the client is alive; the client MUST NOT be
+  /// destroyed from a thread currently running its work (detected — task-3.2).
+  ~JsonRpcClient()
+  {
+    if (_impl)
+    {
+      _impl->quiesce();
+    }
+  }
 
   iora::parsers::Json call(const std::string &endpoint, const std::string &method,
                            const iora::parsers::Json &params = iora::parsers::Json::object(),
@@ -1251,9 +1757,13 @@ public:
 
   std::size_t purgeIdle() { return _impl->purgeIdle(); }
 
-  const Config &config() const noexcept { return _impl->config(); }
+  /// \brief By-value config snapshot (task-3.3(ii)): noexcept removed, returns
+  /// the by-value result of _impl->config() (not a reference into Impl).
+  Config config() const { return _impl->config(); }
 
-  const ClientStats &getStats() const noexcept { return _impl->getStats(); }
+  /// \brief By-value, atomic-free stats snapshot (task-3.3(ii)): noexcept
+  /// removed. Must not be called concurrently with destruction.
+  ClientStatsSnapshot getStats() const { return _impl->getStats(); }
 
   void resetStats() { _impl->resetStats(); }
 

@@ -204,6 +204,44 @@ struct JsonRpcClientTestAccess
     std::lock_guard<std::mutex> guard(c._impl->_mutex);
     return pool->_connections.size();
   }
+
+  // -------------------------------------------------------------------------
+  // task-1.2b — the QUIESCE observation seam (SHAPE-B). The state is EMBEDDED in
+  // JsonRpcClientImpl (there is no separate Quiesce struct), so the snapshot is
+  // taken under Impl::_quiesceMutex, NOT the pool _mutex. Two-stage acquisition
+  // is mandatory: snapshotPools() (pool _mutex) and quiesceSnapshot()
+  // (_quiesceMutex) are taken SEQUENTIALLY and are NOT atomic w.r.t. each other
+  // (task-3.6 forbids holding both simultaneously). There is no
+  // currentThreadMarker() accessor (round-7 F-7): self-destruct uses `owners`.
+  // -------------------------------------------------------------------------
+  struct QuiesceSnapshot
+  {
+    std::size_t inFlight;
+    bool closing;
+    std::vector<std::thread::id> owners;
+  };
+
+  static QuiesceSnapshot quiesceSnapshot(JsonRpcClient &c)
+  {
+    std::lock_guard<std::mutex> lk(c._impl->_quiesceMutex);
+    return QuiesceSnapshot{c._impl->_inFlight,
+                           c._impl->_closing.load(std::memory_order_relaxed), c._impl->_owners};
+  }
+
+  /// \brief TEST-ONLY: perform ONLY the destructor's STEP-1 latch (set _closing
+  /// under _quiesceMutex + notify_all), WITHOUT the STEP-2/3/4 cancel-wait-clear.
+  /// This exercises the REAL production gate (CountGuard reads the same _closing)
+  /// so the task-3.4 refusal channels can be tested deterministically, without a
+  /// racy concurrent-destructor window. Safe to compose with the real
+  /// destructor: quiesce()'s STEP-1 store is idempotent when already latched.
+  static void latchClosing(JsonRpcClient &c)
+  {
+    {
+      std::lock_guard<std::mutex> lk(c._impl->_quiesceMutex);
+      c._impl->_closing.store(true, std::memory_order_release);
+    }
+    c._impl->_quiesceCv.notify_all();
+  }
 };
 } // namespace connectors
 } // namespace modules
@@ -247,6 +285,49 @@ inUseOf(const std::vector<JsonRpcClientTestAccess::PoolSnapshot> &snap, std::uin
     }
   }
   return std::nullopt;
+}
+
+/// \brief Minimal scope-exit guard (cpp17 LOW-D): runs a cleanup lambda on
+/// destruction so a threaded test that spawns a helper thread and then asserts
+/// BEFORE joining does not, on a failing REQUIRE, leave the thread joinable
+/// (~std::thread -> std::terminate) or wedged. Each guard unblocks its thread
+/// (release a gate / reset the client) and joins it; the cleanup is written to
+/// be idempotent so the normal path can also unblock+join explicitly.
+struct ScopeExit
+{
+  std::function<void()> fn;
+  ~ScopeExit()
+  {
+    if (fn)
+    {
+      fn();
+    }
+  }
+};
+
+/// \brief Shared onError probe for the phase-3 refusal/enqueue-failure cases
+/// (simpl-3): records that onError fired and whether the delivered exception was
+/// a ClientShutdownError. Both flags are atomic so the probe is safe whether
+/// onError runs in the calling thread (refusal) or on a worker (enqueue
+/// failure / discard).
+std::function<void(std::exception_ptr)> shutdownErrorProbe(std::atomic<bool> &errCalled,
+                                                           std::atomic<bool> &wasShutdown)
+{
+  return [&errCalled, &wasShutdown](std::exception_ptr e)
+  {
+    errCalled.store(true);
+    try
+    {
+      std::rethrow_exception(e);
+    }
+    catch (const iora::modules::connectors::ClientShutdownError &)
+    {
+      wasShutdown.store(true);
+    }
+    catch (...)
+    {
+    }
+  };
 }
 
 /// \brief A Config whose factory hands out a bare HttpClient and never touches
@@ -992,34 +1073,123 @@ TEST_CASE("CR-3 repro: re-entrant configurer deadlocks under _mutex (hangs)",
 }
 
 // =========================================================================
-// task-1.7 — CR-4 repro: async tasks capture `self=this` onto an externally
-// owned ThreadPool; the client has no destructor, no in-flight counter, no
-// join. A task still QUEUED when the client is destroyed later runs on freed
-// memory. Heap-allocated client (a stack object would need
-// -fsanitize-address-use-after-scope, which nothing enables — cpp17 C-1).
-// Single-worker pool so the second task is genuinely QUEUED, not given its own
-// thread. Detector is ASan heap-use-after-free. WILL_FAIL.
+// PHASE 3 — blocking quiesce (CR-4 / HD-1), SHAPE-B. These exercise the
+// task-3.1 primitive end to end: the quiesce snapshot seam (task-1.2b), gate
+// refusal on every counted channel (task-3.4), the destructor's cancel+wait
+// (task-3.5), and the typed-future (H-1) plumbing. Self-destruct detection
+// (task-3.2) cannot live here — a std::terminate would take down the shared
+// Catch2 process — so it is a standalone binary
+// (iora_test_jsonrpc_quiesce_selfdestruct.cpp). The exhaustive race matrix is
+// phase 6 (task-6.4); these prove the mechanism.
 // =========================================================================
-TEST_CASE("CR-4 repro: queued async task runs on freed client (RED under ASan)",
-          "[jsonrpc][pool][cr4]")
+
+// task-1.2b / task-3.1(a) — the quiesce snapshot observes the EMBEDDED
+// {inFlight, closing, owners} state. A fresh client is open and idle.
+TEST_CASE("phase3: quiesce snapshot reports embedded {inFlight,closing,owners}",
+          "[jsonrpc][pool][phase3]")
 {
   auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  JsonRpcClient client(svc, pool, stubFactoryConfig());
 
-  // Declared BEFORE `pool` so they outlive it: ~ThreadPool joins the worker,
-  // which may still be inside gateF.wait(), so the future/promise must still be
-  // alive when that join happens (destruction is reverse declaration order —
-  // pool is destroyed first) (L4).
+  const auto q = JsonRpcClientTestAccess::quiesceSnapshot(client);
+  REQUIRE(q.inFlight == 0);
+  REQUIRE(q.closing == false);
+  REQUIRE(q.owners.empty());
+}
+
+// task-3.5 — with zero work in flight the destructor returns promptly; it must
+// not block when _inFlight is already 0.
+TEST_CASE("phase3: destructor with zero in-flight returns promptly",
+          "[jsonrpc][pool][phase3]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    JsonRpcClient client(svc, pool, stubFactoryConfig());
+  } // ~JsonRpcClient -> quiesce()
+  REQUIRE((std::chrono::steady_clock::now() - t0) < std::chrono::seconds(2));
+}
+
+// task-3.4 / task-6.4(m) — gate refusal on EVERY counted channel once closing is
+// latched. Sync channels throw ClientShutdownError; the callback async routes to
+// onError (no throw); both future overloads set_exception; purgeIdle returns 0;
+// resetStats no-ops. After every refusal _inFlight is back to 0 — never
+// incremented, never underflowed to SIZE_MAX. Refusal runs entirely in the
+// calling thread (no worker), so this is deterministic without a server.
+TEST_CASE("phase3: every counted channel refuses after closing is latched",
+          "[jsonrpc][pool][phase3]")
+{
+  using iora::modules::connectors::ClientShutdownError;
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  JsonRpcClient client(svc, pool, stubFactoryConfig());
+  const std::string ep = "http://unit.test/rpc";
+
+  JsonRpcClientTestAccess::latchClosing(client);
+  REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(client).closing == true);
+
+  // Sync channels throw ClientShutdownError.
+  REQUIRE_THROWS_AS(client.call(ep, "ping"), ClientShutdownError);
+  REQUIRE_THROWS_AS(client.notify(ep, "ping"), ClientShutdownError);
+  {
+    std::vector<iora::modules::connectors::BatchItem> items;
+    items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
+    REQUIRE_THROWS_AS(client.callBatch(ep, items), ClientShutdownError);
+  }
+
+  // Callback async routes to onError, does not throw.
+  {
+    std::atomic<bool> errCalled{false};
+    std::atomic<bool> wasShutdown{false};
+    client.callAsync(ep, "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
+                     shutdownErrorProbe(errCalled, wasShutdown));
+    REQUIRE(errCalled.load() == true);
+    REQUIRE(wasShutdown.load() == true);
+  }
+
+  // Future overloads set_exception on the returned future.
+  {
+    std::future<iora::parsers::Json> f = client.callAsync(ep, "ping");
+    REQUIRE(f.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    REQUIRE_THROWS_AS(f.get(), ClientShutdownError);
+  }
+  {
+    std::vector<iora::modules::connectors::BatchItem> items;
+    items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
+    std::future<std::vector<iora::parsers::Json>> f = client.callBatchAsync(ep, items);
+    REQUIRE(f.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    REQUIRE_THROWS_AS(f.get(), ClientShutdownError);
+  }
+
+  // purgeIdle returns 0; resetStats no-ops — neither propagates.
+  REQUIRE(client.purgeIdle() == 0);
+  REQUIRE_NOTHROW(client.resetStats());
+
+  // Every refused channel left _inFlight untouched: 0, never SIZE_MAX.
+  REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(client).inFlight == 0);
+}
+
+// task-1.7 (CR-4 residual) / task-3.3 / task-3.5 — the destructor WAITS for a
+// queued async task (state (h)): admitted at call-time, counted, honored (it is
+// not gate-refused mid-queue), and waited for. When the worker frees, the
+// queued token runs and callCore_->acquire_ sees closing and throws
+// ClientShutdownError, delivered via onError; the destructor then returns.
+TEST_CASE("phase3 / CR-4 fixed: destructor waits for a queued async task",
+          "[jsonrpc][pool][cr4][phase3]")
+{
+  using iora::modules::connectors::ClientShutdownError;
+  auto &svc = testService();
+
   std::promise<void> gate;
   std::future<void> gateF = gate.get_future();
   std::atomic<bool> task1Started{false};
 
-  // initial==max==1 so enqueueImpl never spawns a second worker (thread_pool.hpp
-  // :691-695); the second task is queued behind the first (thread-safety M4-5).
+  // initial==max==1 so the async task is genuinely QUEUED behind the blocker.
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
-
   auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
 
-  // Task 1 occupies the single worker until we release the gate.
   pool.enqueue(
     [&task1Started, &gateF]()
     {
@@ -1031,23 +1201,436 @@ TEST_CASE("CR-4 repro: queued async task runs on freed client (RED under ASan)",
     std::this_thread::yield();
   }
 
-  // Task 2 is now QUEUED behind task 1 (worker busy). It captures self=this.
-  client->callAsync(
-    "http://unit.test/rpc", "ping", iora::parsers::Json::object(), {},
-    [](iora::parsers::Json) {}, [](std::exception_ptr) {});
+  std::atomic<bool> errCalled{false};
+  std::atomic<bool> okCalled{false};
+  std::atomic<bool> shutdownErr{false};
+  client->callAsync("http://unit.test/rpc", "ping", iora::parsers::Json::object(), {},
+                    [&](iora::parsers::Json) { okCalled.store(true); },
+                    shutdownErrorProbe(errCalled, shutdownErr));
 
-  // Destroy the client while task 2 is still queued. At HEAD ~JsonRpcClient is
-  // implicit — no join — so this returns immediately, leaving task 2 pointing
-  // at freed storage.
+  // The queued token is counted at call-time.
+  REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(*client).inFlight == 1);
+
+  // Destroy on another thread: quiesce latches closing and blocks in STEP 3
+  // waiting for _inFlight==0, which cannot complete until the worker frees.
+  std::atomic<bool> destroyed{false};
+  std::thread destroyer(
+    [&]()
+    {
+      client.reset();
+      destroyed.store(true);
+    });
+
+  // LOW-D: if a REQUIRE below throws, this guard still frees the worker (so the
+  // destroyer's quiesce can finish) and joins it — idempotent with the normal
+  // path via gateReleased.
+  std::atomic<bool> gateReleased{false};
+  auto releaseGate = [&]()
+  {
+    if (!gateReleased.exchange(true))
+    {
+      gate.set_value();
+    }
+  };
+  ScopeExit joiner{[&]()
+                   {
+                     releaseGate();
+                     if (destroyer.joinable())
+                     {
+                       destroyer.join();
+                     }
+                   }};
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  REQUIRE(destroyed.load() == false); // still blocked on the in-flight token
+
+  releaseGate(); // free the worker -> the queued token runs and drains
+  destroyer.join();
+
+  REQUIRE(destroyed.load() == true);
+  REQUIRE(errCalled.load() == true);
+  REQUIRE(okCalled.load() == false);
+  REQUIRE(shutdownErr.load() == true);
+}
+
+// task-3.5 CORE (task-6.4(s)) — the single regression test for the whole design:
+// a synchronous call wedged against a silent (parked) server is unwound by the
+// destructor's STEP-2 cancelInFlight() and STEP-3 wait, NOT by any timeout. The
+// bound (< 3 s) sits well under the fixture's 5 s handler wait, so it is
+// cancellation — not the handler bound — that frees the call.
+TEST_CASE("phase3: destructor cancels and waits for an in-flight synchronous call",
+          "[jsonrpc][pool][phase3][latched]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  const std::uint16_t serverPort = 18151;
+  LatchedHttpServer server(serverPort); // parks the handler until released
+
+  Config cfg; // real factory so the client actually connects to the fixture
+  cfg.maxRetries = 0;
+  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
+
+  std::atomic<bool> callReturned{false};
+  std::exception_ptr callErr;
+  std::thread caller(
+    [&]()
+    {
+      try
+      {
+        client->call(ep, "ping");
+      }
+      catch (...)
+      {
+        callErr = std::current_exception();
+      }
+      callReturned.store(true);
+    });
+
+  // LOW-D: on a failing REQUIRE, reset the client (cancel unwinds the parked
+  // call) and join the caller. client.reset() is idempotent on a unique_ptr, so
+  // this composes with the normal path below.
+  ScopeExit joiner{[&]()
+                   {
+                     client.reset();
+                     if (caller.joinable())
+                     {
+                       caller.join();
+                     }
+                   }};
+
+  // The request reached the server; the handler is parked and the client is
+  // blocked in receiveSync waiting for the (never-sent) response.
+  REQUIRE(server.waitForArrival(1));
+  REQUIRE(callReturned.load() == false);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  client.reset(); // ~JsonRpcClient -> quiesce: cancel unwinds the parked call
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  caller.join();
+  REQUIRE(callReturned.load() == true);
+  REQUIRE(callErr); // the in-flight call was unwound with an exception
+  REQUIRE(elapsed < std::chrono::seconds(3));
+}
+
+// task-3.1(d) / round-3 H-1 — the typed-future overloads plumb a std::promise
+// through the token: set_value on success, set_exception on failure, for both
+// callAsync(future) (Json) and callBatchAsync (vector<Json>). Its very
+// compilation is the H-1 adjudication (a void runBody cannot type-check to
+// future<Json>); this exercises both channels at runtime.
+TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
+          "[jsonrpc][pool][phase3][latched]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  const std::uint16_t serverPort = 18152;
+  LatchedHttpServer server(serverPort);
+  server.release(); // pass requests straight through
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ok = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
+
+  // set_value: callAsync(future) resolves with the JSON-RPC result ({}).
+  {
+    std::future<iora::parsers::Json> f = client.callAsync(ok, "ping");
+    REQUIRE(f.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    REQUIRE(f.get().is_object());
+  }
+
+  // set_exception: an unroutable endpoint makes callCore_ throw; the future
+  // carries the exception.
+  {
+    std::future<iora::parsers::Json> f = client.callAsync("http://127.0.0.1:1/rpc", "ping");
+    REQUIRE(f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    REQUIRE_THROWS(f.get());
+  }
+
+  // callBatchAsync (vector<Json>) — the SAME InFlightToken<vector<Json>> promise
+  // plumbing, proven via set_exception (the shared fixture returns a single
+  // object, not a batch array, so its set_value path needs a batch-speaking
+  // server — deferred to the deterministic phase-9 fixtures, task-9.1). An
+  // unroutable endpoint makes callBatchCore_ throw; the future carries it.
+  {
+    std::vector<iora::modules::connectors::BatchItem> items;
+    items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
+    std::future<std::vector<iora::parsers::Json>> f =
+      client.callBatchAsync("http://127.0.0.1:1/rpc", items);
+    REQUIRE(f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    REQUIRE_THROWS(f.get());
+  }
+}
+
+// cpp17 L-3 — the callback-overload callAsync HAPPY PATH: enqueue succeeds, the
+// worker runs the RPC and delivers a real result to onSuccess (and onError does
+// NOT fire). This is the overload that carries the TS-5 caller-side OwnerScope,
+// so a happy-path assertion guards it against future interference.
+TEST_CASE("phase3: callback callAsync delivers a result to onSuccess",
+          "[jsonrpc][pool][phase3][latched]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  const std::uint16_t serverPort = 18153;
+  LatchedHttpServer server(serverPort);
+  server.release(); // pass requests straight through
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
+
+  std::promise<void> done;
+  std::future<void> doneF = done.get_future();
+  std::atomic<bool> okCalled{false};
+  std::atomic<bool> errCalled{false};
+  bool resultIsObject = false;
+  client.callAsync(ep, "ping", iora::parsers::Json::object(), {},
+                   [&](iora::parsers::Json r)
+                   {
+                     resultIsObject = r.is_object();
+                     okCalled.store(true);
+                     done.set_value();
+                   },
+                   [&](std::exception_ptr)
+                   {
+                     errCalled.store(true);
+                     done.set_value();
+                   });
+
+  REQUIRE(doneF.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  REQUIRE(okCalled.load() == true);
+  REQUIRE(errCalled.load() == false);
+  REQUIRE(resultIsObject == true); // the JSON-RPC success "result" ({})
+}
+
+// task-3.4(b) — the ENQUEUE-FAILURE channel. With the pool's queue full,
+// _threadPool.enqueue throws inside dispatchToken_; it must be routed through
+// the SAME channel (callback onError / future set_exception) WITHOUT escaping
+// the calling thread, and _inFlight must return to 0 after each (never SIZE_MAX).
+TEST_CASE("phase3: enqueue failure routes through the token's channel, no throw to caller",
+          "[jsonrpc][pool][phase3]")
+{
+  auto &svc = testService();
+
+  // Declared BEFORE `pool` so they outlive it: ~ThreadPool joins the worker,
+  // which may still be inside gateF.wait() when the gate is released, so the
+  // promise/future must outlive that join (destruction is reverse declaration
+  // order — pool is destroyed before these) (mirrors the CR-4 test's L4 note).
+  std::promise<void> gate;
+  std::future<void> gateF = gate.get_future();
+  std::atomic<bool> blockerStarted{false};
+
+  // 1 worker + queue cap 1: occupy the worker, fill the single queue slot, then
+  // every further enqueue throws "task queue is full".
+  iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
+                              /*maxQueueSize*/ 1);
+  JsonRpcClient client(svc, pool, stubFactoryConfig());
+  const std::string ep = "http://unit.test/rpc";
+
+  pool.enqueue(
+    [&blockerStarted, &gateF]()
+    {
+      blockerStarted.store(true);
+      gateF.wait();
+    });
+  while (!blockerStarted.load())
+  {
+    std::this_thread::yield();
+  }
+  pool.enqueue([]() {}); // fills the one queue slot -> subsequent enqueues throw
+
+  // RAII: release the gate exactly once on scope exit (normal or a throwing
+  // REQUIRE) so the worker drains and the pool tears down cleanly. Reuses the
+  // file's ScopeExit helper (simpl L-2); declared after `pool` so it fires
+  // before ~ThreadPool joins the parked worker.
+  ScopeExit releaseGate{[&gate]() { gate.set_value(); }};
+
+  // Callback overload: enqueue throws -> onError fires, callAsync does not throw.
+  {
+    std::atomic<bool> errCalled{false};
+    REQUIRE_NOTHROW(client.callAsync(ep, "ping", iora::parsers::Json::object(), {},
+                                     [](iora::parsers::Json) {},
+                                     [&errCalled](std::exception_ptr) { errCalled.store(true); }));
+    REQUIRE(errCalled.load() == true);
+    REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(client).inFlight == 0);
+  }
+
+  // Future overload: enqueue throws -> the future carries the exception; no throw.
+  {
+    std::future<iora::parsers::Json> f;
+    REQUIRE_NOTHROW(f = client.callAsync(ep, "ping"));
+    REQUIRE(f.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    REQUIRE_THROWS(f.get());
+    REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(client).inFlight == 0);
+  }
+
+  // Batch future overload behaves identically.
+  {
+    std::vector<iora::modules::connectors::BatchItem> items;
+    items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
+    std::future<std::vector<iora::parsers::Json>> f;
+    REQUIRE_NOTHROW(f = client.callBatchAsync(ep, items));
+    REQUIRE(f.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    REQUIRE_THROWS(f.get());
+    REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(client).inFlight == 0);
+  }
+
+  // `releaseGate` (ScopeExit) frees the worker exactly once at scope exit.
+}
+
+// task-3.4(b) ORDERING (TS-6) — a client destroyed CONCURRENTLY with an
+// enqueue-failure delivery must observe onError as already-completed before the
+// destructor returns: the caller frame holds the counted token across the
+// synchronous onError, so STEP-3 cannot see _inFlight==0 until onError returns.
+TEST_CASE("phase3: onError completes before a concurrent destructor returns (enqueue-failure)",
+          "[jsonrpc][pool][phase3]")
+{
+  auto &svc = testService();
+
+  // Declared BEFORE `pool` so they outlive ~ThreadPool's worker join.
+  std::promise<void> gate;
+  std::future<void> gateF = gate.get_future();
+  std::atomic<bool> blockerStarted{false};
+
+  iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
+                              /*maxQueueSize*/ 1);
+  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  const std::string ep = "http://unit.test/rpc";
+
+  pool.enqueue(
+    [&blockerStarted, &gateF]()
+    {
+      blockerStarted.store(true);
+      gateF.wait();
+    });
+  while (!blockerStarted.load())
+  {
+    std::this_thread::yield();
+  }
+  pool.enqueue([]() {}); // fills the one queue slot -> the async enqueue throws
+
+  // A monotonic sequence stamps two events atomically (TS-8): onError's
+  // completion and the destructor's return. The ORDER of the two stamps — not
+  // wall-clock — decides the test, so an OS deschedule cannot false-pass a
+  // broken (non-waiting) destructor.
+  std::atomic<int> seq{0};
+  std::atomic<bool> onErrorStarted{false};
+  std::atomic<bool> onErrorDone{false};
+  std::atomic<int> onErrorSeq{0};
+
+  // Thread A: the callback-overload callAsync whose enqueue fails; its onError
+  // runs synchronously on A.
+  std::thread callerA(
+    [&]()
+    {
+      client->callAsync(ep, "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
+                        [&](std::exception_ptr)
+                        {
+                          onErrorStarted.store(true);
+                          // Small window so a broken destructor reliably returns
+                          // FIRST; correctness is decided by the seq order, not
+                          // this sleep.
+                          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                          onErrorSeq.store(++seq); // stamp: onError completed
+                          onErrorDone.store(true);
+                        });
+    });
+
+  ScopeExit joiner{[&]()
+                   {
+                     gate.set_value();
+                     if (callerA.joinable())
+                     {
+                       callerA.join();
+                     }
+                   }};
+
+  // Wait until A is inside onError (token counted, inFlight==1).
+  while (!onErrorStarted.load())
+  {
+    std::this_thread::yield();
+  }
+
+  // Destroy concurrently: quiesce STEP-3 must wait for A's onError to finish (the
+  // token decrements only when A's callAsync returns).
   client.reset();
+  const int destructorReturnSeq = ++seq; // stamp: destructor returned
 
-  // Release the gate: task 1 completes, the worker picks up task 2, which reads
-  // self->_stats.totalRequests++ on freed memory -> ASan heap-use-after-free.
-  gate.set_value();
+  // Ensure onErrorSeq is set before comparing (it is, on correct code, since the
+  // destructor waited; on broken code we still must read the stamp it will set).
+  while (!onErrorDone.load())
+  {
+    std::this_thread::yield();
+  }
 
-  // Give the worker time to run task 2 and fault before the pool tears down.
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  SUCCEED("reached end without ASan abort (non-ASan build); ASan build is the detector");
+  // onError completed BEFORE the destructor returned iff the destructor waited.
+  // A broken destructor stamps its return first -> onErrorSeq > destructorReturnSeq.
+  REQUIRE(onErrorSeq.load() != 0);
+  REQUIRE(onErrorSeq.load() < destructorReturnSeq);
+
+  // The `joiner` scope guard releases the blocker gate and joins callerA exactly once.
+}
+
+// task-3.5 / task-3.1(f) — the INTERRUPTIBLE retry backoff. A call retrying
+// against a refusing endpoint parks in _quiesceCv.wait_for(delay, closing); the
+// destructor's STEP-1 notify must cut that wait so the call unwinds far faster
+// than the (long) backoff would otherwise allow. This is the regression guard
+// for task-3.1 mutation (3) "revert the interruptible backoff to sleep_for".
+TEST_CASE("phase3: destructor interrupts a call parked in retry backoff",
+          "[jsonrpc][pool][phase3]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxRetries = 5;
+  cfg.initialRetryDelay = std::chrono::milliseconds(2000); // long, so interruption is unmistakable
+  cfg.retryBackoffMultiplier = 2.0;
+  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:1/rpc"; // connection refused -> retry loop
+
+  std::atomic<bool> callReturned{false};
+  std::exception_ptr callErr;
+  std::thread caller(
+    [&]()
+    {
+      try
+      {
+        client->call(ep, "ping");
+      }
+      catch (...)
+      {
+        callErr = std::current_exception();
+      }
+      callReturned.store(true);
+    });
+
+  // LOW-D: reset (cut the backoff) and join on a failing REQUIRE too; idempotent
+  // with the normal path.
+  ScopeExit joiner{[&]()
+                   {
+                     client.reset();
+                     if (caller.joinable())
+                     {
+                       caller.join();
+                     }
+                   }};
+
+  // Let attempt 1 fail (refused, fast) so the call is parked in the 2000 ms backoff.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(callReturned.load() == false);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  client.reset(); // STEP-1 notify must cut the backoff
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  caller.join();
+  REQUIRE(callReturned.load() == true);
+  REQUIRE(callErr); // the parked call was unwound with an exception
+  // Un-interrupted, the destructor would wait ~1700 ms for the first backoff to
+  // time out; < 1 s proves STEP-1's notify cut the wait.
+  REQUIRE(elapsed < std::chrono::seconds(1));
 }
 
 int main(int argc, char *argv[])

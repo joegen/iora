@@ -52,11 +52,12 @@ endif()
 # repros stay deliberately RED and are registered separately below
 # (task-1.1(i): TEST name == TARGET name).
 add_test(NAME iora_test_jsonrpc_client_pool
-    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4]")
-# RESOURCE_LOCK serializes the fixture's fixed-port (18150) bind against any
-# other test that might claim it, independent of the -j1 convention (M2).
+    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3]")
+# RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152 the
+# phase-3 latched cases) against any other test that might claim them,
+# independent of the -j1 convention (M2).
 set_tests_properties(iora_test_jsonrpc_client_pool PROPERTIES
-    TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+    TIMEOUT 90 RESOURCE_LOCK jsonrpc_pool_ports)
 
 # --- Per-repro registrations (task-1.1(h)) -------------------------------
 # Each runs the same binary filtered to one repro's Catch2 tag. The four differ
@@ -107,6 +108,47 @@ set_tests_properties(jsonrpc_client_pool_cr3_deadlock PROPERTIES
 add_test(NAME jsonrpc_client_pool_cr2_freed_pool
     COMMAND iora_test_jsonrpc_client_pool "[cr2]")
 set_tests_properties(jsonrpc_client_pool_cr2_freed_pool PROPERTIES DISABLED TRUE)
-add_test(NAME jsonrpc_client_pool_cr4_freed_client
+# CR-4 (task-1.7): the residual — synchronous + queued in-flight accounting — is
+# now CLOSED by PHASE 3's blocking quiesce. The repro was rewritten into the
+# phase-3 "destructor waits for a queued async task" case (tagged [cr4][phase3])
+# and is GREEN; it runs as part of the default [phase3] registration above. This
+# standalone [cr4] registration re-runs just that case as a focused guard.
+add_test(NAME jsonrpc_client_pool_cr4_quiesce_waits
     COMMAND iora_test_jsonrpc_client_pool "[cr4]")
-set_tests_properties(jsonrpc_client_pool_cr4_freed_client PROPERTIES DISABLED TRUE)
+set_tests_properties(jsonrpc_client_pool_cr4_quiesce_waits PROPERTIES
+    TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+
+# ---------------------------------------------------------------------------
+# task-3.2 — self-destruct detection. Destroying the client from inside its own
+# callback must be detected (this_thread in _owners) and terminate, not hang or
+# UAF. A std::terminate cannot run inside the shared Catch2 pool binary, so this
+# is a standalone executable whose set_terminate handler _Exit(0)s on correct
+# detection (exit 0 == PASS; reaching the end without terminating == exit 1).
+# ---------------------------------------------------------------------------
+create_iora_test_target(iora_test_jsonrpc_quiesce_selfdestruct
+    SOURCES iora_test_jsonrpc_quiesce_selfdestruct.cpp)
+target_include_directories(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+if(IORA_ENABLE_TSAN)
+    target_compile_options(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE -fsanitize=thread)
+elseif(IORA_ENABLE_ASAN)
+    target_compile_options(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE
+        -fsanitize=address -fno-omit-frame-pointer -g -O1 -Wno-maybe-uninitialized)
+    target_link_options(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE -fsanitize=address)
+endif()
+# Positive: destroy the OWN client from its callback -> terminate expected (exit 0).
+add_test(NAME jsonrpc_quiesce_selfdestruct
+    COMMAND iora_test_jsonrpc_quiesce_selfdestruct)
+set_tests_properties(jsonrpc_quiesce_selfdestruct PROPERTIES TIMEOUT 60)
+# Negative (task-3.2 per-Impl isolation, TS-3): destroy a DIFFERENT idle client
+# sharing the ThreadPool from inside the first's callback -> must NOT terminate
+# (exit 0 by clean completion; a terminate exits 3).
+add_test(NAME jsonrpc_quiesce_otherclient_no_terminate
+    COMMAND iora_test_jsonrpc_quiesce_selfdestruct otherclient)
+set_tests_properties(jsonrpc_quiesce_otherclient_no_terminate PROPERTIES TIMEOUT 60)
+# Positive (task-3.2 / TS-5): self-destruct on the SYNCHRONOUS enqueue-failure
+# delivery path must terminate (exit 0), not deadlock.
+add_test(NAME jsonrpc_quiesce_enqfail_selfdestruct
+    COMMAND iora_test_jsonrpc_quiesce_selfdestruct enqfail)
+set_tests_properties(jsonrpc_quiesce_enqfail_selfdestruct PROPERTIES TIMEOUT 60)
