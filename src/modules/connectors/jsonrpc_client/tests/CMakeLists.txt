@@ -52,12 +52,20 @@ endif()
 # repros stay deliberately RED and are registered separately below
 # (task-1.1(i): TEST name == TARGET name).
 add_test(NAME iora_test_jsonrpc_client_pool
-    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5]")
-# RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152 the
-# phase-3 latched cases) against any other test that might claim them,
+    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6]")
+# RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152/18153
+# the phase-3 latched cases; 18154 the phase-5 CR-2 case; 18155/18156 the phase-6
+# task-6.4b(h)/(z) cases) against any other test that might claim them,
 # independent of the -j1 convention (M2).
+#
+# TIMEOUT raised 90 -> 180 when [phase6] was added: the phase-6 block's bounded
+# waits, IN THE FAILURE DIRECTION, sum past 90 s on their own (case (g) allows
+# 30 s, (j) 10 s twice, (x) 9 s, plus a dozen 5 s latch bounds and two 5 s
+# LatchedHttpServer handler bounds). A budget overrun presents to ctest as a
+# TIMEOUT, which is indistinguishable from the real deadlock signal this suite
+# exists to produce — so the budget must exceed the worst legitimate failure.
 set_tests_properties(iora_test_jsonrpc_client_pool PROPERTIES
-    TIMEOUT 90 RESOURCE_LOCK jsonrpc_pool_ports)
+    TIMEOUT 180 RESOURCE_LOCK jsonrpc_pool_ports)
 
 # --- Per-repro registrations (task-1.1(h)) -------------------------------
 # Each runs the same binary filtered to one repro's Catch2 tag. The four differ
@@ -73,14 +81,18 @@ add_test(NAME jsonrpc_client_pool_cr1_identity
 set_tests_properties(jsonrpc_client_pool_cr1_identity PROPERTIES
     TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
 
-# CR-3 (task-1.6): a re-entrant configurer DEADLOCKS the client. A DISABLED test
-# is never executed, so it can never itself expire ctest's TIMEOUT (task-1.1(h),
-# corrected for this repro in task-1.6): its pre-fix evidence is captured out of
-# band via `timeout 60 ./iora_test_jsonrpc_client_pool "<cr3 case>"` (exit 124).
+# CR-3 (task-1.6): a re-entrant configurer DEADLOCKED the client. It was
+# registered DISABLED while the defect lived, because a hang cannot be asserted
+# from inside the process it wedges — its pre-fix evidence was captured out of
+# band via `timeout 60 ./iora_test_jsonrpc_client_pool "[cr3]"` (exit 124).
+# PHASE 6 (task-6.1b/6.2) FIXED IT: the factory/configurer now run outside
+# _mutex and the std::async wrapper is gone, so the [cr3] case is GREEN and this
+# registration is ENABLED. The TIMEOUT is the bounded wait that fails if the
+# deadlock ever returns.
 add_test(NAME jsonrpc_client_pool_cr3_deadlock
     COMMAND iora_test_jsonrpc_client_pool "[cr3]")
 set_tests_properties(jsonrpc_client_pool_cr3_deadlock PROPERTIES
-    TIMEOUT 60 DISABLED TRUE)
+    TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
 
 # CR-2 (task-1.5) and CR-4 (task-1.7): originally heap-use-after-free repros,
 # deterministic ONLY under AddressSanitizer, registered WILL_FAIL so the ASan
@@ -140,18 +152,45 @@ elseif(IORA_ENABLE_ASAN)
         -fsanitize=address -fno-omit-frame-pointer -g -O1 -Wno-maybe-uninitialized)
     target_link_options(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE -fsanitize=address)
 endif()
+# WHY EVERY SCENARIO CARRIES A PASS_REGULAR_EXPRESSION (cpp17 L-6): the shared
+# set_terminate handler _Exit(0)s on ANY terminate, so the exit code alone cannot
+# tell "the self-destruct detector fired" from "something else terminated the
+# process". Each positive scenario stamps a STAGE around the reset that must
+# terminate and the handler echoes it, so matching the stage is what makes exit 0
+# mean the right thing. FAIL_REGULAR_EXPRESSION on "FAILURE" is the paired
+# backstop — it takes precedence over the pass regex, so a diagnostic that the
+# scenario itself prints on a wrong outcome can never be matched past.
+# NOTE: these scenarios do NOT fail by returning non-zero on a regression. The
+# configurer and enqfail scenarios deadlock in quiesce STEP 3 inside their own
+# frame and hang to the TIMEOUT below; only `selfdestruct` (where the destroying
+# thread is a worker and main stays free) can reach its `return 1`.
+#
 # Positive: destroy the OWN client from its callback -> terminate expected (exit 0).
 add_test(NAME jsonrpc_quiesce_selfdestruct
     COMMAND iora_test_jsonrpc_quiesce_selfdestruct)
-set_tests_properties(jsonrpc_quiesce_selfdestruct PROPERTIES TIMEOUT 60)
+set_tests_properties(jsonrpc_quiesce_selfdestruct PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "self-destruct detected\\) stage=own-callback"
+    FAIL_REGULAR_EXPRESSION "FAILURE")
 # Negative (task-3.2 per-Impl isolation, TS-3): destroy a DIFFERENT idle client
 # sharing the ThreadPool from inside the first's callback -> must NOT terminate
 # (exit 0 by clean completion; a terminate exits 3).
 add_test(NAME jsonrpc_quiesce_otherclient_no_terminate
     COMMAND iora_test_jsonrpc_quiesce_selfdestruct otherclient)
-set_tests_properties(jsonrpc_quiesce_otherclient_no_terminate PROPERTIES TIMEOUT 60)
+set_tests_properties(jsonrpc_quiesce_otherclient_no_terminate PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "per-Impl isolation holds"
+    FAIL_REGULAR_EXPRESSION "FAILURE")
 # Positive (task-3.2 / TS-5): self-destruct on the SYNCHRONOUS enqueue-failure
 # delivery path must terminate (exit 0), not deadlock.
 add_test(NAME jsonrpc_quiesce_enqfail_selfdestruct
     COMMAND iora_test_jsonrpc_quiesce_selfdestruct enqfail)
-set_tests_properties(jsonrpc_quiesce_enqfail_selfdestruct PROPERTIES TIMEOUT 60)
+set_tests_properties(jsonrpc_quiesce_enqfail_selfdestruct PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "self-destruct detected\\) stage=enqueue-failure-delivery"
+    FAIL_REGULAR_EXPRESSION "FAILURE")
+# Positive (PHASE 6, task-6.4b(y)): self-destruct from the httpClientConfigurer,
+# which now runs on the CALLING thread inside acquire_'s unlocked construction
+# window. Must terminate (exit 0), not deadlock in STEP 3.
+add_test(NAME jsonrpc_quiesce_configurer_selfdestruct
+    COMMAND iora_test_jsonrpc_quiesce_selfdestruct configurer)
+set_tests_properties(jsonrpc_quiesce_configurer_selfdestruct PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "self-destruct detected\\) stage=configurer-window"
+    FAIL_REGULAR_EXPRESSION "FAILURE")

@@ -24,6 +24,9 @@
 //   * "selfdestruct" (default): destroy the OWN client from its callback ->
 //     terminate EXPECTED. set_terminate handler _Exit(0) = PASS; reaching the
 //     end without terminating (detection regressed) -> return 1.
+//   * "configurer" (PHASE 6, task-6.4b(y)): destroy the client from inside the
+//     httpClientConfigurer, which since phase 6 runs on the CALLING thread in
+//     acquire_'s unlocked construction window -> terminate EXPECTED.
 //   * "otherclient": destroy a DIFFERENT idle client (sharing the ThreadPool)
 //     from the first client's callback -> terminate FORBIDDEN. Reaching the end
 //     cleanly -> return 0 = PASS; a terminate -> handler _Exit(3) = FAIL.
@@ -55,6 +58,24 @@ namespace
 // selfdestruct -> true (terminate == success, _Exit(0)); otherclient -> false
 // (terminate == failure, _Exit(3)).
 std::atomic<bool> g_expectTerminate{true};
+
+// WHERE the scenario was when a terminate fired (cpp17 L-6). Without this the
+// handler _Exit(0)s on ANY terminate — an uncaught exception, a throwing
+// destructor, a terminate from a completely different subsystem — so a scenario
+// could "pass" for a reason unrelated to what it tests. Each scenario sets this
+// immediately before the reset that must terminate and clears it immediately
+// after, and the handler echoes it; the ctest registrations then match on the
+// specific stage via PASS_REGULAR_EXPRESSION, so a terminate from anywhere else
+// carries the wrong stage and the test fails.
+std::atomic<const char *> g_stage{"none"};
+
+/// \brief Sets the stage for the duration of a scope, restoring "none" on exit
+/// (only reached when the expected terminate did NOT fire).
+struct StageScope
+{
+  explicit StageScope(const char *s) { g_stage.store(s); }
+  ~StageScope() { g_stage.store("none"); }
+};
 
 iora::IoraService &testService()
 {
@@ -99,6 +120,7 @@ int runSelfDestruct(iora::IoraService &svc)
       {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
+      StageScope stage("own-callback");
       client.reset(); // destroy the client from inside its own callback
     });
 
@@ -152,13 +174,74 @@ int runEnqueueFailSelfDestruct(iora::IoraService &svc)
   // terminate.
   raw->callAsync("http://unit.test/rpc", "ping", iora::parsers::Json::object(), {},
                  [](iora::parsers::Json) {},
-                 [c = std::move(client)](std::exception_ptr) mutable { c.reset(); });
+                 [c = std::move(client)](std::exception_ptr) mutable
+                 {
+                   StageScope stage("enqueue-failure-delivery");
+                   c.reset();
+                 });
 
   // Only reached if detection regressed (no terminate). Release the blocker so
   // ~ThreadPool does not hang, then report failure.
   std::cerr << "[enqfail] FAILURE: reached end without terminating "
                "(synchronous-delivery self-destruct not detected — TS-5 regressed)\n";
   blockerGate.set_value();
+  return 1;
+}
+
+// Positive (PHASE 6, task-6.4b case (y)) — a NEW self-destruct vector the CR-3
+// fix creates, distinct from the onSuccess/onError site above. Since phase 6 the
+// user httpClientConfigurer runs on the CALLING thread inside acquire_'s
+// unlocked construction window, and call() has already registered that thread in
+// _owners (its OwnerScope spans acquire_). So a configurer that drops the last
+// reference to the client destroys it from INSIDE its own counted work: quiesce
+// STEP-1 must detect this_thread in _owners and terminate, rather than STEP-3
+// deadlocking on an _inFlight count only this thread can release.
+//
+// NAMED MUTATION: remove the calling-thread OwnerScope from call() -> the
+// configurer's self-destruct goes undetected by STEP 1 and STEP 3 deadlocks (the
+// destroying thread waits on its own still-counted call), so this scenario hangs
+// to its ctest TIMEOUT instead of exiting 0.
+//
+// HOW THIS SCENARIO ACTUALLY FAILS (cpp17 L-6). Unlike `selfdestruct` — where
+// the destroying thread is a worker and MAIN is still free to sleep and return 1
+// — the destruction here happens INSIDE this frame's own call(). So a regression
+// does NOT reach the `return 1` below: STEP 3 deadlocks in the configurer and the
+// scenario hangs to the ctest TIMEOUT. The trailing return/diagnostic is
+// therefore unreachable-on-regression and is kept only as a backstop for a
+// hypothetical failure mode that skips the destruction entirely.
+// That makes the exit code alone uninformative in the OTHER direction too: any
+// terminate at all would exit 0. The ctest registration adds
+// PASS_REGULAR_EXPRESSION on `stage=configurer-window`, so exiting 0 counts as a
+// pass only when the terminate fired during the reset inside the window.
+int runConfigurerSelfDestruct(iora::IoraService &svc)
+{
+  iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
+
+  // The SOLE facade reference. The configurer drops it while the construction
+  // window is open, so ~JsonRpcClient runs on this thread, nested inside call().
+  std::shared_ptr<JsonRpcClient> holder;
+  Config cfg = stubConfig();
+  cfg.httpClientConfigurer = [&holder](const std::string &, iora::network::HttpClient &)
+  {
+    StageScope stage("configurer-window");
+    holder.reset();
+  };
+
+  holder = std::make_shared<JsonRpcClient>(svc, pool, cfg);
+  JsonRpcClient *raw = holder.get();
+  try
+  {
+    // Counted + owner-registered. acquire_ reserves, unlocks, and runs the
+    // configurer above — which destroys the client from inside this frame.
+    (void)raw->call("http://127.0.0.1:1/rpc", "ping");
+  }
+  catch (const std::exception &)
+  {
+    // Only reachable if the destruction did not terminate as it must.
+  }
+
+  std::cerr << "[configurer] FAILURE: reached end without terminating (a configurer "
+               "self-destruct inside the construction window went undetected)\n";
   return 1;
 }
 
@@ -218,8 +301,9 @@ int main(int argc, char **argv)
       if (g_expectTerminate.load())
       {
         std::cerr << "[quiesce-selfdestruct] std::terminate reached as expected "
-                     "(self-destruct detected)\n";
-        std::_Exit(0); // PASS: terminate was the expected outcome
+                     "(self-destruct detected) stage="
+                  << g_stage.load() << "\n";
+        std::_Exit(0); // PASS: terminate was the expected outcome AT THIS STAGE
       }
       std::cerr << "[quiesce-selfdestruct] FAILURE: std::terminate fired when it must NOT "
                    "(per-Impl _owners isolation regressed)\n";
@@ -237,6 +321,10 @@ int main(int argc, char **argv)
     if (scenario == "enqfail")
     {
       return runEnqueueFailSelfDestruct(svc);
+    }
+    if (scenario == "configurer")
+    {
+      return runConfigurerSelfDestruct(svc);
     }
     return runSelfDestruct(svc);
   }

@@ -11,15 +11,14 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
-// Retained deliberately: the next phase (blocking quiesce) re-introduces a
-// condition variable on this class. Kept across phase 4 to avoid churning the
-// include set of a public module header between adjacent phases.
+// Used by the blocking quiesce: _quiesceCv, and the interruptible retry
+// backoff in sendJsonWithRetries_ that waits on it.
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <future>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -162,17 +161,39 @@ struct Config
 
   /// \brief Optional factory for creating HttpClient instances (injectable
   /// for tests).
+  /// \details RE-ENTRANCY CONTRACT (phase 6): since the CR-3 fix this runs on
+  /// the CALLING thread with NO client lock held, so it MAY call back into the
+  /// client — that is the point of the fix. Two caveats it is now the caller's
+  /// job to respect:
+  ///   * A re-entrant acquire for the SAME endpoint sees the in-flight
+  ///     reservation in the per-endpoint cap, so on a cap-1 endpoint it throws
+  ///     PoolExhaustedError. That is correct behaviour, not a defect.
+  ///   * A factory that unconditionally re-enters and creates ANOTHER
+  ///     connection recurses. Before phase 6 that self-deadlocked on the mutex;
+  ///     now it recurses until a cap refuses it, or overflows the stack if no
+  ///     cap bounds it. Bound your own re-entrancy.
+  /// Destroying the client from inside this callback is detected as a
+  /// self-destruct and calls std::terminate (task-3.2).
   std::function<std::unique_ptr<iora::network::HttpClient>(const std::string &endpoint)>
     httpClientFactory{};
 
   /// \brief Optional hook to configure a freshly created HttpClient (e.g.,
   /// TLS). \details Called after httpClientFactory() returns and before
-  /// first use.
+  /// first use. The same phase-6 re-entrancy contract as httpClientFactory
+  /// above applies verbatim.
   std::function<void(const std::string &endpoint, iora::network::HttpClient &client)>
     httpClientConfigurer{};
 };
 
 /// \brief JSON-RPC client statistics.
+/// \details EVERY access uses std::memory_order_relaxed (simpl LOW-4 / iteration 2), matching
+/// _nextId and the iora Counter/Gauge idiom. These are eventually-consistent
+/// aggregates: no reader treats them as synchronization variables, and
+/// getStats() already documents that it must not race destruction. Leaving them
+/// at the default seq_cst bought a full barrier per counter bump on every
+/// request path while guaranteeing an ordering nothing consumes — and it could
+/// not have guaranteed a coherent multi-field snapshot anyway, since getStats()
+/// reads the ten fields without a lock.
 struct ClientStats
 {
   std::atomic<std::uint64_t> totalRequests{0};
@@ -189,16 +210,16 @@ struct ClientStats
   /// \brief Reset all counters.
   void reset()
   {
-    totalRequests = 0;
-    successfulRequests = 0;
-    failedRequests = 0;
-    timeoutRequests = 0;
-    retriedRequests = 0;
-    batchRequests = 0;
-    notificationRequests = 0;
-    poolExhaustions = 0;
-    connectionsCreated = 0;
-    connectionsEvicted = 0;
+    totalRequests.store(0, std::memory_order_relaxed);
+    successfulRequests.store(0, std::memory_order_relaxed);
+    failedRequests.store(0, std::memory_order_relaxed);
+    timeoutRequests.store(0, std::memory_order_relaxed);
+    retriedRequests.store(0, std::memory_order_relaxed);
+    batchRequests.store(0, std::memory_order_relaxed);
+    notificationRequests.store(0, std::memory_order_relaxed);
+    poolExhaustions.store(0, std::memory_order_relaxed);
+    connectionsCreated.store(0, std::memory_order_relaxed);
+    connectionsEvicted.store(0, std::memory_order_relaxed);
   }
 };
 
@@ -289,7 +310,7 @@ public:
   /// destruction analogue of copy-then-invoke).
   /// \param evictedCount OUT: the number of idle-expired connections erased here
   /// (H-2/task-5.2). The caller applies `_totalConnections -= evictedCount` and
-  /// `_stats.connectionsEvicted += evictedCount` unconditionally — a dedicated
+  /// `_stats.connectionsEvicted.fetch_add(evictedCount` unconditionally — a dedicated
   /// out-parameter, NOT the return value (which carries the reused connection),
   /// and NOT derived from `evicted` (a shared bin the caller also fills from
   /// tryEvictOneIdleConnLruLocked_, which would double-subtract — H-4). This
@@ -323,19 +344,80 @@ public:
     return nullptr;
   }
 
-  std::shared_ptr<PooledConnection> createAndAcquire(
-    const std::function<std::unique_ptr<iora::network::HttpClient>(const std::string &)> &factory,
-    ClientStats *stats = nullptr)
+  /// \brief Number of creations RESERVED on this pool but not yet published —
+  /// i.e. currently inside phase-6's unlocked construction window (task-6.1a).
+  /// \details A PLAIN member, never an atomic: like _connections it is read and
+  /// written ONLY under JsonRpcClientImpl::_mutex, consistent with the file's
+  /// single-mutex model. It participates in BOTH capacity predicates and in
+  /// recalcTotalLocked_, and it PINS the pool: a pool with pendingCreates() > 0
+  /// is never erased from _pools (architecture designPrinciple #8, invariant I2
+  /// — see retireIfEmptyAndUnpinnedLocked_ and the eviction candidacy filter).
+  std::size_t pendingCreates() const { return _pendingCreates; }
+
+  /// \brief Reserve capacity for ONE creation about to run outside the lock.
+  /// \details Called under _mutex immediately BEFORE the caller releases it
+  /// (task-6.1b). Two things are reserved at once:
+  ///   * the ACCOUNTING slot — ++_pendingCreates, so a concurrent acquire_ on
+  ///     this endpoint counts this in-flight creation in its cap checks and
+  ///     cannot overshoot maxConnectionsPerEndpoint by racing our unlock;
+  ///   * the STORAGE — _connections.reserve(size() + pendingCreates), which is
+  ///     HUMAN DECISION 2026-08-01 "REMEDY B". Reserving here makes the later
+  ///     publishCreate() push_back NOTHROW (it cannot reallocate), so on the
+  ///     publish path ~PooledConnection/~HttpClient — which joins I/O threads —
+  ///     can never run under _mutex during unwinding (T6-2) and no publish-time
+  ///     throw can strand a size()==0 pool (designPrinciple #7).
+  /// Strongly exception-safe WITHOUT a catch block, by ordering: the capacity
+  /// reserve is the only step that can throw, so it runs FIRST. If it does, the
+  /// counter has not moved and the pool is byte-for-byte as it was. The caller
+  /// still retires a pool this leaves empty-and-unpinned (task-6.1b(e)).
+  void reserveCreate()
   {
-    auto pc = std::make_shared<PooledConnection>(factory(_endpoint));
+    // size + (pendingCreates after this call) — i.e. room for every reservation
+    // currently outstanding plus the one being taken now.
+    _connections.reserve(_connections.size() + _pendingCreates + 1);
+    ++_pendingCreates;
+  }
+
+  /// \brief Publish a connection built OUTSIDE the lock, consuming its
+  /// reservation (task-6.1b(f)(i)). Replaces the pre-phase-6 createAndAcquire,
+  /// which ran the user factory UNDER _mutex — the CR-3 shape itself.
+  /// \details NOTHROW by construction: reserveCreate() already sized
+  /// _connections, so this push_back cannot reallocate, and copying a
+  /// shared_ptr is noexcept. The capacity assert below is that claim made
+  /// checkable rather than merely asserted in prose — if a future change ever
+  /// breaks the REMEDY-B invariant, push_back would throw HERE, before the
+  /// decrement, leaving the pool pinned forever with no counter disagreement
+  /// for the tripwire to catch (silent under NDEBUG). connectionsCreated is
+  /// counted HERE, at PUBLISH, not at reservation — task-6.3 asserts a
+  /// rolled-back creation leaves it unchanged. Must hold JsonRpcClientImpl::_mutex.
+  void publishCreate(const std::shared_ptr<PooledConnection> &pc, ClientStats &stats)
+  {
+    assert(_pendingCreates > 0); // publishing without a reservation would underflow
+    assert(_connections.size() < _connections.capacity()); // REMEDY B: push_back is nothrow
     pc->markInUse();
     _connections.push_back(pc);
+    --_pendingCreates;
     touch();
-    if (stats)
-    {
-      stats->connectionsCreated++;
-    }
-    return pc;
+    stats.connectionsCreated.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  /// \brief Release a reservation whose creation failed or was abandoned
+  /// (task-6.1c). A counter decrement — never element removal — which is
+  /// precisely why the pendingCreates route was chosen over a placeholder
+  /// element: there is no half-constructed object for a concurrent purgeIdle or
+  /// eviction to observe. The reserved _connections capacity is deliberately
+  /// NOT given back: capacity is monotone, so a later reserveCreate() on this
+  /// pool simply finds it already sufficient. Must hold _mutex.
+  /// \details The assert is load-bearing, not decoration: _pendingCreates is
+  /// unsigned, so ONE unmatched decrement wraps it to SIZE_MAX, and a pool with
+  /// pendingCreates() != 0 is excluded at every pin site FOREVER — never
+  /// retired, never an eviction candidate, permanently occupying a
+  /// maxEndpointPools slot, with recalcTotalLocked_ overflowing on top. Silent
+  /// under NDEBUG until the pool refuses every later endpoint.
+  void rollbackCreate()
+  {
+    assert(_pendingCreates > 0);
+    --_pendingCreates;
   }
 
   /// \brief Mark a leased connection free again. Handle-based (CR-1c): the lease
@@ -474,6 +556,10 @@ private:
   // drops the pool's reference; a lease that outlives the erase keeps the
   // connection alive, and markFree() on a detached connection stays well-defined.
   std::vector<std::shared_ptr<PooledConnection>> _connections;
+  // task-6.1a: creations reserved but not yet published. Plain, not atomic —
+  // see pendingCreates() above. Zero except inside acquire_'s unlocked
+  // construction window.
+  std::size_t _pendingCreates{0};
   std::chrono::steady_clock::time_point _lastTouched;
 };
 
@@ -887,16 +973,16 @@ public:
   ClientStatsSnapshot getStats() const
   {
     ClientStatsSnapshot s;
-    s.totalRequests = _stats.totalRequests.load();
-    s.successfulRequests = _stats.successfulRequests.load();
-    s.failedRequests = _stats.failedRequests.load();
-    s.timeoutRequests = _stats.timeoutRequests.load();
-    s.retriedRequests = _stats.retriedRequests.load();
-    s.batchRequests = _stats.batchRequests.load();
-    s.notificationRequests = _stats.notificationRequests.load();
-    s.poolExhaustions = _stats.poolExhaustions.load();
-    s.connectionsCreated = _stats.connectionsCreated.load();
-    s.connectionsEvicted = _stats.connectionsEvicted.load();
+    s.totalRequests = _stats.totalRequests.load(std::memory_order_relaxed);
+    s.successfulRequests = _stats.successfulRequests.load(std::memory_order_relaxed);
+    s.failedRequests = _stats.failedRequests.load(std::memory_order_relaxed);
+    s.timeoutRequests = _stats.timeoutRequests.load(std::memory_order_relaxed);
+    s.retriedRequests = _stats.retriedRequests.load(std::memory_order_relaxed);
+    s.batchRequests = _stats.batchRequests.load(std::memory_order_relaxed);
+    s.notificationRequests = _stats.notificationRequests.load(std::memory_order_relaxed);
+    s.poolExhaustions = _stats.poolExhaustions.load(std::memory_order_relaxed);
+    s.connectionsCreated = _stats.connectionsCreated.load(std::memory_order_relaxed);
+    s.connectionsEvicted = _stats.connectionsEvicted.load(std::memory_order_relaxed);
     return s;
   }
 
@@ -929,18 +1015,21 @@ public:
   /// discarded (broken_promise). The count is monotone non-increasing after the
   /// latch.
   ///
-  /// (i) HONEST RESIDUAL — a call inside makeHttpClient_ (running the user
-  /// httpClientFactory/httpClientConfigurer under the pool _mutex, inside its
-  /// std::async(...).wait_for(30s)) is bounded by that 30 s async wait, and while
-  /// it holds _mutex it also DELAYS STEP 2 (which needs _mutex) by up to the
-  /// same. So STEP 2's start, and hence the whole quiesce, is bounded by
-  /// max(cancellation, an in-progress connection creation) — cancellation cannot
-  /// interrupt a factory/configurer already running under the lock. With the
-  /// default factory this is instant; the general bound is removed in PHASE 6
-  /// (CR-3: task-6.1b builds the client OUTSIDE the lock, task-6.2 deletes the
-  /// std::async wrapper). Enumerated here so the "no deadline" claim stays true:
-  /// the deadline is the pre-existing per-connection-creation bound, tracked for
-  /// removal, not a knob this design adds.
+  /// (i) HONEST RESIDUAL (rewritten for PHASE 6 — task-6.2) — a call parked in
+  /// the USER httpClientFactory/httpClientConfigurer. Phase 6 runs those on the
+  /// calling thread with _mutex RELEASED and with no std::async/wait_for around
+  /// them (both deleted), which removes the two bounds this note used to
+  /// describe: the callbacks no longer delay STEP 2 (it needs _mutex, which they
+  /// no longer hold) and there is no 30 s wait to expire. What remains is
+  /// state (x) in the enumeration above, and it is genuinely unbounded: the call
+  /// is counted, so STEP 3 waits for it, and STEP 2's cancelInFlight() cannot
+  /// interrupt it — the callback is user code, not HTTP I/O on a pooled client,
+  /// and the connection under construction is not yet in any pool for the sweep
+  /// to reach. So the quiesce is bounded by max(cancellation, the user callback
+  /// returning). With the default factory that is instant. This is a property of
+  /// user code the design cannot cancel, not a deadline this design adds; the
+  /// post-relock _closing recheck (task-6.1b(d)) ensures the callback's RESULT
+  /// is discarded rather than published once it does return.
   void quiesce()
   {
     // STEP 1 — LATCH (_quiesceMutex). Self-destruct from inside our own work is
@@ -952,8 +1041,12 @@ public:
       std::unique_lock<std::mutex> lk(_quiesceMutex);
       if (std::find(_owners.begin(), _owners.end(), std::this_thread::get_id()) != _owners.end())
       {
-        std::cerr << "fatal: JsonRpcClient destroyed from inside its own callback "
-                     "(self-deadlock); calling std::terminate()\n";
+        // std::fputs, not std::cerr: <iostream> would drag the static
+        // std::ios_base::Init object into every TU that includes this public
+        // header, for one diagnostic on the fatal path (simpl LOW-6 / iteration 2).
+        std::fputs("fatal: JsonRpcClient destroyed from inside its own callback "
+                   "(self-deadlock); calling std::terminate()\n",
+                   stderr);
         std::terminate();
       }
       _closing.store(true, std::memory_order_release);
@@ -983,11 +1076,33 @@ public:
     std::vector<std::shared_ptr<detail::EndpointPool>> evicted;
     {
       std::lock_guard<std::mutex> lk(_mutex);
+      // THE SIXTH POOL-ERASE SITE, and the ONE that does not honour the
+      // designPrinciple-#8 pin: this clears EVERY pool, pinned or not. Its
+      // safety rests on a different argument from the other five — STEP 3 above
+      // guarantees _inFlight == 0, and every production caller that can reach
+      // acquire_ holds a CountGuard spanning it (call/notify/callBatch, and the
+      // async InFlightToken's _guard), so no thread can still be inside phase
+      // 6's unlocked construction window by the time we get here. That argument
+      // is cross-subsystem and invisible from this line, so it is asserted
+      // rather than assumed: a surviving reservation here means some caller
+      // reached acquire_ WITHOUT being counted, and the parked thread is about
+      // to re-lock a _mutex we are about to destroy.
+      assert(std::all_of(_pools.begin(), _pools.end(),
+                         [](const PoolMap::value_type &kv)
+                         { return kv.second->pendingCreates() == 0; }) &&
+             "quiesce STEP 4 with a creation still in flight — an uncounted acquire_ caller exists");
       for (auto &kv : _pools)
       {
         evicted.push_back(std::move(kv.second));
       }
       _pools.clear();
+      // Keep the task-5.2 invariant true at this _mutex-quiescent point. Without
+      // it _totalConnections stays at its pre-clear value forever while
+      // recalcTotalLocked_() is 0, and because acquire_'s ENTRY tripwire runs
+      // BEFORE its _closing check, any later acquire_ on a surviving Impl (a
+      // worker can hold the last shared_ptr) would abort on the tripwire instead
+      // of throwing ClientShutdownError.
+      _totalConnections = 0;
     }
   }
 
@@ -1002,7 +1117,7 @@ private:
                                 const iora::parsers::Json &params,
                                 const std::vector<std::pair<std::string, std::string>> &headers)
   {
-    _stats.totalRequests++;
+    _stats.totalRequests.fetch_add(1, std::memory_order_relaxed);
 
     try
     {
@@ -1010,18 +1125,18 @@ private:
       iora::parsers::Json req = makeRequestEnvelope_(method, params, nextId_());
       iora::parsers::Json resp =
         sendJsonWithRetries_(lease.client(), endpoint, req, mergeHeaders_(headers));
-      _stats.successfulRequests++;
+      _stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
       return parseResponseOrThrow_(std::move(resp));
     }
     catch (const PoolExhaustedError &)
     {
-      _stats.poolExhaustions++;
-      _stats.failedRequests++;
+      _stats.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
+      _stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
       throw;
     }
     catch (...)
     {
-      _stats.failedRequests++;
+      _stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
       throw;
     }
   }
@@ -1030,25 +1145,25 @@ private:
                    const iora::parsers::Json &params,
                    const std::vector<std::pair<std::string, std::string>> &headers)
   {
-    _stats.totalRequests++;
-    _stats.notificationRequests++;
+    _stats.totalRequests.fetch_add(1, std::memory_order_relaxed);
+    _stats.notificationRequests.fetch_add(1, std::memory_order_relaxed);
 
     try
     {
       auto lease = acquire_(endpoint);
       iora::parsers::Json req = makeNotificationEnvelope_(method, params);
       (void)sendJsonWithRetries_(lease.client(), endpoint, req, mergeHeaders_(headers));
-      _stats.successfulRequests++;
+      _stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
     }
     catch (const PoolExhaustedError &)
     {
-      _stats.poolExhaustions++;
-      _stats.failedRequests++;
+      _stats.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
+      _stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
       throw;
     }
     catch (...)
     {
-      _stats.failedRequests++;
+      _stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
       throw;
     }
   }
@@ -1062,10 +1177,64 @@ private:
       return {};
     }
 
-    _stats.batchRequests++;
-    _stats.totalRequests++;
+    _stats.batchRequests.fetch_add(1, std::memory_order_relaxed);
+    _stats.totalRequests.fetch_add(1, std::memory_order_relaxed);
 
-    auto lease = acquire_(endpoint);
+    // The same two-catch shape callCore_ and notifyCore_ use. Without it a batch
+    // acquire_ failure — PoolExhaustedError, or phase 6's new post-relock
+    // ClientShutdownError / std::logic_error — was counted NOWHERE, even though
+    // batchRequests and totalRequests had already been charged above.
+    try
+    {
+      auto lease = acquire_(endpoint);
+      return sendBatchOnLease_(lease, endpoint, items, headers);
+    }
+    catch (const PoolExhaustedError &)
+    {
+      _stats.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
+      _stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
+      throw;
+    }
+    catch (...)
+    {
+      _stats.failedRequests.fetch_add(1, std::memory_order_relaxed);
+      throw;
+    }
+  }
+
+  /// \brief The POST-ACQUIRE half of a batch call: build the envelope array and
+  /// send it on an ALREADY-HELD lease.
+  /// \details Split out of callBatchCore_ (behaviour-preserving) so the window
+  /// this function's _closing fast-fail guards is reachable on its own. That
+  /// window opens only between acquire_ returning and the send starting: if
+  /// _closing is latched BEFORE the acquire, acquire_'s own entry check refuses
+  /// first and the fast-fail below is never consulted. Keeping the send in the
+  /// same function as the acquire therefore made the guard untestable — the
+  /// entry check dominated every reachable ordering (found by the phase-6
+  /// mutation sweep, where deleting the fast-fail changed nothing observable).
+  /// task-6.4b(z) drives THIS function with a lease taken before the latch.
+  std::vector<iora::parsers::Json>
+  sendBatchOnLease_(detail::ConnectionLease &lease, const std::string &endpoint,
+                    const std::vector<BatchItem> &items,
+                    const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    // task-6.1b(d) / R2 M-C — CLOSE THE BATCH-PATH ASYMMETRY. The batch send
+    // goes straight to sendJson_ and therefore never saw sendJsonWithRetries_'s
+    // per-attempt _closing check, so a batch issued on a lease taken BEFORE the
+    // destructor latched relied solely on the STEP-2 cancelInFlight() sweep
+    // making postJson throw at first touch. Against a silent server that is not
+    // enough and the destructor stalls to requestTimeout. Fail fast on the same
+    // flag, with the same acquire ordering.
+    //
+    // FIRST, before the envelope loop: the loop charges
+    // _stats.notificationRequests for every notification in the batch, and on a
+    // refused send none of them is ever transmitted. Checking afterwards
+    // inflated that counter on a path that sends nothing.
+    if (_closing.load(std::memory_order_acquire))
+    {
+      throw ClientShutdownError("JsonRpcClient: cancelled before batch send; client is closing");
+    }
+
     iora::parsers::Json batchReq = iora::parsers::Json::array();
 
     for (const auto &item : items)
@@ -1077,22 +1246,17 @@ private:
       else
       {
         batchReq.push_back(makeNotificationEnvelope_(item.method, item.params));
-        _stats.notificationRequests++;
+        _stats.notificationRequests.fetch_add(1, std::memory_order_relaxed);
       }
     }
 
-    try
-    {
-      iora::parsers::Json batchResp =
-        sendJson_(lease.client(), endpoint, batchReq, mergeHeaders_(headers));
-      _stats.successfulRequests++;
-      return parseBatchResponseOrThrow_(std::move(batchResp), items);
-    }
-    catch (...)
-    {
-      _stats.failedRequests++;
-      throw;
-    }
+    // Failure counting belongs to callBatchCore_, which now wraps BOTH the
+    // acquire and this send in the standard two-catch shape — counting here as
+    // well would double-charge failedRequests.
+    iora::parsers::Json batchResp =
+      sendJson_(lease.client(), endpoint, batchReq, toHeaderMap_(mergeHeaders_(headers)));
+    _stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
+    return parseBatchResponseOrThrow_(std::move(batchResp), items);
   }
 
   std::size_t purgeIdleCore_()
@@ -1112,23 +1276,25 @@ private:
       auto &pool = *(it->second);
       std::size_t evicted = pool.purgeIdle(_config.idleTimeout, evictedConns);
       evictedTotal += evicted;
-      _stats.connectionsEvicted += evicted;
+      _stats.connectionsEvicted.fetch_add(evicted, std::memory_order_relaxed);
 
-      if (pool.size() == 0)
-      {
-        it = retirePoolLocked_(it, evictedPools);
-      }
-      else
-      {
-        ++it;
-      }
+      // PIN SITE 2 (designPrinciple #8): retire only when the pool is BOTH
+      // empty and unpinned. A concurrent acquire_ may hold a reservation on
+      // this pool while parked in its unlocked construction window — this is
+      // exactly the re-entrant purgeIdle() the CR-3 fix makes legal, so the
+      // helper's pendingCreates conjunct is what keeps that pool alive. The
+      // helper returns the following iterator either way.
+      it = retireIfEmptyAndUnpinnedLocked_(it, evictedPools);
     }
     // L-7: recalc ONCE after the loop, not per-pool — recalcTotalLocked_ is
     // itself O(pools), so a per-pool call made this O(pools^2). Still inside the
     // function-scoped lock_guard, so _totalConnections is only read under _mutex.
     _totalConnections = recalcTotalLocked_();
-    // task-5.2 exit tripwire (single return under the function-scoped lock).
+    // task-5.2 exit tripwire (single return under the function-scoped lock),
+    // plus the I1 tripwire the counter one provably cannot see (DP#7): this is
+    // a purgeIdleCore_ RETURN, one of the two exits the invariant names.
     assert(_totalConnections == recalcTotalLocked_());
+    assert(noEmptyUnpinnedPoolLocked_());
     return evictedTotal;
   }
 
@@ -1206,6 +1372,7 @@ private:
                        std::unique_lock<std::mutex> &lock)
   {
     assert(_totalConnections == recalcTotalLocked_()); // task-5.2 exit tripwire
+    assert(noEmptyUnpinnedPoolLocked_());              // I1 tripwire (DP#7)
     lock.unlock();
     return detail::ConnectionLease(shared_from_this(), pool, conn);
   }
@@ -1229,6 +1396,14 @@ private:
     // run under _mutex — on the throw path too, where the lock is released by
     // unwinding rather than an explicit unlock() (thread-safety T6-2/T-2).
     std::shared_ptr<detail::EndpointPool> pool;
+    // task-6.1b(e) / T6-2 — ALSO declared BEFORE `lock`, and for a reason
+    // specific to phase 6: this holds the connection built in the UNLOCKED
+    // construction window until it is published under the re-taken lock. Every
+    // post-relock throw (the re-look-up mismatch, the _closing recheck) unwinds
+    // with _mutex HELD, so a holder declared inside the create branch would run
+    // ~PooledConnection -> ~HttpClient — which joins I/O threads — under the
+    // pool mutex. Declared here, it is destroyed only after `lock` unlocks.
+    std::shared_ptr<detail::PooledConnection> newConn;
     std::unique_lock<std::mutex> lock(_mutex);
 
     // task-5.2 ENTRY tripwire: the invariant _totalConnections == Σ size() holds
@@ -1247,8 +1422,6 @@ private:
     {
       throw ClientShutdownError("JsonRpcClient: cancelled during acquire; client is closing");
     }
-
-    const auto makeClient = [this](const std::string &ep) { return this->makeHttpClient_(ep); };
 
     // Ensure pool exists (respecting maxEndpointPools with LRU idle pool
     // eviction).
@@ -1286,65 +1459,237 @@ private:
     std::size_t reclaimed = 0;
     auto conn = pool->tryAcquireFree(_config.idleTimeout, evictedConns, reclaimed);
     _totalConnections -= reclaimed;
-    _stats.connectionsEvicted += reclaimed; // DP-2: count idle-expiry evictions
+    _stats.connectionsEvicted.fetch_add(reclaimed, std::memory_order_relaxed); // DP-2: count idle-expiry evictions
     if (conn)
     {
       return finishAcquireLocked_(pool, conn, lock); // reuse hit
     }
 
     // Can we create a new one?
-    const bool underPerEndpointCap = pool->size() < _config.maxConnectionsPerEndpoint;
+    // task-6.1a: the per-endpoint cap counts RESERVED creations as well as
+    // published ones. Reading size() alone here is a live overshoot bug under
+    // phase 6: thread A reserves and unlocks before B reads size(), so on a
+    // cap-1 endpoint B still sees size()==0, both create, and the pool
+    // publishes 2 — an overshoot NO tripwire catches (_totalConnections is a
+    // global sum, not a per-endpoint one).
+    const bool underPerEndpointCap =
+      pool->size() + pool->pendingCreates() < _config.maxConnectionsPerEndpoint;
     const bool underGlobalCap =
       (_config.globalMaxConnections == 0) || (_totalConnections < _config.globalMaxConnections);
 
-    if (underPerEndpointCap && underGlobalCap)
+    // The three former inline create paths (create outright / after evicting one
+    // idle connection / after evicting a whole idle pool) differed ONLY in how
+    // they made room, so they collapse into this single predicate plus the one
+    // reserve->unlock->build->relock->publish tail below (task-6.1b(f)(ii)).
+    // Short-circuit order is preserved exactly: the eviction helpers are still
+    // reached only when the per-endpoint cap allows a create and the global cap
+    // does not. Each helper reconciles _totalConnections to the exact
+    // post-eviction sum, which is why the reservation below must come AFTER
+    // this decision — incrementing before an in-condition eviction's recalc
+    // would be silently overwritten (R2 L-F/ts-F).
+    // NAMED IN THE PAST TENSE ON PURPOSE (simpl M4): evaluating this is NOT a
+    // query. Both short-circuit operands are eviction calls with real effects —
+    // the first can destroy an idle connection, the second an ENTIRE idle pool —
+    // and they run only when the earlier operands do not already answer. A name
+    // like `mayCreate` reads as a predicate and invites a reader to assume it is
+    // re-evaluable or reorderable; it is neither.
+    const bool madeRoomForCreate =
+      underPerEndpointCap && (underGlobalCap ||
+                              tryEvictOneIdleConnLruLocked_(evictedConns, evictedPools) ||
+                              evictOneIdlePoolLruLocked_(evictedPools));
+
+    if (!madeRoomForCreate)
     {
-      auto newConn = pool->createAndAcquire(makeClient, &_stats);
-      ++_totalConnections;
-      return finishAcquireLocked_(pool, newConn, lock);
+      // task-5.1 Option A (DP-3): reaching this throw with `pool` empty would
+      // leave a size()==0 pool in _pools (allIdle() now excludes it, so neither
+      // eviction site reclaims it) occupying a maxEndpointPools slot — a later
+      // distinct endpoint could then be refused spuriously. Retire it here, AT
+      // THE THROW ONLY — never eagerly after tryAcquireFree, which would orphan
+      // the pool the create tail then populates. Order (L-2): exit tripwire,
+      // then the retire (a 0-delta — an empty, unpinned pool contributes 0 to
+      // recalcTotalLocked_), then throw. PIN SITE 1 (designPrinciple #8): the
+      // helper's pendingCreates conjunct is what stops this throw retiring a
+      // pool another thread is mid-construction on.
+      assert(_totalConnections == recalcTotalLocked_()); // throw exit tripwire
+      retireIfEmptyAndUnpinnedLocked_(endpoint, pool, evictedPools);
+      // I1 asserted AFTER the retire (before it, `pool` is legitimately empty).
+      // This is the acquire_ THROW exit designPrinciple #7 names explicitly.
+      assert(noEmptyUnpinnedPoolLocked_());
+      throw PoolExhaustedError("No available HTTP connections for endpoint: " + endpoint);
     }
 
-    // Try global LRU eviction of one idle connection across all pools. The helper
-    // reconciles _totalConnections to the exact post-eviction sum before it
-    // returns true, and createAndAcquire adds exactly one connection to `pool`
-    // (never the evicted pool — an empty-or-in-use `pool` is not an allIdle
-    // candidate), so ++ is the exact delta and keeps the exit assert a LIVE
-    // tripwire rather than a recalc-vs-recalc tautology (simpl/ts/cpp17 LOW).
-    if (underPerEndpointCap && tryEvictOneIdleConnLruLocked_(evictedConns, evictedPools))
+    // ---------------------------------------------------------------------
+    // CR-3 — THE CREATE TAIL. Everything above ran under _mutex; the user's
+    // httpClientFactory/httpClientConfigurer must NOT (that is the whole
+    // defect: a callback that re-enters the client deadlocks, and a slow one
+    // blocks every other endpoint). Sequence: RESERVE under the lock, UNLOCK,
+    // BUILD on this thread, RE-LOCK, re-validate, PUBLISH.
+    // ---------------------------------------------------------------------
+
+    // RESERVE (task-6.1a). ++pendingCreates and ++_totalConnections are ONE
+    // pair, applied together under the lock: the reservation is what makes both
+    // cap checks see this in-flight creation, what PINS the pool against all
+    // five retire sites (designPrinciple #8), and what keeps the task-5.2
+    // invariant _totalConnections == Σ(size() + pendingCreates) true throughout
+    // the window. This increment REPLACES the former publish-time
+    // ++_totalConnections — publishing is net-zero on the counter (insert +1 to
+    // size(), -1 to pendingCreates), so counting at both points would
+    // double-count: caught by the Debug tripwire, but under NDEBUG it drifts
+    // _totalConnections permanently high until underGlobalCap starts refusing
+    // legitimate creates with a spurious PoolExhaustedError in production.
+    try
     {
-      auto newConn = pool->createAndAcquire(makeClient, &_stats);
-      ++_totalConnections;
-      return finishAcquireLocked_(pool, newConn, lock);
+      pool->reserveCreate();
+    }
+    catch (...)
+    {
+      // reserveCreate() is strongly exception-safe by ordering, and
+      // _totalConnections has not been touched yet — so the counters are
+      // already at their pre-call values and there is nothing to roll back.
+      // What CAN remain is a freshly emplaced pool with nothing in it, which
+      // designPrinciple #7 forbids persisting. No client exists on this path,
+      // so no T6-2 concern arises.
+      retireIfEmptyAndUnpinnedLocked_(endpoint, pool, evictedPools);
+      assert(_totalConnections == recalcTotalLocked_());
+      assert(noEmptyUnpinnedPoolLocked_());
+      throw;
+    }
+    ++_totalConnections;
+
+    // task-6.1b(a) — a LOCAL COPY of the endpoint, which the task mandates.
+    // The original justification ("the caller passes EndpointPool::_endpoint, a
+    // reference INTO the pool") described the DELETED createAndAcquire shape and
+    // is not true of the code below: all three callers (callCore_, notifyCore_,
+    // callBatchCore_) forward a caller-owned string that outlives the call. The
+    // copy is kept anyway, and deliberately: `endpoint` is a reference this
+    // frame does not own, it is consumed AFTER the lock is released and after
+    // arbitrary user code has run and may have re-entered the client, and the
+    // cost is one small allocation on the create path only. Owning the string
+    // outright makes that safety a local property rather than a contract every
+    // future caller of acquire_ has to honour.
+    const std::string endpointCopy = pool->endpoint();
+
+    lock.unlock();
+    // ================= UNLOCKED CONSTRUCTION WINDOW =================
+    // The factory and configurer run HERE, on the calling thread, with no lock
+    // held — so they may legally re-enter the client (call(), purgeIdle(), ...)
+    // on this very endpoint. The pool cannot be retired under us while they do:
+    // we hold a reservation, and a pool with pendingCreates() > 0 is never
+    // erased (designPrinciple #8). The window is covered by the CALLER's
+    // in-flight count (call()'s CountGuard / the async InFlightToken's guard),
+    // so the destructor's STEP-3 wait cannot run past it.
+
+    // Drop the evicted bins HERE, before entering the window, rather than at
+    // function exit. They were filled under the lock above — by tryAcquireFree's
+    // idle reclaim and by the madeRoomForCreate evictions, which can include an ENTIRE
+    // pool — and phase 6 turned "destroyed a few instructions later" into
+    // "destroyed after the user callback returns", which task-6.2 makes
+    // explicitly UNBOUNDED. Holding them means the evicted sockets, fds and I/O
+    // threads stay alive for that whole time even though the accounting has
+    // already reclaimed their slots, so real concurrent resource usage can
+    // exceed globalMaxConnections without bound. This is the correct place to
+    // destroy them: no lock is held, which is exactly what T6-2 requires.
+    evictedConns.clear();
+    evictedPools.clear();
+    // Guarantee the rollback paths below can retire a pool without allocating:
+    // retirePoolLocked_ push_backs into this bin from inside a catch handler,
+    // where a bad_alloc would REPLACE the user's original exception (which
+    // task-6.3 asserts propagates unchanged) and skip the retire itself.
+    evictedPools.reserve(1);
+
+    try
+    {
+      newConn = std::make_shared<detail::PooledConnection>(makeHttpClient_(endpointCopy));
+    }
+    catch (...)
+    {
+      // task-6.1c — ROLLBACK. `newConn` is null here (the throw came from the
+      // factory, the configurer, or make_shared); any HttpClient the factory
+      // had already returned was destroyed by unwinding while still UNLOCKED,
+      // which is exactly where ~HttpClient belongs (T6-2).
+      //
+      // lock.lock() cannot throw here: `lock` owns a valid, currently-unlocked,
+      // non-recursive std::mutex, and unique_lock::lock() throws only for
+      // "no mutex" or "already owns" — neither is reachable — while the
+      // underlying pthread_mutex_lock has no failure mode for a default
+      // (non-errorcheck, non-robust) mutex short of undefined behaviour.
+      lock.lock();
+      // PIN SITE 5 (designPrinciple #7 extended / #8): the pool was emplaced
+      // before the window, so a failed first creation leaves it empty. Retiring
+      // it is REQUIRED here — unlike the shutdown path below, the client keeps
+      // running, and a stranded empty pool occupies a maxEndpointPools slot and
+      // refuses a later DIFFERENT endpoint. The unpinned conjunct inside the
+      // helper is equally required: a second thread may hold its own
+      // reservation on this same pool, and retiring it would break ITS
+      // re-look-up.
+      rollbackCreateLocked_(endpointCopy, pool, evictedPools);
+      // Rethrown with the lock HELD: unwinding releases `lock` first and only
+      // then drops evictedPools/pool (declared before it), so the pool teardown
+      // still happens outside _mutex.
+      throw;
     }
 
-    // As a last resort, try to evict an entire idle pool (LRU) to free
-    // capacity. Same exact-delta reasoning as the idle-connection path above.
-    if (underPerEndpointCap && evictOneIdlePoolLruLocked_(evictedPools))
-    {
-      auto newConn = pool->createAndAcquire(makeClient, &_stats);
-      ++_totalConnections;
-      return finishAcquireLocked_(pool, newConn, lock);
-    }
+    lock.lock();
+    // ================= RE-LOCKED: RE-VALIDATE, THEN PUBLISH =================
 
-    // task-5.1 Option A (DP-3): reaching this throw with `pool` empty would leave
-    // a size()==0 pool in _pools (allIdle() now excludes it, so neither eviction
-    // site reclaims it) occupying a maxEndpointPools slot — a later distinct
-    // endpoint could then be refused spuriously. Retire it here, AT THE THROW
-    // ONLY — never eagerly after tryAcquireFree, which would orphan the pool
-    // createAndAcquire then populates. Order (L-2): exit tripwire, then the
-    // Option-A retire (a 0-delta — an empty pool sums to 0 in recalcTotalLocked_),
-    // then throw. The find-by-key LOCATES the pool for retirement; it is not a
-    // re-validation of a stale reference (deferred to phase 6, human DP-1).
-    assert(_totalConnections == recalcTotalLocked_()); // throw exit tripwire
-    if (pool && pool->size() == 0)
+    // task-6.1b(b) — DEFENSE IN DEPTH, and it runs FIRST. Re-look up the pool
+    // BY KEY and verify IDENTITY before anything else touches `pool` or the
+    // counters. This is NOT the primary CR-2 guard: the pin makes retiring a
+    // pool with pendingCreates() > 0 impossible at every pin site, and we held
+    // a reservation for the whole window, so a correct implementation can never
+    // reach this throw. It stays as belt-and-suspenders — if a pin is ever
+    // defective, this converts a silent corruption into a loud failure. An
+    // unconditional throw, never an assert: a use-after-free guard must survive
+    // NDEBUG (task-4.2).
+    //
+    // ORDERED BEFORE the _closing recheck deliberately. Both post-relock exits
+    // decrement _totalConnections, and that decrement is only correct if `pool`
+    // is still the pool under `endpoint`: a detaching site (either eviction
+    // path) recomputes _totalConnections via recalcTotalLocked_, which already
+    // excludes our reservation, so decrementing again on a detached pool
+    // underflows std::size_t to SIZE_MAX and every later underGlobalCap check
+    // passes forever. Validating identity first means no path can do that.
     {
-      auto it = _pools.find(endpoint);
-      if (it != _pools.end() && it->second == pool)
+      auto it = _pools.find(endpointCopy);
+      if (it == _pools.end() || it->second != pool)
       {
-        retirePoolLocked_(it, evictedPools);
+        // Counters only: the helper's retire declines to touch a pool that is
+        // no longer ours, which is exactly right — a detached pool is already
+        // out of recalcTotalLocked_'s sum.
+        rollbackCreateLocked_(endpointCopy, pool, evictedPools);
+        throw std::logic_error(
+          "JsonRpcClient: endpoint pool was retired or replaced while a creation was in "
+          "flight (pool-pin invariant violated) for endpoint: " +
+          endpointCopy);
       }
     }
-    throw PoolExhaustedError("No available HTTP connections for endpoint: " + endpoint);
+
+    // task-6.1b(d) — RE-CHECK _closing. This is the load-bearing post-relock
+    // check. quiesce()'s STEP 2 (the cancelInFlight sweep) takes only _mutex,
+    // so it can have run to completion DURING our window: it iterates the pools
+    // as they were then, never sees a connection still under construction, and
+    // therefore cannot cancel it. Publishing an uncancelled client now would
+    // leave a subsequent request bounded only by requestTimeout x (maxRetries+1)
+    // instead of by cancellation, and STEP 3 would wait on it. Roll back
+    // instead. Acquire ordering matches the entry check above.
+    if (_closing.load(std::memory_order_acquire))
+    {
+      // The retire inside the helper is not strictly required on THIS path —
+      // quiesce STEP 4 clears _pools wholesale — but doing it keeps
+      // designPrinciple #7 true on every acquire_ return-or-throw without a
+      // per-path exception to reason about (R2 L-3).
+      rollbackCreateLocked_(endpointCopy, pool, evictedPools);
+      // `newConn` is non-null here and is declared before `lock`: unwinding
+      // unlocks first, so ~HttpClient runs OUTSIDE _mutex (T6-2).
+      throw ClientShutdownError(
+        "JsonRpcClient: cancelled during connection construction; client is closing");
+    }
+
+    // PUBLISH. Nothrow by construction (REMEDY B — see publishCreate).
+    // _totalConnections is deliberately NOT incremented: the reservation
+    // already counted this connection.
+    pool->publishCreate(newConn, _stats);
+    return finishAcquireLocked_(pool, newConn, lock);
   }
 
   std::shared_ptr<detail::EndpointPool> findPool_(const std::string &endpoint)
@@ -1377,14 +1722,127 @@ private:
     }
   }
 
+  /// \brief The authoritative value of _totalConnections, recomputed from the
+  /// pools (the task-5.2 tripwire compares the two).
+  /// \details task-6.1a AMENDS this to add each pool's pendingCreates. Phase 6
+  /// increments _totalConnections at RESERVATION — before the connection
+  /// exists — so the invariant is
+  ///     _totalConnections == Σ over pools of (size() + pendingCreates())
+  /// and summing size() alone would make the tripwire fire inside every
+  /// construction window BY CONSTRUCTION rather than on a real defect.
   std::size_t recalcTotalLocked_() const
   {
     std::size_t total = 0;
     for (const auto &kv : _pools)
     {
-      total += kv.second->size();
+      total += kv.second->size() + kv.second->pendingCreates();
     }
     return total;
+  }
+
+  /// \brief True iff `p` holds no connection AND has no creation in flight.
+  /// The single place the extended designPrinciple-#7 predicate is written, so
+  /// the retire sites and the I1 checker below cannot drift apart.
+  static bool poolIsEmptyAndUnpinnedLocked_(const detail::EndpointPool &p)
+  {
+    return p.size() == 0 && p.pendingCreates() == 0;
+  }
+
+  /// \brief INVARIANT I1 (architecture designPrinciple #7, as extended by phase
+  /// 6): no size()==0 && pendingCreates()==0 pool persists in _pools.
+  /// \details This exists because the task-5.2 counter tripwire provably CANNOT
+  /// see an I1 violation: an empty pool contributes 0 to both _totalConnections
+  /// and recalcTotalLocked_, so a stranded empty pool is invisible to it. Its
+  /// only symptom is a maxEndpointPools slot occupied forever, refusing a later
+  /// UNRELATED endpoint — which surfaces far from the cause. DP#7 requires I1 to
+  /// be re-asserted after every unlock-window re-lock; asserting it next to each
+  /// counter tripwire is how that clause is discharged. Debug-only (O(pools),
+  /// compiled out under NDEBUG). Must hold _mutex.
+  bool noEmptyUnpinnedPoolLocked_() const
+  {
+    for (const auto &kv : _pools)
+    {
+      if (poolIsEmptyAndUnpinnedLocked_(*kv.second))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// \brief Retire `it`'s pool IFF it is empty and unpinned; returns the
+  /// iterator following the erased node, or std::next(it) when nothing was
+  /// retired — so a caller walking _pools can assign the result unconditionally.
+  /// \details The one gate for designPrinciple #7 (no size()==0 pool persists
+  /// across an acquire_/purgeIdleCore_ return-or-throw) as EXTENDED by #8 (a
+  /// pool with pendingCreates()>0 is NEVER erased — invariant I2). Dropping the
+  /// pendingCreates conjunct at any of these sites pulls a pool out from under a
+  /// thread inside phase-6's unlocked construction window, whose re-look-up then
+  /// throws spuriously and whose rollback lands on a detached pool: CR-2 by
+  /// another route. Must hold _mutex.
+  PoolMap::iterator
+  retireIfEmptyAndUnpinnedLocked_(PoolMap::iterator it,
+                                  std::vector<std::shared_ptr<detail::EndpointPool>> &evictedPools)
+  {
+    if (it == _pools.end())
+    {
+      return it; // std::next(end()) would be UB
+    }
+    if (poolIsEmptyAndUnpinnedLocked_(*it->second))
+    {
+      return retirePoolLocked_(it, evictedPools);
+    }
+    return std::next(it);
+  }
+
+  /// \brief Key-and-handle overload for the sites that hold an owning `pool`
+  /// rather than an iterator (acquire_'s Option-A throw retire and task-6.1c's
+  /// rollback retire). Locates the pool BY KEY and verifies IDENTITY before
+  /// touching it (task-4.2's UAF rule): a pool retired and re-created under the
+  /// same key while we were unlocked is a DIFFERENT object, and erasing it would
+  /// destroy someone else's live pool.
+  void
+  retireIfEmptyAndUnpinnedLocked_(const std::string &endpoint,
+                                  const std::shared_ptr<detail::EndpointPool> &pool,
+                                  std::vector<std::shared_ptr<detail::EndpointPool>> &evictedPools)
+  {
+    if (!pool)
+    {
+      return;
+    }
+    auto it = _pools.find(endpoint);
+    if (it != _pools.end() && it->second == pool)
+    {
+      retireIfEmptyAndUnpinnedLocked_(it, evictedPools);
+    }
+  }
+
+  /// \brief Undo a reservation taken by EndpointPool::reserveCreate(): release
+  /// it, drop the matching _totalConnections unit, and retire the pool if that
+  /// left it empty AND unpinned.
+  /// \details The ONE place the post-reservation unwind sequence is written, so
+  /// acquire_'s three failure exits after the reservation (the factory/configurer
+  /// throw, the post-relock _closing recheck, and the re-look-up mismatch) are
+  /// identical BY CONSTRUCTION rather than by three hand-maintained copies.
+  /// Deliberately a plain member function called explicitly, NEVER an RAII
+  /// guard: a locking guard's destructor would re-take _mutex, which is either a
+  /// double-lock or a re-lock under a lock depending on where it fired
+  /// (task-6.1c). Must hold _mutex.
+  ///
+  /// Correct at the re-look-up-mismatch site too, where `pool` is no longer the
+  /// pool under `endpoint`: the retire helper verifies identity and declines to
+  /// touch a pool that is not ours, so only the counters unwind there — which is
+  /// exactly right, because a detached pool is already excluded from
+  /// recalcTotalLocked_ and leaving the increment would desync it permanently.
+  void rollbackCreateLocked_(const std::string &endpoint,
+                             const std::shared_ptr<detail::EndpointPool> &pool,
+                             std::vector<std::shared_ptr<detail::EndpointPool>> &evictedPools)
+  {
+    pool->rollbackCreate();
+    --_totalConnections;
+    retireIfEmptyAndUnpinnedLocked_(endpoint, pool, evictedPools);
+    assert(_totalConnections == recalcTotalLocked_());
+    assert(noEmptyUnpinnedPoolLocked_()); // I1, re-asserted after the re-lock (DP#7)
   }
 
   /// \brief Try to evict the single least-recently-used idle connection
@@ -1423,11 +1881,12 @@ private:
       if (it != _pools.end())
       {
         it->second->erase(bestHandle, evictedConns);
-        _stats.connectionsEvicted += 1; // DP-2: one idle connection evicted
-        if (it->second->size() == 0)
-        {
-          retirePoolLocked_(it, evictedPools);
-        }
+        _stats.connectionsEvicted.fetch_add(1, std::memory_order_relaxed); // DP-2: one idle connection evicted
+        // PIN SITE 3 (designPrinciple #8): dropping the pool's last idle
+        // connection must NOT retire it while a creation is in flight on it —
+        // the reserving thread would re-lock onto a pool no longer in _pools.
+        // `it` may be invalidated by the retire; nothing below dereferences it.
+        (void)retireIfEmptyAndUnpinnedLocked_(it, evictedPools);
         _totalConnections = recalcTotalLocked_();
         return true;
       }
@@ -1451,7 +1910,18 @@ private:
     for (auto it = _pools.begin(); it != _pools.end(); ++it)
     {
       auto &pool = *it->second;
-      if (pool.allIdle())
+      // PIN SITE 4 (designPrinciple #8) — and the SUBTLE one: the exclusion
+      // sits at CANDIDACY, not at the retire below. A pinned pool selected as
+      // bestIt would either be wrongly retired or, worse, shadow a genuinely
+      // evictable pool and make this return false while capacity existed.
+      // The predicate designPrinciple #8 states is
+      //   allIdle() && size() > 0 && pendingCreates() == 0
+      // and the size() > 0 conjunct is already carried by allIdle() itself
+      // (task-5.1 narrowed it to require a non-empty pool — see its comment),
+      // so only the pendingCreates conjunct is written here. This is the one
+      // pin site NOT routed through retireIfEmptyAndUnpinnedLocked_: it selects
+      // NON-empty pools, the opposite predicate (R3 L-4/ts-L1).
+      if (pool.allIdle() && pool.pendingCreates() == 0)
       {
         const auto t = pool.lastTouched();
         if (t < bestTime)
@@ -1468,7 +1938,7 @@ private:
       // retirePoolLocked_ moves the pool out (reading after the move reads a
       // moved-from pool). After the allIdle() size()>0 change an LRU-evicted pool
       // holds >= 1 idle connection, so this is always a positive delta.
-      _stats.connectionsEvicted += bestIt->second->size();
+      _stats.connectionsEvicted.fetch_add(bestIt->second->size(), std::memory_order_relaxed);
       retirePoolLocked_(bestIt, evictedPools);
       _totalConnections = recalcTotalLocked_();
       return true;
@@ -1555,46 +2025,53 @@ private:
 
   std::uint64_t nextId_() { return _nextId.fetch_add(1, std::memory_order_relaxed); }
 
+  /// \brief Run the user's httpClientFactory (and httpClientConfigurer) to
+  /// produce one HTTP client for `endpoint`.
+  /// \details task-6.2 DELETED the std::async(std::launch::async) +
+  /// wait_for(30s) wrapper this used to run in. That wrapper bounded NOTHING:
+  /// per [futures.async] the future returned by std::async joins in its own
+  /// destructor, so a timed-out wait_for was followed by a ~future that blocked
+  /// indefinitely anyway — while the "timed out - likely transport layer
+  /// conflict" message misattributed the cause. It also spawned an OS thread
+  /// per connection creation. Any real bound on construction must come from the
+  /// factory itself or from HttpClient, never from a joining future.
+  ///
+  /// Runs on the CALLING thread and — since phase 6 — with _mutex RELEASED
+  /// (task-6.1b): the callbacks may re-enter the client, and a slow one no
+  /// longer blocks acquires for other endpoints. THROWS propagate to acquire_'s
+  /// create tail, which rolls the reservation back (task-6.1c).
   std::unique_ptr<iora::network::HttpClient> makeHttpClient_(const std::string &endpoint)
   {
-    // Use a future to make HTTP client construction timeout-aware
-    // This prevents hanging if there are transport layer conflicts
-    auto clientFuture = std::async(std::launch::async,
-                                   [this, &endpoint]()
-                                   {
-                                     auto cli = _config.httpClientFactory(endpoint);
-                                     if (!cli)
-                                     {
-                                       throw JsonRpcError("httpClientFactory returned null");
-                                     }
-                                     if (_config.httpClientConfigurer)
-                                     {
-                                       _config.httpClientConfigurer(endpoint, *cli);
-                                     }
-                                     return cli;
-                                   });
-
-    // Wait for client creation with timeout (30 seconds should be more than enough)
-    auto status = clientFuture.wait_for(std::chrono::seconds(30));
-    if (status == std::future_status::timeout)
+    auto cli = _config.httpClientFactory(endpoint);
+    if (!cli)
     {
-      throw JsonRpcError("HTTP client creation timed out - likely transport layer conflict");
+      throw JsonRpcError("httpClientFactory returned null");
     }
-
-    auto cli = clientFuture.get();
+    if (_config.httpClientConfigurer)
+    {
+      _config.httpClientConfigurer(endpoint, *cli);
+    }
     return cli;
   }
 
-  iora::parsers::Json sendJson_(iora::network::HttpClient &http, const std::string &url,
-                                const iora::parsers::Json &payload,
-                                const std::vector<std::pair<std::string, std::string>> &headers)
+  /// \brief The vector-of-pairs header list HttpClient's map-taking postJson
+  /// needs. Hoisted out of sendJson_ (simpl LOW-5 / iteration 2) so the retry loop builds it
+  /// ONCE rather than re-allocating and re-inserting it on every attempt.
+  static std::map<std::string, std::string>
+  toHeaderMap_(const std::vector<std::pair<std::string, std::string>> &headers)
   {
-    // Convert vector to map for HttpClient
     std::map<std::string, std::string> headerMap;
     for (const auto &kv : headers)
     {
       headerMap[kv.first] = kv.second;
     }
+    return headerMap;
+  }
+
+  iora::parsers::Json sendJson_(iora::network::HttpClient &http, const std::string &url,
+                                const iora::parsers::Json &payload,
+                                const std::map<std::string, std::string> &headerMap)
+  {
     auto response = http.postJson(
       url, payload, headerMap, 0); // No retries at HTTP level - retries handled by JSON-RPC client
     return iora::network::HttpClient::parseJsonOrThrow(response);
@@ -1607,6 +2084,9 @@ private:
   {
     std::size_t attempts = 0;
     std::chrono::milliseconds delay = _config.initialRetryDelay;
+    // Built once, reused by every attempt (simpl LOW-5 / iteration 2): the header set does not
+    // change between retries.
+    const auto headerMap = toHeaderMap_(headers);
 
     while (true)
     {
@@ -1618,7 +2098,7 @@ private:
       }
       try
       {
-        return sendJson_(http, url, payload, headers);
+        return sendJson_(http, url, payload, headerMap);
       }
       catch (const std::exception &e)
       {
@@ -1627,12 +2107,12 @@ private:
         {
           if (std::string(e.what()).find("timeout") != std::string::npos)
           {
-            _stats.timeoutRequests++;
+            _stats.timeoutRequests.fetch_add(1, std::memory_order_relaxed);
           }
           throw;
         }
 
-        _stats.retriedRequests++;
+        _stats.retriedRequests.fetch_add(1, std::memory_order_relaxed);
 
         // INTERRUPTIBLE backoff (task-3.1(f)): the destructor's STEP-1 notify
         // cuts the wait so a retry loop cannot outlast the quiesce. Waiting on
@@ -1713,6 +2193,15 @@ private:
   friend class detail::ConnectionLease;
 
   iora::core::ThreadPool &_threadPool;
+  // IMMUTABLE AFTER CONSTRUCTION — load-bearing since phase 6, not a style note.
+  // The constructor applies its keep-alive/compression fixups and nothing writes
+  // _config again. makeHttpClient_ now reads _config.httpClientFactory and
+  // _config.httpClientConfigurer with NO lock held (those reads happened under
+  // _mutex before the CR-3 fix), and config() reads it unlocked too. Adding any
+  // mutating accessor would therefore be an immediate data race on a
+  // std::function and a std::vector that are read concurrently by every thread
+  // creating a connection. If mutability is ever needed, it needs its own
+  // synchronisation design, not a setter.
   Config _config;
   ClientStats _stats;
 
@@ -1859,10 +2348,19 @@ public:
 
   /// \brief By-value config snapshot (task-3.3(ii)): noexcept removed, returns
   /// the by-value result of _impl->config() (not a reference into Impl).
+  /// \warning PRECONDITION, and it is the CALLER's to honour: must not be
+  /// called concurrently with this client's destruction. Unlike call()/notify()/
+  /// callAsync(), this accessor is deliberately NOT counted (task-3.3(ii)), so
+  /// it neither keeps the Impl alive nor makes a concurrent quiesce wait for it
+  /// — a destructor that observes _inFlight == 0 returns immediately and frees
+  /// the Impl this read is walking. Returning by value removes the
+  /// reference-escape hazard, not the read-during-free one.
   Config config() const { return _impl->config(); }
 
   /// \brief By-value, atomic-free stats snapshot (task-3.3(ii)): noexcept
-  /// removed. Must not be called concurrently with destruction.
+  /// removed.
+  /// \warning Same uncounted-accessor precondition as config() above: must not
+  /// be called concurrently with destruction.
   ClientStatsSnapshot getStats() const { return _impl->getStats(); }
 
   void resetStats() { _impl->resetStats(); }
