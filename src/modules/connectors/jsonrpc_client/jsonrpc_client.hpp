@@ -127,8 +127,17 @@ struct Config
   std::size_t maxEndpointPools{0};
 
   /// \brief Idle timeout after which connections are eligible for eviction
-  /// by purgeIdle().
+  /// by purgeIdle(). Governs the wrapper HttpClient OBJECT's lifetime only.
   std::chrono::milliseconds idleTimeout{std::chrono::seconds(30)};
+
+  /// \brief Socket-level idle timeout: how long a POOLED HttpClient keeps its
+  /// underlying TCP socket open between requests before the transport recycles
+  /// it. DISTINCT from idleTimeout (which evicts the wrapper OBJECT); drives
+  /// HttpClient::Config::connectionIdleTimeout (task-7.1a). NOTE: task-7.6 owns
+  /// lowering this default below the common ~5 s server keep-alive floor and the
+  /// README; it is initialised here to HttpClient's current effective 300 s so
+  /// task-7.1a introduces the mapping WITHOUT a behaviour change.
+  std::chrono::milliseconds socketIdleTimeout{std::chrono::seconds(300)};
 
   /// \brief HTTP request timeout for individual JSON-RPC calls.
   std::chrono::milliseconds requestTimeout{std::chrono::seconds(30)};
@@ -174,8 +183,22 @@ struct Config
   ///     cap bounds it. Bound your own re-entrancy.
   /// Destroying the client from inside this callback is detected as a
   /// self-destruct and calls std::terminate (task-3.2).
-  std::function<std::unique_ptr<iora::network::HttpClient>(const std::string &endpoint)>
-    httpClientFactory{};
+  ///
+  /// \details SIGNATURE (task-7.1b, HD-7 row (5)): the factory receives the
+  /// derived HttpClient::Config the client built from THIS Config's six knobs
+  /// (requestTimeout, connectionTimeout, enableKeepAlive, socketIdleTimeout, the
+  /// consumed User-Agent, and leaseAcquireTimeout). A custom factory that ignores
+  /// it silently discards those knobs — the exact defect phase 7 removes — so
+  /// honour it: `std::make_unique<HttpClient>(derived)` and override only what you
+  /// must (e.g. TLS). Post task-7.5 the first parameter is the parsed ORIGIN
+  /// (scheme://host:port), not the caller's full URL. This header is
+  /// plugin-internal (src/modules/); tracker 2026-07-26-1 must make ~HttpClient
+  /// virtual (its task F-3) BEFORE promoting this header to a public API, since a
+  /// derived HttpClient destroyed through the base unique_ptr is UB while
+  /// ~HttpClient is non-virtual.
+  using HttpClientFactory = std::function<std::unique_ptr<iora::network::HttpClient>(
+    const std::string &endpoint, const iora::network::HttpClient::Config &derived)>;
+  HttpClientFactory httpClientFactory{};
 
   /// \brief Optional hook to configure a freshly created HttpClient (e.g.,
   /// TLS). \details Called after httpClientFactory() returns and before
@@ -825,8 +848,11 @@ public:
   {
     if (!_config.httpClientFactory)
     {
-      _config.httpClientFactory = [](const std::string &)
-      { return std::make_unique<iora::network::HttpClient>(); };
+      // task-7.1b — the default factory receives the derived config and honours
+      // it verbatim; its body reduces to make_unique<HttpClient>(derived).
+      _config.httpClientFactory =
+        [](const std::string &, const iora::network::HttpClient::Config &derived)
+      { return std::make_unique<iora::network::HttpClient>(derived); };
     }
 
     // Apply default keep-alive and compression settings
@@ -838,6 +864,39 @@ public:
     {
       _config.defaultHeaders.emplace_back("Accept-Encoding", "gzip");
     }
+
+    // task-7.1a — build the derived HttpClient::Config ONCE, here at the END of
+    // the constructor body (constructor_pipeline_ordering step 4: AFTER the
+    // above fixups and — once task-7.3c lands — after a caller-supplied
+    // User-Agent is consumed into a ctor local read below). Stored in the
+    // NON-const member _derivedHttpConfig, immutable BY CONVENTION like _config
+    // (designPrinciple #9): a language-const member cannot be initialised from
+    // the body-mutated _config. makeHttpClient_ reads it lock-free and passes it
+    // by const-ref to every factory invocation; the happens-before is the
+    // shared_ptr publication in create(), not `const`.
+    iora::network::HttpClient::Config derived;
+    derived.requestTimeout = _config.requestTimeout;
+    derived.connectTimeout = _config.connectionTimeout; // names differ (web W2-L6)
+    derived.reuseConnections = _config.enableKeepAlive;
+    // UNIT-TRUNCATION RULE (web W2-M3): connectionIdleTimeout is SECONDS; a naive
+    // cast of a sub-second socketIdleTimeout truncates to 0 s and would make
+    // `now - lastUsed < 0s` always false, closing and reopening the socket on
+    // every request. Floor the derived value at 1 s.
+    derived.connectionIdleTimeout = std::max(
+      std::chrono::seconds(1),
+      std::chrono::duration_cast<std::chrono::seconds>(_config.socketIdleTimeout));
+    // leaseAcquireTimeout: a BOUNDED residual-bug detector (web W4-M6). Post-fix
+    // nothing should contend for a pooled client's lease; 3 x requestTimeout is
+    // long enough a legitimate exchange never trips it, short enough a residual
+    // identity bug surfaces within a few request budgets. (HttpClient defaults it
+    // to 0 = wait indefinitely.)
+    derived.leaseAcquireTimeout = 3 * _config.requestTimeout;
+    // followRedirects/maxRedirects stay at HttpClient defaults — inert on this
+    // path; mapping them would be a feature-shaped no-op. userAgent stays at the
+    // HttpClient default here; task-7.3c consumes a caller-supplied User-Agent
+    // from defaultHeaders into derived.userAgent at pipeline step (3), before
+    // this build.
+    _derivedHttpConfig = std::move(derived);
   }
 
   /// \brief The only construction path: heap-allocate via make_shared so
@@ -2042,7 +2101,10 @@ private:
   /// create tail, which rolls the reservation back (task-6.1c).
   std::unique_ptr<iora::network::HttpClient> makeHttpClient_(const std::string &endpoint)
   {
-    auto cli = _config.httpClientFactory(endpoint);
+    // task-7.1b — pass the derived config so factory-created clients honour the
+    // mapped knobs. _derivedHttpConfig is immutable post-construction, so this
+    // lock-free read is safe on the phase-6 unlocked construction window.
+    auto cli = _config.httpClientFactory(endpoint, _derivedHttpConfig);
     if (!cli)
     {
       throw JsonRpcError("httpClientFactory returned null");
@@ -2203,6 +2265,13 @@ private:
   // creating a connection. If mutability is ever needed, it needs its own
   // synchronisation design, not a setter.
   Config _config;
+  // task-7.1a — the HttpClient::Config derived from _config's six knobs, built
+  // ONCE at the end of the constructor body and thereafter IMMUTABLE BY
+  // CONVENTION (designPrinciple #9, same discipline as _config). NON-const: a
+  // const member cannot be initialised from the body-mutated _config. Read
+  // lock-free by makeHttpClient_ on arbitrary worker threads in the phase-6
+  // unlock window; its happens-before is the shared_ptr publication in create().
+  iora::network::HttpClient::Config _derivedHttpConfig;
   ClientStats _stats;
 
   // shared_ptr, not unique_ptr (CR-1c/task-4.1c): a ConnectionLease holds an

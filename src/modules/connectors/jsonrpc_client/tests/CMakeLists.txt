@@ -52,11 +52,11 @@ endif()
 # repros stay deliberately RED and are registered separately below
 # (task-1.1(i): TEST name == TARGET name).
 add_test(NAME iora_test_jsonrpc_client_pool
-    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6]")
+    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6],[phase7]")
 # RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152/18153
 # the phase-3 latched cases; 18154 the phase-5 CR-2 case; 18155/18156 the phase-6
-# task-6.4b(h)/(z) cases) against any other test that might claim them,
-# independent of the -j1 convention (M2).
+# task-6.4b(h)/(z) cases; 18160-18165 the phase-7 raw-capture cases) against any
+# other test that might claim them, independent of the -j1 convention (M2).
 #
 # TIMEOUT raised 90 -> 180 when [phase6] was added: the phase-6 block's bounded
 # waits, IN THE FAILURE DIRECTION, sum past 90 s on their own (case (g) allows

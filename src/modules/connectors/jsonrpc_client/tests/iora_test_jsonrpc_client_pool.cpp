@@ -27,11 +27,16 @@
 
 #include <atomic>
 #include <catch2/catch.hpp>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <stdexcept>
+#include <string_view>
+
+#include "iora/core/string_utils.hpp"
 #include <future>
 #include <iostream>
 #include <memory>
@@ -41,6 +46,16 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+// task-7.0a — the raw-byte HTTP capture server accepts a plain socket and reads
+// wire bytes without going through network::HttpServer, so these POSIX socket
+// headers are needed here (network::HttpServer parses the request into a map and
+// cannot observe wire-level field lines — see RawCaptureServer below).
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 using namespace iora;
 using iora::modules::connectors::Config;
@@ -567,7 +582,7 @@ std::function<void(std::exception_ptr)> shutdownErrorProbe(std::atomic<bool> &er
 Config stubFactoryConfig()
 {
   Config cfg;
-  cfg.httpClientFactory = [](const std::string &)
+  cfg.httpClientFactory = [](const std::string &, const iora::network::HttpClient::Config &)
   { return std::make_unique<iora::network::HttpClient>(); };
   return cfg;
 }
@@ -677,6 +692,460 @@ private:
   bool _released{false};
   iora::network::HttpServer _server;
 };
+
+// -------------------------------------------------------------------------
+// task-7.0a — RAW-BYTE HTTP CAPTURE server (task-1.3 part 2, human-deferred to
+// phase 7). LatchedHttpServer is built on network::HttpServer, which PARSES the
+// request into a header MAP and therefore CANNOT observe wire-level duplicate
+// header lines, exact field-line counts, or a byte-exact `Accept-Encoding:
+// identity`. This server accepts a raw socket and records the exact CRLF-
+// delimited request field lines WITHOUT parsing. Six phase-7 verifications
+// (task-7.1a, 7.2b, 7.2c, 7.2d, 7.4, 7.6) assert against these captures and
+// against acceptedConnectionCount().
+//   * A KEEP-ALIVE request loop serves multiple requests on ONE accepted
+//     connection, so socket-reuse / idle-expiry scenarios are expressible and
+//     the one-pool-one-socket assertions (task-7.5c) can read
+//     acceptedConnectionCount().
+//   * A scripted per-response policy (delay-before-response, close-after-
+//     response, caller-chosen response headers incl. Content-Encoding) makes
+//     task-7.2c and task-7.6 writable.
+//   * acceptedConnectionCount() crosses threads (the accept loop writes it, the
+//     test thread reads it), so it is std::atomic<std::size_t> (ts TS-2). The
+//     happens-before that makes the count reflect EVERY accept is stop()'s
+//     _thread.join(), NOT the load ordering: read the count only AFTER the
+//     requests it should reflect are known complete — join the client threads,
+//     then call stop() (which joins the accept thread), then read. The load is
+//     acquire only for coherence of an incidental live read; a live read is
+//     inherently racy in VALUE and must not be relied on.
+// The capture assumes the client does not PIPELINE (JsonRpcClient sends one
+// request, waits for the response, then sends the next on the reused socket), so
+// each read consumes exactly one request's headers + Content-Length body.
+//
+// SINGLE-CONNECTION CONTRACT (web R2-L1): the accept loop is SERIAL — it serves
+// one accepted connection to completion (its keep-alive idle-wait now blocks
+// until the peer closes or stop()) before accept()ing the next. A second
+// CONCURRENT connection to the same server would therefore sit unserved in the
+// kernel backlog and its request would never be captured (waitForRequests would
+// spin to its bound). Every consumer in this file drives ONE connection at a
+// time (sequential client.call()s reuse one pooled socket; the
+// enableKeepAlive=false case relies on the client closing between calls). A test
+// that needs TWO concurrent connections must use one RawCaptureServer per
+// connection (or the stub factory), or this fixture must first be extended to
+// serve each accepted connection on its own joined thread.
+// -------------------------------------------------------------------------
+struct RawResponsePolicy
+{
+  std::chrono::milliseconds delayBeforeResponse{0}; ///< task-7.6: hold before replying
+  bool closeAfterResponse{false};              ///< emit "Connection: close" and drop the socket
+  std::vector<std::string> extraResponseHeaders; ///< task-7.2c: e.g. "Content-Encoding: gzip"
+  std::string body{kJsonRpcSuccessBody};
+  int statusCode{200};
+  std::string reason{"OK"};
+};
+
+class RawCaptureServer
+{
+public:
+  explicit RawCaptureServer(std::uint16_t port, RawResponsePolicy policy = {})
+      : _policy(std::move(policy))
+  {
+    _listenFd = makeListener(port);
+    if (_listenFd < 0)
+    {
+      throw std::runtime_error("RawCaptureServer: cannot listen on port " + std::to_string(port));
+    }
+    _thread = std::thread([this] { run(); });
+  }
+
+  ~RawCaptureServer() { stop(); }
+  RawCaptureServer(const RawCaptureServer &) = delete;
+  RawCaptureServer &operator=(const RawCaptureServer &) = delete;
+
+  /// \brief Stop the accept loop and join the thread. Joining is the
+  /// happens-before that makes acceptedConnectionCount() reflect every accept.
+  void stop()
+  {
+    if (!_stop.exchange(true))
+    {
+      if (_thread.joinable())
+      {
+        _thread.join();
+      }
+      if (_listenFd >= 0)
+      {
+        ::close(_listenFd);
+        _listenFd = -1;
+      }
+    }
+  }
+
+  /// \brief Every captured request's raw CRLF-delimited FIELD lines (the request
+  /// line is excluded), in arrival order. A field line is captured verbatim, so a
+  /// duplicate header appears twice and byte-exact spelling is observable.
+  std::vector<std::vector<std::string>> capturedRequests() const
+  {
+    std::lock_guard<std::mutex> lk(_m);
+    return _requests;
+  }
+
+  std::size_t requestCount() const
+  {
+    std::lock_guard<std::mutex> lk(_m);
+    return _requests.size();
+  }
+
+  /// \brief TCP connections accepted. The reliable happens-before is stop()'s
+  /// join (see the class comment) — read this only after stop(); the acquire load
+  /// merely keeps an incidental live read coherent, it does not make it final.
+  std::size_t acceptedConnectionCount() const
+  {
+    return _accepted.load(std::memory_order_acquire);
+  }
+
+  /// \brief True if any response write failed to fully send (cpp17 L-4). Lets a
+  /// delay/close-policy test distinguish a fixture I/O failure from a client
+  /// failure. Read after stop().
+  bool writeError() const { return _writeError.load(std::memory_order_acquire); }
+
+  /// \brief Block until at least `n` requests are captured, or the bound elapses.
+  bool waitForRequests(std::size_t n,
+                       std::chrono::milliseconds bound = std::chrono::seconds(3)) const
+  {
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+    for (;;)
+    {
+      if (requestCount() >= n)
+      {
+        return true;
+      }
+      if (std::chrono::steady_clock::now() >= deadline)
+      {
+        return requestCount() >= n;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+
+private:
+  static int makeListener(std::uint16_t port)
+  {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+    {
+      return -1;
+    }
+    int opt = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+    addr.sin_port = htons(port);
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+    {
+      ::close(fd);
+      return -1;
+    }
+    if (::listen(fd, 16) < 0)
+    {
+      ::close(fd);
+      return -1;
+    }
+    // Non-blocking LISTEN socket so the accept loop can poll _stop and exit
+    // promptly on teardown. This is the SOLE teardown wakeup, so a failed fcntl
+    // must fail construction (ts R2-L1) — a blocking accept() with no timeout
+    // would make stop()/join() hang unboundedly. The accepted socket stays
+    // blocking with a recv timeout (set in run()).
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
+
+  /// \brief Send `data` fully; returns false if a send failed before completion.
+  static bool writeAll(int fd, const std::string &data)
+  {
+    std::size_t off = 0;
+    while (off < data.size())
+    {
+      ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+      if (n <= 0)
+      {
+        return false;
+      }
+      off += static_cast<std::size_t>(n);
+    }
+    return true;
+  }
+
+  /// \brief Case-insensitive prefix test, reusing the foundation's ASCII-only,
+  /// locale-independent comparator (simpl L-1) rather than a std::tolower loop.
+  static bool startsWithCi(const std::string &line, std::string_view prefix)
+  {
+    return line.size() >= prefix.size() &&
+           iora::core::StringUtils::iequals(std::string_view(line).substr(0, prefix.size()),
+                                            prefix);
+  }
+
+  void run()
+  {
+    while (!_stop.load())
+    {
+      sockaddr_in ca{};
+      socklen_t cl = sizeof(ca);
+      int cs = ::accept(_listenFd, reinterpret_cast<sockaddr *>(&ca), &cl);
+      if (cs < 0)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+      _accepted.fetch_add(1, std::memory_order_relaxed);
+      timeval tv{};
+      tv.tv_sec = 0;
+      tv.tv_usec = 400 * 1000;
+      ::setsockopt(cs, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      serveConnection(cs);
+      ::close(cs);
+    }
+  }
+
+  /// \brief KEEP-ALIVE loop: serve requests on this one accepted socket until the
+  /// peer closes, stop() is requested, or the policy says close-after-response.
+  /// `carry` holds any bytes read past one request (for the next request).
+  void serveConnection(int cs)
+  {
+    std::string carry; // bytes read beyond one request, kept for the next (web L-5)
+    for (;;)
+    {
+      if (_stop.load()) // ts M-1: return promptly on teardown, not on peer whim
+      {
+        return;
+      }
+      std::vector<std::string> fieldLines;
+      if (!readOneRequest(cs, carry, fieldLines))
+      {
+        return; // peer closed, real error, or stop() during an idle wait
+      }
+      {
+        std::lock_guard<std::mutex> lk(_m);
+        _requests.push_back(std::move(fieldLines));
+      }
+      if (!interruptibleDelay(_policy.delayBeforeResponse)) // ts M-1
+      {
+        return; // stop() requested during the scripted delay
+      }
+      if (!writeAll(cs, buildResponse()))
+      {
+        _writeError.store(true, std::memory_order_release); // cpp17 L-4
+      }
+      if (_policy.closeAfterResponse)
+      {
+        return;
+      }
+    }
+  }
+
+  /// \brief Sleep up to `d`, polling _stop every 20 ms. Returns false if stop()
+  /// was requested during the wait, so serveConnection can bail out promptly
+  /// instead of blocking teardown for the full scripted delay (ts M-1).
+  bool interruptibleDelay(std::chrono::milliseconds d)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      if (_stop.load())
+      {
+        return false;
+      }
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+      std::this_thread::sleep_for(std::min(std::chrono::milliseconds(20), remaining));
+    }
+    return true;
+  }
+
+  /// \brief Read exactly one request off `cs`: its CRLF-delimited field lines
+  /// into `fieldLines` (request line excluded), then consume the Content-Length
+  /// body. Bytes read past this request are retained in `carry` for the next call
+  /// (web L-5 — correct even if the client ever coalesces requests). A recv
+  /// timeout (SO_RCVTIMEO) with no complete request yet means the keep-alive
+  /// socket is merely IDLE: keep waiting rather than closing it (web M-4 — else a
+  /// client that holds a pooled socket idle > 400 ms would see a spurious
+  /// reconnect and break one-pool-one-socket assertions), while polling _stop for
+  /// prompt teardown (ts M-1). Returns false on peer close, real error, or stop().
+  bool readOneRequest(int cs, std::string &carry, std::vector<std::string> &fieldLines)
+  {
+    std::string acc = std::move(carry);
+    carry.clear();
+    char buf[2048];
+    std::size_t headerEnd = acc.find("\r\n\r\n");
+    while (headerEnd == std::string::npos)
+    {
+      ssize_t n = ::recv(cs, buf, sizeof(buf), 0);
+      if (n > 0)
+      {
+        acc.append(buf, static_cast<std::size_t>(n));
+        headerEnd = acc.find("\r\n\r\n");
+      }
+      else if (n == 0)
+      {
+        return false; // orderly peer close
+      }
+      else if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        if (_stop.load())
+        {
+          return false;
+        }
+        continue; // idle keep-alive socket: keep waiting for the next request
+      }
+      else
+      {
+        return false; // real socket error
+      }
+    }
+
+    const std::string headerBlock = acc.substr(0, headerEnd);
+    std::vector<std::string> lines;
+    std::size_t pos = 0;
+    while (pos <= headerBlock.size())
+    {
+      std::size_t nl = headerBlock.find("\r\n", pos);
+      if (nl == std::string::npos)
+      {
+        lines.push_back(headerBlock.substr(pos));
+        break;
+      }
+      lines.push_back(headerBlock.substr(pos, nl - pos));
+      pos = nl + 2;
+    }
+
+    // lines[0] is the request line; lines[1..] are the field lines.
+    static constexpr std::string_view kContentLength = "content-length:";
+    std::size_t contentLength = 0;
+    for (std::size_t i = 1; i < lines.size(); ++i)
+    {
+      fieldLines.push_back(lines[i]);
+      if (startsWithCi(lines[i], kContentLength))
+      {
+        const std::string v = lines[i].substr(kContentLength.size());
+        try
+        {
+          contentLength = static_cast<std::size_t>(std::stoul(v));
+        }
+        catch (...)
+        {
+          contentLength = 0;
+        }
+      }
+    }
+
+    // Consume the body (Content-Length bytes) so the next request reads clean.
+    std::string bodyAcc = acc.substr(headerEnd + 4);
+    while (bodyAcc.size() < contentLength)
+    {
+      ssize_t n = ::recv(cs, buf, sizeof(buf), 0);
+      if (n > 0)
+      {
+        bodyAcc.append(buf, static_cast<std::size_t>(n));
+      }
+      else if (n == 0)
+      {
+        return false; // closed mid-body
+      }
+      else if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        if (_stop.load())
+        {
+          return false;
+        }
+        continue;
+      }
+      else
+      {
+        return false;
+      }
+    }
+    // Keep any bytes beyond this request's body for the next request (web L-5).
+    if (bodyAcc.size() > contentLength)
+    {
+      carry = bodyAcc.substr(contentLength);
+    }
+    return true;
+  }
+
+  std::string buildResponse() const
+  {
+    std::string r =
+      "HTTP/1.1 " + std::to_string(_policy.statusCode) + " " + _policy.reason + "\r\n";
+    // web L-6: 1xx/204/304 carry no body and no Content-Length (RFC 9112 6.3
+    // rule 1). Current callers only use 200, but a policy setting one of these
+    // must not emit a framing violation.
+    const bool bodyless = _policy.statusCode == 204 || _policy.statusCode == 304 ||
+                          (_policy.statusCode >= 100 && _policy.statusCode < 200);
+    if (!bodyless)
+    {
+      r += "Content-Type: application/json\r\n";
+      r += "Content-Length: " + std::to_string(_policy.body.size()) + "\r\n";
+    }
+    for (const auto &h : _policy.extraResponseHeaders)
+    {
+      r += h + "\r\n";
+    }
+    if (_policy.closeAfterResponse)
+    {
+      r += "Connection: close\r\n";
+    }
+    r += "\r\n";
+    if (!bodyless)
+    {
+      r += _policy.body;
+    }
+    return r;
+  }
+
+  RawResponsePolicy _policy;
+  int _listenFd{-1};
+  std::thread _thread;
+  // seq_cst is the deliberate safe default for the stop flag (ts R2-L3): it
+  // publishes no companion non-atomic data (the definitive teardown sync is
+  // stop()'s join), so the ordering is not load-bearing — kept idiomatic.
+  std::atomic<bool> _stop{false};
+  std::atomic<std::size_t> _accepted{0};
+  std::atomic<bool> _writeError{false};
+  mutable std::mutex _m;
+  std::vector<std::vector<std::string>> _requests;
+};
+
+/// \brief True if `lines` contains a field line whose spelling equals `expected`
+/// exactly (byte for byte). Used to assert wire-level header content.
+bool hasFieldLine(const std::vector<std::string> &lines, const std::string &expected)
+{
+  for (const auto &l : lines)
+  {
+    if (l == expected)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// \brief A factory that records the derived HttpClient::Config it is handed and
+/// sets `gotIt`, then builds a client honouring it. Shared by the task-7.1a/7.1b
+/// derived-config verification tests (simpl L-3).
+Config::HttpClientFactory capturingFactory(iora::network::HttpClient::Config &captured,
+                                           std::atomic<bool> &gotIt)
+{
+  return [&captured, &gotIt](const std::string &, const iora::network::HttpClient::Config &derived)
+  {
+    captured = derived;
+    gotIt.store(true);
+    return std::make_unique<iora::network::HttpClient>(derived);
+  };
+}
 
 /// \brief Bring up a single process-wide IoraService the client ctor requires.
 /// JsonRpcClient's constructor takes an IoraService& and a core::ThreadPool&,
@@ -2170,11 +2639,14 @@ namespace
 /// \details The wait is bounded, so a regression that never releases the latch
 /// still terminates. Both latches are captured BY REFERENCE, so every caller
 /// must outlive the client (all do — the latches are declared before it).
-std::function<std::unique_ptr<iora::network::HttpClient>(const std::string &)>
+Config::HttpClientFactory
 parkingFactory(std::string parkEndpoint, TestLatch &entered, TestLatch &release,
                std::chrono::milliseconds bound = std::chrono::seconds(5))
 {
-  return [&entered, &release, parkEndpoint, bound](const std::string &ep)
+  // task-7.1b: the factory now receives the derived config; this pool-mechanics
+  // helper ignores it (it never talks to the network).
+  return [&entered, &release, parkEndpoint, bound](const std::string &ep,
+                                                   const iora::network::HttpClient::Config &)
   {
     if (ep == parkEndpoint)
     {
@@ -2303,7 +2775,8 @@ TEST_CASE("task-6.3 R-3: a factory throw rolls the reservation back exactly",
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 2;
   cfg.httpClientFactory =
-    [&factoryCalls, &armed](const std::string &) -> std::unique_ptr<iora::network::HttpClient>
+    [&factoryCalls, &armed](const std::string &, const iora::network::HttpClient::Config &)
+    -> std::unique_ptr<iora::network::HttpClient>
   {
     factoryCalls.fetch_add(1);
     if (armed.load())
@@ -2970,7 +3443,8 @@ TEST_CASE("task-6.4a(w): a rolled-back creation strands no pool in a maxEndpoint
   Config cfg = stubFactoryConfig();
   cfg.maxEndpointPools = 2;
   cfg.httpClientFactory =
-    [&armed](const std::string &) -> std::unique_ptr<iora::network::HttpClient>
+    [&armed](const std::string &, const iora::network::HttpClient::Config &)
+    -> std::unique_ptr<iora::network::HttpClient>
   {
     if (armed.load())
     {
@@ -3023,7 +3497,8 @@ TEST_CASE("task-6.4a(w2): one thread's rollback does not retire a pool another i
 
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 2; // both threads may reserve
-  cfg.httpClientFactory = [&](const std::string &ep) -> std::unique_ptr<iora::network::HttpClient>
+  cfg.httpClientFactory = [&](const std::string &ep, const iora::network::HttpClient::Config &)
+    -> std::unique_ptr<iora::network::HttpClient>
   {
     if (ep == epE && calls.fetch_add(1) == 0)
     {
@@ -3756,6 +4231,315 @@ TEST_CASE("task-6.4b(z): a batch send fast-fails on a reused connection once clo
   const auto t1 = std::chrono::steady_clock::now();
   client.reset();
   REQUIRE(std::chrono::steady_clock::now() - t1 < std::chrono::seconds(2));
+}
+
+// =========================================================================
+// task-7.0a — RAW-BYTE CAPTURE fixture self-tests. These prove the fixture the
+// later phase-7 tasks (7.1a, 7.2b, 7.2c, 7.2d, 7.4, 7.6) build on: it captures
+// exact request FIELD LINES (not a parsed map), the keep-alive loop serves >1
+// request on ONE accepted connection, and the scripted delay/close/response-
+// header policy works. Default factory, maxRetries=0 for deterministic captures.
+// =========================================================================
+TEST_CASE("task-7.0a: raw-capture server records a request's exact field lines",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18160;
+  RawCaptureServer server(port);
+
+  Config cfg; // real (non-stub) factory so the client talks to the raw server
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  const auto result = client.call(ep, "ping");
+  REQUIRE(result.is_object()); // the JSON-RPC success "result" ({})
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop(); // join the accept thread: happens-before the count read
+  REQUIRE(server.acceptedConnectionCount() == 1);
+
+  const auto reqs = server.capturedRequests();
+  REQUIRE(reqs.size() == 1);
+  // Field lines are captured verbatim (a vector of raw lines), NOT a parsed map:
+  // the request line is excluded and the Host / Content-Type / Content-Length
+  // field lines are present exactly as sent.
+  REQUIRE(reqs[0].size() > 0);
+  REQUIRE(hasFieldLine(reqs[0], "Content-Type: application/json"));
+}
+
+TEST_CASE("task-7.0a: the keep-alive loop serves two requests on one accepted connection",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18161;
+  RawCaptureServer server(port);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  // Two sequential calls on the same endpoint: the pooled connection is reused
+  // and the underlying HttpClient reuses the socket (reuseConnections defaults
+  // true), so the server accepts exactly ONE connection and captures TWO
+  // requests on it.
+  REQUIRE(client.call(ep, "ping").is_object());
+  REQUIRE(client.call(ep, "ping").is_object());
+
+  REQUIRE(server.waitForRequests(2));
+  server.stop();
+  REQUIRE(server.acceptedConnectionCount() == 1);
+  REQUIRE(server.requestCount() == 2);
+}
+
+TEST_CASE("task-7.0a: the scripted response policy (delay + extra header + close) is honoured",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18162;
+  RawResponsePolicy policy;
+  policy.delayBeforeResponse = std::chrono::milliseconds(40); // well under the 3 s default
+  policy.extraResponseHeaders = {"Content-Encoding: identity"};
+  policy.closeAfterResponse = true; // server sends "Connection: close" and drops the socket
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto result = client.call(ep, "ping");
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+  REQUIRE(result.is_object());
+  // The delay was actually applied (the response did not return instantly).
+  REQUIRE(elapsed >= std::chrono::milliseconds(30));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);
+  // ts R2-L2: the scripted response must have fully sent — a fixture-side send
+  // failure here would otherwise masquerade as a client parse failure. This is
+  // the case that exercises the writeAll path, so it is where writeError() is
+  // asserted.
+  REQUIRE(!server.writeError());
+}
+
+// =========================================================================
+// task-7.1b — a CUSTOM factory receives the derived HttpClient::Config, and all
+// six knobs are mapped from JsonRpcClient::Config. Compiling is NOT receiving
+// (web W5-M1): this captures the `derived` argument and asserts each field, so
+// the whole point of the signature change — that a custom factory can honour the
+// knobs — cannot regress unnoticed. Mutation-testable: making makeHttpClient_
+// pass a default config (or not pass _derivedHttpConfig) fails every CHECK.
+// =========================================================================
+TEST_CASE("task-7.1b: a custom factory receives the derived config with the knobs mapped",
+          "[jsonrpc][pool][phase7][derivedconfig]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.requestTimeout = std::chrono::milliseconds(7000);
+  cfg.connectionTimeout = std::chrono::milliseconds(4000);
+  cfg.enableKeepAlive = false;
+  cfg.socketIdleTimeout = std::chrono::milliseconds(12000); // 12 s -> 12 s
+
+  iora::network::HttpClient::Config captured;
+  std::atomic<bool> gotIt{false};
+  cfg.httpClientFactory = capturingFactory(captured, gotIt);
+
+  JsonRpcClient client(svc, pool, cfg);
+  {
+    // Force one connection creation; the stub-style factory never hits the wire.
+    auto lease = JsonRpcClientTestAccess::acquire(client, "http://unit.test/rpc");
+    (void)lease;
+  }
+
+  REQUIRE(gotIt.load());
+  CHECK(captured.requestTimeout == std::chrono::milliseconds(7000));
+  CHECK(captured.connectTimeout == std::chrono::milliseconds(4000)); // names differ
+  CHECK(captured.reuseConnections == false);                         // enableKeepAlive=false
+  CHECK(captured.connectionIdleTimeout == std::chrono::seconds(12));
+  CHECK(captured.leaseAcquireTimeout == std::chrono::milliseconds(21000)); // 3 x requestTimeout
+  // userAgent is mapped by task-7.3c (consume a caller-supplied User-Agent from
+  // defaultHeaders); until then the derived value is the HttpClient default.
+  CHECK(captured.userAgent == iora::network::HttpClient::Config{}.userAgent);
+}
+
+// task-7.1a — the unit-truncation rule: a sub-second socketIdleTimeout must NOT
+// silently disable reuse. duration_cast<seconds>(50 ms) == 0 s, and
+// `now - lastUsed < 0s` is always false, so an unfloored value would close and
+// reopen the socket on every request. The mapping floors it at 1 s.
+TEST_CASE("task-7.1a: a sub-second socketIdleTimeout floors connectionIdleTimeout at 1 s",
+          "[jsonrpc][pool][phase7][derivedconfig]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.socketIdleTimeout = std::chrono::milliseconds(50); // -> floors to 1 s, not 0 s
+
+  iora::network::HttpClient::Config captured;
+  std::atomic<bool> gotIt{false};
+  cfg.httpClientFactory = capturingFactory(captured, gotIt);
+  JsonRpcClient client(svc, pool, cfg);
+  {
+    auto lease = JsonRpcClientTestAccess::acquire(client, "http://unit.test/rpc");
+    (void)lease;
+  }
+  REQUIRE(gotIt.load());
+  CHECK(captured.connectionIdleTimeout == std::chrono::seconds(1));
+}
+
+// task-7.1a — the unit-truncation floor holds END-TO-END (cpp17 R1-M2, the
+// accept-count discriminator the tracker mandates): a sub-second socketIdleTimeout
+// floored to 1 s must still permit socket REUSE. Two back-to-back calls (well
+// within 1 s) reuse one socket -> ONE accepted connection. Mutation-test: an
+// unfloored 50 ms -> 0 s connectionIdleTimeout would make every request close and
+// reopen -> TWO accepts.
+TEST_CASE("task-7.1a: a sub-second socketIdleTimeout still permits reuse (default factory)",
+          "[jsonrpc][pool][phase7][derivedconfig]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18165;
+  RawCaptureServer server(port);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.socketIdleTimeout = std::chrono::milliseconds(50); // floors to 1 s
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE(client.call(ep, "ping").is_object());
+  REQUIRE(client.call(ep, "ping").is_object());
+
+  REQUIRE(server.waitForRequests(2));
+  server.stop();
+  REQUIRE(server.acceptedConnectionCount() == 1); // floored -> reuse preserved
+  REQUIRE(server.requestCount() == 2);
+}
+
+// task-7.1a — enableKeepAlive maps to reuseConnections END-TO-END through the
+// DEFAULT factory: with it false, HttpClient sends "Connection: close" and drops
+// the socket after each response, so two sequential calls open TWO sockets. The
+// keep-alive smoke test above shows the true case opens ONE — together they
+// mutation-test the mapping.
+TEST_CASE("task-7.1a: enableKeepAlive=false opens a fresh socket per call (default factory)",
+          "[jsonrpc][pool][phase7][derivedconfig]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18163;
+  RawCaptureServer server(port);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.enableKeepAlive = false;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE(client.call(ep, "ping").is_object());
+  REQUIRE(client.call(ep, "ping").is_object());
+
+  REQUIRE(server.waitForRequests(2));
+  server.stop();
+  REQUIRE(server.acceptedConnectionCount() == 2); // no reuse -> two sockets
+  REQUIRE(server.requestCount() == 2);
+}
+
+// task-7.1a — requestTimeout reaches HttpClient. Set it to 200 ms against a
+// server that delays 600 ms: with the mapping the call fails before the response
+// arrives; with the OLD 3000 ms HttpClient default it would have succeeded. This
+// is the "value clearly distinguishable from 3000 ms" discriminator.
+TEST_CASE("task-7.1a: requestTimeout reaches HttpClient (below the response delay -> failure)",
+          "[jsonrpc][pool][phase7][derivedconfig]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18164;
+  RawResponsePolicy policy;
+  policy.delayBeforeResponse = std::chrono::milliseconds(600);
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.requestTimeout = std::chrono::milliseconds(200); // below the 600 ms delay
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  bool threw = false;
+  const auto t0 = std::chrono::steady_clock::now();
+  try
+  {
+    (void)client.call(ep, "ping");
+  }
+  catch (...)
+  {
+    threw = true;
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+  REQUIRE(threw);
+  // cpp17 L-3: bound the failure time so a non-timeout error can't pass this
+  // spuriously — the failure must occur at ~200 ms (well before the 600 ms
+  // response, and far below the old 3000 ms default that would have succeeded).
+  REQUIRE(elapsed < std::chrono::milliseconds(500));
+  server.stop();
+}
+
+// task-7.1a — connectionTimeout reaches HttpClient END-TO-END through the DEFAULT
+// factory (cpp17 R1-M1). Connect to a NON-ROUTABLE address (192.0.2.1, RFC 5737
+// TEST-NET-1) whose SYN is black-holed, so connect blocks until connectTimeout.
+// 192.0.2.1 is NOT loopback, so http_client's loopback clamp (min 200 ms) does
+// NOT apply, giving a clean discriminator: mapped -> ~50 ms; unmapped -> the
+// HttpClient 2000 ms default. Assert the failure lands well under 1 s.
+// (Verified 2026-09-02 that this host black-holes a non-routable SYN; if a future
+// host fast-refuses it — ENETUNREACH/ECONNREFUSED — this discriminator collapses
+// and would need revisiting.)
+TEST_CASE("task-7.1a: connectionTimeout reaches HttpClient (non-routable connect times out fast)",
+          "[jsonrpc][pool][phase7][derivedconfig]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.connectionTimeout = std::chrono::milliseconds(50); // mapped -> ~50 ms connect budget
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://192.0.2.1:80/rpc";
+
+  bool threw = false;
+  const auto t0 = std::chrono::steady_clock::now();
+  try
+  {
+    (void)client.call(ep, "ping");
+  }
+  catch (...)
+  {
+    threw = true;
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+  REQUIRE(threw);
+  // Mapped 50 ms vs the unmapped 2000 ms default — reverting the connectTimeout
+  // mapping pushes this well past 1 s and fails the bound.
+  REQUIRE(elapsed < std::chrono::seconds(1));
+  // cpp17 R2-L1: the LOWER bound guards against a host that FAST-REFUSES
+  // 192.0.2.1 (ENETUNREACH/ECONNREFUSED in ~0 ms) rather than black-holing the
+  // SYN — there the discriminator is inert, and without this the test would go
+  // vacuously green. A black-holing host consumes the full ~50 ms budget, so
+  // elapsed >= 25 ms; a fast-refuse host trips this loudly instead.
+  REQUIRE(elapsed >= std::chrono::milliseconds(25));
 }
 
 int main(int argc, char *argv[])

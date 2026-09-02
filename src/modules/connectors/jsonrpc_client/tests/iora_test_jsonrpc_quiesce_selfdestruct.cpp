@@ -96,7 +96,7 @@ iora::IoraService &testService()
 Config stubConfig()
 {
   Config cfg;
-  cfg.httpClientFactory = [](const std::string &)
+  cfg.httpClientFactory = [](const std::string &, const iora::network::HttpClient::Config &)
   { return std::make_unique<iora::network::HttpClient>(); };
   cfg.maxRetries = 0; // fail fast so onError fires promptly on the worker
   return cfg;
