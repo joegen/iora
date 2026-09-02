@@ -741,8 +741,13 @@ private:
 // -------------------------------------------------------------------------
 struct RawResponsePolicy
 {
-  std::chrono::milliseconds delayBeforeResponse{0}; ///< task-7.6: hold before replying
+  std::chrono::milliseconds delayBeforeResponse{0}; ///< task-7.1a: hold before replying
   bool closeAfterResponse{false};              ///< emit "Connection: close" and drop the socket
+  /// task-7.6: scripted keep-alive idle timeout. After a response, if the peer
+  /// leaves the socket idle (no next-request bytes) for longer than this, the
+  /// server closes it — modelling a real server's keepAliveTimeout (Node.js /
+  /// Apache default 5 s). 0 (the default) means idle forever, never closing.
+  std::chrono::milliseconds closeAfterIdleMs{0};
   std::vector<std::string> extraResponseHeaders; ///< task-7.2c: e.g. "Content-Encoding: gzip"
   std::string body{kJsonRpcSuccessBody};
   int statusCode{200};
@@ -999,6 +1004,10 @@ private:
     std::string acc = std::move(carry);
     carry.clear();
     char buf[2048];
+    // task-7.6: the idle-close clock starts when we begin waiting for a request.
+    // It only elapses while NO bytes of the next request have arrived, so a
+    // request mid-transfer is never truncated.
+    const auto idleStart = std::chrono::steady_clock::now();
     std::size_t headerEnd = acc.find("\r\n\r\n");
     while (headerEnd == std::string::npos)
     {
@@ -1017,6 +1026,21 @@ private:
         if (_stop.load())
         {
           return false;
+        }
+        // task-7.6: a scripted keep-alive idle timeout. While no bytes of the
+        // next request have arrived (acc.empty()), an idle socket held past
+        // closeAfterIdleMs is closed, modelling a server's keepAliveTimeout.
+        // Detection granularity is the SO_RCVTIMEO period (400 ms). Zero
+        // disables it (the default: idle forever). INTENTIONAL LIMITATION (ts
+        // R1-L1): the acc.empty() guard means a peer that sends a PARTIAL header
+        // and then idles is never idle-closed — the server commits to reading the
+        // request rather than truncating it (a faithful, race-free server model).
+        // Teardown is unaffected: the _stop check above runs every 400 ms tick.
+        // No test needs partial-then-idle, so this is not modelled (YAGNI).
+        if (_policy.closeAfterIdleMs.count() > 0 && acc.empty() &&
+            (std::chrono::steady_clock::now() - idleStart) > _policy.closeAfterIdleMs)
+        {
+          return false; // simulated server-side keep-alive expiry
         }
         continue; // idle keep-alive socket: keep waiting for the next request
       }
@@ -1772,6 +1796,13 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
   cfg.globalMaxConnections = 1;      // the CR-2 ladder gate after idle expiry
   cfg.maxConnectionsPerEndpoint = 8;
   cfg.idleTimeout = std::chrono::milliseconds(200);
+  // task-7.6(e): pin the socket window to 5 s so this repro's 200 ms idleTimeout
+  // governs ONLY wrapper-object retirement (the CR-2 ladder) and never reaches
+  // HttpClient::connectionIdleTimeout. 5 s > every sleep below, so the underlying
+  // socket is not recycled underneath the wrapper eviction, and 5 s is above the
+  // 1 s floor so the max(1 s, ...) unit rule is not exercised here. The recorded
+  // pre-fix mutation signal (revert task-5.2 -> empty snapshot) still reproduces.
+  cfg.socketIdleTimeout = std::chrono::seconds(5);
   cfg.maxRetries = 0;
   JsonRpcClient client(svc, pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
@@ -4582,6 +4613,189 @@ TEST_CASE("task-7.1a: connectionTimeout reaches HttpClient (non-routable connect
   // vacuously green. A black-holing host consumes the full ~50 ms budget, so
   // elapsed >= 25 ms; a fast-refuse host trips this loudly instead.
   REQUIRE(elapsed >= std::chrono::milliseconds(25));
+}
+
+// =========================================================================
+// task-7.6 — Config defaults. The socket window is now 3 s (task-7.6(a)):
+// strictly below the common ~5 s server keep-alive floor, so the client recycles
+// a pooled socket before a typical server closes it. The wrapper-object window
+// (idleTimeout) is UNCHANGED at 30 s (task-7.6(b)) — the two lifetimes are
+// separate knobs. Asserted by config inspection, not by waiting (web W6-M9): a
+// 30 s wall-clock wait would exceed task-1.1(e)'s 60 s per-test bound with no
+// margin, and the DEFAULT is what needs confirming, not the timer.
+// =========================================================================
+TEST_CASE("task-7.6: Config defaults — socketIdleTimeout 3 s, idleTimeout 30 s",
+          "[jsonrpc][pool][phase7][config]")
+{
+  const Config def;
+  CHECK(def.socketIdleTimeout == std::chrono::seconds(3)); // web W6-M9
+  CHECK(def.idleTimeout == std::chrono::seconds(30));      // wrapper window unchanged
+}
+
+// =========================================================================
+// task-7.6 — RAW-CAPTURE FIXTURE self-test for the scripted keep-alive idle
+// timeout (task-1.3 round-3 extension: `closeAfterIdleMs`). Independent of
+// JsonRpcClient — a hand-driven socket sends one request, reads the response,
+// then idles; the server must close the socket on its own after closeAfterIdleMs.
+// This proves the fixture extension the behaviour test below relies on, and
+// mutation-guards it (a fixture that never idle-closes would hang this recv to
+// its 3 s timeout and fail the orderly-close assertion).
+// =========================================================================
+TEST_CASE("task-7.6: closeAfterIdleMs closes an idle keep-alive socket (fixture self-test)",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  const std::uint16_t port = 18166;
+  RawResponsePolicy policy;
+  policy.closeAfterIdleMs = std::chrono::milliseconds(600); // server drops an idle socket at ~0.6-1.0 s
+  RawCaptureServer server(port, policy);
+
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(fd >= 0);
+  // A recv timeout so a fixture that FAILS to close cannot hang the test.
+  timeval tv{};
+  tv.tv_sec = 3;
+  tv.tv_usec = 0;
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+  addr.sin_port = htons(port);
+  REQUIRE(::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+
+  const std::string req =
+    "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n";
+  REQUIRE(::send(fd, req.data(), req.size(), MSG_NOSIGNAL) ==
+          static_cast<ssize_t>(req.size()));
+
+  char buf[2048];
+  const ssize_t got = ::recv(fd, buf, sizeof(buf), 0); // the canned response
+  REQUIRE(got > 0);
+
+  // Now idle. The server closes the keep-alive socket on its own after
+  // closeAfterIdleMs, which surfaces here as an orderly peer close (recv == 0)
+  // well within the 3 s recv timeout.
+  const ssize_t closed = ::recv(fd, buf, sizeof(buf), 0);
+  ::close(fd);
+  REQUIRE(closed == 0); // orderly server-side close, not a timeout (-1/EAGAIN)
+
+  server.stop();
+  REQUIRE(server.acceptedConnectionCount() == 1);
+  REQUIRE(server.requestCount() == 1);
+}
+
+// =========================================================================
+// task-7.6 — the behaviour the default change buys (verification: "a SINGLE
+// successful call, not four attempts"). THE SAFE ORDERING: a server whose
+// keep-alive idle timeout closes a pooled socket models the real-world ~5 s
+// floor. With socketIdleTimeout pinned BELOW that floor, the client recycles its
+// OWN idle socket first and opens a fresh one for the next call, so the second
+// call succeeds on its FIRST attempt with no retry. (This is what the below-floor
+// default REDUCES the race to; the observable recovery when the race IS hit — the
+// dangerous ordering — is the retry, safe only for the closed-before-write case
+// per RFC 9110 §9.2.2, see tracker 2026-09-03-2, exercised by the companion test
+// below.)
+//
+// maxRetries=0 makes this strict: were the client to reuse a server-closed
+// socket, the write would fail and the call would THROW rather than being masked
+// by a silent retry. The recycle is proved by acceptedConnectionCount()==2.
+//
+// MUTATION (run by reverting production; must turn this RED): raise
+// socketIdleTimeout back above the server keep-alive (e.g. the old 300 s), and
+// call 2 reuses the socket the server closed — the second REQUIRE throws
+// (write to a dead socket, maxRetries=0) or, if the server has not yet closed,
+// the reuse yields acceptedConnectionCount()==1. Either way the case fails.
+// =========================================================================
+TEST_CASE("task-7.6: socketIdleTimeout below the server keep-alive floor recycles, one successful call",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18167;
+  RawResponsePolicy policy;
+  policy.closeAfterIdleMs = std::chrono::milliseconds(1200); // server closes idle socket at ~1.2-1.6 s
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;                              // no retry can mask a dead-socket reuse
+  cfg.socketIdleTimeout = std::chrono::seconds(1); // client recycles its socket after 1 s (below server)
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE(client.call(ep, "ping").is_object()); // call 1 -> accept #1, pooled socket S1
+
+  // Idle 1.5 s: past the 1 s socket window, so the client evicts+reopens at call 2
+  // REGARDLESS of whether the server has already closed S1 (both orderings yield a
+  // fresh accept). The assertion below does not discriminate that timing; it
+  // proves the client did not keep reusing one socket.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  REQUIRE(client.call(ep, "ping").is_object()); // call 2 -> recycled -> fresh S2, first-try success
+
+  REQUIRE(server.waitForRequests(2));
+  server.stop();
+  REQUIRE(server.acceptedConnectionCount() == 2); // recycled its own idle socket, did NOT reuse
+  REQUIRE(server.requestCount() == 2);
+}
+
+// =========================================================================
+// task-7.6 — THE DANGEROUS ORDERING (web domain review M-1): the failure mode the
+// below-floor default is designed to survive when it IS hit. Here the client
+// socket window (5 s) is ABOVE the server's keep-alive (~1 s), so at call 2 the
+// client reuses a socket the server has already closed — the classic keep-alive
+// race. With retries enabled (default maxRetries=3), that reset surfaces as an
+// exception which sendJsonWithRetries_ retries on a FRESH socket (HttpClient
+// evicts the dead one), so the call still returns a single success — NOT the
+// "four attempts" the verification warns against. This test asserts the desired
+// OBSERVABLE (the call recovers); it is the closed-while-idle-BEFORE-the-write
+// case, which RFC 9110 §9.2.2 treats as provably-not-applied and therefore safe
+// to retry. NB: the retry loop does NOT currently restrict itself to that case
+// (it retries any exception — a double-submit hazard for non-idempotent POST,
+// tracked in 2026-09-03-2); when that lands, the reused-dead-socket case must be
+// classified provably-not-sent so this test stays green. The 3 s default only
+// lowers how often this path is taken. Complements the safe-ordering test above.
+//
+// Determinism / robustness: the server closes S1 at the first SO_RCVTIMEO idle
+// tick past closeAfterIdleMs=700 ms (nominal ~800 ms; ticks at ~400/800/1200 ms);
+// the 2200 ms sleep clears it by ~1.4 s of slack — more than three ticks — so a
+// load-slipped tick cannot push the close past the reuse (cpp17 R2-N1, ts R2-L1).
+// requestTimeout is pinned to 2 s so a dead-socket write that buffers and fails
+// only on read is bounded at 2 s, not the 30 s default (web R2-L2). Result: two
+// accepts (dead S1 + retry S2), two captured requests (call 1 on S1, the
+// recovered call 2 on S2; the dead-socket write is RST'd, never captured).
+// =========================================================================
+TEST_CASE("task-7.6: a reused socket the server already closed is retried on a fresh one — one success",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18168;
+  RawResponsePolicy policy;
+  policy.closeAfterIdleMs = std::chrono::milliseconds(700); // server closes idle socket at ~0.8 s
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3;                              // recovery budget (the default)
+  cfg.socketIdleTimeout = std::chrono::seconds(5); // ABOVE the server floor -> the client WILL reuse
+  cfg.requestTimeout = std::chrono::seconds(2);    // bound dead-socket detection (web R2-L2)
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE(client.call(ep, "ping").is_object()); // call 1 -> accept #1, pooled socket S1
+
+  // Idle well past the server's ~0.8 s close (~1.4 s of slack) but within the
+  // client's 5 s window, so call 2 reuses the server-closed S1.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+
+  // The reused S1 is dead; the first attempt fails and is retried on a fresh
+  // socket, so the CALL still succeeds — a single successful call, not four.
+  REQUIRE(client.call(ep, "ping").is_object());
+
+  REQUIRE(server.waitForRequests(2));
+  server.stop();
+  REQUIRE(server.acceptedConnectionCount() == 2); // dead S1 dropped + one fresh S2 from the retry
+  REQUIRE(server.requestCount() == 2);            // call 1, then the recovered call 2
 }
 
 // =========================================================================

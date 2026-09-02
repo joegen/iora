@@ -55,8 +55,10 @@ add_test(NAME iora_test_jsonrpc_client_pool
     COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6],[phase7]")
 # RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152/18153
 # the phase-3 latched cases; 18154 the phase-5 CR-2 case; 18155/18156 the phase-6
-# task-6.4b(h)/(z) cases; 18160-18165 the phase-7 raw-capture cases) against any
-# other test that might claim them, independent of the -j1 convention (M2).
+# task-6.4b(h)/(z) cases; 18160-18179 the phase-7 raw-capture cases, incl.
+# 18166/18167/18168 the task-7.6 idle-window cases, 18170 task-7.2b and
+# 18171-18179 task-7.2c) against any other test that might claim them,
+# independent of the -j1 convention (M2).
 #
 # TIMEOUT raised 90 -> 180 when [phase6] was added: the phase-6 block's bounded
 # waits, IN THE FAILURE DIRECTION, sum past 90 s on their own (case (g) allows

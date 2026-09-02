@@ -87,7 +87,7 @@ The plugin exports the following APIs via `IoraService::callExportedApi`:
 | `jsonrpc.client.result` | `iora::core::Json(jobId)` | Get async operation result |
 | `jsonrpc.client.getStats` | `iora::core::Json()` | Get client statistics as JSON object |
 | `jsonrpc.client.resetStats` | `void()` | Reset client statistics |
-| `jsonrpc.client.purgeIdle` | `std::size_t()` | Remove idle connections |
+| `jsonrpc.client.purgeIdle` | `std::size_t()` | Retire idle wrapper objects (app-driven — the client never schedules it) |
 
 ### Batch Item Format
 
@@ -277,9 +277,9 @@ std::cout << "Connections evicted: " << statsJson["connectionsEvicted"] << std::
 // Reset statistics
 svc.callExportedApi<void>("jsonrpc.client.resetStats");
 
-// Purge idle connections
+// Purge idle wrapper objects (the client never schedules this itself)
 auto evicted = svc.callExportedApi<std::size_t>("jsonrpc.client.purgeIdle");
-std::cout << "Evicted " << evicted << " idle connections" << std::endl;
+std::cout << "Evicted " << evicted << " idle wrapper objects" << std::endl;
 ```
 
 ### Custom Headers and Authentication
@@ -347,7 +347,7 @@ enabled = true
 maxConnections = 8                    # Per-endpoint connection limit
 globalMaxConnections = 0              # Global limit (0 = unlimited)
 maxEndpointPools = 0                  # Max endpoint pools (0 = unlimited)
-idleTimeoutMs = 30000                 # Connection idle timeout
+idleTimeoutMs = 30000                 # Wrapper-object retirement window (see note below)
 requestTimeoutMs = 30000              # Request timeout
 connectionTimeoutMs = 10000           # Connection establishment timeout
 maxRetries = 3                        # Retry attempts on failure
@@ -355,7 +355,7 @@ retryBackoffMultiplier = 2.0          # Exponential backoff multiplier
 initialRetryDelayMs = 100             # Initial retry delay
 maxRetryDelayMs = 5000                # Maximum retry delay
 enableKeepAlive = true                # HTTP keep-alive
-defaultHeaders = "User-Agent:IoraClient,Accept:application/json"
+defaultHeaders = "User-Agent:IoraClient"   # User-Agent is consumed into the client's UA; the client sets Content-Type itself and sends no Accept
 
 [iora.modules.jsonrpcClient.tls]
 verifyPeer = true                     # Verify SSL certificates
@@ -372,7 +372,7 @@ clientKeyPath = "/path/to/client.key" # Client private key for mTLS
 | `maxConnections` | int | `8` | Max connections per endpoint |
 | `globalMaxConnections` | int | `0` | Global connection limit (0 = unlimited) |
 | `maxEndpointPools` | int | `0` | Max endpoint pools (0 = unlimited) |
-| `idleTimeoutMs` | int | `30000` | Idle timeout for connections |
+| `idleTimeoutMs` | int | `30000` | Idle window after which `purgeIdle()` may retire a pooled **HttpClient wrapper object** — NOT its socket (see the note below) |
 | `requestTimeoutMs` | int | `30000` | Individual request timeout |
 | `connectionTimeoutMs` | int | `10000` | Connection establishment timeout |
 | `maxRetries` | int | `3` | Maximum retry attempts |
@@ -381,6 +381,42 @@ clientKeyPath = "/path/to/client.key" # Client private key for mTLS
 | `maxRetryDelayMs` | int | `5000` | Maximum retry delay |
 | `enableKeepAlive` | bool | `true` | Enable HTTP keep-alive |
 | `defaultHeaders` | string | - | Default headers (format: "Key:Value,Key2:Value2") |
+
+#### Two idle windows: object vs socket
+
+The client tracks **two distinct idle lifetimes**, and they are not the same thing:
+
+- **`idleTimeout`** (TOML `idleTimeoutMs`, default **30 s**) governs the pooled
+  **`HttpClient` wrapper object** — the unit the pool holds, which owns a
+  `Transport` and a `DnsClient`. It bounds only when `purgeIdle()` is *allowed*
+  to retire that object; it says nothing about the socket.
+- **`socketIdleTimeout`** (a programmatic `Config` field, default **3 s**)
+  governs the underlying **TCP socket**, driving
+  `HttpClient::Config::connectionIdleTimeout`. It defaults **below the common
+  server keep-alive floor** — Node.js `server.keepAliveTimeout` and Apache
+  `KeepAliveTimeout` both default to 5 s (nginx `keepalive_timeout` is 75 s) —
+  so the client recycles a pooled socket *before* a conforming server at or above
+  that floor would close it. This **reduces** the keep-alive reuse race — it is
+  not absolute: an intermediary (proxy/load balancer) with a sub-3 s idle timeout
+  can still close a socket the client then reuses. That reset is retried on a
+  fresh socket, but only the *closed-while-idle-before-the-write* case is
+  provably-not-applied and safe to retry per **RFC 9110 §9.2.2**; the retry loop
+  does not currently restrict itself to that case (it retries any error, a
+  double-submit hazard for non-idempotent POST — see the retry-safety tracker
+  2026-09-03-2). The window only lowers how often the race is hit.
+  **Tradeoff:** against a long-keep-alive
+  peer (nginx 75 s, cloud LBs) a workload with request gaps > 3 s pays a fresh TCP
+  connect — and a TLS handshake for `https` — per burst where a longer window
+  would have reused the socket; raise `socketIdleTimeout` for such peers. A
+  sub-second value floors to 1 s (it does not disable reuse).
+
+**`purgeIdle()` is NOT scheduled by the client.** Nothing inside the client runs
+it on a timer; it is reachable only through the exported API
+`jsonrpc.client.purgeIdle` (`mod_jsonrpc_client.cpp`). If you want idle
+**wrapper objects** retired in the background, the **application** must drive
+`purgeIdle()` itself (see [Best Practices](#connection-management)). Idle
+**sockets**, by contrast, are recycled automatically by `socketIdleTimeout`
+without any call.
 
 ### TLS Configuration
 
@@ -456,7 +492,7 @@ The client maintains per-endpoint connection pools to minimize connection overhe
 - **Per-endpoint pools**: Each unique endpoint gets its own pool
 - **Connection reuse**: HTTP keep-alive for connection reuse
 - **Lazy creation**: Connections created on-demand
-- **Idle eviction**: Unused connections automatically cleaned up
+- **Idle socket recycling**: pooled TCP sockets are recycled automatically after `socketIdleTimeout` (3 s); idle **wrapper objects** are retired only when the application calls `purgeIdle()` (never auto-scheduled)
 - **Global limits**: Optional global connection limits across all endpoints
 
 ### Batch Processing
@@ -520,7 +556,7 @@ For complete client-server integration tests with a full Iora service setup, see
 ### Connection Management
 
 1. **Pool Configuration**: Set appropriate connection limits based on your workload
-2. **Idle Cleanup**: Regularly call `purgeIdle()` to clean up unused connections
+2. **Idle Cleanup**: The client never schedules `purgeIdle()` itself — if you want idle **wrapper objects** retired in the background, the application must call `purgeIdle()` on its own cadence. (Idle **sockets** are recycled automatically by `socketIdleTimeout`.)
 3. **Global Limits**: Use global limits to prevent resource exhaustion
 4. **Monitoring**: Monitor pool statistics for optimization opportunities
 

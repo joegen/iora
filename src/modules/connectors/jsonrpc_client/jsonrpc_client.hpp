@@ -136,11 +136,31 @@ struct Config
   /// \brief Socket-level idle timeout: how long a POOLED HttpClient keeps its
   /// underlying TCP socket open between requests before the transport recycles
   /// it. DISTINCT from idleTimeout (which evicts the wrapper OBJECT); drives
-  /// HttpClient::Config::connectionIdleTimeout (task-7.1a). NOTE: task-7.6 owns
-  /// lowering this default below the common ~5 s server keep-alive floor and the
-  /// README; it is initialised here to HttpClient's current effective 300 s so
-  /// task-7.1a introduces the mapping WITHOUT a behaviour change.
-  std::chrono::milliseconds socketIdleTimeout{std::chrono::seconds(300)};
+  /// HttpClient::Config::connectionIdleTimeout (task-7.1a). Defaults to 3 s
+  /// (task-7.6): strictly BELOW the common server keep-alive floor — Node.js
+  /// server.keepAliveTimeout and Apache KeepAliveTimeout both default to 5 s
+  /// (nginx keepalive_timeout is 75 s, far above). The 2 s gap below the 5 s floor
+  /// must ABSORB the one-way response latency: the server starts its keep-alive
+  /// timer at send-complete, the client its socket-idle timer one latency later at
+  /// receive-complete, so the client fires first only while that sub-floor gap
+  /// exceeds the latency — which at LAN/localhost scales it comfortably does. So
+  /// the client recycles a pooled socket BEFORE a conforming server at or above
+  /// that floor would close it. This REDUCES the keep-alive reuse race;
+  /// it is not an absolute guarantee: an intermediary (proxy/LB) with a sub-3 s
+  /// idle timeout can still close a socket the client then reuses. That reset is
+  /// retried on a fresh socket, but ONLY the closed-while-idle-before-the-write
+  /// case is provably-not-applied and therefore safe to retry per RFC 9110
+  /// §9.2.2; the retry loop does NOT currently restrict itself to that case (it
+  /// retries any exception, a double-submit hazard for non-idempotent POST) —
+  /// see tracker 2026-09-03-2. The window only lowers how often the race is hit.
+  /// TRADEOFF: against a
+  /// long-keep-alive peer (nginx 75 s, ALB/GCP LBs) a workload with request gaps
+  /// > 3 s pays a fresh TCP connect (and TLS handshake for https) per burst where
+  /// a longer window would have reused the socket; raise this for such peers.
+  /// It maps through the seconds-granular max(1 s, cast<seconds>) rule
+  /// (task-7.1a) — truncation is toward zero (4900 ms -> 4 s), and a sub-second
+  /// value floors to 1 s rather than disabling reuse.
+  std::chrono::milliseconds socketIdleTimeout{std::chrono::seconds(3)};
 
   /// \brief HTTP request timeout for individual JSON-RPC calls.
   std::chrono::milliseconds requestTimeout{std::chrono::seconds(30)};
@@ -2384,6 +2404,10 @@ private:
       {
         return sendJson_(http, url, payload, headerMap);
       }
+      // HAZARD (tracker 2026-09-03-2): this blanket catch-and-retry re-sends a
+      // non-idempotent POST on ANY exception, with no provably-not-sent gate — a
+      // double-submit if the server may already have applied the request. The
+      // safe fix (retry only HttpRequestNotSentError) is cross-cutting; tracked.
       catch (const std::exception &e)
       {
         attempts++;
