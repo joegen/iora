@@ -355,3 +355,127 @@ TEST_CASE("obs-fold as the FIRST header line (after request line) is rejected (4
     HttpRequest::fromWireFormat("GET / HTTP/1.1\r\n folded\r\nHost: example.test\r\n\r\n"),
     iora::network::HttpRequestError);
 }
+
+// ---------------------------------------------------------------------------
+// network::normalizeOrigin (task-7.5a / 7.5b) — the connection-pool ORIGIN key.
+// scheme://host:effective-port, scheme+host ASCII-lowercased, port always
+// emitted; path/query/fragment/host-case/explicit-vs-default-port collapse.
+// Malformed/unreachable forms are rejected with std::invalid_argument.
+// ---------------------------------------------------------------------------
+TEST_CASE("normalizeOrigin collapses path, query, fragment and default port",
+          "[http][origin]")
+{
+  using iora::network::normalizeOrigin;
+
+  // Path, query, fragment, trailing slash all drop; default port is emitted.
+  REQUIRE(normalizeOrigin("http://h/rpc") == "http://h:80");
+  REQUIRE(normalizeOrigin("http://h/") == "http://h:80");
+  REQUIRE(normalizeOrigin("http://h") == "http://h:80");
+  // A query/fragment WITH a path drops — the '/' stops the transport's host class
+  // before the '?'/'#', so both parsers agree on host `h`.
+  REQUIRE(normalizeOrigin("http://h/rpc?q=1&x=2") == "http://h:80");
+  REQUIRE(normalizeOrigin("http://h/rpc#frag") == "http://h:80");
+  // Two distinct paths on one host produce ONE origin — the whole point.
+  REQUIRE(normalizeOrigin("http://h/a") == normalizeOrigin("http://h/b"));
+
+  // Explicit default port collapses with the absent port (:80/http, :443/https).
+  REQUIRE(normalizeOrigin("http://h:80/rpc") == "http://h:80");
+  REQUIRE(normalizeOrigin("http://h:80/rpc") == normalizeOrigin("http://h/rpc"));
+  REQUIRE(normalizeOrigin("https://h:443/rpc") == "https://h:443");
+  REQUIRE(normalizeOrigin("https://h:443/rpc") == normalizeOrigin("https://h/rpc"));
+
+  // A non-default explicit port is preserved.
+  REQUIRE(normalizeOrigin("http://h:8080/rpc") == "http://h:8080");
+}
+
+TEST_CASE("normalizeOrigin ASCII-folds scheme-mandated case-insensitive host",
+          "[http][origin]")
+{
+  using iora::network::normalizeOrigin;
+
+  // Host is case-insensitive (RFC 9110 4.2.3) and is ASCII-lowercased.
+  REQUIRE(normalizeOrigin("http://Localhost:8135/rpc") == "http://localhost:8135");
+  REQUIRE(normalizeOrigin("http://LOCALHOST:8135/rpc") ==
+          normalizeOrigin("http://localhost:8135/rpc"));
+  REQUIRE(normalizeOrigin("http://EXAMPLE.Test/a") == "http://example.test:80");
+
+  // A single trailing FQDN-root dot is stripped so host. and host collapse.
+  REQUIRE(normalizeOrigin("http://h./rpc") == "http://h:80");
+  REQUIRE(normalizeOrigin("http://h./rpc") == normalizeOrigin("http://h/rpc"));
+}
+
+TEST_CASE("normalizeOrigin keeps the scheme in the key (http vs https distinct)",
+          "[http][origin]")
+{
+  using iora::network::normalizeOrigin;
+
+  // Same host:port, different scheme -> DISTINCT origins (http cleartext vs https
+  // TLS must never share a pooled connection).
+  REQUIRE(normalizeOrigin("http://h:8443/") != normalizeOrigin("https://h:8443/"));
+  REQUIRE(normalizeOrigin("http://h:8443/") == "http://h:8443");
+  REQUIRE(normalizeOrigin("https://h:8443/") == "https://h:8443");
+}
+
+TEST_CASE("normalizeOrigin rejects forms HttpClient cannot reach (7.5b)",
+          "[http][origin][reject]")
+{
+  using iora::network::normalizeOrigin;
+
+  // Missing scheme / empty.
+  REQUIRE_THROWS_AS(normalizeOrigin(""), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("h/rpc"), std::invalid_argument);
+
+  // Non-lowercase or non-http(s) scheme (HttpClient::parseUrl matches the scheme
+  // case-SENSITIVELY and throws on any other spelling: agree-or-both-reject).
+  REQUIRE_THROWS_AS(normalizeOrigin("HTTP://h/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("Http://h/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("ftp://h/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("ws://h/rpc"), std::invalid_argument);
+
+  // Userinfo (HttpClient folds it into the hostname / request-target).
+  REQUIRE_THROWS_AS(normalizeOrigin("http://user@h/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://user:pass@h/rpc"), std::invalid_argument);
+
+  // Bracketed IPv6 literal (HttpClient's host class cannot express it).
+  REQUIRE_THROWS_AS(normalizeOrigin("http://[::1]:8080/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://[2001:db8::1]/rpc"), std::invalid_argument);
+
+  // Port empty / non-numeric / zero / out of range (would truncate through
+  // parseUrl's uint16 cast or throw std::invalid_argument out of the caller).
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h:/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h:abc/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h:0/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h:65536/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h:99999/rpc"), std::invalid_argument);
+  // 65535 is the last valid port.
+  REQUIRE(normalizeOrigin("http://h:65535/rpc") == "http://h:65535");
+
+  // Empty host / empty DNS label (leading, trailing-after-one-strip, or interior
+  // double dot). An empty label is an invalid FQDN that fails to resolve.
+  REQUIRE_THROWS_AS(normalizeOrigin("http://:8080/rpc"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://./rpc"), std::invalid_argument);  // dot-only host
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h../rpc"), std::invalid_argument); // trailing empty label
+  REQUIRE_THROWS_AS(normalizeOrigin("http://.h/rpc"), std::invalid_argument);  // leading empty label
+  REQUIRE_THROWS_AS(normalizeOrigin("http://a..b/rpc"), std::invalid_argument); // interior empty label
+  // A single trailing FQDN-root dot is fine (host. == host).
+  REQUIRE(normalizeOrigin("http://host./rpc") == "http://host:80");
+
+  // Query or fragment with NO path: HttpClient's host regex folds '?'/'#' into
+  // the hostname, so the transport would DNS-fail every send on the well-keyed
+  // pool. Rejected up front so the two parsers agree-or-both-reject.
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h?q=1"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h#frag"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h:8080?q=1"), std::invalid_argument);
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h#"), std::invalid_argument);
+
+  // ASCII whitespace / controls ANYWHERE in the URL — HttpClient's regex uses \s
+  // in its host AND path classes and anchors on $, so any of these makes the
+  // transport reject every send. A trailing space (common from config values) is
+  // OUTSIDE the authority yet must still be rejected here (agree-or-both-reject).
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h/rpc "), std::invalid_argument);   // trailing space (path region)
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h ost/rpc"), std::invalid_argument); // space in authority
+  REQUIRE_THROWS_AS(normalizeOrigin(" http://h/rpc"), std::invalid_argument);    // leading space
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h\t/rpc"), std::invalid_argument);   // HTAB
+  REQUIRE_THROWS_AS(normalizeOrigin("http://h/rpc\r\n"), std::invalid_argument); // CRLF
+  REQUIRE_THROWS_AS(normalizeOrigin(std::string("http://h/rp\x01" "c")), std::invalid_argument); // control 0x01
+}

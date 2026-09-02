@@ -415,6 +415,186 @@ inline ParsedUrl parseUrl(const std::string &url)
   return result;
 }
 
+/// \brief Normalise a URL to its ORIGIN — `scheme://host:effective-port` with
+/// the scheme and host ASCII-lowercased and the port always emitted — for use as
+/// a connection-pool key. Two URLs that differ only in path, query, fragment,
+/// host case, or an explicit-vs-default port collapse to the SAME origin.
+///
+/// This is HTTP-generic (RFC 9110 §4.2.3: scheme and host are case-insensitive;
+/// all other URL components are case-sensitive), not JSON-RPC-specific.
+///
+/// SELF-CONTAINED PARSE (does NOT delegate to parseUrl). The host and port are
+/// extracted from a single delimiter-correct authority scan performed here, NOT
+/// from parseUrl. parseUrl was found to be unusable as the structural source for
+/// a pool key: (a) it folds a query-string into the host when no path precedes it
+/// (`http://h?q=1` → host `h?q=1`), which would fragment one origin into a pool
+/// per query; and (b) it lowercases the scheme with the locale-dependent
+/// `::tolower` and truncates the port through `static_cast<uint16_t>(std::stoi)`
+/// (`:65536` → 0). Deriving from the local authority scan also collapses the two
+/// URL parsers this key must otherwise reconcile down to one for this purpose.
+///
+/// The origin is a pool key whose every request is re-parsed by the transport's
+/// own URL parser (HttpClient::parseUrl) on each send, so a form this function
+/// ACCEPTS that the transport then rejects would mint a live pool whose every
+/// request fails. To keep the two parsers in agreement (or both rejecting), this
+/// rejects, with a clear std::invalid_argument, every form HttpClient::parseUrl
+/// cannot reach:
+///   * ANY ASCII whitespace or control octet anywhere in the URL (space, HTAB,
+///     CR, LF, and every byte <= 0x20 or == 0x7F). HttpClient's URL regex uses
+///     `\s` in its host and path classes and anchors on `$`, so a single space —
+///     e.g. a trailing space from a config value, `http://h/rpc ` — makes the
+///     transport reject every send. RFC 3986 forbids raw whitespace/controls in a
+///     URI (they must be percent-encoded), so rejecting is also spec-correct;
+///   * a scheme that is not already the lowercase `http` or `https` (HttpClient
+///     matches the scheme case-SENSITIVELY and throws on any other spelling, so
+///     folding `HTTP://` to a pool key would be a key the transport rejects on
+///     every send);
+///   * userinfo in the authority (`user@host` — HttpClient's host class ADMITS
+///     `@` and would fold it into the connect target, so the key would say host
+///     `h` while the transport talks to `user@host`);
+///   * a bracketed IPv6 literal (HttpClient's host class cannot express it);
+///   * a port that is empty, non-numeric, zero, or greater than 65535.
+/// A single trailing dot on the host (the FQDN root — `host.` and `host` reach
+/// the same TCP endpoint) is stripped so both collapse to one pool. This is a
+/// deliberate deviation from WHATWG URL host equality (which keeps `host.`
+/// distinct), justified because each request still carries its own `Host` header
+/// from its own URL; only the pool/socket is shared. Percent-encoded and IDN
+/// hosts are NOT decoded, so two encodings of one host key to two pools — an
+/// accepted over-split, never an under-collapse.
+///
+/// \throws std::invalid_argument on any rejected form (missing scheme, empty
+///   host, or one of the cases above).
+inline std::string normalizeOrigin(const std::string &url)
+{
+  // 0. Reject ASCII whitespace / control octets ANYWHERE in the URL. This must
+  //    scan the WHOLE url, not just the authority: a trailing space in the path
+  //    (`http://h/rpc `) sits outside the authority yet still makes the transport
+  //    regex reject every send (agree-or-both-reject). RFC 3986 forbids them raw.
+  for (unsigned char c : url)
+  {
+    if (c <= 0x20 || c == 0x7F)
+    {
+      throw std::invalid_argument(
+        "normalizeOrigin: URL contains whitespace or a control octet: " + url);
+    }
+  }
+
+  // 1. Scheme. Case-SENSITIVE match to agree with HttpClient::parseUrl, which
+  //    throws on a non-lowercase or non-http(s) scheme.
+  const auto schemeEnd = url.find("://");
+  if (schemeEnd == std::string::npos)
+  {
+    throw std::invalid_argument("normalizeOrigin: URL missing scheme (http:// or https://): " + url);
+  }
+  const std::string scheme = url.substr(0, schemeEnd);
+  if (scheme != "http" && scheme != "https")
+  {
+    throw std::invalid_argument(
+      "normalizeOrigin: scheme must be lowercase 'http' or 'https': " + url);
+  }
+
+  // 2. Isolate the authority: everything from after '://' up to the first '/',
+  //    '?' or '#'. This is the SINGLE structural split; host and port come from
+  //    it (never from parseUrl, which mis-splits a query-without-path).
+  const std::size_t authStart = schemeEnd + 3;
+  std::size_t authEnd = url.find_first_of("/?#", authStart);
+  if (authEnd == std::string::npos)
+  {
+    authEnd = url.size();
+  }
+  const std::string authority = url.substr(authStart, authEnd - authStart);
+
+  // 2a. Reject a query or fragment with NO path (the authority is terminated by
+  //     '?' or '#', not '/'). HttpClient's host regex `[^:/\s]+` stops only at
+  //     ':' '/' or whitespace — it does NOT stop at '?' or '#', so it folds a
+  //     pathless query/fragment into the HOSTNAME (`http://h?q=1` -> host
+  //     `h?q=1`, DNS-fails every send). This is the same live-broken-pool failure
+  //     as a whitespace host, reached via '?'/'#': the key would be well-formed
+  //     (`http://h:80`) but every send on it fails. Reject up front so the two
+  //     parsers agree-or-both-reject. (A path-bearing query — `.../rpc?q=1` — is
+  //     fine: the '/' stops the transport's host class before the '?'.)
+  if (authEnd < url.size() && (url[authEnd] == '?' || url[authEnd] == '#'))
+  {
+    throw std::invalid_argument(
+      "normalizeOrigin: query or fragment with no path — the transport folds it "
+      "into the host, so every send would fail: " + url);
+  }
+
+  // 3. Reject forms the transport cannot reach.
+  if (authority.find('@') != std::string::npos)
+  {
+    throw std::invalid_argument(
+      "normalizeOrigin: userinfo is not permitted in the authority: " + url);
+  }
+  if (authority.find_first_of("[]") != std::string::npos)
+  {
+    throw std::invalid_argument(
+      "normalizeOrigin: bracketed IPv6 literals are not supported: " + url);
+  }
+
+  // 4. Split host:port at the single ':' and validate the RAW port substring
+  //    (`:65536` must not truncate to 0, `:abc` must not slip through).
+  const auto colon = authority.find(':');
+  std::uint16_t effectivePort = (scheme == "https") ? 443 : 80;
+  if (colon != std::string::npos)
+  {
+    const std::string portStr = authority.substr(colon + 1);
+    if (portStr.empty())
+    {
+      throw std::invalid_argument("normalizeOrigin: empty port: " + url);
+    }
+    for (unsigned char c : portStr)
+    {
+      if (c < '0' || c > '9')
+      {
+        throw std::invalid_argument("normalizeOrigin: non-numeric port: " + url);
+      }
+    }
+    unsigned long portVal = 0;
+    try
+    {
+      portVal = std::stoul(portStr);
+    }
+    catch (const std::out_of_range &)
+    {
+      throw std::invalid_argument("normalizeOrigin: port out of range (1-65535): " + url);
+    }
+    if (portVal == 0 || portVal > 65535)
+    {
+      throw std::invalid_argument("normalizeOrigin: port out of range (1-65535): " + url);
+    }
+    effectivePort = static_cast<std::uint16_t>(portVal);
+  }
+
+  // 5. Host is the authority up to the port colon. Strip a single trailing
+  //    FQDN-root dot (host. and host reach the same endpoint), then ASCII-fold
+  //    (locale-independent, NOT ::tolower).
+  std::string host = authority.substr(0, colon);
+  if (!host.empty() && host.back() == '.')
+  {
+    host.pop_back();
+  }
+  // Reject an empty host or an empty DNS label (leading dot, a surviving trailing
+  // dot after the single-dot strip — i.e. an original `host..` — or an interior
+  // `..`). An empty label is an invalid FQDN (RFC 1035 §2.3.1) that fails to
+  // resolve, so it would otherwise mint a dead pool; and the one-dot strip on a
+  // `host..` would leave the key (`host.`) diverging from the transport's
+  // connect-host (`host..`).
+  if (host.empty() || host.front() == '.' || host.back() == '.' ||
+      host.find("..") != std::string::npos)
+  {
+    throw std::invalid_argument(
+      "normalizeOrigin: empty host or empty DNS label (leading/trailing/double dot): " + url);
+  }
+  for (char &ch : host)
+  {
+    ch = CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(ch));
+  }
+
+  // 6. Always emit the effective port so :80/:443/absent collapse.
+  return scheme + "://" + host + ":" + std::to_string(effectivePort);
+}
+
 /// \brief HTTP request message
 class HttpRequest
 {

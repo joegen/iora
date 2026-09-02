@@ -196,8 +196,11 @@ struct JsonRpcClientTestAccess
   static std::shared_ptr<detail::PooledConnection> firstHandle(JsonRpcClient &c,
                                                                const std::string &ep)
   {
+    // Mirror production keying (task-7.5c): the pool map is keyed on the ORIGIN,
+    // so a caller passing a full URL resolves to the same pool acquire_ used.
+    const std::string key = iora::network::normalizeOrigin(ep);
     std::lock_guard<std::mutex> guard(c._impl->_mutex);
-    auto it = c._impl->_pools.find(ep);
+    auto it = c._impl->_pools.find(key);
     if (it == c._impl->_pools.end() || it->second->_connections.empty())
     {
       return nullptr;
@@ -216,8 +219,9 @@ struct JsonRpcClientTestAccess
     // absent / in-use handle — throw before touching `bin`, but declaring it
     // first keeps this seam safe for any future test that erases a live handle.)
     std::vector<std::shared_ptr<detail::PooledConnection>> bin;
+    const std::string key = iora::network::normalizeOrigin(ep);
     std::lock_guard<std::mutex> guard(c._impl->_mutex);
-    auto it = c._impl->_pools.find(ep);
+    auto it = c._impl->_pools.find(key);
     if (it == c._impl->_pools.end())
     {
       throw std::logic_error("test seam: no pool for endpoint");
@@ -230,8 +234,9 @@ struct JsonRpcClientTestAccess
   /// keeps its connection in-use, so purge/evict can never empty the pool.
   static std::shared_ptr<detail::EndpointPool> detachPool(JsonRpcClient &c, const std::string &ep)
   {
+    const std::string key = iora::network::normalizeOrigin(ep);
     std::lock_guard<std::mutex> guard(c._impl->_mutex);
-    auto it = c._impl->_pools.find(ep);
+    auto it = c._impl->_pools.find(key);
     if (it == c._impl->_pools.end())
     {
       return nullptr;
@@ -795,6 +800,16 @@ public:
     return _requests.size();
   }
 
+  /// \brief Every captured request's REQUEST LINE (e.g. "POST /rpc HTTP/1.1"), in
+  /// arrival order. task-7.5c reads the request-target to prove the send path
+  /// still receives the caller's FULL URL even though the pool is keyed on the
+  /// origin. Read after stop() for the same happens-before reason as the others.
+  std::vector<std::string> capturedRequestLines() const
+  {
+    std::lock_guard<std::mutex> lk(_m);
+    return _requestLines;
+  }
+
   /// \brief TCP connections accepted. The reliable happens-before is stop()'s
   /// join (see the class comment) — read this only after stop(); the acquire load
   /// merely keeps an incidental live read coherent, it does not make it final.
@@ -925,13 +940,15 @@ private:
         return;
       }
       std::vector<std::string> fieldLines;
-      if (!readOneRequest(cs, carry, fieldLines))
+      std::string requestLine;
+      if (!readOneRequest(cs, carry, fieldLines, requestLine))
       {
         return; // peer closed, real error, or stop() during an idle wait
       }
       {
         std::lock_guard<std::mutex> lk(_m);
         _requests.push_back(std::move(fieldLines));
+        _requestLines.push_back(std::move(requestLine));
       }
       if (!interruptibleDelay(_policy.delayBeforeResponse)) // ts M-1
       {
@@ -976,7 +993,8 @@ private:
   /// client that holds a pooled socket idle > 400 ms would see a spurious
   /// reconnect and break one-pool-one-socket assertions), while polling _stop for
   /// prompt teardown (ts M-1). Returns false on peer close, real error, or stop().
-  bool readOneRequest(int cs, std::string &carry, std::vector<std::string> &fieldLines)
+  bool readOneRequest(int cs, std::string &carry, std::vector<std::string> &fieldLines,
+                      std::string &requestLine)
   {
     std::string acc = std::move(carry);
     carry.clear();
@@ -1024,6 +1042,7 @@ private:
     }
 
     // lines[0] is the request line; lines[1..] are the field lines.
+    requestLine = lines.empty() ? std::string{} : lines[0];
     static constexpr std::string_view kContentLength = "content-length:";
     std::size_t contentLength = 0;
     for (std::size_t i = 1; i < lines.size(); ++i)
@@ -1118,6 +1137,7 @@ private:
   std::atomic<bool> _writeError{false};
   mutable std::mutex _m;
   std::vector<std::vector<std::string>> _requests;
+  std::vector<std::string> _requestLines; // task-7.5c: the request LINE per request
 };
 
 /// \brief True if `lines` contains a field line whose spelling equals `expected`
@@ -1212,7 +1232,7 @@ TEST_CASE("seam: snapshot observes acquired connection identity",
   cfg.maxConnectionsPerEndpoint = 3;
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   std::chrono::steady_clock::time_point lastUsedWhileInUse;
   {
@@ -1222,7 +1242,7 @@ TEST_CASE("seam: snapshot observes acquired connection identity",
 
     auto snaps = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snaps.size() == 1);
-    REQUIRE(snaps[0].poolKey == ep);
+    REQUIRE(snaps[0].poolKey == iora::network::normalizeOrigin(ep));
     REQUIRE(snaps[0].connections.size() == 1);
     REQUIRE(snaps[0].connections[0].connectionId == id);
     REQUIRE(snaps[0].connections[0].inUse == true);
@@ -1325,7 +1345,7 @@ TEST_CASE("CR-1 fixed: identity-based release frees the leased connection, not a
   cfg.idleTimeout = std::chrono::milliseconds(50);
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   // Own the leases so we control destruction order (the friend seam is what
   // makes this feasible at all — task-1.2a).
@@ -1385,7 +1405,7 @@ TEST_CASE("task-4.3: purgeIdle evicts nothing while all connections are leased",
   cfg.maxConnectionsPerEndpoint = 3;
   cfg.idleTimeout = std::chrono::milliseconds(10); // short, so expiry is not the reason
   JsonRpcClient client(svc, pool, cfg);
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   auto a = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
   auto b = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
@@ -1433,8 +1453,8 @@ TEST_CASE("task-4.1b: purgeIdle evicts idle connections without blocking other e
   cfg.idleTimeout = std::chrono::milliseconds(40);
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string epEvict = "http://unit.test/evict";
-  const std::string epLive = "http://unit.test/live";
+  const std::string epEvict = "http://evict.test/rpc";
+  const std::string epLive = "http://live.test/rpc";
 
   // Create and free four connections on epEvict, so they become idle.
   {
@@ -1492,7 +1512,7 @@ TEST_CASE("task-4.1b: purgeIdle evicts idle connections without blocking other e
   const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
   for (const auto &ps : snap)
   {
-    REQUIRE(ps.poolKey != epEvict);
+    REQUIRE(ps.poolKey != iora::network::normalizeOrigin(epEvict));
   }
   REQUIRE(JsonRpcClientTestAccess::recalcTotal(client) ==
           JsonRpcClientTestAccess::totalConnections(client));
@@ -1514,7 +1534,7 @@ TEST_CASE("task-4.2/4.3: EndpointPool::erase throws on an absent or in-use handl
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
   JsonRpcClient client(svc, pool, cfg);
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   // (b) in-use guard: hold a lease so its connection is in use, then try to
   // erase that exact handle.
@@ -1551,7 +1571,7 @@ TEST_CASE("task-4.1c CR-1c: a lease releases cleanly into a pool erased from the
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
   JsonRpcClient client(svc, pool, cfg);
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   std::shared_ptr<iora::modules::connectors::detail::EndpointPool> detached;
   {
@@ -1577,13 +1597,16 @@ TEST_CASE("task-4.1c CR-1c: a lease releases cleanly into a pool erased from the
 }
 
 // =========================================================================
-// task-4.1b (cpp17 R#7 regression) — an idle pool keyed by an EMPTY-STRING
-// endpoint must be a valid LRU pool-eviction candidate. The old
-// bestKey.empty() sentinel in evictOneIdlePoolLruLocked_ would have skipped it;
-// the iterator sentinel does not. Driven via the maxEndpointPools cap, which
-// triggers idle-pool LRU eviction when a new endpoint needs a pool.
+// task-4.1b (cpp17 R#7 regression) — the LRU pool-eviction candidate is chosen
+// by an ITERATOR sentinel (bestIt != _pools.end()), not the old bestKey.empty()
+// sentinel that would have skipped a pool keyed by the empty string. Since
+// task-7.5a the pool key is a normalised ORIGIN and an empty-string endpoint is
+// REJECTED by normalizeOrigin before any pool is minted, so a "" pool can no
+// longer occur — but the iterator-sentinel choice is still exercised here by
+// evicting an ordinary idle pool. The empty-string rejection is asserted too, as
+// the contract change that retires the sentinel case.
 // =========================================================================
-TEST_CASE("task-4.1b: an idle pool keyed by the empty-string endpoint is LRU-evictable",
+TEST_CASE("task-4.1b: the LRU eviction candidate is chosen by an iterator sentinel",
           "[jsonrpc][pool][phase4]")
 {
   auto &svc = testService();
@@ -1592,29 +1615,28 @@ TEST_CASE("task-4.1b: an idle pool keyed by the empty-string endpoint is LRU-evi
   cfg.maxEndpointPools = 1; // one pool at a time -> a second endpoint forces eviction
   JsonRpcClient client(svc, pool, cfg);
 
-  // Create and free a connection on the empty-string endpoint -> idle pool "".
+  // task-7.5b — an empty-string endpoint is no longer a valid pool key: it has no
+  // scheme, so normalizeOrigin rejects it and acquire_ throws before minting any
+  // pool. (A bestKey.empty() sentinel used to be needed precisely because an
+  // empty key COULD occur; it no longer can.)
+  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, ""), std::invalid_argument);
+  REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).empty());
+
+  // Create and free a connection on an ordinary endpoint -> one idle pool.
   {
-    auto l = JsonRpcClientTestAccess::acquire(client, "");
+    auto l = JsonRpcClientTestAccess::acquire(client, "http://idle.test/rpc");
     (void)l;
   }
-  {
-    auto snap = JsonRpcClientTestAccess::snapshotPools(client);
-    REQUIRE(snap.size() == 1);
-    REQUIRE(snap[0].poolKey.empty()); // the "" pool exists and is idle
-  }
+  REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 1);
 
   // Acquire on a different endpoint: with maxEndpointPools == 1 the only idle
-  // pool ("") is the LRU eviction candidate. A bestKey.empty() sentinel would
-  // have refused to evict it and the "" pool would leak.
+  // pool is the LRU eviction candidate, selected by the iterator sentinel.
   {
-    auto l2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/other");
+    auto l2 = JsonRpcClientTestAccess::acquire(client, "http://other.test/rpc");
     (void)l2;
-    auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+    const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1);
-    for (const auto &ps : snap)
-    {
-      REQUIRE(ps.poolKey != ""); // the empty-string pool was evicted
-    }
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin("http://other.test/rpc"));
   }
 }
 
@@ -1640,9 +1662,9 @@ TEST_CASE("task-4.1b: concurrent PoolExhaustedError throw races whole-pool evict
   cfg.idleTimeout = std::chrono::milliseconds(5);
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string epFull = "http://unit.test/full";
-  const std::string ev[3] = {"http://unit.test/ev0", "http://unit.test/ev1",
-                             "http://unit.test/ev2"};
+  const std::string epFull = "http://full.test/rpc";
+  const std::string ev[3] = {"http://ev0.test/rpc", "http://ev1.test/rpc",
+                             "http://ev2.test/rpc"};
 
   // Hold epFull's single slot for the whole test, so acquire(epFull) always
   // hits the per-endpoint cap and throws.
@@ -1759,7 +1781,7 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
   {
     const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1);
-    REQUIRE(snap[0].poolKey == ep);
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin(ep));
     REQUIRE(snap[0].connections.size() == 1);
     REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 1);
   }
@@ -1777,7 +1799,7 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
   {
     const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1);
-    REQUIRE(snap[0].poolKey == ep);
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin(ep));
     REQUIRE(snap[0].connections.size() == 1);
     recoveredId = snap[0].connections[0].connectionId;
   }
@@ -1790,7 +1812,7 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
   {
     const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1);
-    REQUIRE(snap[0].poolKey == ep);
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin(ep));
     REQUIRE(snap[0].connections.size() == 1);
     REQUIRE(snap[0].connections[0].connectionId == recoveredId);
   }
@@ -1822,7 +1844,7 @@ TEST_CASE("task-5.2: idle-expiry churn keeps _totalConnections exact and counts 
   cfg.maxConnectionsPerEndpoint = 4;
   cfg.idleTimeout = std::chrono::milliseconds(100);
   JsonRpcClient client(svc, pool, cfg);
-  const std::string ep = "http://unit.test/counter";
+  const std::string ep = "http://counter.test/rpc";
 
   // Two idle connections on ep.
   {
@@ -1878,7 +1900,7 @@ TEST_CASE("task-5.2 DP-2: LRU whole-pool eviction counts its connections in conn
   cfg.maxConnectionsPerEndpoint = 4;
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string epA = "http://unit.test/A";
+  const std::string epA = "http://A.test/rpc";
   {
     auto a1 = JsonRpcClientTestAccess::acquire(client, epA);
     auto a2 = JsonRpcClientTestAccess::acquire(client, epA);
@@ -1890,14 +1912,14 @@ TEST_CASE("task-5.2 DP-2: LRU whole-pool eviction counts its connections in conn
 
   // A distinct endpoint B: maxEndpointPools==1 evicts idle pool A (size 2).
   {
-    auto b = JsonRpcClientTestAccess::acquire(client, "http://unit.test/B");
+    auto b = JsonRpcClientTestAccess::acquire(client, "http://B.test/rpc");
     (void)b;
   }
   REQUIRE(client.getStats().connectionsEvicted == evictedBefore + 2);
   {
     const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1);
-    REQUIRE(snap[0].poolKey == "http://unit.test/B");
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin("http://B.test/rpc"));
   }
   REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
           JsonRpcClientTestAccess::recalcTotal(client));
@@ -1918,18 +1940,18 @@ TEST_CASE("task-5.2 DP-2: single idle-connection LRU eviction counts one in conn
 
   // One IDLE connection on A (evictable), one IN-USE connection on B (held).
   {
-    auto a = JsonRpcClientTestAccess::acquire(client, "http://unit.test/A");
+    auto a = JsonRpcClientTestAccess::acquire(client, "http://A.test/rpc");
     (void)a;
   }
   auto bHold = std::make_unique<ConnectionLease>(
-    JsonRpcClientTestAccess::acquire(client, "http://unit.test/B"));
+    JsonRpcClientTestAccess::acquire(client, "http://B.test/rpc"));
   REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 2); // global cap saturated
   const std::uint64_t evictedBefore = client.getStats().connectionsEvicted;
 
   // A second connection on B: per-endpoint cap allows it, global cap is full, so
   // acquire_ evicts the single LRU idle connection (A's) to make room.
   {
-    auto b2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/B");
+    auto b2 = JsonRpcClientTestAccess::acquire(client, "http://B.test/rpc");
     (void)b2;
   }
   REQUIRE(client.getStats().connectionsEvicted == evictedBefore + 1);
@@ -1954,9 +1976,9 @@ TEST_CASE("task-5.2 DP-2: purgeIdle counts every idle-expired connection in conn
 
   // Three idle connections across two endpoints.
   {
-    auto a1 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/A");
-    auto a2 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/A");
-    auto b1 = JsonRpcClientTestAccess::acquire(client, "http://unit.test/B");
+    auto a1 = JsonRpcClientTestAccess::acquire(client, "http://A.test/rpc");
+    auto a2 = JsonRpcClientTestAccess::acquire(client, "http://A.test/rpc");
+    auto b1 = JsonRpcClientTestAccess::acquire(client, "http://B.test/rpc");
     (void)a1;
     (void)a2;
     (void)b1;
@@ -1989,7 +2011,7 @@ TEST_CASE("task-5.3: maxEndpointPools==0 is unlimited (default config never refu
   for (int i = 0; i < 5; ++i)
   {
     REQUIRE_NOTHROW(leases.push_back(std::make_unique<ConnectionLease>(
-      JsonRpcClientTestAccess::acquire(client, "http://unit.test/e" + std::to_string(i)))));
+      JsonRpcClientTestAccess::acquire(client, "http://e" + std::to_string(i) + ".test/rpc"))));
   }
   REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 5);
 
@@ -2014,11 +2036,11 @@ TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evic
     JsonRpcClient client(svc, pool, cfg);
 
     auto l0 = std::make_unique<ConnectionLease>(
-      JsonRpcClientTestAccess::acquire(client, "http://unit.test/p0"));
+      JsonRpcClientTestAccess::acquire(client, "http://p0.test/rpc"));
     auto l1 = std::make_unique<ConnectionLease>(
-      JsonRpcClientTestAccess::acquire(client, "http://unit.test/p1"));
+      JsonRpcClientTestAccess::acquire(client, "http://p1.test/rpc"));
 
-    REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://unit.test/p2"),
+    REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://p2.test/rpc"),
                       PoolExhaustedError);
     REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 2);
     REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
@@ -2032,13 +2054,13 @@ TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evic
     JsonRpcClient client(svc, pool, cfg);
 
     {
-      auto l = JsonRpcClientTestAccess::acquire(client, "http://unit.test/idle");
+      auto l = JsonRpcClientTestAccess::acquire(client, "http://idle.test/rpc");
       (void)l;
     } // idle pool
-    REQUIRE_NOTHROW(JsonRpcClientTestAccess::acquire(client, "http://unit.test/new"));
+    REQUIRE_NOTHROW(JsonRpcClientTestAccess::acquire(client, "http://new.test/rpc"));
     const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1);
-    REQUIRE(snap[0].poolKey == "http://unit.test/new");
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin("http://new.test/rpc"));
   }
 }
 
@@ -2058,7 +2080,7 @@ TEST_CASE("task-5.1 Option A: a global-cap throw retires the empty pool (no spur
   cfg.maxConnectionsPerEndpoint = 2;
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string epA = "http://unit.test/A";
+  const std::string epA = "http://A.test/rpc";
   // A holds two IN-USE connections: pool A is never all-idle (not a whole-pool
   // eviction candidate) and the global cap (2) is saturated.
   auto a1 = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, epA));
@@ -2068,12 +2090,12 @@ TEST_CASE("task-5.1 Option A: a global-cap throw retires the empty pool (no spur
   // A new endpoint B saturates the global cap with no idle connection or pool to
   // evict -> acquire_ reaches its PoolExhaustedError throw. Option A retires B's
   // now-empty pool AT THE THROW; without it, B lingers in _pools.
-  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://unit.test/B"),
+  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://B.test/rpc"),
                     PoolExhaustedError);
   {
     const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
     REQUIRE(snap.size() == 1); // only A; B was retired at the throw
-    REQUIRE(snap[0].poolKey == epA);
+    REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin(epA));
     for (const auto &ps : snap)
     {
       REQUIRE(ps.connections.size() > 0); // no zero-size pool persists
@@ -2092,7 +2114,7 @@ TEST_CASE("task-5.1 Option A: a global-cap throw retires the empty pool (no spur
   // idle connection and create C. Without Option A the lingering empty B pool
   // fills the last slot, the whole-pool eviction finds nothing all-idle, and C
   // throws spuriously.
-  REQUIRE_NOTHROW(JsonRpcClientTestAccess::acquire(client, "http://unit.test/C"));
+  REQUIRE_NOTHROW(JsonRpcClientTestAccess::acquire(client, "http://C.test/rpc"));
 
   a1.reset();
 }
@@ -2166,7 +2188,7 @@ TEST_CASE("phase3: every counted channel refuses after closing is latched",
   auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   JsonRpcClient client(svc, pool, stubFactoryConfig());
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   JsonRpcClientTestAccess::latchClosing(client);
   REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(client).closing == true);
@@ -2233,7 +2255,7 @@ TEST_CASE("phase3 / CR-4 fixed: destructor waits for a queued async task",
   std::atomic<bool> errCalled{false};
   std::atomic<bool> okCalled{false};
   std::atomic<bool> shutdownErr{false};
-  client->callAsync("http://unit.test/rpc", "ping", iora::parsers::Json::object(), {},
+  client->callAsync("http://rpc.test/rpc", "ping", iora::parsers::Json::object(), {},
                     [&](iora::parsers::Json) { okCalled.store(true); },
                     shutdownErrorProbe(errCalled, shutdownErr));
 
@@ -2439,7 +2461,7 @@ TEST_CASE("phase3: enqueue failure routes through the token's channel, no throw 
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
                               /*maxQueueSize*/ 1);
   JsonRpcClient client(svc, pool, stubFactoryConfig());
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   // BlockedWorker owns its latches through a shared_ptr the task captures by
   // value, so — unlike the promise/future shape this replaced — it needs no
@@ -2494,7 +2516,7 @@ TEST_CASE("phase3: onError completes before a concurrent destructor returns (enq
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
                               /*maxQueueSize*/ 1);
   auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
-  const std::string ep = "http://unit.test/rpc";
+  const std::string ep = "http://rpc.test/rpc";
 
   BlockedWorker blocker(pool);
   REQUIRE(blocker.waitUntilRunning());
@@ -2655,10 +2677,14 @@ parkingFactory(std::string parkEndpoint, TestLatch &entered, TestLatch &release,
 {
   // task-7.1b: the factory now receives the derived config; this pool-mechanics
   // helper ignores it (it never talks to the network).
-  return [&entered, &release, parkEndpoint, bound](const std::string &ep,
-                                                   const iora::network::HttpClient::Config &)
+  // task-7.5c: the factory's first parameter is the pool ORIGIN, not the caller's
+  // full URL, so match the parked endpoint on its normalised origin — callers
+  // pass a full URL for `parkEndpoint` (e.g. "http://a.test/rpc").
+  const std::string parkOrigin = iora::network::normalizeOrigin(parkEndpoint);
+  return [&entered, &release, parkOrigin, bound](const std::string &origin,
+                                                 const iora::network::HttpClient::Config &)
   {
-    if (ep == parkEndpoint)
+    if (origin == parkOrigin)
     {
       entered.signal();
       release.wait(bound);
@@ -2715,9 +2741,12 @@ void runAcquire(JsonRpcClient &client, const std::string &ep, AcquireOutcome &ou
 std::optional<JsonRpcClientTestAccess::PoolSnapshot>
 poolOf(const std::vector<JsonRpcClientTestAccess::PoolSnapshot> &snap, const std::string &key)
 {
+  // Pools are keyed on the ORIGIN (task-7.5c), so a caller passing a full URL
+  // resolves to the same pool acquire_ minted.
+  const std::string originKey = iora::network::normalizeOrigin(key);
   for (const auto &ps : snap)
   {
-    if (ps.poolKey == key)
+    if (ps.poolKey == originKey)
     {
       return ps;
     }
@@ -2797,8 +2826,8 @@ TEST_CASE("task-6.3 R-3: a factory throw rolls the reservation back exactly",
   };
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string epLive = "http://unit.test/live";
-  const std::string epDoomed = "http://unit.test/doomed";
+  const std::string epLive = "http://live.test/rpc";
+  const std::string epDoomed = "http://doomed.test/rpc";
 
   // A live connection on a DIFFERENT endpoint, so the restoration assertions
   // below are against a non-zero baseline rather than a trivially empty pool.
@@ -2868,7 +2897,7 @@ TEST_CASE("task-6.3 R-3: a configurer throw rolls back too (client already built
   };
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string ep = "http://unit.test/cfg";
+  const std::string ep = "http://cfg.test/rpc";
   const auto createdBefore = client.getStats().connectionsCreated;
   REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 0);
 
@@ -2907,8 +2936,8 @@ TEST_CASE("task-6.4a(a): a parked factory does not block another endpoint's acqu
 
   TestLatch entered;
   TestLatch release;
-  const std::string epA = "http://unit.test/A";
-  const std::string epB = "http://unit.test/B";
+  const std::string epA = "http://A.test/rpc";
+  const std::string epB = "http://B.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(epA, entered, release);
@@ -2972,7 +3001,7 @@ TEST_CASE("task-6.4a(b): a reservation counts against the per-endpoint cap",
 
   TestLatch entered;
   TestLatch release;
-  const std::string ep = "http://unit.test/capped";
+  const std::string ep = "http://capped.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1; // pinned to 1 so the mutations discriminate
@@ -3029,7 +3058,7 @@ TEST_CASE("task-6.4a(c): a re-entrant configurer completes and the pool survives
 
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1; // so the re-entrant same-endpoint acquire refuses
-  const std::string ep = "http://unit.test/reentrant";
+  const std::string ep = "http://reentrant.test/rpc";
   cfg.httpClientConfigurer = [&](const std::string &, iora::network::HttpClient &)
   {
     if (reentries.fetch_add(1) != 0)
@@ -3099,7 +3128,7 @@ TEST_CASE("task-6.4a(q): purgeIdle does not retire a pool with a creation in fli
 
   TestLatch entered;
   TestLatch release;
-  const std::string ep = "http://unit.test/pinned";
+  const std::string ep = "http://pinned.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
@@ -3152,7 +3181,7 @@ TEST_CASE("task-6.4a(u): _closing latched during the window rolls the creation b
 
   TestLatch entered;
   TestLatch release;
-  const std::string ep = "http://unit.test/closing";
+  const std::string ep = "http://closing.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
@@ -3218,9 +3247,9 @@ TEST_CASE("task-6.4a(v-pool): whole-pool LRU eviction skips a pool with a creati
 
   TestLatch entered;
   TestLatch release;
-  const std::string epX = "http://unit.test/X";
-  const std::string epW = "http://unit.test/W";
-  const std::string epY = "http://unit.test/Y";
+  const std::string epX = "http://X.test/rpc";
+  const std::string epW = "http://W.test/rpc";
+  const std::string epY = "http://Y.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.maxEndpointPools = 2;          // the pressure this regime needs
@@ -3299,8 +3328,8 @@ TEST_CASE("task-6.4a(v-conn): idle-connection LRU eviction does not retire a pin
 
   TestLatch entered;
   TestLatch release;
-  const std::string epX = "http://unit.test/Xc";
-  const std::string epY = "http://unit.test/Yc";
+  const std::string epX = "http://Xc.test/rpc";
+  const std::string epY = "http://Yc.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.maxEndpointPools = 0; // unlimited: keep the POOL cap out of it
@@ -3387,7 +3416,7 @@ TEST_CASE("task-6.4a(p): releasing a lease concurrently with eviction drifts no 
   cfg.idleTimeout = std::chrono::milliseconds(0);
   JsonRpcClient client(svc, pool, cfg);
 
-  const std::string ep = "http://unit.test/racey";
+  const std::string ep = "http://racey.test/rpc";
   auto lease = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
   REQUIRE(JsonRpcClientTestAccess::totalConnections(client) == 1);
 
@@ -3466,11 +3495,11 @@ TEST_CASE("task-6.4a(w): a rolled-back creation strands no pool in a maxEndpoint
 
   // Slot 1: a live, IN-USE pool (not an eviction candidate).
   auto keep = std::make_unique<ConnectionLease>(
-    JsonRpcClientTestAccess::acquire(client, "http://unit.test/keep"));
+    JsonRpcClientTestAccess::acquire(client, "http://keep.test/rpc"));
 
   // Slot 2 is transiently taken by the doomed pool, then must be released.
   armed.store(true);
-  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://unit.test/doomed"),
+  REQUIRE_THROWS_AS(JsonRpcClientTestAccess::acquire(client, "http://doomed.test/rpc"),
                     std::runtime_error);
   armed.store(false);
   REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 1);
@@ -3478,7 +3507,7 @@ TEST_CASE("task-6.4a(w): a rolled-back creation strands no pool in a maxEndpoint
   // A DIFFERENT endpoint must still be admitted. With the retire missing, the
   // stranded empty pool holds slot 2, no pool is all-idle to evict, and this
   // throws.
-  REQUIRE_NOTHROW(JsonRpcClientTestAccess::acquire(client, "http://unit.test/other"));
+  REQUIRE_NOTHROW(JsonRpcClientTestAccess::acquire(client, "http://other.test/rpc"));
   REQUIRE(JsonRpcClientTestAccess::totalConnections(client) ==
           JsonRpcClientTestAccess::recalcTotal(client));
   keep.reset();
@@ -3499,7 +3528,9 @@ TEST_CASE("task-6.4a(w2): one thread's rollback does not retire a pool another i
   auto &svc = testService();
   iora::core::ThreadPool pool(3, 3, std::chrono::seconds(1));
 
-  const std::string epE = "http://unit.test/E";
+  const std::string epE = "http://E.test/rpc";
+  // task-7.5c: the factory receives the pool ORIGIN, not the full URL.
+  const std::string originE = iora::network::normalizeOrigin(epE);
   TestLatch parked;    // signalled once the survivor is inside the window
   TestLatch release;   // releases the survivor
   TestLatch threwOnce; // signalled once the doomed thread has rolled back
@@ -3507,16 +3538,17 @@ TEST_CASE("task-6.4a(w2): one thread's rollback does not retire a pool another i
 
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 2; // both threads may reserve
-  cfg.httpClientFactory = [&](const std::string &ep, const iora::network::HttpClient::Config &)
+  cfg.httpClientFactory =
+    [&](const std::string &origin, const iora::network::HttpClient::Config &)
     -> std::unique_ptr<iora::network::HttpClient>
   {
-    if (ep == epE && calls.fetch_add(1) == 0)
+    if (origin == originE && calls.fetch_add(1) == 0)
     {
       parked.signal(); // FIRST caller is the survivor: park in the window
       release.wait();
       return std::make_unique<iora::network::HttpClient>();
     }
-    if (ep == epE)
+    if (origin == originE)
     {
       throw std::runtime_error("second creation on E blew up"); // the doomed one
     }
@@ -3600,7 +3632,7 @@ TEST_CASE("task-4.2/6.1b(b): a pool detached during the window throws instead of
 
   TestLatch entered;
   TestLatch release;
-  const std::string ep = "http://unit.test/detached";
+  const std::string ep = "http://detached.test/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
@@ -4369,7 +4401,7 @@ TEST_CASE("task-7.1b: a custom factory receives the derived config with the knob
   JsonRpcClient client(svc, pool, cfg);
   {
     // Force one connection creation; the stub-style factory never hits the wire.
-    auto lease = JsonRpcClientTestAccess::acquire(client, "http://unit.test/rpc");
+    auto lease = JsonRpcClientTestAccess::acquire(client, "http://rpc.test/rpc");
     (void)lease;
   }
 
@@ -4402,7 +4434,7 @@ TEST_CASE("task-7.1a: a sub-second socketIdleTimeout floors connectionIdleTimeou
   cfg.httpClientFactory = capturingFactory(captured, gotIt);
   JsonRpcClient client(svc, pool, cfg);
   {
-    auto lease = JsonRpcClientTestAccess::acquire(client, "http://unit.test/rpc");
+    auto lease = JsonRpcClientTestAccess::acquire(client, "http://rpc.test/rpc");
     (void)lease;
   }
   REQUIRE(gotIt.load());
@@ -5088,6 +5120,168 @@ TEST_CASE("task-7.3b: obs-text and empty header values pass through to the wire"
   CHECK(hasFieldLine(reqs[0], "X-Obs: " + obsText));
   // an empty value is accepted and emitted as exactly one line.
   CHECK(countFieldLinesNamed(reqs[0], "X-Empty") == 1);
+}
+
+// =========================================================================
+// task-7.5c — TWO PATHS ON ONE ORIGIN share ONE pool AND ONE socket, while the
+// send path still transmits the caller's FULL URL (its path reaches the wire).
+// The pool key is the origin (scheme://host:port), so /a and /b to the same
+// host:port map to one pool; the pooled HttpClient reuses its socket, so the
+// server accepts exactly ONE connection; and each request line carries the path
+// the caller actually sent. MUTATION (task-7.5c): key the pool on the full URL
+// -> two pools, two sockets, and this case's one-pool/one-socket asserts fail.
+// =========================================================================
+TEST_CASE("task-7.5c: two paths on one origin share one pool and one socket",
+          "[jsonrpc][pool][phase7][origin]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18190;
+  RawCaptureServer server(port);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string base = "http://127.0.0.1:" + std::to_string(port);
+  const std::string epA = base + "/alpha";
+  const std::string epB = base + "/beta"; // different PATH, same origin
+
+  REQUIRE(client.call(epA, "ping").is_object());
+  REQUIRE(client.call(epB, "ping").is_object());
+
+  // ONE pool, keyed on the shared origin.
+  const auto snap = JsonRpcClientTestAccess::snapshotPools(client);
+  REQUIRE(snap.size() == 1);
+  REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin(epA));
+  REQUIRE(snap[0].poolKey == iora::network::normalizeOrigin(epB));
+
+  REQUIRE(server.waitForRequests(2));
+  server.stop();
+  // ONE socket: the pooled HttpClient reused its connection across both paths.
+  REQUIRE(server.acceptedConnectionCount() == 1);
+  REQUIRE(server.requestCount() == 2);
+
+  // The FULL URL still reached the send: each request line carries its own path.
+  const auto lines = server.capturedRequestLines();
+  REQUIRE(lines.size() == 2);
+  REQUIRE(lines[0] == "POST /alpha HTTP/1.1");
+  REQUIRE(lines[1] == "POST /beta HTTP/1.1");
+}
+
+// =========================================================================
+// task-7.5c — the two PUBLIC extension points (httpClientFactory,
+// httpClientConfigurer) receive the ORIGIN, not the caller's full URL. An
+// out-of-tree consumer keying on the path would otherwise silently get the wrong
+// value. sendJson_ still receives the full URL (proven by the request-target).
+// MUTATION: pass the full URL to makeHttpClient_ -> the recorded strings carry
+// the path and these asserts fail.
+// =========================================================================
+TEST_CASE("task-7.5c: factory and configurer receive the origin, the send the full URL",
+          "[jsonrpc][pool][phase7][origin]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18191;
+  RawCaptureServer server(port);
+
+  std::string factorySaw;
+  std::string configurerSaw;
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.httpClientFactory =
+    [&](const std::string &origin, const iora::network::HttpClient::Config &derived)
+  {
+    factorySaw = origin;
+    return std::make_unique<iora::network::HttpClient>(derived);
+  };
+  cfg.httpClientConfigurer = [&](const std::string &origin, iora::network::HttpClient &)
+  { configurerSaw = origin; };
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/deep/path?q=1";
+  REQUIRE(client.call(ep, "ping").is_object());
+
+  const std::string origin = iora::network::normalizeOrigin(ep);
+  REQUIRE(factorySaw == origin);       // NOT the full URL
+  REQUIRE(configurerSaw == origin);    // NOT the full URL
+  REQUIRE(factorySaw.find("/deep") == std::string::npos); // path stripped
+  REQUIRE(factorySaw == "http://127.0.0.1:" + std::to_string(port));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  // sendJson_ received the FULL URL: the request-target is the caller's path+query.
+  const auto lines = server.capturedRequestLines();
+  REQUIRE(lines.size() == 1);
+  REQUIRE(lines[0] == "POST /deep/path?q=1 HTTP/1.1");
+}
+
+// =========================================================================
+// task-7.5b — the scheme is PART of the pool key: http and https to the same
+// host:port are DISTINCT pools (an https request must never reuse an http
+// cleartext socket). Observed via POOL COUNT, minting each pool through acquire_
+// with the stub factory (no network / no TLS handshake needed — acquire_ derives
+// the key and mints the pool before any send). Also covers the origins collapsing
+// path/query: /a and /b?x=1 on one scheme+host+port share ONE key. MUTATION:
+// drop the scheme from normalizeOrigin's key -> one pool, and this asserts two.
+// =========================================================================
+TEST_CASE("task-7.5b: http and https to one host:port are distinct pools",
+          "[jsonrpc][pool][phase7][origin]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  JsonRpcClient client(svc, pool, cfg);
+
+  // http and https to the same host:port -> two DISTINCT origins.
+  auto lHttp = JsonRpcClientTestAccess::acquire(client, "http://h:8443/a");
+  auto lHttps = JsonRpcClientTestAccess::acquire(client, "https://h:8443/b?x=1");
+  REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 2);
+
+  // A third acquire on a DIFFERENT path of the http origin joins the http pool
+  // (path/query do not fork the key) — still two pools.
+  auto lHttp2 = JsonRpcClientTestAccess::acquire(client, "http://h:8443/c?y=2");
+  REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).size() == 2);
+}
+
+// =========================================================================
+// task-7.5b — malformed / unreachable URL forms are REJECTED before any pool is
+// minted, so a live pool whose every request would fail is never created. The
+// throw propagates out of call() (through acquire_'s normalizeOrigin) and the
+// pool map stays empty. HTTP:// mixed case is included: HttpClient::parseUrl
+// throws on it too (agree-or-both-reject). MUTATION: skip the normalizeOrigin
+// validation -> a pool is minted for a URL every send rejects.
+// =========================================================================
+TEST_CASE("task-7.5b: malformed URL forms are rejected before a pool is minted",
+          "[jsonrpc][pool][phase7][origin][reject]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig(); // never reaches the network — rejected before acquire
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::vector<std::string> bad = {
+    "http://user@h/rpc",         // userinfo
+    "http://user:pass@h/rpc",    // userinfo with password
+    "http://[::1]:8080/rpc",     // bracketed IPv6 literal
+    "http://h:65536/rpc",        // port out of range (would truncate to 0)
+    "http://h:0/rpc",            // port zero
+    "http://h:abc/rpc",          // non-numeric port
+    "HTTP://h/rpc",              // non-lowercase scheme (HttpClient::parseUrl throws too)
+    "ws://h/rpc",                // non-http(s) scheme
+    "http://h/rpc ",             // trailing space -> transport regex rejects every send
+    "http://h ost/rpc",          // whitespace in the authority
+    "",                          // empty / missing scheme
+  };
+  for (const auto &url : bad)
+  {
+    REQUIRE_THROWS_AS(client.call(url, "ping"), std::invalid_argument);
+  }
+  // Not one pool was minted for any rejected form.
+  REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).empty());
 }
 
 int main(int argc, char *argv[])

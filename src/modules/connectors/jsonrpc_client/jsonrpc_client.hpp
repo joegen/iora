@@ -198,14 +198,16 @@ struct Config
   /// derived HttpClient destroyed through the base unique_ptr is UB while
   /// ~HttpClient is non-virtual.
   using HttpClientFactory = std::function<std::unique_ptr<iora::network::HttpClient>(
-    const std::string &endpoint, const iora::network::HttpClient::Config &derived)>;
+    const std::string &origin, const iora::network::HttpClient::Config &derived)>;
   HttpClientFactory httpClientFactory{};
 
   /// \brief Optional hook to configure a freshly created HttpClient (e.g.,
   /// TLS). \details Called after httpClientFactory() returns and before
   /// first use. The same phase-6 re-entrancy contract as httpClientFactory
-  /// above applies verbatim.
-  std::function<void(const std::string &endpoint, iora::network::HttpClient &client)>
+  /// above applies verbatim. Post task-7.5 the first parameter is the parsed
+  /// ORIGIN (scheme://host:port), not the caller's full URL — the same string
+  /// the factory received.
+  std::function<void(const std::string &origin, iora::network::HttpClient &client)>
     httpClientConfigurer{};
 };
 
@@ -1487,6 +1489,21 @@ private:
 
   detail::ConnectionLease acquire_(const std::string &endpoint)
   {
+    // task-7.5a/7.5c — DERIVE THE POOL KEY FROM THE ORIGIN, not the full URL.
+    // `endpoint` is the caller's full request URL; the pool is keyed on its
+    // ORIGIN (scheme://host:effective-port) so two paths on one host share ONE
+    // pool (and one HttpClient, one Transport, one DnsClient). Computed HERE,
+    // BEFORE _mutex is taken (thread-safety L-1), and normalizeOrigin is a PURE
+    // function of the URL string — it takes no runtime/capability state. It
+    // THROWS std::invalid_argument on a malformed/unreachable URL form (userinfo,
+    // IPv6 literal, empty/non-numeric/zero/out-of-range port, non-lowercase or
+    // non-http(s) scheme); that throw propagates out of acquire_ before any pool
+    // is minted (task-7.5b) — a form the transport would reject on every send
+    // never mints a live pool. The full `endpoint` is still what the send path
+    // (sendJson_/postJson) re-parses and transmits; only the KEY and the string
+    // handed to the factory/configurer become the origin.
+    const std::string origin = iora::network::normalizeOrigin(endpoint);
+
     // Declared BEFORE `lock` so that on EVERY exit path — normal return or the
     // PoolExhaustedError throw — these owning references are destroyed AFTER
     // `lock` releases _mutex. Members/locals are destroyed in reverse
@@ -1532,8 +1549,8 @@ private:
     }
 
     // Ensure pool exists (respecting maxEndpointPools with LRU idle pool
-    // eviction).
-    pool = findPool_(endpoint);
+    // eviction). Keyed on the ORIGIN (task-7.5c), never the full URL.
+    pool = findPool_(origin);
     if (!pool)
     {
       if (_config.maxEndpointPools > 0 && _pools.size() >= _config.maxEndpointPools)
@@ -1551,10 +1568,12 @@ private:
             "Max endpoint pools reached and no idle pool to evict for endpoint: " + endpoint);
         }
       }
-      // endpoint is guaranteed absent here (findPool_ just missed, and the
+      // origin is guaranteed absent here (findPool_ just missed, and the
       // eviction above only ever removes a DIFFERENT, LRU-idle pool), so create
       // unconditionally — a find-or-create helper's lookup would be dead code.
-      pool = _pools.emplace(endpoint, std::make_shared<detail::EndpointPool>(endpoint))
+      // The pool's _endpoint is the ORIGIN (task-7.5c): it is what pool->endpoint()
+      // hands makeHttpClient_ and thence the factory/configurer.
+      pool = _pools.emplace(origin, std::make_shared<detail::EndpointPool>(origin))
                .first->second;
     }
 
@@ -1619,7 +1638,7 @@ private:
       // helper's pendingCreates conjunct is what stops this throw retiring a
       // pool another thread is mid-construction on.
       assert(_totalConnections == recalcTotalLocked_()); // throw exit tripwire
-      retireIfEmptyAndUnpinnedLocked_(endpoint, pool, evictedPools);
+      retireIfEmptyAndUnpinnedLocked_(origin, pool, evictedPools);
       // I1 asserted AFTER the retire (before it, `pool` is legitimately empty).
       // This is the acquire_ THROW exit designPrinciple #7 names explicitly.
       assert(noEmptyUnpinnedPoolLocked_());
@@ -1657,24 +1676,25 @@ private:
       // What CAN remain is a freshly emplaced pool with nothing in it, which
       // designPrinciple #7 forbids persisting. No client exists on this path,
       // so no T6-2 concern arises.
-      retireIfEmptyAndUnpinnedLocked_(endpoint, pool, evictedPools);
+      retireIfEmptyAndUnpinnedLocked_(origin, pool, evictedPools);
       assert(_totalConnections == recalcTotalLocked_());
       assert(noEmptyUnpinnedPoolLocked_());
       throw;
     }
     ++_totalConnections;
 
-    // task-6.1b(a) — a LOCAL COPY of the endpoint, which the task mandates.
-    // The original justification ("the caller passes EndpointPool::_endpoint, a
-    // reference INTO the pool") described the DELETED createAndAcquire shape and
-    // is not true of the code below: all three callers (callCore_, notifyCore_,
-    // callBatchCore_) forward a caller-owned string that outlives the call. The
-    // copy is kept anyway, and deliberately: `endpoint` is a reference this
-    // frame does not own, it is consumed AFTER the lock is released and after
-    // arbitrary user code has run and may have re-entered the client, and the
-    // cost is one small allocation on the create path only. Owning the string
-    // outright makes that safety a local property rather than a contract every
-    // future caller of acquire_ has to honour.
+    // task-6.1b(a) — a LOCAL COPY of the pool's endpoint, which the task
+    // mandates. Since task-7.5c this is the ORIGIN (pool->endpoint() ==
+    // `origin`), NOT the caller's full URL: it is the string makeHttpClient_
+    // passes to the public httpClientFactory and httpClientConfigurer, so an
+    // out-of-tree extension point receives the origin, not a path-bearing URL.
+    // The copy is kept deliberately: `origin` is a local this frame owns, but it
+    // is consumed AFTER the lock is released and after arbitrary user code has
+    // run and may have re-entered the client, and the re-look-up/rollback tail
+    // below keys on this same string; owning it outright (rather than aliasing a
+    // reference into the pool) makes that safety a local property rather than a
+    // contract every future caller of acquire_ has to honour. The cost is one
+    // small allocation on the create path only.
     const std::string endpointCopy = pool->endpoint();
 
     lock.unlock();
@@ -2245,7 +2265,10 @@ private:
   std::uint64_t nextId_() { return _nextId.fetch_add(1, std::memory_order_relaxed); }
 
   /// \brief Run the user's httpClientFactory (and httpClientConfigurer) to
-  /// produce one HTTP client for `endpoint`.
+  /// produce one HTTP client for `origin`.
+  /// \param origin the pool's ORIGIN (scheme://host:effective-port), NOT the
+  ///   caller's full request URL (task-7.5c). Both public extension points
+  ///   receive this string; the full URL is re-applied only on the send path.
   /// \details task-6.2 DELETED the std::async(std::launch::async) +
   /// wait_for(30s) wrapper this used to run in. That wrapper bounded NOTHING:
   /// per [futures.async] the future returned by std::async joins in its own
@@ -2259,19 +2282,21 @@ private:
   /// (task-6.1b): the callbacks may re-enter the client, and a slow one no
   /// longer blocks acquires for other endpoints. THROWS propagate to acquire_'s
   /// create tail, which rolls the reservation back (task-6.1c).
-  std::unique_ptr<iora::network::HttpClient> makeHttpClient_(const std::string &endpoint)
+  std::unique_ptr<iora::network::HttpClient> makeHttpClient_(const std::string &origin)
   {
     // task-7.1b — pass the derived config so factory-created clients honour the
     // mapped knobs. _derivedHttpConfig is immutable post-construction, so this
     // lock-free read is safe on the phase-6 unlocked construction window.
-    auto cli = _config.httpClientFactory(endpoint, _derivedHttpConfig);
+    // task-7.5c — `origin` (the pool key), NOT the caller's full URL, is what
+    // both public extension points receive.
+    auto cli = _config.httpClientFactory(origin, _derivedHttpConfig);
     if (!cli)
     {
       throw JsonRpcError("httpClientFactory returned null");
     }
     if (_config.httpClientConfigurer)
     {
-      _config.httpClientConfigurer(endpoint, *cli);
+      _config.httpClientConfigurer(origin, *cli);
     }
     return cli;
   }
