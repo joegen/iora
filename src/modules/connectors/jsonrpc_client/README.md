@@ -15,7 +15,6 @@ A high-performance JSON-RPC 2.0 client implementation for the Iora microservice 
 - **Error Handling**: Comprehensive error reporting with detailed messages
 - **Configuration**: TOML-based configuration with runtime overrides
 - **Keep-Alive**: HTTP/1.1 connection reuse for better performance
-- **Compression**: Optional gzip compression for requests/responses
 
 ## Architecture
 
@@ -356,7 +355,6 @@ retryBackoffMultiplier = 2.0          # Exponential backoff multiplier
 initialRetryDelayMs = 100             # Initial retry delay
 maxRetryDelayMs = 5000                # Maximum retry delay
 enableKeepAlive = true                # HTTP keep-alive
-enableCompression = true              # Gzip compression
 defaultHeaders = "User-Agent:IoraClient,Accept:application/json"
 
 [iora.modules.jsonrpcClient.tls]
@@ -382,7 +380,6 @@ clientKeyPath = "/path/to/client.key" # Client private key for mTLS
 | `initialRetryDelayMs` | int | `100` | Initial retry delay |
 | `maxRetryDelayMs` | int | `5000` | Maximum retry delay |
 | `enableKeepAlive` | bool | `true` | Enable HTTP keep-alive |
-| `enableCompression` | bool | `true` | Enable gzip compression |
 | `defaultHeaders` | string | - | Default headers (format: "Key:Value,Key2:Value2") |
 
 ### TLS Configuration

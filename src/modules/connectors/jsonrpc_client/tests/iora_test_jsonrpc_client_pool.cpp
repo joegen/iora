@@ -25,6 +25,7 @@
 
 #include "jsonrpc_client.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch.hpp>
 #include <cerrno>
@@ -1123,14 +1124,23 @@ private:
 /// exactly (byte for byte). Used to assert wire-level header content.
 bool hasFieldLine(const std::vector<std::string> &lines, const std::string &expected)
 {
-  for (const auto &l : lines)
-  {
-    if (l == expected)
+  return std::find(lines.begin(), lines.end(), expected) != lines.end();
+}
+
+/// \brief Count field lines whose field-name (text before the first ':') folds
+/// case-insensitively to `name`. Used for "exactly ONE Accept-Encoding line"
+/// style assertions where the value is irrelevant — a plain string count would
+/// miss a duplicate spelled with a different case (task-7.2b/7.2d).
+std::size_t countFieldLinesNamed(const std::vector<std::string> &lines, std::string_view name)
+{
+  return static_cast<std::size_t>(std::count_if(
+    lines.begin(), lines.end(),
+    [&](const std::string &l)
     {
-      return true;
-    }
-  }
-  return false;
+      const std::size_t colon = l.find(':');
+      return colon != std::string::npos &&
+             iora::core::StringUtils::iequals(std::string_view(l).substr(0, colon), name);
+    }));
 }
 
 /// \brief A factory that records the derived HttpClient::Config it is handed and
@@ -4540,6 +4550,231 @@ TEST_CASE("task-7.1a: connectionTimeout reaches HttpClient (non-routable connect
   // vacuously green. A black-holing host consumes the full ~50 ms budget, so
   // elapsed >= 25 ms; a fast-refuse host trips this loudly instead.
   REQUIRE(elapsed >= std::chrono::milliseconds(25));
+}
+
+// =========================================================================
+// task-7.2b — the client advertises exactly ONE `Accept-Encoding: identity`
+// line, unconditionally, on EVERY request. WIRE-LEVEL via the raw-capture
+// server (a parsed-map harness cannot see a duplicate field line or byte-exact
+// spelling). Mutation-test: dropping the mergeHeaders_ contribution yields zero
+// Accept-Encoding lines and fails hasFieldLine; a bare push instead of the
+// replace-or-append fails the caller-override count.
+// =========================================================================
+TEST_CASE("task-7.2b: every request carries exactly one Accept-Encoding: identity",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18170;
+  RawCaptureServer server(port);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  SECTION("default call, twice (keep-alive reuse) — both requests carry it")
+  {
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(2));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 2);
+    for (const auto &req : reqs)
+    {
+      CHECK(hasFieldLine(req, "Accept-Encoding: identity"));
+      CHECK(countFieldLinesNamed(req, "Accept-Encoding") == 1);
+    }
+  }
+
+  SECTION("a caller-supplied Accept-Encoding (case-variant) is folded to identity, not duplicated")
+  {
+    // FORWARD NOTE (cpp17 R2-L2): task-7.3a will add Accept-Encoding to the
+    // per-call reject set, so a caller-supplied Accept-Encoding must THROW once
+    // 7.3a lands. When it does, INVERT this section (expect a throw) rather than
+    // leaving it asserting the now-unreachable fold.
+    // The caller header name MUST differ in case from the client's canonical
+    // "Accept-Encoding" for this to be a non-vacuous discriminator (cpp17 R1-M1):
+    // toHeaderMap_'s std::map is case-SENSITIVE, so a same-case duplicate would
+    // collapse last-wins to one line regardless of whether mergeHeaders_ dedups.
+    // With a lowercase caller key, a mutation that appends identity WITHOUT the
+    // iequals erase leaves two distinct map keys ("accept-encoding" +
+    // "Accept-Encoding") -> two wire lines -> the count assertion fails. Only the
+    // case-insensitive erase-then-append collapses them to exactly one.
+    const std::vector<std::pair<std::string, std::string>> headers{{"accept-encoding", "gzip"}};
+    REQUIRE(client.call(ep, "ping", iora::parsers::Json::object(), headers).is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Accept-Encoding") == 1);
+    CHECK(hasFieldLine(reqs[0], "Accept-Encoding: identity")); // canonical name, forced value
+    CHECK_FALSE(hasFieldLine(reqs[0], "accept-encoding: gzip"));
+  }
+}
+
+// =========================================================================
+// task-7.2c — the client has no response decoder, so a response Content-Encoding
+// other than `identity` fails LOUDLY before the body is parsed. An absent
+// Content-Encoding means no coding was applied (RFC 9110 8.4) and is accepted.
+// The value fold is case-insensitive, and Content-Encoding is a comma-separated
+// LIST field (RFC 9110 8.4 / RFC 7231 3.1.2.2), so a multi-coding value fails.
+// The response header NAME is matched case-insensitively (Response::headers uses
+// CaseInsensitiveCompare).
+// Positive cases were never asserted before this task.
+// Mutation-test: a validator written as "reject anything not exactly identity"
+// (no absent-header escape) fails EVERY ordinary response; one using == on the
+// raw string fails the mixed-case IDENTITY case.
+// =========================================================================
+TEST_CASE("task-7.2c: a response Content-Encoding other than identity fails loudly",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  auto runCall = [&](std::uint16_t port, std::vector<std::string> extraResponseHeaders)
+  {
+    RawResponsePolicy policy;
+    policy.extraResponseHeaders = std::move(extraResponseHeaders);
+    RawCaptureServer server(port, policy);
+    Config cfg;
+    cfg.maxRetries = 0;
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+    return client.call(ep, "ping");
+  };
+
+  SECTION("no Content-Encoding header -> succeeds")
+  {
+    REQUIRE(runCall(18171, {}).is_object());
+  }
+  SECTION("Content-Encoding: identity -> succeeds")
+  {
+    REQUIRE(runCall(18172, {"Content-Encoding: identity"}).is_object());
+  }
+  SECTION("Content-Encoding: IDENTITY (mixed case) -> succeeds")
+  {
+    REQUIRE(runCall(18173, {"Content-Encoding: IDENTITY"}).is_object());
+  }
+  SECTION("Content-Encoding: GZIP -> throws")
+  {
+    REQUIRE_THROWS_AS(runCall(18174, {"Content-Encoding: GZIP"}),
+                      iora::modules::connectors::JsonRpcError);
+  }
+  SECTION("Content-Encoding: gzip, identity (list) -> throws")
+  {
+    REQUIRE_THROWS_AS(runCall(18175, {"Content-Encoding: gzip, identity"}),
+                      iora::modules::connectors::JsonRpcError);
+  }
+  SECTION("lowercase response header NAME 'content-encoding: gzip' -> throws (web W-1)")
+  {
+    // Pins the case-insensitive header-NAME lookup: a real server may emit a
+    // lowercase field name. If the guard were refactored to a case-sensitive map
+    // or an == comparison it would silently miss this and feed gzip to the
+    // parser. Mutation-proof: comparing the lookup key case-sensitively fails it.
+    REQUIRE_THROWS_AS(runCall(18178, {"content-encoding: gzip"}),
+                      iora::modules::connectors::JsonRpcError);
+  }
+  SECTION("Content-Encoding value with OWS '\\tidentity ' -> succeeds (web W-2)")
+  {
+    // End-to-end: an OWS-padded `identity` is accepted, not rejected. NOTE
+    // (cpp17 R2-M1 / web W2-a): the OWS is stripped UPSTREAM by
+    // HttpClient::parseHeaderBlock before verifyResponseContentEncoding_ sees the
+    // value, so this does NOT exercise the guard's own belt-and-braces trim
+    // (that trim is unreachable with untrimmed input through the postJson path).
+    REQUIRE(runCall(18179, {"Content-Encoding: \tidentity "}).is_object());
+  }
+}
+
+// =========================================================================
+// task-7.2d — after 7.2a/7.2d the constructor contributes NOTHING to
+// Config::defaultHeaders. A default-constructed Config has an EMPTY
+// defaultHeaders; a default client still emits exactly ONE Content-Type line
+// (contributed by HttpClient::postJson, not the client) and exactly ONE
+// Connection line reflecting reuseConnections. Mutation-test: restoring the dead
+// Content-Type default entry keeps the Content-Type count at ONE, proving the
+// entry was genuinely dead (postJson overwrites it).
+// =========================================================================
+TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire is minimal",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  SECTION("a default-constructed Config has empty defaultHeaders")
+  {
+    Config cfg;
+    CHECK(cfg.defaultHeaders.empty());
+  }
+
+  SECTION("a default client emits exactly one Content-Type and one Connection line")
+  {
+    auto &svc = testService();
+    iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+    const std::uint16_t port = 18176;
+    RawCaptureServer server(port);
+
+    Config cfg;
+    cfg.maxRetries = 0; // enableKeepAlive defaults true -> reuseConnections true
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
+    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json"));
+    CHECK(countFieldLinesNamed(reqs[0], "Connection") == 1);
+    CHECK(hasFieldLine(reqs[0], "Connection: keep-alive")); // reuseConnections == true
+  }
+
+  SECTION("enableKeepAlive=false yields exactly one Connection: close line")
+  {
+    auto &svc = testService();
+    iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+    const std::uint16_t port = 18177;
+    RawCaptureServer server(port);
+
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.enableKeepAlive = false; // -> reuseConnections false -> one Connection: close
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Connection") == 1);
+    CHECK(hasFieldLine(reqs[0], "Connection: close"));
+  }
+
+  SECTION("restoring the dead Content-Type default entry keeps the wire count at ONE (cpp17 R1-L4)")
+  {
+    // Permanent regression guard proving the entry 7.2d deleted was genuinely
+    // dead: postJson overwrites Content-Type unconditionally, so re-seeding it in
+    // defaultHeaders still yields exactly ONE wire line. If postJson ever stopped
+    // overriding, this would flip to TWO and fail loudly.
+    auto &svc = testService();
+    iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+    const std::uint16_t port = 18180;
+    RawCaptureServer server(port);
+
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.defaultHeaders = {{"Content-Type", "application/json"}}; // the deleted default, restored
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
+  }
 }
 
 int main(int argc, char *argv[])

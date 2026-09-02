@@ -160,13 +160,11 @@ struct Config
   /// \brief Enable connection keep-alive for HTTP/1.1.
   bool enableKeepAlive{true};
 
-  /// \brief Enable gzip compression for requests/responses.
-  bool enableCompression{true};
-
   /// \brief Default HTTP headers applied to every request; call-specific
-  /// headers can override.
-  std::vector<std::pair<std::string, std::string>> defaultHeaders{
-    {"Content-Type", "application/json"}};
+  /// headers can override. Empty by default (task-7.2d): the constructor
+  /// contributes no entry, and the client's only wire contribution is
+  /// `Accept-Encoding: identity`, added per request in mergeHeaders_ (task-7.2b).
+  std::vector<std::pair<std::string, std::string>> defaultHeaders{};
 
   /// \brief Optional factory for creating HttpClient instances (injectable
   /// for tests).
@@ -855,15 +853,13 @@ public:
       { return std::make_unique<iora::network::HttpClient>(derived); };
     }
 
-    // Apply default keep-alive and compression settings
-    if (_config.enableKeepAlive)
-    {
-      _config.defaultHeaders.emplace_back("Connection", "keep-alive");
-    }
-    if (_config.enableCompression)
-    {
-      _config.defaultHeaders.emplace_back("Accept-Encoding", "gzip");
-    }
+    // task-7.2a/7.2d: the constructor contributes NOTHING to defaultHeaders.
+    // Keep-alive is now Config::reuseConnections (derived from enableKeepAlive in
+    // the HttpClient::Config built below); HttpClient emits its own Connection
+    // line, so a second one here would be a duplicate on the wire. The client's
+    // only wire header is `Accept-Encoding: identity`, added per request in
+    // mergeHeaders_ (task-7.2b) — never in _config, so no client-owned entry can
+    // collide with defaultHeaders validation.
 
     // task-7.1a — build the derived HttpClient::Config ONCE, here at the END of
     // the constructor body (constructor_pipeline_ordering step 4: AFTER the
@@ -2039,24 +2035,45 @@ private:
 
     for (const auto &kv : extra)
     {
-      bool replaced = false;
-      for (auto &base : out)
+      // ASCII-only, locale-independent header-name folding (cpp17 LOW-5): reuse
+      // the iora foundation helper rather than locale-dependent std::tolower, so
+      // the match is byte-stable across processes/locales. First case-insensitive
+      // match wins (replace); no match appends.
+      auto it = std::find_if(out.begin(), out.end(),
+                             [&](const std::pair<std::string, std::string> &base)
+                             { return iora::core::StringUtils::iequals(base.first, kv.first); });
+      if (it != out.end())
       {
-        // ASCII-only, locale-independent header-name folding (cpp17 LOW-5):
-        // reuse the iora foundation helper rather than locale-dependent
-        // std::tolower, so the match is byte-stable across processes/locales.
-        if (iora::core::StringUtils::iequals(base.first, kv.first))
-        {
-          base.second = kv.second;
-          replaced = true;
-          break;
-        }
+        it->second = kv.second;
       }
-      if (!replaced)
+      else
       {
         out.push_back(kv);
       }
     }
+
+    // task-7.2b: the client has no response decoder, so it advertises exactly
+    // one `Accept-Encoding: identity` on every request. RFC 7231 5.3.4 makes an
+    // explicit `identity` a real refusal of every unlisted coding, which is what
+    // pairs with task-7.2c's fail-loudly on a compressed response. Contributed
+    // to the local `out` ONLY — never Config::defaultHeaders — so it cannot
+    // collide with defaultHeaders validation. ERASE every prior Accept-Encoding
+    // (caller-supplied via `extra`, or config-supplied via defaultHeaders — the
+    // plugin's parseHeaderList can seed a case-variant duplicate) and append a
+    // single `identity`: this guarantees exactly one line UNCONDITIONALLY (a
+    // first-match replace would leave a second case-variant entry behind, which
+    // toHeaderMap_'s std::map would then emit as a distinct wire line). The
+    // client's `identity` wins because it is the only coding the client decodes.
+    // FORWARD NOTE (cpp17 R2-L2): task-7.3a adds Accept-Encoding to the per-call
+    // reject set, so a caller-supplied Accept-Encoding in `extra` will THROW
+    // rather than be folded — when 7.3a lands, the caller-erase branch here
+    // becomes reachable only for a config-seeded duplicate; update the 7.2b
+    // caller-override test accordingly rather than leaving a dead fold path.
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](const std::pair<std::string, std::string> &kv)
+                             { return iora::core::StringUtils::iequals(kv.first, "Accept-Encoding"); }),
+              out.end());
+    out.emplace_back("Accept-Encoding", "identity");
     return out;
   }
 
@@ -2130,12 +2147,49 @@ private:
     return headerMap;
   }
 
+  /// \brief task-7.2c: the client advertises `Accept-Encoding: identity` (task-
+  /// 7.2b) and has NO response decoder anywhere in the tree, so a response
+  /// carrying a Content-Encoding other than `identity` must fail loudly rather
+  /// than feed compressed octets to the JSON parser. An ABSENT Content-Encoding
+  /// means no coding was applied (RFC 9110 8.4 — the field indicates what codings
+  /// HAVE BEEN applied), so it is accepted; the common case, and it must NOT fail.
+  /// Content-Encoding is a comma-separated LIST field (RFC 9110 8.4 / RFC 7231
+  /// 3.1.2.2): a sender may apply and list several codings in order, so a
+  /// multi-coding value such as `gzip, identity` fails — the whole field value
+  /// must fold to exactly the single token `identity`. The comparison is a
+  /// case-insensitive ASCII fold, so `IDENTITY` is accepted.
+  /// The value is `trim`-ed as belt-and-braces: in the current call path
+  /// HttpClient::parseHeaderBlock has ALREADY stripped OWS (SP/HTAB) before the
+  /// Response reaches here, so the trim guards only a direct caller or a future
+  /// parser contract change — it cannot be exercised through postJson.
+  /// LIMITATION (tracked as defect_8 in tracker -10, 2026-07-26-10):
+  /// HttpClient's parseHeaderBlock stores duplicate field lines last-wins, so
+  /// `Content-Encoding: gzip` then `Content-Encoding: identity` presents as
+  /// `identity` and slips through here — the http_client Content-Length path DOES
+  /// throw on a conflicting duplicate, so the asymmetry is unintentional.
+  static void verifyResponseContentEncoding_(const iora::network::HttpClient::Response &response)
+  {
+    const auto it = response.headers.find("Content-Encoding");
+    if (it == response.headers.end())
+    {
+      return; // absent == identity; nothing to reject.
+    }
+    if (iora::core::StringUtils::iequals(iora::core::StringUtils::trim(it->second), "identity"))
+    {
+      return;
+    }
+    throw JsonRpcError("JsonRpcClient: response Content-Encoding '" + it->second +
+                       "' is not supported; the client advertises Accept-Encoding: "
+                       "identity and has no decoder for any other coding");
+  }
+
   iora::parsers::Json sendJson_(iora::network::HttpClient &http, const std::string &url,
                                 const iora::parsers::Json &payload,
                                 const std::map<std::string, std::string> &headerMap)
   {
     auto response = http.postJson(
       url, payload, headerMap, 0); // No retries at HTTP level - retries handled by JSON-RPC client
+    verifyResponseContentEncoding_(response); // task-7.2c: fail before parse on a bad coding
     return iora::network::HttpClient::parseJsonOrThrow(response);
   }
 
@@ -2256,8 +2310,9 @@ private:
 
   iora::core::ThreadPool &_threadPool;
   // IMMUTABLE AFTER CONSTRUCTION — load-bearing since phase 6, not a style note.
-  // The constructor applies its keep-alive/compression fixups and nothing writes
-  // _config again. makeHttpClient_ now reads _config.httpClientFactory and
+  // Nothing writes _config after the constructor returns (task-7.2a/7.2d removed
+  // the header fixups it used to emplace). makeHttpClient_ now reads
+  // _config.httpClientFactory and
   // _config.httpClientConfigurer with NO lock held (those reads happened under
   // _mutex before the CR-3 fix), and config() reads it unlocked too. Adding any
   // mutating accessor would therefore be an immediate data race on a

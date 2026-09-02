@@ -77,7 +77,6 @@
 //   (default 2.0) iora.modules.jsonrpcClient.initialRetryDelayMs  : int
 //   (default 100) iora.modules.jsonrpcClient.maxRetryDelayMs      : int
 //   (default 5000) iora.modules.jsonrpcClient.enableKeepAlive      : bool
-//   (default true) iora.modules.jsonrpcClient.enableCompression    : bool
 //   (default true) iora.modules.jsonrpcClient.defaultHeaders       : string
 //   "Key:Val,Key2:Val2" (optional)
 //
@@ -167,9 +166,6 @@ public:
 
         if (auto v = loader->getBool("iora.modules.jsonrpcClient.enableKeepAlive"))
           _clientConfig.enableKeepAlive = *v;
-
-        if (auto v = loader->getBool("iora.modules.jsonrpcClient.enableCompression"))
-          _clientConfig.enableCompression = *v;
 
         if (auto v = loader->getString("iora.modules.jsonrpcClient.defaultHeaders"))
         {
