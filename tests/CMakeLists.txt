@@ -65,6 +65,7 @@ set(NETWORK_TESTS
     network/iora_test_http_client_pool
     network/iora_test_http_client_lease
     network/iora_test_http_client_response_framing
+    network/iora_test_http_client_host_header
     network/iora_test_http_client_retry
     network/iora_test_http_client_cancel
     network/iora_test_tcp_engine

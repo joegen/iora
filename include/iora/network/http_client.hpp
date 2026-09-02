@@ -103,6 +103,33 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+/// \brief Build the `Host` request field line (with trailing CRLF) per RFC 9110
+/// §7.2 (Host = uri-host [ ':' port ]). The port is appended only when it is not
+/// the scheme default, matching RFC 9110 §4.2.3 normalisation (a default port is
+/// omitted). This is a deliberate deviation from the letter of RFC 9112 §3.2,
+/// which wants the port whenever the URI carried one; HttpClient::ParsedUrl backs
+/// an absent port with the scheme default, so it cannot tell an explicit `:80`
+/// from an absent port, and the normalised form is the interop-safe one.
+/// Extracted as a pure free function so all three cases (default, non-default,
+/// https) are unit-testable without a socket (tracker 2026-07-26-10 task-1.7(a)).
+/// PRECONDITION: `host` must already be a validated uri-host — the sole
+/// production caller passes ParsedUrl::host from parseUrl, whose regex forbids
+/// CR/LF and ':'. This helper does NOT sanitize: a CR/LF in `host` would inject
+/// headers (the caller-header CRLF class is tracker-10 defect_7), and a bare IPv6
+/// literal would need bracketing (`[::1]`) which parseUrl does not yet parse
+/// (tracker-10 task-1.6) — neither is reachable through the current parse path.
+inline std::string formatHostHeaderField(const std::string &host, std::uint16_t port, bool isHttps)
+{
+  const std::uint16_t defaultPort = isHttps ? 443 : 80;
+  std::string line = "Host: " + host;
+  if (port != defaultPort)
+  {
+    line += ":" + std::to_string(port);
+  }
+  line += "\r\n";
+  return line;
+}
+
 /// THREADING CONTRACT (sync request path): concurrent same-host requests on a
 /// SHARED HttpClient instance are SAFE but SERIALIZED. Each request acquires an
 /// exclusive per-host:port connection lease (ConnectionLease) that spans the
@@ -1132,7 +1159,11 @@ private:
     // Build HTTP request
     std::ostringstream request;
     request << method << " " << parsedUrl.getPathWithQuery() << " HTTP/1.1\r\n";
-    request << "Host: " << parsedUrl.host << "\r\n";
+    // Host carries the port for a non-default port (tracker 2026-07-26-10
+    // task-1.7(a) / defect_11) — this formerly emitted parsedUrl.host alone and
+    // broke name-based vhosts and gateways. See formatHostHeaderField for the RFC
+    // rule and the documented normalisation deviation.
+    request << formatHostHeaderField(parsedUrl.host, parsedUrl.port, parsedUrl.isHttps());
     request << "User-Agent: " << _config.userAgent << "\r\n";
     request << "Connection: " << (_config.reuseConnections ? "keep-alive" : "close") << "\r\n";
 
