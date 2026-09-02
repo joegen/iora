@@ -181,6 +181,41 @@ TEST_CASE("isListValuedHeader allow/deny set", "[http][helper]")
   REQUIRE_FALSE(detail::isListValuedHeader("X-Forwarded-Proto"));
 }
 
+// task-7.3b — the RFC 9110 header name/value grammar helpers reused by the
+// JSON-RPC client's header validation. Unit-tested here at the foundation.
+TEST_CASE("isHttpToken accepts tokens and rejects non-tokens", "[http][helper][token]")
+{
+  REQUIRE(iora::network::isHttpToken("Content-Type"));
+  REQUIRE(iora::network::isHttpToken("X-Custom.Header_1"));
+  REQUIRE_FALSE(iora::network::isHttpToken(""));         // empty is not 1*tchar
+  REQUIRE_FALSE(iora::network::isHttpToken("X-Foo "));   // trailing space is not a tchar
+  REQUIRE_FALSE(iora::network::isHttpToken("X Foo"));    // interior space
+  REQUIRE_FALSE(iora::network::isHttpToken("bad:name")); // ':' is not a tchar
+}
+
+TEST_CASE("isValidFieldValue enforces RFC 9110 5.5 field-vchar", "[http][helper][fieldvalue]")
+{
+  // Accepted: normal text, empty, whitespace-only (trimmed to empty), interior SP/HTAB.
+  REQUIRE(iora::network::isValidFieldValue("application/json"));
+  REQUIRE(iora::network::isValidFieldValue(""));
+  REQUIRE(iora::network::isValidFieldValue("   \t "));
+  REQUIRE(iora::network::isValidFieldValue("a b\tc"));
+  // POSITIVE obs-text (0x80-0xFF) — a signed-char implementation would wrongly
+  // reject these via `c < 0x20`; this pins the unsigned-char classification.
+  REQUIRE(iora::network::isValidFieldValue(std::string("\x80\xC3\xFF", 3)));
+  // Rejected: controls other than HTAB, and DEL.
+  REQUIRE_FALSE(iora::network::isValidFieldValue(std::string("a\0b", 3))); // NUL
+  REQUIRE_FALSE(iora::network::isValidFieldValue("a\x0b" "b"));           // VT
+  REQUIRE_FALSE(iora::network::isValidFieldValue("a\x0c" "b"));           // FF
+  REQUIRE_FALSE(iora::network::isValidFieldValue("a\x7f" "b"));           // DEL
+  // CR/LF blocked (header injection) — OWS trim is SP/HTAB only, so a trailing
+  // CRLF is NOT stripped away before the reject test.
+  REQUIRE_FALSE(iora::network::isValidFieldValue("foo\r\nX-Injected: evil"));
+  REQUIRE_FALSE(iora::network::isValidFieldValue("bare\rCR"));
+  REQUIRE_FALSE(iora::network::isValidFieldValue("bare\nLF"));
+  REQUIRE_FALSE(iora::network::isValidFieldValue("trailing\r\n"));
+}
+
 TEST_CASE("addOrCombineHeader branches", "[http][helper]")
 {
   HttpHeaders h;

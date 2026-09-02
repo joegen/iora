@@ -119,6 +119,38 @@ inline bool isHttpToken(const std::string &s)
   return true;
 }
 
+/// \brief True iff `s` is a valid RFC 9110 §5.5 field value once surrounding OWS
+/// is stripped. field-vchar = VCHAR (0x21-0x7E) / obs-text (0x80-0xFF), with SP
+/// (0x20) and HTAB (0x09) permitted between field-vchar. So the only rejected
+/// octets are controls other than HTAB (0x00-0x08, 0x0A-0x1F — which includes CR
+/// and LF, blocking header-injection) and DEL (0x7F); obs-text is accepted.
+/// OWS is trimmed with SP/HTAB ONLY — never CR/LF, which are structural and must
+/// reach the reject test, not be stripped away. An empty (or whitespace-only)
+/// value is valid. Classification is on `unsigned char`: on a signed char,
+/// `c < 0x20` would wrongly reject every 0x80-0xFF obs-text octet.
+inline bool isValidFieldValue(const std::string &s)
+{
+  std::size_t begin = 0;
+  std::size_t end = s.size();
+  while (begin < end && (s[begin] == ' ' || s[begin] == '\t'))
+  {
+    ++begin;
+  }
+  while (end > begin && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+  {
+    --end;
+  }
+  for (std::size_t i = begin; i < end; ++i)
+  {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    if ((c < 0x20 && c != 0x09) || c == 0x7F)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// \brief Convert a request method token to HttpMethod. Method names are
 /// CASE-SENSITIVE per RFC 9110 §9.1 (registered methods are uppercase). A
 /// well-formed but unrecognized token throws HttpRequestError(501); a malformed

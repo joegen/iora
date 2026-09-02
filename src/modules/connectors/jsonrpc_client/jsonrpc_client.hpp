@@ -35,6 +35,9 @@
 // For iora::core::StringUtils::iequals (ASCII, locale-independent header-name
 // folding in mergeHeaders_ — cpp17 LOW-5); not pulled in transitively by iora.hpp.
 #include "iora/core/string_utils.hpp"
+// For iora::network::isHttpToken / isValidFieldValue (RFC 9110 header-name/value
+// grammar reused in the constructor + mergeHeaders_ validation — task-7.3b).
+#include "iora/parsers/http_message.hpp"
 
 namespace iora
 {
@@ -861,6 +864,53 @@ public:
     // mergeHeaders_ (task-7.2b) — never in _config, so no client-owned entry can
     // collide with defaultHeaders validation.
 
+    // === Constructor header pipeline (constructor_pipeline_ordering_step0_r1).
+    // These steps MUTATE _config.defaultHeaders and MUST run before the shared_ptr
+    // is published (designPrinciple #9); mergeHeaders_ later only READS the result.
+    // (1) task-7.3d: validate every defaultHeaders entry against the CONSTRUCTOR
+    // reject set + the RFC 9110 grammar, so a misconfigured operator fails module
+    // LOAD once with a clear diagnostic, not on every RPC.
+    for (const auto &kv : _config.defaultHeaders)
+    {
+      validateHeaderOrThrow_(kv.first, kv.second, /*perCall=*/false, "in Config::defaultHeaders");
+    }
+    // (2) task-7.4: canonicalise Content-Type to HttpClient's exact spelling (the
+    // only field HttpClient also writes INTO the request map, at postJson), then
+    // self-dedup defaultHeaders case-insensitively (last-wins, first-seen spelling
+    // retained) so a config like "Accept:a,accept:b" cannot yield two wire lines.
+    for (auto &kv : _config.defaultHeaders)
+    {
+      if (iora::core::StringUtils::iequals(kv.first, "Content-Type"))
+      {
+        kv.first = "Content-Type";
+      }
+    }
+    _config.defaultHeaders = dedupHeadersLastWins_(_config.defaultHeaders);
+    // (3) task-7.3c: User-Agent is stream-written by HttpClient from
+    // Config::userAgent, never via the header map, so it cannot be de-duplicated
+    // downstream. Consume it out of defaultHeaders (case-insensitive; step (2)
+    // already collapsed any duplicate to one entry) into the derived config's
+    // userAgent below. A per-call User-Agent is rejected in mergeHeaders_.
+    std::string consumedUserAgent;
+    bool haveUserAgent = false;
+    {
+      std::vector<std::pair<std::string, std::string>> kept;
+      kept.reserve(_config.defaultHeaders.size());
+      for (auto &kv : _config.defaultHeaders)
+      {
+        if (iora::core::StringUtils::iequals(kv.first, "User-Agent"))
+        {
+          consumedUserAgent = kv.second;
+          haveUserAgent = true;
+        }
+        else
+        {
+          kept.push_back(std::move(kv));
+        }
+      }
+      _config.defaultHeaders = std::move(kept);
+    }
+
     // task-7.1a — build the derived HttpClient::Config ONCE, here at the END of
     // the constructor body (constructor_pipeline_ordering step 4: AFTER the
     // above fixups and — once task-7.3c lands — after a caller-supplied
@@ -888,10 +938,13 @@ public:
     // to 0 = wait indefinitely.)
     derived.leaseAcquireTimeout = 3 * _config.requestTimeout;
     // followRedirects/maxRedirects stay at HttpClient defaults — inert on this
-    // path; mapping them would be a feature-shaped no-op. userAgent stays at the
-    // HttpClient default here; task-7.3c consumes a caller-supplied User-Agent
-    // from defaultHeaders into derived.userAgent at pipeline step (3), before
-    // this build.
+    // path; mapping them would be a feature-shaped no-op. task-7.3c: a
+    // defaultHeaders User-Agent consumed at pipeline step (3) overrides the
+    // HttpClient default; absent one, the HttpClient default stands.
+    if (haveUserAgent)
+    {
+      derived.userAgent = consumedUserAgent;
+    }
     _derivedHttpConfig = std::move(derived);
   }
 
@@ -2028,51 +2081,141 @@ private:
     return j;
   }
 
+  /// \brief The framing/connection fields the client owns and refuses from a
+  /// caller or config (RFC 9110/9112 request-splitting + TE.CL surface). The
+  /// per-call set (task-7.3a) additionally refuses User-Agent — see
+  /// validateHeaderOrThrow_. Content-Type is in NEITHER set. Membership is
+  /// case-insensitive (RFC 9110 §5.1): a lowercase `transfer-encoding` must be
+  /// caught, or it would reach the wire verbatim and reintroduce TE.CL smuggling.
+  static bool isRejectedHeaderName_(const std::string &name)
+  {
+    static const char *const kFraming[] = {
+      "Host",          "Content-Length", "Connection",      "Transfer-Encoding",
+      "TE",            "Trailer",        "Upgrade",         "Proxy-Connection",
+      "Keep-Alive",    "Accept-Encoding", "Content-Encoding"};
+    for (const char *r : kFraming)
+    {
+      if (iora::core::StringUtils::iequals(name, r))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// \brief Validate one header for the constructor set (perCall=false, on
+  /// Config::defaultHeaders) or the per-call set (perCall=true, on `extra`):
+  /// reject a framing/smuggling name (task-7.3a), a per-call User-Agent
+  /// (task-7.3c — consumed once at construction, no per-call override), a
+  /// non-token name (RFC 9110 §5.6.2, task-7.3b) or a value carrying a forbidden
+  /// octet (§5.5). Throws JsonRpcError naming the field. `where` is a location
+  /// clause for the diagnostic.
+  static void validateHeaderOrThrow_(const std::string &name, const std::string &value,
+                                     bool perCall, const char *where)
+  {
+    if (perCall && iora::core::StringUtils::iequals(name, "User-Agent"))
+    {
+      throw JsonRpcError("JsonRpcClient: a per-call 'User-Agent' header is not allowed; "
+                         "set it once in Config::defaultHeaders (it is consumed into the "
+                         "HTTP User-Agent at construction, with no per-call override)");
+    }
+    if (isRejectedHeaderName_(name))
+    {
+      throw JsonRpcError(std::string("JsonRpcClient: header '") + name +
+                         "' is a connection/framing field the client controls and must not "
+                         "be supplied " + where);
+    }
+    if (!iora::network::isHttpToken(name))
+    {
+      throw JsonRpcError(std::string("JsonRpcClient: invalid header name '") + name + "' " +
+                         where + " (not an RFC 9110 token)");
+    }
+    if (!iora::network::isValidFieldValue(value))
+    {
+      throw JsonRpcError(std::string("JsonRpcClient: invalid value for header '") + name +
+                         "' " + where + " (contains a control or DEL octet)");
+    }
+  }
+
+  /// \brief Upsert one header into `out` case-insensitively, LAST-WINS: if a
+  /// same-name (iequals) entry exists, overwrite its value and keep its position
+  /// and first-seen spelling; else append. The single find-or-append primitive
+  /// shared by dedupHeadersLastWins_ and mergeHeaders_ (simpl R1-L1).
+  static void upsertLastWins_(std::vector<std::pair<std::string, std::string>> &out,
+                              const std::pair<std::string, std::string> &kv)
+  {
+    // ASCII-only, locale-independent header-name folding (cpp17 LOW-5): the iora
+    // foundation helper, not locale-dependent std::tolower, so the match is
+    // byte-stable across processes/locales.
+    auto it = std::find_if(out.begin(), out.end(),
+                           [&](const std::pair<std::string, std::string> &e)
+                           { return iora::core::StringUtils::iequals(e.first, kv.first); });
+    if (it != out.end())
+    {
+      it->second = kv.second;
+    }
+    else
+    {
+      out.push_back(kv);
+    }
+  }
+
+  /// \brief De-duplicate a header vector case-insensitively, LAST-WINS, retaining
+  /// the first-seen spelling and position. task-7.4 seed self-dedup: prevents two
+  /// case-variant defaultHeaders entries from becoming two wire lines.
+  static std::vector<std::pair<std::string, std::string>>
+  dedupHeadersLastWins_(const std::vector<std::pair<std::string, std::string>> &in)
+  {
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(in.size());
+    for (const auto &kv : in)
+    {
+      upsertLastWins_(out, kv);
+    }
+    return out;
+  }
+
   std::vector<std::pair<std::string, std::string>>
   mergeHeaders_(const std::vector<std::pair<std::string, std::string>> &extra) const
   {
+    // task-7.3a/7.3b: validate + reject every per-call header BEFORE merging, on
+    // the PER-CALL set (framing fields + User-Agent). A rejection throws before
+    // anything reaches the wire. Runs on the local `extra`; never writes _config.
+    for (const auto &kv : extra)
+    {
+      validateHeaderOrThrow_(kv.first, kv.second, /*perCall=*/true, "in a per-call header");
+    }
+
     std::vector<std::pair<std::string, std::string>> out = _config.defaultHeaders;
+    out.reserve(_config.defaultHeaders.size() + extra.size() + 1); // simpl R1-L2
 
     for (const auto &kv : extra)
     {
-      // ASCII-only, locale-independent header-name folding (cpp17 LOW-5): reuse
-      // the iora foundation helper rather than locale-dependent std::tolower, so
-      // the match is byte-stable across processes/locales. First case-insensitive
-      // match wins (replace); no match appends.
-      auto it = std::find_if(out.begin(), out.end(),
-                             [&](const std::pair<std::string, std::string> &base)
-                             { return iora::core::StringUtils::iequals(base.first, kv.first); });
-      if (it != out.end())
+      // task-7.4 (per-call): canonicalise a caller Content-Type to HttpClient's
+      // exact "Content-Type" spelling so it collapses onto postJson's map key —
+      // otherwise a lowercase `content-type` and postJson's `Content-Type` become
+      // two case-sensitive keys and two wire lines (cpp17 R1-M1 / web R1-W1). The
+      // constructor already canonicalises the config seed; this is the per-call
+      // arm of the same rule. The value is inert (postJson forces
+      // application/json), but the spelling must not fork the plain std::map.
+      if (iora::core::StringUtils::iequals(kv.first, "Content-Type"))
       {
-        it->second = kv.second;
+        upsertLastWins_(out, {"Content-Type", kv.second});
       }
       else
       {
-        out.push_back(kv);
+        upsertLastWins_(out, kv);
       }
     }
 
     // task-7.2b: the client has no response decoder, so it advertises exactly
     // one `Accept-Encoding: identity` on every request. RFC 7231 5.3.4 makes an
-    // explicit `identity` a real refusal of every unlisted coding, which is what
-    // pairs with task-7.2c's fail-loudly on a compressed response. Contributed
-    // to the local `out` ONLY — never Config::defaultHeaders — so it cannot
-    // collide with defaultHeaders validation. ERASE every prior Accept-Encoding
-    // (caller-supplied via `extra`, or config-supplied via defaultHeaders — the
-    // plugin's parseHeaderList can seed a case-variant duplicate) and append a
-    // single `identity`: this guarantees exactly one line UNCONDITIONALLY (a
-    // first-match replace would leave a second case-variant entry behind, which
-    // toHeaderMap_'s std::map would then emit as a distinct wire line). The
-    // client's `identity` wins because it is the only coding the client decodes.
-    // FORWARD NOTE (cpp17 R2-L2): task-7.3a adds Accept-Encoding to the per-call
-    // reject set, so a caller-supplied Accept-Encoding in `extra` will THROW
-    // rather than be folded — when 7.3a lands, the caller-erase branch here
-    // becomes reachable only for a config-seeded duplicate; update the 7.2b
-    // caller-override test accordingly rather than leaving a dead fold path.
-    out.erase(std::remove_if(out.begin(), out.end(),
-                             [](const std::pair<std::string, std::string> &kv)
-                             { return iora::core::StringUtils::iequals(kv.first, "Accept-Encoding"); }),
-              out.end());
+    // explicit `identity` a real refusal of every unlisted coding, which pairs
+    // with task-7.2c's fail-loudly on a compressed response. Contributed to the
+    // local `out` ONLY — never Config::defaultHeaders. A plain append yields
+    // exactly one line: task-7.3a rejects a per-call Accept-Encoding (above) and
+    // task-7.3d rejects one in defaultHeaders at construction, so neither the
+    // seed nor `extra` can carry a prior Accept-Encoding for this to duplicate.
     out.emplace_back("Accept-Encoding", "identity");
     return out;
   }

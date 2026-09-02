@@ -4589,29 +4589,15 @@ TEST_CASE("task-7.2b: every request carries exactly one Accept-Encoding: identit
     }
   }
 
-  SECTION("a caller-supplied Accept-Encoding (case-variant) is folded to identity, not duplicated")
+  SECTION("a caller-supplied Accept-Encoding (any case) is now REJECTED (task-7.3a)")
   {
-    // FORWARD NOTE (cpp17 R2-L2): task-7.3a will add Accept-Encoding to the
-    // per-call reject set, so a caller-supplied Accept-Encoding must THROW once
-    // 7.3a lands. When it does, INVERT this section (expect a throw) rather than
-    // leaving it asserting the now-unreachable fold.
-    // The caller header name MUST differ in case from the client's canonical
-    // "Accept-Encoding" for this to be a non-vacuous discriminator (cpp17 R1-M1):
-    // toHeaderMap_'s std::map is case-SENSITIVE, so a same-case duplicate would
-    // collapse last-wins to one line regardless of whether mergeHeaders_ dedups.
-    // With a lowercase caller key, a mutation that appends identity WITHOUT the
-    // iequals erase leaves two distinct map keys ("accept-encoding" +
-    // "Accept-Encoding") -> two wire lines -> the count assertion fails. Only the
-    // case-insensitive erase-then-append collapses them to exactly one.
+    // task-7.3a added Accept-Encoding to the per-call reject set: a caller may no
+    // longer supply it (the client owns the sole `identity`), so mergeHeaders_
+    // throws before anything reaches the wire. (Full 7.3a reject-set coverage is
+    // in the dedicated task-7.3a test case below.)
     const std::vector<std::pair<std::string, std::string>> headers{{"accept-encoding", "gzip"}};
-    REQUIRE(client.call(ep, "ping", iora::parsers::Json::object(), headers).is_object());
-    REQUIRE(server.waitForRequests(1));
-    server.stop();
-    const auto reqs = server.capturedRequests();
-    REQUIRE(reqs.size() == 1);
-    CHECK(countFieldLinesNamed(reqs[0], "Accept-Encoding") == 1);
-    CHECK(hasFieldLine(reqs[0], "Accept-Encoding: identity")); // canonical name, forced value
-    CHECK_FALSE(hasFieldLine(reqs[0], "accept-encoding: gzip"));
+    REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), headers),
+                      iora::modules::connectors::JsonRpcError);
   }
 }
 
@@ -4775,6 +4761,333 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
     REQUIRE(reqs.size() == 1);
     CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
   }
+}
+
+// =========================================================================
+// task-7.3a — the client rejects framing/smuggling fields CASE-INSENSITIVELY,
+// with two reject sets. Rejection happens in mergeHeaders_ before any transport,
+// so no live server is needed (validation throws JsonRpcError before the send).
+// Content-Type is in NEITHER set. A malformed defaultHeaders entry fails at
+// CONSTRUCTION (module load), not on every RPC.
+// =========================================================================
+TEST_CASE("task-7.3a: per-call framing/smuggling headers are rejected (case-insensitive)",
+          "[jsonrpc][pool][phase7]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  // Rejection precedes the send, so this endpoint is never dialed.
+  const std::string ep = "http://127.0.0.1:9/rpc";
+
+  auto rejects = [&](const std::string &name, const std::string &value)
+  {
+    const std::vector<std::pair<std::string, std::string>> h{{name, value}};
+    REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), h),
+                      iora::modules::connectors::JsonRpcError);
+  };
+
+  SECTION("every framing field in the per-call set throws (canonical case)")
+  {
+    for (const char *n : {"Host", "Content-Length", "Connection", "Transfer-Encoding", "TE",
+                          "Trailer", "Upgrade", "Proxy-Connection", "Keep-Alive",
+                          "Accept-Encoding", "Content-Encoding"})
+    {
+      rejects(n, "x");
+    }
+  }
+  SECTION("non-canonical case is still caught (web H1: the TE.CL smuggling guard)")
+  {
+    rejects("transfer-encoding", "chunked");
+    rejects("CoNtEnT-LeNgTh", "5");
+    rejects("CONNECTION", "close");
+    rejects("content-encoding", "gzip");
+    rejects("hOsT", "evil.example");
+  }
+}
+
+TEST_CASE("task-7.3a/7.3d: a framing field in defaultHeaders fails CONSTRUCTION",
+          "[jsonrpc][pool][phase7]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+
+  SECTION("lowercase framing field in defaultHeaders throws at construction")
+  {
+    Config cfg;
+    cfg.defaultHeaders = {{"transfer-encoding", "chunked"}};
+    REQUIRE_THROWS_AS(JsonRpcClient(svc, pool, cfg), iora::modules::connectors::JsonRpcError);
+  }
+  SECTION("a default-constructed Config constructs and its defaultHeaders are empty")
+  {
+    Config cfg;
+    REQUIRE_NOTHROW(JsonRpcClient(svc, pool, cfg));
+  }
+}
+
+// =========================================================================
+// task-7.3b — header names must be RFC 9110 tokens and values must be valid
+// field-values (no control/DEL octet; CR/LF blocks injection). Reuses the
+// network foundation (isHttpToken / isValidFieldValue). Rejection is per-call
+// (no server needed). Positive obs-text is exercised in the http_message unit
+// test; here we pin the client-level reject + the CR/LF injection guard.
+// =========================================================================
+TEST_CASE("task-7.3b: invalid header names and values are rejected per call",
+          "[jsonrpc][pool][phase7]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:9/rpc";
+
+  auto rejects = [&](const std::string &name, const std::string &value)
+  {
+    const std::vector<std::pair<std::string, std::string>> h{{name, value}};
+    REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), h),
+                      iora::modules::connectors::JsonRpcError);
+  };
+
+  SECTION("non-token names throw")
+  {
+    rejects("X Foo", "v");   // space is not a tchar
+    rejects("X-Foo ", "v");  // trailing space is not trimmed from a NAME
+    rejects("bad:name", "v"); // ':' is not a tchar
+  }
+  SECTION("values with a control or DEL octet throw")
+  {
+    rejects("X-Test", std::string("a\0b", 3)); // NUL
+    rejects("X-Test", "a\x0b" "b");            // VT
+    rejects("X-Test", "a\x0c" "b");            // FF
+    rejects("X-Test", "a\x7f" "b");            // DEL
+  }
+  SECTION("CR/LF in a value is rejected (header-injection guard)")
+  {
+    rejects("X-Test", "foo\r\nX-Injected: evil");
+    rejects("X-Test", "bare\rCR");
+    rejects("X-Test", "bare\nLF");
+  }
+}
+
+// =========================================================================
+// task-7.3c — User-Agent is consumed in the constructor into the derived
+// HttpClient::Config (stream-written, not map-written), so it cannot be
+// de-duplicated downstream. A per-call User-Agent is rejected; defaultHeaders
+// User-Agent(s) (any case, possibly duplicated) collapse to exactly ONE wire
+// User-Agent line and leave config().defaultHeaders carrying none.
+// =========================================================================
+TEST_CASE("task-7.3c: User-Agent is consumed from defaultHeaders and rejected per call",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+
+  SECTION("a per-call User-Agent throws with a diagnostic naming defaultHeaders")
+  {
+    iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+    Config cfg;
+    cfg.maxRetries = 0;
+    JsonRpcClient client(svc, pool, cfg);
+    const std::vector<std::pair<std::string, std::string>> h{{"User-Agent", "Mine/1.0"}};
+    REQUIRE_THROWS_WITH(
+      client.call("http://127.0.0.1:9/rpc", "ping", iora::parsers::Json::object(), h),
+      Catch::Contains("defaultHeaders"));
+  }
+
+  SECTION("dual-case User-Agent in defaultHeaders -> one wire line, none left in config()")
+  {
+    iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+    const std::uint16_t port = 18181;
+    RawCaptureServer server(port);
+
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.defaultHeaders = {{"User-Agent", "First/1.0"}, {"user-agent", "Second/2.0"}};
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    // Exactly one User-Agent line (stream-written from the derived config), and it
+    // is the last-wins value; config().defaultHeaders carries no User-Agent.
+    CHECK(countFieldLinesNamed(reqs[0], "User-Agent") == 1);
+    CHECK(hasFieldLine(reqs[0], "User-Agent: Second/2.0"));
+    const auto dh = client.config().defaultHeaders;
+    CHECK(std::none_of(dh.begin(), dh.end(),
+                       [](const std::pair<std::string, std::string> &kv)
+                       { return iora::core::StringUtils::iequals(kv.first, "User-Agent"); }));
+  }
+}
+
+// =========================================================================
+// task-7.3d — defaultHeaders is validated ONCE at construction (a malformed
+// value fails module load, not every RPC); a default Config and the README's
+// documented configuration both construct and call successfully.
+// =========================================================================
+TEST_CASE("task-7.3d: defaultHeaders is validated once at construction",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+
+  SECTION("a malformed defaultHeaders value fails construction, naming the field")
+  {
+    iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
+    Config cfg;
+    cfg.defaultHeaders = {{"X-Bad", "has\r\ninjection"}};
+    REQUIRE_THROWS_WITH(JsonRpcClient(svc, pool, cfg), Catch::Contains("X-Bad"));
+  }
+
+  SECTION("the README configuration (User-Agent + Accept) constructs and sends one UA line")
+  {
+    iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+    const std::uint16_t port = 18182;
+    RawCaptureServer server(port);
+
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.defaultHeaders = {{"User-Agent", "IoraClient"}, {"Accept", "application/json"}};
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "User-Agent") == 1);
+    CHECK(hasFieldLine(reqs[0], "User-Agent: IoraClient"));
+    CHECK(hasFieldLine(reqs[0], "Accept: application/json")); // a non-framing caller header passes through
+  }
+}
+
+// =========================================================================
+// task-7.4 — canonicalise Content-Type spelling + self-dedup defaultHeaders so a
+// single field never becomes two wire lines through the plain std::map.
+// =========================================================================
+TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  SECTION("a lowercase content-type in defaultHeaders yields exactly one Content-Type line")
+  {
+    const std::uint16_t port = 18183;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.defaultHeaders = {{"content-type", "application/json"}};
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    // postJson writes "Content-Type"; canonicalising the config entry to the same
+    // spelling collapses them to one map key -> one wire line.
+    CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
+  }
+
+  SECTION("both 'Accept' and 'accept' in defaultHeaders yield exactly one Accept line")
+  {
+    const std::uint16_t port = 18184;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.defaultHeaders = {{"Accept", "application/json"}, {"accept", "text/plain"}};
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Accept") == 1); // self-dedup, last-wins
+  }
+
+  SECTION("a PER-CALL lowercase content-type yields exactly one Content-Type line (cpp17 R1-M1)")
+  {
+    // The per-call arm of task-7.4: without canonicalising the caller's
+    // 'content-type' spelling, it and postJson's 'Content-Type' become two
+    // case-sensitive map keys -> two wire lines. Mutation-test: dropping the
+    // per-call canonicalisation in mergeHeaders_ makes this count 2.
+    const std::uint16_t port = 18185;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    const std::vector<std::pair<std::string, std::string>> h{{"content-type", "application/json-rpc"}};
+    REQUIRE(client.call(ep, "ping", iora::parsers::Json::object(), h).is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
+    // The one line carries postJson's forced value, not the caller's (web R2-L1):
+    // accept-and-override is what makes canonicalise (vs reject) safe.
+    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json"));
+  }
+
+  SECTION("a config-seed Content-Type PLUS a per-call content-type still yields one line (cpp17 R2-L1)")
+  {
+    // Exercises the upsertLastWins_ OVERWRITE branch of the Content-Type arm (the
+    // per-call header matches the canonical seed entry rather than appending).
+    const std::uint16_t port = 18187;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.defaultHeaders = {{"Content-Type", "application/xml"}};
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    const std::vector<std::pair<std::string, std::string>> h{{"content-type", "application/json-rpc"}};
+    REQUIRE(client.call(ep, "ping", iora::parsers::Json::object(), h).is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
+    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json")); // postJson forces the value
+  }
+}
+
+// =========================================================================
+// task-7.3b (wire) — the positive obs-text and empty-value cases must reach the
+// wire unchanged through JsonRpcClient -> mergeHeaders_ -> toHeaderMap_ ->
+// postJson (the predicate unit test only proves isValidFieldValue accepts them).
+// =========================================================================
+TEST_CASE("task-7.3b: obs-text and empty header values pass through to the wire",
+          "[jsonrpc][pool][phase7][raw]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  const std::uint16_t port = 18186;
+  RawCaptureServer server(port);
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  const std::string obsText("v\x80\xC3\xFF", 4); // obs-text octets 0x80-0xFF
+  const std::vector<std::pair<std::string, std::string>> h{{"X-Obs", obsText}, {"X-Empty", ""}};
+  REQUIRE(client.call(ep, "ping", iora::parsers::Json::object(), h).is_object());
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  const auto reqs = server.capturedRequests();
+  REQUIRE(reqs.size() == 1);
+  // obs-text reaches the wire byte-for-byte unchanged.
+  CHECK(hasFieldLine(reqs[0], "X-Obs: " + obsText));
+  // an empty value is accepted and emitted as exactly one line.
+  CHECK(countFieldLinesNamed(reqs[0], "X-Empty") == 1);
 }
 
 int main(int argc, char *argv[])
