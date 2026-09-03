@@ -276,6 +276,43 @@ TEST_CASE("isIdempotentMethod: non-idempotent and malformed tokens", "[http_clie
   CHECK_FALSE(HttpClient::isIdempotentMethod("get "));
 }
 
+// tracker 2026-09-03-2: isRequestProvablyNotSent is the SINGLE point of truth for
+// the RFC 9110 §9.2.2 not-sent taxonomy — the whole double-submit guarantee funnels
+// through it (both performRequest's own gate and the JsonRpcClient retry loop). It
+// must return true for HttpRequestNotSentError AND its subclass
+// HttpLeaseAcquireTimeoutError (subclass-INCLUSION), and false for the three
+// siblings (HttpClientCancelledError, HttpFramingError, HttpResponseTimeoutError)
+// and a plain std::exception (sibling/base-EXCLUSION). An end-to-end test cannot
+// pin this directly — the jsonrpc gate catches HttpClientCancelledError before the
+// predicate — so it is asserted here at the source.
+TEST_CASE("isRequestProvablyNotSent: not-sent taxonomy (subclass incl / sibling excl)",
+          "[http_client_retry][classify]")
+{
+  // TRUE: the not-sent base and its subclass.
+  CHECK(HttpClient::isRequestProvablyNotSent(HttpRequestNotSentError("x")));
+  CHECK(HttpClient::isRequestProvablyNotSent(HttpLeaseAcquireTimeoutError("x")));
+  // FALSE: possibly-sent / possibly-applied siblings.
+  CHECK_FALSE(HttpClient::isRequestProvablyNotSent(HttpClientCancelledError("x")));
+  CHECK_FALSE(HttpClient::isRequestProvablyNotSent(HttpFramingError("x")));
+  CHECK_FALSE(HttpClient::isRequestProvablyNotSent(HttpResponseTimeoutError("x")));
+  CHECK_FALSE(HttpClient::isRequestProvablyNotSent(std::runtime_error("x")));
+}
+
+// tracker 2026-09-03-2 DD invariant (2): HttpResponseTimeoutError is a DIRECT
+// std::runtime_error subclass — NOT a HttpRequestNotSentError (a response-read
+// timeout is possibly-applied, so it must stay non-retryable for a POST) and NOT a
+// HttpFramingError (performRequest catches HttpFramingError first and never retries
+// it — that would wrongly make an idempotent-GET response-timeout non-retryable).
+// Pinned at compile time so a future edit cannot silently reparent it.
+static_assert(!std::is_base_of<HttpRequestNotSentError, HttpResponseTimeoutError>::value,
+              "HttpResponseTimeoutError must NOT be a HttpRequestNotSentError (must stay "
+              "non-retryable for a non-idempotent POST)");
+static_assert(!std::is_base_of<HttpFramingError, HttpResponseTimeoutError>::value,
+              "HttpResponseTimeoutError must NOT be a HttpFramingError (must reach the generic "
+              "gate so it stays retryable for an idempotent method)");
+static_assert(std::is_base_of<std::runtime_error, HttpResponseTimeoutError>::value,
+              "HttpResponseTimeoutError must be a std::runtime_error");
+
 // ══════════════════════════════════════════════════════════════════════════
 // T1: POST that fails AFTER the request reached the wire is NOT retried.
 //     (server reads the full request, then closes without responding)
@@ -393,6 +430,24 @@ TEST_CASE("POST not retried on response timeout", "[http_client_retry][post][tim
 
   CHECK_THROWS(client.post(url(port, "/x"), "payload", {}, /*retries=*/2));
   CHECK(server.requestsReceived() == 1);
+}
+
+// T6 mirror (tracker 2026-09-03-2, web L-1): a response timeout on an IDEMPOTENT
+// method IS retried. HttpResponseTimeoutError is a sibling (not a
+// HttpRequestNotSentError), so it reaches performRequest's generic gate, where
+// isIdempotentMethod("GET") makes it retry-eligible (RFC 9110 §9.2.2 — idempotent
+// semantics). Guards against a future edit that special-cases the timeout type as
+// unconditionally non-retryable.
+TEST_CASE("GET retried on response timeout (idempotent)", "[http_client_retry][get][timeout]")
+{
+  const std::uint16_t port = 18808;
+  RawServer server;
+  REQUIRE(server.start(port, timeoutHandler()));
+
+  HttpClient client = makeClient();
+
+  CHECK_THROWS(client.get(url(port, "/x"), {}, /*retries=*/2));
+  CHECK(server.requestsReceived() == 3); // initial + 2 retries
 }
 
 // ══════════════════════════════════════════════════════════════════════════

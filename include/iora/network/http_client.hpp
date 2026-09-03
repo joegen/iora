@@ -134,6 +134,29 @@ public:
   }
 };
 
+/// \brief Thrown when the response read times out — the request was fully written
+/// and the server MAY have applied it before the reply arrived, so this is a
+/// POSSIBLY-SENT failure.
+///
+/// INVARIANT (tracker 2026-09-03-2): a DIRECT subclass of std::runtime_error and a
+/// SIBLING of HttpRequestNotSentError / HttpFramingError / HttpClientCancelledError
+/// — NEVER a subclass of any of them. It must NOT be a HttpRequestNotSentError (a
+/// response-read timeout is not provably-not-sent, so it must stay non-retryable for
+/// a non-idempotent method), and it must NOT be a HttpFramingError (performRequest
+/// catches HttpFramingError first and never retries it — that would wrongly make a
+/// response-read timeout on an IDEMPOTENT method non-retryable). It therefore falls
+/// through to performRequest's generic gate, where `isIdempotentMethod(method) ||
+/// isRequestProvablyNotSent(e)` retries it for an idempotent method (RFC 9110 §9.2.2
+/// "means to know that the request semantics are actually idempotent") and not for a
+/// POST. Given a distinct type so a caller can classify a response-read timeout by
+/// TYPE rather than by a brittle substring on the message; the message text
+/// ("HTTP response timeout") is preserved for any legacy substring consumer.
+class HttpResponseTimeoutError : public std::runtime_error
+{
+public:
+  explicit HttpResponseTimeoutError(const std::string &what) : std::runtime_error(what) {}
+};
+
 /// \brief Build the `Host` request field line (with trailing CRLF) per RFC 9110
 /// §7.2 (Host = uri-host [ ':' port ]). The port is appended only when it is not
 /// the scheme default, matching RFC 9110 §4.2.3 normalisation (a default port is
@@ -511,6 +534,21 @@ public:
            method == "OPTIONS" || method == "TRACE";
   }
 
+  /// \brief True iff \p e proves the request never reached the wire (RFC 9110
+  /// §9.2.2 "some means to detect that the original request was never applied"), so
+  /// it is safe to auto-retry even a non-idempotent method. This is the SINGLE home
+  /// of the not-sent taxonomy: it matches HttpRequestNotSentError and, by
+  /// inheritance, its subclass HttpLeaseAcquireTimeoutError, while EXCLUDING the
+  /// siblings HttpClientCancelledError, HttpFramingError and HttpResponseTimeoutError
+  /// (a response-read timeout is possibly-sent). Used by performRequest's own gate
+  /// AND by JsonRpcClient's retry loop (which bypasses performRequest via
+  /// postJson(...,0)), so the two never drift (tracker 2026-09-03-2). Pointer-form
+  /// dynamic_cast: nullptr on failure, no std::bad_cast, includes subclasses.
+  static bool isRequestProvablyNotSent(const std::exception &e)
+  {
+    return dynamic_cast<const HttpRequestNotSentError *>(&e) != nullptr;
+  }
+
   /// \brief Perform synchronous GET request
   Response get(const std::string &url, const std::map<std::string, std::string> &headers = {},
                int retries = 0)
@@ -882,6 +920,16 @@ private:
     return parsedUrl.host;
   }
 
+  /// \brief The outcome of acquireConnection: the session plus whether it is a
+  /// REUSED pooled connection (true) or a freshly-opened one (false). executeRequest
+  /// probes only a reused connection for a pre-write peer close (tracker 2026-09-03-2)
+  /// — a fresh connect has no pending EOF, so probing it would only add latency.
+  struct AcquiredConnection
+  {
+    SessionId id;
+    bool reused;
+  };
+
   /// \brief Reuse a cached connection for \p parsedUrl, or open a fresh one.
   ///
   /// MUST be called while holding the lease for parsedUrl.getHostPort(): the
@@ -890,7 +938,7 @@ private:
   /// and is RELEASED across DNS resolution and connectSync (LEASE-7 — the lease,
   /// not the mutex, serializes same-host work; holding _mutex across I/O would
   /// block lease releases and other hosts' bookkeeping).
-  SessionId acquireConnection(const ParsedUrl &parsedUrl)
+  AcquiredConnection acquireConnection(const ParsedUrl &parsedUrl)
   {
     const std::string hostPort = parsedUrl.getHostPort();
 
@@ -904,7 +952,7 @@ private:
         if (now - it->second.lastUsed < _config.connectionIdleTimeout)
         {
           it->second.lastUsed = now;
-          return it->second.id;
+          return {it->second.id, /*reused=*/true};
         }
         // Idle: close and evict, then fall through to reconnect.
         _transport->close(it->second.id);
@@ -952,7 +1000,7 @@ private:
       _connections[hostPort] = ConnectionEntry{sessionId, std::chrono::steady_clock::now()};
     }
 
-    return sessionId;
+    return {sessionId, /*reused=*/false};
   }
 
   /// \brief Close \p sessionId and evict it from the connection cache.
@@ -1059,8 +1107,7 @@ private:
         // request may have been transmitted must NOT be auto-retried — the server
         // may have already processed it, and re-sending would double-submit
         // (duplicate orders/charges/state mutations).
-        const bool retryEligible =
-          isIdempotentMethod(method) || (dynamic_cast<const HttpRequestNotSentError *>(&e) != nullptr);
+        const bool retryEligible = isIdempotentMethod(method) || isRequestProvablyNotSent(e);
         if (!retryEligible)
         {
           iora::core::Logger::warning(
@@ -1152,7 +1199,8 @@ private:
     SessionId sessionId{};
     try
     {
-      sessionId = acquireConnection(parsedUrl);
+      const AcquiredConnection acquired = acquireConnection(parsedUrl);
+      sessionId = acquired.id;
 
       // Set session to sync mode BEFORE sending request so response data gets
       // buffered correctly
@@ -1160,6 +1208,53 @@ private:
       {
         dropConnection(hostPort, sessionId);
         throw std::runtime_error("Failed to set session to sync read mode");
+      }
+
+      // Pre-write liveness probe on a REUSED pooled socket (tracker 2026-09-03-2).
+      // A keep-alive socket the peer closed while idle is still cached (within
+      // connectionIdleTimeout); writing to it buffers locally and fails only on the
+      // subsequent read — a POSSIBLY-SENT failure that must NOT be retried for a
+      // non-idempotent POST. Detecting the close BEFORE writing any byte turns the
+      // common idle-close case into a provably-not-sent HttpRequestNotSentError
+      // (this catch's else-branch), so the JSON-RPC retry loop can safely retry it
+      // on a fresh socket. A near-zero-timeout receiveSync distinguishes a dead
+      // socket (PeerClosed — the transport left a closed tombstone in the sync
+      // buffer at onClose) from a healthy quiescent one (Timeout, returned
+      // immediately on the past deadline). BEST-EFFORT ONLY: peer close is observed
+      // asynchronously, so this can return Timeout for a socket that has in fact
+      // died (FIN not yet reflected, or its tombstone GC'd by an unrelated session's
+      // close) — in which case the write proceeds and the post-write failure is
+      // (correctly) not retried. The double-submit SAFETY guarantee rests on the
+      // retry gate keying on HttpRequestNotSentError, NEVER on this probe. A fresh
+      // connection is not probed (no pending EOF; probing only adds latency).
+      // dropConnection MUST run before every throwing outcome so the not-sent retry
+      // opens a FRESH socket rather than re-acquiring this same dead cached one.
+      if (acquired.reused)
+      {
+        char probeByte = 0;
+        std::size_t probeLen = sizeof(probeByte);
+        auto probe =
+          _transport->receiveSync(sessionId, &probeByte, probeLen, std::chrono::milliseconds(0));
+        // The one "socket is healthy, keep it" outcome: an immediate Timeout (no
+        // pending bytes, not closed). Every other outcome is handled below.
+        const bool healthyQuiescent =
+          probe.isErr() && probe.error().code == TransportError::Timeout;
+        if (!healthyQuiescent)
+        {
+          // Any non-Timeout outcome means the reused socket is unusable BEFORE we
+          // wrote a byte: PeerClosed (idle close), Ok-with-bytes (an unsolicited
+          // server message such as 408 + Connection: close, RFC 9110 §15.5.9, or a
+          // stale tail — reused connections are cached surplus-free, so these bytes
+          // are never our own response), BufferOverflow (corrupt sync buffer),
+          // Cancelled/ShuttingDown, or any other error. Evict, then throw a plain
+          // runtime_error: the outer catches below re-classify it as
+          // HttpClientCancelledError when _closing, else HttpRequestNotSentError —
+          // correct for every pre-write outcome (no request byte was sent).
+          dropConnection(hostPort, sessionId);
+          const std::string detail =
+            probe.isErr() ? probe.error().message : "unexpected bytes on idle connection";
+          throw std::runtime_error("Reused connection is dead before send: " + detail);
+        }
       }
     }
     catch (const HttpFramingError &)
@@ -1237,7 +1332,16 @@ private:
       // If we are closing, this failure is a cancellation-induced close, not a
       // retryable transport error (task-1.7).
       throwIfClosing("HttpClient: cancelled while sending request");
-      throw std::runtime_error("Failed to send HTTP request: " + sendResult.error().message);
+      // sendSync errs ONLY when the transport failed to ENQUEUE the bytes — nothing
+      // reached the socket, a provably-not-sent condition (RFC 9110 §9.2.2), so it
+      // is safe to retry for ANY method. Raise HttpRequestNotSentError rather than a
+      // generic runtime_error (tracker 2026-09-03-2); the TYPE now carries the
+      // not-sent semantics. The message string is preserved BYTE-IDENTICALLY because
+      // it is a cross-repo contract: tmc_edge_proxy TmcClient::classifyTransportError
+      // documents and unit-tests this exact "what()" text. NOTE the asymmetry is
+      // deliberate: sendSync returning OK does NOT prove transmission (async socket
+      // write), so a later receive-side failure stays possibly-sent and non-retryable.
+      throw HttpRequestNotSentError("Failed to send HTTP request: " + sendResult.error().message);
     }
 
     // Receive the response, framing it per RFC 9112 §6.3 as bytes arrive.
@@ -1274,7 +1378,11 @@ private:
         }
         else if (recvResult.isErr() && recvResult.error().code == TransportError::Timeout)
         {
-          throw std::runtime_error("HTTP response timeout");
+          // POSSIBLY-SENT: the request was fully written, so a response-read timeout
+          // must stay non-retryable for a non-idempotent method. Typed so a caller
+          // classifies it by TYPE, not a substring; message preserved for any legacy
+          // substring consumer (tracker 2026-09-03-2).
+          throw HttpResponseTimeoutError("HTTP response timeout");
         }
         else if (recvResult.isErr() && recvResult.error().code == TransportError::BufferOverflow)
         {

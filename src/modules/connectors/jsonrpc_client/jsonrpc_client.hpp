@@ -2415,17 +2415,20 @@ private:
   }
 
   /// \brief True if \p e is a transport TIMEOUT that ClientStats::timeoutRequests
-  /// should count. The lease-acquire timeout is matched by TYPE
-  /// (HttpLeaseAcquireTimeoutError — its message reads "timed out", which a
-  /// find("timeout") substring match misses; task-7.8 / HD-7 Secondary row); the
-  /// response-read timeout ("HTTP response timeout") by the retained substring.
-  /// Shared by the single-call retry loop AND the batch path (task-7.8 M2) so both
-  /// classify identically. NOTE: connect/DNS timeouts are wrapped/re-messaged
-  /// without a "timeout" substring and are NOT yet counted — backlog 2026-09-03-3.
+  /// should count. Both counted timeouts are now matched by TYPE (tracker
+  /// 2026-09-03-2): the lease-acquire timeout (HttpLeaseAcquireTimeoutError — its
+  /// message reads "timed out", never matched a find("timeout")) and the
+  /// response-read timeout (HttpResponseTimeoutError — formerly a generic
+  /// runtime_error matched by the now-removed find("timeout") substring). Keying on
+  /// TYPE, not message text, means a server-supplied error string containing
+  /// "timeout" can no longer be mis-counted. Shared by the single-call retry loop
+  /// AND the batch path (task-7.8 M2) so both classify identically. NOTE: connect/DNS
+  /// timeouts are wrapped as HttpRequestNotSentError("...connectSync timed out")
+  /// without a distinct type and are NOT yet counted — backlog 2026-09-03-3.
   static bool isTimeoutFailure_(const std::exception &e)
   {
     return dynamic_cast<const iora::network::HttpLeaseAcquireTimeoutError *>(&e) != nullptr ||
-           std::string_view(e.what()).find("timeout") != std::string_view::npos;
+           dynamic_cast<const iora::network::HttpResponseTimeoutError *>(&e) != nullptr;
   }
 
   iora::parsers::Json
@@ -2451,22 +2454,43 @@ private:
       {
         return sendJson_(http, url, payload, headerMap);
       }
-      // HAZARD (tracker 2026-09-03-2): this blanket catch-and-retry re-sends a
-      // non-idempotent POST on ANY exception, with no provably-not-sent gate — a
-      // double-submit if the server may already have applied the request. The
-      // safe fix (retry only HttpRequestNotSentError) is cross-cutting; tracked.
+      // Retry gate (tracker 2026-09-03-2): every JSON-RPC call is a non-idempotent
+      // POST, so retry ONLY a PROVABLY-NOT-SENT failure — HttpRequestNotSentError
+      // and its subclass HttpLeaseAcquireTimeoutError (RFC 9110 §9.2.2). A generic
+      // post-write failure, an HttpResponseTimeoutError, an HttpFramingError, or a
+      // verifyResponseContentEncoding_/parseJsonOrThrow throw is POSSIBLY-SENT and is
+      // rethrown WITHOUT retry: re-sending a request the server may already have
+      // applied would double-submit (duplicate create/charge/transfer). The gate
+      // keys on exception TYPE via HttpClient::isRequestProvablyNotSent — the single
+      // home of the not-sent taxonomy, shared with HttpClient::performRequest.
       catch (const std::exception &e)
       {
-        attempts++;
-        if (attempts > _config.maxRetries)
+        // A mid-call cancellation surfaces as HttpClientCancelledError (a sibling,
+        // NOT a HttpRequestNotSentError, so it is never retried). Map it to the
+        // client's shutdown contract; it can only occur once the client is closing.
+        // Handled first so the cold teardown path skips the classifiers below.
+        if (dynamic_cast<const iora::network::HttpClientCancelledError *>(&e) != nullptr)
         {
-          if (isTimeoutFailure_(e))
+          throw ClientShutdownError("JsonRpcClient: cancelled during send; client is closing");
+        }
+
+        // Single classification point: compute both properties once, then decide.
+        const bool timeout = isTimeoutFailure_(e);
+        const bool notSent = iora::network::HttpClient::isRequestProvablyNotSent(e);
+
+        // Terminal: not retryable, or the retry budget is spent. Count a timeout on
+        // THIS path too (not only on exhaustion) so narrowing the gate does not drop
+        // the timeoutRequests metric for a non-retryable response-read timeout.
+        if (!notSent || attempts >= _config.maxRetries)
+        {
+          if (timeout)
           {
             _stats.timeoutRequests.fetch_add(1, std::memory_order_relaxed);
           }
           throw;
         }
 
+        attempts++;
         _stats.retriedRequests.fetch_add(1, std::memory_order_relaxed);
 
         // INTERRUPTIBLE backoff (task-3.1(f)): the destructor's STEP-1 notify

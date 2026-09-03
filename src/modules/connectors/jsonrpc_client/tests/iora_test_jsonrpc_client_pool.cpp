@@ -752,6 +752,17 @@ struct RawResponsePolicy
   std::string body{kJsonRpcSuccessBody};
   int statusCode{200};
   std::string reason{"OK"};
+  /// tracker 2026-09-03-2: read the FULL request (so requestCount() counts it —
+  /// the server "may have applied" it), then close the socket WITHOUT replying.
+  /// Models a possibly-applied failure that a non-idempotent POST must NOT retry.
+  bool closeAfterRequestNoReply{false};
+  /// tracker 2026-09-03-2: read the full request, then hold the socket open and
+  /// SILENT (never reply), so the client hits its requestTimeout — a response-read
+  /// timeout (HttpResponseTimeoutError), also a possibly-applied non-retryable case.
+  bool holdOpenNoReply{false};
+  /// tracker 2026-09-03-2: if non-empty, send these exact bytes instead of
+  /// buildResponse() — e.g. a malformed status line to force an HttpFramingError.
+  std::string rawResponseOverride;
 };
 
 class RawCaptureServer
@@ -955,11 +966,25 @@ private:
         _requests.push_back(std::move(fieldLines));
         _requestLines.push_back(std::move(requestLine));
       }
+      // tracker 2026-09-03-2: possibly-applied failure models. The request is
+      // already recorded above (the server "received" it), so a client that
+      // retries would push requestCount() past 1 — the double-submit these assert
+      // against.
+      if (_policy.closeAfterRequestNoReply)
+      {
+        return; // drop the socket before replying (read-then-drop)
+      }
+      if (_policy.holdOpenNoReply)
+      {
+        interruptibleDelay(std::chrono::hours(1)); // never reply; client hits requestTimeout, then stop()
+        return;
+      }
       if (!interruptibleDelay(_policy.delayBeforeResponse)) // ts M-1
       {
         return; // stop() requested during the scripted delay
       }
-      if (!writeAll(cs, buildResponse()))
+      if (!writeAll(cs, _policy.rawResponseOverride.empty() ? buildResponse()
+                                                            : _policy.rawResponseOverride))
       {
         _writeError.store(true, std::memory_order_release); // cpp17 L-4
       }
@@ -4749,11 +4774,13 @@ TEST_CASE("task-7.6: socketIdleTimeout below the server keep-alive floor recycle
 // "four attempts" the verification warns against. This test asserts the desired
 // OBSERVABLE (the call recovers); it is the closed-while-idle-BEFORE-the-write
 // case, which RFC 9110 §9.2.2 treats as provably-not-applied and therefore safe
-// to retry. NB: the retry loop does NOT currently restrict itself to that case
-// (it retries any exception — a double-submit hazard for non-idempotent POST,
-// tracked in 2026-09-03-2); when that lands, the reused-dead-socket case must be
-// classified provably-not-sent so this test stays green. The 3 s default only
-// lowers how often this path is taken. Complements the safe-ordering test above.
+// to retry. As of tracker 2026-09-03-2 the retry loop retries ONLY provably-not-sent
+// failures (HttpRequestNotSentError): HttpClient's pre-write liveness probe detects
+// this reused-dead socket BEFORE writing and raises HttpRequestNotSentError, so the
+// call recovers here — while the possibly-applied cases (server read the request,
+// then dropped/stalled/mis-framed) are NOT retried; see the sibling [double-submit]
+// tests. The 3 s socketIdleTimeout default only lowers how often this path is taken.
+// Complements the safe-ordering test above.
 //
 // Determinism / robustness: the server closes S1 at the first SO_RCVTIMEO idle
 // tick past closeAfterIdleMs=700 ms (nominal ~800 ms; ticks at ~400/800/1200 ms);
@@ -4796,6 +4823,175 @@ TEST_CASE("task-7.6: a reused socket the server already closed is retried on a f
   server.stop();
   REQUIRE(server.acceptedConnectionCount() == 2); // dead S1 dropped + one fresh S2 from the retry
   REQUIRE(server.requestCount() == 2);            // call 1, then the recovered call 2
+}
+
+// =========================================================================
+// tracker 2026-09-03-2 — DOUBLE-SUBMIT GUARD (the P0 this task fixes). Every
+// JSON-RPC call is a non-idempotent POST. A failure that occurs AFTER the request
+// bytes may have reached the server (peer close on read, response-read timeout,
+// framing error, unparseable/bad-coding response) is POSSIBLY-APPLIED and must NOT
+// be auto-retried, even with maxRetries>0 — retrying would re-submit a request the
+// server may already have processed. Each case below drives the retry loop with
+// maxRetries=3 and asserts EXACTLY ONE server-side receipt (requestCount()==1) and
+// ONE connection (acceptedConnectionCount()==1): no retry, no double-submit. The
+// server records the request BEFORE the failure, so a regression to blanket-retry
+// would push requestCount() to 2+. Complements 18168 (the provably-not-sent
+// reused-dead-socket case, which SHOULD recover on a fresh socket).
+// =========================================================================
+TEST_CASE("2026-09-03-2: a POST whose server read it then dropped before replying is NOT retried",
+          "[jsonrpc][pool][phase7][raw][double-submit]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18192;
+  RawResponsePolicy policy;
+  policy.closeAfterRequestNoReply = true; // read the full request, then drop before replying
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3; // retries ENABLED — the guard must still not retry a possibly-applied POST
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "mutate"));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);            // received exactly once — NOT re-submitted
+  REQUIRE(server.acceptedConnectionCount() == 1); // no retry -> no second connection
+}
+
+TEST_CASE("2026-09-03-2: a POST that times out on the response read is NOT retried",
+          "[jsonrpc][pool][phase7][raw][double-submit][timeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18193;
+  RawResponsePolicy policy;
+  policy.holdOpenNoReply = true; // read the request, then hold the socket open and silent
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3;
+  cfg.requestTimeout = std::chrono::milliseconds(200); // response-read timeout fires quickly
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "mutate"));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);            // received once, not retried
+  REQUIRE(server.acceptedConnectionCount() == 1);
+  const auto s = client.getStats();
+  REQUIRE(s.timeoutRequests == 1); // counted on the non-retryable rethrow path (typed)
+}
+
+TEST_CASE("2026-09-03-2: a POST answered with a malformed (unframable) response is NOT retried",
+          "[jsonrpc][pool][phase7][raw][double-submit]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18194;
+  RawResponsePolicy policy;
+  // A status line with a non-numeric status code — a deterministic framing
+  // violation (HttpFramingError), which HttpClient never retries.
+  policy.rawResponseOverride = "HTTP/1.1 XX Bad\r\nContent-Length: 0\r\n\r\n";
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "mutate"));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);            // framing error is not retried
+  REQUIRE(server.acceptedConnectionCount() == 1);
+}
+
+TEST_CASE("2026-09-03-2: a POST whose response has an unsupported Content-Encoding is NOT retried",
+          "[jsonrpc][pool][phase7][raw][double-submit]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18195;
+  RawResponsePolicy policy;
+  policy.extraResponseHeaders = {"Content-Encoding: gzip"}; // server processed; reply merely undecodable
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "mutate"));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);            // parse/coding failure is possibly-applied -> not retried
+  REQUIRE(server.acceptedConnectionCount() == 1);
+}
+
+TEST_CASE("2026-09-03-2: a POST answered with a well-framed but unparseable-JSON body is NOT retried",
+          "[jsonrpc][pool][phase7][raw][double-submit]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18196;
+  RawResponsePolicy policy;
+  // A correctly-framed HTTP 200 (valid Content-Length) whose body is not JSON: the
+  // server processed the POST, the reply merely fails parseJsonOrThrow. Distinct
+  // from the Content-Encoding case (18183), which throws in verifyResponseContentEncoding_
+  // BEFORE the parser is reached.
+  policy.rawResponseOverride =
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\nnotjson";
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "mutate"));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);            // parse failure is possibly-applied -> not retried
+  REQUIRE(server.acceptedConnectionCount() == 1);
+}
+
+TEST_CASE("2026-09-03-2: the BATCH path does not retry a possibly-applied failure",
+          "[jsonrpc][pool][phase7][raw][double-submit][batch]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18197;
+  RawResponsePolicy policy;
+  policy.closeAfterRequestNoReply = true; // read the batch, drop before replying
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 3;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  std::vector<iora::modules::connectors::BatchItem> items;
+  items.emplace_back("mutate", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
+  REQUIRE_THROWS(client.callBatch(ep, items));
+
+  REQUIRE(server.waitForRequests(1));
+  server.stop();
+  REQUIRE(server.requestCount() == 1);            // batch sent once, never retried
+  REQUIRE(server.acceptedConnectionCount() == 1);
 }
 
 // =========================================================================
@@ -5604,15 +5800,15 @@ TEST_CASE("M-12 (batch): an error item in a batch increments failedRequests only
 }
 
 // =========================================================================
-// task-7.8 — the classifier retains its substring branch for the response-read
-// timeout ("HTTP response timeout" carries "timeout"). This guards that adding
-// the typed-exception branch for the lease-acquire timeout did not break the
-// substring classification the response timeout still relies on. (The lease-
-// acquire timeout is unreachable through the pool — one caller per wrapper, so no
+// task-7.8 / tracker 2026-09-03-2 — a response-read timeout increments
+// timeoutRequests, now classified by TYPE (HttpResponseTimeoutError), not the
+// former find("timeout") substring which 2026-09-03-2 removed. This guards that
+// the typed classifier still counts the response-read timeout. (The lease-acquire
+// timeout is unreachable through the pool — one caller per wrapper, so no
 // intra-wrapper lease contention — and its typed classification is proven at the
 // HttpClient layer in iora_test_http_client_lease.cpp.)
 // =========================================================================
-TEST_CASE("task-7.8: a response-read timeout still increments timeoutRequests (substring path)",
+TEST_CASE("task-7.8: a response-read timeout increments timeoutRequests (typed path)",
           "[jsonrpc][pool][phase7][stats][timeout]")
 {
   auto &svc = testService();
