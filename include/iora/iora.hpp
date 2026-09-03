@@ -133,6 +133,7 @@ public:
       std::optional<bool> async;
       std::optional<int> retentionDays;
       std::optional<std::string> timeFormat;
+      std::optional<int> compressAfterDays;
     } log;
     struct ThreadPool
     {
@@ -1080,6 +1081,7 @@ protected:
     const char *DEFAULT_LOG_FILE = "";
     const bool DEFAULT_LOG_ASYNC = false;
     const int DEFAULT_LOG_RETENTION = 7;
+    const int DEFAULT_LOG_COMPRESS = 0; // 0 = off (compress files older than N days)
     const char *DEFAULT_LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S";
 
     // Logger: must be initialized first
@@ -1118,9 +1120,11 @@ protected:
     bool logAsync = _config.log.async.value_or(DEFAULT_LOG_ASYNC);
     int logRetention = _config.log.retentionDays.value_or(DEFAULT_LOG_RETENTION);
     std::string logTimeFormat = _config.log.timeFormat.value_or(DEFAULT_LOG_TIME_FORMAT);
+    int logCompress = _config.log.compressAfterDays.value_or(DEFAULT_LOG_COMPRESS);
     try
     {
-      core::Logger::init(toLevel(logLevel), logFile, logAsync, logRetention, logTimeFormat);
+      core::Logger::init(toLevel(logLevel), logFile, logAsync, logRetention, logTimeFormat,
+                         logCompress);
       IORA_LOG_INFO("applyConfig: Logger initialized");
     }
     catch (const std::exception &e)
@@ -1139,6 +1143,10 @@ protected:
       "applyConfig: log.retentionDays = " << (_config.log.retentionDays.has_value()
                                                 ? std::to_string(_config.log.retentionDays.value())
                                                 : "<unset>"));
+    IORA_LOG_INFO("applyConfig: log.compressAfterDays = "
+                  << (_config.log.compressAfterDays.has_value()
+                        ? std::to_string(_config.log.compressAfterDays.value())
+                        : "<unset>"));
     IORA_LOG_INFO("applyConfig: log.timeFormat = " << _config.log.timeFormat.value_or("<unset>"));
     IORA_LOG_INFO(
       "applyConfig: server.bindAddress = " << _config.server.bindAddress.value_or("<unset>"));

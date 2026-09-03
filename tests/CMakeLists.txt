@@ -245,6 +245,13 @@ if(TARGET iora_test_kvstore)
     target_compile_options(iora_test_kvstore PRIVATE -Wno-free-nonheap-object)
 endif()
 
+# The aged-file compressor's test-injection seams (Logger::TestHooks) are compiled
+# in ONLY for this test target — production/shipped builds of logger.hpp have no
+# such fault-injection surface. See logger.hpp (IORA_ENABLE_TEST_HOOKS).
+if(TARGET iora_test_logger)
+    target_compile_definitions(iora_test_logger PRIVATE IORA_ENABLE_TEST_HOOKS)
+endif()
+
 # LoggerData-immortal probes (tracker 2026-07-23-4): each drives a process EXIT
 # (std::exit from a handler, static-destruction ordering, or a forked child that
 # exits). Their assertion is a CLEAN EXIT within a bounded time — a regression

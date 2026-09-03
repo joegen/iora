@@ -29,6 +29,15 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <deque>
+#include <unordered_set>
+#include <cstdint>
+#include "iora/util/gzip.hpp" // core-safe util leaf: dependency-free header-only
+                              // codec (std only). The one blessed exception to the
+                              // one-way util->core layering — no link cycle
+                              // (libiora_util does not exist; gzip.hpp/crc32.hpp
+                              // compile into libiora_core). See arch designPrinciples
+                              // LAYERING. Consumed by the aged-file compressor only.
 
 #ifdef _WIN32
   #include <io.h>
@@ -36,6 +45,7 @@
   #define fileno _fileno
 #else
   #include <unistd.h>
+  #include <fcntl.h> // ::open/::fsync for the durable .partial write (no ofstream fd)
 #endif
 
 namespace iora
@@ -156,13 +166,70 @@ public:
   };
   static inline constexpr Endl endl{};
 
+#ifdef IORA_ENABLE_TEST_HOOKS
+  /// Test-only injection seams for the aged-file compressor (used ONLY by
+  /// iora_test_logger to make the compressor's guarded edges deterministic).
+  /// COMPILED OUT of production builds entirely: the struct, the accessor, AND
+  /// every read site are guarded by IORA_ENABLE_TEST_HOOKS, which only the test
+  /// target defines (tests/CMakeLists.txt). A shipped build has no such symbol and
+  /// no fault-injection surface for services/plugins to reach.
+  /// SYNCHRONIZATION: each flag is a STANDALONE relaxed atomic that publishes no
+  /// companion data, so it may be set before spawn (init()) or toggled on a LIVE
+  /// compressor without extra synchronization (e.g. tests clear throwInCompress /
+  /// throwBeforeCompressOneFile mid-run). The ONE exception is the park handshake
+  /// (pauseBeforeRecheck/parkedAtRecheck/recheckProceed), whose recheckProceed load
+  /// is `acquire` precisely because a test publishes companion state (nowOffsetDays)
+  /// before releasing the park. Any FUTURE hook that carries companion data must
+  /// likewise use acquire/release, not relaxed.
+  struct TestHooks
+  {
+    std::atomic<std::uint64_t> scanCount{0};        ///< collectLogFiles() invocations
+    std::atomic<std::int64_t> nowOffsetDays{0};     ///< added to "now" in the fileDays calc
+    std::atomic<bool> throwInCompress{false};       ///< force a throw INSIDE compressOneFile's try
+    std::atomic<bool> throwBeforeCompressOneFile{false}; ///< force a throw in compressorLoop BEFORE
+                                                         ///< the call (exercises the outer catch)
+    std::atomic<bool> throwInStartupCleanup{false}; ///< force a throw in the spawn cleanup
+    std::atomic<bool> pauseBeforeRecheck{false};    ///< park the compressor before its re-check
+    std::atomic<bool> parkedAtRecheck{false};       ///< compressor signals it has parked
+    std::atomic<bool> recheckProceed{false};        ///< test releases the park
+    std::atomic<bool> startupCleanupDone{false};    ///< set when compressorStartupCleanup finishes
+    void reset()
+    {
+      scanCount.store(0);
+      nowOffsetDays.store(0);
+      throwInCompress.store(false);
+      throwBeforeCompressOneFile.store(false);
+      throwInStartupCleanup.store(false);
+      pauseBeforeRecheck.store(false);
+      parkedAtRecheck.store(false);
+      recheckProceed.store(false);
+      startupCleanupDone.store(false);
+    }
+  };
+  static TestHooks &testHooks()
+  {
+    static TestHooks hooks;
+    return hooks;
+  }
+  /// Shared helper for the identical conditional-throw seams (compiled out with
+  /// TestHooks in production).
+  static void throwIfTestFaultArmed(std::atomic<bool> &flag, const char *msg)
+  {
+    if (flag.load(std::memory_order_relaxed))
+    {
+      throw std::runtime_error(msg);
+    }
+  }
+#endif // IORA_ENABLE_TEST_HOOKS
+
   /// \brief (Re)initialize the logger. NOT concurrency-safe against active
   /// logging: init() clears the queues and resets mode/level under the lock but
   /// does NOT drain in-flight handler invocations, so calling it concurrently
   /// with live logging can silently drop queued raw entries. Call it once at
   /// startup (or while quiescent), not as live reconfiguration.
   static void init(Level level = Level::Info, const std::string &filePath = "", bool async = false,
-                   int retentionDays = 7, const std::string &timeFormat = "%Y-%m-%d %H:%M:%S")
+                   int retentionDays = 7, const std::string &timeFormat = "%Y-%m-%d %H:%M:%S",
+                   int compressAfterDays = 0)
   {
     auto &data = getData();
     std::unique_lock<std::mutex> lock(data.mutex);
@@ -207,6 +274,23 @@ public:
     // If no filePath provided, log to console only (no file)
     data.logBasePath = filePath;
     data.retentionDays = retentionDays;
+    data.compressAfterDays = compressAfterDays;
+    // Derived effective-enable: a file must age into compression BEFORE retention
+    // deletes it, else compression can never fire. When retention is OFF
+    // (retentionDays<=0) there is no upper bound. Gates spawn + sweep + enqueue.
+    // A compressor is pointless with no log file (console-only) — don't spawn one.
+    data.compressionEffective = !filePath.empty() && (compressAfterDays > 0) &&
+                                (retentionDays <= 0 || retentionDays > compressAfterDays);
+    if (compressAfterDays > 0 && retentionDays > 0 && retentionDays <= compressAfterDays)
+    {
+      // Invalid config: compression disabled. One-time warning at configuration
+      // time (init is start-up/quiescent-only), never per-rotation.
+      std::cerr << "[Logger] compressAfterDays (" << compressAfterDays << ") >= retentionDays ("
+                << retentionDays
+                << "): log compression disabled (files are deleted before they age into "
+                   "compression)."
+                << std::endl;
+    }
     // Republish the format snapshot changing ONLY the timestamp format, CARRYING
     // the current logFormat + segments unchanged: init() historically did not touch
     // _logFormat/_compiledFormat, so a setLogFormat() issued before init() must
@@ -224,6 +308,22 @@ public:
     // useExternalHandler was already cleared).
     data.queue = {};
     data.rawQueue = {};
+
+    // Reset the compressor stop flag + clear its PENDING queue BEFORE the boot
+    // rotate below: that rotate's age sweep enqueues, and the enqueue push/skip
+    // gate reads compressorExit — a stale `true` left by a prior shutdown() would
+    // drop the whole startup backlog. Do NOT clear compressorInFlight: a live
+    // re-init compressor self-clears it (clearing it here would let a concurrent
+    // sweep re-enqueue the in-flight file). Safe to clear compressorExit early
+    // ONLY under init()'s start-up/quiescent-only contract (see the doc-comment
+    // above) — no compressor teardown is in flight. Under the strict-leaf
+    // compressorMutex (edge mutex -> compressorMutex).
+    {
+      std::lock_guard<std::mutex> clk(data.compressorMutex);
+      data.compressorExit = false;
+      data.compressorQueue.clear();
+      data.compressorQueued.clear();
+    }
 
     rotateLogFileIfNeeded();
 
@@ -244,6 +344,19 @@ public:
       data.workerThreadId = data.workerThread.get_id();
       data.workerRunning = true;
       ++data.workerGeneration;
+    }
+
+    // Aged-file compressor: spawn AFTER the boot rotate (open-file-before-spawn
+    // safety, mirroring the worker) so a throwing std::thread ctor cannot kill
+    // file logging. Predicate `compressionEffective && !compressorRunning` mirrors
+    // the worker's asyncMode gate so a live-compressor re-init does not double
+    // spawn. compressorRunning is published AFTER a successful construct. The boot
+    // sweep already enqueued the backlog above (compressorExit was reset before
+    // the rotate); the compressor's first cv.wait sees the non-empty queue.
+    if (data.compressionEffective && !data.compressorRunning)
+    {
+      data.compressorThread = std::thread(compressorLoop);
+      data.compressorRunning = true;
     }
   }
 
@@ -750,11 +863,20 @@ public:
   struct LoggerData
   {
     /// LOCK DISCIPLINE (single source of truth for this class):
-    ///  - `mutex` is the ONLY mutex in the logger and the LOWEST logger-owned lock:
-    ///    the only locks acquired beneath it are the stream/stdio locks of the sink
-    ///    (see the sink-I/O bullet below). Keep it lowest if a second lock is ever
-    ///    added. The converse statement, that `mutex` is never taken while another
-    ///    lock is held, is neither true nor enforceable.
+    ///  - `mutex` is the LOWEST logger-owned lock. There is ONE other logger mutex,
+    ///    `compressorMutex` (the aged-file compressor's strict-leaf hand-off lock),
+    ///    which sits STRICTLY BELOW `mutex` on the single edge `mutex ->
+    ///    compressorMutex` (the age-sweep enqueue, and init's reset, take the leaf
+    ///    while holding `mutex`). compressorMutex is a strict leaf — held only for
+    ///    O(1) queue/dedup ops, NEVER across file I/O and NEVER across any call back
+    ///    into the logger; the compressor acquires `mutex` ONLY with compressorMutex
+    ///    released, and NEVER calls any `Logger::` API (std::cerr only) — a re-entry
+    ///    would self-deadlock on this non-recursive `mutex`. See the compressor
+    ///    members' comment for the full contract. The only OTHER locks acquired
+    ///    beneath `mutex` are the stream/stdio locks of the sink (see the sink-I/O
+    ///    bullet below). Keep `mutex` lowest and any new lock a documented leaf below
+    ///    it. The converse statement, that `mutex` is never taken while another lock
+    ///    is held, is neither true nor enforceable.
     ///    CAVEAT — this does NOT make "log while holding your own lock"
     ///    unconditionally safe. It is safe with respect to `mutex`, but in SYNC mode
     ///    logDispatch invokes the external handler ON THE CALLER'S STACK with the
@@ -833,6 +955,15 @@ public:
     /// (tracker 2026-07-23-5). Plain bool: read/written ONLY under `mutex`.
     bool fileReopenPending = false;
     int retentionDays = 7;
+    /// Age threshold (days) after which a rotated `<base>.<date>.log` is
+    /// gzip-compressed to `<base>.<date>.log.gz` off the hot path. `<= 0` = OFF.
+    /// Read/written ONLY under `mutex`.
+    int compressAfterDays = 0;
+    /// Derived at init under `mutex`: compression actually runs iff
+    /// compressAfterDays>0 AND (retentionDays<=0 OR retentionDays>compressAfterDays)
+    /// — a file must age into compression BEFORE retention deletes it. Gates the
+    /// compressor spawn, the sweep, and the enqueue. Read ONLY under `mutex`.
+    bool compressionEffective = false;
     /// Format configuration snapshot (COW, tracker 2026-07-22-3). Replaces the
     /// former _logFormat, _compiledFormat, and timestampFormat members. NEVER null:
     /// initialized to the default snapshot at construction and only ever
@@ -886,6 +1017,35 @@ public:
     /// exits, so it cannot go stale across thread-id reuse the way the removed
     /// handler-self-detection scheme could.)
     std::thread::id workerThreadId;
+
+    // ---- Aged-file compressor (Component B: gzip compression of old logs) ----
+    /// STRICT-LEAF LOCK ORDERING: the age-sweep enqueue runs UNDER `mutex`, adding
+    /// a `mutex -> compressorMutex` edge. compressorMutex is a STRICT LEAF held
+    /// only for O(1) queue/dedup ops — NEVER across file I/O and NEVER across any
+    /// call back into the logger. The compressor thread COPIES the path out under
+    /// the leaf, releases, then gzips off-lock; it acquires `mutex` ONLY with
+    /// compressorMutex released (ABBA guard) and NEVER calls any Logger:: API
+    /// (std::cerr only — a Logger:: call would re-enter and self-deadlock on the
+    /// non-recursive `mutex`). `mutex` stays the lowest lock; compressorMutex sits
+    /// strictly below it on this one edge and is taken nowhere else.
+    static constexpr std::size_t COMPRESSOR_QUEUE_MAX = 256;
+    std::thread compressorThread;
+    std::mutex compressorMutex;
+    std::condition_variable compressorCv;
+    std::deque<std::string> compressorQueue;          ///< pending source .log paths
+    std::unordered_set<std::string> compressorQueued; ///< O(1) dedup mirror of the queue
+    std::string compressorInFlight;                   ///< path currently compressing ("" = idle)
+    /// Compressor stop predicate AND the enqueue push/skip gate. Owned by
+    /// compressorMutex (read/written only under it). Reset to false BEFORE the boot
+    /// rotate in init(); set true at teardown. The enqueue pushes when false (incl.
+    /// boot, where compressorRunning is still false) and skips when true (post-reap)
+    /// — the gate is compressorExit, NOT compressorRunning.
+    bool compressorExit = false;
+    /// TRUE from spawn until the teardown join clears it. Guarded by `mutex`. The
+    /// spawn predicate is `compressionEffective && !compressorRunning` (mirrors the
+    /// worker); published AFTER a successful std::thread construct.
+    bool compressorRunning = false;
+
     /// Enable ANSI color codes for console output
     bool _enableConsoleColors = false;
     /// Cache whether stdout is a TTY
@@ -1222,6 +1382,39 @@ private:
         flushError = std::current_exception();
       }
     }
+
+    // ---- Aged-file compressor teardown (THIRD step) -------------------------
+    // MUST run AFTER the final-drain locked scope above closes: that drain's
+    // rotate MAY run the age sweep and enqueue, so the compressor has to be alive
+    // through it. Set compressorExit UNDER the leaf (a lock-free set risks a lost
+    // wakeup -> join hang), notify, then join with data.mutex RELEASED (the
+    // in-flight compressor may need data.mutex for its re-check before it can
+    // observe compressorExit; joining under data.mutex deadlocks). The compressor
+    // finishes only its in-flight file and abandons the rest (bounded atexit).
+    // Idempotent: gated on compressorRunning, so a second call (atexit after
+    // shutdown) no-ops. The compressor never calls Logger::/shutdown()/init(), so
+    // the teardown thread is never the compressor — a plain join (never detached)
+    // cannot self-join.
+    std::thread compressor;
+    {
+      std::unique_lock<std::mutex> lock(data.mutex);
+      if (data.compressorRunning)
+      {
+        compressor = std::move(data.compressorThread);
+      }
+    }
+    if (compressor.joinable())
+    {
+      {
+        std::lock_guard<std::mutex> clk(data.compressorMutex);
+        data.compressorExit = true;
+      }
+      data.compressorCv.notify_one();
+      compressor.join();
+      std::lock_guard<std::mutex> lock(data.mutex);
+      data.compressorRunning = false; // cleared AFTER the join, compressorMutex not held
+    }
+
     // Lock released. Report and release the USER exception objects here: noexcept,
     // so this cannot escape ~LoggerData or shutdown() (both run from destructors,
     // atexit and noexcept teardown, where an escape is std::terminate).
@@ -1928,62 +2121,147 @@ public:
         data.fileStream.reset();
       }
 
-      // Retention sweep is a date-rollover concern ONLY. Running it on a
-      // reopen-pending pass would re-scan the whole log directory on every log
-      // call while a path stays unopenable — the storm the fileReopenPending
-      // one-shot exists to prevent.
-      if (dateChanged)
+      // Retention + compression are date-rollover concerns ONLY. Running the scan
+      // on a reopen-pending pass would re-scan the whole log directory on every
+      // log call while a path stays unopenable — the storm the fileReopenPending
+      // one-shot exists to prevent. ONE shared directory scan feeds both retention
+      // and the age sweep; skip it entirely when there is no work to do (preserves
+      // the pre-existing no-scan-when-retention-off behavior). The
+      // `|| data.compressionEffective` half of the guard and the
+      // compressOldLogFiles(entries, datesWithGz) call are added with the
+      // compressor (keeping the whole data.mutex -> compressorMutex enqueue edge
+      // in one place).
+      if (dateChanged && (data.retentionDays > 0 || data.compressionEffective))
       {
-        deleteOldLogFiles();
+        std::unordered_set<std::string> datesWithGz;
+        auto entries = collectLogFiles(datesWithGz);
+        deleteOldLogFiles(entries);        // prune first, so compression never
+        compressOldLogFiles(entries, datesWithGz); // enqueues a to-be-deleted file
       }
     }
   }
 
-  static void deleteOldLogFiles()
+  enum class LogFileKind
+  {
+    LOG,
+    LOG_GZ,
+    PARTIAL_GZ
+  };
+
+  /// One rotated-log directory entry, classified and dated in a single scan.
+  struct LogFileEntry
+  {
+    std::string path;
+    std::string date; ///< 10-char YYYY-MM-DD (LOCAL, matches currentLogDate)
+    long fileDays;    ///< days old, UTC-midnight based (as deleteOldLogFiles)
+    LogFileKind kind;
+  };
+
+  /// Classify a filename's terminal suffix MOST-SPECIFIC-FIRST (`.gz.partial` and
+  /// `.log.gz` both contain `.log`). Returns false for non-log artifacts.
+  static bool classifyLogFileKind(const std::string &fname, LogFileKind &out)
+  {
+    auto endsWith = [&](const char *suf)
+    {
+      const std::size_t n = std::char_traits<char>::length(suf);
+      return fname.size() >= n && fname.compare(fname.size() - n, n, suf) == 0;
+    };
+    if (endsWith(".gz.partial"))
+    {
+      out = LogFileKind::PARTIAL_GZ;
+      return true;
+    }
+    if (endsWith(".log.gz"))
+    {
+      out = LogFileKind::LOG_GZ;
+      return true;
+    }
+    if (endsWith(".log"))
+    {
+      out = LogFileKind::LOG;
+      return true;
+    }
+    return false;
+  }
+
+  /// Shared positional YYYY-MM-DD parse: fills datePart (LOCAL date string) and
+  /// fileDays (UTC-midnight based, day-granular), returns false if `fname` carries
+  /// no valid date at the fixed offset after `prefix`. Used by collectLogFiles AND
+  /// the compressor's retention re-check so the two cannot diverge (archReviewR1
+  /// LOW-3). timegm avoids TZ-global contention; the UTC-vs-LOCAL skew is handled
+  /// by the date!=currentLogDate active-file guard, not here.
+  static bool parseLogFileDate(const std::string &fname, const std::string &prefix,
+                               std::string &datePart, long &fileDays)
+  {
+    // rfind(prefix, 0) == 0 is the position-0-only starts-with (no full scan on a
+    // miss) and already implies fname.size() >= prefix.size().
+    if (fname.rfind(prefix, 0) != 0)
+    {
+      return false;
+    }
+    datePart = fname.substr(prefix.size(), 10);
+    struct tm tm{};
+    std::istringstream ss(datePart);
+    ss >> std::get_time(&tm, "%Y-%m-%d");
+    if (ss.fail())
+    {
+      return false;
+    }
+    std::time_t fileEpoch = detail::timeGmReentrant(&tm);
+    if (fileEpoch == static_cast<std::time_t>(-1))
+    {
+      return false; // malformed date (e.g. 2025-02-30)
+    }
+    auto fileTime = std::chrono::system_clock::from_time_t(fileEpoch);
+    auto now = std::chrono::system_clock::now();
+#ifdef IORA_ENABLE_TEST_HOOKS
+    // nowOffsetDays is a test-only seam that shifts "now" so a test can make the
+    // active/today file read fileDays>=1 (the west-of-UTC edge) deterministically
+    // without controlling the wall clock. Compiled out of production entirely.
+    now += std::chrono::hours(24 * testHooks().nowOffsetDays.load(std::memory_order_relaxed));
+#endif
+    fileDays =
+      static_cast<long>(std::chrono::duration_cast<std::chrono::hours>(now - fileTime).count() / 24);
+    return true;
+  }
+
+  /// ONE non-throwing directory pass over `<base>.<date>.<suffix>` files, shared
+  /// by retention (deleteOldLogFiles) and the age sweep (compressOldLogFiles) so
+  /// the date-parse cannot diverge. Populates datesWithGz with the dates that
+  /// already have a `.log.gz`. Runs UNDER data.mutex on the rotation thread;
+  /// error_code overloads only (a throw would escape the sync Logger::info()).
+  static std::vector<LogFileEntry> collectLogFiles(std::unordered_set<std::string> &datesWithGz)
   {
     auto &data = getData();
-    if (data.logBasePath.empty() || data.retentionDays <= 0)
-    {
-      return;
-    }
-
+#ifdef IORA_ENABLE_TEST_HOOKS
+    testHooks().scanCount.fetch_add(1, std::memory_order_relaxed); // test-only counter
+#endif
+    std::vector<LogFileEntry> out;
     namespace fs = std::filesystem;
-    auto now = std::chrono::system_clock::now();
     auto logPath = fs::path(data.logBasePath);
     auto logDir = logPath.parent_path();
     if (logDir.empty())
     {
-      // error_code overload: called under data.mutex from rotateLogFileIfNeeded on
-      // the sync log() path — a throwing current_path() would escape Logger::info().
       std::error_code cwd_ec;
       logDir = fs::current_path(cwd_ec);
       if (cwd_ec)
       {
-        return; // cannot resolve cwd; nothing to prune
+        return out;
       }
     }
-    std::string baseName = logPath.filename().string();
-    std::string prefix = baseName + ".";
-
+    const std::string prefix = logPath.filename().string() + ".";
     std::error_code dir_ec;
     if (!fs::exists(logDir, dir_ec))
     {
-      // Directory does not exist, nothing to delete
-      return;
+      return out;
     }
-
-    // Drive the iterator with the error_code increment() overload rather than a
-    // range-for: a range-for advances via the THROWING operator++, and
-    // deleteOldLogFiles runs under data.mutex on the sync log() path
-    // (rotateLogFileIfNeeded -> here), where a std::filesystem_error would escape
-    // the caller's own Logger::info(). Keep traversal non-throwing end to end.
     fs::directory_iterator it(logDir, dir_ec);
     const fs::directory_iterator end;
     if (dir_ec)
     {
-      std::cerr << "[Logger] Failed to open log directory: " << logDir << " - "
-                << dir_ec.message() << std::endl;
-      return;
+      std::cerr << "[Logger] Failed to open log directory: " << logDir << " - " << dir_ec.message()
+                << std::endl;
+      return out;
     }
     for (; it != end; it.increment(dir_ec))
     {
@@ -1993,44 +2271,435 @@ public:
                   << dir_ec.message() << std::endl;
         break;
       }
-      const auto &entry = *it;
-      const auto &path = entry.path();
-      std::string fname = path.filename().string();
-      if (fname.find(prefix) != 0 || fname.size() <= prefix.size())
+      std::string fname = it->path().filename().string();
+      LogFileKind kind;
+      if (!classifyLogFileKind(fname, kind))
       {
         continue;
       }
+      // The prefix/size guard lives in parseLogFileDate (one place); it rejects a
+      // suffix-matching name with a foreign base here.
+      // Positional 10-char YYYY-MM-DD at a fixed offset from the prefix — identical
+      // for `.log`, `.log.gz`, and `.gz.partial` siblings of the same date.
+      std::string datePart;
+      long fileDays = -1;
+      if (!parseLogFileDate(fname, prefix, datePart, fileDays))
+      {
+        continue;
+      }
+      if (kind == LogFileKind::LOG_GZ)
+      {
+        datesWithGz.insert(datePart);
+      }
+      out.push_back(LogFileEntry{it->path().string(), std::move(datePart), fileDays, kind});
+    }
+    return out;
+  }
 
-      // Extract date from filename: baseName.YYYY-MM-DD.log
-      std::string datePart = fname.substr(prefix.size(), 10); // YYYY-MM-DD
-      struct tm tm{};
-      std::istringstream ss(datePart);
-      ss >> std::get_time(&tm, "%Y-%m-%d");
-      if (ss.fail())
+  /// Retention prune over pre-collected entries (shared scan). Compression-aware:
+  /// deletes LOG and LOG_GZ at retentionDays (compression does NOT extend
+  /// retention), NEVER PARTIAL_GZ (compressor-owned). Active-file-safe: skips the
+  /// entry whose date == currentLogDate — the just-opened file can read
+  /// fileDays>=1 west of UTC (LOCAL-date name vs UTC fileDays). Runs UNDER
+  /// data.mutex.
+  static void deleteOldLogFiles(const std::vector<LogFileEntry> &entries)
+  {
+    auto &data = getData();
+    if (data.logBasePath.empty() || data.retentionDays <= 0)
+    {
+      return;
+    }
+    namespace fs = std::filesystem;
+    for (const auto &e : entries)
+    {
+      if (e.kind == LogFileKind::PARTIAL_GZ)
       {
-        continue;
+        continue; // compressor-owned in-flight temp; never retention's to delete
       }
-      // Use timegm (UTC, no TZ globals) instead of std::mktime to avoid
-      // contention on glibc's tzset internals. Comparison is day-granular
-      // (retentionDays >= 1), so the UTC-vs-local offset is irrelevant.
-      std::time_t fileEpoch = detail::timeGmReentrant(&tm);
-      if (fileEpoch == static_cast<std::time_t>(-1))
+      if (e.date == data.currentLogDate)
       {
-        // Malformed date parsed via get_time (e.g., "2025-02-30"): skip.
-        continue;
+        continue; // active file (LOCAL-date name vs UTC fileDays skew)
       }
-      auto fileTime = std::chrono::system_clock::from_time_t(fileEpoch);
-      // Only compare date, not time-of-day
-      auto fileDays = std::chrono::duration_cast<std::chrono::hours>(now - fileTime).count() / 24;
-      if (fileDays >= data.retentionDays)
+      if (e.fileDays >= data.retentionDays)
       {
         std::error_code ec;
-        fs::remove(path, ec);
+        fs::remove(e.path, ec);
         if (ec)
         {
-          std::cerr << "[Logger] Failed to delete old log file: " << path << " - " << ec.message()
+          std::cerr << "[Logger] Failed to delete old log file: " << e.path << " - " << ec.message()
                     << std::endl;
         }
+      }
+    }
+  }
+
+  /// Age sweep: enqueue aged, uncompressed, not-active, not-queued `.log` files
+  /// for the compressor. Runs UNDER `mutex` (called from rotateLogFileIfNeeded on
+  /// a true date rollover). Each enqueue takes the STRICT-LEAF compressorMutex for
+  /// an O(1) gate+dedup+push, releases, then notifies — never holds the leaf
+  /// across the loop or the notify. The push/skip gate is compressorExit (NOT
+  /// compressorRunning): the boot sweep must push while compressorRunning is still
+  /// false, and a post-reap sweep must skip — only compressorExit distinguishes
+  /// them.
+  static void compressOldLogFiles(const std::vector<LogFileEntry> &entries,
+                                  const std::unordered_set<std::string> &datesWithGz)
+  {
+    auto &data = getData();
+    if (!data.compressionEffective)
+    {
+      return;
+    }
+    for (const auto &e : entries)
+    {
+      if (e.kind != LogFileKind::LOG)
+      {
+        continue; // (a) only uncompressed logs
+      }
+      if (e.fileDays < data.compressAfterDays)
+      {
+        continue; // (b) not old enough
+      }
+      if (data.retentionDays > 0 && e.fileDays >= data.retentionDays)
+      {
+        continue; // (c) retention will delete it (belt-and-suspenders; deleteOldLogFiles ran first)
+      }
+      if (datesWithGz.count(e.date) != 0)
+      {
+        continue; // (d) a sibling .log.gz already exists
+      }
+      if (e.date == data.currentLogDate)
+      {
+        continue; // (f) the active file (LOCAL-date-name vs UTC-fileDays guard)
+      }
+      bool pushed = false;
+      {
+        std::lock_guard<std::mutex> lk(data.compressorMutex);
+        if (data.compressorExit)
+        {
+          continue; // post-reap: skip (non-blocking no-op)
+        }
+        if (data.compressorQueued.count(e.path) != 0 || data.compressorInFlight == e.path)
+        {
+          continue; // (e) already queued or in-flight
+        }
+        if (data.compressorQueue.size() >= LoggerData::COMPRESSOR_QUEUE_MAX)
+        {
+          continue; // bounded queue full: DROP (leave file .log, retried next sweep)
+        }
+        data.compressorQueue.push_back(e.path);
+        data.compressorQueued.insert(e.path);
+        pushed = true;
+      }
+      if (pushed)
+      {
+        data.compressorCv.notify_one();
+      }
+    }
+  }
+
+  /// One-time cleanup at compressor spawn (before it produces any `.partial`):
+  /// remove stray `.gz.partial` from a prior crash, and reclaim a crash-orphan
+  /// `.log` whose completed `.gz` sibling already exists. error_code only; NEVER
+  /// calls Logger::. Runs off the leaf; the dir scan reads `mutex`-guarded fields
+  /// under `mutex` (thread-creation happens-before already makes init's writes
+  /// visible; the brief lock is explicit and non-racy). Unlinks happen off-lock.
+  static void compressorStartupCleanup()
+  {
+    auto &data = getData();
+    namespace fs = std::filesystem;
+#ifdef IORA_ENABLE_TEST_HOOKS
+    // Test-only fault injection for the PRE-LOOP throw path (the compressorLoop
+    // spawn-cleanup guard must contain it — a throw here would otherwise propagate).
+    throwIfTestFaultArmed(testHooks().throwInStartupCleanup, "injected startup-cleanup fault");
+#endif
+    std::unordered_set<std::string> datesWithGz;
+    std::vector<LogFileEntry> entries;
+    std::string currentDateSnapshot; // snapshot under the lock; compared off-lock below
+    {
+      std::lock_guard<std::mutex> lk(data.mutex);
+      if (data.logBasePath.empty())
+      {
+        // Unreachable for a spawned compressor (compressionEffective requires a
+        // non-empty path), but signal done on this path too so startupCleanupDone
+        // is genuinely unconditional per its contract.
+#ifdef IORA_ENABLE_TEST_HOOKS
+        testHooks().startupCleanupDone.store(true, std::memory_order_relaxed);
+#endif
+        return;
+      }
+      currentDateSnapshot = data.currentLogDate;
+      entries = collectLogFiles(datesWithGz);
+    }
+    for (const auto &e : entries)
+    {
+      std::error_code ec;
+      if (e.kind == LogFileKind::PARTIAL_GZ)
+      {
+        fs::remove(e.path, ec); // incomplete temp from a prior crash
+        if (ec)
+        {
+          std::cerr << "[Logger] compressor: startup cleanup could not remove " << e.path << " - "
+                    << ec.message() << std::endl;
+        }
+      }
+      // Crash-orphan reclaim: a .log whose .gz sibling already landed. CRITERION (f)
+      // applies here too (third delete-capable path) — NEVER reclaim the active
+      // (currentLogDate) file, even if a stale .gz for today's date is present.
+      else if (e.kind == LogFileKind::LOG && e.date != currentDateSnapshot &&
+               datesWithGz.count(e.date) != 0)
+      {
+        fs::remove(e.path, ec);
+        if (ec)
+        {
+          std::cerr << "[Logger] compressor: startup cleanup could not reclaim orphan " << e.path
+                    << " - " << ec.message() << std::endl;
+        }
+      }
+    }
+#ifdef IORA_ENABLE_TEST_HOOKS
+    testHooks().startupCleanupDone.store(true, std::memory_order_relaxed); // test-sync signal
+#endif
+  }
+
+  /// Compress one source `.log` to `<src>.gz` off-lock via a streaming Gzip
+  /// encoder written through an fsync-capable FILE* (std::ofstream exposes no fd),
+  /// then durably publish under ONE brief `mutex` critical section {re-check
+  /// source; atomic rename; unlink source}. Contains ALL its own exceptions
+  /// (never throws out — the loop must continue). NEVER calls any Logger:: API.
+  static void compressOneFile(const std::string &src)
+  {
+    auto &data = getData();
+    namespace fs = std::filesystem;
+    const std::string finalPath = src + ".gz";
+    const std::string partial = src + ".gz.partial";
+    try
+    {
+#ifdef IORA_ENABLE_TEST_HOOKS
+      // Test-only fault injection for compressOneFile's OWN try/catch: caught below,
+      // the .partial is abandoned, and the compressor loop continues.
+      throwIfTestFaultArmed(testHooks().throwInCompress, "injected compress fault");
+#endif
+      std::ifstream in(src, std::ios::binary);
+      if (!in)
+      {
+        return; // source vanished (retention/dedup) — nothing to do
+      }
+      bool durable = false;
+      {
+        // RAII the FILE* (R-MEM-4): Gzip::Encoder ctor / update() / finish() allocate
+        // and may throw (bad_alloc/length_error — a path the design anticipates); a
+        // manual success-path fclose would leak the descriptor on such a throw.
+        std::unique_ptr<std::FILE, int (*)(std::FILE *)> fp(std::fopen(partial.c_str(), "wb"),
+                                                            &std::fclose);
+        if (fp == nullptr) // null unique_ptr does not invoke the deleter — safe
+        {
+          std::cerr << "[Logger] compressor: cannot create " << partial << std::endl;
+          return;
+        }
+        bool ok = true;
+        iora::util::Gzip::Encoder enc(iora::util::Gzip::Level::DEFAULT);
+        auto writeAll = [&](const std::string &bytes) -> bool {
+          return bytes.empty() ||
+                 std::fwrite(bytes.data(), 1, bytes.size(), fp.get()) == bytes.size();
+        };
+        std::vector<char> buf(64 * 1024);
+        while (ok && in.good())
+        {
+          in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+          std::streamsize got = in.gcount();
+          if (got > 0)
+          {
+            ok = writeAll(enc.update(std::string_view(buf.data(), static_cast<std::size_t>(got))));
+          }
+        }
+        if (in.bad())
+        {
+          ok = false; // read error mid-stream
+        }
+        if (ok)
+        {
+          ok = writeAll(enc.finish());
+        }
+        durable = ok && (std::fflush(fp.get()) == 0);
+        if (durable)
+        {
+#ifdef _WIN32
+          durable = (_commit(fileno(fp.get())) == 0);
+#else
+          durable = (::fsync(fileno(fp.get())) == 0);
+#endif
+        }
+        // Close explicitly and fold a close error into durability (a non-zero close
+        // after fsync means the bytes are not guaranteed). release() so the RAII
+        // deleter does not double-close.
+        if (std::fclose(fp.release()) != 0)
+        {
+          durable = false;
+        }
+      }
+      if (!durable)
+      {
+        std::error_code ec;
+        fs::remove(partial, ec); // abandon incomplete / undurable output
+        return;
+      }
+#ifdef IORA_ENABLE_TEST_HOOKS
+      // Test-only park BEFORE acquiring data.mutex: lets a test drive a teardown or
+      // mutate the source in the re-check window (data.mutex is NOT held here).
+      if (testHooks().pauseBeforeRecheck.load(std::memory_order_relaxed))
+      {
+        testHooks().parkedAtRecheck.store(true, std::memory_order_relaxed);
+        // ACQUIRE on recheckProceed so any test writes made before it releases the
+        // park (e.g. case 10b's nowOffsetDays=25) are visible to the re-check below.
+        while (testHooks().pauseBeforeRecheck.load(std::memory_order_relaxed) &&
+               !testHooks().recheckProceed.load(std::memory_order_acquire))
+        {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+#endif
+      // Durable publish: ONE uninterrupted `mutex` critical section, metadata only.
+      std::lock_guard<std::mutex> lk(data.mutex);
+      std::error_code ec;
+      if (!fs::exists(src, ec))
+      {
+        fs::remove(partial, ec); // source pruned out from under us — abandon
+        return;
+      }
+      if (data.retentionDays > 0)
+      {
+        // Re-check via the SAME parse retention uses; only guard when retention is
+        // ON (retention-off-safe: no upper bound).
+        std::string srcName = fs::path(src).filename().string();
+        std::string prefix = fs::path(data.logBasePath).filename().string() + ".";
+        std::string datePart;
+        long fileDays = -1;
+        if (parseLogFileDate(srcName, prefix, datePart, fileDays) && fileDays >= data.retentionDays)
+        {
+          fs::remove(partial, ec); // aged past retention while queued — abandon
+          return;
+        }
+      }
+      fs::rename(partial, finalPath, ec);
+      if (ec)
+      {
+        fs::remove(partial, ec);
+        return;
+      }
+      fs::remove(src, ec); // unlink the source ONLY after the durable rename
+      if (ec)
+      {
+        std::cerr << "[Logger] compressor: failed to unlink source " << src << " - " << ec.message()
+                  << std::endl;
+      }
+    }
+    catch (const std::exception &e)
+    {
+      std::error_code ec;
+      std::filesystem::remove(partial, ec);
+      std::cerr << "[Logger] compressor: exception on " << src << ": " << e.what() << std::endl;
+    }
+    catch (...)
+    {
+      std::error_code ec;
+      std::filesystem::remove(partial, ec);
+      std::cerr << "[Logger] compressor: unknown exception on " << src << std::endl;
+    }
+  }
+
+  /// Compressor thread top-level function. The ENTIRE body is contained by
+  /// try/catch -> std::cerr (a throw escaping a raw std::thread = std::terminate):
+  /// the one-time spawn cleanup runs before the loop and can throw too. Loop:
+  /// wait, break-BEFORE-pop (only the in-flight file completes at teardown),
+  /// pop+erase+set-inFlight as ONE leaf hold, compress off-lock, clear inFlight.
+  static void compressorLoop()
+  {
+    auto &data = getData();
+    // Spawn-time cleanup in its OWN guard so a throw here (e.g. bad_alloc) is
+    // contained and the thread STILL enters the drain loop rather than dying.
+    try
+    {
+      compressorStartupCleanup();
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "[Logger] compressor: spawn cleanup threw: " << e.what() << std::endl;
+    }
+    catch (...)
+    {
+      std::cerr << "[Logger] compressor: spawn cleanup threw (unknown)" << std::endl;
+    }
+    // PER-ITERATION containment: a throw from the per-file work — including the
+    // path-string construction INSIDE compressOneFile (before its own try) or the
+    // inFlight copy below — must NOT end the thread. A dead thread strands
+    // compressorRunning==true (cleared only at the teardown join), so a later
+    // init() would refuse to respawn (predicate `&& !compressorRunning`) and
+    // compression would be silently, permanently disabled until a full
+    // shutdown()+init(). On any throw: report, clear the in-flight slot, CONTINUE.
+    // Only compressorExit ends the loop.
+    for (;;)
+    {
+      bool doExit = false;
+      bool threw = false;
+      try
+      {
+        std::string src;
+        {
+          std::unique_lock<std::mutex> lk(data.compressorMutex);
+          data.compressorCv.wait(
+            lk, [&] { return !data.compressorQueue.empty() || data.compressorExit; });
+          if (data.compressorExit)
+          {
+            doExit = true; // break AFTER releasing the leaf (below); nothing in flight
+          }
+          else
+          {
+            // Exception-safety ordering: do the potentially-throwing copies (front
+            // -> src, src -> inFlight) BEFORE the noexcept removals (pop_front /
+            // erase). A throw here then leaves the queue + dedup set intact so the
+            // item is retried on the next iteration, never stranded in neither.
+            src = data.compressorQueue.front();
+            data.compressorInFlight = src;
+            data.compressorQueue.pop_front();
+            data.compressorQueued.erase(src);
+          }
+        }
+        if (!doExit)
+        {
+#ifdef IORA_ENABLE_TEST_HOOKS
+          // Force a throw HERE (in the loop body, outside compressOneFile's own try)
+          // to exercise this per-iteration catch — the actual zombie-fix mechanism.
+          throwIfTestFaultArmed(testHooks().throwBeforeCompressOneFile,
+                                "injected pre-compress fault (outer-catch coverage)");
+#endif
+          compressOneFile(src); // off-lock; also contains its own exceptions
+        }
+      }
+      catch (const std::exception &e)
+      {
+        threw = true;
+        std::cerr << "[Logger] compressor: iteration failure: " << e.what() << std::endl;
+      }
+      catch (...)
+      {
+        threw = true;
+        std::cerr << "[Logger] compressor: iteration failure (unknown)" << std::endl;
+      }
+      {
+        std::lock_guard<std::mutex> lk(data.compressorMutex);
+        data.compressorInFlight.clear(); // always — after normal completion, a throw, or exit
+      }
+      if (doExit)
+      {
+        break;
+      }
+      if (threw)
+      {
+        // Backoff: a caught per-item failure whose cause persists (e.g. sustained
+        // bad_alloc during the pre-pop copy) would otherwise busy-spin, since the
+        // CV predicate stays true. A short sleep bounds the spin; normal one-off
+        // failures pay a negligible 1ms.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
     }
   }

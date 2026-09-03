@@ -8,8 +8,14 @@
 #include "logger_race_harness.hpp"
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include <chrono>
 #include <clocale>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <regex>
+#include <thread>
 
 namespace
 {
@@ -1077,4 +1083,571 @@ TEST_CASE("Logger logFixedBuffer Does Not Crash When The Record Is Level-Gated O
 
   std::lock_guard<std::mutex> lk(cap.m);
   REQUIRE(cap.messages.empty()); // gated out — formatted safely, never delivered
+}
+
+// ============================================================================
+// Aged-file gzip compression (Component B of the native gzip initiative)
+// Tracker: tasks/iora/ongoing/2026-09-03-10_logger-gzip-compression_P2.json
+// Arch:    architecture/iora/logger_gzip_compression.json v0.6.0
+//
+// compressAfterDays (int, <=0 = off): a rotated <base>.<date>.log is gzip-
+// compressed to <base>.<date>.log.gz off the hot path once its date is older
+// than N days, via an age sweep piggybacked on the date rollover (incl. init
+// first-open) sharing one directory scan with retention. Cases are added
+// incrementally per the tracker's testStrategy (1,2,3,3b,3c,4,5,5b,5c,6,6b,
+// 7,7b,8,9,10,11,12,13,14). Reuses this iora_test_logger target (in
+// IORA_SANITIZED_TEST_TARGETS -> TSan/ASan under setarch on WSL2).
+// ============================================================================
+
+namespace gz
+{
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
+
+// Local YYYY-MM-DD for (today - n) days, matching Logger::currentDate() (local).
+std::string dateNDaysAgo(int n)
+{
+  std::time_t t = std::time(nullptr) - static_cast<std::time_t>(n) * 24 * 60 * 60;
+  std::tm tmv{};
+  ::localtime_r(&t, &tmv);
+  char buf[16];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tmv);
+  return std::string(buf);
+}
+
+void writeFile(const std::string &path, const std::string &content)
+{
+  std::ofstream o(path, std::ios::binary | std::ios::trunc);
+  o << content;
+}
+
+bool exists(const std::string &path)
+{
+  std::error_code ec;
+  return fs::exists(path, ec);
+}
+
+// Delegates to the shared iora::test::waitFor (one poller, no drift); keeps the
+// convenient int-ms call sites used below.
+template <class F> bool waitFor(F pred, int timeoutMs = 8000)
+{
+  return iora::test::waitFor(std::move(pred), std::chrono::milliseconds(timeoutMs));
+}
+
+std::size_t countSuffix(const std::string &base, const std::string &suffix)
+{
+  std::size_t n = 0;
+  std::error_code ec;
+  const std::string prefix = fs::path(base).filename().string() + ".";
+  auto dir = fs::path(base).parent_path();
+  if (dir.empty())
+  {
+    dir = fs::current_path(ec);
+  }
+  for (fs::directory_iterator it(dir, ec), end; it != end && !ec; it.increment(ec))
+  {
+    const std::string fn = it->path().filename().string();
+    if (fn.rfind(prefix, 0) == 0 && fn.size() >= suffix.size() &&
+        fn.compare(fn.size() - suffix.size(), suffix.size(), suffix) == 0)
+    {
+      ++n;
+    }
+  }
+  return n;
+}
+
+bool haveInflater()
+{
+  return std::system("command -v gunzip >/dev/null 2>&1") == 0 ||
+         std::system("command -v python3 >/dev/null 2>&1") == 0;
+}
+
+// Reference-decode a .gz FILE via an INDEPENDENT inflater (never our own decoder,
+// which does not exist yet). Returns plaintext; empty on failure.
+std::string referenceInflate(const std::string &gzPath)
+{
+  std::string cmd;
+  if (std::system("command -v gunzip >/dev/null 2>&1") == 0)
+  {
+    cmd = "gunzip -c '" + gzPath + "' 2>/dev/null";
+  }
+  else
+  {
+    cmd = "python3 -c \"import sys,gzip; sys.stdout.buffer.write(gzip.open('" + gzPath +
+          "','rb').read())\" 2>/dev/null";
+  }
+  std::string out;
+  std::FILE *p = ::popen(cmd.c_str(), "r");
+  if (p == nullptr)
+  {
+    return out;
+  }
+  char buf[4096];
+  std::size_t r;
+  while ((r = std::fread(buf, 1, sizeof(buf), p)) > 0)
+  {
+    out.append(buf, r);
+  }
+  ::pclose(p);
+  return out;
+}
+
+// RAII: unique base + cleanup before and after; shuts the logger down (joins the
+// compressor) so tests never bleed state into each other.
+struct Fixture
+{
+  std::string base;
+  explicit Fixture(const std::string &name) : base(name)
+  {
+    iora::core::Logger::testHooks().reset(); // isolate hook state between cases
+    iora::util::removeFilesMatchingPrefix(fs::path(base).filename().string() + ".");
+  }
+  ~Fixture()
+  {
+    iora::core::Logger::shutdown();
+    iora::core::Logger::testHooks().reset();
+    iora::util::removeFilesMatchingPrefix(fs::path(base).filename().string() + ".");
+  }
+  std::string log(const std::string &date) const { return base + "." + date + ".log"; }
+  std::string gz(const std::string &date) const { return base + "." + date + ".log.gz"; }
+  std::string partial(const std::string &date) const { return base + "." + date + ".log.gz.partial"; }
+};
+
+constexpr const char *TF = "%Y-%m-%d %H:%M:%S";
+
+// Arms the compressor's re-check park, seeds one aged .log, inits, and waits until
+// the compressor is parked in its re-check window. Returns the file's date.
+// Centralizes the "parked at re-check" setup for cases 9/10a/10b so none can
+// silently forget the parkedAtRecheck wait (which would make it vacuous).
+std::string armParkedRecheck(const Fixture &f, int retentionDays, int compressAfterDays,
+                             const std::string &content, int ageDays = 10)
+{
+  auto &hooks = iora::core::Logger::testHooks();
+  hooks.pauseBeforeRecheck.store(true);
+  const std::string d = dateNDaysAgo(ageDays);
+  writeFile(f.log(d), content);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, retentionDays, TF,
+                           compressAfterDays);
+  REQUIRE(waitFor([&] { return hooks.parkedAtRecheck.load(); }));
+  return d;
+}
+} // namespace gz
+
+using namespace std::chrono_literals; // for the ms literals in the cases below
+
+// --- Case 1: a file older than N compresses to .gz (reference-decodable); source gone
+TEST_CASE("gzip: aged file compresses, source removed, gunzip round-trips",
+          "[logger][gzip][compression]")
+{
+  REQUIRE(gz::haveInflater()); // interop is a hard gate, not a skip
+  gz::Fixture f("testlog_gz1");
+  const std::string d = gz::dateNDaysAgo(10);
+  const std::string content = "aged line one\naged line two\n";
+  gz::writeFile(f.log(d), content);
+
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 7);
+
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d)) && !gz::exists(f.log(d)); }));
+  REQUIRE(gz::referenceInflate(f.gz(d)) == content);
+  REQUIRE(!gz::exists(f.partial(d)));
+}
+
+// --- Case 2: a file younger than N is NOT compressed
+TEST_CASE("gzip: file younger than N is not compressed", "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz2");
+  const std::string d = gz::dateNDaysAgo(3);
+  gz::writeFile(f.log(d), "recent\n");
+
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 7);
+
+  std::this_thread::sleep_for(250ms); // the sweep decided synchronously in init()
+  REQUIRE(gz::exists(f.log(d)));
+  REQUIRE(!gz::exists(f.gz(d)));
+}
+
+// --- Case 3: today's ACTIVE file is never compressed
+TEST_CASE("gzip: active (today) file is never compressed", "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz3");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 1);
+  IORA_LOG_INFO("write to today's active file");
+  iora::core::Logger::flush();
+  const std::string today = gz::dateNDaysAgo(0);
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(gz::exists(f.log(today)));  // active file present
+  REQUIRE(!gz::exists(f.gz(today)));  // never compressed (age 0 + criterion (f))
+}
+
+// --- Case 4: idempotency — one .gz per file, no re-enqueue across a second sweep
+TEST_CASE("gzip: idempotent — exactly one .gz, no re-compress on re-sweep",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz4");
+  const std::string d = gz::dateNDaysAgo(10);
+  gz::writeFile(f.log(d), "once\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d)); }));
+  // Second init re-runs the boot sweep; the .gz sibling + missing .log must NOT
+  // re-enqueue anything.
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 7);
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(gz::countSuffix(f.base, ".log.gz") == 1);
+  REQUIRE(gz::countSuffix(f.base, ".gz.partial") == 0);
+}
+
+// --- Case 5: retention ordering — mid-aged compresses, past-retention is deleted
+TEST_CASE("gzip: aged<retention compresses; aged>=retention is deleted",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz5");
+  const std::string mid = gz::dateNDaysAgo(10); // 7..30 -> compress
+  const std::string old = gz::dateNDaysAgo(40); // >=30 -> delete
+  gz::writeFile(f.log(mid), "mid\n");
+  gz::writeFile(f.log(old), "old\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(mid)); }));
+  REQUIRE(!gz::exists(f.log(mid)));
+  REQUIRE(gz::waitFor([&] { return !gz::exists(f.log(old)); }));
+  REQUIRE(!gz::exists(f.gz(old))); // deleted, never compressed
+}
+
+// --- Case 5b: invariant violated (retention<=compress) disables compression
+TEST_CASE("gzip: compressAfterDays>=retentionDays disables compression",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz5b");
+  const std::string d = gz::dateNDaysAgo(3); // young enough that retention=5 keeps it
+  gz::writeFile(f.log(d), "kept\n");
+  // retention 5, compress 6 -> 6>=5 invalid -> compression disabled
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 5, gz::TF, 6);
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(gz::exists(f.log(d))); // not deleted (3<5), not compressed (disabled)
+  REQUIRE(!gz::exists(f.gz(d)));
+}
+
+// --- Case 5c: retention prunes .log.gz by date, NEVER a .partial
+TEST_CASE("gzip: retention prunes aged .log.gz but never a .partial",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz5c");
+  const std::string old = gz::dateNDaysAgo(40);
+  gz::writeFile(f.gz(old), "already compressed\n"); // a stale compressed log
+  gz::writeFile(f.partial(old), "half written\n");   // an in-flight temp
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 30, gz::TF, 0);
+  REQUIRE(gz::waitFor([&] { return !gz::exists(f.gz(old)); })); // pruned by date
+  REQUIRE(gz::exists(f.partial(old)));                          // NEVER retention's to delete
+}
+
+// --- Case 6: retention OFF + compression ON — compresses and keeps the .gz
+TEST_CASE("gzip: retention off, aged file compresses and .gz persists",
+          "[logger][gzip][compression]")
+{
+  REQUIRE(gz::haveInflater());
+  gz::Fixture f("testlog_gz6");
+  const std::string d = gz::dateNDaysAgo(100);
+  const std::string content = "very old\n";
+  gz::writeFile(f.log(d), content);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d)) && !gz::exists(f.log(d)); }));
+  std::this_thread::sleep_for(150ms);
+  REQUIRE(gz::exists(f.gz(d))); // persists (retention off never deletes)
+  REQUIRE(gz::referenceInflate(f.gz(d)) == content);
+}
+
+// --- Case 6b: both off -> NO directory scan (verified by the scan counter, not
+// just by "no side effects" which cannot distinguish no-scan from scan-then-noop)
+TEST_CASE("gzip: both off performs no directory scan; work triggers one",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz6b");
+  auto &hooks = iora::core::Logger::testHooks();
+  const std::string old = gz::dateNDaysAgo(40);
+  gz::writeFile(f.log(old), "untouched\n");
+
+  hooks.scanCount.store(0);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 0);
+  // The boot sweep runs synchronously inside init(); with both off it is skipped
+  // and no compressor spawns, so the count is final on return (no sleep needed).
+  REQUIRE(hooks.scanCount.load() == 0); // both off -> collectLogFiles never called
+  REQUIRE(gz::exists(f.log(old)));       // and no side effects
+  REQUIRE(!gz::exists(f.gz(old)));
+
+  // Re-init with compression ON: the boot rotate DOES scan (work exists).
+  hooks.scanCount.store(0);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  REQUIRE(hooks.scanCount.load() >= 1); // work -> the boot sweep scanned (synchronous in init)
+}
+
+// --- Case 7: startup backlog compresses at boot (init first-open sweep)
+TEST_CASE("gzip: startup backlog compresses at init first-open", "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz7");
+  std::vector<std::string> dates{gz::dateNDaysAgo(10), gz::dateNDaysAgo(11), gz::dateNDaysAgo(12)};
+  for (const auto &d : dates)
+  {
+    gz::writeFile(f.log(d), "backlog " + d + "\n");
+  }
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 60, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::countSuffix(f.base, ".log.gz") == 3; }));
+  for (const auto &d : dates)
+  {
+    REQUIRE(!gz::exists(f.log(d)));
+  }
+}
+
+// --- Case 7b: respawn — an aged file still compresses in a SECOND session
+TEST_CASE("gzip: respawn after shutdown still compresses (compressorExit reset)",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz7b");
+  const std::string d1 = gz::dateNDaysAgo(10);
+  gz::writeFile(f.log(d1), "session one\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 60, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d1)); }));
+  iora::core::Logger::shutdown(); // sets compressorExit=true
+
+  const std::string d2 = gz::dateNDaysAgo(11);
+  gz::writeFile(f.log(d2), "session two\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 60, gz::TF, 7);
+  // Without the compressorExit reset before the boot rotate, the second-session
+  // compressor would be born already-stopped and this would hang -> timeout-fail.
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d2)) && !gz::exists(f.log(d2)); }));
+}
+
+// --- Case 8: non-blocking overflow — the bounded queue drops, dropped stay .log
+TEST_CASE("gzip: bounded queue drops on overflow, dropped files stay .log",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz8");
+  // NOTE: 256 below is LoggerData::COMPRESSOR_QUEUE_MAX (private-nested, not test-
+  // visible). If that constant changes, update the two 256 literals here.
+  const std::size_t total = 300; // > COMPRESSOR_QUEUE_MAX (256)
+  for (std::size_t i = 0; i < total; ++i)
+  {
+    // distinct old dates: 10..309 days ago, all in (compress 7, retention off)
+    gz::writeFile(f.log(gz::dateNDaysAgo(static_cast<int>(10 + i))), "x\n");
+  }
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  // At most 256 enqueued in the boot pass; the compressor drains them. The
+  // remainder are DROPPED (non-blocking) and remain .log for a later sweep.
+  REQUIRE(gz::waitFor([&] { return gz::countSuffix(f.base, ".log.gz") == 256; }, 20000));
+  std::this_thread::sleep_for(200ms);
+  REQUIRE(gz::countSuffix(f.base, ".log.gz") == 256);
+  // dropped backlog files stay .log, plus today's (empty) active file that init opened
+  REQUIRE(gz::countSuffix(f.base, ".log") == (total - 256) + 1);
+}
+
+// --- Case 9: teardown while the compressor is DETERMINISTICALLY parked in its
+// re-check window — proves the join is OFF data.mutex (would deadlock/timeout if
+// the join were under the lock) and is idempotent. Non-vacuous (R2/M5).
+TEST_CASE("gzip: teardown joins off-lock while compressor is mid-re-check (deterministic)",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz9");
+  auto &hooks = iora::core::Logger::testHooks();
+  gz::armParkedRecheck(f, /*retentionDays=*/0, /*compressAfterDays=*/7,
+                       "payload for a nontrivial gzip\n"); // parked, data.mutex free
+
+  std::atomic<bool> done{false};
+  std::thread teardown([&] { iora::core::Logger::shutdown(); done.store(true); });
+  std::this_thread::sleep_for(100ms); // let shutdown reach the compressor stop+join
+  hooks.recheckProceed.store(true);   // release the parked compressor
+  // If the join held data.mutex, the released compressor could never acquire it for
+  // the re-check -> shutdown() would hang -> this times out. Off-lock join => bounded.
+  const bool completed = gz::waitFor([&] { return done.load(); }, 8000);
+  if (completed) { teardown.join(); }
+  else { teardown.detach(); }
+  REQUIRE(completed);
+  REQUIRE(gz::countSuffix(f.base, ".gz.partial") == 0); // no torn temp left behind
+  iora::core::Logger::shutdown();                        // idempotent second call: no hang/crash
+}
+
+// --- Case 10: the compressOneFile re-check ABANDON branches, forced deterministically
+// by parking the compressor after the gzip but before the re-check (R2/L5).
+TEST_CASE("gzip: re-check abandons a vanished source (no .gz published)",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz10a");
+  auto &hooks = iora::core::Logger::testHooks();
+  const std::string d = gz::armParkedRecheck(f, /*retentionDays=*/0, /*compressAfterDays=*/7,
+                                             "vanishing\n");
+  std::error_code ec;
+  std::filesystem::remove(f.log(d), ec); // delete the source during the re-check window
+  hooks.recheckProceed.store(true);
+  REQUIRE(gz::waitFor([&] { return !gz::exists(f.partial(d)); })); // .partial abandoned
+  REQUIRE(!gz::exists(f.gz(d))); // never resurrected as a .gz
+}
+
+TEST_CASE("gzip: re-check abandons a source that aged past retention while queued",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz10b");
+  auto &hooks = iora::core::Logger::testHooks();
+  // retention 30: at enqueue the 10-day file is compressible (10 < 30).
+  const std::string d = gz::armParkedRecheck(f, /*retentionDays=*/30, /*compressAfterDays=*/7,
+                                             "doomed\n");
+  hooks.nowOffsetDays.store(25); // now +25 -> the file reads 35 days old >= retention 30
+  hooks.recheckProceed.store(true);
+  REQUIRE(gz::waitFor([&] { return !gz::exists(f.partial(d)); })); // abandoned by the re-check
+  REQUIRE(!gz::exists(f.gz(d)));  // no .gz (never resurrected)
+  REQUIRE(gz::exists(f.log(d)));  // source not renamed/deleted (abandoned before rename)
+}
+
+// --- Case 11: startup cleanup removes a stray .partial and reclaims a crash-orphan .log
+TEST_CASE("gzip: spawn cleanup removes stray .partial and reclaims orphan .log",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz11");
+  const std::string strayDate = gz::dateNDaysAgo(20);
+  const std::string orphanDate = gz::dateNDaysAgo(21);
+  gz::writeFile(f.partial(strayDate), "incomplete\n");   // stray temp from a crash
+  gz::writeFile(f.log(orphanDate), "orphan source\n");    // crash-orphan .log ...
+  gz::writeFile(f.gz(orphanDate), "already durable\n");   // ... whose .gz already landed
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] {
+    return !gz::exists(f.partial(strayDate)) && !gz::exists(f.log(orphanDate));
+  }));
+  REQUIRE(gz::exists(f.gz(orphanDate))); // the durable .gz survives
+}
+
+// --- Case 11b: spawn cleanup's orphan-reclaim carries criterion (f) — it must
+// NEVER reclaim the ACTIVE (today) .log even when a stale .gz for today's date is
+// present at spawn (the third delete-capable path). Fails if the guard is removed.
+TEST_CASE("gzip: spawn cleanup never reclaims the active file despite a today .gz",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz11b");
+  auto &hooks = iora::core::Logger::testHooks();
+  const std::string today = gz::dateNDaysAgo(0);
+  gz::writeFile(f.gz(today), "stale .gz matching today's active file\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  IORA_LOG_INFO("active line to today's file");
+  iora::core::Logger::flush();
+  // Wait for the spawn-time cleanup to actually run (non-vacuous: without this the
+  // negative assertion could pass before cleanup even executed).
+  REQUIRE(gz::waitFor([&] { return hooks.startupCleanupDone.load(); }));
+  REQUIRE(gz::exists(f.log(today))); // active file NOT reclaimed (criterion (f) on the reclaim path)
+}
+
+// --- Case 13: sync-mode compression works (no worker thread present)
+TEST_CASE("gzip: compression works in sync mode (no async worker)",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz13");
+  const std::string d = gz::dateNDaysAgo(10);
+  gz::writeFile(f.log(d), "sync mode\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, /*async=*/false, 30, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d)) && !gz::exists(f.log(d)); }));
+}
+
+// --- Case 3c: criterion (f) on the DELETE path — deterministically forced.
+// The nowOffsetDays seam shifts "now" so today's active file reads fileDays==2
+// (the west-of-UTC LOCAL-date-name vs UTC-fileDays skew, made deterministic): with
+// retention=1 the active file is now past retention BY AGE and only criterion (f)
+// (date == currentLogDate) stops the delete. The test FAILS if (f) is removed.
+TEST_CASE("gzip: criterion (f) — retention never deletes the active file",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz3c");
+  iora::core::Logger::testHooks().nowOffsetDays.store(2); // active file reads fileDays==2
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 1, gz::TF, 0);
+  IORA_LOG_INFO("active");
+  iora::core::Logger::flush();
+  const std::string today = gz::dateNDaysAgo(0); // == currentLogDate
+  std::this_thread::sleep_for(200ms);
+  REQUIRE(gz::exists(f.log(today))); // NOT deleted — only criterion (f) prevents it
+}
+
+// --- Case 3b: criterion (f) on the COMPRESS path — deterministically forced.
+// Same seam; retention off + compress 1 makes compression effective, and the
+// active file (fileDays==2 >= 1) is only spared by criterion (f).
+TEST_CASE("gzip: criterion (f) — sweep never compresses the active file",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz3b");
+  iora::core::Logger::testHooks().nowOffsetDays.store(2);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 1);
+  IORA_LOG_INFO("active");
+  iora::core::Logger::flush();
+  const std::string today = gz::dateNDaysAgo(0);
+  std::this_thread::sleep_for(200ms);
+  REQUIRE(gz::exists(f.log(today)));  // present
+  REQUIRE(!gz::exists(f.gz(today)));  // NOT compressed — only criterion (f) prevents it
+}
+
+// --- Case 12: exception containment — an ACTUAL throw on the per-file path is
+// contained and the loop continues (part A); a pre-loop spawn-cleanup throw is
+// contained and the process survives (part B). Both drive the whole-thread
+// try/catch via a fault-injection seam.
+TEST_CASE("gzip: a per-file throw is contained and the compressor loop continues",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz12a");
+  auto &hooks = iora::core::Logger::testHooks();
+  hooks.throwInCompress.store(true); // the first compression throws
+  const std::string bad = gz::dateNDaysAgo(10);
+  gz::writeFile(f.log(bad), "will throw\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  std::this_thread::sleep_for(200ms); // throw caught (before any .partial is created); alive
+  REQUIRE(!gz::exists(f.partial(bad)));
+  // Clear the fault and enqueue a good file (re-init re-runs the boot sweep on the
+  // SAME live compressor): it must still compress — proving the loop survived the throw.
+  hooks.throwInCompress.store(false);
+  const std::string good = gz::dateNDaysAgo(11);
+  gz::writeFile(f.log(good), "good after throw\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(good)); }));
+}
+
+TEST_CASE("gzip: a spawn-cleanup throw is contained; the process survives",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz12b");
+  iora::core::Logger::testHooks().throwInStartupCleanup.store(true);
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  std::this_thread::sleep_for(150ms); // pre-loop throw contained by the whole-thread try/catch
+  IORA_LOG_INFO("still alive after a spawn-cleanup throw");
+  iora::core::Logger::flush();
+  SUCCEED("process survived a compressor spawn-cleanup throw (no std::terminate)");
+}
+
+// --- Case 12c: a throw from the loop body OUTSIDE compressOneFile's own try is
+// contained by compressorLoop's per-iteration catch (the actual zombie-fix outer
+// catch) — the thread survives and a later file still compresses. Distinct from
+// 12a, whose throw fires inside compressOneFile's inner try.
+TEST_CASE("gzip: a pre-compress loop-body throw is contained; the loop continues",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz12c");
+  auto &hooks = iora::core::Logger::testHooks();
+  hooks.throwBeforeCompressOneFile.store(true); // throws in the loop, before compressOneFile
+  const std::string bad = gz::dateNDaysAgo(10);
+  gz::writeFile(f.log(bad), "will throw before compress\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  std::this_thread::sleep_for(200ms); // outer catch contains it; thread stays alive
+  // Clear the fault and enqueue a good file: the SAME live compressor must compress
+  // it, proving the outer per-iteration catch continued the loop (not just survived).
+  hooks.throwBeforeCompressOneFile.store(false);
+  const std::string good = gz::dateNDaysAgo(11);
+  gz::writeFile(f.log(good), "good after outer-catch\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(good)); }));
+}
+
+// --- Case 14: a post-boot enqueue wakes a PARKED compressor (the notify)
+TEST_CASE("gzip: steady-state enqueue wakes a parked compressor",
+          "[logger][gzip][compression]")
+{
+  gz::Fixture f("testlog_gz14");
+  // Boot with an empty backlog so the compressor parks in cv.wait immediately.
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  std::this_thread::sleep_for(100ms); // let it reach cv.wait
+  // Now drop an aged file and re-run the sweep (re-init re-runs the boot sweep and
+  // enqueues + notifies). Without notify_one on enqueue, a parked compressor would
+  // never wake and this would time out.
+  const std::string d = gz::dateNDaysAgo(10);
+  gz::writeFile(f.log(d), "woke you up\n");
+  iora::core::Logger::init(iora::core::Logger::Level::Info, f.base, false, 0, gz::TF, 7);
+  REQUIRE(gz::waitFor([&] { return gz::exists(f.gz(d)) && !gz::exists(f.log(d)); }));
 }
