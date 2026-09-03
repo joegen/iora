@@ -173,6 +173,18 @@ struct JsonRpcClientTestAccess
     return c._impl->recalcTotalLocked_();
   }
 
+  /// \brief Evaluate the counter invariant _totalConnections ==
+  /// recalcTotalLocked_() under a SINGLE lock hold. The two-call form
+  /// (totalConnections() then recalcTotal()) takes the lock twice and is racy
+  /// under concurrency — a mutation between the calls makes them legitimately
+  /// differ. The invariant only holds WITHIN one lock hold, so it must be read
+  /// atomically here (task-9.2).
+  static bool totalMatchesRecalc(JsonRpcClient &c)
+  {
+    std::lock_guard<std::mutex> guard(c._impl->_mutex);
+    return c._impl->_totalConnections == c._impl->recalcTotalLocked_();
+  }
+
   /// \brief The connectionId of the connection a live lease references, matched
   /// by the stable HttpClient address. Returns 0 if not found.
   static std::uintptr_t connectionIdOf(JsonRpcClient &c, detail::ConnectionLease &lease)
@@ -5940,6 +5952,352 @@ TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 't
   REQUIRE(s.failedRequests == 1);
   REQUIRE(s.timeoutRequests == 0); // application error, not a transport timeout
   server.stop();
+}
+
+// =========================================================================
+// PHASE 8 — remaining stats/contract verification.
+//
+// task-8.2 (M-4): a pool-exhausted call() and callBatch() must BOTH increment
+// poolExhaustions AND failedRequests. Before the phase-6/7 rework the batch
+// acquire_ sat OUTSIDE callBatch's try, so a pool-exhausted batch was counted
+// NOWHERE. These two cases lock that in. Deterministic via the pool seam: with
+// maxConnectionsPerEndpoint == 1 and the single slot held by a seam lease, any
+// further acquire on that ORIGIN throws PoolExhaustedError at acquire_ (before
+// any send), with no server and no timing.
+// =========================================================================
+TEST_CASE("task-8.2 M-4: a pool-exhausted call() counts poolExhaustions AND failedRequests",
+          "[jsonrpc][pool][phase8][stats]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 1; // one slot -> deterministic exhaustion
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://exhaust.test/rpc";
+
+  // Hold the single slot; every further acquire on this origin is now capped.
+  ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
+
+  REQUIRE_THROWS_AS(client.call(ep, "m"), PoolExhaustedError);
+
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.poolExhaustions == 1);
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.successfulRequests == 0); // exhaustion is a failure, never a success
+
+  // Mutation: maxConnectionsPerEndpoint = 2 lets call() acquire a second slot,
+  // so acquire_ no longer throws PoolExhaustedError (the stub send then fails
+  // with a transport error) and poolExhaustions stays 0 — this case then fails.
+}
+
+TEST_CASE("task-8.2 M-4: a pool-exhausted callBatch() counts poolExhaustions AND failedRequests, matching call()",
+          "[jsonrpc][pool][phase8][stats]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 1;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://exhaust-batch.test/rpc";
+
+  ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
+
+  std::vector<iora::modules::connectors::BatchItem> items;
+  items.emplace_back("m", iora::parsers::Json::object(), std::uint64_t{1});
+  REQUIRE_THROWS_AS(client.callBatch(ep, items), PoolExhaustedError);
+
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.batchRequests == 1);
+  REQUIRE(s.poolExhaustions == 1); // M-4: previously counted nowhere on the batch path
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.successfulRequests == 0);
+}
+
+// =========================================================================
+// task-8.5(b): PoolExhaustedError is delivered by TYPE on BOTH async channels
+// (future and callback), locking in the already-correct library behaviour so a
+// later refactor cannot silently flatten it. Same deterministic seam-hold.
+// =========================================================================
+TEST_CASE("task-8.5(b): a pool-exhausted callAsync (future) delivers PoolExhaustedError catchable BY TYPE",
+          "[jsonrpc][pool][phase8][async]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 1;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://exhaust-async-fut.test/rpc";
+
+  // `held` stays alive across get(): the worker's acquire_ throws while the slot
+  // is held, so the future carries the exception type intact.
+  ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
+  std::future<iora::parsers::Json> fut = client.callAsync(ep, "m");
+  REQUIRE_THROWS_AS(fut.get(), PoolExhaustedError);
+}
+
+TEST_CASE("task-8.5(b): a pool-exhausted callAsync (callback) delivers PoolExhaustedError to onError, catchable BY TYPE",
+          "[jsonrpc][pool][phase8][async]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 1;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://exhaust-async-cb.test/rpc";
+
+  ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
+
+  std::atomic<bool> errFired{false};
+  std::atomic<bool> wasExhausted{false};
+  std::atomic<bool> successFired{false};
+  client.callAsync(
+    ep, "m", iora::parsers::Json::object(), {},
+    [&](iora::parsers::Json) { successFired.store(true); },
+    [&](std::exception_ptr e)
+    {
+      try
+      {
+        std::rethrow_exception(e);
+      }
+      catch (const PoolExhaustedError &)
+      {
+        wasExhausted.store(true);
+      }
+      catch (...)
+      {
+      }
+      // errFired is the completion signal and MUST be the callback's LAST write
+      // to any main-owned capture (thread-safety M2): the main thread observes
+      // it and then asserts wasExhausted / unwinds this scope. Storing it before
+      // the classification would (a) flake on a loaded runner and (b) let the
+      // captured atomics — declared after `client`, so destroyed before its
+      // quiesce — die while the worker still had writes to make (use-after-scope).
+      errFired.store(true);
+    });
+
+  // Bounded wait for delivery via the shared helper; `held` is alive throughout,
+  // so the worker's acquire_ throws. Observing errFired now establishes
+  // happens-before for wasExhausted (it was written first, errFired last).
+  REQUIRE(waitFor([&]() { return errFired.load(); }, std::chrono::seconds(3)));
+  REQUIRE(wasExhausted.load());
+  REQUIRE(successFired.load() == false);
+}
+
+// =========================================================================
+// task-8.6: getStats() returns an INDEPENDENT by-value snapshot. Two snapshots
+// taken across intervening activity must not alias the live counters — the first
+// keeps its value after the second increments.
+// =========================================================================
+TEST_CASE("task-8.6: getStats returns an independent by-value snapshot",
+          "[jsonrpc][pool][phase8][stats]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 1;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://snap.test/rpc";
+
+  ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
+
+  REQUIRE_THROWS_AS(client.call(ep, "m"), PoolExhaustedError);
+  const iora::modules::connectors::ClientStatsSnapshot first = client.getStats();
+  REQUIRE(first.failedRequests == 1);
+
+  // More activity mutates the LIVE ClientStats...
+  REQUIRE_THROWS_AS(client.call(ep, "m"), PoolExhaustedError);
+  const iora::modules::connectors::ClientStatsSnapshot second = client.getStats();
+
+  // ...but `first` is a value copy, unaffected by the later increment. This is
+  // the whole independence guarantee: a reference-returning getStats() could not
+  // hold first.failedRequests at 1 here, and would not compile the `const
+  // ClientStatsSnapshot first = client.getStats();` binding as a value at all.
+  REQUIRE(first.failedRequests == 1); // still 1: independent of the live counters
+  REQUIRE(second.failedRequests == 2);
+}
+
+// =========================================================================
+// PHASE 9 — remaining tests.
+//
+// task-9.1: a latched in-flight call deterministically exhausts a cap-1 origin.
+// Thread A parks INSIDE the send holding the only lease; thread B (this thread)
+// then hits the per-endpoint cap and throws at acquire_ — independent of the
+// server ever seeing B's request. Four conditions per the tracker: (a) release
+// the latch and join via a scope guard on EVERY exit; (b) the server-side wait
+// is bounded (LatchedHttpServer's handler wait); (c) poolExhaustions is
+// cumulative, so assert the exact count while A is still parked; (d) maxRetries
+// == 0 so no retry re-enters the handler or holds the lease across a backoff.
+// =========================================================================
+TEST_CASE("task-9.1: a latched in-flight call deterministically exhausts a cap-1 origin (counted)",
+          "[jsonrpc][pool][phase9][latched]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t serverPort = 18210;
+  LatchedHttpServer server(serverPort);
+
+  Config cfg;                          // real factory: A actually sends and parks
+  cfg.maxConnectionsPerEndpoint = 1;   // one slot -> deterministic throw
+  cfg.maxRetries = 0;                  // (d)
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
+
+  std::exception_ptr aErr;
+  std::atomic<bool> aDone{false};
+  std::thread caller(
+    [&]()
+    {
+      try
+      {
+        (void)client.call(ep, "hold");
+      }
+      catch (...)
+      {
+        aErr = std::current_exception();
+      }
+      aDone.store(true);
+    });
+  // (a): release the latch and join on EVERY exit path, including an early
+  // REQUIRE throw below (a trailing join would be skipped on unwind -> a
+  // joinable ~thread -> std::terminate).
+  JoinGuard guard{caller, [&]() { server.release(); }};
+
+  // (b): bounded wait. Once A's request has reached the latch, A holds the lease.
+  REQUIRE(server.waitForArrival(1));
+
+  // Thread B: the one slot is leased by A parked in the send, so acquire_ throws
+  // at once. B never reaches a send.
+  REQUIRE_THROWS_AS(client.call(ep, "second"), PoolExhaustedError);
+
+  // (c): cumulative counter, A not yet complete -> exactly B's throw is counted.
+  const auto sMid = client.getStats();
+  REQUIRE(sMid.poolExhaustions == 1);
+  REQUIRE(sMid.failedRequests == 1);
+  REQUIRE(sMid.successfulRequests == 0); // A is still parked
+
+  // Release A and let it complete.
+  server.release();
+  caller.join(); // idempotent with the guard (guarded by joinable())
+  REQUIRE(aDone.load());
+  REQUIRE(!aErr); // A's call succeeded once unlatched
+
+  const auto sEnd = client.getStats();
+  REQUIRE(sEnd.successfulRequests == 1); // A now succeeded
+  REQUIRE(sEnd.poolExhaustions == 1);    // unchanged
+
+  // Mutation: maxConnectionsPerEndpoint = 2 lets B acquire a second connection
+  // instead of throwing, so the poolExhaustions == 1 assertion fails.
+}
+
+// =========================================================================
+// task-9.2: bounded concurrent acquire/release/purge with STRUCTURAL INVARIANT
+// assertions. Why the sanitizers are not the coverage here:
+//   * TSan is structurally blind to the ORIGINAL CR-1/CR-2, which were
+//     mutex-serialised LOGICAL bugs (no data race to detect). But the phase-3
+//     quiesce (a cross-thread counter + CV) and the phase-6 UNLOCKED
+//     construction window ARE genuine data-race surfaces, and TSan IS the
+//     detector there (thread-safety M-9).
+//   * Per-target sanitizer flags instrument only THIS test TU; iora_core stays
+//     uninstrumented, so a clean run is NOT proof of full coverage (cpp17 R2-L6).
+// So this asserts the invariants explicitly rather than leaning on a clean
+// sanitizer pass. Snapshots use snapshotPools() (pool _mutex) and
+// quiesceSnapshot() (_quiesceMutex) taken SEQUENTIALLY — never both at once
+// (task-1.2b / task-3.6 rule (i)).
+// =========================================================================
+TEST_CASE("task-9.2: bounded concurrent acquire/release/purge preserves the pool invariants",
+          "[jsonrpc][pool][phase9][concurrency]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(4, 4, std::chrono::seconds(1));
+  Config cfg = stubFactoryConfig();
+  cfg.maxConnectionsPerEndpoint = 8; // headroom over 4 threads -> never exhausts
+  cfg.idleTimeout = std::chrono::milliseconds(2);
+  JsonRpcClient client(svc, pool, cfg);
+
+  const std::string eps[3] = {"http://c0.test/rpc", "http://c1.test/rpc", "http://c2.test/rpc"};
+
+  // Invariants that must hold while QUIESCENT (all leases released), checked
+  // under the seam locks.
+  auto assertQuiescentInvariants = [&]()
+  {
+    const auto snaps = JsonRpcClientTestAccess::snapshotPools(client); // pool _mutex
+    const auto q = JsonRpcClientTestAccess::quiesceSnapshot(client);   // _quiesceMutex (separate)
+    REQUIRE(JsonRpcClientTestAccess::totalMatchesRecalc(client)); // atomic under one lock
+    std::size_t inUse = 0;
+    for (const auto &ps : snaps)
+    {
+      REQUIRE(ps.connections.empty() == false); // no size()==0 pool persists in _pools
+      for (const auto &ci : ps.connections)
+      {
+        if (ci.inUse)
+        {
+          ++inUse;
+        }
+      }
+    }
+    REQUIRE(inUse == 0);      // quiescent: no leased connection
+    REQUIRE(q.inFlight == 0); // quiescent: no counted call outstanding
+  };
+
+  constexpr int kRounds = 8;
+  for (int round = 0; round < kRounds; ++round)
+  {
+    std::atomic<int> unexpected{0};
+    std::atomic<bool> raceDetected{false};
+    std::thread workers[4];
+    for (int w = 0; w < 4; ++w)
+    {
+      workers[w] = std::thread(
+        [&, w]()
+        {
+          try
+          {
+            for (int i = 0; i < 40; ++i)
+            {
+              const std::string &e = eps[(w + i) % 3];
+              {
+                ConnectionLease l = JsonRpcClientTestAccess::acquire(client, e);
+                // total == recalc holds at EVERY lock release, even mid-flight —
+                // evaluated atomically under ONE lock (the two-call form would be
+                // racy: a concurrent mutation between the two locks legitimately
+                // differs).
+                if (!JsonRpcClientTestAccess::totalMatchesRecalc(client))
+                {
+                  raceDetected.store(true);
+                }
+              } // release the lease
+              if ((i % 4) == 0)
+              {
+                client.purgeIdle(); // concurrent idle/whole-pool eviction
+              }
+            }
+          }
+          catch (...)
+          {
+            unexpected.fetch_add(1);
+          }
+        });
+    }
+    for (auto &t : workers)
+    {
+      t.join();
+    }
+    REQUIRE(unexpected.load() == 0);   // no spurious throw (never exhausts at cap 8)
+    REQUIRE(raceDetected.load() == false);
+    client.purgeIdle(); // drain to quiescence
+    assertQuiescentInvariants();
+  }
+
+  // Mutation: removing the acquire_/purgeIdle exit tripwire that maintains
+  // total == recalc would trip the mid-flight raceDetected check above.
 }
 
 int main(int argc, char *argv[])

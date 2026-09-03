@@ -76,6 +76,23 @@ public:
 
 /// \brief Thrown when a pool has reached its configured maximum size and no
 /// connection is available.
+/// \details CONTRACT (task-8.5, HD-5 — permanent): when more than
+/// `maxConnectionsPerEndpoint` calls are concurrently in flight to a single
+/// ORIGIN (scheme://host:effective-port — task-7.5, NOT the full request URL),
+/// the call that finds no free connection and no create budget fails
+/// IMMEDIATELY with this exception. There is NO queuing, NO wait, and NO
+/// backpressure signal beyond the exception type itself: a caller that wants to
+/// bound concurrency must do so on its own side. The same exception is raised
+/// for the global cap (`globalMaxConnections`) and the pool cap
+/// (`maxEndpointPools`) when neither can admit a new connection.
+///
+/// It is delivered by TYPE on every channel, so a caller can catch it
+/// specifically: thrown from the synchronous `call`/`notify`/`callBatch`;
+/// carried through `std::future::get()` by the future-returning async overloads;
+/// and passed to the `onError(std::exception_ptr)` callback of the
+/// callback-based `callAsync` (rethrow-and-catch to recover the type). Do NOT
+/// reach for HttpClientPool as a substitute back-pressure mechanism: it is
+/// origin-agnostic and fixed-size and cannot express a per-origin cap (L-2).
 class PoolExhaustedError : public JsonRpcError
 {
 public:
@@ -252,6 +269,21 @@ struct ClientStats
   std::atomic<std::uint64_t> notificationRequests{0};
   std::atomic<std::uint64_t> poolExhaustions{0};
   std::atomic<std::uint64_t> connectionsCreated{0};
+  /// \brief Count of pooled HttpClient OBJECTS discarded by THIS JSON-RPC pool
+  /// (idle-expiry purge, LRU connection eviction, LRU whole-pool eviction). It
+  /// counts ZERO of the socket-level evictions HttpClient performs internally
+  /// (forceEvict / dropConnection on a dead or recycled TCP socket). So
+  /// connectionsEvicted == 0 means "the pool never retired a wrapper", NOT "no
+  /// socket was ever torn down" — an operator must not read a zero here as proof
+  /// that connections are being reused (web W-M6). The name is kept rather than
+  /// renamed: a rename is a public-surface change spanning the plugin and tests,
+  /// and this note removes the ambiguity in place (task-8.6b).
+  ///
+  /// W-M6b (recorded so no one makes the wasted edit): returning a connection to
+  /// this pool after a FAILED exchange is SAFE, and a "never return a poisoned
+  /// connection" rule would be WRONG here — the socket-level reuse/drop policy
+  /// lives entirely in HttpClient::executeRequest, which the JSON-RPC pool cannot
+  /// see and must not second-guess.
   std::atomic<std::uint64_t> connectionsEvicted{0};
 
   /// \brief Reset all counters.
@@ -287,6 +319,8 @@ struct ClientStatsSnapshot
   std::uint64_t notificationRequests{0};
   std::uint64_t poolExhaustions{0};
   std::uint64_t connectionsCreated{0};
+  /// \brief See ClientStats::connectionsEvicted for the exact meaning (pool
+  /// wrapper objects retired here, NOT HttpClient socket-level evictions).
   std::uint64_t connectionsEvicted{0};
 };
 
@@ -625,8 +659,17 @@ class ConnectionLease
 public:
   ConnectionLease() = delete;
 
+  // noexcept (task-8.1, locks in L-6): the specifier constrains this ctor's
+  // BODY, which only move-constructs three shared_ptrs — an unconditionally
+  // noexcept operation. The by-value parameters are filled at the sole call site
+  // (finishAcquireLocked_) by shared_from_this() + two shared_ptr copies, which
+  // are SEPARATELY noexcept by shared_ptr's contract; together the whole
+  // construction is non-throwing. finishAcquireLocked_ UNLOCKS _mutex and THEN
+  // constructs the lease, so a throw here would strand an already-in-use
+  // connection (markFree'd only by ~ConnectionLease) with no lease to release it
+  // — a permanent slot leak. noexcept makes that guarantee explicit for the body.
   ConnectionLease(std::shared_ptr<JsonRpcClientImpl> impl, std::shared_ptr<EndpointPool> pool,
-                  std::shared_ptr<PooledConnection> conn)
+                  std::shared_ptr<PooledConnection> conn) noexcept
       : _impl(std::move(impl)), _pool(std::move(pool)), _conn(std::move(conn))
   {
   }
@@ -2597,19 +2640,76 @@ private:
   // removed from the map stays well-defined instead of dereferencing freed
   // memory.
   std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>> _pools;
-  // LOCK ORDERING (task-3.6 / task-8.4), stated here at the declaration:
-  //  (i)   the pool _mutex and Impl::_quiesceMutex are NEVER held simultaneously
-  //        (the quiesce CV must not reuse this mutex — a task blocked in acquire_
-  //        on _mutex and a destructor waiting for it would deadlock).
-  //  (iii) no ConnectionLease/CountGuard/OwnerScope may be constructed OR
-  //        destroyed while this _mutex is held: ~ConnectionLease takes _mutex,
-  //        and ~CountGuard/~OwnerScope take _quiesceMutex — by (i) disjoint.
-  //  (iv)  every counted entry point acquires its CountGuard/token as the FIRST
-  //        local, ABOVE any pool lock, and releases it after _mutex is released.
-  //  (ii)  _quiesceMutex is NEVER held across a call into core::ThreadPool.
-  // The only order between core::ThreadPool::_mutex and _quiesceMutex is
-  // ThreadPool::_mutex -> _quiesceMutex (queued-task discard); the reverse is
-  // forbidden by (ii), so no cycle can form. (Full rule set: task-3.6/task-8.4.)
+  // ==========================================================================
+  // THE LOCK CONTRACT FOR _mutex (HR-2 — the full rule set, task-3.6 + task-8.4).
+  // This is the authoritative statement; it ADDS to (never overwrites) the
+  // phase-3 rules task-3.6 seeded here.
+  //
+  // WHAT _mutex GUARDS:
+  //   _pools (the endpoint map), every EndpointPool in it, every PooledConnection
+  //   in each pool, and _totalConnections. EndpointPool and PooledConnection have
+  //   NO internal locking of their own — every one of their methods is CALLER-
+  //   LOCKED and may be touched only while this _mutex is held (see their class
+  //   comments). PooledConnection::markFree() in particular is ALWAYS performed
+  //   under _mutex, whether or not the connection has been detached from a pool
+  //   (thread-safety M-3, task-4.1c).
+  //
+  // _mutex IS NON-RECURSIVE:
+  //   ConnectionLease's destructor re-acquires THIS SAME _mutex (via
+  //   releaseConnection_), so no ConnectionLease may be destroyed while the
+  //   owning thread already holds _mutex — that would self-deadlock. The
+  //   counterpart rule is now structural after task-4.1c: a lease holds a
+  //   shared_ptr<Impl>, so NO ConnectionLease may outlive the Impl.
+  //
+  // THE LOAD-BEARING INVARIANT (designPrinciple #7/#8):
+  //   "a pool containing an in-use OR reserved (pendingCreates>0) connection is
+  //   never erased." Tasks 4.3, 5.1 and 6.1 all rest on it; it is what lets a
+  //   ConnectionLease and a re-entrant acquire_ safely reference a pool across
+  //   the unlocked construction window.
+  //
+  // CROSS-MUTEX RULES (roman numerals referenced across the file):
+  //  (i)   _mutex and Impl::_quiesceMutex are NEVER held simultaneously (the
+  //        quiesce CV must not reuse _mutex — a task blocked in acquire_ on
+  //        _mutex while a destructor waited for it would deadlock).
+  //  (ii)  Impl::_quiesceMutex is NEVER held across ANY call into
+  //        core::ThreadPool. getState() (thread_pool.hpp, lock-free) is the ONLY
+  //        ThreadPool query permitted while considering these primitives;
+  //        getPendingTaskCount() and getInFlightCount() BOTH take
+  //        ThreadPool::_mutex and are therefore forbidden while _quiesceMutex is
+  //        held (thread-safety T5-6). callAsync at the enqueue site holds NO pool
+  //        lock, so ThreadPool::_mutex and _mutex are never held together either.
+  //  (iii) No CountGuard/OwnerScope/InFlightToken may be constructed OR destroyed
+  //        while _mutex is held, and no ConnectionLease may be DESTROYED while it
+  //        is held: ~ConnectionLease takes _mutex, and CountGuard/OwnerScope/token
+  //        acquisition AND release both take _quiesceMutex (task-3.1(c) sites the
+  //        gate in CountGuard's ctor) — by (i) disjoint from _mutex (T6-5). The
+  //        ConnectionLease *ctor* is noexcept and lock-free (it touches no mutex),
+  //        so constructing a lease under _mutex is not itself a lock interaction;
+  //        finishAcquireLocked_ nonetheless builds it only AFTER unlock, as the
+  //        "no work between unlock and hand-off" discipline, not a ctor-level rule.
+  //  (iv)  Every counted entry point acquires its CountGuard/token as the FIRST
+  //        local, ABOVE any pool lock, and releases it AFTER _mutex is released.
+  //        No ConnectionLease may be destroyed while _quiesceMutex is held (its
+  //        dtor takes _mutex — the mirror of (iii)).
+  //  (v)   There is NO acquisition order between ThreadPool::_mutex and
+  //        _quiesceMutex once task-3.5(e)'s reset-while-alive prohibition holds
+  //        (thread-safety T5-7); the only concrete order that ever arises is
+  //        ThreadPool::_mutex -> _quiesceMutex on the queued-task-discard path,
+  //        and the reverse is forbidden by (ii), so no cycle can form. Rule (ii)
+  //        is defence-in-depth, not a derived order.
+  //  (vi)  _mutex and HttpClient::_mutex are NEVER HELD SIMULTANEOUSLY. This is
+  //        stated as NON-SIMULTANEITY, deliberately NOT as "A -> B" nesting
+  //        (thread-safety F-L2 — arrow notation would wrongly imply nesting is
+  //        allowed). It is TRUE ONLY because of task-4.1b's COLLECT-THEN-DESTROY
+  //        rule: every erase path MOVES its owning PooledConnection/EndpointPool
+  //        reference into an evicted bin that the caller destroys ONLY AFTER
+  //        releasing _mutex. ~HttpClient -> cleanup() takes HttpClient::_mutex and
+  //        JOINS the transport and DNS I/O threads; without collect-then-destroy
+  //        that teardown would run under _mutex on the ordinary erase path and
+  //        create the very edge this rule forbids. makeHttpClient_ (whose
+  //        factory/configurer may call HttpClient::setTlsConfig, taking
+  //        HttpClient::_mutex) likewise runs OUTSIDE _mutex since task-6.1/6.2.
+  // ==========================================================================
   std::mutex _mutex;
 
   std::atomic<std::uint64_t> _nextId;
@@ -2686,6 +2786,27 @@ public:
     }
   }
 
+  /// \brief Synchronous JSON-RPC call; returns the parsed `result`.
+  /// \throws JsonRpcError is the base of all the JSON-RPC exceptions below
+  ///   (PoolExhaustedError/RemoteError/ClientShutdownError derive from it), and
+  ///   is ALSO thrown directly for a rejected per-call header
+  ///   (validateHeaderOrThrow_ — e.g. a caller-supplied User-Agent or a
+  ///   framing/connection header), a null httpClientFactory return, or an
+  ///   unsupported response Content-Encoding. Catch JsonRpcError to cover them all.
+  /// \throws PoolExhaustedError immediately, with no wait or queuing, when the
+  ///   origin already has `maxConnectionsPerEndpoint` calls in flight (or a
+  ///   global/pool cap refuses a new connection) — see PoolExhaustedError.
+  /// \throws RemoteError when the peer returns a JSON-RPC error envelope.
+  /// \throws ClientShutdownError when the client is closing.
+  /// \throws std::invalid_argument when the endpoint URL is malformed/unreachable
+  ///   (iora::network::normalizeOrigin rejects userinfo, a bracketed IPv6
+  ///   literal, an empty/non-numeric/zero/out-of-range port, a missing or
+  ///   non-http(s)/non-lowercase scheme, whitespace/control octets, a pathless
+  ///   query/fragment, or an empty host / empty DNS label) — raised before any
+  ///   connection is attempted.
+  /// \throws std::logic_error on an internal pool-invariant violation (defensive;
+  ///   a pool retired mid-construction, or a lease/handle mismatch).
+  /// \throws network/transport exceptions from the underlying HttpClient.
   iora::parsers::Json call(const std::string &endpoint, const std::string &method,
                            const iora::parsers::Json &params = iora::parsers::Json::object(),
                            const std::vector<std::pair<std::string, std::string>> &headers = {})
@@ -2693,6 +2814,16 @@ public:
     return _impl->call(endpoint, method, params, headers);
   }
 
+  /// \brief Fire-and-forget JSON-RPC notification (no id, no response parsed).
+  /// \throws JsonRpcError — the base of the exceptions below, also thrown for a
+  ///   rejected per-call header or a null factory (see call()).
+  /// \throws PoolExhaustedError immediately, with no wait or queuing, when the
+  ///   origin is at capacity — see PoolExhaustedError.
+  /// \throws ClientShutdownError when the client is closing.
+  /// \throws std::invalid_argument when the endpoint URL is malformed/unreachable
+  ///   (origin normalization; see call()) — raised before any connection.
+  /// \throws std::logic_error on an internal pool-invariant violation (defensive).
+  /// \throws network/transport exceptions from the underlying HttpClient.
   void notify(const std::string &endpoint, const std::string &method,
               const iora::parsers::Json &params = iora::parsers::Json::object(),
               const std::vector<std::pair<std::string, std::string>> &headers = {})
@@ -2700,6 +2831,15 @@ public:
     _impl->notify(endpoint, method, params, headers);
   }
 
+  /// \brief Asynchronous JSON-RPC call; the result (or the exception) is
+  ///   delivered through the returned future.
+  /// \throws (via std::future::get) PoolExhaustedError — catchable BY TYPE off
+  ///   the future — when the origin is at capacity; the pool never queues or
+  ///   waits. RemoteError, ClientShutdownError, the base JsonRpcError (per-call
+  ///   header rejection / null factory / bad response Content-Encoding; see
+  ///   call()), std::invalid_argument (a malformed/unreachable endpoint URL; see
+  ///   call()), std::logic_error (an internal pool-invariant violation) and
+  ///   transport exceptions travel the same channel.
   std::future<iora::parsers::Json>
   callAsync(const std::string &endpoint, const std::string &method,
             const iora::parsers::Json &params = iora::parsers::Json::object(),
@@ -2708,6 +2848,20 @@ public:
     return _impl->callAsync(endpoint, method, params, headers);
   }
 
+  /// \brief Asynchronous JSON-RPC call with completion callbacks.
+  /// \details PoolExhaustedError is delivered to \p onError as a
+  ///   std::exception_ptr, catchable BY TYPE after std::rethrow_exception — the
+  ///   pool does not queue or wait past the per-origin cap. RemoteError,
+  ///   ClientShutdownError, the base JsonRpcError (per-call header rejection /
+  ///   null factory / bad response Content-Encoding; see call()),
+  ///   std::invalid_argument (a malformed/unreachable endpoint URL; see call()),
+  ///   std::logic_error (an internal pool-invariant violation) and transport
+  ///   exceptions arrive the same way. \p onError runs
+  ///   synchronously on the calling thread ONLY for the two pre-enqueue failures
+  ///   (a closing-gate refusal, or an enqueue throw, both delivering
+  ///   ClientShutdownError / the enqueue exception); EVERY failure after a
+  ///   successful enqueue — pool exhaustion, URL validation, send, and parse —
+  ///   is delivered on a worker thread.
   void callAsync(const std::string &endpoint, const std::string &method,
                  const iora::parsers::Json &params,
                  const std::vector<std::pair<std::string, std::string>> &headers,
@@ -2717,6 +2871,17 @@ public:
     _impl->callAsync(endpoint, method, params, headers, std::move(onSuccess), std::move(onError));
   }
 
+  /// \brief Synchronous JSON-RPC batch call.
+  /// \throws PoolExhaustedError immediately, with no wait or queuing, when the
+  ///   origin is at capacity — see PoolExhaustedError.
+  /// \throws RemoteError/JsonRpcError when any batch item errors or is missing;
+  ///   JsonRpcError (the base of the exceptions here) is also thrown for a
+  ///   rejected per-call header or a null factory (see call()).
+  /// \throws ClientShutdownError when the client is closing.
+  /// \throws std::invalid_argument when the endpoint URL is malformed/unreachable
+  ///   (origin normalization; see call()) — raised before any connection.
+  /// \throws std::logic_error on an internal pool-invariant violation (defensive).
+  /// \throws network/transport exceptions from the underlying HttpClient.
   std::vector<iora::parsers::Json>
   callBatch(const std::string &endpoint, const std::vector<BatchItem> &items,
             const std::vector<std::pair<std::string, std::string>> &headers = {})
@@ -2724,6 +2889,14 @@ public:
     return _impl->callBatch(endpoint, items, headers);
   }
 
+  /// \brief Asynchronous JSON-RPC batch call; results/exception via the future.
+  /// \throws (via std::future::get) PoolExhaustedError — catchable BY TYPE off
+  ///   the future — when the origin is at capacity; the pool never queues or
+  ///   waits. RemoteError/JsonRpcError (also per-call header rejection / null
+  ///   factory / bad response Content-Encoding; see call()), ClientShutdownError,
+  ///   std::invalid_argument (a malformed/unreachable endpoint URL; see call()),
+  ///   std::logic_error (an internal pool-invariant violation) and transport
+  ///   exceptions travel the same channel.
   std::future<std::vector<iora::parsers::Json>>
   callBatchAsync(const std::string &endpoint, const std::vector<BatchItem> &items,
                  const std::vector<std::pair<std::string, std::string>> &headers = {})
