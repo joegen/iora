@@ -126,6 +126,7 @@ set(PARSERS_TESTS
 
 # Util namespace tests
 set(UTIL_TESTS
+    util/iora_test_crc32
     util/iora_test_expiring_cache
     util/iora_test_shell_runner
     util/iora_test_ttl_map
