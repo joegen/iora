@@ -2240,6 +2240,41 @@ public:
     log(level, std::string(buffer.data(), size));
   }
 
+  /// \brief Backend for the printf-style IORA_LOG_*F macros: format into a fixed
+  ///        4096-byte stack buffer (4095 payload bytes + NUL) with source location.
+  /// \param level The log level
+  /// \param file Source file (__FILE__)
+  /// \param line Source line (__LINE__)
+  /// \param function Enclosing function (__func__)
+  /// \param fmt Printf-style format string, followed by its arguments
+  /// \note Overrun is truncated (intended, distinguishing the macro path from the
+  ///       heap-sized logFormatted). std::vsnprintf returns a negative value on an
+  ///       ENCODING error (e.g. %ls with an invalid wide sequence), leaving the
+  ///       buffer unspecified with no guaranteed NUL; the return is checked and the
+  ///       "[Logger] Invalid format string" diagnostic substituted instead (mirrors
+  ///       logFormatted), so the buffer bound to log()'s const std::string& is always
+  ///       a valid NUL-terminated string — never an indeterminate/out-of-bounds read.
+#if defined(__GNUC__) || defined(__clang__)
+  __attribute__((format(printf, 5, 6)))
+#endif
+  static void logFixedBuffer(Level level, const char *file, int line,
+                             const char *function, const char *fmt, ...)
+  {
+    char buf[4096];
+    std::va_list args;
+    va_start(args, fmt);
+    const int n = std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n < 0)
+    {
+      // Encoding error: buf is unspecified with no guaranteed NUL, so it is never read.
+      // Log the diagnostic literal directly (mirrors logFormatted's error branch).
+      log(level, "[Logger] Invalid format string", file, line, function);
+      return;
+    }
+    log(level, buf, file, line, function);
+  }
+
   /// \brief Core formatter (no locking). Renders `segments` into a line. Source
   /// location is optional: when `hasLocation` is false, the %F/%l/%f placeholders
   /// emit NOTHING (an empty field) — NOT "0" for %l. This preserves the historic
@@ -2475,63 +2510,41 @@ inline LoggerProxy Logger;
 /// \brief Printf-style logging macros with source location support
 /// Source location is passed to logger and formatted according to format string.
 /// Use placeholders %F (file), %l (line), %f (function) in format string to display source location.
-/// \warning Messages are limited to 4096 bytes (including null terminator).
-///          Longer messages will be silently truncated by std::snprintf.
-///          For messages exceeding this limit, use Logger::tracef() directly.
-/// \note Uses stack buffer for performance - suitable for most logging scenarios.
-#define IORA_LOG_TRACEF(fmt, ...)                                                                      \
-  do                                                                                                   \
-  {                                                                                                    \
-    char _buf[4096];                                                                                   \
-    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::log(iora::core::Logger::Level::Trace, _buf,                                   \
-                            __FILE__, __LINE__, __func__);                                             \
-  } while (0)
+/// \warning Messages are limited to 4095 payload bytes + a NUL terminator (a fixed
+///          stack buffer). Longer messages are truncated. On an encoding error
+///          (e.g. %ls with an invalid wide sequence) std::vsnprintf returns a
+///          negative value; the "[Logger] Invalid format string" diagnostic is
+///          logged instead — the error is never silent and never undefined.
+///          For messages exceeding the length limit, use Logger::tracef() directly.
+/// \note Each macro forwards to Logger::logFixedBuffer, which uses a stack buffer for
+///       performance - suitable for most logging scenarios. The whole argument list is
+///       variadic (not a named `fmt` + `...`) so a call with only a format string and no
+///       conversion arguments — IORA_LOG_INFOF("plain message") — is well-formed under
+///       -pedantic -Werror; a named `fmt, ...` form makes that a hard ISO error (the "..."
+///       receives zero arguments).
+#define IORA_LOG_TRACEF(...)                                                                          \
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Trace, __FILE__, __LINE__, __func__,  \
+                                     __VA_ARGS__)
 
-#define IORA_LOG_DEBUGF(fmt, ...)                                                                      \
-  do                                                                                                   \
-  {                                                                                                    \
-    char _buf[4096];                                                                                   \
-    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::log(iora::core::Logger::Level::Debug, _buf,                                   \
-                            __FILE__, __LINE__, __func__);                                             \
-  } while (0)
+#define IORA_LOG_DEBUGF(...)                                                                          \
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Debug, __FILE__, __LINE__, __func__,  \
+                                     __VA_ARGS__)
 
-#define IORA_LOG_INFOF(fmt, ...)                                                                       \
-  do                                                                                                   \
-  {                                                                                                    \
-    char _buf[4096];                                                                                   \
-    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::log(iora::core::Logger::Level::Info, _buf,                                    \
-                            __FILE__, __LINE__, __func__);                                             \
-  } while (0)
+#define IORA_LOG_INFOF(...)                                                                           \
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Info, __FILE__, __LINE__, __func__,   \
+                                     __VA_ARGS__)
 
-#define IORA_LOG_WARNF(fmt, ...)                                                                       \
-  do                                                                                                   \
-  {                                                                                                    \
-    char _buf[4096];                                                                                   \
-    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::log(iora::core::Logger::Level::Warning, _buf,                                 \
-                            __FILE__, __LINE__, __func__);                                             \
-  } while (0)
+#define IORA_LOG_WARNF(...)                                                                           \
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Warning, __FILE__, __LINE__,          \
+                                     __func__, __VA_ARGS__)
 
-#define IORA_LOG_ERRORF(fmt, ...)                                                                      \
-  do                                                                                                   \
-  {                                                                                                    \
-    char _buf[4096];                                                                                   \
-    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::log(iora::core::Logger::Level::Error, _buf,                                   \
-                            __FILE__, __LINE__, __func__);                                             \
-  } while (0)
+#define IORA_LOG_ERRORF(...)                                                                          \
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Error, __FILE__, __LINE__, __func__,  \
+                                     __VA_ARGS__)
 
-#define IORA_LOG_FATALF(fmt, ...)                                                                      \
-  do                                                                                                   \
-  {                                                                                                    \
-    char _buf[4096];                                                                                   \
-    std::snprintf(_buf, sizeof(_buf), fmt, ##__VA_ARGS__);                                             \
-    iora::core::Logger::log(iora::core::Logger::Level::Fatal, _buf,                                   \
-                            __FILE__, __LINE__, __func__);                                             \
-  } while (0)
+#define IORA_LOG_FATALF(...)                                                                          \
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Fatal, __FILE__, __LINE__, __func__,  \
+                                     __VA_ARGS__)
 
 inline LoggerStream Logger::stream(Logger::Level level) { return LoggerStream(level); }
 } // namespace core

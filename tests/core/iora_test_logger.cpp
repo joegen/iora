@@ -8,6 +8,7 @@
 #include "logger_race_harness.hpp"
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include <clocale>
 #include <regex>
 
 namespace
@@ -898,4 +899,182 @@ TEST_CASE("Logger Clear External Handler With Async Backlog Does Not Orphan rawQ
   // four messages and must include at least m1 — never a phantom re-invocation.)
   REQUIRE(handlerCalls->load() >= 1);
   REQUIRE(handlerCalls->load() <= 4);
+}
+
+// ---------------------------------------------------------------------------
+// IORA_LOG_*F / Logger::logFixedBuffer — tracker 2026-07-23-6.
+// The six printf-style macros forward to logFixedBuffer, which must (a) treat a
+// negative std::vsnprintf return (encoding error) as UB-safe by substituting the
+// "[Logger] Invalid format string" diagnostic (mirroring logFormatted) rather than
+// reading an indeterminate buffer, and (b) truncate at 4095 payload bytes + NUL.
+// ---------------------------------------------------------------------------
+namespace
+{
+// RAII: capture the process C locale and restore it, so a test that forces the "C"
+// locale to make a wide conversion fail cannot leak that state into other cases
+// (and is itself immune to another case having installed a UTF-8 locale). L-new-1.
+struct ScopedCLocale
+{
+  std::string _saved;
+  ScopedCLocale()
+  {
+    const char *cur = std::setlocale(LC_ALL, nullptr);
+    _saved = cur ? cur : "C";
+    std::setlocale(LC_ALL, "C");
+  }
+  ~ScopedCLocale() { std::setlocale(LC_ALL, _saved.c_str()); }
+};
+
+// The formatter terminates each rendered line with a newline; strip a single
+// trailing '\n' so the captured "%m" payload can be compared byte-for-byte.
+std::string chomp(std::string s)
+{
+  if (!s.empty() && s.back() == '\n')
+  {
+    s.pop_back();
+  }
+  return s;
+}
+
+// Shared fixture for the logFixedBuffer cases: initialises a SYNCHRONOUS logger at
+// the requested min-level, formats records as bare "%m" (the raw payload, no
+// timestamp), and installs a handler that captures each newline-stripped payload
+// into `messages`. Tears the process-global handler out on scope exit. Folds the
+// init + format + handler-install + guard boilerplate the cases used to repeat.
+struct CapturingSyncLogger
+{
+  std::mutex m;
+  std::vector<std::string> messages;
+  std::string _savedFormat;
+
+  explicit CapturingSyncLogger(iora::core::Logger::Level minLevel = iora::core::Logger::Level::Info)
+  {
+    iora::core::Logger::init(minLevel, "", false);          // sync: handler runs inline
+    _savedFormat = iora::core::Logger::getLogFormat();      // restored in the dtor
+    iora::core::Logger::setLogFormat("%m");                 // "%m" == the raw message payload
+    iora::core::Logger::setExternalHandler(
+      [this](iora::core::Logger::Level, const std::string &formattedMessage, const std::string &)
+      {
+        std::lock_guard<std::mutex> lk(m);
+        messages.push_back(chomp(formattedMessage));
+      });
+  }
+  ~CapturingSyncLogger()
+  {
+    iora::core::Logger::clearExternalHandler();
+    iora::core::Logger::setLogFormat(_savedFormat); // don't leak "%m" into later cases (--order rand)
+  }
+
+  CapturingSyncLogger(const CapturingSyncLogger &) = delete;
+  CapturingSyncLogger &operator=(const CapturingSyncLogger &) = delete;
+};
+} // namespace
+
+TEST_CASE("Logger logFixedBuffer Substitutes Diagnostic On Encoding Error",
+          "[logger][fixedbuffer][encoding]")
+{
+  // A %ls conversion of a wide char unconvertible in the C locale (U+00FF) makes
+  // vsnprintf return < 0. logFixedBuffer must substitute the diagnostic, never read
+  // the indeterminate buffer. Assert on the RAW message field via format "%m" so the
+  // per-call timestamp does not perturb byte-equality (L-new-2a).
+  ScopedCLocale locale;
+  CapturingSyncLogger cap;
+
+  // Direct call to the public backend — the portable path, independent of macro
+  // expansion. Must not crash (this is the UB the fix removes).
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Info, __FILE__, __LINE__, __func__,
+                                     "%ls", L"\u00ff");
+  iora::core::Logger::shutdown();
+
+  std::lock_guard<std::mutex> lk(cap.m);
+  REQUIRE(cap.messages.size() == 1);
+  REQUIRE(cap.messages[0] == "[Logger] Invalid format string");
+}
+
+TEST_CASE("Logger IORA_LOG_INFOF Macro Forwards With And Without Varargs",
+          "[logger][fixedbuffer][macro]")
+{
+  // Proves the forwarder wiring: a format-only call (no conversion arguments — the
+  // all-variadic macro forwards the format string as the first __VA_ARGS__ element,
+  // no ## comma-drop involved), a formatted call, and the macro path through an
+  // encoding error.
+  ScopedCLocale locale;
+  CapturingSyncLogger cap;
+
+  IORA_LOG_INFOF("literal no varargs");     // format-only: all-variadic forwarding, no conv args
+  IORA_LOG_INFOF("val=%d str=%s", 42, "x"); // formatted
+  IORA_LOG_INFOF("%ls", L"\u00ff");         // encoding error through the macro path
+  iora::core::Logger::shutdown();
+
+  std::lock_guard<std::mutex> lk(cap.m);
+  REQUIRE(cap.messages.size() == 3);
+  REQUIRE(cap.messages[0] == "literal no varargs");
+  REQUIRE(cap.messages[1] == "val=42 str=x");
+  REQUIRE(cap.messages[2] == "[Logger] Invalid format string");
+}
+
+TEST_CASE("Logger logFixedBuffer Truncates At 4095 Payload Bytes",
+          "[logger][fixedbuffer][truncation]")
+{
+  // A 5000-byte payload must yield exactly 4095 bytes + NUL and must not read past
+  // the 4096-byte stack buffer (ASan-covered: this target is in the sanitized set).
+  CapturingSyncLogger cap;
+
+  const std::string big(5000, 'x');
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Info, __FILE__, __LINE__, __func__,
+                                     "%s", big.c_str());
+  iora::core::Logger::shutdown();
+
+  std::lock_guard<std::mutex> lk(cap.m);
+  REQUIRE(cap.messages.size() == 1);
+  REQUIRE(cap.messages[0].size() == 4095);
+  REQUIRE(cap.messages[0] == std::string(4095, 'x'));
+}
+
+TEST_CASE("Logger Macro And Function Paths Agree On Encoding-Error Diagnostic",
+          "[logger][fixedbuffer][parity]")
+{
+  // The fixed-buffer (macro) path and the heap-sized logFormatted (Logger::infof)
+  // path must emit the identical diagnostic payload on an encoding error. They
+  // deliberately differ on the length limit (macro truncates at 4095, function does
+  // not) — that non-parity is asserted in the truncation case above, not here.
+  ScopedCLocale locale;
+  CapturingSyncLogger cap;
+
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Info, __FILE__, __LINE__, __func__,
+                                     "%ls", L"\u00ff"); // fixed-buffer path
+  iora::core::Logger::infof("%ls", L"\u00ff");          // logFormatted path
+  iora::core::Logger::shutdown();
+
+  std::lock_guard<std::mutex> lk(cap.m);
+  REQUIRE(cap.messages.size() == 2);
+  REQUIRE(cap.messages[0] == "[Logger] Invalid format string");
+  REQUIRE(cap.messages[1] == cap.messages[0]); // identical payload, both paths
+}
+
+TEST_CASE("Logger logFixedBuffer Does Not Crash When The Record Is Level-Gated Out",
+          "[logger][fixedbuffer][gated]")
+{
+  // logFixedBuffer formats UNCONDITIONALLY, before log() applies the min-level gate
+  // (it does not pre-gate like logFormatted — see the tracker's level_gate decision).
+  // So the encoding-error path (the UB the fix removes) runs even for a record that is
+  // dropped. With min-level Error, an Info call must still not crash, and no record may
+  // reach the handler. This asserts the no-crash property SEPARATELY from delivery
+  // (test_requirements level-gating bullet).
+  //
+  // NOTE (step-8 LOW-1): messages.empty() alone would also hold if a future pre-gate
+  // skipped formatting entirely. The "format step runs before the gate" guarantee this
+  // case exercises rests on code structure (logFixedBuffer has no early return before
+  // the vsnprintf) plus this file's ASan coverage of that format step — not on the
+  // assertion below. A pre-gate would be a Zero-Deviation change to the level_gate
+  // decision and would be caught there, not here.
+  ScopedCLocale locale;
+  CapturingSyncLogger cap(iora::core::Logger::Level::Error); // Info is gated out
+
+  iora::core::Logger::logFixedBuffer(iora::core::Logger::Level::Info, __FILE__, __LINE__, __func__,
+                                     "%ls", L"\u00ff");
+  iora::core::Logger::shutdown();
+
+  std::lock_guard<std::mutex> lk(cap.m);
+  REQUIRE(cap.messages.empty()); // gated out — formatted safely, never delivered
 }
