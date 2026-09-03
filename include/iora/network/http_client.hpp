@@ -157,6 +157,36 @@ public:
   explicit HttpResponseTimeoutError(const std::string &what) : std::runtime_error(what) {}
 };
 
+/// \brief Thrown when the transport connect phase (TCP handshake, and for an https
+/// endpoint the TLS handshake) exceeds its deadline — i.e. connectSync returns
+/// TransportError::Timeout. The request was PROVABLY NOT SENT (no request byte is
+/// written until after a connection is established), so it is safely retryable for
+/// ANY method per RFC 9110 §9.2.2.
+///
+/// It IS a subclass of HttpRequestNotSentError, exactly like HttpLeaseAcquireTimeoutError
+/// and for the same reason: this failure never reached the wire. Retry classification
+/// (isRequestProvablyNotSent, a dynamic_cast to HttpRequestNotSentError) therefore
+/// treats it identically to the plain HttpRequestNotSentError it replaces on the
+/// connect-timeout path — NO retry-behaviour change. It is given a DISTINCT type
+/// SOLELY so a caller can classify a connect timeout by TYPE for a timeoutRequests
+/// metric (tracker 2026-09-03-3); the classification is keyed on the structured
+/// TransportError::Timeout code, never on the message text. The transport's own
+/// message is passed through unaltered (e.g. "...connectSync timed out" from the
+/// connectSync deadline, or "...Connect timeout" from the tcp_engine watchdog — both
+/// set code == Timeout), but that text is DEFENSIVE-ONLY: no consumer keys on it, and
+/// none should — a substring match on transport messages is exactly the fragility this
+/// typing exists to remove.
+///
+/// INVARIANT: same visibility/inline shape as its sibling timeout types so the
+/// dynamic_cast in the separately-compiled jsonrpc_client module resolves across the
+/// shared-object boundary (the existing typed timeouts already rely on this RTTI
+/// unification).
+class HttpConnectTimeoutError : public HttpRequestNotSentError
+{
+public:
+  explicit HttpConnectTimeoutError(const std::string &what) : HttpRequestNotSentError(what) {}
+};
+
 /// \brief Build the `Host` request field line (with trailing CRLF) per RFC 9110
 /// §7.2 (Host = uri-host [ ':' port ]). The port is appended only when it is not
 /// the scheme default, matching RFC 9110 §4.2.3 normalisation (a default port is
@@ -976,8 +1006,27 @@ private:
     auto connectResult = _transport->connectSync(resolvedHost, parsedUrl.port, tlsMode, timeout);
     if (connectResult.isErr())
     {
-      throw std::runtime_error("Connection failed to " + hostPort + ": " +
-                               connectResult.error().message);
+      const std::string detail =
+        "Connection failed to " + hostPort + ": " + connectResult.error().message;
+      // A connect-phase TIMEOUT is provably-not-sent (no request byte is written
+      // until after connect), so surface it as HttpConnectTimeoutError — a
+      // HttpRequestNotSentError subclass, so retry semantics are unchanged, but a
+      // distinct TYPE the timeoutRequests classifier can key on (tracker
+      // 2026-09-03-3). Discriminate on the STRUCTURED transport code, never the
+      // message text: BOTH connect-timeout producers surface as
+      // TransportError::Timeout here — the connectSync wait_for deadline
+      // (transport_impl.hpp) and the tcp_engine CloseOrigin::ConnectTimeout watchdog
+      // (delivered via onClose). Every other connect failure stays a plain
+      // runtime_error, flattened to HttpRequestNotSentError by the generic pre-send
+      // catch below: a refusal/reset is TransportError::Connect and a resolution
+      // failure is TransportError::Resolve — neither is a timeout (DNS/resolution is
+      // a distinct failure domain, deliberately NOT counted; tracker 2026-09-03-3
+      // DQ-2 scope_out).
+      if (connectResult.error().code == TransportError::Timeout)
+      {
+        throw HttpConnectTimeoutError(detail);
+      }
+      throw std::runtime_error(detail);
     }
     SessionId sessionId = connectResult.value();
 
@@ -1284,6 +1333,18 @@ private:
       if (_closing.load(std::memory_order_acquire))
       {
         throw HttpClientCancelledError(e.what());
+      }
+      // Preserve a typed connect timeout (tracker 2026-09-03-3). It is already a
+      // HttpRequestNotSentError subclass, so re-wrapping it below would keep the
+      // not-sent/retry semantics but ERASE the timeout type the timeoutRequests
+      // classifier keys on. Placed AFTER the _closing check so a concurrent
+      // cancellation still takes precedence (HttpClientCancelledError), preserving
+      // the existing ordering. Only the connect timeout transits this catch —
+      // lease-acquire timeouts are thrown before this try and response-read timeouts
+      // in the receive region — so no other type needs preserving here.
+      if (dynamic_cast<const HttpConnectTimeoutError *>(&e) != nullptr)
+      {
+        throw;
       }
       throw HttpRequestNotSentError(e.what());
     }

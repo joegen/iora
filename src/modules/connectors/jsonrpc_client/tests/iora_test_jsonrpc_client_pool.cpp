@@ -28,6 +28,10 @@
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch.hpp>
+// Shared bound-not-listening endpoint (testnet::RefusingEndpoint) for the
+// connect-refusal discriminator test (tracker 2026-09-03-3). Included after
+// catch2/catch.hpp because the helper uses REQUIRE at construction.
+#include "iora_test_net_utils.hpp"
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -5951,6 +5955,276 @@ TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 't
   REQUIRE(s.totalRequests == 1);
   REQUIRE(s.failedRequests == 1);
   REQUIRE(s.timeoutRequests == 0); // application error, not a transport timeout
+  server.stop();
+}
+
+// =========================================================================
+// tracker 2026-09-03-3 — the transport CONNECT timeout is now typed
+// (HttpConnectTimeoutError, a HttpRequestNotSentError subclass) and keyed on the
+// structured TransportError::Timeout code, so ClientStats::timeoutRequests counts
+// it. The classifier isTimeoutFailure_ is shared by the single-call and batch
+// paths. DQ-2 scope_out: a DNS/RESOLUTION failure surfaces as TransportError::Resolve
+// and is deliberately NOT counted here.
+//
+// All connect-timeout cases use 192.0.2.1 (RFC 5737 TEST-NET-1): a non-routable SYN
+// is black-holed, so connectSync unwinds on its deadline as TransportError::Timeout.
+// If a future host FAST-REFUSES 192.0.2.1 (ENETUNREACH/ECONNREFUSED) the outcome is
+// TransportError::Connect instead and timeoutRequests would read 0 — the ==1 asserts
+// then fail LOUDLY rather than going vacuously green (same host assumption the
+// task-7.1a black-hole test documents, verified 2026-09-02).
+//
+// KNOWN LIMITATIONS (verified during the steps-4-8 review, recorded here so the
+// coverage boundary is explicit rather than silently absent):
+//   * Two producers set TransportError::Timeout on connectResult and both are counted:
+//     the connectSync wait_for deadline (transport_impl.hpp) and the tcp_engine
+//     CloseOrigin::ConnectTimeout watchdog (tcp_engine.hpp, via onClose). These tests
+//     exercise the deadline producer (the 192.0.2.1 SYN black-hole). The watchdog
+//     producer sets the IDENTICAL code, so the discriminator logic is validated for
+//     both, but no jsonrpc-layer test forces the watchdog path specifically — it is a
+//     transport-layer concern (cpp17 steps-4-8 finding #3).
+//   * TLS-handshake STALL on an https endpoint IS counted: connectSync spans TCP +
+//     TLS, and its connectTimeout (default 2s; 50ms here) fires well before the engine
+//     handshakeTimeout (30s default, never overridden by HttpClient), so a stalled TLS
+//     handshake closes with TransportError::Timeout -> counted. This holds for every
+//     normal config; only a caller setting connectTimeout > 30s would let the engine
+//     handshakeTimeout win and surface TransportError::TLSHandshake (uncounted). Test
+//     2.7 exercises the TCP-connect timeout on an https URL; the pure TLS-stall
+//     sub-case is not driven deterministically (would need an accept-then-stall TLS
+//     server) (web steps-4-8 finding #1).
+//   * A TLS-handshake FAILURE (cert verify / protocol mismatch -> TransportError::
+//     TLSHandshake) is correctly NOT a timeout: it flattens to HttpRequestNotSentError
+//     (retried like any not-sent failure) and never increments timeoutRequests. The
+//     discriminator must NOT be widened to include TLSHandshake, because that same code
+//     also carries handshake FAILURES which are not timeouts. Untested here (needs a
+//     bad-cert TLS server fixture) (web steps-4-8 finding #2).
+//   * A RESOLUTION failure (TransportError::Resolve) is NOT counted — the negative
+//     side of the discriminator for a non-Timeout code is proven DETERMINISTICALLY by
+//     test 2.4 (a refusal -> TransportError::Connect). A Resolve-SPECIFIC assertion was
+//     prototyped against a guaranteed-NXDOMAIN name (.invalid) but proved
+//     ENVIRONMENT-NONDETERMINISTIC: a resolver that hijacks NXDOMAIN (captive portal /
+//     ISP wildcard) intermittently resolves .invalid to a routable IP that then
+//     black-holes on connect -> a GENUINE TransportError::Timeout (observed once under
+//     TSan: timeoutRequests==1; the instrumented re-run correctly NXDOMAINed and read
+//     0). The classifier is correct in both outcomes; the test INPUT is not a reliable
+//     resolution failure. A deterministic Resolve-boundary test needs an injectable
+//     transport/resolver seam, tracked as backlog 2026-09-03-5; until then 2.4 carries
+//     the invariant.
+// =========================================================================
+
+// The two black-hole endpoints (RFC 5737 TEST-NET-1). Co-located with the assumption
+// documented above so the single value a maintainer edits, if that host ever stops
+// black-holing, sits next to the rationale (simplification steps-4-8 LOW-2).
+static constexpr const char *kBlackHoleHttpEp = "http://192.0.2.1:80/rpc";
+static constexpr const char *kBlackHoleHttpsEp = "https://192.0.2.1:443/rpc";
+
+// Shared type-probe: call the endpoint and classify the thrown exception's dynamic
+// type in the test TU (the existing typed-timeout classifier already relies on this
+// cross-.so RTTI unification; no test-access seam needed). Returns the classification
+// only — every discriminating REQUIRE/REQUIRE_FALSE stays visible in the test body
+// (simplification steps-4-8 LOW-1).
+struct ConnectThrowProbe
+{
+  bool threw{false};
+  bool isConnectTimeout{false};
+  bool isNotSent{false};
+};
+static ConnectThrowProbe probeConnectThrow(JsonRpcClient &client, const std::string &ep)
+{
+  ConnectThrowProbe p;
+  try
+  {
+    (void)client.call(ep, "ping");
+  }
+  catch (const std::exception &e)
+  {
+    p.threw = true;
+    p.isConnectTimeout =
+      dynamic_cast<const iora::network::HttpConnectTimeoutError *>(&e) != nullptr;
+    p.isNotSent = dynamic_cast<const iora::network::HttpRequestNotSentError *>(&e) != nullptr;
+  }
+  return p;
+}
+
+// 2.1 (+ MUTATION guard) — a single-call connect timeout increments timeoutRequests
+// exactly once, and the thrown exception is HttpConnectTimeoutError, itself a
+// HttpRequestNotSentError (retry semantics unchanged). MUTATION: drop the
+// `code == TransportError::Timeout` branch in acquireConnection (throw the plain
+// runtime_error unconditionally) and this reads timeoutRequests == 0 and the type is
+// a bare HttpRequestNotSentError — this case fails.
+TEST_CASE("2026-09-03-3: a single-call connect timeout increments timeoutRequests (typed)",
+          "[jsonrpc][pool][stats][timeout][connecttimeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.connectionTimeout = std::chrono::milliseconds(50); // mapped -> ~50 ms connect budget
+  JsonRpcClient client(svc, pool, cfg);
+
+  const ConnectThrowProbe p = probeConnectThrow(client, kBlackHoleHttpEp);
+  REQUIRE(p.threw);
+  REQUIRE(p.isConnectTimeout);         // typed as a connect timeout
+  REQUIRE(p.isNotSent);                // still provably-not-sent -> retry semantics intact
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.timeoutRequests == 1);     // counted (MUTATION guard: reads 0 without the branch)
+}
+
+// 2.2 — the BATCH path shares isTimeoutFailure_, so a batch connect timeout counts
+// timeoutRequests too (sendBatchOnLease_'s send classifier).
+TEST_CASE("2026-09-03-3: a batch connect timeout increments timeoutRequests (shared classifier)",
+          "[jsonrpc][pool][stats][timeout][connecttimeout][batch]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.connectionTimeout = std::chrono::milliseconds(50);
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = kBlackHoleHttpEp;
+
+  std::vector<iora::modules::connectors::BatchItem> items;
+  items.emplace_back("ping", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
+
+  REQUIRE_THROWS(client.callBatch(ep, items));
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.batchRequests == 1);
+  REQUIRE(s.timeoutRequests == 1);
+}
+
+// 2.3 (L1 regression) — the classifier keys on TYPE, never message text: a server
+// response carrying `Content-Encoding: x-timeout` fails verifyResponseContentEncoding_
+// (a JsonRpcError, NOT a timeout type), so timeoutRequests stays 0 even though the
+// server-controlled string contains "timeout". Pins the exact L1 vector.
+TEST_CASE("2026-09-03-3 (L1): a server 'Content-Encoding: x-timeout' is NOT counted as a timeout",
+          "[jsonrpc][pool][stats][timeout][connecttimeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18188;
+  RawResponsePolicy policy;
+  policy.extraResponseHeaders = {"Content-Encoding: x-timeout"}; // unsupported coding -> rejected
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "x"));
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.timeoutRequests == 0); // server-supplied 'timeout' substring must not count
+  server.stop();
+}
+
+// 2.4 (M-1, the NEGATIVE discriminator) — a connect REFUSAL (bound-not-listening ->
+// TransportError::Connect, deterministic ECONNREFUSED) must stay a plain
+// HttpRequestNotSentError (retryable), NOT a HttpConnectTimeoutError, and must NOT
+// count as a timeout. Guards a future mutation that broadened the discriminator
+// beyond `== Timeout`.
+TEST_CASE("2026-09-03-3 (M-1): a connect refusal is NOT a connect timeout and is not counted",
+          "[jsonrpc][pool][stats][timeout][connecttimeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  testnet::RefusingEndpoint refuser; // bound, not listening -> RST -> ECONNREFUSED
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(refuser.port()) + "/rpc";
+
+  const ConnectThrowProbe p = probeConnectThrow(client, ep);
+  REQUIRE(p.threw);
+  REQUIRE_FALSE(p.isConnectTimeout);   // a refusal is NOT a timeout
+  REQUIRE(p.isNotSent);                // but still provably-not-sent (retryable)
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.timeoutRequests == 0);     // refusal is not a timeout
+}
+
+// 2.5 (M-2) — a connect timeout is provably-not-sent, so it is RETRIED for a POST,
+// and counted EXACTLY ONCE at exhaustion (not once per attempt). maxRetries=2 ->
+// retriedRequests==2, timeoutRequests==1. initialRetryDelay is tiny so the retries
+// do not dominate the test's runtime.
+TEST_CASE("2026-09-03-3 (M-2): a connect timeout is retried and counted once at exhaustion",
+          "[jsonrpc][pool][stats][timeout][connecttimeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.maxRetries = 2;
+  cfg.initialRetryDelay = std::chrono::milliseconds(1);
+  cfg.connectionTimeout = std::chrono::milliseconds(50);
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = kBlackHoleHttpEp;
+
+  REQUIRE_THROWS(client.call(ep, "ping"));
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.retriedRequests == 2);     // retried (byte-identical not-sent semantics)
+  REQUIRE(s.timeoutRequests == 1);     // counted ONCE at exhaustion, not per-attempt
+}
+
+// 2.6 (M-4, the scope_out boundary): the resolution-failure case is documented as a
+// KNOWN LIMITATION in the section header above (a .invalid-based test proved
+// environment-nondeterministic because NXDOMAIN-hijacking resolvers intermittently
+// resolve it to a routable IP -> a genuine connect timeout). The negative side of the
+// discriminator for a non-Timeout transport code is proven DETERMINISTICALLY by test
+// 2.4 (refusal -> TransportError::Connect); a Resolve-specific assertion awaits the
+// injectable transport seam tracked as backlog 2026-09-03-5.
+
+// 2.7 (web L-1) — an https connect timeout is also counted. 192.0.2.1:443 black-holes
+// the SYN, so connectSync (which for https spans TCP + TLS handshake) unwinds on its
+// deadline as TransportError::Timeout before any TLS bytes flow. This confirms https
+// connect timeouts reach the metric. A pure TLS-handshake STALL is also counted for
+// every normal config (connectTimeout < the 30s engine handshakeTimeout) — see the
+// KNOWN LIMITATIONS block above for the verified mapping and the >30s corner; it is
+// not driven deterministically here (would need an accept-then-stall TLS server).
+TEST_CASE("2026-09-03-3 (L-1): an https connect timeout increments timeoutRequests",
+          "[jsonrpc][pool][stats][timeout][connecttimeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.connectionTimeout = std::chrono::milliseconds(50);
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = kBlackHoleHttpsEp;
+
+  REQUIRE_THROWS(client.call(ep, "ping"));
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.timeoutRequests == 1);
+}
+
+// 2.8 (web L-2, over-count guard) — a normal successful call must NOT touch
+// timeoutRequests.
+TEST_CASE("2026-09-03-3 (L-2): a successful call leaves timeoutRequests unchanged",
+          "[jsonrpc][pool][stats][timeout][connecttimeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18189;
+  RawCaptureServer server(port); // default policy: a JSON-RPC success body
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_NOTHROW(client.call(ep, "ping"));
+  const auto s = client.getStats();
+  REQUIRE(s.successfulRequests == 1);
+  REQUIRE(s.timeoutRequests == 0);
   server.stop();
 }
 

@@ -2458,20 +2458,27 @@ private:
   }
 
   /// \brief True if \p e is a transport TIMEOUT that ClientStats::timeoutRequests
-  /// should count. Both counted timeouts are now matched by TYPE (tracker
-  /// 2026-09-03-2): the lease-acquire timeout (HttpLeaseAcquireTimeoutError — its
-  /// message reads "timed out", never matched a find("timeout")) and the
-  /// response-read timeout (HttpResponseTimeoutError — formerly a generic
-  /// runtime_error matched by the now-removed find("timeout") substring). Keying on
-  /// TYPE, not message text, means a server-supplied error string containing
-  /// "timeout" can no longer be mis-counted. Shared by the single-call retry loop
-  /// AND the batch path (task-7.8 M2) so both classify identically. NOTE: connect/DNS
-  /// timeouts are wrapped as HttpRequestNotSentError("...connectSync timed out")
-  /// without a distinct type and are NOT yet counted — backlog 2026-09-03-3.
+  /// should count. All three counted timeouts are matched by TYPE, never by message
+  /// text, so a server-supplied error string containing "timeout" can never be
+  /// mis-counted:
+  ///   - the lease-acquire timeout (HttpLeaseAcquireTimeoutError — tracker
+  ///     2026-09-03-2; its message reads "timed out", which a find("timeout") missed);
+  ///   - the response-read timeout (HttpResponseTimeoutError — tracker 2026-09-03-2,
+  ///     formerly a generic runtime_error matched by a now-removed find("timeout"));
+  ///   - the connect timeout (HttpConnectTimeoutError — tracker 2026-09-03-3; a TCP/TLS
+  ///     handshake exceeding its deadline, keyed on the structured TransportError::Timeout
+  ///     code at the throw site, never on the transport message, which varies by producer
+  ///     ("...connectSync timed out" vs "...Connect timeout")).
+  /// Shared by the single-call retry loop AND the batch path (task-7.8 M2) so both
+  /// classify identically. NOTE: a DNS/resolution failure is deliberately NOT counted
+  /// here — it surfaces as TransportError::Resolve (a distinct failure domain from a
+  /// transport timeout) and its observability is tracked separately (backlog
+  /// 2026-09-03-9), preserving the OS-resolver fallback.
   static bool isTimeoutFailure_(const std::exception &e)
   {
     return dynamic_cast<const iora::network::HttpLeaseAcquireTimeoutError *>(&e) != nullptr ||
-           dynamic_cast<const iora::network::HttpResponseTimeoutError *>(&e) != nullptr;
+           dynamic_cast<const iora::network::HttpResponseTimeoutError *>(&e) != nullptr ||
+           dynamic_cast<const iora::network::HttpConnectTimeoutError *>(&e) != nullptr;
   }
 
   iora::parsers::Json

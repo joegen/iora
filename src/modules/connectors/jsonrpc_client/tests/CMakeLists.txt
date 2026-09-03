@@ -24,9 +24,13 @@ create_iora_test_target(iora_test_jsonrpc_client_pool
 )
 
 # jsonrpc_client.hpp lives one directory up; add it to the include path so the
-# test can include it by bare name.
+# test can include it by bare name. The top-level tests/ dir supplies the shared
+# iora_test_net_utils.hpp (testnet::RefusingEndpoint — the canonical
+# bound-not-listening endpoint) so the connect-refusal discriminator test
+# (tracker 2026-09-03-3) reuses it rather than inlining another raw-socket copy.
 target_include_directories(iora_test_jsonrpc_client_pool PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_SOURCE_DIR}/tests)
 
 # Opt-in sanitizer instrumentation. IORA_ENABLE_TSAN / IORA_ENABLE_ASAN are
 # cache-global option()s (tests/CMakeLists.txt:41-42), readable from this module
@@ -52,12 +56,13 @@ endif()
 # repros stay deliberately RED and are registered separately below
 # (task-1.1(i): TEST name == TARGET name).
 add_test(NAME iora_test_jsonrpc_client_pool
-    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6],[phase7]")
+    COMMAND iora_test_jsonrpc_client_pool "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6],[phase7],[connecttimeout]")
 # RESOURCE_LOCK serializes the fixed-port binds (18150 fixture; 18151/18152/18153
 # the phase-3 latched cases; 18154 the phase-5 CR-2 case; 18155/18156 the phase-6
 # task-6.4b(h)/(z) cases; 18160-18179 the phase-7 raw-capture cases, incl.
 # 18166/18167/18168 the task-7.6 idle-window cases, 18170 task-7.2b and
-# 18171-18179 task-7.2c) against any other test that might claim them,
+# 18171-18179 task-7.2c; 18188/18189 the tracker-2026-09-03-3 connect-timeout
+# cases) against any other test that might claim them,
 # independent of the -j1 convention (M2).
 #
 # TIMEOUT raised 90 -> 180 when [phase6] was added: the phase-6 block's bounded
