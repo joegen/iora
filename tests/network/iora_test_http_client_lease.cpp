@@ -33,6 +33,7 @@
 #include <string>
 #include <sys/socket.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <vector>
 
@@ -836,10 +837,20 @@ TEST_CASE("Shared HttpClient: bounded lease-acquire timeout", "[http_client_leas
 
   std::string errMsg;
   bool threw = false;
+  bool typedThrow = false;
   auto start = std::chrono::steady_clock::now();
   try
   {
     client.get(fixture.url("/hold")); // same host:port -> blocks, then times out
+  }
+  catch (const HttpLeaseAcquireTimeoutError &e)
+  {
+    // task-7.8: acquireLease raises a DISTINCT type (not a bare std::runtime_error),
+    // so a consumer can classify it by TYPE. The typed catch precedes the generic
+    // one because it is a subclass of std::runtime_error.
+    threw = true;
+    typedThrow = true;
+    errMsg = e.what();
   }
   catch (const std::exception &e)
   {
@@ -852,7 +863,17 @@ TEST_CASE("Shared HttpClient: bounded lease-acquire timeout", "[http_client_leas
   holder.join();
 
   REQUIRE(threw);
+  REQUIRE(typedThrow); // the lease-acquire timeout is HttpLeaseAcquireTimeoutError
+  // task-7.8 / M3: it IS an HttpRequestNotSentError (the request never reached the
+  // wire), so performRequest's retry classifier (dynamic_cast<HttpRequestNotSentError*>)
+  // retries it for ANY method per RFC 9110 9.2.2 — not idempotent-only.
+  static_assert(std::is_base_of<HttpRequestNotSentError, HttpLeaseAcquireTimeoutError>::value,
+                "lease-acquire timeout must be a not-sent error (RFC 9110 9.2.2)");
   REQUIRE(errMsg.find("lease") != std::string::npos);
+  // The message still reads "timed out", which find("timeout") would MISS — proving
+  // why classification must be by type, not by that substring (task-7.8).
+  REQUIRE(errMsg.find("timeout") == std::string::npos);
+  REQUIRE(errMsg.find("timed out") != std::string::npos);
   // Bounded near leaseAcquireTimeout (150ms), well under the holder's 1500ms hold.
   REQUIRE(elapsed.count() < 600);
 }

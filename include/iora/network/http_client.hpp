@@ -103,6 +103,37 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+/// \brief Thrown by acquireLease when Config::leaseAcquireTimeout elapses before
+/// the exclusive per-host connection lease becomes available. A subclass of
+/// HttpRequestNotSentError (hence an INDIRECT subclass of std::runtime_error) and
+/// a SIBLING of HttpFramingError and HttpClientCancelledError — never a subclass
+/// of those two.
+///
+/// The failure provably never touched the wire — acquireLease runs before any
+/// connect or send — so a consumer may safely retry it for ANY method. It is
+/// given a DISTINCT type so a caller can classify it by TYPE rather than by a
+/// brittle substring match on the message: the message reads "timed out", which
+/// the common find("timeout") predicate misses (tracker 2026-07-26-2 task-7.8 /
+/// HD-7 Secondary row).
+///
+/// It IS a subclass of HttpRequestNotSentError: a lease-acquire timeout fires
+/// before any connect or send, so the request provably never reached the wire and
+/// is safely retryable for ANY method per RFC 9110 §9.2.2 — exactly the contract
+/// HttpRequestNotSentError carries. performRequest's retry classification
+/// (dynamic_cast<HttpRequestNotSentError*>) therefore retries it even for a
+/// non-idempotent POST, while a caller wanting to count it distinctly still keys
+/// on the more-derived HttpLeaseAcquireTimeoutError type. [Decision 2026-09-03,
+/// arch DD-lease-acquire-not-sent: derive-from-not-sent SUPERSEDES the earlier
+/// preserve-prior-sibling choice, which forwent that safe POST retry.]
+class HttpLeaseAcquireTimeoutError : public HttpRequestNotSentError
+{
+public:
+  explicit HttpLeaseAcquireTimeoutError(const std::string &what)
+      : HttpRequestNotSentError(what)
+  {
+  }
+};
+
 /// \brief Build the `Host` request field line (with trailing CRLF) per RFC 9110
 /// §7.2 (Host = uri-host [ ':' port ]). The port is appended only when it is not
 /// the scheme default, matching RFC 9110 §4.2.3 normalisation (a default port is
@@ -766,8 +797,11 @@ private:
   /// spurious-wakeup safe) and is bounded by Config::leaseAcquireTimeout when
   /// that is non-zero (LEASE/INV-5), surfacing a DISTINCT timeout error rather
   /// than hanging. Returns an RAII guard whose destruction releases the lease.
-  /// \throws std::runtime_error on lease-acquire timeout (retry-eligible for
-  ///   idempotent methods), HttpClientCancelledError on shutdown (never retried).
+  /// \throws HttpLeaseAcquireTimeoutError on lease-acquire timeout — a subclass of
+  ///   HttpRequestNotSentError (the request never reached the wire), so HttpClient
+  ///   retries it for ANY method per RFC 9110 §9.2.2 and a caller may also classify
+  ///   it by its own more-derived type. HttpClientCancelledError on shutdown (never
+  ///   retried).
   ConnectionLease acquireLease(const std::string &hostPort)
   {
     std::unique_lock<std::mutex> lock(_mutex);
@@ -777,8 +811,8 @@ private:
     {
       if (!_cv.wait_for(lock, _config.leaseAcquireTimeout, available))
       {
-        throw std::runtime_error("HttpClient: timed out acquiring connection lease for " +
-                                 hostPort);
+        throw HttpLeaseAcquireTimeoutError(
+          "HttpClient: timed out acquiring connection lease for " + hostPort);
       }
     }
     else
@@ -1107,11 +1141,14 @@ private:
     // HttpRequestNotSentError so performRequest can distinguish them from
     // possibly-sent failures. The HttpFramingError guard comes FIRST so a (today
     // impossible) framing error in this region is never downgraded to retryable.
-    // NOTE: parseUrl and acquireLease (above) sit BEFORE this wrap deliberately —
-    // a throw from either is left possibly-sent, which fails safe: parseUrl is
-    // deterministic (a retry re-fails identically) and acquireLease never touched
-    // the wire, so neither risks a double-submit. Re-verify this invariant if
-    // acquireConnection/setReadMode ever change.
+    // NOTE: parseUrl and acquireLease (above) sit BEFORE this wrap deliberately.
+    // parseUrl's throw is left possibly-sent, which fails safe (it is
+    // deterministic: a retry re-fails identically). acquireLease throws
+    // HttpLeaseAcquireTimeoutError, itself an HttpRequestNotSentError, so it is
+    // already classified not-sent and retry-eligible for any method (it never
+    // touched the wire) without passing through this wrap. Neither risks a
+    // double-submit. Re-verify this invariant if acquireConnection/setReadMode
+    // ever change.
     SessionId sessionId{};
     try
     {

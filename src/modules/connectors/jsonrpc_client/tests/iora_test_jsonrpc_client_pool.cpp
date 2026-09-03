@@ -5498,6 +5498,254 @@ TEST_CASE("task-7.5b: malformed URL forms are rejected before a pool is minted",
   REQUIRE(JsonRpcClientTestAccess::snapshotPools(client).empty());
 }
 
+// =========================================================================
+// task-7.9 / M-12 — a JSON-RPC error envelope must increment failedRequests
+// ONLY, never both. callCore_ used to charge successfulRequests BEFORE
+// parseResponseOrThrow_, which throws RemoteError on an error reply and lands in
+// the catch(...) that charges failedRequests — double-counting the reply as both
+// successful AND failed. The success increment now happens only after the parse.
+// The success and notification paths are asserted alongside as the contrast.
+// =========================================================================
+TEST_CASE("M-12: a JSON-RPC error envelope increments failedRequests only, not successful",
+          "[jsonrpc][pool][phase7][stats][m12]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  // ---- error envelope: parseResponseOrThrow_ throws RemoteError AFTER the send ----
+  const std::uint16_t errPort = 18170;
+  RawResponsePolicy errPolicy;
+  errPolicy.body =
+    R"({"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1})";
+  RawCaptureServer errServer(errPort, errPolicy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string errEp = "http://127.0.0.1:" + std::to_string(errPort) + "/rpc";
+
+  REQUIRE_THROWS_AS(client.call(errEp, "missing"), iora::modules::connectors::RemoteError);
+  {
+    const auto s = client.getStats();
+    REQUIRE(s.totalRequests == 1);
+    REQUIRE(s.failedRequests == 1);
+    // The fix. Mutation-test: restore the pre-fix order in callCore_ (increment
+    // BEFORE parseResponseOrThrow_) and successfulRequests reads 1 here.
+    REQUIRE(s.successfulRequests == 0);
+  }
+  errServer.stop();
+
+  // ---- a genuine success still increments successfulRequests (unchanged path) ----
+  const std::uint16_t okPort = 18171;
+  RawCaptureServer okServer(okPort); // default success body
+  const std::string okEp = "http://127.0.0.1:" + std::to_string(okPort) + "/rpc";
+
+  const auto r = client.call(okEp, "ping");
+  REQUIRE(r.is_object());
+  {
+    const auto s = client.getStats();
+    REQUIRE(s.totalRequests == 2);
+    REQUIRE(s.successfulRequests == 1);
+    REQUIRE(s.failedRequests == 1);
+  }
+
+  // ---- a notification has no parse step, so its success increment is correct ----
+  client.notify(okEp, "ping");
+  {
+    const auto s = client.getStats();
+    REQUIRE(s.totalRequests == 3);
+    REQUIRE(s.notificationRequests == 1);
+    REQUIRE(s.successfulRequests == 2); // notifyCore_ still counts success (verify, not change)
+    REQUIRE(s.failedRequests == 1);
+  }
+  okServer.stop();
+}
+
+// =========================================================================
+// task-7.9 / M-12 (batch site) — the SAME double-count lived in
+// sendBatchOnLease_, which charged successfulRequests BEFORE
+// parseBatchResponseOrThrow_. A mixed batch (a success item and an error item)
+// throws RemoteError on the error item, which callBatchCore_'s catch(...) charges
+// to failedRequests — so the batch was counted both successful and failed.
+// =========================================================================
+TEST_CASE("M-12 (batch): an error item in a batch increments failedRequests only",
+          "[jsonrpc][pool][phase7][stats][m12]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18172;
+  RawResponsePolicy policy;
+  // ids match the caller-supplied BatchItem ids below so parseBatchResponseOrThrow_
+  // pairs them: id 1 -> result, id 2 -> error envelope.
+  policy.body = R"([{"jsonrpc":"2.0","result":{},"id":1},)"
+                R"({"jsonrpc":"2.0","error":{"code":-32000,"message":"boom"},"id":2}])";
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  std::vector<iora::modules::connectors::BatchItem> items;
+  items.emplace_back("ok", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
+  items.emplace_back("fail", iora::parsers::Json::object(), static_cast<std::uint64_t>(2));
+
+  REQUIRE_THROWS_AS(client.callBatch(ep, items), iora::modules::connectors::RemoteError);
+
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.batchRequests == 1);
+  REQUIRE(s.failedRequests == 1);
+  // Mutation-test: restore the pre-fix order in sendBatchOnLease_ (increment
+  // BEFORE parseBatchResponseOrThrow_) and successfulRequests reads 1 here.
+  REQUIRE(s.successfulRequests == 0);
+  server.stop();
+}
+
+// =========================================================================
+// task-7.8 — the classifier retains its substring branch for the response-read
+// timeout ("HTTP response timeout" carries "timeout"). This guards that adding
+// the typed-exception branch for the lease-acquire timeout did not break the
+// substring classification the response timeout still relies on. (The lease-
+// acquire timeout is unreachable through the pool — one caller per wrapper, so no
+// intra-wrapper lease contention — and its typed classification is proven at the
+// HttpClient layer in iora_test_http_client_lease.cpp.)
+// =========================================================================
+TEST_CASE("task-7.8: a response-read timeout still increments timeoutRequests (substring path)",
+          "[jsonrpc][pool][phase7][stats][timeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18173;
+  RawResponsePolicy policy;
+  policy.delayBeforeResponse = std::chrono::milliseconds(700); // exceeds requestTimeout below
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.requestTimeout = std::chrono::milliseconds(200); // reaches HttpClient (task-7.1)
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS(client.call(ep, "slow"));
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.timeoutRequests == 1);
+  server.stop();
+}
+
+// =========================================================================
+// task-7.8 (M2) — the BATCH path must classify timeouts too. sendBatchOnLease_
+// sends via sendJson_ directly (never sendJsonWithRetries_), so before the M2 fix
+// a batch timeout was counted only in failedRequests, never timeoutRequests —
+// asymmetric with a single call. sendBatchOnLease_'s catch(const std::exception&)
+// around the sendJson_ call now runs the shared isTimeoutFailure_ classifier.
+// =========================================================================
+TEST_CASE("task-7.8 (M2): a batch-path response timeout increments timeoutRequests",
+          "[jsonrpc][pool][phase7][stats][timeout][batch]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18174;
+  RawResponsePolicy policy;
+  policy.delayBeforeResponse = std::chrono::milliseconds(700); // exceeds requestTimeout below
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  cfg.requestTimeout = std::chrono::milliseconds(200);
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  std::vector<iora::modules::connectors::BatchItem> items;
+  items.emplace_back("slow", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
+
+  // Mutation-test: remove the catch(const std::exception&) classifier around
+  // sendJson_ in sendBatchOnLease_ and timeoutRequests reads 0 here while
+  // failedRequests stays 1.
+  REQUIRE_THROWS(client.callBatch(ep, items));
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.batchRequests == 1);
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.timeoutRequests == 1);
+  server.stop();
+}
+
+// =========================================================================
+// task-7.8 (R2-1) — a JSON-RPC APPLICATION error whose server-supplied message
+// contains "timeout" must NOT be counted as a transport timeout. The batch send
+// (sendBatchOnLease_) returns HTTP 200 with an error item; parseBatchResponseOrThrow_
+// then throws RemoteError. Because the batch timeout classifier is scoped to the
+// SEND only (not the parse), that RemoteError never reaches isTimeoutFailure_ —
+// mirroring the single-call path. Mutation-test: widen the classifier to wrap the
+// parse (move it to callBatchCore_'s catch) and timeoutRequests reads 1.
+// =========================================================================
+TEST_CASE("task-7.8 (R2-1): a batch RemoteError whose message contains 'timeout' is NOT a transport timeout",
+          "[jsonrpc][pool][phase7][stats][timeout][batch]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18175;
+  RawResponsePolicy policy;
+  policy.body = R"([{"jsonrpc":"2.0","error":{"code":-32000,"message":"upstream gateway timeout"},"id":1}])";
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  std::vector<iora::modules::connectors::BatchItem> items;
+  items.emplace_back("x", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
+
+  REQUIRE_THROWS_AS(client.callBatch(ep, items), iora::modules::connectors::RemoteError);
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.batchRequests == 1);
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.timeoutRequests == 0); // application error, not a transport timeout
+  server.stop();
+}
+
+// =========================================================================
+// task-7.8 (R3-L1) — the SINGLE-CALL twin of the R2-1 guard: a JSON-RPC
+// application error whose server-supplied message contains "timeout" must NOT be
+// counted as a transport timeout. Structural today (parseResponseOrThrow_ runs in
+// callCore_, outside sendJsonWithRetries_'s classifier wrap); this pins that so a
+// future refactor moving the parse INTO the wrap is caught. Mutation-test: run
+// parseResponseOrThrow_ inside sendJsonWithRetries_'s try and timeoutRequests reads 1.
+// =========================================================================
+TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 'timeout' is NOT a transport timeout",
+          "[jsonrpc][pool][phase7][stats][timeout]")
+{
+  auto &svc = testService();
+  iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
+
+  const std::uint16_t port = 18176;
+  RawResponsePolicy policy;
+  policy.body =
+    R"({"jsonrpc":"2.0","error":{"code":-32000,"message":"upstream gateway timeout"},"id":1})";
+  RawCaptureServer server(port, policy);
+
+  Config cfg;
+  cfg.maxRetries = 0;
+  JsonRpcClient client(svc, pool, cfg);
+  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+  REQUIRE_THROWS_AS(client.call(ep, "x"), iora::modules::connectors::RemoteError);
+  const auto s = client.getStats();
+  REQUIRE(s.totalRequests == 1);
+  REQUIRE(s.failedRequests == 1);
+  REQUIRE(s.timeoutRequests == 0); // application error, not a transport timeout
+  server.stop();
+}
+
 int main(int argc, char *argv[])
 {
   // Initialize the service once and tear it down in an orderly fashion. Without

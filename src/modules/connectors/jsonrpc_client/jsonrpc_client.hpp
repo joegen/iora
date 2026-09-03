@@ -26,6 +26,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -1255,8 +1256,13 @@ private:
       iora::parsers::Json req = makeRequestEnvelope_(method, params, nextId_());
       iora::parsers::Json resp =
         sendJsonWithRetries_(lease.client(), endpoint, req, mergeHeaders_(headers));
+      // Count success only AFTER the response parses cleanly: parseResponseOrThrow_
+      // throws RemoteError on a JSON-RPC error envelope, which the catch(...) below
+      // charges to failedRequests. Incrementing before the parse double-counted an
+      // error reply as BOTH successful and failed (M-12).
+      iora::parsers::Json parsed = parseResponseOrThrow_(std::move(resp));
       _stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
-      return parseResponseOrThrow_(std::move(resp));
+      return parsed;
     }
     catch (const PoolExhaustedError &)
     {
@@ -1380,13 +1386,40 @@ private:
       }
     }
 
-    // Failure counting belongs to callBatchCore_, which now wraps BOTH the
-    // acquire and this send in the standard two-catch shape — counting here as
-    // well would double-charge failedRequests.
-    iora::parsers::Json batchResp =
-      sendJson_(lease.client(), endpoint, batchReq, toHeaderMap_(mergeHeaders_(headers)));
+    // Failure counting belongs to callBatchCore_, which wraps BOTH the acquire and
+    // this send in the standard two-catch shape — counting failedRequests here as
+    // well would double-charge it.
+    //
+    // task-7.8 (M2, R2-1): classify a TRANSPORT timeout on the batch SEND, scoped
+    // to sendJson_ ONLY — exactly mirroring the single-call path, where the
+    // classifier lives in sendJsonWithRetries_ (which wraps the send) and never
+    // sees the RPC parse. If the classifier instead wrapped the parse below, a
+    // RemoteError from parseBatchResponseOrThrow_ (a JSON-RPC application error
+    // whose server-supplied message may contain "timeout", e.g. "gateway timeout")
+    // would be mis-counted as a transport timeout — the batch-vs-single asymmetry
+    // R2-1 flagged. timeoutRequests only; failedRequests stays callBatchCore_'s.
+    iora::parsers::Json batchResp;
+    try
+    {
+      batchResp = sendJson_(lease.client(), endpoint, batchReq, toHeaderMap_(mergeHeaders_(headers)));
+    }
+    catch (const std::exception &e)
+    {
+      if (isTimeoutFailure_(e))
+      {
+        _stats.timeoutRequests.fetch_add(1, std::memory_order_relaxed);
+      }
+      throw;
+    }
+    // Count success only AFTER the batch parses cleanly: parseBatchResponseOrThrow_
+    // throws RemoteError/JsonRpcError on an error or missing-response item, which
+    // callBatchCore_'s catch(...) charges to failedRequests. Incrementing before the
+    // parse double-counted a batch carrying an error item as BOTH successful and
+    // failed (M-12, batch site — the same defect as callCore_).
+    std::vector<iora::parsers::Json> parsed =
+      parseBatchResponseOrThrow_(std::move(batchResp), items);
     _stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
-    return parseBatchResponseOrThrow_(std::move(batchResp), items);
+    return parsed;
   }
 
   std::size_t purgeIdleCore_()
@@ -2381,6 +2414,20 @@ private:
     return iora::network::HttpClient::parseJsonOrThrow(response);
   }
 
+  /// \brief True if \p e is a transport TIMEOUT that ClientStats::timeoutRequests
+  /// should count. The lease-acquire timeout is matched by TYPE
+  /// (HttpLeaseAcquireTimeoutError — its message reads "timed out", which a
+  /// find("timeout") substring match misses; task-7.8 / HD-7 Secondary row); the
+  /// response-read timeout ("HTTP response timeout") by the retained substring.
+  /// Shared by the single-call retry loop AND the batch path (task-7.8 M2) so both
+  /// classify identically. NOTE: connect/DNS timeouts are wrapped/re-messaged
+  /// without a "timeout" substring and are NOT yet counted — backlog 2026-09-03-3.
+  static bool isTimeoutFailure_(const std::exception &e)
+  {
+    return dynamic_cast<const iora::network::HttpLeaseAcquireTimeoutError *>(&e) != nullptr ||
+           std::string_view(e.what()).find("timeout") != std::string_view::npos;
+  }
+
   iora::parsers::Json
   sendJsonWithRetries_(iora::network::HttpClient &http, const std::string &url,
                        const iora::parsers::Json &payload,
@@ -2413,7 +2460,7 @@ private:
         attempts++;
         if (attempts > _config.maxRetries)
         {
-          if (std::string(e.what()).find("timeout") != std::string::npos)
+          if (isTimeoutFailure_(e))
           {
             _stats.timeoutRequests.fetch_add(1, std::memory_order_relaxed);
           }
