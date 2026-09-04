@@ -4931,7 +4931,7 @@ TEST_CASE("2026-09-03-2: a POST answered with a malformed (unframable) response 
   REQUIRE(server.acceptedConnectionCount() == 1);
 }
 
-TEST_CASE("2026-09-03-2: a POST whose response has an unsupported Content-Encoding is NOT retried",
+TEST_CASE("2026-09-03-2: a POST whose response has an undecodable Content-Encoding is NOT retried",
           "[jsonrpc][pool][phase7][raw][double-submit]")
 {
   auto &svc = testService();
@@ -4939,7 +4939,10 @@ TEST_CASE("2026-09-03-2: a POST whose response has an unsupported Content-Encodi
 
   const std::uint16_t port = 18195;
   RawResponsePolicy policy;
-  policy.extraResponseHeaders = {"Content-Encoding: gzip"}; // server processed; reply merely undecodable
+  // Content-Encoding: gzip over the default (plain-JSON) body: the server processed
+  // the POST, the reply merely fails to inflate. decodeResponseContentEncoding_
+  // throws (malformed) — a possibly-sent failure, so it is NOT retried.
+  policy.extraResponseHeaders = {"Content-Encoding: gzip"};
   RawCaptureServer server(port, policy);
 
   Config cfg;
@@ -4965,8 +4968,8 @@ TEST_CASE("2026-09-03-2: a POST answered with a well-framed but unparseable-JSON
   RawResponsePolicy policy;
   // A correctly-framed HTTP 200 (valid Content-Length) whose body is not JSON: the
   // server processed the POST, the reply merely fails parseJsonOrThrow. Distinct
-  // from the Content-Encoding case (18183), which throws in verifyResponseContentEncoding_
-  // BEFORE the parser is reached.
+  // from the Content-Encoding case (port 18195), which throws in
+  // decodeResponseContentEncoding_ BEFORE the parser is reached.
   policy.rawResponseOverride =
     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\nnotjson";
   RawCaptureServer server(port, policy);
@@ -5011,29 +5014,36 @@ TEST_CASE("2026-09-03-2: the BATCH path does not retry a possibly-applied failur
 }
 
 // =========================================================================
-// task-7.2b — the client advertises exactly ONE `Accept-Encoding: identity`
-// line, unconditionally, on EVERY request. WIRE-LEVEL via the raw-capture
-// server (a parsed-map harness cannot see a duplicate field line or byte-exact
-// spelling). Mutation-test: dropping the mergeHeaders_ contribution yields zero
-// Accept-Encoding lines and fails hasFieldLine; a bare push instead of the
-// replace-or-append fails the caller-override count.
+// task-7.2b / task-2.1 — the client advertises exactly ONE Accept-Encoding line,
+// unconditionally, on EVERY request; its VALUE is picked by advertiseAcceptEncoding
+// (Consumer C phase 3 reverses the task-7.2b identity-lock):
+//   * default (advertiseAcceptEncoding=true)  -> `Accept-Encoding: gzip` (identity
+//     implicit; NEVER identity;q=0). Pairs with the response decoder, shipped in the
+//     same slice, so advertising gzip is never ahead of the ability to inflate it.
+//   * advertiseAcceptEncoding=false           -> `Accept-Encoding: identity`
+//     (positively suppress server compression, not header-omission).
+// WIRE-LEVEL via the raw-capture server (a parsed-map harness cannot see a duplicate
+// field line or byte-exact spelling). Mutation-test: dropping the mergeHeaders_
+// contribution yields zero Accept-Encoding lines and fails hasFieldLine; emitting
+// identity;q=0 in the true branch fails the exact-spelling check; a bare push instead
+// of the replace-or-append fails the caller-override count. The full DP-6 decode
+// matrix + round-trip live in iora_test_jsonrpc_gzip_response.
 // =========================================================================
-TEST_CASE("task-7.2b: every request carries exactly one Accept-Encoding: identity",
+TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line",
           "[jsonrpc][pool][phase7][raw]")
 {
   auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18170;
-  RawCaptureServer server(port);
-
-  Config cfg;
-  cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
-  const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
-
-  SECTION("default call, twice (keep-alive reuse) — both requests carry it")
+  SECTION("default (advertiseAcceptEncoding=true): gzip, twice (keep-alive reuse)")
   {
+    const std::uint16_t port = 18170;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
     REQUIRE(client.call(ep, "ping").is_object());
     REQUIRE(client.call(ep, "ping").is_object());
     REQUIRE(server.waitForRequests(2));
@@ -5042,37 +5052,66 @@ TEST_CASE("task-7.2b: every request carries exactly one Accept-Encoding: identit
     REQUIRE(reqs.size() == 2);
     for (const auto &req : reqs)
     {
-      CHECK(hasFieldLine(req, "Accept-Encoding: identity"));
+      CHECK(hasFieldLine(req, "Accept-Encoding: gzip"));
+      CHECK_FALSE(hasFieldLine(req, "Accept-Encoding: identity")); // not identity;q=0 either
       CHECK(countFieldLinesNamed(req, "Accept-Encoding") == 1);
     }
   }
 
-  SECTION("a caller-supplied Accept-Encoding (any case) is now REJECTED (task-7.3a)")
+  SECTION("advertiseAcceptEncoding=false: exactly one Accept-Encoding: identity")
   {
-    // task-7.3a added Accept-Encoding to the per-call reject set: a caller may no
-    // longer supply it (the client owns the sole `identity`), so mergeHeaders_
-    // throws before anything reaches the wire. (Full 7.3a reject-set coverage is
-    // in the dedicated task-7.3a test case below.)
+    const std::uint16_t port = 18169;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    cfg.advertiseAcceptEncoding = false;
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+
+    REQUIRE(client.call(ep, "ping").is_object());
+    REQUIRE(server.waitForRequests(1));
+    server.stop();
+    const auto reqs = server.capturedRequests();
+    REQUIRE(reqs.size() == 1);
+    CHECK(hasFieldLine(reqs[0], "Accept-Encoding: identity"));
+    CHECK(countFieldLinesNamed(reqs[0], "Accept-Encoding") == 1);
+  }
+
+  SECTION("a caller-supplied Accept-Encoding (any case) is still REJECTED (task-7.3a/DP-8)")
+  {
+    // Accept-Encoding is on the per-call reject set: the client owns the sole
+    // Accept-Encoding line, so a caller may not supply one — mergeHeaders_ throws
+    // before anything reaches the wire, regardless of advertiseAcceptEncoding.
+    const std::uint16_t port = 18168;
+    RawCaptureServer server(port);
+    Config cfg;
+    cfg.maxRetries = 0;
+    JsonRpcClient client(svc, pool, cfg);
+    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
     const std::vector<std::pair<std::string, std::string>> headers{{"accept-encoding", "gzip"}};
     REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), headers),
                       iora::modules::connectors::JsonRpcError);
+    server.stop();
   }
 }
 
 // =========================================================================
-// task-7.2c — the client has no response decoder, so a response Content-Encoding
-// other than `identity` fails LOUDLY before the body is parsed. An absent
-// Content-Encoding means no coding was applied (RFC 9110 8.4) and is accepted.
-// The value fold is case-insensitive, and Content-Encoding is a comma-separated
-// LIST field (RFC 9110 8.4 / RFC 7231 3.1.2.2), so a multi-coding value fails.
-// The response header NAME is matched case-insensitively (Response::headers uses
-// CaseInsensitiveCompare).
-// Positive cases were never asserted before this task.
-// Mutation-test: a validator written as "reject anything not exactly identity"
-// (no absent-header escape) fails EVERY ordinary response; one using == on the
-// raw string fails the mixed-case IDENTITY case.
+// task-7.2c / task-2.2 — Consumer C phase 3 REVERSES the task-7.2c identity-lock:
+// the client now DECODES the response Content-Encoding (decodeResponseContentEncoding_)
+// instead of rejecting every non-identity coding. This case pins the DECODE-ERROR
+// handling over CRAFTED raw responses (RawCaptureServer's default body is plain JSON,
+// NOT valid gzip, so any gzip label over it is a genuine malformed-inflate — the
+// clean discriminator for the error paths): identity variants are a no-op and
+// succeed; a mislabeled/unknown coding fails LOUDLY (JsonRpcError) before the parser
+// sees the body. The response header NAME is matched case-insensitively
+// (Response::headers uses CaseInsensitiveCompare). Valid-gzip DECODES + the full DP-6
+// matrix (round-trip, x-gzip, stacked, empties, >2 reject, caps, defect_8 combine)
+// live in iora_test_jsonrpc_gzip_response.
+// Mutation-test: a decoder that skipped the absent-header escape fails EVERY ordinary
+// response; one that skipped the unknown-coding throw would feed undecoded octets to
+// the parser and fail the "br -> throws" section.
 // =========================================================================
-TEST_CASE("task-7.2c: a response Content-Encoding other than identity fails loudly",
+TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
           "[jsonrpc][pool][phase7][raw]")
 {
   auto &svc = testService();
@@ -5090,44 +5129,44 @@ TEST_CASE("task-7.2c: a response Content-Encoding other than identity fails loud
     return client.call(ep, "ping");
   };
 
-  SECTION("no Content-Encoding header -> succeeds")
+  SECTION("no Content-Encoding header -> succeeds (absent == identity)")
   {
     REQUIRE(runCall(18171, {}).is_object());
   }
-  SECTION("Content-Encoding: identity -> succeeds")
+  SECTION("Content-Encoding: identity -> succeeds (no-op)")
   {
     REQUIRE(runCall(18172, {"Content-Encoding: identity"}).is_object());
   }
-  SECTION("Content-Encoding: IDENTITY (mixed case) -> succeeds")
+  SECTION("Content-Encoding: IDENTITY (mixed case) -> succeeds (no-op)")
   {
     REQUIRE(runCall(18173, {"Content-Encoding: IDENTITY"}).is_object());
   }
-  SECTION("Content-Encoding: GZIP -> throws")
+  SECTION("Content-Encoding: gzip over a non-gzip body -> throws (malformed inflate)")
   {
-    REQUIRE_THROWS_AS(runCall(18174, {"Content-Encoding: GZIP"}),
+    REQUIRE_THROWS_AS(runCall(18174, {"Content-Encoding: gzip"}),
                       iora::modules::connectors::JsonRpcError);
   }
-  SECTION("Content-Encoding: gzip, identity (list) -> throws")
+  SECTION("Content-Encoding: br (unknown coding) -> throws (unsupported coding)")
   {
-    REQUIRE_THROWS_AS(runCall(18175, {"Content-Encoding: gzip, identity"}),
+    // An unknown coding must throw BEFORE any decode attempt (fail loudly), never
+    // feed undecoded octets to the parser.
+    REQUIRE_THROWS_AS(runCall(18175, {"Content-Encoding: br"}),
                       iora::modules::connectors::JsonRpcError);
   }
-  SECTION("lowercase response header NAME 'content-encoding: gzip' -> throws (web W-1)")
+  SECTION("lowercase response header NAME 'content-encoding: br' -> throws (web W-1)")
   {
     // Pins the case-insensitive header-NAME lookup: a real server may emit a
-    // lowercase field name. If the guard were refactored to a case-sensitive map
-    // or an == comparison it would silently miss this and feed gzip to the
-    // parser. Mutation-proof: comparing the lookup key case-sensitively fails it.
-    REQUIRE_THROWS_AS(runCall(18178, {"content-encoding: gzip"}),
+    // lowercase field name. If the lookup were case-sensitive it would silently
+    // miss this and feed the undecoded body to the parser. Mutation-proof:
+    // comparing the lookup key case-sensitively fails it.
+    REQUIRE_THROWS_AS(runCall(18178, {"content-encoding: br"}),
                       iora::modules::connectors::JsonRpcError);
   }
   SECTION("Content-Encoding value with OWS '\\tidentity ' -> succeeds (web W-2)")
   {
-    // End-to-end: an OWS-padded `identity` is accepted, not rejected. NOTE
-    // (cpp17 R2-M1 / web W2-a): the OWS is stripped UPSTREAM by
-    // HttpClient::parseHeaderBlock before verifyResponseContentEncoding_ sees the
-    // value, so this does NOT exercise the guard's own belt-and-braces trim
-    // (that trim is unreachable with untrimmed input through the postJson path).
+    // An OWS-padded identity is trimmed to a no-op and accepted. The OWS is stripped
+    // UPSTREAM by HttpClient::parseHeaderBlock before decodeResponseContentEncoding_
+    // sees the value (belt-and-braces trim in the split path guards a direct caller).
     REQUIRE(runCall(18179, {"Content-Encoding: \tidentity "}).is_object());
   }
 }
@@ -6096,9 +6135,10 @@ TEST_CASE("2026-09-03-3: a batch connect timeout increments timeoutRequests (sha
 }
 
 // 2.3 (L1 regression) — the classifier keys on TYPE, never message text: a server
-// response carrying `Content-Encoding: x-timeout` fails verifyResponseContentEncoding_
-// (a JsonRpcError, NOT a timeout type), so timeoutRequests stays 0 even though the
-// server-controlled string contains "timeout". Pins the exact L1 vector.
+// response carrying `Content-Encoding: x-timeout` (an unknown coding) fails
+// decodeResponseContentEncoding_ (a JsonRpcError, NOT a timeout type), so
+// timeoutRequests stays 0 even though the server-controlled string contains
+// "timeout". Pins the exact L1 vector.
 TEST_CASE("2026-09-03-3 (L1): a server 'Content-Encoding: x-timeout' is NOT counted as a timeout",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {

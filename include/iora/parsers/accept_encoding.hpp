@@ -166,9 +166,15 @@ inline double qValueOf(std::string_view params)
 } // namespace acceptencoding_detail
 
 /// \brief RFC 9110 §12.5.3 Accept-Encoding acceptability for gzip (q-values).
-/// gzip acceptable iff an explicit 'gzip' entry (else '*') has a non-zero
+/// gzip acceptable iff an explicit 'gzip' entry — or its legacy alias 'x-gzip'
+/// (RFC 9110 §8.4.1: x-gzip is equivalent to gzip), else '*' — has a non-zero
 /// qvalue; absent header / empty header / q=0 -> identity (NOT acceptable). NOT a
 /// naive contains() (which misses q=0, ordering, and the '*' fallback).
+///
+/// The x-gzip alias is honored SYMMETRICALLY with the decode side (both the server
+/// request decode and the client response decode accept x-gzip as gzip), so a
+/// third-party client that asks with Accept-Encoding: x-gzip is served gzip rather
+/// than falling through to identity.
 ///
 /// Both an ABSENT Accept-Encoding and an EMPTY Accept-Encoding resolve to
 /// identity here (return false): RFC 9110 §12.5.3 permits a server to send
@@ -199,7 +205,9 @@ inline bool gzipAcceptable(std::string_view acceptEncoding)
     {
       q = d::qValueOf(entry.substr(semi + 1));
     }
-    if (d::asciiIEquals(coding, "gzip"))
+    // gzip and its legacy alias x-gzip (§8.4.1) are the same coding. If both appear
+    // (pathological), the last one wins — harmless, both mean gzip.
+    if (d::asciiIEquals(coding, "gzip") || d::asciiIEquals(coding, "x-gzip"))
     {
       gzipQ = q;
     }

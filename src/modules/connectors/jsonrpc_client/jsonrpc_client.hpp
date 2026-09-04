@@ -41,6 +41,7 @@
 // iora::network::normalizeOrigin (the request-compression cache key).
 #include "iora/parsers/http_message.hpp"
 // For iora::util::Gzip::compress — request-body compression (Consumer C phase 2).
+#include "iora/parsers/content_coding.hpp" // splitContentCodings (Consumer C phase 3 response)
 #include "iora/util/gzip.hpp"
 
 namespace iora
@@ -2441,15 +2442,25 @@ private:
       }
     }
 
-    // task-7.2b: the client has no response decoder, so it advertises exactly
-    // one `Accept-Encoding: identity` on every request. RFC 7231 5.3.4 makes an
-    // explicit `identity` a real refusal of every unlisted coding, which pairs
-    // with task-7.2c's fail-loudly on a compressed response. Contributed to the
-    // local `out` ONLY — never Config::defaultHeaders. A plain append yields
-    // exactly one line: task-7.3a rejects a per-call Accept-Encoding (above) and
-    // task-7.3d rejects one in defaultHeaders at construction, so neither the
-    // seed nor `extra` can carry a prior Accept-Encoding for this to duplicate.
-    out.emplace_back("Accept-Encoding", "identity");
+    // task-2.1 (Consumer C phase 3): the client advertises exactly one
+    // Accept-Encoding line, whose VALUE the advertiseAcceptEncoding switch picks:
+    //   * true (default) -> `Accept-Encoding: gzip` (single line, identity
+    //     IMPLICITLY acceptable — NEVER `identity;q=0`, which would 406 a
+    //     non-gzippable body). Pairs with decodeResponseContentEncoding_ below,
+    //     which inflates the gzip the server may now send. Advertise and decode are
+    //     coupled (arch DP-9): the decoder shipped in the SAME slice, so advertising
+    //     gzip is never ahead of the ability to inflate it.
+    //   * false -> `Accept-Encoding: identity` (POSITIVELY suppress server
+    //     compression; RFC 7231 §5.3.4 makes explicit identity a real refusal of
+    //     every unlisted coding — NOT header-omission, which a conformant server may
+    //     ignore and gzip anyway).
+    // Contributed to the local `out` ONLY — never Config::defaultHeaders. A plain
+    // append yields exactly one line: task-7.3a rejects a per-call Accept-Encoding
+    // (above) and task-7.3d rejects one in defaultHeaders at construction, so
+    // neither the seed nor `extra` can carry a prior Accept-Encoding to duplicate.
+    // The caller reject-list (isRejectedHeaderName_) still blocks a caller-supplied
+    // Accept-Encoding/Content-Encoding (DP-8) — the client owns these codings.
+    out.emplace_back("Accept-Encoding", _config.advertiseAcceptEncoding ? "gzip" : "identity");
     return out;
   }
 
@@ -2528,40 +2539,92 @@ private:
     return headerMap;
   }
 
-  /// \brief task-7.2c: the client advertises `Accept-Encoding: identity` (task-
-  /// 7.2b) and has NO response decoder anywhere in the tree, so a response
-  /// carrying a Content-Encoding other than `identity` must fail loudly rather
-  /// than feed compressed octets to the JSON parser. An ABSENT Content-Encoding
-  /// means no coding was applied (RFC 9110 8.4 — the field indicates what codings
-  /// HAVE BEEN applied), so it is accepted; the common case, and it must NOT fail.
-  /// Content-Encoding is a comma-separated LIST field (RFC 9110 8.4 / RFC 7231
-  /// 3.1.2.2): a sender may apply and list several codings in order, so a
-  /// multi-coding value such as `gzip, identity` fails — the whole field value
-  /// must fold to exactly the single token `identity`. The comparison is a
-  /// case-insensitive ASCII fold, so `IDENTITY` is accepted.
-  /// The value is `trim`-ed as belt-and-braces: in the current call path
-  /// HttpClient::parseHeaderBlock has ALREADY stripped OWS (SP/HTAB) before the
-  /// Response reaches here, so the trim guards only a direct caller or a future
-  /// parser contract change — it cannot be exercised through postJson.
-  /// LIMITATION (tracked as defect_8 in tracker -10, 2026-07-26-10):
-  /// HttpClient's parseHeaderBlock stores duplicate field lines last-wins, so
-  /// `Content-Encoding: gzip` then `Content-Encoding: identity` presents as
-  /// `identity` and slips through here — the http_client Content-Length path DOES
-  /// throw on a conflicting duplicate, so the asymmetry is unintentional.
-  static void verifyResponseContentEncoding_(const iora::network::HttpClient::Response &response)
+  /// \brief task-2.2 (Consumer C phase 3): DECODE the response Content-Encoding in
+  /// place before the body reaches parseJsonOrThrow. Renamed from
+  /// verifyResponseContentEncoding_ (which merely REJECTED any non-identity coding,
+  /// the task-7.2c identity-lock this slice reverses): the client now advertises
+  /// Accept-Encoding: gzip and inflates what the server returns.
+  ///
+  /// Content-Encoding is an ORDERED comma-list (RFC 9110 §8.4; duplicate field-lines
+  /// COMBINE with a comma per §5.3 — the defect_8 COMBINE fix in HttpClient's
+  /// parseHeaderBlock ensures two physical lines arrive here as one ordered list, not
+  /// last-wins). The list records codings in APPLIED order, so decode OUTERMOST-FIRST
+  /// (reverse): "identity, gzip" was identity-then-gzip, so gunzip then strip identity
+  /// (a no-op). Semantics symmetric with the server request path (DP-6):
+  ///   * an ABSENT header, or a header with only empty/whitespace elements, means no
+  ///     coding was applied -> accepted unchanged (the common case);
+  ///   * identity is a no-op; x-gzip is a DECODE-side alias of gzip (§8.4.1); token
+  ///     comparison is case-insensitive ASCII (§8.4.1), so GZIP is accepted;
+  ///   * an unknown coding throws (fail loudly — never feed undecoded octets to the
+  ///     parser);
+  ///   * the stacked-coding list is hard-capped at <=2 on TOTAL length (bounds the
+  ///     O(N) CPU of a stacked-inflate chain AND rejects an identity-padding attack —
+  ///     symmetric with the server request cap, arch designDecisions);
+  ///   * each inflate is bounded INCREMENTALLY to maxDecodedResponseBytes (a zip bomb
+  ///     is rejected before the whole buffer materializes); OUTPUT_TOO_LARGE and
+  ///     MALFORMED_INPUT both surface as a JsonRpcError.
+  /// Mutates response.body so the single downstream parseJsonOrThrow (with the
+  /// maxPayloadSize aligned to maxDecodedResponseBytes, task-2.3) sees the decoded
+  /// bytes. Non-static (reads _config.maxDecodedResponseBytes).
+  void decodeResponseContentEncoding_(iora::network::HttpClient::Response &response) const
   {
     const auto it = response.headers.find("Content-Encoding");
     if (it == response.headers.end())
     {
-      return; // absent == identity; nothing to reject.
+      return; // absent == identity; nothing to decode.
     }
-    if (iora::core::StringUtils::iequals(iora::core::StringUtils::trim(it->second), "identity"))
+    const std::vector<std::string> codings = iora::parsers::splitContentCodings(it->second);
+    if (codings.empty())
     {
-      return;
+      return; // only empty/whitespace elements -> nothing applied (§5.6.1).
     }
-    throw JsonRpcError("JsonRpcClient: response Content-Encoding '" + it->second +
-                       "' is not supported; the client advertises Accept-Encoding: "
-                       "identity and has no decoder for any other coding");
+    // <=2 hard cap on the TOTAL list length (DP-6, symmetric with the server request
+    // path): bounds stacked-inflate CPU and rejects an 'identity,...,gzip' pad attack.
+    if (codings.size() > 2)
+    {
+      // The response Content-Encoding is UNTRUSTED (server/proxy-controlled) and this
+      // message may be logged, so scrub it (log-integrity, web W-1).
+      throw JsonRpcError("JsonRpcClient: response Content-Encoding '" +
+                         iora::parsers::sanitizeCodingForLog(it->second) +
+                         "' stacks more than 2 codings");
+    }
+    // Validate EVERY coding is one we can strip BEFORE decoding any (fail loudly on an
+    // unknown coding rather than partially decode). identity is a no-op; gzip/x-gzip
+    // (§8.4.1 alias) are decodable — via the shared isGzipContentCoding classifier.
+    for (const auto &c : codings)
+    {
+      if (iora::core::StringUtils::iequals(c, "identity") ||
+          iora::parsers::isGzipContentCoding(c))
+      {
+        continue;
+      }
+      throw JsonRpcError("JsonRpcClient: response Content-Encoding '" +
+                         iora::parsers::sanitizeCodingForLog(it->second) +
+                         "' contains an unsupported coding '" +
+                         iora::parsers::sanitizeCodingForLog(c) +
+                         "'; the client decodes only gzip/x-gzip/identity");
+    }
+    // Decode OUTERMOST-FIRST (reverse of applied order); identity is a no-op. Each
+    // inflate is bounded incrementally to maxDecodedResponseBytes.
+    for (auto rit = codings.rbegin(); rit != codings.rend(); ++rit)
+    {
+      if (iora::core::StringUtils::iequals(*rit, "identity"))
+      {
+        continue; // no-op coding
+      }
+      auto r = iora::util::Gzip::decompress(response.body, _config.maxDecodedResponseBytes);
+      if (!r.isOk())
+      {
+        if (r.error() == iora::util::Gzip::DecompressError::OUTPUT_TOO_LARGE)
+        {
+          throw JsonRpcError(
+            "JsonRpcClient: decoded response body exceeds maxDecodedResponseBytes (" +
+            std::to_string(_config.maxDecodedResponseBytes) + " bytes)");
+        }
+        throw JsonRpcError("JsonRpcClient: response Content-Encoding gzip is malformed");
+      }
+      response.body = std::move(r).value();
+    }
   }
 
   /// \brief Internal per-request carrier for the request-compression decision
@@ -2696,16 +2759,27 @@ private:
     // ONLY when we compressed (an identity 415, e.g. media-type, is not our coding
     // being refused and must flow to parseJsonOrThrow's generic non-2xx throw).
     // parseJsonOrThrow throws on any non-2xx, and a non-conformant 415 carrying
-    // Content-Encoding could otherwise make verifyResponseContentEncoding_ throw
-    // first, so the status read precedes both.
+    // Content-Encoding could otherwise make decodeResponseContentEncoding_ throw
+    // (malformed inflate) first, so the status read precedes both.
     if (ctl.compressed && response.statusCode == 415)
     {
       throw ContentCodingRejectedError(
         ctl.origin, "JsonRpcClient: server rejected request Content-Encoding: gzip (415)");
     }
 
-    verifyResponseContentEncoding_(response); // task-7.2c: fail before parse on a bad coding
-    return iora::network::HttpClient::parseJsonOrThrow(response);
+    // task-2.2: decode the response Content-Encoding IN PLACE (gzip/x-gzip/identity,
+    // outermost-first, bounded to maxDecodedResponseBytes) before parse. Absent/
+    // identity is a no-op; an unknown coding or a malformed/oversized body throws.
+    decodeResponseContentEncoding_(response);
+    // task-2.3: align the JSON parse cap to maxDecodedResponseBytes for EVERY response
+    // (decoded AND identity), making it the single encoding-transparent JSON ceiling
+    // (arch caps.client). The single-arg parseJsonOrThrow would otherwise re-check
+    // body.size() against a fresh 10 MiB JsonConfig; passing the aligned config makes
+    // the same JSON acceptable whether it arrived gzipped or identity (this
+    // deliberately raises the identity-path cap from 10 MiB to maxDecodedResponseBytes).
+    iora::network::HttpClient::JsonConfig jsonConfig;
+    jsonConfig.maxPayloadSize = _config.maxDecodedResponseBytes;
+    return iora::network::HttpClient::parseJsonOrThrow(response, jsonConfig);
   }
 
   /// \brief Single-call compression wrapper (task-2.3) — sits OUTSIDE
@@ -2803,7 +2877,7 @@ private:
       // POST, so retry ONLY a PROVABLY-NOT-SENT failure — HttpRequestNotSentError
       // and its subclass HttpLeaseAcquireTimeoutError (RFC 9110 §9.2.2). A generic
       // post-write failure, an HttpResponseTimeoutError, an HttpFramingError, or a
-      // verifyResponseContentEncoding_/parseJsonOrThrow throw is POSSIBLY-SENT and is
+      // decodeResponseContentEncoding_/parseJsonOrThrow throw is POSSIBLY-SENT and is
       // rethrown WITHOUT retry: re-sending a request the server may already have
       // applied would double-submit (duplicate create/charge/transfer). The gate
       // keys on exception TYPE via HttpClient::isRequestProvablyNotSent — the single

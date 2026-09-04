@@ -67,6 +67,34 @@ set_tests_properties(iora_test_jsonrpc_gzip_request PROPERTIES
     TIMEOUT 120 RESOURCE_LOCK jsonrpc_pool_ports)
 
 # ---------------------------------------------------------------------------
+# JSON-RPC negotiated-gzip Consumer C — response direction (tracker 2026-09-04-4).
+# Real client + real server round-trip: the server compresses response bodies when
+# Accept-Encoding negotiates gzip (Vary), and the client decodes them, plus the
+# client cap-alignment. Constructs JsonRpcClient directly (includes jsonrpc_client.hpp
+# one dir up) and drives the real mod_jsonrpc_server .so, so it depends on
+# mod_jsonrpc_server. Binds a server port — RESOURCE_LOCK it against the other
+# jsonrpc port-binding tests.
+# ---------------------------------------------------------------------------
+create_iora_test_target(iora_test_jsonrpc_gzip_response
+    SOURCES iora_test_jsonrpc_gzip_response.cpp
+)
+target_include_directories(iora_test_jsonrpc_gzip_response PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_dependencies(iora_test_jsonrpc_gzip_response mod_jsonrpc_server)
+if(IORA_ENABLE_TSAN)
+    target_compile_options(iora_test_jsonrpc_gzip_response PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(iora_test_jsonrpc_gzip_response PRIVATE -fsanitize=thread)
+elseif(IORA_ENABLE_ASAN)
+    target_compile_options(iora_test_jsonrpc_gzip_response PRIVATE
+        -fsanitize=address -fno-omit-frame-pointer -g -O1 -Wno-maybe-uninitialized)
+    target_link_options(iora_test_jsonrpc_gzip_response PRIVATE -fsanitize=address)
+endif()
+add_test(NAME iora_test_jsonrpc_gzip_response
+    COMMAND iora_test_jsonrpc_gzip_response)
+set_tests_properties(iora_test_jsonrpc_gzip_response PROPERTIES
+    TIMEOUT 120 RESOURCE_LOCK jsonrpc_pool_ports)
+
+# ---------------------------------------------------------------------------
 # Pool lifetime / identity defect repros (tracker 2026-07-26-2, phase 1).
 # Constructs JsonRpcClient directly, so it includes jsonrpc_client.hpp from the
 # parent module directory (task-1.1(f)).

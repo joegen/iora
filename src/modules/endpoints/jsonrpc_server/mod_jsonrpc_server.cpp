@@ -13,8 +13,10 @@
 #include <vector>
 
 #include "iora/iora.hpp"
-#include "iora/core/string_utils.hpp" // StringUtils::iequals/trim (content-coding parse)
-#include "iora/util/gzip.hpp"         // request-body gzip decode (Consumer C, phase 2)
+#include "iora/core/string_utils.hpp"    // StringUtils::iequals/trim (content-coding parse)
+#include "iora/parsers/accept_encoding.hpp" // gzipAcceptable (Consumer C, phase 3 response)
+#include "iora/parsers/content_coding.hpp"  // splitContentCodings (Consumer C, phase 2/3)
+#include "iora/util/gzip.hpp"            // request-body gzip decode (Consumer C, phase 2)
 
 namespace iora
 {
@@ -198,29 +200,18 @@ private:
                                const std::string &message)
   {
     res.status = status;
+    // DP-9 invariant, enforced defensively (not merely by statement order): every
+    // non-2xx error body stays identity. If a throw during response compression
+    // unwinds into handlePost's catch AFTER Vary / Content-Encoding were set on the
+    // 200 path, those negotiation headers would otherwise leak onto the 500 (and a
+    // stray Content-Encoding: gzip on an identity body would make a client try to
+    // inflate plaintext). Erase them here so the invariant holds under exception
+    // unwind regardless of where the throw originated.
+    res.headers.erase("Content-Encoding");
+    res.headers.erase("Vary");
     res.set_content("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":" + std::to_string(code) +
                       ",\"message\":\"" + message + "\"},\"id\":null}",
                     "application/json");
-  }
-
-  /// \brief Split an (already combined, RFC 9110 §5.3) Content-Encoding value into
-  /// ordered, OWS-trimmed coding tokens, skipping empty/whitespace-only elements
-  /// (RFC 9110 §5.6.1 — a legal consequence of comma-combining, e.g. "gzip,," or
-  /// ", gzip"). Tokens keep their original case; callers compare case-insensitively
-  /// (RFC 9110 §8.4.1). Reuses the foundation StringUtils::split/trim primitives
-  /// (no hand-rolled comma scan). Consumer C task-1.1.
-  static std::vector<std::string> splitContentCodings_(const std::string &value)
-  {
-    std::vector<std::string> out;
-    for (std::string_view tok : iora::core::StringUtils::split(value, ','))
-    {
-      const std::string_view trimmed = iora::core::StringUtils::trim(tok);
-      if (!trimmed.empty())
-      {
-        out.emplace_back(trimmed);
-      }
-    }
-    return out;
   }
 
   void handlePost(const iora::network::WebhookServer::Request &req,
@@ -328,7 +319,7 @@ private:
       const auto ceIt = req.headers.find("Content-Encoding");
       if (ceIt != req.headers.end())
       {
-        const std::vector<std::string> codings = splitContentCodings_(ceIt->second);
+        const std::vector<std::string> codings = iora::parsers::splitContentCodings(ceIt->second);
         if (!codings.empty())
         {
           // Whether every coding in the list is one we can strip. gzip/x-gzip is
@@ -349,9 +340,8 @@ private:
               {
                 continue; // no-op coding
               }
-              // x-gzip is a DECODE-side alias of gzip (RFC 9110 §8.4.1).
-              if (iora::core::StringUtils::iequals(c, "gzip") ||
-                  iora::core::StringUtils::iequals(c, "x-gzip"))
+              // gzip / its legacy alias x-gzip (RFC 9110 §8.4.1) — shared classifier.
+              if (iora::parsers::isGzipContentCoding(c))
               {
                 hasGzip = true;
                 continue;
@@ -373,8 +363,10 @@ private:
             setJsonRpcError_(res, 415, -32600, "Unsupported Content-Encoding");
             if (_logRequests)
             {
-              iora::core::Logger::warning(
-                "JSON-RPC request rejected: undecodable Content-Encoding '" + ceIt->second + "'");
+              // ceIt->second is UNTRUSTED (client-controlled); scrub before logging
+              // so a hostile Content-Encoding cannot forge log lines (web W-1).
+              iora::core::Logger::warning("JSON-RPC request rejected: undecodable Content-Encoding '" +
+                                          iora::parsers::sanitizeCodingForLog(ceIt->second) + "'");
             }
             return;
           }
@@ -440,13 +432,58 @@ private:
       }
 
       res.status = 200;
-      res.set_content(std::move(out), "application/json");
+      const std::size_t responseSize = out.size(); // captured before any std::move(out) below
+
+      // ── Consumer C phase 3: response Content-Encoding negotiation (DP-9, tasks
+      // 1.1-1.3). `out` is non-empty here (the empty/notification case returned 204
+      // above), so the 204/empty path never carries Content-Encoding. All non-2xx
+      // error bodies exit via setJsonRpcError_ (which never touches these headers),
+      // so they stay identity, including the 401.
+      if (_enableResponseCompression)
+      {
+        // A content-negotiated 200 varies its representation by Accept-Encoding, so
+        // advertise Vary on EVERY negotiated 200 — the compressed, the identity-
+        // negotiated (gzip;q=0), and the no-Accept-Encoding one — for cache
+        // correctness (RFC 9110 §12.5.5). When response compression is disabled no
+        // negotiation occurs, so Vary is intentionally not emitted (task-1.3).
+        res.set_header("Vary", "Accept-Encoding");
+
+        // Negotiate gzip only when the client accepts it with a non-zero q (the
+        // promoted RFC 9110 §12.5.3 gzipAcceptable parser: gzip;q=0 -> not
+        // acceptable, '*' fallback), the body is over threshold, and non-empty. The
+        // request Accept-Encoding was already combined into one ordered comma-list on
+        // ingress (foundation isListValuedHeader gate), so a split field is handled.
+        // An unsatisfiable Accept-Encoding (e.g. identity;q=0) is NOT 406'd — identity
+        // is sent (RFC 9110 §12.5.3 permits, the common tolerated choice).
+        const auto aeIt = req.headers.find("Accept-Encoding");
+        const std::string_view acceptEncoding =
+          (aeIt != req.headers.end()) ? std::string_view(aeIt->second) : std::string_view{};
+        if (out.size() > _compressionThreshold && iora::parsers::gzipAcceptable(acceptEncoding))
+        {
+          // Compress BEFORE set_content: set_content snapshots Content-Length from
+          // content.size() (http_server.hpp:115-131), so compressing first computes
+          // Content-Length over the compressed bytes (DP-9/DP-11). Content-Type stays
+          // application/json — Content-Encoding modifies the representation; the
+          // underlying media type is unchanged (RFC 9110 §8.4).
+          std::string compressed = iora::util::Gzip::compress(out);
+          res.set_header("Content-Encoding", "gzip");
+          res.set_content(std::move(compressed), "application/json");
+        }
+        else
+        {
+          res.set_content(std::move(out), "application/json");
+        }
+      }
+      else
+      {
+        res.set_content(std::move(out), "application/json");
+      }
 
       if (_logRequests)
       {
         iora::core::Logger::debug("JSON-RPC request processed in " +
                                   std::to_string(duration.count()) +
-                                  "ms, response size: " + std::to_string(out.size()) + " bytes");
+                                  "ms, response size: " + std::to_string(responseSize) + " bytes");
       }
     }
     catch (const std::exception &e)
