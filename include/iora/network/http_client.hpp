@@ -13,7 +13,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <ctime>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -29,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "iora/crypto/secure_rng.hpp"
 #include "iora/network/dns_client.hpp"
 #include "iora/network/transport_impl.hpp"
 #include "iora/parsers/http_message.hpp"
@@ -60,6 +60,42 @@ class HttpFramingError : public std::runtime_error
 {
 public:
   explicit HttpFramingError(const std::string &what) : std::runtime_error(what) {}
+};
+
+/// \brief Thrown when a CALLER-SUPPLIED request header name or value fails RFC
+/// 9110 validation: a name that is not a valid token (§5.6.2 tchar) or a value
+/// carrying a forbidden octet (§5.5 field-value grammar — any octet < 0x20 other
+/// than HTAB, or 0x7F/DEL). A DIRECT subclass of HttpFramingError so
+/// performRequest's `catch (const HttpFramingError &)` rejects it WITHOUT retry:
+/// a header-injection / non-token name is a deterministic caller error, not a
+/// transient failure, and must never be re-sent on an idempotent method. It is
+/// deliberately NOT an HttpRequestNotSentError subclass — the "not sent => safe
+/// to retry ANY method" contract must not be misapplied to a caller bug
+/// (tracker 2026-07-26-10 task-1.2 / defect_1 / defect_3).
+class HttpInvalidHeaderError : public HttpFramingError
+{
+public:
+  explicit HttpInvalidHeaderError(const std::string &what) : HttpFramingError(what) {}
+};
+
+/// \brief Thrown by parseUrl for a URL it refuses: a malformed URL, a URL
+/// carrying userinfo (`user@` / `user:pass@` — credentials must never land in
+/// the request-target, RFC 9112 §3.2), a bracketed IPv6 literal (not parsed —
+/// see the decision in parseUrl), or a port outside 1..65535 or that overflows
+/// (defect_7 / defect_15). It is a subclass of std::invalid_argument so the
+/// cross-repo contract that a malformed URL surfaces as std::invalid_argument is
+/// preserved (tmc_edge_proxy TmcStatefulPrimitives catches std::invalid_argument
+/// to turn it into a fail action; the malformed-URL what() string is kept
+/// byte-identical). performRequest adds a dedicated non-retry catch for this
+/// type BEFORE its generic catch, so a deterministic URL fault is NOT retried on
+/// an idempotent method (it previously escaped as a raw std::invalid_argument /
+/// std::out_of_range into the retry path). Kept OUT of the HttpFramingError
+/// hierarchy precisely to remain a std::invalid_argument for that contract
+/// (tracker 2026-07-26-10 task-1.6).
+class HttpInvalidUrlError : public std::invalid_argument
+{
+public:
+  explicit HttpInvalidUrlError(const std::string &what) : std::invalid_argument(what) {}
 };
 
 /// \brief Thrown when a request failed BEFORE any byte was transmitted (a
@@ -157,6 +193,25 @@ public:
   explicit HttpResponseTimeoutError(const std::string &what) : std::runtime_error(what) {}
 };
 
+/// \brief Thrown when a single request/response exchange exceeds
+/// Config::totalRequestTimeout — the whole-exchange deadline computed once
+/// BEFORE connect (defect_14, a client-side slowloris bound). Distinct from the
+/// PER-iteration HttpResponseTimeoutError: a peer that trickles one byte per
+/// window (or floods well-formed interim 1xx responses) resets the per-iteration
+/// timer forever, so only an outer deadline bounds it.
+///
+/// It is a subclass of HttpFramingError specifically so performRequest's
+/// `catch (const HttpFramingError &)` rejects it WITHOUT retry: the deadline is a
+/// deterministic terminal condition for THIS attempt, and re-sending after
+/// exponential backoff would just re-incur it (and for a non-idempotent method
+/// would be unsafe). Making it non-retryable is what bounds total wall-clock to
+/// ~1x the deadline rather than (retries+1)x (task-1.10).
+class HttpExchangeDeadlineError : public HttpFramingError
+{
+public:
+  explicit HttpExchangeDeadlineError(const std::string &what) : HttpFramingError(what) {}
+};
+
 /// \brief Thrown when the transport connect phase (TCP handshake, and for an https
 /// endpoint the TLS handshake) exceeds its deadline — i.e. connectSync returns
 /// TransportError::Timeout. The request was PROVABLY NOT SENT (no request byte is
@@ -212,6 +267,162 @@ inline std::string formatHostHeaderField(const std::string &host, std::uint16_t 
   }
   line += "\r\n";
   return line;
+}
+
+/// \brief RFC 9110 §5.6.2 tchar: the characters permitted in a header field
+/// NAME (token = 1*tchar). Implemented as an ALLOW-LIST — a deny-list of
+/// separators is error-prone and leaks '<', '>', DEL and high bytes (tracker
+/// 2026-07-26-10 task-1.2 / web L2). tchar = DIGIT / ALPHA /
+/// "!#$%&'*+-.^_`|~".
+inline bool isHttpTokenChar(unsigned char c)
+{
+  if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+  {
+    return true;
+  }
+  switch (c)
+  {
+    case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
+    case '+': case '-': case '.': case '^': case '_': case '`': case '|': case '~':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// \brief A valid header field NAME is a non-empty RFC 9110 §5.6.2 token.
+/// Rejects an empty name, any whitespace (incl. a trailing space before the
+/// colon — RFC 9112 §5.1), and every separator/control octet (tracker
+/// 2026-07-26-10 defect_3 / defect_10). Extracted as a pure free function so it
+/// is unit-testable without a socket.
+inline bool isValidHttpFieldName(const std::string &name)
+{
+  if (name.empty())
+  {
+    return false;
+  }
+  for (char ch : name)
+  {
+    if (!isHttpTokenChar(static_cast<unsigned char>(ch)))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// \brief A valid header field VALUE per RFC 9110 §5.5: field-vchar (VCHAR
+/// %x21-7E / obs-text %x80-FF) optionally interleaved with SP / HTAB. So REJECT
+/// any octet < 0x20 other than HTAB (0x09), PLUS 0x7F (DEL); obs-text
+/// (0x80-0xFF) is permitted. This rejects CR, LF and NUL (header / request-line
+/// injection) AND the historically line-terminator-treated VT (0x0B) / FF
+/// (0x0C) that a naive CR/LF/NUL filter passes (tracker 2026-07-26-10 defect_1 /
+/// task-1.2). Leading/trailing OWS is NOT stripped here (recipients strip it;
+/// documented no-op).
+inline bool isValidHttpFieldValue(const std::string &value)
+{
+  for (char ch : value)
+  {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == '\t')
+    {
+      continue; // HTAB is permitted between field-vchar runs
+    }
+    if (c < 0x20 || c == 0x7F)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// \brief ASCII case-insensitive string equality (RFC 9110 §5.1: field names
+/// are compared case-insensitively). A free function so the request-side
+/// controlled-header guard below and HttpClient's response-side parser share
+/// ONE implementation (tracker 2026-07-26-10 task-1.3).
+inline bool ciEqualsAscii(const std::string &a, const std::string &b)
+{
+  if (a.size() != b.size())
+  {
+    return false;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i)
+  {
+    if (CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(a[i])) !=
+        CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(b[i])))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// \brief The request header field names HttpClient controls itself and a
+/// caller MUST NOT supply. Supplying any produces a duplicate or conflicting
+/// framing field — the CL/CL desync (RFC 9112 §6.3), the TE.CL desync (§6.1/
+/// §6.2), a duplicate Host a server answers 400 (§3.2) — or a connection /
+/// expectation control HttpClient owns (Connection is driven by
+/// Config::reuseConnections, not a header; Expect:100-continue cannot be
+/// honored because HttpClient sends the full request + body in one shot,
+/// RFC 9110 §10.1.1, so REJECT is the conservative client policy). The
+/// TE-family (Transfer-Encoding, TE, Trailer, Upgrade) is rejected outright:
+/// §6.1 says a client must not send Transfer-Encoding unless it knows the
+/// server handles HTTP/1.1, and HttpClient cannot chunk (tracker
+/// 2026-07-26-10 task-1.3 / defect_2 / defect_4). Matched ASCII
+/// case-insensitively because the caller map is a case-SENSITIVE std::map, so a
+/// mixed-case `content-length:` / `TRANSFER-ENCODING:` would otherwise bypass
+/// the guard and reinstate the desync.
+///
+/// DELIBERATELY ABSENT: Content-Encoding / Accept-Encoding — JsonRpcClient
+/// self-injects `Content-Encoding: gzip` into the caller map AFTER its own
+/// validation (task-1.1 FLAG-1), so rejecting content-coding here would break
+/// JSON-RPC request-gzip; that stays a JsonRpcClient-layer concern. User-Agent
+/// is also absent: HttpClient lets the caller OVERRIDE it (emitted downstream
+/// only when the caller supplied none) rather than rejecting. Proxy-Connection
+/// and Keep-Alive are non-framing hop-by-hop headers with no in-tree caller
+/// (task-1.1 sweep) and no smuggling primitive, so they are not rejected (YAGNI
+/// — the guard is scoped to framing-critical/owned controls, not general
+/// duplicate suppression: a caller's non-controlled ci-duplicate X-Foo/x-foo
+/// still emits both lines, which is acceptable).
+inline bool isFramingControlledHeaderName(const std::string &name)
+{
+  static const char *const kControlled[] = {
+      "Host", "Content-Length", "Connection", "Transfer-Encoding",
+      "TE",   "Trailer",        "Upgrade",    "Expect"};
+  for (const char *candidate : kControlled)
+  {
+    if (ciEqualsAscii(name, candidate))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// \brief Set a library-owned header on a case-SENSITIVE request-header map,
+/// first removing ANY ASCII case-variant of \p name the caller may have
+/// supplied. A plain `headers[name] = value` on a case-sensitive std::map would
+/// leave a mixed-case caller key (e.g. "content-type") live alongside the
+/// canonical one, emitting TWO field-lines on the wire — a duplicate
+/// representation/framing field (defect_2 class). Used where the library's value
+/// is authoritative and unconditional (postFile / postJson Content-Type); it is
+/// NOT the caller-overridable path (postStream sets its SSE defaults only when
+/// absent). (tracker 2026-07-26-10 task-1.5 / task-1.4 round-2 review.)
+inline void setLibraryOwnedHeader(std::map<std::string, std::string> &headers,
+                                  const std::string &name, const std::string &value)
+{
+  for (auto it = headers.begin(); it != headers.end();)
+  {
+    if (ciEqualsAscii(it->first, name))
+    {
+      it = headers.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+  headers[name] = value;
 }
 
 /// THREADING CONTRACT (sync request path): concurrent same-host requests on a
@@ -271,8 +482,20 @@ public:
   /// \brief Configuration for HTTP client
   struct Config
   {
+    /// Per-connect timeout. NOTE (defect_9): silently clamped to
+    /// min(connectTimeout, 200ms) for loopback (127.0.0.1 / ::1, and the
+    /// hostname "localhost" which resolveHostAddress maps to 127.0.0.1) — a
+    /// loopback connect resolves near-instantly, so this value is NOT observable
+    /// against loopback. To exercise a real connect timeout, target a
+    /// non-routable address such as 192.0.2.1 (TEST-NET-1).
     std::chrono::milliseconds connectTimeout;
     std::chrono::milliseconds requestTimeout;
+    /// RESERVED AND INERT (defect_5): HttpClient does NOT follow redirects — no
+    /// Location / 3xx handling exists. These two fields are retained only for
+    /// source/ABI compatibility with HttpClientPool::Config, which mirrors them;
+    /// nothing reads them. followRedirects defaults to FALSE so the config does
+    /// not advertise a capability the client lacks (it formerly defaulted true).
+    /// Do not add redirect logic keyed on these without a design pass.
     int maxRedirects;
     bool followRedirects;
     std::string userAgent;
@@ -282,6 +505,16 @@ public:
     /// connection lease before failing with a distinct timeout error. Zero (the
     /// default) means wait indefinitely, preserving pre-lease blocking semantics.
     std::chrono::milliseconds leaseAcquireTimeout;
+    /// Whole-exchange deadline for a single request attempt (defect_14). Unlike
+    /// requestTimeout, which re-arms per receiveSync iteration and so is reset by
+    /// any byte from a slow-trickle / interim-1xx-flooding peer, this bounds the
+    /// TOTAL time from just before connect through the final byte. Computed ONCE
+    /// per attempt, so a slow connect composes with a slow body. On expiry the
+    /// attempt throws HttpExchangeDeadlineError (NON-retryable), bounding total
+    /// wall-clock to ~1x this value. Zero (the DEFAULT) DISABLES the bound
+    /// (opt-in — preserves the prior unbounded behavior; set a positive value to
+    /// harden a live client against a client-side slowloris).
+    std::chrono::milliseconds totalRequestTimeout;
     /// Hard cap on total received response bytes (headers + body), enforced
     /// DURING receipt to bound memory for a huge/absent-length/close-delimited
     /// server (RFC 9112 §6.3 close-delimited has no length). Distinct from
@@ -292,9 +525,10 @@ public:
     JsonConfig jsonConfig; // JSON parsing configuration
 
     Config()
-        : connectTimeout(2000), requestTimeout(3000), maxRedirects(5), followRedirects(true),
+        : connectTimeout(2000), requestTimeout(3000), maxRedirects(5), followRedirects(false),
           userAgent("Iora-HttpClient/1.0"), reuseConnections(true), connectionIdleTimeout(300),
-          leaseAcquireTimeout(0), maxResponseBytes(16 * 1024 * 1024), jsonConfig{}
+          leaseAcquireTimeout(0), totalRequestTimeout(0), maxResponseBytes(16 * 1024 * 1024),
+          jsonConfig{}
     {
     }
 
@@ -430,7 +664,23 @@ private:
         return path.empty() ? "/" : path;
       return (path.empty() ? "/" : path) + "?" + query;
     }
-    std::string getHostPort() const { return host + ":" + std::to_string(port); }
+    /// \brief The connection-cache / lease key. SCHEME-QUALIFIED (defect_12):
+    /// an https:// request MUST NOT reuse a plaintext session opened for an
+    /// http:// request to the same host:port (a silent TLS downgrade). Keying on
+    /// `scheme://host:port` makes the TLS-mode invariant STRUCTURAL rather than
+    /// checked. This is the SOLE key source — `_connections`, `_leasedHosts`,
+    /// the lease acquire/release and dropConnection all derive their key from
+    /// here, so re-keying here re-keys every site atomically (a partial re-key
+    /// would let an http and an https request to one authority hold distinct
+    /// leases yet collide on a shared cache slot, each closing the other's
+    /// SessionId — an unsynchronized double-close across the released _mutex).
+    /// The connect authority does NOT come from here (connectSync takes the
+    /// resolved host + numeric port directly), so the scheme prefix never leaks
+    /// onto the wire; it only appears in this key and in diagnostic strings.
+    std::string getHostPort() const
+    {
+      return scheme + "://" + host + ":" + std::to_string(port);
+    }
   };
 
   /// \brief Move-only RAII guard for an exclusive per-host:port connection lease.
@@ -564,6 +814,16 @@ public:
            method == "OPTIONS" || method == "TRACE";
   }
 
+  /// \brief True for a method whose semantics anticipate a request body
+  /// (POST/PUT/PATCH). RFC 9110 §8.6 advises a user agent send Content-Length: 0
+  /// for such a method even when the body is empty, so a peer does not wait for
+  /// content or mis-frame (defect_13). EXACT, case-sensitive match (RFC 9110
+  /// §9.1 method tokens are case-sensitive), consistent with isIdempotentMethod.
+  static bool methodAnticipatesContent(const std::string &method)
+  {
+    return method == "POST" || method == "PUT" || method == "PATCH";
+  }
+
   /// \brief True iff \p e proves the request never reached the wire (RFC 9110
   /// §9.2.2 "some means to detect that the original request was never applied"), so
   /// it is safe to auto-retry even a non-idempotent method. This is the SINGLE home
@@ -599,7 +859,9 @@ public:
                     const std::map<std::string, std::string> &headers = {}, int retries = 0)
   {
     std::map<std::string, std::string> jsonHeaders = headers;
-    jsonHeaders["Content-Type"] = "application/json";
+    // Library owns Content-Type here; drop any case-variant caller key so a
+    // mixed-case "content-type" cannot produce a duplicate line (task-1.4 review).
+    setLibraryOwnedHeader(jsonHeaders, "Content-Type", "application/json");
     std::string jsonBody = body.dump();
     return performRequest("POST", url, jsonBody, jsonHeaders, retries);
   }
@@ -642,8 +904,32 @@ public:
                   const std::function<void(const std::string &)> &onChunk, int retries = 0)
   {
     std::map<std::string, std::string> streamHeaders = headers;
-    streamHeaders["Accept"] = "text/event-stream";
-    streamHeaders["Cache-Control"] = "no-cache";
+    // The SSE defaults are caller-OVERRIDABLE (task-1.5 / defect_6; mirrors the
+    // postJson change in tracker 2026-07-26-5 task-3.1): set them only when the
+    // caller supplied none, so a caller-provided Accept / Cache-Control survives
+    // rather than being silently overwritten. Matched case-insensitively so a
+    // lowercase caller key is not duplicated on the wire.
+    bool hasAccept = false;
+    bool hasCacheControl = false;
+    for (const auto &[name, value] : headers)
+    {
+      if (ciEqualsAscii(name, "Accept"))
+      {
+        hasAccept = true;
+      }
+      else if (ciEqualsAscii(name, "Cache-Control"))
+      {
+        hasCacheControl = true;
+      }
+    }
+    if (!hasAccept)
+    {
+      streamHeaders["Accept"] = "text/event-stream";
+    }
+    if (!hasCacheControl)
+    {
+      streamHeaders["Cache-Control"] = "no-cache";
+    }
 
     Response response = postJson(url, body, streamHeaders, retries);
     if (!response.success())
@@ -684,8 +970,56 @@ public:
       filename = filename.substr(pos + 1);
     }
 
+    // Reject a quote, CR, LF or NUL in the caller-controlled part-header fields
+    // (defect_6). RFC 7578 §4.2 defines NO escaping mechanism for these inside
+    // name=""/filename="", so REJECT rather than escape — consistent with
+    // task-1.2's throw-not-strip decision. A CRLF would inject additional
+    // part-headers; a quote would break out of the quoted-string
+    // (RFC 9110 §5.6.4). HttpInvalidHeaderError is non-retryable.
+    auto rejectMultipartField = [](const std::string &field, const char *label)
+    {
+      for (char ch : field)
+      {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c == '"' || c == '\r' || c == '\n' || c == '\0')
+        {
+          throw HttpInvalidHeaderError(
+              std::string("postFile ") + label +
+              " contains a character forbidden in a multipart part-header "
+              "(quote, CR, LF or NUL)");
+        }
+      }
+    };
+    rejectMultipartField(fieldName, "fieldName");
+    rejectMultipartField(filename, "filename");
+
+    // Generate a HIGH-ENTROPY random boundary (defect_17) — the former
+    // clock-derived "----IoraBoundary<time>" was second-granularity and fully
+    // predictable. RFC 2046 §5.1.1 makes the boundary's NON-APPEARANCE in the
+    // content a MUST, so VERIFY the chosen boundary does not occur in
+    // fileContent and regenerate on collision; a probabilistic "entropy makes
+    // collision negligible" argument does not satisfy the MUST for arbitrary
+    // binary uploads. Use the shared crypto::SecureRng (do NOT hand-roll RNG).
+    auto makeBoundary = []()
+    {
+      std::uint8_t raw[18];
+      iora::crypto::SecureRng::fill(raw, sizeof(raw));
+      static const char kHex[] = "0123456789abcdef";
+      std::string b = "----IoraBoundary";
+      for (unsigned char byte : raw)
+      {
+        b += kHex[byte >> 4];
+        b += kHex[byte & 0x0F];
+      }
+      return b; // 16 + 36 = 52 chars, within RFC 2046's 70-char limit
+    };
+    std::string boundary = makeBoundary();
+    while (fileContent.find(boundary) != std::string::npos)
+    {
+      boundary = makeBoundary();
+    }
+
     // Create multipart form data
-    std::string boundary = "----IoraBoundary" + std::to_string(std::time(nullptr));
     std::ostringstream body;
     body << "--" << boundary << "\r\n";
     body << "Content-Disposition: form-data; name=\"" << fieldName << "\"; filename=\"" << filename
@@ -695,7 +1029,12 @@ public:
     body << "\r\n--" << boundary << "--\r\n";
 
     std::map<std::string, std::string> multipartHeaders = headers;
-    multipartHeaders["Content-Type"] = "multipart/form-data; boundary=" + boundary;
+    // The generated Content-Type carries the boundary and MUST be the only one
+    // on the wire — drop any case-variant caller key first, or a mixed-case
+    // "content-type" would emit a second line whose (absent/mismatched) boundary
+    // corrupts the multipart framing (task-1.5 unconditional-CT invariant).
+    setLibraryOwnedHeader(multipartHeaders, "Content-Type",
+                          "multipart/form-data; boundary=" + boundary);
 
     return performRequest("POST", url, body.str(), multipartHeaders, retries);
   }
@@ -825,7 +1164,23 @@ private:
     return regexes;
   }
 
-  /// \brief Parse URL into components
+  /// \brief Parse URL into components.
+  ///
+  /// SCHEME CASE (decision, task-1.6): the scheme is matched case-SENSITIVELY —
+  /// only lowercase `http` / `https` parse; `HTTP://…` is rejected as a
+  /// malformed URL. (parsers::parseUrl lowercases the scheme; that divergence is
+  /// left as-is here — harmonizing it would reach across into the parsers layer
+  /// and tracker -2's origin key, out of this task's scope.)
+  ///
+  /// USERINFO / IPv6 (defect_7): the raw authority is inspected BEFORE trusting
+  /// the regex's host capture, because the host character class stops at ':' and
+  /// '/', so `user:pass@host` would otherwise fold the credentials into the path
+  /// (request-target) and `[::1]:8080` would yield host="[". Userinfo is
+  /// REJECTED (credentials must never reach the request-target). A bracketed
+  /// IPv6 literal is REJECTED rather than parsed: parsing it would couple to
+  /// bracket-aware changes in formatHostHeaderField and getHostPort (both do
+  /// `host + ":" + port`) for a form no in-tree caller uses (YAGNI). Both throw
+  /// HttpInvalidUrlError (a std::invalid_argument, non-retryable).
   ParsedUrl parseUrl(const std::string &url) const
   {
     ParsedUrl parsed;
@@ -833,7 +1188,25 @@ private:
     std::smatch match;
     if (!std::regex_match(url, match, compiledRegexes().url))
     {
-      throw std::invalid_argument("Invalid URL format: " + url);
+      throw HttpInvalidUrlError("Invalid URL format: " + url);
+    }
+
+    // Inspect the raw authority (between "://" and the first '/', '?' or '#')
+    // for userinfo and IPv6 brackets — independent of the regex host class.
+    const std::size_t authStart = url.find("://") + 3;
+    const std::size_t authEnd = url.find_first_of("/?#", authStart);
+    const std::string authority =
+      url.substr(authStart, authEnd == std::string::npos ? std::string::npos : authEnd - authStart);
+    if (authority.find('@') != std::string::npos)
+    {
+      throw HttpInvalidUrlError("Invalid URL: userinfo (user@ / user:pass@) is not "
+                                "permitted; credentials must not appear in the "
+                                "request-target (RFC 9112 §3.2): " + url);
+    }
+    if (!authority.empty() && authority.front() == '[')
+    {
+      throw HttpInvalidUrlError("Invalid URL: bracketed IPv6 literals are not "
+                                "supported: " + url);
     }
 
     parsed.scheme = match[1].str();
@@ -842,7 +1215,20 @@ private:
     // Default ports
     if (match[3].matched)
     {
-      parsed.port = static_cast<std::uint16_t>(std::stoi(match[3].str()));
+      // Parse strictly and validate the 1..65535 range. The old
+      // static_cast<uint16_t>(std::stoi(...)) truncated :65536 to port 0 (the
+      // client then connected to port 0) and let an unbounded digit run throw
+      // std::out_of_range into the retry path (defect_15).
+      const std::string portStr = match[3].str();
+      unsigned long portVal = 0;
+      const char *first = portStr.data();
+      const char *last = first + portStr.size();
+      const auto res = std::from_chars(first, last, portVal);
+      if (res.ec != std::errc() || res.ptr != last || portVal < 1 || portVal > 65535)
+      {
+        throw HttpInvalidUrlError("Invalid URL: port must be 1..65535: " + url);
+      }
+      parsed.port = static_cast<std::uint16_t>(portVal);
     }
     else
     {
@@ -851,7 +1237,9 @@ private:
 
     parsed.path = match[4].str();
     if (parsed.path.empty())
+    {
       parsed.path = "/";
+    }
 
     parsed.query = match[5].str();
 
@@ -998,7 +1386,15 @@ private:
     //     slot, so no other thread races this connect/publish.
     TlsMode tlsMode = parsedUrl.isHttps() ? TlsMode::Client : TlsMode::None;
 
-    // Use shorter timeout for localhost — connection refused should be instant.
+    // LOOPBACK CONNECT-TIMEOUT CLAMP (defect_9): for 127.0.0.1 / ::1 the connect
+    // timeout is clamped to min(connectTimeout, 200ms) — a loopback connect
+    // either succeeds or is refused almost instantly, so a long timeout only
+    // delays a refusal. CONSEQUENCE: Config::connectTimeout is NOT observable
+    // against loopback (the address every in-tree test uses); a test that needs
+    // to exercise a real connect-timeout must target a non-loopback,
+    // non-routable address (e.g. 192.0.2.1, TEST-NET-1). resolveHostAddress also
+    // maps the hostname "localhost" to 127.0.0.1 (:1227), so "localhost" is
+    // clamped too. This is documented on Config::connectTimeout as well.
     auto timeout = (resolvedHost == "127.0.0.1" || resolvedHost == "::1")
       ? std::min(_config.connectTimeout, std::chrono::milliseconds(200))
       : _config.connectTimeout;
@@ -1148,6 +1544,18 @@ private:
         // irrelevant (siblings).
         throw;
       }
+      catch (const HttpInvalidUrlError &e)
+      {
+        // A deterministic URL fault (malformed, userinfo, IPv6 literal, bad
+        // port). Retrying re-parses and re-throws identically, and for a
+        // non-idempotent method would be unsafe — never retry (task-1.6). This
+        // guard MUST precede the generic catch(std::exception&): HttpInvalidUrlError
+        // is a std::invalid_argument (a std::exception), which the generic gate
+        // would otherwise retry on an idempotent method.
+        iora::core::Logger::error("HttpClient: Request to " + url +
+                                  " failed with a non-retryable URL error: " + e.what());
+        throw;
+      }
       catch (const std::exception &e)
       {
         // Only retry when it is safe: the method is idempotent (RFC 9110 §9.2.2),
@@ -1199,11 +1607,64 @@ private:
                           const std::string &body,
                           const std::map<std::string, std::string> &headers)
   {
+    // Validate the CALLER-supplied headers BEFORE acquiring a lease or
+    // connecting, so a CR/LF-injection value or a non-token name never reaches
+    // the wire and no connection is spent on a doomed request (tracker
+    // 2026-07-26-10 task-1.2 / defect_1 / defect_3). The throw is
+    // HttpInvalidHeaderError (an HttpFramingError), which performRequest rejects
+    // WITHOUT retry — a deterministic caller error is never re-sent. This gate
+    // covers ONLY the caller `headers` map; the library's own Host / Content-
+    // Length / Content-Type are emitted downstream, after this point (task-1.1
+    // FLAG-2). The error message never echoes the raw invalid value (it could
+    // carry the control octets), and echoes the name only after it validated.
+    for (const auto &namedHeader : headers)
+    {
+      if (!isValidHttpFieldName(namedHeader.first))
+      {
+        throw HttpInvalidHeaderError(
+            "caller-supplied request header name is not a valid RFC 9110 token");
+      }
+      if (!isValidHttpFieldValue(namedHeader.second))
+      {
+        throw HttpInvalidHeaderError(
+            "caller-supplied request header value contains a forbidden octet: '" +
+            namedHeader.first + "'");
+      }
+      // Reject the framing/connection-control fields HttpClient emits itself.
+      // A caller-supplied Host / Content-Length / Connection / Transfer-Encoding
+      // / TE / Trailer / Upgrade / Expect would produce a duplicate or
+      // conflicting framing field (CL/CL and TE.CL desync, RFC 9112 §6.1-§6.3;
+      // a second Host, §3.2) — the request-smuggling primitive this guard
+      // closes. Matched case-INSENSITIVELY: the caller map is case-sensitive, so
+      // a mixed-case name would otherwise slip past. THROW is safe for every
+      // in-tree caller (task-1.1 sweep found none supplies these); content-coding
+      // is intentionally NOT rejected here (task-1.1 FLAG-1). See
+      // isFramingControlledHeaderName (tracker 2026-07-26-10 task-1.3 / defect_2
+      // / defect_4).
+      if (isFramingControlledHeaderName(namedHeader.first))
+      {
+        throw HttpInvalidHeaderError(
+            "caller supplied a request header HttpClient controls itself; it is "
+            "framing-critical or connection-managed and must not be set by a "
+            "caller: '" +
+            namedHeader.first + "'");
+      }
+    }
+
     auto parsedUrl = parseUrl(url);
     const std::string hostPort = parsedUrl.getHostPort();
 
     // Use normal timeout - optimization will be handled at transport level
     std::chrono::milliseconds sendTimeout = _config.requestTimeout;
+
+    // Whole-exchange deadline (defect_14 / task-1.10): computed ONCE, HERE,
+    // BEFORE the lease/connect, so a slow connect composes with a slow-trickle
+    // body against a single bound. Zero disables it (opt-in). The trip is an
+    // explicit non-retryable throw at the receive-loop top (below); this is only
+    // the anchor time.
+    const bool haveDeadline = _config.totalRequestTimeout.count() > 0;
+    const std::chrono::steady_clock::time_point exchangeDeadline =
+      std::chrono::steady_clock::now() + _config.totalRequestTimeout;
 
     // Acquire the exclusive per-host connection lease for the WHOLE exchange
     // (INV-2: connect, send, receive, parse, eviction). The RAII guard releases
@@ -1357,7 +1818,23 @@ private:
     // broke name-based vhosts and gateways. See formatHostHeaderField for the RFC
     // rule and the documented normalisation deviation.
     request << formatHostHeaderField(parsedUrl.host, parsedUrl.port, parsedUrl.isHttps());
-    request << "User-Agent: " << _config.userAgent << "\r\n";
+    // User-Agent is caller-OVERRIDABLE (task-1.3): emit the library default only
+    // when the caller did not supply its own, so an override yields ONE line
+    // rather than a duplicate. Unlike the framing-critical fields (rejected
+    // above), a caller User-Agent is harmless and defensibly the caller's to set.
+    bool callerSuppliedUserAgent = false;
+    for (const auto &[name, value] : headers)
+    {
+      if (ciEqualsAscii(name, "User-Agent"))
+      {
+        callerSuppliedUserAgent = true;
+        break;
+      }
+    }
+    if (!callerSuppliedUserAgent)
+    {
+      request << "User-Agent: " << _config.userAgent << "\r\n";
+    }
     request << "Connection: " << (_config.reuseConnections ? "keep-alive" : "close") << "\r\n";
 
     // Add custom headers
@@ -1366,10 +1843,18 @@ private:
       request << name << ": " << value << "\r\n";
     }
 
-    // Add body if present
+    // Emit Content-Length for the body. RFC 9110 §8.6: a user agent SHOULD send
+    // Content-Length: 0 for a method whose semantics anticipate content
+    // (POST/PUT/PATCH) even when the body is empty, so the peer does not wait
+    // for a body or mis-frame the exchange (defect_13). A body-less GET/HEAD/etc.
+    // carries no Content-Length, as before.
     if (!body.empty())
     {
       request << "Content-Length: " << body.size() << "\r\n";
+    }
+    else if (methodAnticipatesContent(method))
+    {
+      request << "Content-Length: 0\r\n";
     }
 
     request << "\r\n";
@@ -1424,8 +1909,41 @@ private:
     {
       while (!complete)
       {
+        // WHOLE-EXCHANGE DEADLINE TRIP (task-1.10) — the SOLE trip mechanism, an
+        // explicit check BEFORE receiveSync, evaluated every iteration (which is
+        // also every interim-1xx continuation: frameResponse discards a 1xx and
+        // returns here, so the next byte forces another loop turn). A trickle or
+        // 1xx flood delivers data faster than sendTimeout, so the per-iteration
+        // timeout never fires — only this bound stops it. NON-retryable
+        // (HttpExchangeDeadlineError IS-A HttpFramingError), so an idempotent
+        // trickle GET is not retried and total wall-clock stays ~1x the deadline.
+        if (haveDeadline && std::chrono::steady_clock::now() >= exchangeDeadline)
+        {
+          throw HttpExchangeDeadlineError("HTTP total request deadline exceeded");
+        }
+
         std::size_t len = sizeof(buffer);
-        auto recvResult = _transport->receiveSync(sessionId, buffer, len, sendTimeout);
+        // Clamp the per-iteration receive wait to the remaining budget so a
+        // single receiveSync cannot overshoot the deadline by up to a full
+        // sendTimeout. OVERSHOOT-LIMITER ONLY — never the trip: floor strictly
+        // positive (never hand poll() 0/negative — 0 is the near-zero probe,
+        // negative is block-forever). A Timeout produced by THIS clamp loops back
+        // so the top check throws the non-retryable deadline error, rather than
+        // surfacing as the RETRYABLE HttpResponseTimeoutError (which on an
+        // idempotent method would re-enable the slowloris amplification).
+        std::chrono::milliseconds recvTimeout = sendTimeout;
+        bool clampedByDeadline = false;
+        if (haveDeadline)
+        {
+          const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            exchangeDeadline - std::chrono::steady_clock::now());
+          if (remaining < recvTimeout)
+          {
+            recvTimeout = (remaining.count() > 0) ? remaining : std::chrono::milliseconds(1);
+            clampedByDeadline = true;
+          }
+        }
+        auto recvResult = _transport->receiveSync(sessionId, buffer, len, recvTimeout);
 
         if (recvResult.isOk() && len > 0)
         {
@@ -1439,6 +1957,15 @@ private:
         }
         else if (recvResult.isErr() && recvResult.error().code == TransportError::Timeout)
         {
+          // A timeout produced by the deadline clamp is NOT the per-iteration
+          // silent-server timeout: loop so the top-of-loop deadline check throws
+          // the NON-retryable HttpExchangeDeadlineError (task-1.10). Only a
+          // timeout at the FULL, unclamped sendTimeout is the genuine
+          // silent-server case below.
+          if (clampedByDeadline)
+          {
+            continue;
+          }
           // POSSIBLY-SENT: the request was fully written, so a response-read timeout
           // must stay non-retryable for a non-idempotent method. Typed so a caller
           // classifies it by TYPE, not a substring; message preserved for any legacy
@@ -1564,7 +2091,8 @@ private:
         parseHeaderBlock(data.substr(0, he), resp);
         if (resp.statusCode >= 100 && resp.statusCode < 200)
         {
-          // Interim 1xx response (RFC 9112 §15.2): discard it wholesale and
+          // Interim 1xx response (RFC 9110 §15.2 — RFC 9112 has no §15): discard
+          // it wholesale and
           // continue scanning the remaining bytes for the final response. The
           // discarded bytes do not count against the cap once removed; the scan
           // cursor resets since the buffer shifted.
@@ -1654,16 +2182,12 @@ private:
         std::size_t b = value.find_last_not_of(" \t", end == 0 ? 0 : end - 1);
         if (a != std::string::npos && a < end && b != std::string::npos && b >= a)
         {
-          std::string token = value.substr(a, b - a + 1);
-          std::transform(token.begin(), token.end(), token.begin(),
-                         [](char c)
-                         { return CaseInsensitiveCompare::asciiLower(
-                             static_cast<unsigned char>(c)); });
-          if (token == "close")
+          const std::string token = value.substr(a, b - a + 1);
+          if (ciEqualsAscii(token, "close"))
           {
             return true; // a "close" token wins outright
           }
-          if (token == "keep-alive")
+          if (ciEqualsAscii(token, "keep-alive"))
           {
             sawKeepAlive = true;
           }
@@ -1704,22 +2228,7 @@ private:
     return r.ec == std::errc() && r.ptr == e;
   }
 
-  static bool ciEquals(const std::string &a, const std::string &b)
-  {
-    if (a.size() != b.size())
-    {
-      return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i)
-    {
-      if (CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(a[i])) !=
-          CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(b[i])))
-      {
-        return false;
-      }
-    }
-    return true;
-  }
+  static bool ciEquals(const std::string &a, const std::string &b) { return ciEqualsAscii(a, b); }
 
   /// \brief Parse a Content-Length value, honoring RFC 9112 §6.3 rule 5: a
   /// comma-separated list is valid only if every element is a valid, identical
@@ -1788,8 +2297,11 @@ private:
 
   /// \brief Parse the status line + header fields of \p headerSection into
   /// \p resp, enforcing RFC 9112: HTTP/1.x only (DD-13), reject obs-fold (§5.2),
-  /// reject conflicting duplicate Content-Length (§6.3 rule 5). Throws
-  /// HttpFramingError on any violation.
+  /// reject conflicting duplicate Content-Length (§6.3 rule 5), reject a
+  /// duplicate Transfer-Encoding response field-line (defect_18), and COMBINE
+  /// repeated list-valued field-lines (Content-Encoding / Accept-Encoding) into
+  /// an ordered comma-list (RFC 9110 §5.3, defect_8). Throws HttpFramingError on
+  /// any violation.
   void parseHeaderBlock(const std::string &hs, Response &resp) const
   {
     std::size_t nl = hs.find("\r\n");
@@ -1829,6 +2341,7 @@ private:
     std::size_t pos = nl + 2;
     bool haveCL = false;
     std::string clValue;
+    bool haveTE = false;
     while (pos < hs.size())
     {
       std::size_t lnl = hs.find("\r\n", pos);
@@ -1860,6 +2373,14 @@ private:
         std::size_t b = s.find_last_not_of(" \t");
         s = s.substr(a, b - a + 1);
       };
+      // OWS-before-colon (defect_10): trim(name) removes any trailing SP/HTAB
+      // between the field-name and the colon. RFC 9112 §5.1 requires a SERVER to
+      // reject such whitespace and a PROXY to strip it; a user agent parsing a
+      // RESPONSE accepting it (as here) is lenient, not wrong (recipients strip).
+      // DECISION (task-1.7(c)): ACCEPT with this recorded rationale — a leading
+      // OWS is impossible here (an obs-fold continuation is rejected above at the
+      // SP/HTAB-first-char guard), so trim(name) only ever removes the §5.1
+      // whitespace-before-colon, matching Postel-robust client parsing.
       trim(name);
       trim(value);
       if (ciEquals(name, "Content-Length"))
@@ -1871,7 +2392,32 @@ private:
         haveCL = true;
         clValue = value;
       }
-      resp.headers[name] = value;
+      // Transfer-Encoding response duplicate (defect_18): a client only RECEIVES
+      // responses (never forwards them), so more than one Transfer-Encoding
+      // field-line on a response is overwhelmingly attack or misconfiguration.
+      // REJECT any duplicate (unlike Content-Length, which rejects only a
+      // CONFLICTING value: RFC 9112 §6.1 forbids applying chunked more than once,
+      // so even identical duplicate TE lines are malformed). A SINGLE TE line —
+      // including an internal comma-list like "gzip, chunked" — is unaffected and
+      // frames exactly as before (determineFraming untouched). TE is kept OUT of
+      // isListValuedHeader: this is an independent reject, not the CE combine path.
+      if (ciEquals(name, "Transfer-Encoding"))
+      {
+        if (haveTE)
+        {
+          throw HttpFramingError("more than one Transfer-Encoding response field-line");
+        }
+        haveTE = true;
+      }
+      // Combine repeated list-valued response field-lines into an ordered
+      // comma-list (defect_8): Content-Encoding / Accept-Encoding are #list-valued
+      // (RFC 9110 §5.3/§8.4), so "Content-Encoding: gzip" then
+      // "Content-Encoding: identity" must present as "gzip, identity" (arrival
+      // order preserved, so a decoder strips codings outermost-first), NOT
+      // last-wins "identity". The shared allow-list-driven helper keeps every
+      // non-list field (incl. the singleton Content-Length checked above)
+      // last-wins, so this changes only list-valued duplicates.
+      detail::addOrCombineHeader(resp.headers, name, value);
       pos = (lnl == std::string::npos) ? hs.size() : lnl + 2;
     }
   }

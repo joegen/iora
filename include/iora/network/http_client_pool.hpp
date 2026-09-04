@@ -229,16 +229,32 @@ public:
     /// Enable gzip compression
     bool enableCompression = false;
 
-    /// Follow HTTP redirects
-    bool followRedirects = true;
+    /// Whole-exchange deadline mirrored onto each pooled HttpClient
+    /// (HttpClient::Config::totalRequestTimeout). Zero (the default) disables the
+    /// bound (opt-in). A pooled consumer sets this to harden against a
+    /// client-side slowloris; it is the pool's opt-in path for defect_14
+    /// (tracker 2026-07-26-10 task-1.10 — the client field alone was
+    /// unreachable through the pool).
+    std::chrono::milliseconds totalRequestTimeout{0};
 
-    /// Maximum number of redirects to follow
+    /// RESERVED AND INERT (defect_5): neither the pool nor HttpClient follows
+    /// redirects — no Location / 3xx logic exists. These two fields are retained
+    /// only for source/ABI stability and are copied onto each client's
+    /// (also inert) fields; nothing reads them. followRedirects defaults FALSE so
+    /// the config does not advertise a capability that does not exist (it
+    /// formerly defaulted true and overwrote the client's corrected default).
+    bool followRedirects = false;
+
+    /// RESERVED AND INERT (defect_5) — see followRedirects above.
     int maxRedirects = 5;
 
     /// User agent string
     std::string userAgent = "Iora-HttpClientPool/1.0";
 
-    /// Default headers applied to all requests
+    /// RESERVED AND INERT: declared for source/ABI stability but not applied —
+    /// the pool does not inject default headers onto pooled clients' requests
+    /// (no code reads this). Do not rely on it; set headers per-request instead
+    /// (tracker 2026-07-26-10 task-1.8 review, cpp17 L3).
     std::map<std::string, std::string> defaultHeaders{};
 
     /// Optional factory for custom client creation
@@ -451,6 +467,7 @@ private:
       HttpClient::Config clientConfig;
       clientConfig.requestTimeout = _config.requestTimeout;
       clientConfig.connectTimeout = _config.connectionTimeout;
+      clientConfig.totalRequestTimeout = _config.totalRequestTimeout;
       clientConfig.followRedirects = _config.followRedirects;
       clientConfig.maxRedirects = _config.maxRedirects;
       clientConfig.userAgent = _config.userAgent;

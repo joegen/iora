@@ -66,6 +66,14 @@ set(NETWORK_TESTS
     network/iora_test_http_client_lease
     network/iora_test_http_client_response_framing
     network/iora_test_http_client_host_header
+    network/iora_test_http_client_header_validation
+    network/iora_test_http_client_controlled_fields
+    network/iora_test_http_client_multipart
+    network/iora_test_http_client_parseurl
+    network/iora_test_http_client_response_headers
+    network/iora_test_http_client_redirect_clamp_1xx
+    network/iora_test_http_client_scheme_cache_key
+    network/iora_test_http_client_exchange_deadline
     network/iora_test_http_client_retry
     network/iora_test_http_client_cancel
     network/iora_test_tcp_engine
