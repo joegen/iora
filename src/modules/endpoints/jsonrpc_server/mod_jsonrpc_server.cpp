@@ -35,7 +35,8 @@ public:
   JsonRpcServerPlugin(iora::IoraService *service)
       : Plugin(service), _enabled(true), _path("/rpc"), _maxRequestBytes(1 * 1024 * 1024),
         _maxBatchItems(50), _requireAuth(false), _timeoutMs(5000), _logRequests(false),
-        _enableMetrics(true)
+        _enableMetrics(true), _enableRequestDecompression(false),
+        _enableResponseCompression(false), _compressionThreshold(1024)
   {
   }
 
@@ -65,6 +66,16 @@ public:
           _logRequests = *v;
         if (auto v = loader->getBool("iora.modules.jsonrpc_server.enableMetrics"))
           _enableMetrics = *v;
+        // Negotiated gzip compression (Consumer C). enableRequestDecompression
+        // gates only DECODING — the request Content-Encoding is examined
+        // regardless (phase 2). The behavior these drive lands in phase 2; the
+        // fields + their config keys are established here at foundation stage.
+        if (auto v = loader->getBool("iora.modules.jsonrpc_server.enableRequestDecompression"))
+          _enableRequestDecompression = *v;
+        if (auto v = loader->getBool("iora.modules.jsonrpc_server.enableResponseCompression"))
+          _enableResponseCompression = *v;
+        if (auto v = loader->getInt("iora.modules.jsonrpc_server.compressionThreshold"))
+          _compressionThreshold = static_cast<std::size_t>(*v);
 
         iora::core::Logger::info("JSON-RPC server plugin configured: path=" + _path +
                                  ", auth=" + (_requireAuth ? "true" : "false") +
@@ -142,6 +153,28 @@ public:
                        });
 
     service->exportApi(*this, "jsonrpc.resetStats", [this]() -> void { _router.resetStats(); });
+
+    // Config-introspection seam. The plugin class is compiled only into the .so
+    // (never header-visible), so a friend test-access struct or public getters —
+    // the two seams the client uses — are unreachable across the .so boundary. An
+    // exported readback is the .so-boundary equivalent of "public const getters"
+    // (mirroring jsonrpc.getStats) and lets a test assert the effective config,
+    // including the negotiated-gzip defaults, after loadSingleModule -> onLoad.
+    service->exportApi(*this, "jsonrpc.getConfig",
+                       [this]() -> iora::parsers::Json
+                       {
+                         auto cfg = iora::parsers::Json::object();
+                         cfg["path"] = _path;
+                         cfg["maxRequestBytes"] = _maxRequestBytes;
+                         cfg["maxBatchItems"] = _maxBatchItems;
+                         cfg["requireAuth"] = _requireAuth;
+                         cfg["timeoutMs"] = _timeoutMs;
+                         cfg["enableMetrics"] = _enableMetrics;
+                         cfg["enableRequestDecompression"] = _enableRequestDecompression;
+                         cfg["enableResponseCompression"] = _enableResponseCompression;
+                         cfg["compressionThreshold"] = _compressionThreshold;
+                         return cfg;
+                       });
 
     // Mount POST {path} directly on the webhookServer.
     service->webhookServer()->onPost(_path, [this](const iora::network::WebhookServer::Request &req,
@@ -308,6 +341,13 @@ private:
   int _timeoutMs;
   bool _logRequests;
   bool _enableMetrics;
+  // Negotiated gzip compression (Consumer C, arch configSurface.serverFields).
+  // enableRequestDecompression gates DECODING only; the request Content-Encoding
+  // is EXAMINED regardless (phase 2). The decoded/decompressed-input cap reuses
+  // the existing _maxRequestBytes (arch caps.server). Behavior lands in phase 2.
+  bool _enableRequestDecompression;
+  bool _enableResponseCompression;
+  std::size_t _compressionThreshold;
 
   modules::jsonrpc::JsonRpcServer _router;
 };

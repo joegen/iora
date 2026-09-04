@@ -31,6 +31,7 @@
 #include <iora/core/timer.hpp>
 #include <iora/network/http_server.hpp>
 #include <iora/network/sse_stream.hpp>
+#include <iora/parsers/accept_encoding.hpp>
 #include <iora/parsers/html_escape.hpp>
 #include <iora/parsers/json.hpp>
 #include <iora/parsers/mustache.hpp>
@@ -242,7 +243,7 @@ public:
       // deref against any future drift in the gzipVariantExists<->gzipBytes
       // Assets invariant (web L-1).
       const bool serveGzip = blob.gzipVariantExists && blob.gzipBytes.has_value() &&
-                             gzipAcceptable(req.get_header_value("Accept-Encoding"));
+                             iora::parsers::gzipAcceptable(req.get_header_value("Accept-Encoding"));
       const std::string_view selectedEtagRaw = serveGzip ? blob.gzipEtag : blob.rawEtag;
       const std::string selectedQuoted = "\"" + std::string(selectedEtagRaw) + "\"";
       const std::string cacheControl =
@@ -484,34 +485,6 @@ private:
 
   static bool isOws(char c) { return c == ' ' || c == '\t'; }
 
-  static bool asciiIEquals(std::string_view a, std::string_view b)
-  {
-    if (a.size() != b.size())
-    {
-      return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i)
-    {
-      const char ca = asciiLower(a[i]);
-      const char cb = asciiLower(b[i]);
-      if (ca != cb)
-      {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  static char asciiLower(char c)
-  {
-    const unsigned char u = static_cast<unsigned char>(c);
-    if (u >= 'A' && u <= 'Z')
-    {
-      return static_cast<char>(u - 'A' + 'a');
-    }
-    return c;
-  }
-
   /// \brief True iff the path has a ".." path segment (split on '/').
   static bool hasDotDotSegment(std::string_view path)
   {
@@ -532,126 +505,6 @@ private:
       start = slash + 1;
     }
     return false;
-  }
-
-  /// \brief RFC 9110 §12.5.3 Accept-Encoding acceptability for gzip (q-values).
-  /// gzip acceptable iff an explicit 'gzip' entry (else '*') has a non-zero
-  /// qvalue; absent header / q=0 -> identity. NOT a naive contains() (web L-1).
-  static bool gzipAcceptable(std::string_view ae)
-  {
-    if (trimView(ae).empty())
-    {
-      return false;
-    }
-    std::optional<double> gzipQ;
-    std::optional<double> starQ;
-    std::size_t pos = 0;
-    while (pos <= ae.size())
-    {
-      const std::size_t comma = ae.find(',', pos);
-      const std::string_view entry =
-        (comma == std::string_view::npos) ? ae.substr(pos) : ae.substr(pos, comma - pos);
-      pos = (comma == std::string_view::npos) ? ae.size() + 1 : comma + 1;
-
-      const std::size_t semi = entry.find(';');
-      const std::string_view coding = trimView(entry.substr(0, semi));
-      double q = 1.0;
-      if (semi != std::string_view::npos)
-      {
-        q = qValueOf(entry.substr(semi + 1));
-      }
-      if (asciiIEquals(coding, "gzip"))
-      {
-        gzipQ = q;
-      }
-      else if (coding == "*")
-      {
-        starQ = q;
-      }
-    }
-    const double eff = gzipQ ? *gzipQ : (starQ ? *starQ : 0.0);
-    return eff > 0.0;
-  }
-
-  /// \brief Parse the q-value from a ';'-separated parameter list. Absent q ->
-  /// 1.0 (a coding with no q defaults to q=1, RFC 9110 §12.5.3). A present but
-  /// MALFORMED / out-of-range q -> 0.0 (treated as not-acceptable, the
-  /// conservative choice — a garbage q must never enable a coding).
-  static double qValueOf(std::string_view params)
-  {
-    std::size_t pos = 0;
-    while (pos <= params.size())
-    {
-      const std::size_t semi = params.find(';', pos);
-      const std::string_view param =
-        (semi == std::string_view::npos) ? params.substr(pos) : params.substr(pos, semi - pos);
-      pos = (semi == std::string_view::npos) ? params.size() + 1 : semi + 1;
-
-      const std::size_t eq = param.find('=');
-      if (eq == std::string_view::npos)
-      {
-        continue;
-      }
-      const std::string_view name = trimView(param.substr(0, eq));
-      if (asciiIEquals(name, "q"))
-      {
-        return parseQValue(trimView(param.substr(eq + 1)));
-      }
-    }
-    return 1.0; // no explicit q -> q=1
-  }
-
-  /// \brief Locale-INDEPENDENT RFC 9110 §12.5.3 qvalue parse: ( "0" [ "."
-  /// 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] ). Returns the value in [0,1], or
-  /// 0.0 for any malformed / out-of-range input (NOT std::stod, which is
-  /// locale-sensitive and accepts scientific/out-of-range forms).
-  static double parseQValue(std::string_view v)
-  {
-    if (v.empty())
-    {
-      return 0.0;
-    }
-    double whole;
-    if (v[0] == '0')
-    {
-      whole = 0.0;
-    }
-    else if (v[0] == '1')
-    {
-      whole = 1.0;
-    }
-    else
-    {
-      return 0.0; // invalid leading digit
-    }
-    double frac = 0.0;
-    double scale = 0.1;
-    std::size_t i = 1;
-    if (i < v.size())
-    {
-      if (v[i] != '.')
-      {
-        return 0.0; // junk after the leading digit
-      }
-      ++i;
-      int digits = 0;
-      for (; i < v.size(); ++i, ++digits)
-      {
-        const char c = v[i];
-        if (c < '0' || c > '9' || digits >= 3)
-        {
-          return 0.0; // non-digit or >3 fractional digits (grammar violation)
-        }
-        frac += static_cast<double>(c - '0') * scale;
-        scale *= 0.1;
-      }
-    }
-    const double q = whole + frac;
-    if (q > 1.0)
-    {
-      return 0.0; // out of range (e.g. "1.5") is invalid -> not acceptable
-    }
-    return q;
   }
 
   /// \brief If-None-Match evaluation (RFC 9110 §13.1.2 weak comparison) against

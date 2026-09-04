@@ -133,6 +133,38 @@ private:
   iora::parsers::Json _data;
 };
 
+/// \brief Thrown by the request-compression wrapper when the SERVER rejects our
+/// request content-coding: sendJson_ read Response{status==415} on a request the
+/// client had compressed (Content-Encoding: gzip), so the wrapper must retry the
+/// request uncompressed and latch compression off for the origin (DP-3/DP-4).
+///
+/// Deliberately a STANDALONE type deriving directly from std::runtime_error:
+///   * NOT a JsonRpcError — a generic catch(JsonRpcError) must not intercept it
+///     before the compression wrapper (which sits outside sendJsonWithRetries_)
+///     gets to handle the fallback.
+///   * NOT an HttpRequestNotSentError / HttpClientCancelledError — a 415 is a
+///     successful round trip, so isRequestProvablyNotSent (http_client.hpp:577,
+///     a dynamic_cast over HttpRequestNotSentError) correctly returns false for
+///     it and the not-sent retry gate leaves it to the bare rethrow.
+///   * WITHOUT an Http* prefix — an Http-prefixed type in namespace connectors
+///     would falsely signal membership in the iora::network Http*Error family
+///     (defined in http_client.hpp); this type is raised AND caught only here.
+/// Carries the origin so the wrapper can latch that origin off.
+class ContentCodingRejectedError : public std::runtime_error
+{
+public:
+  ContentCodingRejectedError(std::string origin, const std::string &what)
+      : std::runtime_error(what), _origin(std::move(origin))
+  {
+  }
+
+  /// \brief The origin (scheme://host:port) whose request compression must latch off.
+  const std::string &origin() const noexcept { return _origin; }
+
+private:
+  std::string _origin;
+};
+
 /// \brief JSON-RPC client configuration.
 struct Config
 {
@@ -247,6 +279,88 @@ struct Config
   /// the factory received.
   std::function<void(const std::string &origin, iora::network::HttpClient &client)>
     httpClientConfigurer{};
+
+  // ── negotiated gzip compression (Consumer C) ───────────────────────────────
+  // First-class per-origin switches (arch configSurface.clientFields). These are
+  // JsonRpcClient's OWN config; do NOT reach for HttpClientPool::Config::
+  // enableCompression (a different, unused class — per-origin design).
+
+  /// \brief Master switch: compress client->server REQUEST bodies (over
+  /// compressionThreshold) with Content-Encoding: gzip. Per-origin runtime
+  /// capability is tracked in the request-compression state cache; this is the
+  /// configured intent. Default false. The compress path itself lands in phase 2.
+  bool enableRequestCompression{false};
+
+  /// \brief Emit `Accept-Encoding: gzip` (single line, identity implicit) so the
+  /// server MAY compress responses, and enable client response-decode. Default true.
+  /// NOTE: this default is INERT scaffolding at foundation stage — there is no
+  /// emit site yet. Its actual emit AND the response-decode path MUST land TOGETHER
+  /// in phase 3 (advertising a coding the client cannot yet inflate would be a
+  /// regression); recorded here as a coordination guard.
+  bool advertiseAcceptEncoding{true};
+
+  /// \brief Minimum REQUEST-body size (bytes) to attempt request compression;
+  /// sub-threshold bodies are sent identity (tiny envelopes expand or break even).
+  /// Default 1024.
+  std::size_t compressionThreshold{1024};
+
+  /// \brief Client RESPONSE-decode cap: the maxOutputBytes passed to
+  /// Gzip::decompress AND (phase 3) the aligned parse cap — sendJson_ passes a
+  /// JsonConfig whose maxPayloadSize == this value for EVERY response parse
+  /// (decoded AND identity), making it the single encoding-transparent decoded/JSON
+  /// ceiling. DISTINCT from HttpClient::Config::maxResponseBytes and
+  /// jsonConfig.maxPayloadSize (which bound the COMPRESSED wire bytes). Default 16 MiB.
+  std::size_t maxDecodedResponseBytes{16 * 1024 * 1024};
+};
+
+/// \brief Per-origin request-compression negotiation state (arch capabilityCache).
+///
+/// Holds MUTABLE negotiation state (not a passive capability lookup): whether the
+/// origin is configured request-capable, whether a 415-on-compressed has latched
+/// compression OFF, when that latch may be re-probed, and an optional DP-2 pre-seed
+/// from a server response Accept-Encoding. NAMESPACE-SCOPE (public) so tests can
+/// construct it directly. The write sites (latch on 415, TTL re-probe) land in
+/// phase 2; foundation defines the type + the owning cache member only.
+///
+/// CONCURRENCY CONTRACT (two SEPARATE concerns — do not conflate them in phase 2):
+///   (1) VALUE-level: losing a negotiation update (a {latchedOff, ttlExpiry} write)
+///       to a concurrent last-writer is acceptable — the cost is at worst one
+///       redundant 415. When phase 2 writes the pair, publish BOTH fields together
+///       so a concurrent reader never sees latchedOff without its matching ttlExpiry.
+///   (2) CONTAINER-level: the map's structural mutation is NOT covered by (1). The
+///       owning cache is a std::unordered_map, so inserting a new origin key
+///       concurrently with any other access can rehash and race bucket/node
+///       structure — undefined behavior, NOT benign last-writer-wins. The container
+///       access MUST be serialized regardless of the value-level tolerance. An
+///       atomic on a value field CANNOT make the container safe, so "atomic flag
+///       alone" is NOT a viable option.
+/// The phase-2 write sites decide the serialization WITH the thread-safety auditor;
+/// the actually-viable options are: a mutex guarding the map (a dedicated leaf mutex,
+/// or the class _mutex only if the write sites never hold it across a callback or a
+/// ConnectionLease destruction — see the _mutex lock contract), or
+/// iora::core::ConcurrentHashMap (the project's sharded-lock keyed-state primitive).
+struct OriginRequestCompressionState
+{
+  /// \brief Default re-probe interval: after a 415 latch-off, an origin is
+  /// re-probed once ttlExpiry passes, so a re-configured/upgraded server recovers.
+  /// A compile-time DURATION constant (300 s) — DISTINCT from the ttlExpiry
+  /// time_point field below (which is a concrete now()+kRequestCompressionTtl).
+  static constexpr std::chrono::seconds kRequestCompressionTtl{300};
+
+  /// \brief Configured intent for this origin (from Config::enableRequestCompression).
+  bool configuredRequestCapable{false};
+
+  /// \brief Set true after a 415-on-compressed; suppresses further compression
+  /// until ttlExpiry.
+  bool latchedOff{false};
+
+  /// \brief Re-probe boundary: when latchedOff, compression stays off until now()
+  /// reaches this point (== the 415 time + kRequestCompressionTtl).
+  std::chrono::steady_clock::time_point ttlExpiry{};
+
+  /// \brief Optional DP-2 pre-seed: a server that proactively advertised
+  /// Accept-Encoding on a normal response lets the cache skip the first-request 415.
+  std::optional<bool> seededServerAcceptsGzip{};
 };
 
 /// \brief JSON-RPC client statistics.
@@ -2647,6 +2761,21 @@ private:
   // removed from the map stays well-defined instead of dereferencing freed
   // memory.
   std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>> _pools;
+
+  // Per-origin request-compression negotiation state (arch capabilityCache),
+  // keyed by origin like _pools / makeHttpClient_(origin). SCAFFOLD-ONLY at
+  // foundation stage: no reader or writer touches it yet, so it is NOT listed in
+  // the _mutex "WHAT _mutex GUARDS" enumeration below and is guarded by nothing.
+  // The phase-2 write sites (latch-off on a 415, TTL re-probe) and the
+  // serialization decision for them land with the request-direction tracker, NOT
+  // here — see OriginRequestCompressionState's CONCURRENCY CONTRACT: the container
+  // mutation MUST be serialized (an unordered_map insert/rehash race is UB; the
+  // value-level last-writer-wins tolerance does NOT extend to it, and "atomic flag
+  // alone" is insufficient). IF phase 2 chooses to guard this map with _mutex, it
+  // MUST add _requestCompressionState to the _mutex enumeration below in the SAME
+  // edit that adds the write sites.
+  std::unordered_map<std::string, OriginRequestCompressionState> _requestCompressionState;
+
   // ==========================================================================
   // THE LOCK CONTRACT FOR _mutex (HR-2 — the full rule set, task-3.6 + task-8.4).
   // This is the authoritative statement; it ADDS to (never overwrites) the

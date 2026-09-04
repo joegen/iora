@@ -15,6 +15,25 @@ add_dependencies(iora_test_mod_jsonrpc_client_server_real
 add_test(NAME JsonRpcClientServerRealTest COMMAND iora_test_mod_jsonrpc_client_server_real)
 
 # ---------------------------------------------------------------------------
+# JSON-RPC negotiated-gzip Consumer C — foundation slice (tracker 2026-09-04-2).
+# Constructs the client types directly (includes jsonrpc_client.hpp one dir up)
+# and loads the server .so to read back its config defaults via the
+# jsonrpc.getConfig seam, so it depends on mod_jsonrpc_server. Binds the
+# IoraService server port (8138) for the seam case — RESOURCE_LOCK it against the
+# other jsonrpc port-binding tests.
+# ---------------------------------------------------------------------------
+create_iora_test_target(iora_test_jsonrpc_gzip_foundation
+    SOURCES iora_test_jsonrpc_gzip_foundation.cpp
+)
+target_include_directories(iora_test_jsonrpc_gzip_foundation PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_dependencies(iora_test_jsonrpc_gzip_foundation mod_jsonrpc_server)
+add_test(NAME iora_test_jsonrpc_gzip_foundation
+    COMMAND iora_test_jsonrpc_gzip_foundation)
+set_tests_properties(iora_test_jsonrpc_gzip_foundation PROPERTIES
+    TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+
+# ---------------------------------------------------------------------------
 # Pool lifetime / identity defect repros (tracker 2026-07-26-2, phase 1).
 # Constructs JsonRpcClient directly, so it includes jsonrpc_client.hpp from the
 # parent module directory (task-1.1(f)).

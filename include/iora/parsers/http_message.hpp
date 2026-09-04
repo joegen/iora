@@ -267,10 +267,18 @@ namespace detail
 /// X-Forwarded-Host / X-Forwarded-Proto are deliberately EXCLUDED — they are
 /// single-valued-per-hop, do not accumulate, and the protocol-correct handling of
 /// duplicates is ignore, not comma-join.
+///
+/// Content-Encoding and Accept-Encoding are #list-valued (RFC 9110 §8.4 / §12.5.3):
+/// a conformant sender MAY split them across repeated field-lines, so rejecting or
+/// last-wins-collapsing a multi-line value is non-conformant (§5.3). Combining is
+/// UNBOUNDED here (any number of repeated lines merge); a per-consumer stacked-coding
+/// cap (e.g. the JSON-RPC decode path caps Content-Encoding at <=2) is enforced by
+/// that consumer, and the server's max-header-bytes limit is the backstop against a
+/// pathological repeat for consumers that impose no cap of their own.
 inline bool isListValuedHeader(const std::string &name)
 {
   static const std::set<std::string, CaseInsensitiveCompare> kListValued = {
-    "X-Forwarded-For", "Forwarded", "Via"};
+    "X-Forwarded-For", "Forwarded", "Via", "Content-Encoding", "Accept-Encoding"};
   return kListValued.count(name) != 0;
 }
 
