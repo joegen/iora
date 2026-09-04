@@ -8,9 +8,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "iora/iora.hpp"
+#include "iora/core/string_utils.hpp" // StringUtils::iequals/trim (content-coding parse)
+#include "iora/util/gzip.hpp"         // request-body gzip decode (Consumer C, phase 2)
 
 namespace iora
 {
@@ -183,6 +187,42 @@ public:
   }
 
 private:
+  /// \brief Emit a JSON-RPC 2.0 error envelope on \p res with the given HTTP
+  /// \p status and JSON-RPC \p code/\p message. DRYs handlePost's error sites so
+  /// the envelope shape cannot drift between them (simplification L5).
+  /// CONTRACT: \p message MUST be a trusted, JSON-safe literal (no '"' or '\\' or
+  /// control octets) — it is interpolated verbatim, NOT escaped. Every caller here
+  /// passes a compile-time literal. If an untrusted/dynamic string is ever emitted,
+  /// escape it first (do NOT pass it through this helper raw).
+  static void setJsonRpcError_(iora::network::WebhookServer::Response &res, int status, int code,
+                               const std::string &message)
+  {
+    res.status = status;
+    res.set_content("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":" + std::to_string(code) +
+                      ",\"message\":\"" + message + "\"},\"id\":null}",
+                    "application/json");
+  }
+
+  /// \brief Split an (already combined, RFC 9110 §5.3) Content-Encoding value into
+  /// ordered, OWS-trimmed coding tokens, skipping empty/whitespace-only elements
+  /// (RFC 9110 §5.6.1 — a legal consequence of comma-combining, e.g. "gzip,," or
+  /// ", gzip"). Tokens keep their original case; callers compare case-insensitively
+  /// (RFC 9110 §8.4.1). Reuses the foundation StringUtils::split/trim primitives
+  /// (no hand-rolled comma scan). Consumer C task-1.1.
+  static std::vector<std::string> splitContentCodings_(const std::string &value)
+  {
+    std::vector<std::string> out;
+    for (std::string_view tok : iora::core::StringUtils::split(value, ','))
+    {
+      const std::string_view trimmed = iora::core::StringUtils::trim(tok);
+      if (!trimmed.empty())
+      {
+        out.emplace_back(trimmed);
+      }
+    }
+    return out;
+  }
+
   void handlePost(const iora::network::WebhookServer::Request &req,
                   iora::network::WebhookServer::Response &res)
   {
@@ -197,7 +237,12 @@ private:
     // Set CORS headers if needed
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    // Consumer C DP-10 / task-1.5: allow a cross-origin fetch to manually set
+    // Content-Encoding (it is NOT a Fetch forbidden request-header, so a browser
+    // CAN drive request compression by gzipping the body itself). Do NOT add
+    // Accept-Encoding — it IS a Fetch forbidden request-header a browser cannot set.
+    res.set_header("Access-Control-Allow-Headers",
+                   "Content-Type, Authorization, Content-Encoding");
 
     // Handle preflight OPTIONS request
     if (req.method == iora::network::HttpMethod::OPTIONS)
@@ -211,10 +256,9 @@ private:
       auto it = req.headers.find("Content-Type");
       if (it == req.headers.end() || it->second.find("application/json") == std::string::npos)
       {
-        res.status = 415;
-        res.set_content(
-          R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Unsupported Media Type"},"id":null})",
-          "application/json");
+        // Media-type 415 — deliberately carries NO Accept-Encoding (that header
+        // belongs only to the content-coding 415 below, DP-7 disambiguation).
+        setJsonRpcError_(res, 415, -32600, "Unsupported Media Type");
 
         if (_logRequests)
         {
@@ -227,10 +271,7 @@ private:
     // Logical size guard (webhookServer also caps internally).
     if (req.body.size() > _maxRequestBytes)
     {
-      res.status = 413;
-      res.set_content(
-        R"({"jsonrpc":"2.0","error":{"code":-32600,"message":"Request Entity Too Large"},"id":null})",
-        "application/json");
+      setJsonRpcError_(res, 413, -32600, "Request Entity Too Large");
 
       if (_logRequests)
       {
@@ -259,16 +300,117 @@ private:
 
       if (!subject)
       {
-        res.status = 401;
-        res.set_content(
-          R"({"jsonrpc":"2.0","error":{"code":-32001,"message":"Authentication required"},"id":null})",
-          "application/json");
+        setJsonRpcError_(res, 401, -32001, "Authentication required");
 
         if (_logRequests)
         {
           iora::core::Logger::warning("JSON-RPC request rejected: authentication required");
         }
         return;
+      }
+    }
+
+    // ── Consumer C phase 2: request Content-Encoding handling (DP-6/DP-7, tasks
+    // 1.1-1.4). Runs AFTER auth (task-1.4): an unauthenticated caller must not be
+    // able to force even incrementally-bounded decompression CPU (DoS hardening),
+    // so a bad coding behind a 401 yields 401, never 415/413. The request
+    // Content-Encoding is EXAMINED whenever the request reaches body handling,
+    // INDEPENDENT of _enableRequestDecompression (which gates only whether gzip is
+    // DECODED). The field was already combined into an ordered comma-list on
+    // ingress (foundation isListValuedHeader gate). Pinned step order:
+    // media-type-415 -> size-413 -> auth-401 -> HERE -> route.
+    // The body handed to the router: `req.body` on the common (no-coding / identity)
+    // path with NO copy; a locally-owned inflated buffer only when we actually
+    // decode gzip (simplification M2 — the router takes it by const ref).
+    const std::string *bodyForRouter = &req.body;
+    std::string decoded; // filled only on the inflate path
+    {
+      const auto ceIt = req.headers.find("Content-Encoding");
+      if (ceIt != req.headers.end())
+      {
+        const std::vector<std::string> codings = splitContentCodings_(ceIt->second);
+        if (!codings.empty())
+        {
+          // Whether every coding in the list is one we can strip. gzip/x-gzip is
+          // decodable ONLY when _enableRequestDecompression; identity always is.
+          // The <=2 hard cap is on the TOTAL list length (INTENTIONAL, not just the
+          // gzip-layer count): it bounds the O(N) CPU of a stacked-inflate chain AND
+          // conservatively rejects an 'identity,identity,...,gzip' padding attack
+          // that would otherwise smuggle an over-long list past a gzip-only counter.
+          // An over-cap list is a distinct 'undecodable' outcome (DP-6) -> 415, never
+          // a 500 and never an unbounded inflate.
+          bool hasGzip = false;
+          bool decodable = codings.size() <= 2;
+          if (decodable)
+          {
+            for (const auto &c : codings)
+            {
+              if (iora::core::StringUtils::iequals(c, "identity"))
+              {
+                continue; // no-op coding
+              }
+              // x-gzip is a DECODE-side alias of gzip (RFC 9110 §8.4.1).
+              if (iora::core::StringUtils::iequals(c, "gzip") ||
+                  iora::core::StringUtils::iequals(c, "x-gzip"))
+              {
+                hasGzip = true;
+                continue;
+              }
+              decodable = false; // unknown coding
+              break;
+            }
+          }
+
+          // 415 WITH Accept-Encoding listing the decodable set (identity always;
+          // gzip iff enabled) whenever the request is UNDECODABLE (DP-7) — this is
+          // what makes the client's latch-off fire instead of a silent 200 +
+          // parse-error. The media-type 415 above deliberately carries NO
+          // Accept-Encoding.
+          if (!decodable || (hasGzip && !_enableRequestDecompression))
+          {
+            res.set_header("Accept-Encoding",
+                           _enableRequestDecompression ? "gzip, identity" : "identity");
+            setJsonRpcError_(res, 415, -32600, "Unsupported Content-Encoding");
+            if (_logRequests)
+            {
+              iora::core::Logger::warning(
+                "JSON-RPC request rejected: undecodable Content-Encoding '" + ceIt->second + "'");
+            }
+            return;
+          }
+
+          if (hasGzip)
+          {
+            // Decode OUTERMOST-FIRST (reverse of the applied order). Each inflate is
+            // bounded to _maxRequestBytes — the decoded ceiling, identical to the
+            // identity path (gzip does NOT raise it, arch caps.server).
+            // MALFORMED_INPUT -> 400, OUTPUT_TOO_LARGE -> 413.
+            decoded = req.body; // the one working buffer, allocated only here
+            for (auto rit = codings.rbegin(); rit != codings.rend(); ++rit)
+            {
+              if (iora::core::StringUtils::iequals(*rit, "identity"))
+              {
+                continue; // no-op
+              }
+              auto r = iora::util::Gzip::decompress(decoded, _maxRequestBytes);
+              if (!r.isOk())
+              {
+                if (r.error() == iora::util::Gzip::DecompressError::OUTPUT_TOO_LARGE)
+                {
+                  setJsonRpcError_(res, 413, -32600, "Request Entity Too Large");
+                }
+                else
+                {
+                  setJsonRpcError_(res, 400, -32600, "Malformed Content-Encoding");
+                }
+                return;
+              }
+              decoded = std::move(r).value();
+            }
+            bodyForRouter = &decoded;
+          }
+          // All-identity (or absent gzip) falls through routing req.body directly.
+        }
       }
     }
 
@@ -279,7 +421,7 @@ private:
 
     try
     {
-      std::string out = _router.handleRequest(req.body, ctx, _maxBatchItems);
+      std::string out = _router.handleRequest(*bodyForRouter, ctx, _maxBatchItems);
 
       auto endTime = std::chrono::steady_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -310,20 +452,12 @@ private:
     catch (const std::exception &e)
     {
       iora::core::Logger::error("JSON-RPC internal error: " + std::string(e.what()));
-
-      res.status = 500;
-      res.set_content(
-        R"({"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal server error"},"id":null})",
-        "application/json");
+      setJsonRpcError_(res, 500, -32603, "Internal server error");
     }
     catch (...)
     {
       iora::core::Logger::error("JSON-RPC unknown internal error");
-
-      res.status = 500;
-      res.set_content(
-        R"({"jsonrpc":"2.0","error":{"code":-32603,"message":"Unknown internal error"},"id":null})",
-        "application/json");
+      setJsonRpcError_(res, 500, -32603, "Unknown internal error");
     }
   }
 

@@ -37,8 +37,11 @@
 // folding in mergeHeaders_ — cpp17 LOW-5); not pulled in transitively by iora.hpp.
 #include "iora/core/string_utils.hpp"
 // For iora::network::isHttpToken / isValidFieldValue (RFC 9110 header-name/value
-// grammar reused in the constructor + mergeHeaders_ validation — task-7.3b).
+// grammar reused in the constructor + mergeHeaders_ validation — task-7.3b) and
+// iora::network::normalizeOrigin (the request-compression cache key).
 #include "iora/parsers/http_message.hpp"
+// For iora::util::Gzip::compress — request-body compression (Consumer C phase 2).
+#include "iora/util/gzip.hpp"
 
 namespace iora
 {
@@ -1412,7 +1415,7 @@ private:
       auto lease = acquire_(endpoint);
       iora::parsers::Json req = makeRequestEnvelope_(method, params, nextId_());
       iora::parsers::Json resp =
-        sendJsonWithRetries_(lease.client(), endpoint, req, mergeHeaders_(headers));
+        sendJsonCompressedOrIdentity_(lease.client(), endpoint, req, mergeHeaders_(headers));
       // Count success only AFTER the response parses cleanly: parseResponseOrThrow_
       // throws RemoteError on a JSON-RPC error envelope, which the catch(...) below
       // charges to failedRequests. Incrementing before the parse double-counted an
@@ -1445,7 +1448,7 @@ private:
     {
       auto lease = acquire_(endpoint);
       iora::parsers::Json req = makeNotificationEnvelope_(method, params);
-      (void)sendJsonWithRetries_(lease.client(), endpoint, req, mergeHeaders_(headers));
+      (void)sendJsonCompressedOrIdentity_(lease.client(), endpoint, req, mergeHeaders_(headers));
       _stats.successfulRequests.fetch_add(1, std::memory_order_relaxed);
     }
     catch (const PoolExhaustedError &)
@@ -2561,14 +2564,174 @@ private:
                        "identity and has no decoder for any other coding");
   }
 
+  /// \brief Internal per-request carrier for the request-compression decision
+  /// (Consumer C phase 2). Threaded by reference through the sendJson_ overload so
+  /// the body is compressed AT MOST ONCE and re-sent UNCHANGED across a
+  /// sendJsonWithRetries_ not-sent retry (web M-4: Content-Length is computed once
+  /// over the compressed bytes; do NOT recompress per retry). NOT caller-facing —
+  /// it never appears on sendJson_/sendJsonWithRetries_'s caller-visible signatures.
+  struct RequestCompressionCtl_
+  {
+    std::string origin;         ///< cache key + latch target (normalizeOrigin(url)).
+    bool allow = false;         ///< may this request be compressed at all? (single-call path).
+    bool forceIdentity = false; ///< hard override for the 415 identity re-entry (cpp17 M2).
+    bool decided = false;       ///< has the first attempt made+cached the decision?
+    bool prepared = false;      ///< ctl.body holds the exact bytes to send (compressed OR identity).
+    bool compressed = false;    ///< decision outcome (memoized): body carries gzip.
+    std::string body;           ///< the exact bytes to (re)send, memoized once when prepared.
+  };
+
+  /// \brief Decide whether to compress a request to \p origin now, mutating the
+  /// per-origin state under the dedicated leaf mutex (arch capabilityCache): an
+  /// origin latched off by a prior 415 stays off until its TTL elapses, at which
+  /// point the latch resets so a re-configured/upgraded server is re-probed. The
+  /// unordered_map access (insert-if-absent may rehash) MUST be serialized — the
+  /// value-level last-writer tolerance does NOT extend to the container.
+  bool shouldCompressOrigin_(const std::string &origin)
+  {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(_requestCompressionMutex);
+    OriginRequestCompressionState &st = _requestCompressionState[origin];
+    if (st.latchedOff)
+    {
+      if (now >= st.ttlExpiry)
+      {
+        st.latchedOff = false; // TTL elapsed -> re-probe this origin
+        return true;
+      }
+      return false; // still latched off
+    }
+    return true;
+  }
+
+  /// \brief Latch request compression OFF for \p origin after a 415-on-compressed,
+  /// with a re-probe boundary kRequestCompressionTtl in the future. Publishes
+  /// latchedOff and ttlExpiry TOGETHER under the leaf mutex so a concurrent reader
+  /// never sees latchedOff without its matching ttlExpiry (concurrency contract).
+  void latchOff_(const std::string &origin)
+  {
+    const auto expiry =
+      std::chrono::steady_clock::now() + OriginRequestCompressionState::kRequestCompressionTtl;
+    std::lock_guard<std::mutex> lk(_requestCompressionMutex);
+    OriginRequestCompressionState &st = _requestCompressionState[origin];
+    st.latchedOff = true;
+    st.ttlExpiry = expiry;
+  }
+
+  /// \brief Identity-only send (no request compression). The 4-arg form used by
+  /// the batch path (which is NOT covered by the 415 safety-net); it delegates to
+  /// the compression-aware overload with allow=false so batch bodies are never
+  /// compressed and never raise ContentCodingRejectedError.
   iora::parsers::Json sendJson_(iora::network::HttpClient &http, const std::string &url,
                                 const iora::parsers::Json &payload,
                                 const std::map<std::string, std::string> &headerMap)
   {
-    auto response = http.postJson(
-      url, payload, headerMap, 0); // No retries at HTTP level - retries handled by JSON-RPC client
+    RequestCompressionCtl_ ctl; // allow=false -> identity
+    return sendJson_(http, url, payload, headerMap, ctl);
+  }
+
+  /// \brief Send one JSON-RPC request, OWNING the request-compression decision
+  /// (cpp17 M1): on the FIRST attempt it reads _config + the per-origin state and,
+  /// when compression is allowed and enabled and the serialized body exceeds the
+  /// threshold and the origin is not latched off, gzips the body ONCE and memoizes
+  /// it in \p ctl; a not-sent retry re-sends those same bytes. The client sets its
+  /// OWN Content-Type + Content-Encoding on the internal string-body post() path —
+  /// NOT through mergeHeaders_/validateHeaderOrThrow_ — so the caller reject-list
+  /// (DP-8) that rejects a caller-supplied Content-Encoding is preserved and the
+  /// self-set header is not self-rejected. Compression completes BEFORE post()
+  /// computes Content-Length (over the compressed bytes). When (and only when) the
+  /// request was compressed and the raw response is 415, it throws
+  /// ContentCodingRejectedError BEFORE decode/parse (DP-4) so the outer wrapper can
+  /// latch off and retry identity — never via message-text matching.
+  iora::parsers::Json sendJson_(iora::network::HttpClient &http, const std::string &url,
+                                const iora::parsers::Json &payload,
+                                const std::map<std::string, std::string> &headerMap,
+                                RequestCompressionCtl_ &ctl)
+  {
+    if (!ctl.decided)
+    {
+      ctl.decided = true;
+      if (ctl.allow && !ctl.forceIdentity && _config.enableRequestCompression)
+      {
+        // Serialize ONCE (simplification L3): the same bytes are either gzipped
+        // and sent, or sent as-is via the string-body route — no second dump on
+        // the sub-threshold / latched-off identity path.
+        std::string dumped = payload.dump();
+        if (dumped.size() > _config.compressionThreshold && shouldCompressOrigin_(ctl.origin))
+        {
+          ctl.body = iora::util::Gzip::compress(dumped);
+          ctl.compressed = true;
+        }
+        else
+        {
+          ctl.body = std::move(dumped); // memoized identity bytes
+        }
+        ctl.prepared = true; // ctl.body now holds the exact bytes to (re)send
+      }
+    }
+
+    iora::network::HttpClient::Response response;
+    if (ctl.prepared)
+    {
+      // Compression-enabled path (compressed or identity): the string-body post()
+      // route computes Content-Length over ctl.body (the compressed bytes when
+      // gzipped — DP-11). Content-Type/Content-Encoding are self-set here, NOT via
+      // mergeHeaders_, so the caller reject-list (DP-8) is preserved.
+      std::map<std::string, std::string> sendHeaders = headerMap;
+      sendHeaders["Content-Type"] = "application/json";
+      if (ctl.compressed)
+      {
+        sendHeaders["Content-Encoding"] = "gzip";
+      }
+      response = http.post(url, ctl.body, sendHeaders, 0);
+    }
+    else
+    {
+      // Batch / compression-disabled / the forceIdentity 415 re-entry: unchanged
+      // postJson path (the retained uncompressed body for a re-entry is `payload`).
+      response = http.postJson(url, payload, headerMap, 0);
+    }
+
+    // DP-4 / task-2.2: read a 415 on the RAW response BEFORE decode/parse — but
+    // ONLY when we compressed (an identity 415, e.g. media-type, is not our coding
+    // being refused and must flow to parseJsonOrThrow's generic non-2xx throw).
+    // parseJsonOrThrow throws on any non-2xx, and a non-conformant 415 carrying
+    // Content-Encoding could otherwise make verifyResponseContentEncoding_ throw
+    // first, so the status read precedes both.
+    if (ctl.compressed && response.statusCode == 415)
+    {
+      throw ContentCodingRejectedError(
+        ctl.origin, "JsonRpcClient: server rejected request Content-Encoding: gzip (415)");
+    }
+
     verifyResponseContentEncoding_(response); // task-7.2c: fail before parse on a bad coding
     return iora::network::HttpClient::parseJsonOrThrow(response);
+  }
+
+  /// \brief Single-call compression wrapper (task-2.3) — sits OUTSIDE
+  /// sendJsonWithRetries_. On the first send the request may be compressed; if the
+  /// server refuses the coding (415 -> ContentCodingRejectedError, propagated
+  /// unmodified through the not-sent gate), latch the origin off and re-enter ONCE
+  /// forcing identity via an EXPLICIT flag — NOT by re-reading latchedOff, whose
+  /// concurrent TTL-expiry reset could otherwise re-compress and draw a second 415
+  /// (cpp17 M2). If the identity re-entry itself 415s (e.g. a genuine media-type
+  /// 415), sendJson_ does not throw ContentCodingRejectedError on an uncompressed
+  /// request, so it surfaces as a normal error and does NOT loop again (bounded
+  /// once — cpp17 M5 / web L-2).
+  iora::parsers::Json
+  sendJsonCompressedOrIdentity_(iora::network::HttpClient &http, const std::string &url,
+                                const iora::parsers::Json &payload,
+                                const std::vector<std::pair<std::string, std::string>> &headers)
+  {
+    try
+    {
+      return sendJsonWithRetries_(http, url, payload, headers, /*forceIdentity=*/false);
+    }
+    catch (const ContentCodingRejectedError &e)
+    {
+      latchOff_(e.origin());
+      return sendJsonWithRetries_(http, url, payload, headers, /*forceIdentity=*/true);
+    }
   }
 
   /// \brief True if \p e is a transport TIMEOUT that ClientStats::timeoutRequests
@@ -2598,13 +2761,31 @@ private:
   iora::parsers::Json
   sendJsonWithRetries_(iora::network::HttpClient &http, const std::string &url,
                        const iora::parsers::Json &payload,
-                       const std::vector<std::pair<std::string, std::string>> &headers)
+                       const std::vector<std::pair<std::string, std::string>> &headers,
+                       bool forceIdentity = false)
   {
     std::size_t attempts = 0;
     std::chrono::milliseconds delay = _config.initialRetryDelay;
     // Built once, reused by every attempt (simpl LOW-5 / iteration 2): the header set does not
     // change between retries.
     const auto headerMap = toHeaderMap_(headers);
+
+    // Request-compression carrier (Consumer C phase 2), built once so the body is
+    // compressed AT MOST once and re-sent UNCHANGED across not-sent retries (web
+    // M-4). forceIdentity=true (the outer wrapper's identity re-entry) sends
+    // identity regardless of config/latch. On the single-call path allow=true;
+    // the batch path never reaches here (it calls the 4-arg sendJson_).
+    RequestCompressionCtl_ ctl;
+    ctl.allow = true;
+    ctl.forceIdentity = forceIdentity;
+    // origin is only read on the compression path; skip the parse (already done by
+    // acquire_ for the identical URL) when compression is off — the default
+    // (simplification L2). normalizeOrigin cannot throw here that acquire_ did not
+    // already throw on the same string.
+    if (_config.enableRequestCompression)
+    {
+      ctl.origin = iora::network::normalizeOrigin(url);
+    }
 
     while (true)
     {
@@ -2616,7 +2797,7 @@ private:
       }
       try
       {
-        return sendJson_(http, url, payload, headerMap);
+        return sendJson_(http, url, payload, headerMap, ctl);
       }
       // Retry gate (tracker 2026-09-03-2): every JSON-RPC call is a non-idempotent
       // POST, so retry ONLY a PROVABLY-NOT-SENT failure — HttpRequestNotSentError
@@ -2763,17 +2944,19 @@ private:
   std::unordered_map<std::string, std::shared_ptr<detail::EndpointPool>> _pools;
 
   // Per-origin request-compression negotiation state (arch capabilityCache),
-  // keyed by origin like _pools / makeHttpClient_(origin). SCAFFOLD-ONLY at
-  // foundation stage: no reader or writer touches it yet, so it is NOT listed in
-  // the _mutex "WHAT _mutex GUARDS" enumeration below and is guarded by nothing.
-  // The phase-2 write sites (latch-off on a 415, TTL re-probe) and the
-  // serialization decision for them land with the request-direction tracker, NOT
-  // here — see OriginRequestCompressionState's CONCURRENCY CONTRACT: the container
-  // mutation MUST be serialized (an unordered_map insert/rehash race is UB; the
-  // value-level last-writer-wins tolerance does NOT extend to it, and "atomic flag
-  // alone" is insufficient). IF phase 2 chooses to guard this map with _mutex, it
-  // MUST add _requestCompressionState to the _mutex enumeration below in the SAME
-  // edit that adds the write sites.
+  // keyed by origin like _pools / makeHttpClient_(origin). Phase 2 (request
+  // direction) guards it with a DEDICATED LEAF mutex (_requestCompressionMutex
+  // below), NOT the class _mutex: the read (shouldCompressOrigin_) and write
+  // (latchOff_) sites run on the send path with the class _mutex RELEASED and hold
+  // NO other lock and invoke NO callback while holding this leaf mutex, so it never
+  // participates in the _mutex lock-ordering contract. This satisfies the
+  // container-serialization requirement of OriginRequestCompressionState's
+  // CONCURRENCY CONTRACT (an unordered_map insert/rehash race is UB — the
+  // value-level last-writer tolerance does NOT extend to the container, and "atomic
+  // flag alone" is insufficient) while keeping value-level last-writer-wins
+  // (a redundant extra 415 at worst). It is therefore deliberately NOT in the
+  // _mutex "WHAT _mutex GUARDS" enumeration below.
+  mutable std::mutex _requestCompressionMutex;
   std::unordered_map<std::string, OriginRequestCompressionState> _requestCompressionState;
 
   // ==========================================================================

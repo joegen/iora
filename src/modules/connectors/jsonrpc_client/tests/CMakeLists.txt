@@ -34,6 +34,39 @@ set_tests_properties(iora_test_jsonrpc_gzip_foundation PROPERTIES
     TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
 
 # ---------------------------------------------------------------------------
+# JSON-RPC negotiated-gzip Consumer C — request direction (tracker 2026-09-04-3).
+# Real client + real server round-trip: the client compresses request bodies and
+# the server decodes them, plus the 415 safety-net (latch-off + TTL re-probe).
+# Constructs JsonRpcClient directly (includes jsonrpc_client.hpp one dir up) and
+# drives the real mod_jsonrpc_server .so through the webhookServer, so it depends
+# on mod_jsonrpc_server. Binds a server port — RESOURCE_LOCK it against the other
+# jsonrpc port-binding tests.
+# ---------------------------------------------------------------------------
+create_iora_test_target(iora_test_jsonrpc_gzip_request
+    SOURCES iora_test_jsonrpc_gzip_request.cpp
+)
+target_include_directories(iora_test_jsonrpc_gzip_request PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_dependencies(iora_test_jsonrpc_gzip_request mod_jsonrpc_server)
+# Opt-in sanitizer instrumentation (same IORA_ENABLE_TSAN/ASAN cache-global
+# options as iora_test_jsonrpc_client_pool). The [concurrency] case that hammers
+# the request-compression cache is the TSan probe: removing the leaf mutex must
+# trip a data race under -DIORA_ENABLE_TSAN=ON. TSan and ASan are mutually
+# exclusive; TSan takes precedence.
+if(IORA_ENABLE_TSAN)
+    target_compile_options(iora_test_jsonrpc_gzip_request PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(iora_test_jsonrpc_gzip_request PRIVATE -fsanitize=thread)
+elseif(IORA_ENABLE_ASAN)
+    target_compile_options(iora_test_jsonrpc_gzip_request PRIVATE
+        -fsanitize=address -fno-omit-frame-pointer -g -O1 -Wno-maybe-uninitialized)
+    target_link_options(iora_test_jsonrpc_gzip_request PRIVATE -fsanitize=address)
+endif()
+add_test(NAME iora_test_jsonrpc_gzip_request
+    COMMAND iora_test_jsonrpc_gzip_request)
+set_tests_properties(iora_test_jsonrpc_gzip_request PROPERTIES
+    TIMEOUT 120 RESOURCE_LOCK jsonrpc_pool_ports)
+
+# ---------------------------------------------------------------------------
 # Pool lifetime / identity defect repros (tracker 2026-07-26-2, phase 1).
 # Constructs JsonRpcClient directly, so it includes jsonrpc_client.hpp from the
 # parent module directory (task-1.1(f)).
