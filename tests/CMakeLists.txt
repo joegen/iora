@@ -128,6 +128,7 @@ set(PARSERS_TESTS
 set(UTIL_TESTS
     util/iora_test_crc32
     util/iora_test_gzip
+    util/iora_test_gzip_decode
     util/iora_test_expiring_cache
     util/iora_test_shell_runner
     util/iora_test_ttl_map
@@ -286,6 +287,7 @@ endforeach()
 set(IORA_SANITIZED_TEST_TARGETS
     iora_test_logger
     iora_test_gzip
+    iora_test_gzip_decode
     iora_test_ttl_map
     iora_test_expiring_cache
     iora_test_transport
