@@ -448,6 +448,36 @@ TEST_CASE("gzip response server: negotiation matrix (enabled, low threshold)",
     REQUIRE(r.headers.find("Content-Encoding") == r.headers.end());
   }
 
+  // CR-6 (task-2.4, tracker 2026-07-26-3): a 204 MUST carry no content. HttpServer
+  // pre-populates every matched Response with set_content("Not Found","text/plain"),
+  // so before the endpoint's explicit body/header clear the 204 leaked "Not Found"
+  // with Content-Length: 9 and Content-Type: text/plain (RFC 9110 §15.3.5 / RFC
+  // 9112 §6.3 violation). Assert the body and the framing/type headers are gone.
+  SECTION("204 successful notification has an empty body and no Content-Length/Content-Type (CR-6)")
+  {
+    auto r = http.post(url, echoNotify(payload),
+                       {{"Content-Type", "application/json"}, {"Accept-Encoding", "gzip"}}, 0);
+    REQUIRE(r.statusCode == 204);
+    REQUIRE(r.body.empty());
+    REQUIRE(r.headers.find("Content-Length") == r.headers.end());
+    REQUIRE(r.headers.find("Content-Type") == r.headers.end());
+  }
+
+  // W-H1 widens the 204 path to FAILED notifications: a notification to an unknown
+  // method is now suppressed (empty dispatcher result) and reaches the same 204
+  // branch, so the CR-6 clear must hold there too.
+  SECTION("204 failed notification (unknown method) is body-less with no framing headers (CR-6 + W-H1)")
+  {
+    const std::string notifyUnknown = R"({"jsonrpc":"2.0","method":"nope","params":{}})";
+    auto r = http.post(url, notifyUnknown,
+                       {{"Content-Type", "application/json"}, {"Accept-Encoding", "gzip"}}, 0);
+    REQUIRE(r.statusCode == 204);
+    REQUIRE(r.body.empty());
+    REQUIRE(r.headers.find("Content-Length") == r.headers.end());
+    REQUIRE(r.headers.find("Content-Type") == r.headers.end());
+    REQUIRE(r.headers.find("Content-Encoding") == r.headers.end());
+  }
+
   SECTION("media-type 415 error body stays identity, no Vary (task-1.3)")
   {
     auto r = http.post(url, req,

@@ -421,7 +421,19 @@ private:
       if (out.empty())
       {
         // Notification-only request or batch with only notifications.
+        // CR-6 (RFC 9110 §15.3.5 / RFC 9112 §6.3): a 204 MUST carry no content.
+        // HttpServer pre-populates every matched Response with
+        // set_content("Not Found","text/plain") before dispatch
+        // (http_server.hpp:1096-1098), so a handler that only sets status=204 would
+        // emit a 204 carrying "Not Found" with Content-Length: 9. Clear the body
+        // and erase the framing/type headers, mirroring HttpServer's own
+        // AUTO_OPTIONS 204 handling. W-H1 widens the set of requests reaching this
+        // path (failed notifications now route here too), so this clear is landed
+        // alongside W-H1 rather than left to the migration's endpoint extraction.
         res.status = 204;
+        res.body.clear();
+        res.headers.erase("Content-Length");
+        res.headers.erase("Content-Type");
 
         if (_logRequests)
         {
