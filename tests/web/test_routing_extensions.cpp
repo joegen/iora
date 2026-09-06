@@ -20,11 +20,13 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -41,6 +43,7 @@
 #define IORA_TSAN 1
 #endif
 
+using iora::network::HttpResponse;
 using iora::network::HttpServer;
 using iora::network::SessionId;
 using Request = HttpServer::Request;
@@ -191,19 +194,36 @@ public:
       ssize_t n = ::recv(_fd, tmp, sizeof(tmp), 0);
       if (n == 0)
       {
-        return true; // EOF — server closed the connection
+        return true; // EOF — server closed the connection gracefully
       }
       if (n < 0)
       {
-        return false; // timeout (server still holding the connection open)
+        // ECONNRESET is also the peer closing: when the server closes a socket
+        // that still has unread inbound data (e.g. a client that overran the
+        // size cap and kept sending), TCP delivers an RST rather than a clean
+        // FIN. Treat that as closed; only a genuine timeout (EAGAIN/EWOULDBLOCK)
+        // means the server is still holding the connection open.
+        return errno == ECONNRESET;
       }
       // n > 0: server sent bytes (none expected for limit closes) — keep reading
       // until EOF or timeout.
     }
   }
 
-  // Parse one HTTP response. Body-length rules: HEAD / 204 / 304 carry no body;
-  // otherwise read Content-Length bytes (or until close if absent).
+  // Number of unconsumed octets sitting after the last parsed response's header
+  // block terminator (the leaked-body framing defect makes this non-zero on a
+  // bodyless response). A short bounded poll first pulls in any straggler
+  // segment, so a body delivered in a SEPARATE TCP segment from the header block
+  // is not missed (task-2.1 / the fixture-shares-the-bug rule). Non-const because
+  // it may read from the socket; do NOT substitute a sleep for the poll.
+  std::size_t residual()
+  {
+    pollFill(200);
+    return _buf.size();
+  }
+
+  // Parse one HTTP response. Body-length rules: HEAD / 1xx / 204 / 304 carry no
+  // body; otherwise read Content-Length bytes (or until close if absent).
   RawResponse readResponse(const std::string &method)
   {
     RawResponse r;
@@ -247,7 +267,8 @@ public:
       pos = e + 2;
     }
 
-    const bool noBody = (method == "HEAD" || r.status == 204 || r.status == 304);
+    const bool noBody = (method == "HEAD" || r.status == 204 || r.status == 304 ||
+                         (r.status >= 100 && r.status < 200));
     if (!noBody)
     {
       auto it = r.headers.find("content-length");
@@ -280,6 +301,31 @@ public:
 private:
   bool fill()
   {
+    char tmp[4096];
+    ssize_t n = ::recv(_fd, tmp, sizeof(tmp), 0);
+    if (n <= 0)
+    {
+      return false;
+    }
+    _buf.append(tmp, static_cast<std::size_t>(n));
+    return true;
+  }
+
+  // Poll the socket for up to timeoutMs; if readable, drain one recv into _buf.
+  // Returns true iff bytes were appended. Used by residual() to catch a body
+  // that the server leaked in a segment separate from the header block without
+  // blocking on the 3s SO_RCVTIMEO.
+  bool pollFill(int timeoutMs)
+  {
+    struct pollfd pfd
+    {
+      _fd, POLLIN, 0
+    };
+    int pr = ::poll(&pfd, 1, timeoutMs);
+    if (pr <= 0)
+    {
+      return false; // timeout or error: nothing readable
+    }
     char tmp[4096];
     ssize_t n = ::recv(_fd, tmp, sizeof(tmp), 0);
     if (n <= 0)
@@ -608,29 +654,25 @@ TEST_CASE("routing: getStatusText 304/426", "[routing][status]")
   REQUIRE(TestServer::statusText(426) == "Upgrade Required");
 }
 
-TEST_CASE("routing: HEAD x 304 -> bodyless, no contradictory Content-Length (SR-18)", "[routing][head][304]")
+TEST_CASE("routing: HEAD x 304 -> bodyless, no contradictory framing headers (SR-18)", "[routing][head][304]")
 {
   TestServer srv;
-  // A conditional GET handler that returns a proper 304 (no body, no body-length
-  // header — it manages its own response headers, as a real asset handler does).
-  srv.onGet("/asset", [](const Request &, Response &res)
-            {
-              res.status = 304;
-              res.body.clear();
-              res.headers.erase("Content-Length");
-              res.headers.erase("Content-Type");
-            });
+  // A conditional GET handler that returns a bare 304 and does NOT clear any
+  // headers itself — the dispatcher/serializer must strip the body-framing and
+  // representation headers. (If the handler erased them, this test would pass
+  // even against the unfixed server — fixture-shares-the-bug.)
+  srv.onGet("/asset", [](const Request &, Response &res) { res.status = 304; });
   int port = startOn(srv);
 
   auto head = rawRequest(port, "HEAD", "/asset");
   REQUIRE(head.status == 304);
   REQUIRE(head.body.empty());
-  // auto-HEAD must NOT synthesize/keep a contradictory body Content-Length for a
-  // bodyless status (SR-18): the dispatcher leaves the handler's 304 untouched.
-  if (head.hasHeader("Content-Length"))
-  {
-    REQUIRE(head.header("Content-Length") == "0");
-  }
+  // Unconditional absence. Content-Length alone is a VACUOUS assertion for a
+  // HEAD x 304 — the unfixed HEAD block already erased Content-Length for 204/304
+  // but NOT Content-Type, so Content-Type is the header that discriminates the
+  // fix from the unfixed server (RFC 9112 §6.3 rule 1 / RFC 9110 §15.4.5).
+  REQUIRE_FALSE(head.hasHeader("Content-Length"));
+  REQUIRE_FALSE(head.hasHeader("Content-Type"));
 
   srv.stop();
 }
@@ -1285,4 +1327,619 @@ TEST_CASE("routing: stop() force-timeout reset does not crash a still-running wo
   // the reset-vs-straggler race (ASAN-clean).
   REQUIRE(stopMs >= 1800);
   REQUIRE(stopMs < 3500);
+}
+
+// ===========================================================================
+// HttpServer response conformance (tracker 2026-07-26-4): bodyless framing,
+// Date, 431/413, getStatusText, status validation.
+//
+// task-2.4 — four-way mutation gate (the standing non-vacuity proof for the
+// bodyless invariant). Each of the four suppressions in HttpResponse::toWireFormat
+// (http_message.hpp — the authoritative wire producer; the dispatcher choke point
+// is a backstop) is validated by a DISTINCT assertion in the tests below; removing
+// exactly one of them turns exactly one assertion red (verified by mutation run,
+// each a distinct red):
+//   (a) body suppression         -> the toWireFormat unit test's bodyless block
+//                                    (the "SHOULD-NOT-APPEAR" body must not appear).
+//   (b) Content-Length suppression -> "bodyless 204 erases ONLY the four framing
+//                                      fields": REQUIRE_FALSE(hasHeader(CL)) red.
+//   (c) Content-Type suppression   -> same test: REQUIRE_FALSE(hasHeader(CT)) red.
+//   (d) Transfer-Encoding suppression -> same test: REQUIRE_FALSE(hasHeader(TE)) red.
+// One mutation cannot validate a four-part invariant; four do.
+// ===========================================================================
+
+namespace
+{
+// RFC 9110 §5.6.7 IMF-fixdate: "Sun, 31 May 2026 12:00:00 GMT" — exactly 29
+// characters, fixed field positions, trailing " GMT".
+bool isImfFixdate(const std::string &s)
+{
+  if (s.size() != 29)
+  {
+    return false;
+  }
+  if (s.compare(25, 4, " GMT") != 0)
+  {
+    return false;
+  }
+  if (s[3] != ',' || s[4] != ' ' || s[7] != ' ' || s[11] != ' ' || s[16] != ' ' ||
+      s[19] != ':' || s[22] != ':')
+  {
+    return false;
+  }
+  auto isDigit = [&](std::size_t i) { return s[i] >= '0' && s[i] <= '9'; };
+  const std::size_t digitPos[] = {5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24};
+  for (std::size_t i : digitPos)
+  {
+    if (!isDigit(i))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace
+
+TEST_CASE("respconf: keep-alive framing after a bodyless 204 (task-3.1, PRIMARY)",
+          "[respconf][204][keepalive]")
+{
+  TestServer srv;
+  srv.onGet("/nc", [](const Request &, Response &res) { res.status = 204; });
+  srv.onGet("/page",
+            [](const Request &, Response &res) { res.set_content("PAGE-BODY", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  // (1) send request 1 (204), keep-alive; (2) read up to and including CRLFCRLF.
+  c.sendRequest("GET", "/nc", "", "", /*keepAlive=*/true);
+  auto r1 = c.readResponse("GET");
+  REQUIRE(r1.status == 204);
+  REQUIRE(r1.body.empty());
+  REQUIRE_FALSE(r1.hasHeader("Content-Length"));
+  REQUIRE_FALSE(r1.hasHeader("Content-Type"));
+  // (3) exactly zero octets after the blank line — the leaked "Not Found" /
+  // Content-Length: 9 defect would leave 9 surplus octets here (poll-based, so a
+  // straggler segment is not missed). Mutation (a) turns this red.
+  REQUIRE(c.residual() == 0);
+  // (4) a second request on the SAME connection parses from byte 0.
+  c.sendRequest("GET", "/page", "", "", /*keepAlive=*/false);
+  auto r2 = c.readResponse("GET");
+  REQUIRE(r2.status == 200);
+  REQUIRE(r2.body == "PAGE-BODY");
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: bodyless 204 erases ONLY the four framing fields (task-3.2)",
+          "[respconf][204]")
+{
+  TestServer srv;
+  // A handler that sets content (body + Content-Length + Content-Type), a
+  // Transfer-Encoding, and two non-framing headers, THEN sets 204. Only the four
+  // body-framing/representation fields are stripped; Set-Cookie and X-Foo survive.
+  srv.onGet("/nc", [](const Request &, Response &res)
+            {
+              res.set_content("SHOULD-VANISH", "text/plain");
+              res.set_header("Transfer-Encoding", "chunked");
+              res.set_header("Set-Cookie", "sid=abc");
+              res.set_header("X-Foo", "bar");
+              res.status = 204;
+            });
+  int port = startOn(srv);
+
+  auto r = rawRequest(port, "GET", "/nc");
+  REQUIRE(r.status == 204);
+  REQUIRE(r.body.empty());
+  REQUIRE_FALSE(r.hasHeader("Content-Length"));   // mutation (b)
+  REQUIRE_FALSE(r.hasHeader("Content-Type"));      // mutation (c)
+  REQUIRE_FALSE(r.hasHeader("Transfer-Encoding")); // mutation (d)
+  REQUIRE(r.header("Set-Cookie") == "sid=abc");    // non-framing header survives
+  REQUIRE(r.header("X-Foo") == "bar");
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: set-content-then-204 across dispatch arms (task-3.2)", "[respconf][204]")
+{
+  TestServer srv;
+  srv.onGet("/nc", [](const Request &, Response &res) { res.status = 204; });
+  // 204 from the DEFAULT handler (NO_ROUTE with a handler).
+  srv.setDefaultHandler([](const Request &, Response &res) { res.status = 204; });
+  int port = startOn(srv);
+
+  // MATCHED arm.
+  auto m = rawRequest(port, "GET", "/nc");
+  REQUIRE(m.status == 204);
+  REQUIRE(m.body.empty());
+  REQUIRE_FALSE(m.hasHeader("Content-Length"));
+
+  // NO_ROUTE-with-handler arm (default handler) -> 204.
+  auto d = rawRequest(port, "GET", "/anything-else");
+  REQUIRE(d.status == 204);
+  REQUIRE(d.body.empty());
+  REQUIRE_FALSE(d.hasHeader("Content-Length"));
+  REQUIRE_FALSE(d.hasHeader("Content-Type"));
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: HEAD to a 204 handler + MATCHED_AS_HEAD (task-3.2)", "[respconf][204][head]")
+{
+  TestServer srv;
+  srv.onGet("/nc", [](const Request &, Response &res) { res.status = 204; });
+  int port = startOn(srv);
+
+  // HEAD to a 204-returning GET route: both the HEAD block and the bodyless
+  // normalization fire; the response stays bodyless with no framing headers.
+  auto h = rawRequest(port, "HEAD", "/nc");
+  REQUIRE(h.status == 204);
+  REQUIRE(h.body.empty());
+  REQUIRE_FALSE(h.hasHeader("Content-Length"));
+  REQUIRE_FALSE(h.hasHeader("Content-Type"));
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: HEAD to a direct-res.body handler reports the GET length (task-3.2, H-A)",
+          "[respconf][head]")
+{
+  TestServer srv;
+  // A handler that writes res.body DIRECTLY (no set_content, so no Content-Length).
+  // The HEAD response must report Content-Length = the GET body length, synthesized
+  // BEFORE the body is dropped — NOT 0 (wrong-ordering regression) and NOT 9 (the
+  // leaked 404 pre-population value the unfixed server emitted for this shape).
+  srv.onGet("/direct", [](const Request &, Response &res) { res.body = "DIRECT-BODY-12"; });
+  int port = startOn(srv);
+
+  auto h = rawRequest(port, "HEAD", "/direct");
+  REQUIRE(h.status == 200);
+  REQUIRE(h.body.empty());
+  REQUIRE(h.header("Content-Length") == "14"); // strlen("DIRECT-BODY-12")
+
+  // And the GET returns that exact body with the same length.
+  auto g = rawRequest(port, "GET", "/direct");
+  REQUIRE(g.status == 200);
+  REQUIRE(g.body == "DIRECT-BODY-12");
+  REQUIRE(g.header("Content-Length") == "14");
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: HEAD to a direct-body handler with a spurious Transfer-Encoding (web L-1)",
+          "[respconf][head]")
+{
+  TestServer srv;
+  // A handler writes res.body directly (no Content-Length) AND sets a spurious
+  // Transfer-Encoding. On a HEAD, the CL synthesis must still capture the GET length
+  // (RFC 9110 §9.3.2) — the TE must NOT block it — and the spurious TE is stripped.
+  // Pins the round-2 fix: reinstating a TE-absent guard on the HEAD synthesis would
+  // regress this to Content-Length: 0.
+  srv.onGet("/directte", [](const Request &, Response &res)
+            {
+              res.body = "DIRECT"; // 6 bytes
+              res.set_header("Transfer-Encoding", "chunked");
+            });
+  int port = startOn(srv);
+
+  auto h = rawRequest(port, "HEAD", "/directte");
+  REQUIRE(h.status == 200);
+  REQUIRE(h.body.empty());
+  REQUIRE(h.header("Content-Length") == "6");      // the GET length, not 0
+  REQUIRE_FALSE(h.hasHeader("Transfer-Encoding"));  // spurious TE stripped
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: bodyless 204 on the Connection: close path (task-3.2)", "[respconf][204][close]")
+{
+  TestServer srv;
+  srv.onGet("/nc", [](const Request &, Response &res) { res.status = 204; });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  // A request that asks the server to close after the response (the request-header
+  // Connection: close path, which is wired via req.headers). The 204 is bodyless
+  // and the server closes cleanly. (HTTP/1.0 default-close is a SEPARATE path that
+  // is currently dead — see backlog 2026-09-06-5 — so it is not asserted here.)
+  c.sendRaw("GET /nc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+  auto r = c.readResponse("GET");
+  REQUIRE(r.status == 204);
+  REQUIRE(r.body.empty());
+  REQUIRE_FALSE(r.hasHeader("Content-Length"));
+  // No leaked body octets, and the peer closes (Connection: close honored).
+  REQUIRE(c.residual() == 0);
+  REQUIRE(c.peerClosed());
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: AUTO_OPTIONS 204 still carries Allow (task-3.2)", "[respconf][204][options]")
+{
+  TestServer srv;
+  srv.onGet("/u/:id", [](const Request &, Response &res) { res.set_content("G", "text/plain"); });
+  srv.onPost("/u/:id", [](const Request &, Response &res) { res.set_content("P", "text/plain"); });
+  int port = startOn(srv);
+
+  auto o = rawRequest(port, "OPTIONS", "/u/1");
+  REQUIRE(o.status == 204);
+  REQUIRE(o.header("Allow") == "GET, HEAD, POST, OPTIONS"); // Allow is NOT a framing field
+  REQUIRE_FALSE(o.hasHeader("Content-Length"));
+  REQUIRE_FALSE(o.hasHeader("Content-Type"));
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: handler-set interim/1xx status is coerced to 500 (task-1.5)",
+          "[respconf][1xx]")
+{
+  TestServer srv;
+  srv.onGet("/interim", [](const Request &, Response &res) { res.status = 100; });
+  srv.onGet("/switch", [](const Request &, Response &res) { res.status = 101; });
+  int port = startOn(srv);
+
+  auto a = rawRequest(port, "GET", "/interim");
+  REQUIRE(a.status == 500); // RFC 9110 §15.2: interim on the normal path is a bug
+
+  auto b = rawRequest(port, "GET", "/switch");
+  REQUIRE(b.status == 500);
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: non-bodyless defects — 201+Location and direct-body keep-alive (task-3.3)",
+          "[respconf][framing]")
+{
+  TestServer srv;
+  // 201 with a Location header and NO set_content: no body, Content-Length: 0 —
+  // NOT "Not Found" with Content-Length: 9.
+  srv.onPost("/things", [](const Request &, Response &res)
+             {
+               res.status = 201;
+               res.set_header("Location", "/things/1");
+             });
+  // A handler writing res.body directly (defect-2 shape): Content-Length must
+  // match the body so a following keep-alive request frames correctly.
+  srv.onGet("/hello", [](const Request &, Response &res) { res.body = "hello"; });
+  srv.onGet("/next", [](const Request &, Response &res) { res.set_content("NEXT", "text/plain"); });
+  int port = startOn(srv);
+
+  auto c1 = rawRequest(port, "POST", "/things");
+  REQUIRE(c1.status == 201);
+  REQUIRE(c1.header("Location") == "/things/1");
+  REQUIRE(c1.body.empty());
+  REQUIRE(c1.header("Content-Length") == "0");
+
+  // Direct-body Content-Length synthesis + following-request integrity.
+  RawConn c;
+  REQUIRE(c.open(port));
+  c.sendRequest("GET", "/hello", "", "", /*keepAlive=*/true);
+  auto r1 = c.readResponse("GET");
+  REQUIRE(r1.status == 200);
+  REQUIRE(r1.header("Content-Length") == "5");
+  REQUIRE(r1.body == "hello");
+  REQUIRE(c.residual() == 0);
+  c.sendRequest("GET", "/next", "", "", /*keepAlive=*/false);
+  auto r2 = c.readResponse("GET");
+  REQUIRE(r2.status == 200);
+  REQUIRE(r2.body == "NEXT");
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: HttpResponse::toWireFormat direct unit tests (task-3.4)", "[respconf][unit]")
+{
+  // Bodyless status: body + framing headers suppressed, Date present.
+  {
+    HttpResponse r(204, "No Content");
+    r.setHeader("Content-Type", "text/plain");
+    r.setHeader("Content-Length", "9");
+    r.setHeader("Transfer-Encoding", "chunked");
+    r.setHeader("X-Keep", "yes");
+    r.body = "SHOULD-NOT-APPEAR";
+    const std::string wire = r.toWireFormat();
+    REQUIRE(wire.find("SHOULD-NOT-APPEAR") == std::string::npos);
+    REQUIRE(wire.find("Content-Length:") == std::string::npos);
+    REQUIRE(wire.find("Content-Type:") == std::string::npos);
+    REQUIRE(wire.find("Transfer-Encoding:") == std::string::npos);
+    REQUIRE(wire.find("X-Keep: yes") != std::string::npos);
+    REQUIRE(wire.find("Date: ") != std::string::npos);
+  }
+  // Non-bodyless status: body present, Date added, existing headers verbatim.
+  {
+    HttpResponse r(200, "OK");
+    r.setHeader("Content-Type", "text/plain");
+    r.setHeader("Content-Length", "5");
+    r.body = "hello";
+    const std::string wire = r.toWireFormat();
+    REQUIRE(wire.find("\r\n\r\nhello") != std::string::npos);
+    REQUIRE(wire.find("Content-Length: 5") != std::string::npos);
+    REQUIRE(wire.find("Date: ") != std::string::npos);
+  }
+  // A handler-set Date is not duplicated (case-insensitive singleton).
+  {
+    HttpResponse r(200, "OK");
+    r.setHeader("date", "Mon, 01 Jan 2001 00:00:00 GMT");
+    r.setHeader("Content-Length", "0");
+    const std::string wire = r.toWireFormat();
+    // Exactly one Date line (the handler's), matched case-insensitively.
+    std::size_t count = 0;
+    for (std::size_t p = 0; (p = wire.find("01 Jan 2001", p)) != std::string::npos; p += 1)
+    {
+      ++count;
+    }
+    REQUIRE(count == 1);
+  }
+  // 5xx does NOT get a synthesized Date (Date is MAY for 5xx).
+  {
+    HttpResponse r(500, "Internal Server Error");
+    r.setHeader("Content-Length", "0");
+    const std::string wire = r.toWireFormat();
+    REQUIRE(wire.find("Date: ") == std::string::npos);
+  }
+  // An injected reason phrase (CR/LF) is dropped, not emitted (RFC 9112 §4).
+  {
+    HttpResponse r(200, "OK\r\nX-Injected: evil");
+    r.setHeader("Content-Length", "0");
+    const std::string wire = r.toWireFormat();
+    REQUIRE(wire.find("X-Injected") == std::string::npos);
+    REQUIRE(wire.find("evil") == std::string::npos);
+    REQUIRE(wire.compare(0, 15, "HTTP/1.1 200 \r\n") == 0); // empty reason, one CRLF
+  }
+}
+
+TEST_CASE("respconf: Date on 2xx/3xx/4xx across builders (task-4.1)", "[respconf][date]")
+{
+  TestServer srv;
+  srv.onGet("/ok", [](const Request &, Response &res) { res.set_content("OK", "text/plain"); });
+  srv.onGet("/nm", [](const Request &, Response &res) { res.status = 304; });
+  int port = startOn(srv);
+
+  auto ok = rawRequest(port, "GET", "/ok"); // dispatch builder, 200
+  REQUIRE(ok.status == 200);
+  REQUIRE(ok.hasHeader("Date"));
+  REQUIRE(isImfFixdate(ok.header("Date")));
+
+  auto nm = rawRequest(port, "GET", "/nm"); // bodyless 304 still carries Date
+  REQUIRE(nm.status == 304);
+  REQUIRE(nm.hasHeader("Date"));
+  REQUIRE(isImfFixdate(nm.header("Date")));
+
+  auto nf = rawRequest(port, "GET", "/does-not-exist"); // 404
+  REQUIRE(nf.status == 404);
+  REQUIRE(nf.hasHeader("Date"));
+  REQUIRE(isImfFixdate(nf.header("Date")));
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: 431 at the header cap, 413 at the body cap (task-4.3)", "[respconf][limits]")
+{
+  TestServer srv;
+  srv.onPost("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  srv.onGet("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  // Header block over the 64 KB cap -> 431 (no CRLFCRLF seen at the cap).
+  {
+    RawConn c;
+    REQUIRE(c.open(port));
+    std::string big(70 * 1024, 'a');
+    c.sendRaw("GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: " + big + "\r\n\r\n");
+    auto r = c.readResponse("GET");
+    REQUIRE(r.status == 431);
+    // The 431 is a 4xx built via sendErrorResponse -> toWireFormat, so it carries a
+    // Date (task-4.1 covers the non-dispatcher builders, not only the dispatch path).
+    REQUIRE(r.hasHeader("Date"));
+    REQUIRE(isImfFixdate(r.header("Date")));
+    REQUIRE(c.peerClosed());
+  }
+  // Declared Content-Length over the 10 MB body cap -> 413 (no body sent).
+  {
+    RawConn c;
+    REQUIRE(c.open(port));
+    c.sendRaw("POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 20000000\r\n\r\n");
+    auto r = c.readResponse("POST");
+    REQUIRE(r.status == 413);
+    REQUIRE(c.peerClosed());
+  }
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: buffer-cap body overflow -> 413, not 431 (task-4.3, M-d)", "[respconf][limits]")
+{
+  TestServer srv;
+  srv.onPost("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  // Declare a body under the 10 MB body cap but stream more than the 1 MB session
+  // buffer cap: the header block terminator is already in the buffer, so the cap
+  // trip is a BODY overflow -> 413 (RFC 9110 §15.5.14), NOT a header 431.
+  std::string body(1200 * 1024, 'b'); // 1.2 MB > 1 MB buffer cap
+  c.sendRaw("POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2000000\r\n\r\n" + body);
+  auto r = c.readResponse("POST");
+  // The status is the discriminating assertion (413, not 431). peerClosed() is
+  // NOT asserted here: this path overruns the socket in both directions (the
+  // client is still pushing 1.2 MB as the server closes after 1 MB), so whether
+  // the close surfaces as FIN, RST, or a still-draining socket is nondeterministic.
+  // Clean-close behavior is covered deterministically by the non-overrun 431/413
+  // cases above.
+  REQUIRE(r.status == 413);
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: getStatusText class-derived fallback + filled codes (task-4.4)",
+          "[respconf][status]")
+{
+  REQUIRE(TestServer::statusText(415) == "Unsupported Media Type");
+  REQUIRE(TestServer::statusText(429) == "Too Many Requests");
+  REQUIRE(TestServer::statusText(302) == "Found");
+  REQUIRE(TestServer::statusText(431) == "Request Header Fields Too Large");
+  REQUIRE(TestServer::statusText(413) == "Content Too Large");   // renamed
+  REQUIRE(TestServer::statusText(422) == "Unprocessable Content"); // renamed
+  // Class-derived fallback, never "Unknown", for an unlisted valid code.
+  REQUIRE(TestServer::statusText(418) == "Client Error");
+  REQUIRE(TestServer::statusText(599) == "Server Error");
+  REQUIRE(TestServer::statusText(250) == "Successful");
+}
+
+TEST_CASE("respconf: out-of-range handler status is rewritten to 500 (task-4.5)",
+          "[respconf][status]")
+{
+  TestServer srv;
+  srv.onGet("/high", [](const Request &, Response &res)
+            {
+              res.status = 1000;
+              res.set_content("x", "text/plain");
+            });
+  srv.onGet("/zero", [](const Request &, Response &res) { res.status = 0; });
+  int port = startOn(srv);
+
+  REQUIRE(rawRequest(port, "GET", "/high").status == 500);
+  REQUIRE(rawRequest(port, "GET", "/zero").status == 500);
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: Date on the 400 exception builder (task-4.1)", "[respconf][date]")
+{
+  TestServer srv;
+  srv.onGet("/x", [](const Request &, Response &res) { res.set_content("ok", "text/plain"); });
+  int port = startOn(srv);
+
+  // A HTTP/1.1 request with no Host header is a 400 (RFC 9110 §7.2), produced by
+  // the exception-builder path (NOT the normal dispatcher). Its Date proves the
+  // serializer covers every builder, which is the whole point of moving Date there.
+  RawConn c;
+  REQUIRE(c.open(port));
+  c.sendRaw("GET /x HTTP/1.1\r\n\r\n");
+  auto r = c.readResponse("GET");
+  REQUIRE(r.status == 400);
+  REQUIRE(r.hasHeader("Date"));
+  REQUIRE(isImfFixdate(r.header("Date")));
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: 205 Reset Content gets Content-Length: 0 and no body (task the_205_boundary)",
+          "[respconf][205]")
+{
+  TestServer srv;
+  // A handler that returns 205 with a stray body: RFC 9110 §15.3.6 forbids content,
+  // but §6.3 rule 8 means it must still be framed -> Content-Length: 0, empty body.
+  // 205 must NOT be bodyless-erased (that would drop the required Content-Length).
+  srv.onGet("/reset", [](const Request &, Response &res)
+            {
+              res.status = 205;
+              res.set_content("SHOULD-VANISH", "text/plain");
+            });
+  int port = startOn(srv);
+
+  auto r = rawRequest(port, "GET", "/reset");
+  REQUIRE(r.status == 205);
+  REQUIRE(r.body.empty());
+  REQUIRE(r.header("Content-Length") == "0");    // present and zero (NOT erased)
+  REQUIRE_FALSE(r.hasHeader("Content-Type"));     // stale CT dropped (no representation)
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: a handler header value with CR/LF is dropped, no response splitting (H-1)",
+          "[respconf][security]")
+{
+  TestServer srv;
+  // A handler builds a response header from (pretend) unvalidated input carrying a
+  // CRLF — the classic HTTP response-splitting payload. RFC 9110 §5.5: such a field
+  // MUST NOT be emitted. The server drops the whole header; nothing injected reaches
+  // the wire, and the response is otherwise intact.
+  srv.onGet("/inject", [](const Request &, Response &res)
+            {
+              res.set_header("Location", "/ok\r\nX-Injected: evil");
+              res.set_content("BODY", "text/plain");
+            });
+  int port = startOn(srv);
+
+  auto r = rawRequest(port, "GET", "/inject");
+  REQUIRE(r.status == 200);
+  REQUIRE(r.body == "BODY");
+  REQUIRE_FALSE(r.hasHeader("X-Injected"));       // no injected header line
+  REQUIRE_FALSE(r.hasHeader("Location"));          // the CRLF-bearing header dropped whole
+  REQUIRE(r.rawHead.find("X-Injected") == std::string::npos);
+  REQUIRE(r.rawHead.find("evil") == std::string::npos);
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: a non-HEAD handler Content-Length mismatch is overwritten (task M-B/web)",
+          "[respconf][framing]")
+{
+  TestServer srv;
+  // A handler that sets a body via set_content then mutates res.body to a shorter
+  // value, leaving a stale Content-Length. The server writes the whole res.body
+  // inline, so the only correct CL is res.body.size(): it must be OVERWRITTEN, not
+  // left to desync the wire (RFC 9110 §8.6).
+  srv.onGet("/mismatch", [](const Request &, Response &res)
+            {
+              res.set_content("this-is-a-long-body", "text/plain"); // CL = 19
+              res.body = "short";                                    // actual = 5
+            });
+  srv.onGet("/after",
+            [](const Request &, Response &res) { res.set_content("AFTER", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  c.sendRequest("GET", "/mismatch", "", "", /*keepAlive=*/true);
+  auto r = c.readResponse("GET");
+  REQUIRE(r.status == 200);
+  REQUIRE(r.header("Content-Length") == "5"); // overwritten to the real body size
+  REQUIRE(r.body == "short");
+  REQUIRE(c.residual() == 0);
+  // Following keep-alive request frames correctly (no desync from a wrong CL).
+  c.sendRequest("GET", "/after", "", "", /*keepAlive=*/false);
+  auto r2 = c.readResponse("GET");
+  REQUIRE(r2.status == 200);
+  REQUIRE(r2.body == "AFTER");
+
+  srv.stop();
+}
+
+TEST_CASE("respconf: a handler-set Content-Length + Transfer-Encoding never coexist (task M-B)",
+          "[respconf][framing]")
+{
+  TestServer srv;
+  // A handler that sets both Content-Length (via set_content) and a spurious
+  // Transfer-Encoding. RFC 9112 §6.1: the two MUST NOT coexist (smuggling). The
+  // server frames by Content-Length and strips the spurious Transfer-Encoding.
+  srv.onGet("/both", [](const Request &, Response &res)
+            {
+              res.set_content("BODY", "text/plain");
+              res.set_header("Transfer-Encoding", "chunked");
+            });
+  srv.onGet("/after",
+            [](const Request &, Response &res) { res.set_content("AFTER", "text/plain"); });
+  int port = startOn(srv);
+
+  RawConn c;
+  REQUIRE(c.open(port));
+  c.sendRequest("GET", "/both", "", "", /*keepAlive=*/true);
+  auto r = c.readResponse("GET");
+  REQUIRE(r.status == 200);
+  REQUIRE(r.hasHeader("Content-Length"));         // framed by Content-Length
+  REQUIRE(r.header("Content-Length") == "4");      // == strlen("BODY")
+  REQUIRE_FALSE(r.hasHeader("Transfer-Encoding")); // spurious TE stripped
+  REQUIRE(r.body == "BODY");
+  REQUIRE(c.residual() == 0);
+  // Following keep-alive request frames correctly (no desync from a leftover TE).
+  c.sendRequest("GET", "/after", "", "", /*keepAlive=*/false);
+  auto r2 = c.readResponse("GET");
+  REQUIRE(r2.status == 200);
+  REQUIRE(r2.body == "AFTER");
+
+  srv.stop();
 }

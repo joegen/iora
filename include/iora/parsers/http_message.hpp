@@ -255,8 +255,127 @@ struct CaseInsensitiveCompare
 /// \brief HTTP headers with case-insensitive keys
 using HttpHeaders = std::map<std::string, std::string, CaseInsensitiveCompare>;
 
+/// \brief RFC 9112 §6.3 rule 1: a response with a 1xx, 204, or 304 status is
+/// always terminated by the first empty line after the header fields and thus
+/// cannot carry a message body, a Content-Length, a Transfer-Encoding, or a
+/// trailer section — regardless of the header fields present.
+///
+/// This is the SINGLE definition of that rule for the whole library (foundation
+/// -first placement); the server's response finalization/serializer and the
+/// client's determineFraming NoBody rule both consume it, replacing hand-rolled
+/// copies that had drifted (one omitted 1xx entirely).
+///
+/// WARNING — do NOT extend this list. HEAD is a method, not a status, and is
+/// handled separately (a HEAD response keeps the Content-Length a GET would
+/// send). 205 (Reset Content) is NOT bodyless-framed: RFC 9112 §6.3 rule 8 makes
+/// any other response lacking both Content-Length and Transfer-Encoding
+/// close-delimited, so a 205 must receive Content-Length: 0, and erasing its
+/// framing headers would convert a no-body response into an unframed one that
+/// hangs a keep-alive client.
+constexpr bool statusForbidsBody(int code) noexcept
+{
+  return code == 204 || code == 304 || (code >= 100 && code < 200);
+}
+
+/// \brief The body-framing / representation header fields that a bodyless response
+/// must not carry, and that a coerced (500) response must drop. Single source of the
+/// set so adding a field touches one place (RFC 9112 §6.3 rule 1 / RFC 9110 §8.6 /
+/// §15.4.5). Consumed by the server's dispatcher normalization and by the
+/// HttpResponse::toWireFormat bodyless filter below.
+inline constexpr const char *const kBodyFramingHeaders[] = {"Content-Length", "Content-Type",
+                                                            "Transfer-Encoding", "Trailer"};
+
+/// \brief Whether a header field NAME or VALUE contains a CR, LF, or NUL — the
+/// bytes that enable HTTP response splitting / header injection (RFC 9110 §5.5:
+/// "a sender MUST NOT generate a field value containing CR, LF, or NUL"; RFC 9112
+/// §2.2). A field carrying any of these must never be written to the wire.
+inline bool headerHasInjection(const std::string &s) noexcept
+{
+  for (char c : s)
+  {
+    if (c == '\r' || c == '\n' || c == '\0')
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 namespace detail
 {
+
+/// \brief Thread-safe reentrant UTC time conversion — the UTC analogue of
+/// core::detail::localTimeReentrant (logger.hpp). std::gmtime is FORBIDDEN here:
+/// it returns a shared static std::tm and HTTP Date headers are formatted on
+/// HttpServer worker threads concurrently. Returns true on success.
+inline bool gmTimeReentrant(const std::time_t *t, std::tm *out)
+{
+#ifdef _WIN32
+  return ::gmtime_s(out, t) == 0;
+#else
+  return ::gmtime_r(t, out) != nullptr;
+#endif
+}
+
+/// \brief Append a 2-digit zero-padded value (mod 100, so any input yields
+/// exactly two characters — no buffer-overflow analysis surprises).
+inline void appendTwoDigits(std::string &s, int v)
+{
+  const int n = ((v % 100) + 100) % 100;
+  s += static_cast<char>('0' + (n / 10));
+  s += static_cast<char>('0' + (n % 10));
+}
+
+/// \brief Format an epoch instant as an RFC 9110 §5.6.7 IMF-fixdate
+/// ("Sun, 31 May 2026 12:00:00 GMT" — fixed 29 chars, UTC/GMT, C-locale ENGLISH
+/// day/month abbreviations independent of the process locale). Uses the reentrant
+/// gmTimeReentrant conversion and hand-rolled tables — NOT strftime-with-locale,
+/// and NOT snprintf (whose worst-case-width analysis trips -Wformat-truncation).
+///
+/// Lives here (foundation, next to the message types) so both the SSE preamble
+/// (network/sse_stream.hpp) and HttpResponse::toWireFormat's Date emission consume
+/// one formatter with no #include cycle. FQN is iora::network::detail::formatHttpDate.
+inline std::string formatHttpDate(std::time_t t)
+{
+  static const char *const kDays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  static const char *const kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  std::tm tmv{};
+  if (!gmTimeReentrant(&t, &tmv))
+  {
+    return std::string("Thu, 01 Jan 1970 00:00:00 GMT");
+  }
+  const int wday = (tmv.tm_wday >= 0 && tmv.tm_wday < 7) ? tmv.tm_wday : 0;
+  const int mon = (tmv.tm_mon >= 0 && tmv.tm_mon < 12) ? tmv.tm_mon : 0;
+  int year = tmv.tm_year + 1900;
+  if (year < 0)
+  {
+    year = 0;
+  }
+  year %= 10000; // keep the fixed 4-digit field
+  std::string s;
+  s.reserve(29);
+  s += kDays[wday];
+  s += ", ";
+  appendTwoDigits(s, tmv.tm_mday);
+  s += ' ';
+  s += kMonths[mon];
+  s += ' ';
+  s += static_cast<char>('0' + (year / 1000) % 10);
+  s += static_cast<char>('0' + (year / 100) % 10);
+  s += static_cast<char>('0' + (year / 10) % 10);
+  s += static_cast<char>('0' + year % 10);
+  s += ' ';
+  appendTwoDigits(s, tmv.tm_hour);
+  s += ':';
+  appendTwoDigits(s, tmv.tm_min);
+  s += ':';
+  appendTwoDigits(s, tmv.tm_sec);
+  s += " GMT";
+  return s;
+}
+
+
 /// \brief Whether a header field is a comma-separated list (RFC 9110 §5.3) whose
 /// repeated field-lines may be combined with ", ".
 ///
@@ -926,24 +1045,89 @@ public:
     setHeader("Content-Length", std::to_string(body.size()));
   }
 
-  /// \brief Convert to HTTP wire format
+  /// \brief Convert to HTTP wire format.
+  ///
+  /// This const serializer is the UNBYPASSABLE choke point for two response
+  /// conformance invariants that every server response builder must obey:
+  ///
+  ///  - RFC 9112 §6.3 rule 1 / RFC 9110 §8.6 (MUST): a 1xx/204/304 response
+  ///    carries no body and no Content-Length / Transfer-Encoding / Trailer, and
+  ///    Content-Type on it is meaningless-or-cache-poisoning (RFC 9110 §15.4.5).
+  ///    For such a status the body and those four framing/representation headers
+  ///    are suppressed here regardless of what the builder set. Date is NOT in
+  ///    that set — it is preserved (and, below, synthesized).
+  ///  - RFC 9110 §6.6.1 (MUST): an origin server with a clock generates a Date on
+  ///    every 2xx/3xx/4xx response. It is added here (add-if-absent) so ALL five
+  ///    builders — dispatch, shutdown 503, upgrade, exception, sendErrorResponse —
+  ///    are covered from one place; Date is MAY for 1xx/5xx so it is not forced there.
+  ///
+  /// Both are applied to the LOCAL output stream only — the const member `headers`
+  /// map is never mutated, so this stays a read-only, lock-free filter safe to run
+  /// on any thread (HttpResponse instances are constructed and consumed on one
+  /// thread; the wire bytes cross threads only as an immutable shared_ptr<string>).
   std::string toWireFormat() const
   {
     std::ostringstream ss;
 
-    // Status line
-    ss << version.toString() << " " << statusCode << " " << statusText << "\r\n";
+    // Status line. The reason phrase is subject to the same CR/LF/NUL prohibition as
+    // header fields (RFC 9112 §4 / RFC 9110 §5.5); if a caller supplied an injected
+    // phrase, emit an EMPTY reason rather than let it split the response (statusCode
+    // is an int, always safe). This closes the last start-line path to the wire, so
+    // the CR/LF/NUL guarantee this serializer makes for headers is now total.
+    ss << version.toString() << " " << statusCode << " ";
+    if (!headerHasInjection(statusText))
+    {
+      ss << statusText;
+    }
+    ss << "\r\n";
 
-    // Headers
+    const bool bodyless = statusForbidsBody(statusCode);
+    // Date presence is checked case-insensitively (HttpHeaders uses
+    // CaseInsensitiveCompare), so a handler-set "date"/"DATE" is not duplicated.
+    const bool hasDate = headers.find("Date") != headers.end();
+
+    // Headers. For a bodyless status suppress the body-framing / representation
+    // headers (Content-Length, Transfer-Encoding, Trailer, Content-Type); every
+    // other header — including Date and the RFC 9110 §15.4.5 304 must-generate set
+    // (Cache-Control, ETag, Expires, Vary, Content-Location, Last-Modified) — is
+    // emitted verbatim. The suppressed set reuses HttpHeaders' own case-insensitive
+    // comparator so a handler-set 'content-length' etc. is matched regardless of case.
+    static const std::set<std::string, CaseInsensitiveCompare> kBodylessSuppressed(
+      std::begin(kBodyFramingHeaders), std::end(kBodyFramingHeaders));
     for (const auto &[key, value] : headers)
     {
+      if (bodyless && kBodylessSuppressed.count(key) != 0)
+      {
+        continue;
+      }
+      // RFC 9110 §5.5 / RFC 9112 §2.2: never emit a field whose name or value
+      // carries CR/LF/NUL — that is the HTTP response-splitting / header-injection
+      // vector. Drop the WHOLE field (an injected value cannot be made safe by
+      // truncation) so no attacker-controlled bytes can start a new header line or a
+      // forged response. This is the unbypassable serializer backstop; the dispatcher
+      // additionally logs when it drops such a header (this const serializer cannot).
+      if (headerHasInjection(key) || headerHasInjection(value))
+      {
+        continue;
+      }
       ss << key << ": " << value << "\r\n";
+    }
+
+    // RFC 9110 §6.6.1: add a Date on 2xx/3xx/4xx when the builder set none. A
+    // bodyless 204/304 is in this range and DOES get a Date (it is not a framing
+    // header). 1xx/5xx are excluded (Date is MAY there).
+    if (!hasDate && statusCode >= 200 && statusCode < 500)
+    {
+      ss << "Date: " << detail::formatHttpDate(std::time(nullptr)) << "\r\n";
     }
 
     ss << "\r\n"; // End of headers
 
-    // Body
-    ss << body;
+    // Body — suppressed on the wire for a bodyless status.
+    if (!bodyless)
+    {
+      ss << body;
+    }
 
     return ss.str();
   }

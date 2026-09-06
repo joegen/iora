@@ -2113,7 +2113,59 @@ private:
         resp.body.clear();
         if (data.size() > bodyStart)
         {
-          forceEvict = true; // unexpected bytes after a bodyless response
+          // Surplus octets already sit past the header block — the peer sent a body
+          // rule 1 forbids. Evict rather than parse them as the next response.
+          forceEvict = true;
+        }
+        else
+        {
+          // Split-segment guard: a 204 or 1xx that DECLARED a non-zero
+          // Content-Length is non-conformant (RFC 9110 §8.6) and its phantom body
+          // octets may still be in flight in a later TCP segment; evict so a
+          // subsequent keep-alive request does not misread them as a status line.
+          // A HEAD or 304 MAY legitimately carry a non-zero Content-Length with
+          // zero octets on the wire (the GET length / the cached representation
+          // length that 304 caching relies on), so those are NOT evicted on a
+          // declared length alone — only on ARRIVED surplus above.
+          const int nbSc = resp.statusCode;
+          // Reuse the single library predicate, carving out 304: a 304 MAY declare a
+          // non-zero Content-Length while putting zero body octets on the wire (RFC
+          // 9110 §8.6), so it is not evicted on a declared length alone. A 204 MUST
+          // NOT declare a body length, so a declared one is presumptively broken.
+          // (1xx is also in the predicate but is consumed earlier in this loop, so
+          // in practice only 204 reaches here.)
+          const bool bodyForbidden = statusForbidsBody(nbSc) && nbSc != 304;
+          if (bodyForbidden)
+          {
+            // A 204 MUST NOT declare a body via EITHER framing mechanism (RFC 9110
+            // §8.6 / RFC 9112 §6.1). A declared Transfer-Encoding on such a status
+            // signals phantom (chunk) octets that may arrive in a later TCP segment —
+            // the symmetric hazard to the Content-Length case below — so evict rather
+            // than pool a connection a subsequent request would desync.
+            if (resp.headers.find("Transfer-Encoding") != resp.headers.end())
+            {
+              forceEvict = true;
+            }
+            auto clIt = resp.headers.find("Content-Length");
+            if (clIt != resp.headers.end())
+            {
+              // A malformed CL on a bodyless status is itself non-conformant: evict
+              // (the fail-safe default). Only a parsed zero is safe to keep.
+              bool evict = true;
+              try
+              {
+                evict = parseContentLength(clIt->second) != 0;
+              }
+              catch (...)
+              {
+                // keep evict == true (malformed Content-Length -> evict)
+              }
+              if (evict)
+              {
+                forceEvict = true;
+              }
+            }
+          }
         }
         return true;
       case BodyMode::ContentLength:
@@ -2434,7 +2486,9 @@ private:
     }
     const int sc = resp.statusCode;
     // Rule 1: HEAD and 1xx/204/304 have no body regardless of header fields.
-    if (method == "HEAD" || sc == 204 || sc == 304 || (sc >= 100 && sc < 200))
+    // statusForbidsBody is the single library definition of the 1xx/204/304 rule
+    // (parsers/http_message.hpp); HEAD is a method, handled here alongside it.
+    if (method == "HEAD" || statusForbidsBody(sc))
     {
       return {BodyMode::NoBody, 0};
     }

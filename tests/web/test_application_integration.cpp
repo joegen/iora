@@ -348,7 +348,8 @@ public:
       pos = e + 2;
     }
 
-    const bool noBody = (method == "HEAD" || r.status == 204 || r.status == 304);
+    const bool noBody = (method == "HEAD" || r.status == 204 || r.status == 304 ||
+                         (r.status >= 100 && r.status < 200));
     if (!noBody)
     {
       auto it = r.headers.find("content-length");

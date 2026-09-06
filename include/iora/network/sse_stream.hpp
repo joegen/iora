@@ -47,78 +47,11 @@ namespace network
 /// thread-safe RNG (L-2). writeRetry itself is a plain emitter (no jitter).
 static constexpr std::uint32_t kDefaultSseRetryMs = 3000;
 
-namespace detail
-{
-
-/// \brief Thread-safe reentrant UTC time conversion — the UTC analogue of
-/// core::detail::localTimeReentrant (logger.hpp). std::gmtime is FORBIDDEN here:
-/// it returns a shared static std::tm and the SSE preamble is built on HttpServer
-/// worker threads concurrently (thread-H4 / cpp17-H2). Returns true on success.
-inline bool gmTimeReentrant(const std::time_t *t, std::tm *out)
-{
-#ifdef _WIN32
-  return ::gmtime_s(out, t) == 0;
-#else
-  return ::gmtime_r(t, out) != nullptr;
-#endif
-}
-
-/// \brief Append a 2-digit zero-padded value (mod 100, so any input yields
-/// exactly two characters — no buffer-overflow analysis surprises).
-inline void appendTwoDigits(std::string &s, int v)
-{
-  const int n = ((v % 100) + 100) % 100;
-  s += static_cast<char>('0' + (n / 10));
-  s += static_cast<char>('0' + (n % 10));
-}
-
-/// \brief Format an epoch instant as an RFC 9110 §5.6.7 IMF-fixdate
-/// ("Sun, 31 May 2026 12:00:00 GMT" — fixed 29 chars, UTC/GMT, C-locale ENGLISH
-/// day/month abbreviations independent of the process locale). Uses the reentrant
-/// gmTimeReentrant conversion and hand-rolled tables — NOT strftime-with-locale,
-/// and NOT snprintf (whose worst-case-width analysis trips -Wformat-truncation).
-inline std::string formatHttpDate(std::time_t t)
-{
-  static const char *const kDays[] = {"Sun", "Mon", "Tue", "Wed",
-                                       "Thu", "Fri", "Sat"};
-  static const char *const kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  std::tm tmv{};
-  if (!gmTimeReentrant(&t, &tmv))
-  {
-    return std::string("Thu, 01 Jan 1970 00:00:00 GMT");
-  }
-  const int wday = (tmv.tm_wday >= 0 && tmv.tm_wday < 7) ? tmv.tm_wday : 0;
-  const int mon = (tmv.tm_mon >= 0 && tmv.tm_mon < 12) ? tmv.tm_mon : 0;
-  int year = tmv.tm_year + 1900;
-  if (year < 0)
-  {
-    year = 0;
-  }
-  year %= 10000; // keep the fixed 4-digit field
-  std::string s;
-  s.reserve(29);
-  s += kDays[wday];
-  s += ", ";
-  appendTwoDigits(s, tmv.tm_mday);
-  s += ' ';
-  s += kMonths[mon];
-  s += ' ';
-  s += static_cast<char>('0' + (year / 1000) % 10);
-  s += static_cast<char>('0' + (year / 100) % 10);
-  s += static_cast<char>('0' + (year / 10) % 10);
-  s += static_cast<char>('0' + year % 10);
-  s += ' ';
-  appendTwoDigits(s, tmv.tm_hour);
-  s += ':';
-  appendTwoDigits(s, tmv.tm_min);
-  s += ':';
-  appendTwoDigits(s, tmv.tm_sec);
-  s += " GMT";
-  return s;
-}
-
-} // namespace detail
+// The IMF-fixdate formatter (detail::formatHttpDate and its helpers) moved DOWN
+// to parsers/http_message.hpp (foundation-first, next to the message types) so
+// the SSE preamble and HttpResponse::toWireFormat's Date emission share one
+// formatter with no #include cycle. It is reachable here as
+// iora::network::detail::formatHttpDate via the http_server.hpp include above.
 
 /// \brief A lightweight handle to a single SSE connection: a SessionId plus a
 /// back-pointer to the owning HttpServer (SseStream is a FRIEND of HttpServer per

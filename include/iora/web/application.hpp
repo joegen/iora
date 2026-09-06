@@ -254,11 +254,13 @@ public:
       if (!inm.empty() && ifNoneMatchMatches(inm, selectedQuoted))
       {
         // Step (304): RD-21/APP-10 — DIRECT field writes, never set_content.
-        // Strip any body-framing headers the dispatcher pre-seeded on res (the
-        // default response carries Content-Type/Content-Length) so the bodyless
-        // 304 drags NO stale Content-Length or Content-Type along. Omitting
-        // Content-Length is also the RFC 9110 §15.4.5 / RFC 9112 §6.2 compliant
-        // form (a non-empty 200 body means "0" would be wrong).
+        // Strip any body-framing headers so the bodyless 304 drags NO stale
+        // Content-Length or Content-Type along. As of the HttpServer response-
+        // conformance fix the dispatcher/serializer now erase these for a bodyless
+        // status too, so these erases are DEFENCE-IN-DEPTH (APP-10); Content-
+        // Encoding stays serveStatic-owned (the invariant does not erase it).
+        // Omitting Content-Length is also the RFC 9110 §15.4.5 / RFC 9110 §8.6
+        // compliant form (a non-empty 200 body means "0" would be wrong).
         res.status = 304;
         res.body.clear();
         res.headers.erase("Content-Length");

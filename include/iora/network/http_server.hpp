@@ -707,6 +707,7 @@ protected:
 
     // Append to session buffer with size limits
     bool bufferLimitExceeded = false;
+    bool bufferHeaderBlockSeen = false;
     {
       std::lock_guard<std::mutex> lock(_sessionMutex);
       auto it = _sessionInfo.find(sid);
@@ -720,12 +721,28 @@ protected:
       {
         iora::core::Logger::error("HttpServer: Buffer size limit exceeded for session " +
                                   std::to_string(sid) + " - closing connection");
-        // Capture-then-close: closeSession takes _mutex, and the documented lock
-        // order is _mutex -> _sessionMutex, so it MUST NOT be called while
-        // _sessionMutex is held. Defer the close to after this scope. On this
-        // limit path the incoming data is intentionally NOT appended to the
-        // buffer (the connection is about to be closed).
+        // Capture-then-send: sendErrorResponse takes _mutex, and the documented
+        // lock order is _mutex -> _sessionMutex, so it MUST NOT be called while
+        // _sessionMutex is held. Defer to after this scope. The incoming data is
+        // intentionally NOT appended (the connection is about to be closed).
+        // Discriminate the status while we hold the buffer: if the header-block
+        // terminator has already arrived, this is a body/total overflow (413);
+        // otherwise the header block itself is oversized (431). The buffer cap
+        // (1 MB) is smaller than the body cap (10 MB), so a 1-10 MB accumulated
+        // body trips HERE before the Content-Length body check below.
         bufferLimitExceeded = true;
+        // The header-block terminator may straddle the buffer/incoming-segment
+        // boundary (the incoming dataStr is intentionally NOT appended on this
+        // path), so check the accumulated buffer PLUS the small 3+3-byte overlap
+        // with the incoming segment (the terminator is 4 bytes).
+        bufferHeaderBlockSeen = it->second.buffer.find("\r\n\r\n") != std::string::npos;
+        if (!bufferHeaderBlockSeen)
+        {
+          const std::size_t tail = std::min<std::size_t>(it->second.buffer.size(), 3);
+          const std::string boundary = it->second.buffer.substr(it->second.buffer.size() - tail) +
+                                       dataStr.substr(0, std::min<std::size_t>(dataStr.size(), 3));
+          bufferHeaderBlockSeen = boundary.find("\r\n\r\n") != std::string::npos;
+        }
       }
       else
       {
@@ -735,9 +752,11 @@ protected:
     }
     if (bufferLimitExceeded)
     {
-      // closeSession guards '_transport && !_shutdown' under _mutex (no unguarded
-      // raw _transport deref vs stop()'s reset), with _sessionMutex NOT held.
-      closeSession(sid);
+      // sendErrorResponse guards '_transport && !_shutdown' under _mutex and closes
+      // + cleans up the session; _sessionMutex is NOT held here. Header terminator
+      // already seen -> body/total overflow -> 413; not yet -> header overflow -> 431.
+      const int limitStatus = bufferHeaderBlockSeen ? 413 : 431;
+      sendErrorResponse(sid, limitStatus, getStatusText(limitStatus), "", /*headersOnly=*/true);
       return;
     }
 
@@ -750,14 +769,16 @@ protected:
         break; // Need more data for headers
       }
 
-      // Check header size limit
+      // Check header size limit -> 431 Request Header Fields Too Large (RFC 6585
+      // §5). The header block (terminated at headerEnd) exceeds the cap, so this
+      // is unambiguously a header overflow, not a body overflow.
       if (headerEnd > SessionInfo::MAX_HEADER_SIZE)
       {
         iora::core::Logger::error("HttpServer: Header size limit exceeded for session " +
-                                  std::to_string(sid) + " - closing connection");
-        // No lock held here; closeSession guards '_transport && !_shutdown' under
-        // _mutex (was an unguarded raw _transport->close — UAF risk vs stop()).
-        closeSession(sid);
+                                  std::to_string(sid) + " - sending 431 and closing");
+        // No lock held here; sendErrorResponse guards '_transport && !_shutdown'
+        // under _mutex, sends headers-only, then closes + cleans up the session.
+        sendErrorResponse(sid, 431, getStatusText(431), "", /*headersOnly=*/true);
         return;
       }
 
@@ -798,9 +819,11 @@ protected:
               if (contentLength > SessionInfo::MAX_BODY_SIZE)
               {
                 iora::core::Logger::error("HttpServer: Body size limit exceeded for session " +
-                                          std::to_string(sid) + " - closing connection");
-                // No lock held; guarded close (was unguarded raw _transport->close).
-                closeSession(sid);
+                                          std::to_string(sid) + " - sending 413 and closing");
+                // Declared Content-Length over the body cap -> 413 Content Too Large
+                // (RFC 9110 §15.5.14). No lock held; sendErrorResponse guards under
+                // _mutex, sends headers-only, then closes + cleans up the session.
+                sendErrorResponse(sid, 413, getStatusText(413), "", /*headersOnly=*/true);
                 return;
               }
             }
@@ -809,7 +832,11 @@ protected:
               iora::core::Logger::error("HttpServer: Invalid "
                                         "content-length header for session " +
                                         std::to_string(sid) + " - closing connection");
-              // No lock held; guarded close (was unguarded raw _transport->close).
+              // An invalid Content-Length is a 400 Bad Request (RFC 9112 §6.3). The
+              // request-side framing fix (400 emission, chunked hardening) is owned
+              // by tracker 2026-07-26-7; here we keep the safe bare close and route
+              // the 400 there rather than fold a request-parser change into this
+              // response-conformance tracker. No lock held; guarded close.
               closeSession(sid);
               return;
             }
@@ -1092,10 +1119,14 @@ protected:
       }
       req.pathRest = decision.pathRest;
 
-      // Create response (default 404; overwritten by the category below).
+      // Create the response. Each dispatch arm below sets its own status/body;
+      // the only branch that wants a 404 body (NO_ROUTE without a handler) sets it
+      // itself. NO 404 body is pre-populated here — pre-populating leaked a
+      // "Not Found" body plus Content-Length: 9 / Content-Type onto success (201),
+      // direct-body, and bodyless (204/304) responses (root_cause). The default
+      // status stays 200 (matching the switch arms that run a handler); a status
+      // left unset by a bug is caught by the framing normalization below.
       Response res;
-      res.status = 404;
-      res.set_content("Not Found", "text/plain");
 
       // ── Post-lock dispatch: exhaustive switch, NO server lock held ──
       bool ranHandler = false; // true iff a user handler was invoked (MATCHED / NO_ROUTE)
@@ -1122,22 +1153,17 @@ protected:
         }
         break;
       case DispatchDecision::Cat::AUTO_OPTIONS:
-        // Answered directly by routing: 204 No Content, empty body, omit
-        // Content-Length AND the inherited Content-Type, Allow from the routing
-        // data (SR-21).
+        // Answered directly by routing: 204 No Content, Allow from the routing data
+        // (SR-21). No handler runs, so `res` is empty here — the bodyless
+        // normalization below erases body/CL/CT for the 204; only Allow is set.
         res.status = 204;
-        res.body.clear();
-        res.headers.erase("Content-Length");
-        res.headers.erase("Content-Type");
         res.headers["Allow"] = decision.allow;
         break;
       case DispatchDecision::Cat::OPTIONS_STAR:
-        // Server-wide OPTIONS * — 200 + Content-Length: 0, no Allow, no inherited
-        // Content-Type (SR-1).
+        // Server-wide OPTIONS * — 200 + Content-Length: 0 (SR-1). No handler runs,
+        // so `res` is empty; Content-Length: 0 is set explicitly for local clarity
+        // (the normalization would synthesize it anyway from the empty body).
         res.status = 200;
-        res.body.clear();
-        res.headers.erase("Allow");
-        res.headers.erase("Content-Type");
         res.headers["Content-Length"] = "0";
         break;
       case DispatchDecision::Cat::METHOD_NOT_ALLOWED:
@@ -1177,15 +1203,160 @@ protected:
 
       // RFC 9110 §9.3.2: a HEAD response MUST carry no body on the wire, on
       // EVERY terminal path (MATCHED_AS_HEAD, 405, NO_ROUTE/404/default). The
-      // body is computed then dropped; Content-Length (reflecting the body a GET
-      // would return) is preserved for a 2xx/4xx representation. For a bodyless
-      // status (304/204) drop any contradictory body Content-Length (SR-18).
+      // Content-Length a GET would return is synthesized here — BEFORE the body is
+      // dropped — for a direct-res.body handler that set none (RD-21); the body is
+      // then dropped. The bodyless-status erase (a HEAD to a 204/304) is NOT done
+      // here — it is left to the single normalization step below (one owner), where
+      // the erase correctly wins over this synthesized Content-Length.
       if (req.method == HttpMethod::HEAD)
       {
-        res.body.clear();
-        if (res.status == 204 || res.status == 304)
+        // Capture the GET-body length BEFORE dropping the body, whenever the handler
+        // set no Content-Length. A handler-set Transfer-Encoding does NOT block this:
+        // the non-bodyless normalization below strips a spurious TE and frames by
+        // Content-Length, so the HEAD must still report the GET length (RFC 9110
+        // §9.3.2), not fall through to Content-Length: 0.
+        if (!res.body.empty() && res.headers.find("Content-Length") == res.headers.end())
         {
-          res.headers.erase("Content-Length");
+          res.headers["Content-Length"] = std::to_string(res.body.size());
+        }
+        res.body.clear();
+      }
+
+      // ── Response framing normalization (choke point, RFC 9112 §6.3 / RFC 9110
+      // §8.6) ───────────────────────────────────────────────────────────────
+      // Runs on EVERY terminal response, on the worker's stack-local `res`, AFTER
+      // the suppression early-return above (an SSE / session-hand-off response is
+      // never touched) and AFTER the HEAD body-strip, but BEFORE `httpRes.headers =
+      // res.headers` below (mutating res after that copy would be lost). NO LOCK IS
+      // HELD here — the classify pass released its lock and the next lock is
+      // _sessionMutex below; `res` is automatic and its address never escapes, so
+      // this is race-free. Do NOT move it into a locked scope or above the
+      // suppression gate. The serializer (HttpResponse::toWireFormat) applies the
+      // same bodyless suppression as an unbypassable backstop across all five
+      // builders; this dispatcher-level step keeps the in-process Response
+      // internally consistent for the res.status logging below and any post-dispatch
+      // middleware that reads res. (onResponseSuppressed ran ABOVE, before this step,
+      // so it observes the raw handler output, not the normalized response.)
+
+      // RFC 9112 §4: status-code is 3DIGIT (100-599 in practice). A handler typo
+      // (res.status = 20, 0, 1000) would emit a malformed status line — substitute
+      // 500. RFC 9110 §15.2: an interim 1xx is a response a client blocks on
+      // awaiting a final; a handler on the NORMAL dispatch path must never emit one
+      // (the legitimate 101 upgrade returned earlier). Both are programming errors
+      // and both rewrite to 500.
+      if (res.status < 200 || res.status > 599)
+      {
+        const char *why = (res.status < 100 || res.status > 599) ? "an out-of-range status"
+                                                                 : "an interim status";
+        iora::core::Logger::error(std::string("HttpServer: handler set ") + why + " (" +
+                                  std::to_string(res.status) + "); rewriting to 500");
+        res.status = 500;
+        res.body.clear();
+        // Erase ALL four framing/representation fields (not just CL/CT): a handler
+        // that set a bad status AND a Transfer-Encoding would otherwise ship a 500
+        // with a stale chunked framing and an empty body, hanging the client.
+        for (const char *h : iora::network::kBodyFramingHeaders)
+        {
+          res.headers.erase(h);
+        }
+      }
+
+      if (iora::network::statusForbidsBody(res.status))
+      {
+        // Bodyless-by-status (1xx/204/304): drop the body and every body-framing /
+        // representation header. RFC 9112 §6.3 rule 1 forbids Content-Length,
+        // Transfer-Encoding and Trailer; Content-Type is meaningless / cache-
+        // poisoning (RFC 9110 §15.4.5). ERASE — never zero — and it wins over any
+        // Content-Length, including one a HEAD synthesized just above. Date and the
+        // §15.4.5 304 must-generate set (Cache-Control/ETag/Expires/Vary/
+        // Content-Location/Last-Modified) and Allow are NOT touched. (205 is
+        // deliberately NOT in statusForbidsBody — see the 205 branch below.)
+        res.body.clear();
+        for (const char *h : iora::network::kBodyFramingHeaders)
+        {
+          res.headers.erase(h);
+        }
+      }
+      else if (res.status == 205)
+      {
+        // 205 Reset Content: RFC 9110 §15.3.6 forbids CONTENT, but RFC 9112 §6.3
+        // rule 8 makes a response lacking both CL and TE close-delimited — so a 205
+        // needs Content-Length: 0 (NOT a bodyless erase). Drop any handler body and
+        // pin CL:0; strip a spurious Transfer-Encoding/Trailer, and drop Content-Type
+        // (it describes a representation that no longer exists once the body is gone).
+        res.body.clear();
+        res.headers.erase("Transfer-Encoding");
+        res.headers.erase("Trailer");
+        res.headers.erase("Content-Type");
+        res.headers["Content-Length"] = "0";
+      }
+      else
+      {
+        // A non-bodyless response needs EXACTLY ONE framing mechanism. The server
+        // never chunk-encodes a handler body (the whole body sits in res.body and is
+        // written inline by toWireFormat), so a handler-set Transfer-Encoding is
+        // spurious and MUST NOT coexist with Content-Length (RFC 9112 §6.1 — the
+        // classic request-smuggling primitive through a proxy): strip TE/Trailer and
+        // frame by Content-Length.
+        if (res.headers.find("Transfer-Encoding") != res.headers.end())
+        {
+          iora::core::Logger::warning(
+            "HttpServer: stripping a handler-set Transfer-Encoding on a " +
+            std::to_string(res.status) +
+            " response (the server frames by Content-Length; RFC 9112 §6.1)");
+          res.headers.erase("Transfer-Encoding");
+          res.headers.erase("Trailer");
+        }
+        auto clIt = res.headers.find("Content-Length");
+        if (clIt == res.headers.end())
+        {
+          // No definite length yet (empty-body 200/201/202, a direct-res.body
+          // handler, or a just-stripped TE). Synthesize it. A HEAD already
+          // synthesized its GET-length Content-Length above (and cleared the body).
+          res.headers["Content-Length"] = std::to_string(res.body.size());
+        }
+        else if (req.method != HttpMethod::HEAD)
+        {
+          // The server writes the WHOLE res.body inline (toWireFormat), so for a
+          // non-HEAD response the only correct Content-Length is res.body.size(). A
+          // handler-set value that disagrees would put N octets of framing over M
+          // octets of body — a keep-alive desync / response-splitting primitive — so
+          // it is OVERWRITTEN (the server-written body is authoritative), with a
+          // warning for diagnosis. A HEAD legitimately reports the GET length over an
+          // empty body and is excluded above.
+          const std::string actual = std::to_string(res.body.size());
+          if (clIt->second != actual)
+          {
+            iora::core::Logger::warning(
+              "HttpServer: overwriting a handler-set Content-Length (" + clIt->second +
+              ") that does not match the body size (" + actual + ") on a " +
+              std::to_string(res.status) + " response (RFC 9110 §8.6)");
+            clIt->second = actual;
+          }
+        }
+      }
+
+      // RFC 9110 §5.5 response-splitting guard: a handler must never place CR/LF/NUL
+      // into a response header (e.g. a Location/HX-Redirect/Set-Cookie built from
+      // unvalidated request input — `?next=%0d%0aSet-Cookie:...`). Drop any such
+      // header here (toWireFormat is the unbypassable backstop, but this runs on the
+      // handler-set path where the risk is real and gives observability). The log
+      // never echoes the offending name/value — only the already-validated request
+      // method/path — so it is not itself a log-injection sink.
+      for (auto hit = res.headers.begin(); hit != res.headers.end();)
+      {
+        if (iora::network::headerHasInjection(hit->first) ||
+            iora::network::headerHasInjection(hit->second))
+        {
+          iora::core::Logger::error(
+            "HttpServer: dropped a response header containing CR/LF/NUL "
+            "(response-splitting attempt) on " +
+            toString(req.method) + " " + req.path + " (session " + std::to_string(sid) + ")");
+          hit = res.headers.erase(hit);
+        }
+        else
+        {
+          ++hit;
         }
       }
 
@@ -1243,11 +1414,19 @@ protected:
       auto sharedResponseData = std::make_shared<std::string>(std::move(responseData));
 
       // Check if transport is still available before sending. SR-7: sendAsync
-      // fires its completion synchronously on this thread while _mutex is held,
-      // so the completion lambda only RECORDS the close intent (capture-only);
-      // the actual _transport->close happens after the lock_guard releases.
-      bool sendFailed = false;
-      bool sendSucceeded = false;
+      // fires its completion synchronously on this thread while _mutex is held.
+      // The completion records only the send OUTCOME through a shared_ptr captured
+      // BY VALUE (not the stack bools by reference) — so there is no dangling
+      // reference if a future transport ever completes the send asynchronously,
+      // matching the capture-free shutdown/exception/sendErrorResponse paths
+      // (task-5.4e). The actual _transport->close happens after the lock releases.
+      enum class SendOutcome
+      {
+        Pending,
+        Ok,
+        Failed
+      };
+      auto sendOutcome = std::make_shared<std::atomic<SendOutcome>>(SendOutcome::Pending);
       {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_transport && !_shutdown)
@@ -1257,21 +1436,24 @@ protected:
             req.remote_addr + ":" + std::to_string(req.remote_port) + " (session " +
             std::to_string(sid) + ", " + std::to_string(sharedResponseData->size()) + " bytes)");
           _transport->sendAsync(sid, sharedResponseData->data(), sharedResponseData->size(),
-                                [&sendFailed, &sendSucceeded,
-                                 sharedResponseData](SessionId session, const SendResult &result)
+                                [sendOutcome, sharedResponseData](SessionId session,
+                                                                  const SendResult &result)
                                 {
                                   if (!result.isOk())
                                   {
                                     iora::core::Logger::error("Failed to send HTTP response: " +
                                                               result.error().message);
-                                    sendFailed = true;
+                                    // relaxed: the atomic carries no dependent data
+                                    // and completion is synchronous on this thread.
+                                    sendOutcome->store(SendOutcome::Failed,
+                                                       std::memory_order_relaxed);
                                   }
                                   else
                                   {
                                     iora::core::Logger::debug("HttpServer - HTTP response "
                                                               "sent successfully for session " +
                                                               std::to_string(session));
-                                    sendSucceeded = true;
+                                    sendOutcome->store(SendOutcome::Ok, std::memory_order_relaxed);
                                   }
                                 });
         }
@@ -1284,6 +1466,9 @@ protected:
                                     ") for session " + std::to_string(sid));
         }
       }
+      const SendOutcome sendResult = sendOutcome->load(std::memory_order_relaxed);
+      const bool sendFailed = (sendResult == SendOutcome::Failed);
+      const bool sendSucceeded = (sendResult == SendOutcome::Ok);
       // Close the connection (on send failure, or when the response requested
       // close) AFTER releasing _mutex, re-acquiring it unnested and re-checking
       // the guard.
@@ -1502,21 +1687,49 @@ protected:
     return result;
   }
 
-  /// \brief Get status text for HTTP status code
+  /// \brief Get the reason phrase for an HTTP status code.
+  ///
+  /// The reason phrase is advisory (RFC 9112 §4), but a wrong or "Unknown" phrase
+  /// on a common status (a 302 redirect, a 415) is a poor default in an HTMX
+  /// application. The table below carries every status this server or its handlers
+  /// realistically emit; anything not listed falls back to the RFC 9110 §15
+  /// class-derived phrase (never "Unknown", which is always wrong for a valid code).
   static std::string getStatusText(int code)
   {
     switch (code)
     {
+    // 1xx Informational
+    case 100:
+      return "Continue";
     case 101:
       return "Switching Protocols";
+    // 2xx Successful
     case 200:
       return "OK";
     case 201:
       return "Created";
+    case 202:
+      return "Accepted";
     case 204:
       return "No Content";
+    case 205:
+      return "Reset Content";
+    case 206:
+      return "Partial Content";
+    // 3xx Redirection
+    case 301:
+      return "Moved Permanently";
+    case 302:
+      return "Found";
+    case 303:
+      return "See Other";
     case 304:
       return "Not Modified";
+    case 307:
+      return "Temporary Redirect";
+    case 308:
+      return "Permanent Redirect";
+    // 4xx Client Error
     case 400:
       return "Bad Request";
     case 401:
@@ -1527,12 +1740,33 @@ protected:
       return "Not Found";
     case 405:
       return "Method Not Allowed";
+    case 409:
+      return "Conflict";
+    case 410:
+      return "Gone";
+    case 411:
+      return "Length Required";
+    case 412:
+      return "Precondition Failed";
     case 413:
-      return "Payload Too Large";
+      return "Content Too Large"; // RFC 9110 §15.5.14 (renamed from "Payload Too Large")
     case 414:
       return "URI Too Long";
+    case 415:
+      return "Unsupported Media Type";
+    case 422:
+      return "Unprocessable Content"; // RFC 9110 §15.5.21
     case 426:
       return "Upgrade Required";
+    case 428:
+      return "Precondition Required";
+    case 429:
+      return "Too Many Requests";
+    case 431:
+      return "Request Header Fields Too Large"; // RFC 6585 §5
+    case 451:
+      return "Unavailable For Legal Reasons";
+    // 5xx Server Error
     case 500:
       return "Internal Server Error";
     case 501:
@@ -1541,66 +1775,111 @@ protected:
       return "Bad Gateway";
     case 503:
       return "Service Unavailable";
+    case 504:
+      return "Gateway Timeout";
     case 505:
       return "HTTP Version Not Supported";
     default:
-      return "Unknown";
+      break;
     }
+    // Class-derived fallback (RFC 9110 §15): never "Unknown" for a valid code.
+    if (code >= 100 && code < 200)
+    {
+      return "Informational";
+    }
+    if (code >= 200 && code < 300)
+    {
+      return "Successful";
+    }
+    if (code >= 300 && code < 400)
+    {
+      return "Redirection";
+    }
+    if (code >= 400 && code < 500)
+    {
+      return "Client Error";
+    }
+    if (code >= 500 && code < 600)
+    {
+      return "Server Error";
+    }
+    return "Unknown";
   }
 
-  /// \brief Send an error response with specified status code and message
+  /// \brief Send an error response with a specified status code and close the
+  /// connection. When headersOnly is true the response carries no body (just
+  /// Content-Length: 0) — used at the request-size limits (431/413), where there
+  /// is no useful representation to return and the request is being rejected.
   void sendErrorResponse(SessionId sid, int statusCode, const std::string &statusText,
-                         const std::string &body = "")
+                         const std::string &body = "", bool headersOnly = false)
   {
     try
     {
       HttpResponse errorRes(statusCode, statusText);
-      std::string responseBody = body.empty() ? statusText : body;
-      errorRes.setHeader("Content-Type", "text/plain");
-      errorRes.body = responseBody;
-      errorRes.setHeader("Content-Length", std::to_string(responseBody.size()));
       errorRes.setHeader("Connection", "close");
-      errorRes.setHeader("Server", "Iora HttpServer");
-
-      auto errorResponseData = std::make_shared<std::string>(errorRes.toWireFormat());
-
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (_transport && !_shutdown)
+      errorRes.setHeader("Server", "Iora/1.0"); // match the dispatch path's Server value
+      if (headersOnly)
       {
-        iora::core::Logger::info("HttpServer: Sending " + std::to_string(statusCode) + " " +
-                                 statusText + " response (session " + std::to_string(sid) + ", " +
-                                 std::to_string(errorResponseData->size()) + " bytes)");
-        _transport->sendAsync(
-          sid, errorResponseData->data(), errorResponseData->size(),
-          [this, sid, errorResponseData](SessionId session, const SendResult &result)
-          {
-            // Close connection after error response is sent
-            if (result.isOk())
-            {
-              iora::core::Logger::debug("HttpServer: Error response "
-                                        "sent successfully to session " +
-                                        std::to_string(session));
-            }
-            else
-            {
-              iora::core::Logger::error("HttpServer: Failed to send "
-                                        "error response to session " +
-                                        std::to_string(session) + ": " + result.error().message);
-            }
-
-            // Always close the connection after sending error response
-            _transport->close(session);
-
-            // Clean up session info
-            std::lock_guard<std::mutex> sessionLock(_sessionMutex);
-            _sessionInfo.erase(session);
-          });
+        // No body, but a definite framing length is still required so the client
+        // does not wait for a close-delimited body (RFC 9112 §6.3 rule 8).
+        errorRes.setHeader("Content-Length", "0");
       }
       else
       {
-        iora::core::Logger::warning("HttpServer: Cannot send error response to session " +
-                                    std::to_string(sid) +
-                                    " - transport unavailable or shutting down");
+        std::string responseBody = body.empty() ? statusText : body;
+        errorRes.setHeader("Content-Type", "text/plain");
+        errorRes.body = responseBody;
+        errorRes.setHeader("Content-Length", std::to_string(responseBody.size()));
+      }
+
+      auto errorResponseData = std::make_shared<std::string>(errorRes.toWireFormat());
+
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_transport && !_shutdown)
+        {
+          iora::core::Logger::info("HttpServer: Sending " + std::to_string(statusCode) + " " +
+                                   statusText + " response (session " + std::to_string(sid) + ", " +
+                                   std::to_string(errorResponseData->size()) + " bytes)");
+          // SR-7: sendAsync fires its completion synchronously on this thread while
+          // _mutex is held, so the completion lambda must NOT re-acquire _mutex and
+          // must NOT capture `this`. It only logs; the connection close and session
+          // cleanup are HOISTED below (still under _mutex, honoring the documented
+          // _mutex -> _sessionMutex order) so there is no latent use-after-free if a
+          // future transport ever completes the send asynchronously (task-5.4e).
+          _transport->sendAsync(
+            sid, errorResponseData->data(), errorResponseData->size(),
+            [errorResponseData](SessionId session, const SendResult &result)
+            {
+              if (result.isOk())
+              {
+                iora::core::Logger::debug("HttpServer: Error response sent successfully to "
+                                          "session " +
+                                          std::to_string(session));
+              }
+              else
+              {
+                iora::core::Logger::error("HttpServer: Failed to send error response to "
+                                          "session " +
+                                          std::to_string(session) + ": " + result.error().message);
+              }
+            });
+
+          // Always close the connection after an error response. Runs under the
+          // _mutex already held (no re-lock, no raw-`this` capture in a callback),
+          // then takes _sessionMutex second (documented order) to erase the session.
+          _transport->close(sid);
+          {
+            std::lock_guard<std::mutex> sessionLock(_sessionMutex);
+            _sessionInfo.erase(sid);
+          }
+        }
+        else
+        {
+          iora::core::Logger::warning("HttpServer: Cannot send error response to session " +
+                                      std::to_string(sid) +
+                                      " - transport unavailable or shutting down");
+        }
       }
     }
     catch (const std::exception &e)
@@ -2089,10 +2368,11 @@ private:
   // total order is _wsMutex/_sseMutex (subclass/friend, OUTER, e.g.
   // WebSocketServer holds _wsMutex across sendRaw which takes _mutex) ->
   // _mutex (HttpServer, inner) -> _sessionMutex (inner). _mutex and
-  // _sessionMutex ARE co-held in sendErrorResponse (the synchronous sendAsync
-  // completion lambda does _transport->close then _sessionInfo.erase under
-  // _sessionMutex while _mutex is still held — order _mutex -> _sessionMutex);
-  // there is NO reverse _sessionMutex -> _mutex edge. No HttpServer code holding _mutex may call a
+  // _sessionMutex ARE co-held in sendErrorResponse: after enqueuing the send,
+  // _transport->close(sid) then _sessionInfo.erase(sid) run under _sessionMutex
+  // while _mutex is still held (the completion lambda itself only logs — the
+  // close+erase were hoisted OUT of it) — order _mutex -> _sessionMutex; there is
+  // NO reverse _sessionMutex -> _mutex edge. No HttpServer code holding _mutex may call a
   // subclass/friend (SseStream/upgradeToSse) method that re-takes a higher
   // lock — the dispatch narrowing copies the handler out and invokes it with
   // no lock held. (_sseMutex is PROSPECTIVE — owned by SseStream/sse_stream.hpp,

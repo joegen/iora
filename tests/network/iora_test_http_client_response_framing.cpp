@@ -718,3 +718,91 @@ TEST_CASE("framing: normal responses still parse and reuse", "[http_framing][reg
     raw.shutdown();
   }
 }
+
+// ── (i) split-segment / surplus-octet eviction scoping (tracker 2026-07-26-4
+// task-5.1) ───────────────────────────────────────────────────────────────────
+TEST_CASE("framing: a bodyless 204 carrying surplus body octets EVICTS the connection",
+          "[http_framing][nobody][evict]")
+{
+  // A non-conformant 204 that declares Content-Length: 9 and puts 9 body octets on
+  // the wire (RFC 9112 §6.3 rule 1 forbids a body). The client must frame it as
+  // bodyless AND evict the connection rather than pool it dirty — otherwise a
+  // subsequent keep-alive request would parse "Not Found" as the next status line.
+  const std::uint16_t port = 19050;
+  RawServer raw;
+  REQUIRE(raw.start(port, keepAlive("HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\nNot Found")));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  HttpClient client(cfg());
+  auto r1 = client.get(urlFor(port));
+  REQUIRE(r1.statusCode == 204);
+  REQUIRE(r1.body.empty());
+  auto r2 = client.get(urlFor(port));
+  REQUIRE(r2.statusCode == 204);
+  // Eviction: the second request opened a NEW connection (the dirty one was not
+  // reused). Pre-fix (unconditional-reuse) this would be 1.
+  REQUIRE(raw.acceptedCount() == 2);
+  raw.shutdown();
+}
+
+TEST_CASE("framing: a conformant keep-alive 304 with Content-Length is REUSED, not evicted",
+          "[http_framing][nobody][evict]")
+{
+  // A conformant 304 MAY carry Content-Length equal to the 200-response octet count
+  // while putting ZERO body octets on the wire (RFC 9110 §8.6 / RFC 9112 §6.3 rule
+  // 1). Evicting it would defeat the cache-validation keep-alive reuse a 304 exists
+  // for, so the client must NOT evict on a declared length alone — only on ARRIVED
+  // surplus. Two requests must share ONE connection.
+  const std::uint16_t port = 19051;
+  RawServer raw;
+  REQUIRE(raw.start(port, keepAlive("HTTP/1.1 304 Not Modified\r\nContent-Length: 50\r\n\r\n")));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  HttpClient client(cfg());
+  auto r1 = client.get(urlFor(port));
+  REQUIRE(r1.statusCode == 304);
+  REQUIRE(r1.body.empty());
+  auto r2 = client.get(urlFor(port));
+  REQUIRE(r2.statusCode == 304);
+  REQUIRE(r2.body.empty());
+  REQUIRE(raw.acceptedCount() == 1); // reused, not evicted
+  raw.shutdown();
+}
+
+TEST_CASE("framing: a bodyless 204 declaring Transfer-Encoding (no CL) EVICTS the connection",
+          "[http_framing][nobody][evict]")
+{
+  // Symmetric to the Content-Length case: a 204 that declares Transfer-Encoding
+  // with no body octets in this segment is non-conformant (RFC 9112 §6.1) and its
+  // phantom chunk data may arrive later; the client must evict, not pool dirty.
+  const std::uint16_t port = 19052;
+  RawServer raw;
+  REQUIRE(raw.start(port, keepAlive("HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n")));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  HttpClient client(cfg());
+  auto r1 = client.get(urlFor(port));
+  REQUIRE(r1.statusCode == 204);
+  REQUIRE(r1.body.empty());
+  auto r2 = client.get(urlFor(port));
+  REQUIRE(r2.statusCode == 204);
+  REQUIRE(raw.acceptedCount() == 2); // evicted -> second request opened a new connection
+  raw.shutdown();
+}
+
+TEST_CASE("framing: a bodyless 204 with a MALFORMED Content-Length EVICTS the connection",
+          "[http_framing][nobody][evict]")
+{
+  // A 204 declaring a non-numeric Content-Length is non-conformant; the eviction
+  // guard's parseContentLength throws and the fail-safe default (evict) applies, so
+  // the connection is not pooled dirty.
+  const std::uint16_t port = 19053;
+  RawServer raw;
+  REQUIRE(raw.start(port, keepAlive("HTTP/1.1 204 No Content\r\nContent-Length: notanumber\r\n\r\n")));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  HttpClient client(cfg());
+  auto r1 = client.get(urlFor(port));
+  REQUIRE(r1.statusCode == 204);
+  REQUIRE(r1.body.empty());
+  auto r2 = client.get(urlFor(port));
+  REQUIRE(r2.statusCode == 204);
+  REQUIRE(raw.acceptedCount() == 2); // evicted (fail-safe on malformed CL)
+  raw.shutdown();
+}
