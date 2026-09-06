@@ -248,6 +248,42 @@ TEST_CASE("TW: TimingWheelAdapter cancel", "[timing_wheel][adapter]")
   REQUIRE_FALSE(fired);
 }
 
+TEST_CASE("TW: tickDuration exposes the configured tick (task-4.7c)",
+          "[timing_wheel][adapter]")
+{
+  TimingWheel tw(10ms, 16, 2);
+  CHECK(tw.tickDuration() == 10ms); // const-after-construction: valid pre-start.
+  tw.start();
+  CHECK(tw.tickDuration() == 10ms); // unchanged by lifecycle.
+  tw.stop();
+
+  TimingWheel tw4(4ms, 32, 3);
+  CHECK(tw4.tickDuration() == 4ms); // reflects the ctor value, not a constant.
+
+  TimingWheelAdapter adapter(tw);
+  CHECK(adapter.tickDuration() == tw.tickDuration()); // forwards the wheel getter.
+}
+
+TEST_CASE("TW: ITimerService::tickDuration defaults to a 0 sentinel for a "
+          "non-overriding implementer (task-4.7c standoff resolution)",
+          "[timing_wheel][adapter]")
+{
+  // A minimal ITimerService overriding ONLY the pure virtuals — proving the new
+  // tickDuration() is NON-pure with a safe 0 ("granularity unknown") default, so
+  // the 30+ existing implementers keep compiling without any change.
+  struct BareTimer : ITimerService
+  {
+    TimerId schedule(std::chrono::milliseconds, std::function<void()>) override
+    {
+      return InvalidTimerId;
+    }
+    bool cancel(TimerId) override { return false; }
+    bool reschedule(TimerId, std::chrono::milliseconds) override { return false; }
+  };
+  BareTimer t;
+  CHECK(t.tickDuration() == 0ms);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Multiple Timers
 // ══════════════════════════════════════════════════════════════════════════════

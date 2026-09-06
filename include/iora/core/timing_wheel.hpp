@@ -53,6 +53,19 @@ public:
                            std::function<void()> callback) = 0;
   virtual bool cancel(TimerId id) = 0;
   virtual bool reschedule(TimerId id, std::chrono::milliseconds newDelay) = 0;
+
+  /// \brief Tick granularity of the backing scheduler, or 0 if unknown.
+  ///
+  /// NON-PURE with a safe 0-sentinel default so the 30+ existing implementers
+  /// (iora core, iora_sip production + test mocks, iora_media) keep compiling
+  /// unchanged; a TimingWheel-backed adapter overrides it with the real tick.
+  /// A returned value of 0 means "granularity unknown" — a consumer that needs
+  /// to reason about the scheduler's floor MUST fail closed on 0 rather than
+  /// divide by it.
+  virtual std::chrono::milliseconds tickDuration() const noexcept
+  {
+    return std::chrono::milliseconds{0};
+  }
 };
 
 /// \brief Hierarchical timing wheel for O(1) timer insert/cancel.
@@ -113,6 +126,14 @@ public:
   TimingWheel& operator=(const TimingWheel&) = delete;
   TimingWheel(TimingWheel&&) = delete;
   TimingWheel& operator=(TimingWheel&&) = delete;
+
+  /// \brief Time per tick, fixed at construction. Lock-free: _tickDuration is
+  /// const-after-construction, so no _wheelMutex is taken (a scheduling-path
+  /// consumer must not be coupled to the wheel lock to read the granularity).
+  std::chrono::milliseconds tickDuration() const noexcept
+  {
+    return _tickDuration;
+  }
 
   // ── Schedule / Cancel / Reschedule ─────────────────────────────────────
 
@@ -726,6 +747,11 @@ public:
   bool reschedule(TimerId id, std::chrono::milliseconds newDelay) override
   {
     return _wheel.reschedule(id, newDelay);
+  }
+
+  std::chrono::milliseconds tickDuration() const noexcept override
+  {
+    return _wheel.tickDuration();
   }
 
 private:
