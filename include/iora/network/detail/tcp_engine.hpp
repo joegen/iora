@@ -58,6 +58,7 @@
 #include "iora/core/timer.hpp"
 #include "iora/network/detail/engine_base.hpp"
 #include "iora/network/event_batch_processor.hpp"
+#include "iora/network/name_resolver.hpp"
 #include "iora/network/sockaddr_utils.hpp"
 #include "iora/network/transport_types.hpp"
 #include <openssl/err.h>
@@ -168,6 +169,14 @@ public:
       std::lock_guard<std::mutex> g(_cmdMutex);
       _cmdsClosed = false;
     }
+
+    // RE-CREATE the post gate BEFORE _eventFd/_epollFd/_loop, co-located with the
+    // _cmdsClosed reset. A resolver continuation left over from a prior run keeps
+    // its OLD (closed) gate and drops; continuations from this run see this fresh
+    // (open) gate. Without this, every post-restart named-host resolve would drop
+    // against a permanently-closed gate (spurious onClose(Resolve)).
+    _postGuard = std::make_shared<detail::EnginePostGate>();
+    _postGuard->engine = this;
 
     if (!initTls())
     {
@@ -713,6 +722,18 @@ private:
     TlsMode tls{TlsMode::None};
   };
 
+  /// \brief I/O-thread-only record of a named-host connect awaiting off-thread
+  /// resolution. It is the SINGLE-OWNER one-shot terminal event for that sid —
+  /// exactly one of {resume, resolve-timeout, teardown/close} erases it and
+  /// fires the terminal; the others no-op. Holds only the resolve-timeout handle
+  /// (no owned resource, no connectSync handle — connectSync is a Transport-layer
+  /// CV). The UDP engine's counterpart carries an absolute resolveDeadline
+  /// instead (it has no TimerService).
+  struct PendingConnect
+  {
+    std::uint64_t resolveTimeoutId{0}; // TimerService id; 0 == none armed
+  };
+
   struct SendReq
   {
     SessionId sid{};
@@ -725,7 +746,8 @@ private:
     AddListener,
     Connect,
     Send,
-    Close
+    Close,
+    RunOnIo // generic "run this closure on the I/O thread" (runOnIoThread seam)
   };
 
   enum class CloseOrigin
@@ -747,8 +769,15 @@ private:
     std::string closeMsg;
     CloseOrigin closeOrigin{CloseOrigin::App};
     std::shared_ptr<std::promise<bool>> listenerReady; // signals when addListener bind completes
+    std::function<void()> fn; // Cmd::RunOnIo payload (std::function keeps Command copyable)
 
     static Command shutdown() { return Command{Cmd::Shutdown}; }
+    static Command runOnIo(std::function<void()> fn)
+    {
+      Command x{Cmd::RunOnIo};
+      x.fn = std::move(fn);
+      return x;
+    }
     static Command addListener(const ListenerCfg &lc,
                                std::shared_ptr<std::promise<bool>> ready = nullptr)
     {
@@ -782,6 +811,12 @@ private:
     }
   };
 
+  // The Cmd::RunOnIo payload is a std::function<void()> member, so Command stays
+  // copyable — the command deque copies/moves entries (arch C2; tracker task-1.6
+  // / testStrategy c1_c3_unit "RunOnIo keeps Command/Cmd copyable").
+  static_assert(std::is_copy_constructible<Command>::value,
+                "Command must remain copyable after adding the RunOnIo fn member");
+
   // Push a command and wake the I/O loop. The deque push, the _cmdsClosed
   // check, and the _eventFd wakeup ::write all happen UNDER _cmdMutex so they
   // are atomic w.r.t. shutdownDrain()'s `close(_eventFd); _eventFd=-1` (which
@@ -790,6 +825,34 @@ private:
   // write is held under the lock safely because _eventFd is EFD_NONBLOCK.
   // NOTE: on the exception path the onError callback is invoked synchronously on
   // the CALLER's thread (copy-then-invoke, outside _cbMutex), not the I/O thread.
+  /// \brief EngineBase seam: post \p fn onto the I/O thread as a RunOnIo command.
+  /// NOEXCEPT and callback-free — on any failure (closed, or allocation) it
+  /// returns false and fires NO user callback; a dropped resolve post is
+  /// backstopped by the resolve-timeout (#10/#14). ALWAYS posts, never inline.
+  bool runOnIoThread(std::function<void()> fn) noexcept override
+  {
+    try
+    {
+      std::lock_guard<std::mutex> g(_cmdMutex);
+      if (_cmdsClosed)
+      {
+        return false;
+      }
+      _cmds.push_back(Command::runOnIo(std::move(fn)));
+      _atomicStats.commands++;
+      if (_eventFd >= 0)
+      {
+        std::uint64_t one = 1;
+        (void)::write(_eventFd, &one, sizeof(one));
+      }
+      return true;
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
   bool enqueue(const Command &cmd)
   {
     try
@@ -1091,6 +1154,52 @@ private:
       ::close(_timerFd);
       _timerFd = -1;
     }
+
+    // (a) CLOSE THE POST GATE — a STANDALONE gate->m section, BEFORE the
+    // _cmdMutex teardown block and never nested inside it (HR-2: gate->m is
+    // strictly OUTSIDE _cmdMutex). closed and engine are set together, so a
+    // resolver continuation seeing !closed always finds engine alive; after this
+    // point continuations drop instead of posting a resume (#8/#13).
+    {
+      std::lock_guard<std::mutex> gg(_postGuard->m);
+      _postGuard->closed = true;
+      _postGuard->engine = nullptr;
+    }
+
+    // (b) DRAIN in-flight named-host resolves (#7b): COLLECT-THEN-FIRE. Fire
+    // exactly one onClose(ShuttingDown) per pending sid, COPY-THEN-INVOKE (copy
+    // onClose under _cbMutex, mirror the session drain above), OUTSIDE gate->m
+    // and outside the _cmdMutex teardown block (#14/HR-3). Erase before firing so
+    // a re-entrant callback cannot double-fire an entry.
+    if (!_pendingConnects.empty())
+    {
+      std::vector<SessionId> pendingSids;
+      pendingSids.reserve(_pendingConnects.size());
+      for (auto &kv : _pendingConnects)
+      {
+        pendingSids.push_back(kv.first);
+      }
+      decltype(_cbs.onClose) drainCb;
+      { std::lock_guard<std::mutex> g(_cbMutex); drainCb = _cbs.onClose; }
+      for (SessionId sid : pendingSids)
+      {
+        auto it = _pendingConnects.find(sid);
+        if (it == _pendingConnects.end())
+        {
+          continue;
+        }
+        if (_timerService && it->second.resolveTimeoutId != 0)
+        {
+          _timerService->cancel(it->second.resolveTimeoutId);
+        }
+        _pendingConnects.erase(it);
+        if (drainCb)
+        {
+          drainCb(sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown", 0, 0});
+        }
+      }
+    }
+
     // Close _eventFd and the command queue together under _cmdMutex so the
     // close is mutually exclusive with enqueue()'s wakeup ::write (DD-1) and no
     // further command can be queued after teardown (DD-5). Any promise-bearing
@@ -1233,11 +1342,39 @@ private:
         case Cmd::Connect:
           doConnect(c.c);
           break;
+        case Cmd::RunOnIo:
+          if (c.fn)
+          {
+            c.fn();
+          }
+          break;
         case Cmd::Send:
           doSend(std::move(c.s));
           break;
         case Cmd::Close:
         {
+          // Close DURING the resolve window: the session was never inserted into
+          // _sessions (resolution is still in flight), so consult _pendingConnects
+          // FIRST. If found, cancel the resolve timeout, erase, fire the single
+          // terminal onClose; the later resumeConnect finds no entry and no-ops.
+          {
+            auto pit = _pendingConnects.find(c.closeSid);
+            if (pit != _pendingConnects.end())
+            {
+              if (_timerService && pit->second.resolveTimeoutId != 0)
+              {
+                _timerService->cancel(pit->second.resolveTimeoutId);
+              }
+              _pendingConnects.erase(pit);
+              decltype(_cbs.onClose) closeCb;
+              { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+              if (closeCb)
+              {
+                closeCb(c.closeSid, TransportErrorInfo{c.closeReason, c.closeMsg, 0, 0});
+              }
+              break;
+            }
+          }
           auto it = _sessions.find(c.closeSid);
           if (it != _sessions.end())
           {
@@ -1454,39 +1591,24 @@ private:
     }
   }
 
+  /// \brief KICKOFF: literal-IP short-circuit stays synchronous; a named host
+  /// is resolved OFF the I/O thread, event-driven, then resumed via
+  /// resumeConnect. Enqueue-only contract preserved (returns without blocking).
   bool doConnect(const ConnectReq &cr)
   {
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    addrinfo *res = nullptr;
-    std::string ps = std::to_string(cr.port);
-
-    // CRITICAL FIX: Skip getaddrinfo() for IP addresses to prevent I/O thread
-    // from hanging For IP addresses, we can directly use them without DNS
-    // resolution
-    int rc = 0;
-
-    // Check if host is already an IP address (IPv4 or IPv6)
+    // Literal IP short-circuit — SYNCHRONOUS, no resolver. Build a STACK-owned
+    // addrinfo and connect directly; connectFromAddrs never frees it.
     struct sockaddr_in sa4;
     struct sockaddr_in6 sa6;
-    bool isIPv4 = (inet_pton(AF_INET, cr.host.c_str(), &(sa4.sin_addr)) == 1);
-    bool isIPv6 = (inet_pton(AF_INET6, cr.host.c_str(), &(sa6.sin6_addr)) == 1);
-
-    bool manualAddrinfo = false;
-    addrinfo manualHints{};
-
+    const bool isIPv4 = (inet_pton(AF_INET, cr.host.c_str(), &(sa4.sin_addr)) == 1);
+    const bool isIPv6 = (inet_pton(AF_INET6, cr.host.c_str(), &(sa6.sin6_addr)) == 1);
     if (isIPv4 || isIPv6)
     {
-      // For IP addresses, use stack-allocated addrinfo instead of heap allocation
-      manualAddrinfo = true;
-      std::memset(&manualHints, 0, sizeof(manualHints));
+      addrinfo manualHints{};
       manualHints.ai_family = isIPv4 ? AF_INET : AF_INET6;
       manualHints.ai_socktype = SOCK_STREAM;
       manualHints.ai_protocol = IPPROTO_TCP;
       manualHints.ai_next = nullptr;
-
       if (isIPv4)
       {
         manualHints.ai_addrlen = sizeof(sockaddr_in);
@@ -1505,44 +1627,138 @@ private:
         inet_pton(AF_INET6, cr.host.c_str(), &(sa6.sin6_addr));
         manualHints.ai_addr = reinterpret_cast<sockaddr *>(&sa6);
       }
-
-      res = &manualHints;
-      rc = 0; // Success
+      return connectFromAddrs(cr, &manualHints);
     }
-    else
-    {
-      // For hostnames, use getaddrinfo with timeout
-      auto dnsTimeout = std::chrono::seconds(2);
-      auto dnsResult =
-        std::async(std::launch::async,
-                   [&]() { return ::getaddrinfo(cr.host.c_str(), ps.c_str(), &hints, &res); });
 
-      auto dnsStatus = dnsResult.wait_for(dnsTimeout);
-      if (dnsStatus == std::future_status::timeout)
+    // NAMED host: resolve OFF the I/O thread, EVENT-DRIVEN. Arm the resolve
+    // timeout, record the single-owner pending entry, kick off the async
+    // resolve, and RETURN (enqueue-only contract). The old
+    // std::async(launch::async) + wait_for(2s) block is DELETED: it blocked the
+    // epoll I/O thread, had an illusory timeout (the ~future joins the still-
+    // running getaddrinfo), and leaked the addrinfo on the timeout path
+    // (#12; cpp17 L3/L4; ts F3).
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    // AI_ADDRCONFIG: on an IPv4-only host, do NOT return AAAA for a dual-stack
+    // FQDN — otherwise RFC 6724 orders the AAAA first and the single-address,
+    // terminal-on-failure connect hits ENETUNREACH (a terminal fast-fail) without
+    // ever trying the reachable A record (sip-voip M-1). Loopback is exempt in
+    // glibc, so localhost/ip6-localhost resolution is unaffected. Resolution-time
+    // filtering, orthogonal to F2 multi-address failover.
+    hints.ai_flags = AI_ADDRCONFIG;
+
+    PendingConnect pc;
+    if (_timerService && _config.resolveTimeout.count() > 0)
+    {
+      pc.resolveTimeoutId = _timerService->scheduleAfter(
+        _config.resolveTimeout, [this, sid = cr.sid] { handleResolveTimeout(sid); });
+    }
+    _pendingConnects[cr.sid] = pc;
+
+    resolveHostAsync(cr.host, std::to_string(cr.port), hints, makeResolveContinuation(cr));
+    return true;
+  }
+
+  /// \brief Build the resolver continuation (runs on a blockingIoPool thread).
+  /// Captures only owned state by value + a shared_ptr copy of the post gate; it
+  /// builds the resume closure OUTSIDE gate->m, then posts it onto the I/O thread
+  /// iff the gate is still open (#4/#5/#8/#14). NO user callback runs under
+  /// gate->m; runOnIoThread is noexcept/callback-free.
+  std::function<void(iora::network::ResolveResult)> makeResolveContinuation(const ConnectReq &cr)
+  {
+    auto gate = _postGuard; // shared_ptr copy — keeps the gate alive
+    SessionId sid = cr.sid;
+    std::string host = cr.host;
+    std::uint16_t port = cr.port;
+    TlsMode tls = cr.tls;
+    return [this, gate, sid, host = std::move(host), port, tls](iora::network::ResolveResult r)
+    {
+      // Built OUTSIDE gate->m; on bad_alloc here r (and its addrs) frees on
+      // unwind and the resolve-timeout backstops the missing terminal (#16).
+      std::function<void()> resume =
+        [this, sid, host, port, tls, addrs = r.addrs, gai = r.gaiCode]
+        { resumeConnect(sid, host, port, tls, addrs, gai); };
+      std::lock_guard<std::mutex> g(gate->m);
+      if (gate->closed)
       {
-        std::string timeoutMsg = "DNS_TIMEOUT_FIX_TRIGGERED: getaddrinfo timeout after " +
-                                 std::to_string(dnsTimeout.count()) + "s for " + cr.host + ":" + ps;
-        decltype(_cbs.onClose) closeCb;
-        { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-        if (closeCb) closeCb(cr.sid, TransportErrorInfo{TransportError::Resolve, timeoutMsg});
-        err(TransportError::Resolve, timeoutMsg);
-        return false;
+        return; // engine torn down: drop; addrs frees when r/resume drop
       }
+      gate->engine->runOnIoThread(std::move(resume));
+    };
+  }
 
-      rc = dnsResult.get();
-    }
-    if (rc != 0 || !res)
+  /// \brief RESUME (I/O thread). Single-owner one-shot: connect ONLY if this call
+  /// erased the pending entry; a stale sid (already resolved/closed/torn down)
+  /// no-ops and lets \p addrs free.
+  void resumeConnect(SessionId sid, const std::string &host, std::uint16_t port, TlsMode tls,
+                     std::shared_ptr<iora::network::OwnedAddrInfo> addrs, int gai)
+  {
+    auto it = _pendingConnects.find(sid);
+    if (it == _pendingConnects.end())
     {
+      return; // resolve-timeout or close already fired the terminal
+    }
+    if (_timerService && it->second.resolveTimeoutId != 0)
+    {
+      _timerService->cancel(it->second.resolveTimeoutId);
+    }
+    _pendingConnects.erase(it);
+
+    if (gai != 0 || !addrs || !addrs->get())
+    {
+      // gai==0 with a null/empty chain is defensive (glibc returns EAI_* + null
+      // together); resolveErrorMessage(0) would say "Success", so use a fixed
+      // string for that path (sip-voip L-4).
+      const std::string msg =
+        (gai != 0) ? iora::network::resolveErrorMessage(gai) : "resolve returned no addresses";
       decltype(_cbs.onClose) closeCb;
       { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-      {
-        closeCb(cr.sid, TransportErrorInfo{TransportError::Resolve,
-                                            std::string("getaddrinfo: ") + gai_strerror(rc)});
-      }
-      err(TransportError::Resolve, "getaddrinfo failed");
-      return false;
+      if (closeCb) closeCb(sid, TransportErrorInfo{TransportError::Resolve, msg});
+      err(TransportError::Resolve, std::string("resolve failed: ") + msg);
+      return;
     }
+    connectFromAddrs(ConnectReq{sid, host, port, tls}, addrs->get());
+  }
+
+  /// \brief Resolve-timeout, TimerService thread. MARSHALS to the I/O thread —
+  /// never mutates _pendingConnects directly. #8b: this-lifetime is bounded by
+  /// ~TimerService joining the timer thread before _cmds/_cmdMutex/_eventFd are
+  /// destroyed (they are declared BEFORE _timerService, so ~TimerService runs
+  /// first). #16: if BOTH this post and the resolver post fail on bad_alloc, an
+  /// async connect observer gets no terminal until teardown drains
+  /// _pendingConnects.
+  void handleResolveTimeout(SessionId sid)
+  {
+    runOnIoThread([this, sid] { resolveTimeoutOnIo(sid); });
+  }
+
+  /// \brief Resolve-timeout apply (I/O thread). One-shot eraser: fire
+  /// onClose(Resolve) iff this call erased the entry; a resume that already won
+  /// leaves nothing to do.
+  void resolveTimeoutOnIo(SessionId sid)
+  {
+    auto it = _pendingConnects.find(sid);
+    if (it == _pendingConnects.end())
+    {
+      return; // resume/close won the race
+    }
+    _pendingConnects.erase(it);
+    decltype(_cbs.onClose) closeCb;
+    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+    if (closeCb) closeCb(sid, TransportErrorInfo{TransportError::Resolve, "resolve timeout"});
+    err(TransportError::Resolve, "resolve timeout");
+  }
+
+  /// \brief Connect using an EXTERNALLY-owned addrinfo chain (single-address,
+  /// terminal-on-failure — core scope; F2 adds multi-address failover). NEVER
+  /// calls ::freeaddrinfo — the caller owns \p res (a stack addrinfo for the
+  /// literal path, or a shared_ptr<OwnedAddrInfo> for the resume path); a free
+  /// here would double-free (#6, cpp17 H3). Runs on the I/O thread.
+  bool connectFromAddrs(const ConnectReq &cr, addrinfo *res)
+  {
+    std::string ps = std::to_string(cr.port);
 
     int cfd = -1;
     addrinfo *chosen = nullptr;
@@ -1572,11 +1788,7 @@ private:
         ::close(cfd);
         cfd = -1;
 
-        // Clean up addrinfo before returning
-        if (!manualAddrinfo)
-        {
-          ::freeaddrinfo(res);
-        }
+        // NO ::freeaddrinfo — the caller owns res (#6, cpp17 H3).
 
         // Report immediate failure
         decltype(_cbs.onClose) closeCb;
@@ -1598,8 +1810,9 @@ private:
     int loopErrno = errno;
     std::string loopErr = lastErr();
 
-    // Save peer address from chosen entry BEFORE freeing the addrinfo chain.
-    // chosen points into res, so it becomes dangling after freeaddrinfo/delete.
+    // Copy the peer address out of the chosen entry. NO ::freeaddrinfo — the
+    // caller owns res (#6, cpp17 H3); chosen stays valid for the caller's frame,
+    // but we use the copied savedPeer from here on regardless.
     sockaddr_storage savedPeer{};
     socklen_t savedPeerLen = 0;
     if (chosen)
@@ -1607,14 +1820,6 @@ private:
       savedPeerLen = (socklen_t)chosen->ai_addrlen;
       std::memcpy(&savedPeer, chosen->ai_addr, savedPeerLen);
     }
-
-    // Clean up addrinfo (stack-allocated manualHints needs no cleanup)
-    if (!manualAddrinfo)
-    {
-      ::freeaddrinfo(res);
-    }
-    res = nullptr;
-    chosen = nullptr; // dangling after free — use savedPeer instead
 
     if (cfd < 0)
     {
@@ -2858,6 +3063,11 @@ private:
   // High-resolution timer service
   std::unique_ptr<iora::core::TimerService> _timerService;
   iora::core::TimerServiceConfig _timerConfig;
+
+  // Named-host connects awaiting off-thread resolution. I/O-THREAD-ONLY — every
+  // mutation (doConnect kickoff, resumeConnect, resolveTimeoutOnIo, doClose
+  // drain, shutdownDrain) runs on the I/O loop thread, so no lock is taken.
+  std::unordered_map<SessionId, PendingConnect> _pendingConnects;
 
   // Batch processor (created when batching is enabled)
   std::unique_ptr<EventBatchProcessor> _batchProcessor;

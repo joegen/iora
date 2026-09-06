@@ -57,6 +57,7 @@ endif()
 set(NETWORK_TESTS
     network/iora_test_batch_processor
     network/iora_test_sockaddr_utils
+    network/iora_test_name_resolver
     network/iora_test_dns_basic
     network/iora_test_dns_timer_cancellation
     network/iora_test_dns_async
@@ -88,6 +89,13 @@ set(NETWORK_TESTS
     network/iora_test_websocket
     network/iora_test_transport
     network/iora_test_engine_introspection
+    # Event-driven DNS-resolve tests (tracker 2026-09-06-4). The three below
+    # monopolise the process-wide blockingIoPool() (block all workers / fill the
+    # queue) to drive resolve-timeout and reject-fast paths deterministically, so
+    # they are ISOLATED in their own binaries and ordered LAST in this list.
+    network/iora_test_tcp_engine_resolve
+    network/iora_test_udp_engine_resolve
+    network/iora_test_name_resolver_saturation
 )
 
 
@@ -304,6 +312,10 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_tcp_engine_teardown_race
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race
+    iora_test_name_resolver
+    iora_test_tcp_engine_resolve
+    iora_test_udp_engine_resolve
+    iora_test_name_resolver_saturation
     iora_test_http_client_lease
     iora_test_http_client_response_framing
     iora_test_http_client_retry

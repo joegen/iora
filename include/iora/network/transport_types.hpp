@@ -291,6 +291,11 @@ struct TransportConfig
   std::chrono::seconds maxConnAge{std::chrono::seconds::zero()};
   std::chrono::milliseconds connectTimeout{30000};
   std::chrono::milliseconds handshakeTimeout{30000};
+  // Off-thread name-resolution timeout (event-driven doConnect). count()==0
+  // disables it; SIP transports MUST NOT disable it (a disabled resolve-timeout
+  // is an aggregate-budget violation — see the iora_sip budget assert, tracker
+  // 2026-09-06-4 task-5.2). See architecture/iora/transport_dns_resolve.json C6.
+  std::chrono::milliseconds resolveTimeout{5000};
   std::chrono::milliseconds writeStallTimeout{0};
   std::chrono::seconds gcInterval{5};
 

@@ -1176,5 +1176,18 @@ private:
   std::atomic<bool> _accepting{false};  // Flag to control acceptance of new work during drain
 };
 
+/// \brief Process-wide, immortal, hard-capped, reject-fast pool for BLOCKING I/O
+///        (e.g. ::getaddrinfo) that must NEVER run on an event-loop thread.
+///
+/// The FIRST global ThreadPool accessor in iora::core. Dedicated to blocking,
+/// uncancellable syscalls: a stuck worker (a hung resolver) must not starve
+/// unrelated work, so the pool is hard-capped (maxSize=16) and reject-fast
+/// (tryEnqueue returns false at maxQueueSize=128 rather than blocking). It is
+/// a deliberately-leaked function-local static (LoggerData precedent) because
+/// an uncancellable getaddrinfo worker may still be parked at process exit;
+/// joining it would hang teardown, so the pool is never destroyed. Defined in
+/// src/core/iora_core.cpp. See architecture/iora/transport_dns_resolve.json (C3).
+ThreadPool &blockingIoPool();
+
 } // namespace core
 } // namespace iora

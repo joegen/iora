@@ -17,6 +17,24 @@ MetricsRegistry& MetricsRegistry::instance()
   return registry;
 }
 
+// IMMORTAL / deliberately-leaked blockingIoPool singleton (transport DNS-resolve
+// CORE, arch transport_dns_resolve.json C3). Dedicated pool for blocking,
+// uncancellable I/O (::getaddrinfo) that must never run on an epoll I/O thread.
+// Never destroyed: an uncancellable getaddrinfo worker may still be parked when
+// process exit runs static destructors — joining it (ThreadPool's dtor) would
+// hang teardown, and a late worker only touches immortal statics + its engine's
+// already-closed EnginePostGate. This is the R-MEM-1 immortal-singleton exception
+// (raw new / no delete), mirroring the LoggerData precedent below. Do NOT revert
+// to `static ThreadPool pool(...)` — that reopens the exit-hang path. The leak is
+// intentional (LSan: intentional immortal). ThreadPool(initial=2, max=16,
+// idleTimeout=30s, maxQueueSize=128) — hard-capped + reject-fast via tryEnqueue.
+ThreadPool &blockingIoPool()
+{
+  static ThreadPool *pool =
+    new ThreadPool(2, 16, std::chrono::seconds(30), 128);
+  return *pool;
+}
+
 // IMMORTAL / deliberately-leaked LoggerData singleton (tracker 2026-07-23-4).
 // Never destroyed: the mutex/condition_variables it owns must outlive (1) every
 // object with static storage that may log from its OWN destructor — e.g. a sink

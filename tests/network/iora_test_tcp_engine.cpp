@@ -164,6 +164,57 @@ TEST_CASE("TCP loopback echo", "[tcp][echo]")
   f.tx.stop();
 }
 
+TEST_CASE("TCP named-host connect (event-driven resolve)", "[tcp][resolve]")
+{
+  // Connect by NAME (not an IP literal) so doConnect takes the off-thread
+  // resolve -> resumeConnect path (phase-2). "localhost" resolves via
+  // /etc/hosts, no network dependency.
+  TcpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  auto cr = f.tx.connect("localhost", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
+
+  // The resolve is async, so allow a little longer than the literal path.
+  REQUIRE(f.waitForCondition([&]() { return f.connectCount > 0 && f.acceptCount > 0; }, 3000ms));
+  REQUIRE(f.connectedSessions.size() == 1);
+  REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve) on the happy path
+
+  const char *msg = "hello named";
+  REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
+  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() > 0; }));
+  REQUIRE(f.sessionData[cs] == "hello named");
+
+  f.tx.stop();
+}
+
+TEST_CASE("TCP named-host connect after restart (fresh post gate)", "[tcp][resolve][restart]")
+{
+  // Validates task-2.2: start() re-creates the EnginePostGate before the loop.
+  // Without it, a resolver continuation posted after restart would drop against
+  // a permanently-closed gate, yielding a spurious onClose(Resolve).
+  TcpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  f.tx.stop();
+  REQUIRE(f.tx.start().isOk()); // restart — fresh gate must be installed
+  f.reset();
+
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  auto cr = f.tx.connect("localhost", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+
+  REQUIRE(f.waitForCondition([&]() { return f.connectCount > 0 && f.acceptCount > 0; }, 3000ms));
+  REQUIRE(f.connectedSessions.size() == 1);
+  REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve) after restart
+
+  f.tx.stop();
+}
+
 TEST_CASE("TCP stats verification", "[tcp][stats]")
 {
   TcpFixture f;

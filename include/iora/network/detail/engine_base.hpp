@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -19,6 +21,29 @@ namespace network
 {
 namespace detail
 {
+
+class EngineBase;
+
+/// \brief Shutdown/lifetime gate for cross-thread posts from the off-thread
+///        name-resolution continuation (see name_resolver.hpp).
+///
+/// A resolver continuation runs on a blockingIoPool() thread and must post the
+/// resume closure back onto the engine's I/O thread — but the engine may have
+/// been torn down meanwhile. The continuation captures a shared_ptr copy of this
+/// gate and posts under \c m iff \c closed is false. The DERIVED engine's
+/// shutdownDrain sets closed=true + engine=nullptr under \c m before the engine's
+/// members die; start() RE-CREATES a fresh gate before the loop, so a stale
+/// continuation keeps its OLD gate (closed) and drops. \c closed and \c engine
+/// are always set together, so !closed implies engine is alive.
+///
+/// LOCK ORDERING (HR-2): \c m is acquired STRICTLY OUTSIDE the engine's command
+/// mutex, and NO user-facing callback runs while \c m is held (#13/#14).
+struct EnginePostGate
+{
+  std::mutex m;
+  bool closed{false};
+  EngineBase *engine{nullptr};
+};
 
 /// \brief Abstract engine interface — owned by Transport, never by consumers.
 ///
@@ -125,7 +150,24 @@ public:
   // no synchronization is used.
   virtual void scheduleSelfDestruct(std::function<void()> deleter) = 0;
 
+  /// \brief Post \p fn to run on the engine's I/O thread. ALWAYS posts — never
+  /// runs \p fn inline, even if called on the I/O thread.
+  ///
+  /// PUBLIC because the off-thread name-resolution continuation reaches it
+  /// through an EnginePostGate::engine (an EngineBase*), mirroring the public
+  /// scheduleSelfDestruct. Each concrete engine wraps \p fn into its own
+  /// RunOnIo command variant and enqueues via a NOEXCEPT, callback-free path:
+  /// on allocation failure it returns false and fires NO user callback (a
+  /// dropped resolve post is backstopped by the resolve-timeout). Returns true
+  /// iff the command was queued.
+  virtual bool runOnIoThread(std::function<void()> fn) noexcept = 0;
+
 protected:
+  /// \brief Initializes the post gate with engine==this. start() re-creates it
+  /// before the loop (tracker 2026-09-06-4 task-2.2/4.4); this initial gate
+  /// covers the pre-start window.
+  EngineBase() : _postGuard(std::make_shared<EnginePostGate>()) { _postGuard->engine = this; }
+
   /// \brief Stamp the current thread as the I/O thread. Call FIRST-THING in the
   /// concrete engine's loop thread, before any dispatch, so isOnIoThread() is
   /// valid for the whole loop lifetime.
@@ -143,6 +185,12 @@ protected:
   {
     _ioThreadId.store(std::thread::id{}, std::memory_order_relaxed);
   }
+
+  /// \brief Shared post gate captured by resolver continuations. Re-created in
+  /// each derived engine's start() before the loop; closed (closed=true,
+  /// engine=nullptr under _postGuard->m) in shutdownDrain before members die.
+  /// See EnginePostGate. Protected: derived start()/shutdownDrain manage it.
+  std::shared_ptr<EnginePostGate> _postGuard;
 
 private:
   // Published I/O-thread identity for isOnIoThread(). std::thread::id is

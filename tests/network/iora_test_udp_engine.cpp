@@ -147,6 +147,73 @@ TEST_CASE("UDP loopback echo", "[udp][echo]")
   f.tx.stop();
 }
 
+TEST_CASE("UDP named-host connect (event-driven resolve)", "[udp][resolve]")
+{
+  // Connect by NAME so connectDo takes the off-thread resolve -> resumeConnect
+  // path (phase-4). "localhost" resolves via /etc/hosts, no network dependency.
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  auto cr = f.tx.connect("localhost", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
+
+  REQUIRE(f.waitFor(f.connected, 3000));
+  REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve)
+
+  const char *msg = "udp named";
+  REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
+  REQUIRE(f.waitFor(f.clientGotEcho, 2000));
+  REQUIRE(f.lastData == "udp named");
+
+  f.tx.stop();
+}
+
+TEST_CASE("UDP named-host connectViaListener (event-driven, listener re-lookup)", "[udp][via][resolve]")
+{
+  // Named-host via-listener: resolve off-thread, re-look-up the listener at
+  // resume, create the session on the listener fd (phase-4 task-4.3).
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port1 = testnet::getFreePortUDP();
+  auto port2 = testnet::getFreePortUDP();
+
+  auto lr = f.tx.addListener("127.0.0.1", port1, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+
+  auto cs = f.tx.connectViaListener(lid, "localhost", port2);
+  REQUIRE(cs.isOk());
+
+  REQUIRE(f.waitFor(f.connected, 3000));
+  REQUIRE(f.closeCount == 0); // resolved + session created on the listener fd
+
+  f.tx.stop();
+}
+
+TEST_CASE("UDP named-host connect after restart (fresh post gate)", "[udp][resolve][restart]")
+{
+  // Validates task-4.4: UDP start() re-creates the EnginePostGate before the
+  // loop, so a post-restart resolver continuation does not drop.
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  f.tx.stop();
+  REQUIRE(f.tx.start().isOk()); // restart — fresh gate must be installed
+
+  auto port = testnet::getFreePortUDP();
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  auto cr = f.tx.connect("localhost", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+
+  REQUIRE(f.waitFor(f.connected, 3000));
+  REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve) after restart
+
+  f.tx.stop();
+}
+
 TEST_CASE("UDP rejects TLS mode", "[udp][config]")
 {
   UdpFixture f;
