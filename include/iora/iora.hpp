@@ -26,6 +26,7 @@
 #include <any>
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <typeindex>
 #include <unordered_set>
 
@@ -233,8 +234,13 @@ public:
       svc._dependents.clear();
       svc._pendingDependencies.clear();
 
-      // Clear all API exports to ensure clean state
+      // Clear all API exports to ensure clean state. Unsynchronized (no
+      // _apiMutex hold) is safe ONLY under the documented destroyInstance
+      // quiescence precondition — no thread may call getExportedApiSafe or
+      // (un)loadModule concurrently with service destruction (see the
+      // _safeApiRegistry SHUTDOWN PRECONDITION note near its declaration).
       svc._apiExports.clear();
+      svc._apiToModule.clear();
 
       // Flush the JSON file store
       if (svc._jsonFileStore)
@@ -332,7 +338,6 @@ public:
 
   private:
     IoraService *_service = nullptr;
-    std::vector<std::string> _apiExports;   // APIs this plugin exports
     std::vector<std::string> _dependencies; // Modules this plugin depends on
     std::string _name;                      // Plugin name for identification
     std::string _path;                      // Path to the plugin library
@@ -438,15 +443,23 @@ public:
   core::EventQueue &eventQueue() { return _eventQueue; }
 
   /// \brief Registers a plugin API function that can be called by plugins.
-  /// This version maintains plugin association for automatic cleanup.
+  /// This version maintains plugin association for automatic cleanup: the
+  /// export is torn down authoritatively via _apiToModule (A-C3) when the
+  /// owning plugin's module unloads, so no separate per-plugin bookkeeping
+  /// is needed here.
   template <typename Func> void exportApi(Plugin &plugin, const std::string &name, Func &&func)
   {
     exportApi(plugin.getIdentity(), name, std::forward<Func>(func));
-    plugin._apiExports.push_back(name);
   }
 
   /// \brief Registers an API function with explicit plugin identity (reduces coupling).
-  /// Note: Manual cleanup required - no automatic unregistration on plugin unload.
+  /// Note: An export whose pluginIdentity matches a loaded module's name is
+  /// AUTO-UNEXPORTED when that module unloads (see removeExportsForModule),
+  /// via the _apiToModule reverse map populated below. There is no per-name
+  /// manual unexport API: an export whose pluginIdentity does not correspond
+  /// to a module name known to _loadedModules (e.g. a synthetic/host-owned
+  /// identity) is cleared only at service shutdown, alongside every other
+  /// export.
   template <typename Func>
   void exportApi(const std::string &pluginIdentity, const std::string &name, Func &&func)
   {
@@ -456,7 +469,7 @@ public:
       throw std::invalid_argument("Plugin API name cannot be empty");
     }
     // Check-then-insert must be atomic under _apiMutex: reading _apiExports
-    // outside the lock is a data race with concurrent exportApi/unexportApi and a
+    // outside the lock is a data race with concurrent exportApi calls and a
     // TOCTOU on the duplicate check.
     std::lock_guard<std::mutex> lock(_apiMutex);
     if (_apiExports.find(name) != _apiExports.end())
@@ -467,6 +480,12 @@ public:
     core::Logger::info("IoraService::exportApi() - Registering plugin API: " + name +
                        " for plugin: " + pluginIdentity);
     _apiExports[name] = ApiWrapper(makeStdFunction(std::forward<Func>(func)));
+    // Single write site (A-C1): this is the ONLY place _apiToModule is
+    // populated. The exportApi(Plugin&, ...) overload gets this for free via
+    // its delegation to this overload and must NOT write _apiToModule itself
+    // (a second, unguarded write there would be a data race with this
+    // _apiMutex-guarded one).
+    _apiToModule[name] = pluginIdentity;
   }
 
   // Robust function signature deduction and wrapping helpers
@@ -1046,18 +1065,9 @@ protected:
         {
           pluginInstance->_name = pluginName; // Set the plugin name
           pluginInstance->_path = pluginPath; // Set the plugin path
-          // Snapshot of the names onLoad exported, captured the moment onLoad
-          // returns and BEFORE the _loadedModules insert. This is the failure-path
-          // teardown's authoritative source: if the insert itself throws (rehash
-          // bad_alloc), the moved-from Plugin object (the braced value_type
-          // temporary) is destroyed during unwinding and is unreachable from BOTH
-          // pluginInstance (null) and _loadedModules (insert had no effect), so the
-          // exported names cannot be recovered from the object anymore. (cpp17 M1)
-          std::vector<std::string> exportedNames;
           try
           {
             pluginInstance->onLoad(this);
-            exportedNames = pluginInstance->_apiExports; // onLoad succeeded
 
             // Only add to _loadedModules if onLoad succeeds
             _loadedModules.insert({pluginName, std::move(pluginInstance)});
@@ -1077,26 +1087,15 @@ protected:
             // outer catch dlcloses. Otherwise they dangle into the unmapped .so and
             // fault at the next call or at ~IoraService (_apiExports.clear()). (C1)
             //
-            // Source the exported names: onLoad-throw -> the still-owned
-            // pluginInstance (exportedNames not yet captured); onLoad-success then
-            // insert/notify-throw -> the exportedNames snapshot (the object may be
-            // gone). This covers the insert-throw sub-case (cpp17 M1).
-            // Source the exported names from the still-owned object, else the
-            // pre-insert snapshot. Each unexportApi is best-effort (it throws on a
-            // not-found name): a missing name must not skip the rest of the teardown
-            // (unregister/erase) and leak an object into the .so about to be dlclosed.
-            const std::vector<std::string> &namesToUnexport =
-              pluginInstance ? pluginInstance->_apiExports : exportedNames;
-            for (auto &apiName : namesToUnexport)
-            {
-              try
-              {
-                unexportApi(apiName); // destroys the plugin std::function (.so mapped)
-              }
-              catch (const std::exception &)
-              {
-              }
-            }
+            // Authoritative teardown (A-C3, cpp17 H-1): resolve the exported
+            // names to remove from _apiToModule, keyed by pluginName, rather
+            // than from the (possibly moved-from / not-yet-captured)
+            // pluginInstance object. This covers BOTH the onLoad-throw
+            // sub-case (pluginInstance still owned, never inserted) and the
+            // insert/notify-throw sub-case (pluginInstance moved into
+            // _loadedModules) uniformly, and also covers identity-overload
+            // exports the old Plugin::_apiExports-based iteration never saw.
+            removeExportsForModule(pluginName);
             ServiceRegistry::unregisterModule(pluginName);
             auto lit = _loadedModules.find(pluginName);
             if (lit != _loadedModules.end())
@@ -1196,17 +1195,50 @@ protected:
     IORA_LOG_INFO("Module loading complete.");
   }
 
-  /// \brief Unregisters a plugin API by name.
-  /// Throws std::runtime_error if the API is not found.
-  void unexportApi(const std::string &name)
+  /// \brief Resolve the module that owns an exported API from the
+  /// authoritative reverse map. PRECONDITION: caller holds _apiMutex (this
+  /// helper does not lock, so it can be reused by callers that must take
+  /// _apiMutex themselves to avoid a double-lock, e.g. findModuleNameForApi).
+  /// \return the owning module name, or std::nullopt if the API is not
+  /// (or no longer) exported.
+  std::optional<std::string> resolveOwningModuleLocked(const std::string &apiName) const
+  {
+    auto it = _apiToModule.find(apiName);
+    if (it == _apiToModule.end())
+    {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  /// \brief Authoritative teardown: remove every API exported by `module`
+  /// from BOTH _apiExports and _apiToModule in a single _apiMutex hold
+  /// (A-DP-4). Owner-checked (only entries whose recorded module == `module`
+  /// are erased, so a name re-bound to a different live module survives) and
+  /// leak-free (no snapshot-then-release gap between resolving and erasing).
+  /// Replaces the old snapshot-then-loop per-name teardown, which raced
+  /// concurrent exportApi calls (neither was gated by the unloading claim)
+  /// and could wrong-unexport a re-bound name or leak a post-snapshot export.
+  /// This ACQUIRES _apiMutex itself (hence no "...Locked" suffix): the
+  /// caller MUST NOT already hold _apiMutex (that would self-deadlock the
+  /// non-recursive mutex).
+  /// PRECONDITION: caller holds _loadModulesMutex (the existing
+  /// _loadModulesMutex -> _apiMutex lock order).
+  void removeExportsForModule(const std::string &module)
   {
     std::lock_guard<std::mutex> lock(_apiMutex);
-    auto it = _apiExports.find(name);
-    if (it == _apiExports.end())
+    for (auto it = _apiToModule.begin(); it != _apiToModule.end();)
     {
-      throw std::runtime_error("Plugin API not found: " + name);
+      if (it->second == module)
+      {
+        _apiExports.erase(it->first);
+        it = _apiToModule.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
     }
-    _apiExports.erase(it);
   }
 
   /// \brief Applies the merged configuration in _config to the service.
@@ -1594,6 +1626,17 @@ private:
   /// \brief EventQueue for managing and dispatching events
   core::EventQueue _eventQueue{4}; // Default to 4 worker threads
   std::unordered_map<std::string, ApiWrapper> _apiExports;
+  // Authoritative apiName -> owning-module-name reverse map (tracker
+  // 2026-09-07-8, architecture/iora/api_module_reverse_map.json, A-DP-1).
+  // Guarded by _apiMutex and mutated in the SAME critical sections as
+  // _apiExports, so the two maps never disagree. Populated ONLY by the
+  // identity-overload exportApi(pluginIdentity, name, func); erased by
+  // removeExportsForModule; cleared together with _apiExports at shutdown.
+  std::unordered_map<std::string, std::string> _apiToModule;
+  // Lock order: _loadModulesMutex (outer) -> _apiMutex (inner). Any code
+  // path that must hold both acquires _loadModulesMutex first. _apiCallGuard
+  // (declared below) is a leaf guarding only the SafeApiFunction registry —
+  // it is never nested with either of these two.
   mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
@@ -1742,19 +1785,13 @@ private:
         if (it->second)
         {
           it->second->onUnload();
-          for (auto &apiName : it->second->_apiExports)
-          {
-            // Best-effort: a not-found name (unexportApi throws) must not skip the
-            // remaining names / unregister / erase before dlclose.
-            try
-            {
-              unexportApi(apiName);
-            }
-            catch (const std::exception &)
-            {
-            }
-          }
         }
+        // Authoritative teardown (A-C3): a single owner-checked atomic erase
+        // over _apiToModule, covering BOTH the exportApi(Plugin&) and
+        // exportApi(pluginIdentity, ...) overloads from one source of truth
+        // (replaces the old Plugin::_apiExports iteration, which never saw
+        // identity-overload exports).
+        removeExportsForModule(name);
         // MUST run before erase (invalidates it) and before dlclose (which unmaps
         // the plugin's vtables). unregisterModule never throws.
         ServiceRegistry::unregisterModule(name);
@@ -1943,35 +1980,25 @@ private:
   mutable std::atomic<bool> eventHandlerRegistered{false};
   mutable std::weak_ptr<SafeApiFunction<R(Args...)>> selfReference;
 
-  /// \brief Resolve the module name for an API. Only ever reached from the ctor
-  /// via getExportedApiSafe (the sole factory), which rejects the call when this
-  /// thread already holds _loadModulesMutex (host-only, see getExportedApiSafe),
-  /// so this always takes the lock — no re-lock of the non-recursive mutex occurs.
+  /// \brief Resolve the module name for an API from the authoritative
+  /// _apiToModule reverse map (A-DP-2 / A-C2). Only ever reached from the
+  /// ctor via getExportedApiSafe (the sole factory), which rejects the call
+  /// when this thread already holds _loadModulesMutex (host-only, see
+  /// getExportedApiSafe) — so no SafeApiFunction is ever constructed while
+  /// _apiMutex is held (A-DP-5 reentrancy invariant), and this can safely
+  /// take _apiMutex itself. NOT-FOUND: throws (A-DP-2) rather than guessing a
+  /// "<prefix>.so" module name and handing back a wrapper for an API that was
+  /// never (or is no longer) exported — deferred/pre-export binding is
+  /// intentionally not supported.
   std::string findModuleNameForApi(const std::string &apiName) const
   {
-    std::lock_guard<std::mutex> lock(service->_loadModulesMutex);
-    // Extract the prefix from API name (e.g., "testplugin.add" -> "testplugin")
-    size_t dotPos = apiName.find('.');
-    std::string apiPrefix = (dotPos != std::string::npos) ? apiName.substr(0, dotPos) : apiName;
-
-    // Look for a loaded module whose name starts with the API prefix
-    for (const auto &[moduleName, pluginPtr] : service->_loadedModules)
+    std::lock_guard<std::mutex> lock(service->_apiMutex);
+    auto module = service->resolveOwningModuleLocked(apiName);
+    if (!module.has_value())
     {
-      if (pluginPtr && moduleName.find(apiPrefix) == 0)
-      {
-        // Check if this module actually exports this API
-        for (const auto &exportedApi : pluginPtr->_apiExports)
-        {
-          if (exportedApi == apiName)
-          {
-            return moduleName; // Found the right module
-          }
-        }
-      }
+      throw std::runtime_error("API not found: " + apiName);
     }
-
-    // Fallback: assume module name is prefix + ".so"
-    return apiPrefix + ".so";
+    return *module;
   }
 
   /// \brief Register event handler safely using weak_ptr.

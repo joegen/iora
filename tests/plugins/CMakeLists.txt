@@ -56,3 +56,27 @@ create_iora_plugin_target(indirectcycleb
 create_iora_plugin_target(indirectcyclec
     SOURCES IndirectCycleC.cpp
 )
+
+# API-module reverse-map probes (tracker 2026-09-07-8,
+# architecture/iora/api_module_reverse_map.json A-T1..A-T4)
+create_iora_plugin_target(collidepfxplugin
+    SOURCES CollidePfxPlugin.cpp
+)
+create_iora_plugin_target(collidepfxplusplugin
+    SOURCES CollidePfxPlusPlugin.cpp
+)
+create_iora_plugin_target(nonconventionplugin
+    SOURCES NonConventionPlugin.cpp
+)
+create_iora_plugin_target(identityexportplugin
+    SOURCES IdentityExportPlugin.cpp
+)
+create_iora_plugin_target(identityexportthenthrowplugin
+    SOURCES IdentityExportThenThrowPlugin.cpp
+)
+create_iora_plugin_target(ownerplugin
+    SOURCES OwnerPlugin.cpp
+)
+create_iora_plugin_target(ownerconflictplugin
+    SOURCES OwnerConflictPlugin.cpp
+)

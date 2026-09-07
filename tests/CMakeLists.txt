@@ -166,6 +166,7 @@ set(SERVICE_TESTS
     service/iora_test_plugin_dependencies
     service/iora_test_plugin_isolation
     service/iora_test_features_config
+    service/iora_test_api_module_reverse_map
 )
 
 # Debug/helper tests (keep in root)
@@ -499,6 +500,20 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_plugin_drain PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The api-module reverse-map test (tracker 2026-09-07-8) dlopen's plugins
+    # at runtime; depend on them so a targeted build of the test also builds
+    # the .so's it loads, and link libdl for dlopen.
+    if(TARGET iora_test_api_module_reverse_map)
+        foreach(_reverse_map_plugin testplugin collidepfxplugin collidepfxplusplugin
+                nonconventionplugin identityexportplugin identityexportthenthrowplugin
+                ownerplugin ownerconflictplugin)
+            if(TARGET ${_reverse_map_plugin})
+                add_dependencies(iora_test_api_module_reverse_map ${_reverse_map_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_api_module_reverse_map PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 

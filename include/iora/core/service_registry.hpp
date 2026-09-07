@@ -44,7 +44,7 @@ namespace iora
 ///
 /// Lifecycle (C-5, RD-7): a plugin's registrations are removed before dlclose by
 /// the core-driven unregisterModule(pluginName) call wired into
-/// IoraService::unloadSingleModule (symmetric to the unexportApi loop). The
+/// IoraService::unloadSingleModule (symmetric to removeExportsForModule). The
 /// shared_ptr<T> returned by get<T>() keeps the OBJECT alive, but its VTABLE
 /// lives in the plugin .so code segment and is unmapped by dlclose; using a
 /// get<T>() result obtained just before an unload, after dlclose, dereferences
@@ -137,7 +137,10 @@ public:
 
   /// \brief Remove the registration for a single interface type T. Returns true
   /// if an entry was removed, false if none was present. Used by a plugin in
-  /// onUnload to clear one interface before dlclose; symmetric to unexportApi.
+  /// onUnload to clear one interface before dlclose; symmetric in spirit to how
+  /// removeExportsForModule clears a module's API exports before dlclose,
+  /// though that path removes every export owned by a module in bulk rather
+  /// than one at a time.
   template <typename T> static bool unregister()
   {
     const std::type_index key(typeid(T));
@@ -147,9 +150,10 @@ public:
   }
 
   /// \brief Remove ALL registrations owned by moduleId. The bulk-cleanup analog
-  /// of the unexportApi loop; called automatically by unloadSingleModule with
-  /// the plugin name before dlclose. Idempotent (a module with zero
-  /// registrations is a no-op).
+  /// of removeExportsForModule (both perform bulk per-module teardown under a
+  /// single lock hold before dlclose); called automatically by
+  /// unloadSingleModule with the plugin name before dlclose. Idempotent (a
+  /// module with zero registrations is a no-op).
   ///
   /// While iterating under the write lock it detects misuse (RD-6 / AH-2): any
   /// SURVIVING non-core entry with an empty moduleId is owned by nothing and
@@ -208,11 +212,12 @@ private:
   /// under _loadModulesMutex during unloadSingleModule). There is NO reverse
   /// edge: get<T>() takes ONLY this shared lock and never acquires
   /// _loadModulesMutex. For context, the surrounding load/unload code also has
-  /// the edge _loadModulesMutex -> IoraService::_apiMutex (the exportApi /
-  /// unexportApi loop), but _apiMutex and this registry mutex are NEVER held
-  /// simultaneously: unloadSingleModule runs the whole unexportApi loop (each
-  /// call takes and releases _apiMutex) and only THEN calls unregisterModule
-  /// (which takes this mutex). So there is no _apiMutex <-> registry edge and no
+  /// the edge _loadModulesMutex -> IoraService::_apiMutex (exportApi, and
+  /// removeExportsForModule during unload), but _apiMutex and this registry
+  /// mutex are NEVER held simultaneously: unloadSingleModule calls
+  /// removeExportsForModule (a single _apiMutex hold that tears down every API
+  /// export owned by the module) and only THEN calls unregisterModule (which
+  /// takes this mutex). So there is no _apiMutex <-> registry edge and no
   /// cycle. Otherwise this mutex is a LEAF — never held while acquiring
   /// HttpServer::_mutex or IoraService::_apiMutex, and no user callback is
   /// invoked while it is held (get returns the shared_ptr, then the caller
