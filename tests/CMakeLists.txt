@@ -118,6 +118,8 @@ set(CORE_TESTS
     core/iora_test_threadpool
     core/iora_test_threadpool_cleanup
     core/iora_test_threadpool_lifecycle
+    core/iora_test_async_pool
+    core/iora_test_async_pool_crossso
     core/iora_test_timer
     core/iora_test_timer_lifecycle
     core/iora_test_metrics
@@ -160,6 +162,7 @@ set(STORAGE_TESTS
 set(SERVICE_TESTS
     service/iora_test_iora_service
     service/iora_test_plugin
+    service/iora_test_plugin_drain
     service/iora_test_plugin_dependencies
     service/iora_test_plugin_isolation
     service/iora_test_features_config
@@ -301,6 +304,8 @@ endforeach()
 # thread) compiled directly into the test TU, so per-target instrumentation
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
+    iora_test_plugin_drain
+    iora_test_plugin
     iora_test_logger
     iora_test_gzip
     iora_test_gzip_decode
@@ -482,6 +487,30 @@ endif()
 # Build test plugins for dynamic loading tests (only if service tests enabled)
 if(IORA_BUILD_SERVICE_TESTS)
     add_subdirectory(plugins)
+
+    # The drain-redesign test (tracker 2026-09-07-1) dlopen's plugins at runtime,
+    # so a targeted `cmake --build build --target iora_test_plugin_drain` must also
+    # build the .so's it loads, and it needs libdl for dlopen. New drain-specific
+    # test plugins are added under plugins/ and depended on here as they land.
+    if(TARGET iora_test_plugin_drain)
+        foreach(_drain_plugin testplugin exportthenthrowplugin onloadgetsafeplugin)
+            if(TARGET ${_drain_plugin})
+                add_dependencies(iora_test_plugin_drain ${_drain_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_plugin_drain PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+endif()
+
+# Build core test plugins (generalAsyncPool cross-.so identity test, DP-9) when
+# core tests are on. The test dlopen's the plugin at runtime; depend on it so a
+# targeted build of the test also builds the .so, and link libdl for dlopen.
+if(IORA_BUILD_CORE_TESTS)
+    add_subdirectory(core_plugins)
+    if(TARGET iora_test_async_pool_crossso AND TARGET core_test_async_pool_plugin)
+        add_dependencies(iora_test_async_pool_crossso core_test_async_pool_plugin)
+        target_link_libraries(iora_test_async_pool_crossso PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 endif()
 
 # Build web test plugins (ServiceRegistry cross-.so test) when web tests are on.

@@ -35,6 +35,35 @@ ThreadPool &blockingIoPool()
   return *pool;
 }
 
+// IMMORTAL / deliberately-leaked generalAsyncPool singleton (async_pool.json C1).
+// General-purpose async pool backing iora::core::async (a std::async drop-in),
+// distinct from blockingIoPool (which is reserved for blocking uncancellable
+// syscalls). FIXED-SIZE: initialSize == maxSize == hardware_concurrency()*4.
+// initialSize == maxSize is LOAD-BEARING for correctness (DP-15): it pins the
+// worker count so ThreadPool::enqueue never spawns a worker post-commit, making
+// enqueue all-or-nothing -- a throw from enqueue always means the task was NOT
+// committed, so iora::core::async can synthesize a rejection future without
+// orphaning a running task (round-2 C-1). The hc==0 clamp is SAFETY-CRITICAL:
+// a 0-worker fixed-size pool would never run a task, so a blocking ~PooledFuture
+// would wait forever. hc*4 = I/O-burst capacity (HTTP work is I/O-bound). Never
+// destroyed (blockingIoPool precedent): an in-flight task at process exit must
+// not hang teardown's join (DP-2). The leak is intentional (LSan: intentional
+// immortal). Do NOT switch to a dynamically-scaled (initial<max) pool without
+// first landing the ThreadPool all-or-nothing hardening (backlog 2026-09-06-11).
+ThreadPool &generalAsyncPool()
+{
+  static ThreadPool *pool = []
+  {
+    unsigned hc = std::thread::hardware_concurrency();
+    if (hc == 0)
+    {
+      hc = 4;
+    }
+    return new ThreadPool(hc * 4, hc * 4, std::chrono::seconds(30), 1024);
+  }();
+  return *pool;
+}
+
 // IMMORTAL / deliberately-leaked LoggerData singleton (tracker 2026-07-23-4).
 // Never destroyed: the mutex/condition_variables it owns must outlive (1) every
 // object with static storage that may log from its OWN destructor — e.g. a sink
@@ -133,6 +162,21 @@ void IoraService::destroyInstance()
 {
   std::lock_guard<std::mutex> lock(sInstanceMutex);
   getInstancePtr().reset();
+}
+
+// Single process-wide (per-thread) definition of the SafeApiFunction unload
+// machinery's thread-local ownership flag (tracker 2026-09-07-1). Defined ONCE
+// here — NOT as a header inline variable — because iora.hpp is compiled into the
+// host AND into plugin .so's loaded RTLD_LOCAL, and an inline variable does not
+// guarantee a single TLS instance across a dlopen boundary. getExportedApiSafe
+// reads this to REJECT (throw) a call made while this thread holds
+// _loadModulesMutex (a plugin calling it from onLoad) — host-only enforcement, so
+// a plugin-resident wrapper can never outlive its .so. Mirrors
+// Logger::handlerReentryDepth() above.
+bool &IoraService::ownsLoadModulesMutex()
+{
+  static thread_local bool owns = false;
+  return owns;
 }
 
 namespace storage {

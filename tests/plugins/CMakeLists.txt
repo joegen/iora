@@ -36,6 +36,14 @@ create_iora_plugin_target(singletonprobe
     SOURCES SingletonProbePlugin.cpp
 )
 
+# Drain-redesign failure-path probes (tracker 2026-09-07-1, steps 4-8 C1 / DP-F)
+create_iora_plugin_target(exportthenthrowplugin
+    SOURCES ExportThenThrowPlugin.cpp
+)
+create_iora_plugin_target(onloadgetsafeplugin
+    SOURCES OnLoadGetSafePlugin.cpp
+)
+
 # Indirect cycle test plugins
 create_iora_plugin_target(indirectcyclea
     SOURCES IndirectCycleA.cpp

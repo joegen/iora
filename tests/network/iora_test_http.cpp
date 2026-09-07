@@ -83,17 +83,39 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
     REQUIRE(json["echo"]["message"] == "hello");
   }
 
-  SECTION("Async POST JSON returns future")
+  SECTION("Async POST JSON and GET return futures")
   {
+    // getAsync/postJsonAsync dispatch onto the shared, bounded
+    // iora::core::generalAsyncPool, which requires the client to be time-bounded
+    // (async_pool.json DP-13). A default client (totalRequestTimeout=0 /
+    // leaseAcquireTimeout=0) is rejected at the boundary; configure finite bounds.
+    iora::network::HttpClient::Config asyncConfig;
+    asyncConfig.totalRequestTimeout = std::chrono::milliseconds(5000);
+    asyncConfig.leaseAcquireTimeout = std::chrono::milliseconds(5000);
+    iora::network::HttpClient asyncClient(asyncConfig);
+
     auto payload = iora::parsers::Json::object();
     payload["async_test"] = 1;
-    std::future<iora::network::HttpClient::Response> future =
-      client.postJsonAsync("http://localhost:8081/test-async", payload);
-    auto res = future.get();
-    REQUIRE(res.success());
-    auto json = iora::network::HttpClient::parseJsonOrThrow(res);
-    REQUIRE(json["async"] == true);
-    REQUIRE(json["received"]["async_test"] == 1);
+    auto postFuture = asyncClient.postJsonAsync("http://localhost:8081/test-async", payload);
+    auto postRes = postFuture.get();
+    REQUIRE(postRes.success());
+    auto postJsonBody = iora::network::HttpClient::parseJsonOrThrow(postRes);
+    REQUIRE(postJsonBody["async"] == true);
+    REQUIRE(postJsonBody["received"]["async_test"] == 1);
+
+    // getAsync smoke (previously untested at runtime).
+    auto getFuture = asyncClient.getAsync("http://localhost:8081/test-get");
+    auto getRes = getFuture.get();
+    REQUIRE(getRes.success());
+    auto getJsonBody = iora::network::HttpClient::parseJsonOrThrow(getRes);
+    REQUIRE(getJsonBody["status"] == "ok");
+
+    // DP-13 enforcement: a default (unbounded) client rejects pooled dispatch,
+    // surfacing AsyncRejectedError through the future rather than admitting an
+    // unbounded task onto the shared pool.
+    iora::network::HttpClient unboundedClient;
+    auto rejectedFuture = unboundedClient.getAsync("http://localhost:8081/test-get");
+    REQUIRE_THROWS_AS(rejectedFuture.get(), iora::core::AsyncRejectedError);
   }
 
   SECTION("Streamed POST returns line chunks")

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -21,6 +22,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1188,6 +1191,178 @@ private:
 /// joining it would hang teardown, so the pool is never destroyed. Defined in
 /// src/core/iora_core.cpp. See architecture/iora/transport_dns_resolve.json (C3).
 ThreadPool &blockingIoPool();
+
+/// \brief Process-wide, immortal, general-purpose async pool (the SECOND global
+///        ThreadPool accessor in iora::core, after blockingIoPool).
+///
+/// Backs iora::core::async -- a reusable std::async(std::launch::async, ...)
+/// drop-in that dispatches onto this shared pool instead of spawning an OS
+/// thread per call. Distinct from blockingIoPool (reserved for blocking,
+/// uncancellable syscalls like ::getaddrinfo): this pool hosts general,
+/// non-blocking-syscall async work (HTTP requests today). It is FIXED-SIZE
+/// (initialSize == maxSize == hardware_concurrency()*4): pinning the worker
+/// count is load-bearing for correctness -- it guarantees the enqueue path never
+/// spawns a worker post-commit, so a throw from enqueue always means the task
+/// was NOT committed (all-or-nothing enqueue), which iora::core::async relies on
+/// to synthesize a rejection future without orphaning a running task.
+/// Deliberately leaked / immortal (blockingIoPool precedent) so an in-flight
+/// task at process exit cannot hang teardown's join. Defined once in
+/// src/core/iora_core.cpp. See architecture/iora/async_pool.json (C1).
+ThreadPool &generalAsyncPool();
+
+/// \brief Carried in the returned future when iora::core::async cannot enqueue
+///        (pool draining/shutting down, or its queue is full).
+///
+/// Distinct from a task-internal exception: an AsyncRejectedError means the task
+/// was NEVER attempted (relevant for retry / idempotency reasoning). See
+/// architecture/iora/async_pool.json (DP-5a).
+class AsyncRejectedError : public std::runtime_error
+{
+public:
+  using std::runtime_error::runtime_error;
+};
+
+/// \brief Move-only future wrapper that replicates std::async's
+///        [futures.async]/5 join-on-destruction over a pool-backed future.
+///
+/// A std::future from a std::packaged_task has ordinary, non-blocking
+/// destruction, so abandoning it would let the task run later against destroyed
+/// captures (use-after-free). PooledFuture's destructor -- AND its move
+/// assignment -- wait() on the shared state when valid(), so an abandoned future
+/// joins exactly as std::async's does. The consume path (get()/wait() leaves the
+/// future !valid()) pays nothing. share() and an implicit conversion to
+/// std::future<R> are intentionally omitted: either would move the guarantee out
+/// to a bare, non-blocking future. The move operations are noexcept
+/// (load-bearing for std::vector<PooledFuture> relocation of a move-only type).
+/// See architecture/iora/async_pool.json (C3, DP-3 / DP-3a / DP-3b / DP-3c).
+template <typename R> class PooledFuture
+{
+public:
+  PooledFuture() noexcept = default;
+  explicit PooledFuture(std::future<R> future) noexcept : _future(std::move(future)) {}
+
+  PooledFuture(PooledFuture &&) noexcept = default;
+  PooledFuture &operator=(PooledFuture &&other) noexcept
+  {
+    if (this != &other)
+    {
+      if (_future.valid())
+      {
+        _future.wait();
+      }
+      _future = std::move(other._future);
+    }
+    return *this;
+  }
+
+  PooledFuture(const PooledFuture &) = delete;
+  PooledFuture &operator=(const PooledFuture &) = delete;
+
+  ~PooledFuture()
+  {
+    if (_future.valid())
+    {
+      _future.wait();
+    }
+  }
+
+  R get() { return _future.get(); }
+  void wait() const { _future.wait(); }
+
+  template <typename Rep, typename Period>
+  std::future_status wait_for(const std::chrono::duration<Rep, Period> &timeout) const
+  {
+    return _future.wait_for(timeout);
+  }
+
+  template <typename Clock, typename Duration>
+  std::future_status wait_until(const std::chrono::time_point<Clock, Duration> &deadline) const
+  {
+    return _future.wait_until(deadline);
+  }
+
+  bool valid() const noexcept { return _future.valid(); }
+
+private:
+  std::future<R> _future;
+};
+
+namespace detail
+{
+/// Build a packaged_task in place (move-invoke parity with std::async; bypasses
+/// ThreadPool::enqueueWithResult's std::bind lvalue-invoke), enqueue it on
+/// \p pool, and return a PooledFuture. On enqueue failure (pool draining /
+/// shutting down / queue full) return a PooledFuture carrying AsyncRejectedError
+/// rather than throwing at the call site. See DP-5 / DP-5a / DP-10a.
+template <typename F, typename... Args>
+auto submitTo(ThreadPool &pool, F &&func, Args &&...args)
+  -> PooledFuture<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+{
+  using ResultType = std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>;
+  auto bound = [func = std::forward<F>(func),
+                argsTuple = std::make_tuple(std::forward<Args>(args)...)]() mutable -> ResultType
+  {
+    return std::apply(
+      [&func](auto &&...unpacked) -> ResultType
+      { return std::invoke(std::move(func), std::forward<decltype(unpacked)>(unpacked)...); },
+      std::move(argsTuple));
+  };
+  auto task = std::make_shared<std::packaged_task<ResultType()>>(std::move(bound));
+  std::future<ResultType> future = task->get_future();
+  // Already-ready exception-carrying future for the enqueue-reject path
+  // (DP-5/DP-5a); shared by both catch arms.
+  auto makeRejected = [](std::string message) -> PooledFuture<ResultType>
+  {
+    std::promise<ResultType> rejected;
+    rejected.set_exception(std::make_exception_ptr(AsyncRejectedError(std::move(message))));
+    return PooledFuture<ResultType>(rejected.get_future());
+  };
+  try
+  {
+    pool.enqueue([task]() { (*task)(); });
+  }
+  catch (const std::exception &ex)
+  {
+    return makeRejected(ex.what());
+  }
+  catch (...)
+  {
+    return makeRejected("iora::core::async enqueue rejected");
+  }
+  // Return OUTSIDE the try: once the task is committed, the caller must always
+  // receive a joinable future -- never a synthesized rejection for a task that
+  // will run. See DP-5 / round-3 L-R3-1.
+  return PooledFuture<ResultType>(std::move(future));
+}
+} // namespace detail
+
+/// \brief A general, reusable, memory-safe drop-in for
+///        std::async(std::launch::async, f, args...).
+///
+/// Runs \p func on the process-wide generalAsyncPool() instead of spawning an OS
+/// thread per call, returning a PooledFuture<R> with std::async's
+/// join-on-destruction semantics. On enqueue rejection the returned future
+/// carries AsyncRejectedError (the call itself does not throw). See
+/// architecture/iora/async_pool.json (C2, DP-5).
+template <typename F, typename... Args>
+auto async(F &&func, Args &&...args)
+  -> PooledFuture<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+{
+  return detail::submitTo(generalAsyncPool(), std::forward<F>(func), std::forward<Args>(args)...);
+}
+
+/// \brief std::launch-accepting overload for literal call-site symmetry with
+///        std::async. The policy is ACCEPTED but IGNORED (always pool-async);
+///        std::launch::deferred is rejected (asserted in debug, treated as async
+///        in release). See DP-4.
+template <typename F, typename... Args>
+auto async(std::launch policy, F &&func, Args &&...args)
+  -> PooledFuture<std::invoke_result_t<std::decay_t<F>, std::decay_t<Args>...>>
+{
+  assert(policy != std::launch::deferred && "iora::core::async cannot honor std::launch::deferred");
+  (void)policy;
+  return detail::submitTo(generalAsyncPool(), std::forward<F>(func), std::forward<Args>(args)...);
+}
 
 } // namespace core
 } // namespace iora

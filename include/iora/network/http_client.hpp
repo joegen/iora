@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "iora/core/thread_pool.hpp"
 #include "iora/crypto/secure_rng.hpp"
 #include "iora/network/dns_client.hpp"
 #include "iora/network/transport_impl.hpp"
@@ -880,22 +881,46 @@ public:
     return performRequest("DELETE", url, "", headers, retries);
   }
 
-  /// \brief Perform asynchronous GET request
-  std::future<Response> getAsync(const std::string &url,
-                                 const std::map<std::string, std::string> &headers = {},
-                                 int retries = 0)
+  /// \brief Perform asynchronous GET request.
+  /// \note Returns an iora::core::PooledFuture<Response> (a std::async drop-in
+  ///       that runs on the shared, bounded iora::core::generalAsyncPool instead
+  ///       of a per-call OS thread). Its destructor joins like std::async's, so
+  ///       an abandoned future is memory-safe PROVIDED this HttpClient outlives
+  ///       the future (std::async parity; async_pool.json DP-3b). The returned
+  ///       future MUST NOT be consumed/abandoned from within a generalAsyncPool
+  ///       worker (async_pool.json DP-8). Because the pool is shared and bounded,
+  ///       pooled work MUST be time-bounded (DP-13): this method REJECTS (returns
+  ///       a future carrying core::AsyncRejectedError) unless the client is
+  ///       configured with finite Config::totalRequestTimeout AND
+  ///       Config::leaseAcquireTimeout, so a hung request cannot occupy a worker
+  ///       indefinitely and starve other pool consumers.
+  core::PooledFuture<Response> getAsync(const std::string &url,
+                                        const std::map<std::string, std::string> &headers = {},
+                                        int retries = 0)
   {
-    return std::async(std::launch::async,
-                      [this, url, headers, retries]() { return get(url, headers, retries); });
+    core::PooledFuture<Response> rejected;
+    if (rejectUnboundedPooledRequest("getAsync", rejected))
+    {
+      return rejected;
+    }
+    return core::async([this, url, headers, retries]() { return get(url, headers, retries); });
   }
 
-  /// \brief Perform asynchronous POST request with JSON body
-  std::future<Response> postJsonAsync(const std::string &url, const parsers::Json &body,
-                                      const std::map<std::string, std::string> &headers = {},
-                                      int retries = 0)
+  /// \brief Perform asynchronous POST request with JSON body.
+  /// \note Returns an iora::core::PooledFuture<Response>; see getAsync (same
+  ///       shared-pool, join-on-destruction, DP-8 and DP-13 finite-timeout
+  ///       requirements apply).
+  core::PooledFuture<Response> postJsonAsync(const std::string &url, const parsers::Json &body,
+                                             const std::map<std::string, std::string> &headers = {},
+                                             int retries = 0)
   {
-    return std::async(std::launch::async, [this, url, body, headers, retries]()
-                      { return postJson(url, body, headers, retries); });
+    core::PooledFuture<Response> rejected;
+    if (rejectUnboundedPooledRequest("postJsonAsync", rejected))
+    {
+      return rejected;
+    }
+    return core::async([this, url, body, headers, retries]()
+                       { return postJson(url, body, headers, retries); });
   }
 
   /// \brief Stream HTTP response via callback (for server-sent events, etc.)
@@ -1493,6 +1518,32 @@ private:
     return std::regex_match(str, compiledRegexes().ipv4);
   }
 
+  /// \brief DP-13 enforcement for pooled async dispatch.
+  ///
+  /// Returns true (and sets \p out to a PooledFuture carrying AsyncRejectedError)
+  /// when this client is not configured to time-bound a request — i.e. either the
+  /// whole-exchange deadline (Config::totalRequestTimeout) or the connection-lease
+  /// wait (Config::leaseAcquireTimeout) is unbounded (0). Async methods dispatch
+  /// onto the shared, bounded iora::core::generalAsyncPool; an unbounded request
+  /// would occupy a worker indefinitely and starve every other pool consumer, so
+  /// it is rejected at the boundary rather than admitted. Returns false when both
+  /// bounds are finite (the request may proceed).
+  bool rejectUnboundedPooledRequest(const char *op, core::PooledFuture<Response> &out) const
+  {
+    if (_config.totalRequestTimeout.count() > 0 && _config.leaseAcquireTimeout.count() > 0)
+    {
+      return false;
+    }
+    std::promise<Response> rejected;
+    rejected.set_exception(std::make_exception_ptr(core::AsyncRejectedError(
+      std::string("HttpClient::") + op +
+      " requires finite Config::totalRequestTimeout and Config::leaseAcquireTimeout so pooled "
+      "work is time-bounded (avoids starving the shared iora::core::generalAsyncPool); set both "
+      "to a positive value.")));
+    out = core::PooledFuture<Response>(rejected.get_future());
+    return true;
+  }
+
   /// \brief Perform HTTP request with retry logic
   Response performRequest(const std::string &method, const std::string &url,
                           const std::string &body,
@@ -1595,7 +1646,23 @@ private:
           static_cast<std::mt19937::result_type>(
             std::hash<std::thread::id>{}(std::this_thread::get_id())));
         std::uniform_int_distribution<int> jitterDist(0, 99);
-        int backoffMs = (1 << attempt) * 100 + jitterDist(jitterRng);
+        // Clamp the shift exponent and cap the total backoff (DP-13, async-pool
+        // LOW-8). `attempt` is bounded only by the caller-supplied `retries`, so
+        // an unclamped `1 << attempt` is signed-integer overflow (UB) for a large
+        // retry count. Independently, async requests run on a shared, bounded
+        // generalAsyncPool worker that is held for the whole exchange INCLUDING
+        // this sleep, so an unbounded exponential backoff would extend a single
+        // task's worker occupancy without limit and undermine DP-13's finite
+        // per-task-occupancy ceiling. Cap the base at 2^kMaxBackoffShift steps and
+        // the final value (jitter included) at kMaxBackoffMs.
+        constexpr int kMaxBackoffShift = 10;                     // 2^10 * 100ms base
+        constexpr int kMaxBackoffMs = (1 << kMaxBackoffShift) * 100;
+        const int shift = attempt < kMaxBackoffShift ? attempt : kMaxBackoffShift;
+        int backoffMs = (1 << shift) * 100 + jitterDist(jitterRng);
+        if (backoffMs > kMaxBackoffMs)
+        {
+          backoffMs = kMaxBackoffMs;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
         attempt++;
       }

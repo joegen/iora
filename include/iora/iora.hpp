@@ -27,11 +27,32 @@
 #include <cassert>
 #include <iostream>
 #include <typeindex>
+#include <unordered_set>
 
 #define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
 
 namespace iora
 {
+
+/// \brief Non-template host-side base so IoraService can clear a heterogeneous
+/// per-module registry of SafeApiFunction wrappers before dlclose (DP-B).
+///
+/// invalidateAndClearCache() takes the wrapper's cacheMutex and destroys its
+/// cached plugin std::function while the plugin .so is still mapped. Because
+/// operator() invokes the cached function UNDER cacheMutex, this clear also waits
+/// out any in-flight invoke of that wrapper (DP-CACHEMUTEX-SERIALIZES), so no
+/// counter/drain is needed. The unloader calls this with _loadModulesMutex
+/// RELEASED (DP-CLEAR-OFF-LOADMUTEX) to avoid a _loadModulesMutex->cacheMutex
+/// edge that would cycle with operator()'s cacheMutex->_loadModulesMutex order.
+/// The vtable of any concrete SafeApiFunction is host-resident because
+/// getExportedApiSafe is only ever called from host TUs (DP-F/host-only).
+struct ISafeApiClearable
+{
+  virtual ~ISafeApiClearable() = default;
+  /// \brief Invalidate the wrapper and destroy its cached std::function (under
+  /// cacheMutex, .so still mapped). noexcept.
+  virtual void invalidateAndClearCache() noexcept = 0;
+};
 
 /// \brief Singleton entry point for the Iora library, managing all core
 /// components and providing factory methods for utilities and plugins.
@@ -562,8 +583,28 @@ public:
   template <typename FuncSignature>
   std::shared_ptr<SafeApiFunction<FuncSignature>> getExportedApiSafe(const std::string &name)
   {
-    auto safeApi = std::make_shared<SafeApiFunction<FuncSignature>>(name, this);
+    // HOST-ONLY (DP-G/DP-H-hostonly): a SafeApiFunction created in a plugin TU has
+    // its vtable + shared_ptr control block resident in the plugin .so; if it (or
+    // the service's weak_ptr) outlives the plugin's dlclose, destroying it invokes
+    // an unmapped manager -> the exact destructor UAF this fix prevents. We cannot
+    // detect a plugin caller in general, but the one cheaply-detectable and most
+    // likely case is a plugin calling this from onLoad (which runs while this
+    // thread holds _loadModulesMutex): reject it loudly rather than hand back a
+    // wrapper that crashes at shutdown.
+    if (ownsLoadModulesMutex())
+    {
+      throw std::runtime_error(
+        "getExportedApiSafe() is host-only and must not be called during module load "
+        "(e.g. from a plugin onLoad): the wrapper's vtable would live in the plugin .so "
+        "and use-after-dlclose. Resolve the API from the host after load instead.");
+    }
+    // Sole factory (DP-G): the ctor is private and registration is intrinsic, so
+    // no SafeApiFunction can exist unregistered (which would leave its cache
+    // uncleared before dlclose). make_shared cannot reach the private ctor.
+    std::shared_ptr<SafeApiFunction<FuncSignature>> safeApi(
+      new SafeApiFunction<FuncSignature>(name, this));
     safeApi->setSelfReference(safeApi);
+    registerSafeApi(safeApi->getModuleName(), std::weak_ptr<ISafeApiClearable>(safeApi));
     return safeApi;
   }
 
@@ -661,74 +702,73 @@ public:
   /// \return true if the module was successfully unloaded, false if it wasn't loaded
   bool unloadSingleModule(const std::string &pluginName)
   {
-    std::lock_guard<std::mutex> lock(_loadModulesMutex);
-    auto it = _loadedModules.find(pluginName);
-    if (it != _loadedModules.end())
-    {
-      auto &pluginPtr = it->second;
-      if (pluginPtr)
-      {
-        try
-        {
-          // Notify dependents that this module is about to be unloaded
-          notifyDependentsOfUnload(pluginName);
+    // LoadModulesGuard keeps ownsLoadModulesMutex() in sync with the lock across
+    // the release/re-acquire window used for the off-lock cache clear.
+    LoadModulesGuard guard(_loadModulesMutex);
 
-          pluginPtr->onUnload();
-          for (auto &apiName : pluginPtr->_apiExports)
-          {
-            unexportApi(apiName);
-          }
-          // Authoritative core-driven cleanup of this module's ServiceRegistry
-          // interface registrations, symmetric to the unexportApi loop above and
-          // running under the same _loadModulesMutex (lock-ordering edge
-          // _loadModulesMutex -> ServiceRegistry mutex). MUST run BEFORE
-          // _loadedModules.erase(it) (which invalidates pluginPtr/it) and BEFORE
-          // dlclose unmaps the plugin's vtables (C-5/RD-6). pluginName equals the
-          // module key and the plugin's getIdentity(), so it matches every entry
-          // the plugin registered. unregisterModule never throws (it aborts on
-          // misuse), so it is safe inside this try block — a throw here would be
-          // swallowed by the catch below and skip dlclose.
-          ServiceRegistry::unregisterModule(pluginName);
-          _loadedModules.erase(it); // unique_ptr will delete
-          PluginManager::unloadPlugin(pluginName);
-
-          // Clean up dependency tracking data for this plugin
-          // Remove entries where this plugin is the dependent (depends on others)
-          _pendingDependencies.erase(pluginName);
-
-          // Remove this plugin from other plugins' dependent lists
-          for (auto &dependentList : _dependents)
-          {
-            auto &dependents = dependentList.second;
-            dependents.erase(std::remove(dependents.begin(), dependents.end(), pluginName),
-                             dependents.end());
-          }
-
-          // Note: We don't erase _dependents[pluginName] because other plugins still
-          // depend on this one and should be notified when it's reloaded
-
-          IORA_LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
-
-          // Emit module unloaded event
-          auto event = parsers::Json::object();
-          event["eventId"] = "module_unloaded_" + pluginName;
-          event["eventName"] = "module.unload." + pluginName;
-          event["moduleName"] = pluginName;
-          pushEvent(event);
-
-          return true;
-        }
-        catch (const std::exception &e)
-        {
-          IORA_LOG_ERROR("Failed to unload plugin: " + pluginName + " - " + e.what());
-        }
-      }
-    }
-    else
+    if (_loadedModules.find(pluginName) == _loadedModules.end())
     {
       IORA_LOG_ERROR("Plugin not found: " + pluginName);
+      return false;
     }
-    return false;
+    if (isModuleUnloadingLocked(pluginName))
+    {
+      // Another unloader already owns the claim; do not re-tear-down.
+      return false;
+    }
+
+    // Claim the module: new operator() calls now observe it as "not loaded" and
+    // throw, and a concurrent same-name load/unload fails fast.
+    _apiUnloadingModules.insert(pluginName);
+
+    // Clear every registered wrapper's cache with _loadModulesMutex RELEASED. Each
+    // invalidateAndClearCache takes the wrapper's cacheMutex — which serializes
+    // against an in-flight invoke (operator() invokes under cacheMutex) and
+    // destroys the plugin std::function while the .so is still mapped — and
+    // clearing off _loadModulesMutex avoids the _loadModulesMutex->cacheMutex
+    // cycle with operator()'s slow path. Restore the claim on any throw
+    // (snapshotSafeApis can throw bad_alloc; guard.lock() can throw system_error)
+    // so a failure does not brick the module as permanently "unloading".
+    try
+    {
+      guard.unlock();
+      clearSafeApiCaches(pluginName);
+      guard.lock();
+    }
+    catch (...)
+    {
+      if (!guard.ownsLock())
+      {
+        guard.lock();
+      }
+      openGate(pluginName);
+      throw;
+    }
+
+    // Host-side teardown (onUnload/unexport/unregister/erase/dependency cleanup/
+    // prune), THEN dlclose — dlclose runs only after every host-side destroy, while
+    // the .so is still mapped. teardownModuleHostSideLocked returns false (no
+    // dlclose) if the module vanished across the release/re-acquire (claim blocks
+    // that, but bail safely if so) or if onUnload threw (leave it as the original
+    // did). The claim is released regardless.
+    const bool ok = teardownModuleHostSideLocked(pluginName, /*notifyDependents=*/true);
+    if (ok)
+    {
+      PluginManager::unloadPlugin(pluginName); // dlclose AFTER host-side teardown
+    }
+    openGate(pluginName);
+
+    if (ok)
+    {
+      IORA_LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
+      // Emit module unloaded event
+      auto event = parsers::Json::object();
+      event["eventId"] = "module_unloaded_" + pluginName;
+      event["eventName"] = "module.unload." + pluginName;
+      event["moduleName"] = pluginName;
+      pushEvent(event);
+    }
+    return ok;
   }
 
   /// \brief Reloads a module by unloading and loading it again
@@ -767,65 +807,97 @@ protected:
   /// \brief Internal version of isModuleLoaded that assumes lock is already held
   bool isModuleLoadedLocked(const std::string &moduleName) const
   {
+    // A module claimed unloading (DP-E) reports NOT loaded so the API gate,
+    // isModuleLoaded(), and Plugin::require() all agree it is unavailable during
+    // the unload/claim window, even though its entry is still in _loadedModules until
+    // teardown completes.
+    if (!_apiUnloadingModules.empty() &&
+        _apiUnloadingModules.find(moduleName) != _apiUnloadingModules.end())
+    {
+      return false;
+    }
     return _loadedModules.find(moduleName) != _loadedModules.end();
   }
 
 public:
   bool unloadAllModules()
   {
-    std::lock_guard<std::mutex> lock(_loadModulesMutex);
+    LoadModulesGuard guard(_loadModulesMutex);
     bool success = true;
 
-    // Store plugin names for library unloading after plugin destruction
-    std::vector<std::string> pluginNames;
-
-    // Call onUnload on all plugins while they're still in place
-    for (auto &[name, pluginPtr] : _loadedModules)
+    // Claim every (not-already-unloading) module and snapshot the names to tear
+    // down, all while holding _loadModulesMutex.
+    std::vector<std::string> names;
+    for (auto &kv : _loadedModules)
     {
-      if (pluginPtr)
+      const std::string &name = kv.first;
+      if (isModuleUnloadingLocked(name))
       {
-        pluginNames.push_back(name);
-        try
-        {
-          pluginPtr->onUnload();
-          IORA_LOG_INFO("Plugin " + name + " onUnload completed.");
-        }
-        catch (const std::exception &e)
-        {
-          IORA_LOG_ERROR("Failed to call onUnload for plugin: " + name + " - " + e.what());
-          success = false;
-        }
+        continue; // a concurrent single-unload owns this claim
       }
+      _apiUnloadingModules.insert(name);
+      names.push_back(name);
     }
 
-    // Clear all state before plugin destruction
-    _loadedModules.clear(); // This will destroy all plugin objects
-    _dependents.clear();
-    _pendingDependencies.clear();
-
-    // Clear all API exports to ensure clean state
+    // Clear all wrapper caches with _loadModulesMutex RELEASED (see
+    // unloadSingleModule): each clear serializes against in-flight invokes via
+    // cacheMutex and frees the plugin std::function before dlclose. Restore all
+    // claims on any throw so a failure does not brick modules as "unloading".
+    try
     {
-      std::lock_guard<std::mutex> apiLock(_apiMutex);
-      _apiExports.clear();
+      guard.unlock();
+      for (const auto &name : names)
+      {
+        clearSafeApiCaches(name);
+      }
+      guard.lock();
+    }
+    catch (...)
+    {
+      if (!guard.ownsLock())
+      {
+        guard.lock();
+      }
+      for (const auto &name : names)
+      {
+        openGate(name);
+      }
+      throw;
     }
 
-    // Now unload the shared libraries after plugin objects are destroyed
-    for (const auto &name : pluginNames)
+    // TWO-PASS teardown over ONLY the claimed names. Pass 1: host-side teardown for
+    // EVERY module (onUnload/unexport/unregister/erase/dependency cleanup/prune) —
+    // NO dlclose. Pass 2: dlclose the modules that were erased. This guarantees no
+    // module's onUnload runs after a sibling's .so has been dlclosed (the original
+    // batch-unloadAll() ordering, restored). We NEVER PluginManager::unloadAll() or
+    // blanket-clear the dependency maps: that would dlclose/wipe a module this call
+    // did NOT claim (one a concurrent unloadSingleModule owns, or one loaded during
+    // the release window). Orphaned PluginManager entries from failed loads are
+    // cleaned up at the source in loadSingleModule.
+    std::vector<std::string> toDlclose;
+    toDlclose.reserve(names.size());
+    for (const auto &name : names)
     {
-      try
+      // notifyDependents=false for batch unload (everything is going away; matches
+      // the original unloadAllModules, which did not notify dependents).
+      if (teardownModuleHostSideLocked(name, /*notifyDependents=*/false))
       {
-        PluginManager::unloadPlugin(name);
-        IORA_LOG_INFO("Plugin library " + name + " unloaded successfully.");
+        toDlclose.push_back(name);
       }
-      catch (const std::exception &e)
+      else
       {
-        IORA_LOG_ERROR("Failed to unload plugin library: " + name + " - " + e.what());
-        success = false;
+        success = false; // present-but-onUnload-threw, or already gone
       }
     }
-
-    // Clear the PluginManager registry to ensure clean state
-    PluginManager::unloadAll();
+    for (const auto &name : toDlclose)
+    {
+      PluginManager::unloadPlugin(name); // dlclose only AFTER every host-side teardown
+      IORA_LOG_INFO("Plugin library " + name + " unloaded successfully.");
+    }
+    for (const auto &name : names)
+    {
+      openGate(name);
+    }
 
     return success;
   }
@@ -933,16 +1005,38 @@ protected:
     std::string pluginName;
     std::string pluginPath;
     bool loadSuccess = false;
+    // True once loadPlugin() has registered this .so in PluginManager for THIS
+    // call, so the failure-path cleanup only unregisters an entry we own — NOT one
+    // a concurrent load owns (a "Plugin already loaded" throw from loadPlugin must
+    // never dlclose the other loader's live module).
+    bool pluginRegistered = false;
 
     // Critical section: hold mutex only for plugin loading and data structure updates
     {
-      std::lock_guard<std::mutex> lock(_loadModulesMutex);
+      // LoadModulesGuard (not a bare lock_guard) so ownsLoadModulesMutex() is
+      // true across onLoad(): a plugin whose onLoad calls getExportedApiSafe is
+      // then REJECTED (getExportedApiSafe throws) — its wrapper's vtable would live
+      // in the plugin .so and use-after-dlclose (DP-F host-only enforcement).
+      LoadModulesGuard loadGuard(_loadModulesMutex);
       try
       {
         pluginName = entry.path().filename().string();
         pluginPath = entry.path().string();
+
+        // Fail-fast if this module name is mid-unload (claimed): loading over a
+        // an in-progress unload would drop the fresh instance (map insert is a no-op on
+        // an existing key) and corrupt the module map across the release/re-acquire window
+        // (DP-E). This directory_entry overload is the single insertion point, so
+        // it covers reloadModule and batch loadModules().
+        if (isModuleUnloadingLocked(pluginName))
+        {
+          IORA_LOG_ERROR("Cannot load '" + pluginName + "': an unload is in progress.");
+          return false;
+        }
+
         IORA_LOG_INFO("Loading module: " + pluginName);
         loadPlugin(pluginName, pluginPath);
+        pluginRegistered = true; // we now own the PluginManager entry for this name
 
         // Resolve and call the exported loadModule function
         using LoadModuleFunc = Plugin *(*)(iora::IoraService *);
@@ -952,9 +1046,18 @@ protected:
         {
           pluginInstance->_name = pluginName; // Set the plugin name
           pluginInstance->_path = pluginPath; // Set the plugin path
+          // Snapshot of the names onLoad exported, captured the moment onLoad
+          // returns and BEFORE the _loadedModules insert. This is the failure-path
+          // teardown's authoritative source: if the insert itself throws (rehash
+          // bad_alloc), the moved-from Plugin object (the braced value_type
+          // temporary) is destroyed during unwinding and is unreachable from BOTH
+          // pluginInstance (null) and _loadedModules (insert had no effect), so the
+          // exported names cannot be recovered from the object anymore. (cpp17 M1)
+          std::vector<std::string> exportedNames;
           try
           {
             pluginInstance->onLoad(this);
+            exportedNames = pluginInstance->_apiExports; // onLoad succeeded
 
             // Only add to _loadedModules if onLoad succeeds
             _loadedModules.insert({pluginName, std::move(pluginInstance)});
@@ -965,37 +1068,77 @@ protected:
             // Only mark as successful if we reach this point
             loadSuccess = true;
           }
-          catch (const std::exception &e)
+          catch (const std::exception &)
           {
-            // If onLoad fails, the plugin should not be considered loaded
-            throw;
+            // onLoad (or the subsequent insert/notify) failed AFTER the plugin may
+            // have exported APIs / registered ServiceRegistry entries. Those hold
+            // plugin-resident std::functions / objects; tear them down HOST-SIDE now
+            // — while the plugin object and its .so are still mapped — BEFORE the
+            // outer catch dlcloses. Otherwise they dangle into the unmapped .so and
+            // fault at the next call or at ~IoraService (_apiExports.clear()). (C1)
+            //
+            // Source the exported names: onLoad-throw -> the still-owned
+            // pluginInstance (exportedNames not yet captured); onLoad-success then
+            // insert/notify-throw -> the exportedNames snapshot (the object may be
+            // gone). This covers the insert-throw sub-case (cpp17 M1).
+            // Source the exported names from the still-owned object, else the
+            // pre-insert snapshot. Each unexportApi is best-effort (it throws on a
+            // not-found name): a missing name must not skip the rest of the teardown
+            // (unregister/erase) and leak an object into the .so about to be dlclosed.
+            const std::vector<std::string> &namesToUnexport =
+              pluginInstance ? pluginInstance->_apiExports : exportedNames;
+            for (auto &apiName : namesToUnexport)
+            {
+              try
+              {
+                unexportApi(apiName); // destroys the plugin std::function (.so mapped)
+              }
+              catch (const std::exception &)
+              {
+              }
+            }
+            ServiceRegistry::unregisterModule(pluginName);
+            auto lit = _loadedModules.find(pluginName);
+            if (lit != _loadedModules.end())
+            {
+              _loadedModules.erase(lit); // ~Plugin while the .so is still mapped
+            }
+            throw; // outer catch runs PluginManager::unloadPlugin (dlclose) after this
           }
         }
         else
         {
           IORA_LOG_ERROR("Module " + pluginName + " did not return a valid instance.");
+          // We registered this .so above; remove OUR entry so a failed load does
+          // not leave an orphaned _plugins entry ("already loaded" on retry). This
+          // source-level fix lets unloadAll* avoid a blanket
+          // PluginManager::unloadAll() (which would dlclose modules it never
+          // claimed — a concurrent-unload UAF).
+          if (pluginRegistered)
+          {
+            PluginManager::unloadPlugin(pluginName);
+          }
           return false;
         }
       }
       catch (const std::exception &e)
       {
         IORA_LOG_ERROR("Failed to load module: " + entry.path().string() + " - " + e.what());
+        // Same source-level cleanup on any load failure AFTER we registered the
+        // entry (onLoad threw, resolve failed, etc.). Guarded by pluginRegistered
+        // so a "Plugin already loaded" throw from loadPlugin() — where the entry
+        // belongs to a CONCURRENT load — never dlcloses that live module.
+        if (pluginRegistered)
+        {
+          PluginManager::unloadPlugin(pluginName);
+        }
         throw; // Re-throw to provide detailed error information to the caller
       }
     } // End critical section - mutex released here
 
-    // Push event after releasing mutex to avoid potential deadlock with event handlers
-    // TEMPORARILY DISABLED to test if events are causing the deadlock
-    if (false && loadSuccess)
-    {
-      auto event = parsers::Json::object();
-      event["eventId"] = "module_loaded_" + pluginName;
-      event["eventName"] = "module.load." + pluginName;
-      event["moduleName"] = pluginName;
-      event["modulePath"] = pluginPath;
-      pushEvent(event);
-    }
-
+    // Note: no module.load event is emitted (unlike module.unload). SafeApiFunction
+    // only reacts to module.(unload|reload); no in-repo consumer subscribes to
+    // module.load. If load notifications are ever needed, add them here.
     return loadSuccess;
   }
 
@@ -1455,6 +1598,223 @@ private:
   mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
 
+  // --- SafeApiFunction clear-before-dlclose machinery (tracker 2026-09-07-1,
+  // architecture/iora/safe_api_function_drain.json). Fixes the use-after-dlclose
+  // in SafeApiFunction: a cached plugin std::function (manager resident in the
+  // plugin .so text) outliving dlclose (destructor UAF), and an operator()
+  // invoking it while a concurrent unload dlcloses (concurrent-call UAF).
+  //
+  // Design (zero per-call cost): operator() invokes the cached function UNDER
+  // cacheMutex, exactly as before. On unload the service (a) CLAIMS the module so
+  // new calls are rejected, then (b) with _loadModulesMutex RELEASED, clears every
+  // registered wrapper's cache under that wrapper's cacheMutex — which both frees
+  // the plugin std::function before dlclose AND, via cacheMutex, waits out any
+  // in-flight invoke of that wrapper — then (c) re-acquires and tears down/dlclose.
+  //
+  // Lock order (the ONLY nestings): operator() slow path takes cacheMutex ->
+  // _loadModulesMutex -> _apiMutex. The unload CLEAR takes cacheMutex with
+  // _loadModulesMutex NOT held (this is what avoids a _loadModulesMutex->cacheMutex
+  // edge cycling with operator()'s cacheMutex->_loadModulesMutex order — the exact
+  // deadlock a naive clear-under-_loadModulesMutex would hit). _apiCallGuard is a
+  // leaf guarding only the registry (snapshot + registration).
+  mutable std::mutex _apiCallGuard;
+  // Modules currently unloading (claim). Guarded by _loadModulesMutex. Gates ALL
+  // same-name module-map mutations: operator()/isModuleLoadedLocked report NOT
+  // loaded, load/reload fail-fast, a second unload no-ops.
+  std::unordered_set<std::string> _apiUnloadingModules;
+  // Live SafeApiFunction wrappers per module, for clear-before-dlclose. Guarded by
+  // the LEAF _apiCallGuard so registration is safe from a plugin onLoad (which
+  // holds _loadModulesMutex). SHUTDOWN PRECONDITION: this map is destroyed with the
+  // IoraService (destroyInstance) off _apiCallGuard, so — like the rest of the
+  // service — no thread may call getExportedApiSafe or (un)loadModule concurrently
+  // with service destruction (the documented destroyInstance() precondition).
+  std::unordered_map<std::string, std::vector<std::weak_ptr<ISafeApiClearable>>> _safeApiRegistry;
+
+public:
+  /// \brief Whether this thread currently holds _loadModulesMutex, so
+  /// getExportedApiSafe can REJECT (throw on) a call made from a plugin onLoad
+  /// (host-only enforcement — a plugin-resident wrapper would use-after-dlclose).
+  /// Defined ONCE in src/core/iora_core.cpp
+  /// (PAT-3), NOT as a header inline variable: iora.hpp is compiled into the host
+  /// AND into plugin .so's (loaded RTLD_LOCAL), and an inline variable does not
+  /// guarantee a single TLS instance across a dlopen boundary. Mirrors
+  /// Logger::handlerReentryDepth().
+  static bool &ownsLoadModulesMutex();
+
+private:
+  /// \brief Erase-remove expired weak_ptrs from a registry bucket. Caller holds
+  /// _apiCallGuard.
+  static void eraseExpired(std::vector<std::weak_ptr<ISafeApiClearable>> &vec)
+  {
+    vec.erase(std::remove_if(vec.begin(), vec.end(),
+                             [](const std::weak_ptr<ISafeApiClearable> &e) { return e.expired(); }),
+              vec.end());
+  }
+
+  /// \brief Register a live SafeApiFunction wrapper for clear-before-dlclose.
+  /// Guarded by the LEAF _apiCallGuard (safe from onLoad). Prunes expired
+  /// entries first.
+  void registerSafeApi(const std::string &moduleName, std::weak_ptr<ISafeApiClearable> w)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    auto &vec = _safeApiRegistry[moduleName];
+    eraseExpired(vec);
+    vec.push_back(std::move(w));
+  }
+
+  /// \brief Snapshot the module's live wrappers (locked shared_ptrs), copy-then-
+  /// use so the clear runs outside _apiCallGuard. Guarded by the leaf _apiCallGuard.
+  std::vector<std::shared_ptr<ISafeApiClearable>> snapshotSafeApis(const std::string &moduleName)
+  {
+    std::vector<std::shared_ptr<ISafeApiClearable>> live;
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    auto it = _safeApiRegistry.find(moduleName);
+    if (it != _safeApiRegistry.end())
+    {
+      for (auto &w : it->second)
+      {
+        if (auto sp = w.lock())
+        {
+          live.push_back(std::move(sp));
+        }
+      }
+    }
+    return live;
+  }
+
+  /// \brief Clear every registered wrapper's cache for the module, freeing the
+  /// plugin std::function before dlclose. MUST be called with _loadModulesMutex
+  /// RELEASED (each invalidateAndClearCache takes a wrapper's cacheMutex, and
+  /// operator()'s slow path takes cacheMutex -> _loadModulesMutex; clearing while
+  /// holding _loadModulesMutex would close a lock-order cycle). cacheMutex also
+  /// makes each clear wait out that wrapper's in-flight invoke.
+  void clearSafeApiCaches(const std::string &moduleName)
+  {
+    for (auto &sp : snapshotSafeApis(moduleName))
+    {
+      sp->invalidateAndClearCache();
+    }
+  }
+
+  /// \brief Prune expired wrapper weak_ptrs for the module (and drop the map entry
+  /// if empty), so the registry does not grow unboundedly for uniquely-named
+  /// modules that are never reloaded. Live wrappers stay registered (they must be
+  /// re-cleared on a later unload). Guarded by the leaf _apiCallGuard.
+  void pruneSafeApiRegistry(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    auto it = _safeApiRegistry.find(moduleName);
+    if (it == _safeApiRegistry.end())
+    {
+      return;
+    }
+    auto &vec = it->second;
+    eraseExpired(vec);
+    if (vec.empty())
+    {
+      _safeApiRegistry.erase(it);
+    }
+  }
+
+  /// \brief Run ALL host-side teardown for a claimed module — optional dependent
+  /// notification, onUnload, unexport its APIs, unregister its ServiceRegistry
+  /// entries, erase it from _loadedModules, clean dependency tracking, prune its
+  /// registry — but NOT dlclose. Returns true if the module was erased (so the
+  /// caller should dlclose it). PRE: holds _loadModulesMutex.
+  ///
+  /// The dlclose is deferred to the caller so that, for a BATCH unload, EVERY
+  /// module's host-side teardown (esp. onUnload, which may touch a sibling) runs
+  /// BEFORE ANY dlclose — never onUnload-after-a-sibling's-dlclose. All host-side
+  /// destroys (std::function targets in _apiExports, ServiceRegistry objects, the
+  /// Plugin instance) run while the .so is still mapped.
+  bool teardownModuleHostSideLocked(const std::string &name, bool notifyDependents)
+  {
+    bool erased = false;
+    try
+    {
+      if (notifyDependents)
+      {
+        notifyDependentsOfUnload(name);
+      }
+      auto it = _loadedModules.find(name);
+      if (it != _loadedModules.end())
+      {
+        if (it->second)
+        {
+          it->second->onUnload();
+          for (auto &apiName : it->second->_apiExports)
+          {
+            // Best-effort: a not-found name (unexportApi throws) must not skip the
+            // remaining names / unregister / erase before dlclose.
+            try
+            {
+              unexportApi(apiName);
+            }
+            catch (const std::exception &)
+            {
+            }
+          }
+        }
+        // MUST run before erase (invalidates it) and before dlclose (which unmaps
+        // the plugin's vtables). unregisterModule never throws.
+        ServiceRegistry::unregisterModule(name);
+        _loadedModules.erase(it); // unique_ptr will delete
+        erased = true;
+      }
+    }
+    catch (const std::exception &e)
+    {
+      IORA_LOG_ERROR("Failed to unload plugin: " + name + " - " + e.what());
+    }
+    // Dependency-tracking + registry cleanup regardless of teardown outcome. We do
+    // NOT erase _dependents[name]: other plugins still depend on it across a reload.
+    _pendingDependencies.erase(name);
+    for (auto &dependentList : _dependents)
+    {
+      auto &dependents = dependentList.second;
+      dependents.erase(std::remove(dependents.begin(), dependents.end(), name), dependents.end());
+    }
+    pruneSafeApiRegistry(name);
+    return erased;
+  }
+
+  /// \brief Release the unloading claim. PRE: holds _loadModulesMutex.
+  void openGate(const std::string &moduleName) { _apiUnloadingModules.erase(moduleName); }
+
+  /// \brief True if the module is currently claimed unloading. PRE: holds
+  /// _loadModulesMutex.
+  bool isModuleUnloadingLocked(const std::string &moduleName) const
+  {
+    return _apiUnloadingModules.find(moduleName) != _apiUnloadingModules.end();
+  }
+
+  /// \brief RAII guard over a unique_lock<_loadModulesMutex> that keeps
+  /// ownsLoadModulesMutex() in sync with the lock's ACTUAL held/released state
+  /// across the release/re-acquire window (DP-D), restoring false on every
+  /// throw/return path (DP-F). Use its lock()/unlock(); never touch the
+  /// underlying lock directly. (_loadModulesMutex is non-recursive, so a single
+  /// thread never nests two of these — the bool cannot be clobbered.)
+  class LoadModulesGuard
+  {
+  public:
+    explicit LoadModulesGuard(std::mutex &m) : _lk(m) { ownsLoadModulesMutex() = true; }
+    ~LoadModulesGuard() { ownsLoadModulesMutex() = false; }
+    void unlock()
+    {
+      ownsLoadModulesMutex() = false;
+      _lk.unlock();
+    }
+    void lock()
+    {
+      _lk.lock();
+      ownsLoadModulesMutex() = true;
+    }
+    bool ownsLock() const { return _lk.owns_lock(); }
+
+  private:
+    std::unique_lock<std::mutex> _lk;
+  };
+
   /// \brief Holds the merged configuration (CLI, TOML, defaults).
   Config _config;
 };
@@ -1565,32 +1925,31 @@ IoraService::onEventNameMatches(const std::string &eventNamePattern)
 /// - Double-checked locking pattern for performance
 /// - Event handlers use weak_ptr to prevent dangling pointers
 /// - Uses weak_ptr self-reference for safe event handling
-template <typename R, typename... Args> class IoraService::SafeApiFunction<R(Args...)>
+template <typename R, typename... Args>
+class IoraService::SafeApiFunction<R(Args...)> : public ISafeApiClearable
 {
 private:
+  friend class IoraService; // getExportedApiSafe is the sole factory (DP-G).
+
+  // Cached plugin std::function. Its type-erased manager lives in the plugin .so
+  // text, so it MUST be cleared (destroyed) before dlclose — done by
+  // invalidateAndClearCache() on unload while the .so is still mapped.
   mutable std::function<R(Args...)> cachedFunc;
   mutable std::atomic<bool> valid{false};
-  mutable std::mutex cacheMutex; // Protects cachedFunc updates
+  mutable std::mutex cacheMutex; // Protects cachedFunc; also held during invoke
   std::string apiName;
   std::string moduleName;
   IoraService *service;
   mutable std::atomic<bool> eventHandlerRegistered{false};
   mutable std::weak_ptr<SafeApiFunction<R(Args...)>> selfReference;
 
-  /// \brief Find module name from API name by checking all loaded modules
+  /// \brief Resolve the module name for an API. Only ever reached from the ctor
+  /// via getExportedApiSafe (the sole factory), which rejects the call when this
+  /// thread already holds _loadModulesMutex (host-only, see getExportedApiSafe),
+  /// so this always takes the lock — no re-lock of the non-recursive mutex occurs.
   std::string findModuleNameForApi(const std::string &apiName) const
   {
-    IORA_LOG_INFO("MUTEX DEBUG: SafeApiFunction attempting to acquire _loadModulesMutex for API: " +
-                  apiName);
     std::lock_guard<std::mutex> lock(service->_loadModulesMutex);
-    IORA_LOG_INFO("MUTEX DEBUG: SafeApiFunction acquired _loadModulesMutex for API: " + apiName);
-    auto result = findModuleNameForApiLocked(apiName);
-    IORA_LOG_INFO("MUTEX DEBUG: SafeApiFunction releasing _loadModulesMutex for API: " + apiName);
-    return result;
-  }
-
-  std::string findModuleNameForApiLocked(const std::string &apiName) const
-  {
     // Extract the prefix from API name (e.g., "testplugin.add" -> "testplugin")
     size_t dotPos = apiName.find('.');
     std::string apiPrefix = (dotPos != std::string::npos) ? apiName.substr(0, dotPos) : apiName;
@@ -1615,7 +1974,12 @@ private:
     return apiPrefix + ".so";
   }
 
-  /// \brief Register event handler safely using weak_ptr
+  /// \brief Register event handler safely using weak_ptr.
+  /// NOTE: This async module.(unload|reload) -> valid=false invalidation is now
+  /// REDUNDANT for safety — the synchronous clear-before-dlclose (invalidateAndClearCache
+  /// under the unloading claim) already invalidates the cache before dlclose. It is
+  /// retained as harmless belt-and-suspenders (races nothing; valid is atomic); do
+  /// NOT reintroduce reliance on the post-dlclose async event for invalidation.
   void registerEventHandler() const
   {
     if (!eventHandlerRegistered.exchange(true))
@@ -1649,19 +2013,37 @@ private:
     }
   }
 
-public:
-  /// \brief Constructor that defers event registration until shared_ptr is created
+  // Private: constructed ONLY by getExportedApiSafe (DP-G), which registers the
+  // wrapper intrinsically so no unregistered instance (whose cache would be
+  // uncleared before dlclose -> destructor UAF) can exist.
   SafeApiFunction(const std::string &name, IoraService *svc) : apiName(name), service(svc)
   {
-    // Find the actual module name for this API
+    // Resolve the module name up front so registerEventHandler's regex and the
+    // registry key are available before first use (DP-F).
     moduleName = findModuleNameForApi(name);
-    // Event handler registration is deferred until first use
   }
 
-  /// \brief Set the self-reference weak_ptr (called by getExportedApiSafe)
+  /// \brief Set the self-reference weak_ptr (called by getExportedApiSafe).
   void setSelfReference(std::weak_ptr<SafeApiFunction<R(Args...)>> ref) { selfReference = ref; }
 
-  /// \brief Function call operator - validates module and calls API (thread-safe)
+public:
+  /// \brief Invalidate the wrapper and destroy its cached plugin std::function.
+  /// Called by the unloader (with _loadModulesMutex released) BEFORE dlclose, so
+  /// the plugin-text manager is destroyed while the .so is still mapped. Takes
+  /// cacheMutex, which — because operator() invokes UNDER cacheMutex — also waits
+  /// out any in-flight invoke of this wrapper before the cache is cleared.
+  void invalidateAndClearCache() noexcept override
+  {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    valid.store(false);
+    cachedFunc = nullptr;
+  }
+
+  /// \brief Function call operator - validates module and calls API (thread-safe).
+  /// The invoke runs UNDER cacheMutex; the unloader's invalidateAndClearCache
+  /// (also under cacheMutex, with _loadModulesMutex released) therefore serializes
+  /// against an in-flight invoke and clears the cache before dlclose — no
+  /// per-call drain/counter is needed.
   R operator()(Args... args) const
   {
     // Ensure event handler is registered (lazy initialization)
@@ -1687,7 +2069,7 @@ public:
       return cachedFunc(args...);
     }
 
-    // Module was unloaded/reloaded, or this is the first call
+    // Module was unloaded/reloaded/unloading, or this is the first call
     if (!service->isModuleLoaded(moduleName))
     {
       valid.store(false);
