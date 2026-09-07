@@ -25,8 +25,10 @@
 #include "util/filesystem.hpp"
 #include <any>
 #include <cassert>
+#include <condition_variable>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <typeindex>
 #include <unordered_set>
 
@@ -640,13 +642,111 @@ public:
   }
 
   /// \brief Calls a registered plugin API by name with arguments.
-  /// Throws std::runtime_error if the API is not found or the signature does
-  /// not match.
+  /// Throws std::runtime_error if the API is not found, the owning module is not
+  /// loaded / is unloading, or the signature does not match.
+  ///
+  /// The exported callable is copied out of _apiExports and invoked+destroyed on
+  /// the caller stack outside any lock, but the copy is protected against a
+  /// concurrent module unload by the per-module in-flight drain gate: the owning
+  /// module is resolved, entered (rejected if an unload is draining it), and the
+  /// unload path WAITS for this call to complete before it tears the module down
+  /// (DP-1b). \note The return type MUST be HOST-OWNED. C++17 guaranteed copy
+  /// elision materializes the returned object in the CALLER's frame, so a return
+  /// type whose destructor lives in the plugin .so would run AFTER the drain
+  /// releases — outside the gate's protection. All in-repo callers return host-
+  /// owned types (iora_media codecs return CodecRegistry& / a reference; karoo_tmc
+  /// returns Json). The copied std::function itself IS protected (it is destroyed
+  /// before leaveApiCall by the declaration order below).
   template <typename Ret, typename... Args>
   Ret callExportedApi(const std::string &name, Args &&...args)
   {
     core::Logger::debug("IoraService::callExportedApi() - Calling plugin API: " + name);
-    auto func = getExportedApi<Ret(Args...)>(name);
+
+    // (1) Resolve the owning module authoritatively (Slice A reverse map).
+    std::string module;
+    {
+      std::lock_guard<std::mutex> lock(_apiMutex);
+      auto owner = resolveOwningModuleLocked(name);
+      if (!owner)
+      {
+        throw std::runtime_error("API not found: " + name);
+      }
+      module = *owner;
+    }
+
+    // (1b) Is-loaded gate (DP-6b): reject a call to a not-yet-loaded (mid-onLoad)
+    // or mid-unload-claim module, mirroring SafeApiFunction::operator(). This
+    // _loadModulesMutex acquisition is taken-and-released here, NEVER nested with
+    // _apiMutex or _apiCallGuard, so no lock-order edge is introduced.
+    if (!isModuleLoaded(module))
+    {
+      throw std::runtime_error("plugin API unavailable: module " + module + " not loaded");
+    }
+
+    // (2) Enter the drain gate. A rejected call never materializes a copy.
+    if (!enterApiCall(module))
+    {
+      throw std::runtime_error("plugin API unavailable: module " + module + " is unloading");
+    }
+
+    // (3)+(4) Arm the leave-guard IMMEDIATELY (M-A: before the thread-local push,
+    // so a throwing push still runs leaveApiCall — no permanent drain hang), then
+    // push. The guard pops ONE entry (erase(find), NOT erase(key) which would
+    // drop all equal entries and corrupt the reentrant/transitive count — M1) and
+    // calls leaveApiCall. Declared BEFORE `func` so ~func (the .so-resident
+    // manager) runs before leaveApiCall (DP-8 belt-and-suspenders).
+    struct LeaveGuard
+    {
+      IoraService *svc;
+      const std::string *module;
+      bool pushed = false;
+      ~LeaveGuard() noexcept
+      {
+        try
+        {
+          if (pushed)
+          {
+            auto &set = IoraService::inFlightApiModules();
+            auto it = set.find(*module);
+            if (it != set.end())
+            {
+              set.erase(it); // erase ONE (M1)
+            }
+          }
+          svc->leaveApiCall(*module);
+        }
+        catch (...)
+        {
+          // leaveApiCall locks _apiCallGuard; std::mutex::lock can throw. This
+          // dtor is noexcept, so a propagating throw would std::terminate — a
+          // _apiCallGuard lock failure is treated as unrecoverable but is
+          // swallowed here rather than crash the process (L-4).
+        }
+      }
+    } guard{this, &module};
+    IoraService::inFlightApiModules().insert(module);
+    guard.pushed = true;
+
+    // (5) Copy WITH an owner re-check in the SAME _apiMutex hold (C-1): between
+    // resolving M and copying, a concurrent unexport+re-export could rebind the
+    // name to a DIFFERENT module P while our gate protects M. Re-resolving
+    // owner==M under the copy hold proves the copied function belongs to the
+    // drained module M. `func` is declared here (after the guard) for the DP-8
+    // destruction ordering.
+    std::function<Ret(Args...)> func;
+    {
+      std::lock_guard<std::mutex> lock(_apiMutex);
+      auto owner = resolveOwningModuleLocked(name);
+      auto it = _apiExports.find(name);
+      if (!owner || *owner != module || it == _apiExports.end())
+      {
+        throw std::runtime_error("API not found or owner changed for: " + name);
+      }
+      func = it->second.get<Ret(Args...)>(name);
+    }
+
+    // (6) Invoke off all locks. The gate keeps M's host-side teardown waiting
+    // until this returns and the guard fires leaveApiCall.
     return func(std::forward<Args>(args)...);
   }
 
@@ -736,22 +836,36 @@ public:
       return false;
     }
 
-    // Claim the module: new operator() calls now observe it as "not loaded" and
-    // throw, and a concurrent same-name load/unload fails fast.
-    _apiUnloadingModules.insert(pluginName);
+    // Self-unload guard (DP-7 / H-C): if this thread is inside a callExportedApi
+    // of this module, draining it would wait on an in-flight count that includes
+    // this thread — a deadlock. Detect and throw BEFORE claiming, so no claim is
+    // leaked (a throw after the claim would brick the module as "unloading").
+    if (inFlightApiModules().count(pluginName) > 0)
+    {
+      throw std::runtime_error("cannot unload module " + pluginName +
+                               " from within its own exported API call (self-unload deadlock)");
+    }
 
-    // Clear every registered wrapper's cache with _loadModulesMutex RELEASED. Each
-    // invalidateAndClearCache takes the wrapper's cacheMutex — which serializes
-    // against an in-flight invoke (operator() invokes under cacheMutex) and
-    // destroys the plugin std::function while the .so is still mapped — and
-    // clearing off _loadModulesMutex avoids the _loadModulesMutex->cacheMutex
-    // cycle with operator()'s slow path. Restore the claim on any throw
-    // (snapshotSafeApis can throw bad_alloc; guard.lock() can throw system_error)
-    // so a failure does not brick the module as permanently "unloading".
+    // Claim the module: new operator() calls now observe it as "not loaded" and
+    // throw, and a concurrent same-name load/unload fails fast. beginApiDrain in
+    // the SAME critical section marks the callExportedApi gate draining so no new
+    // call slips past the claim-to-drain gap.
+    _apiUnloadingModules.insert(pluginName);
+    beginApiDrain(pluginName);
+
+    // Clear every registered wrapper's cache AND drain in-flight callExportedApi
+    // copies with _loadModulesMutex RELEASED. clearSafeApiCaches takes each
+    // wrapper's cacheMutex (serializes against operator()); drainApiCalls waits
+    // out in-flight callExportedApi invokes of this module. Both run off
+    // _loadModulesMutex (DP-3: an in-flight call must be able to complete) and
+    // COMPLETE before teardownModuleHostSideLocked destroys the plugin object
+    // (DP-1b). Restore the claim AND the gate on any throw (snapshotSafeApis /
+    // CV wait / guard.lock() can throw) so a failure does not brick the module.
     try
     {
       guard.unlock();
       clearSafeApiCaches(pluginName);
+      drainApiCalls(pluginName);
       guard.lock();
     }
     catch (...)
@@ -769,11 +883,23 @@ public:
     // the .so is still mapped. teardownModuleHostSideLocked returns false (no
     // dlclose) if the module vanished across the release/re-acquire (claim blocks
     // that, but bail safely if so) or if onUnload threw (leave it as the original
-    // did). The claim is released regardless.
-    const bool ok = teardownModuleHostSideLocked(pluginName, /*notifyDependents=*/true);
-    if (ok)
+    // did). The claim + gate are released regardless: a throw from
+    // PluginManager::unloadPlugin (its mutex lock / a dtor) must NOT skip openGate,
+    // else the claim AND draining=true leak and the module name is permanently
+    // bricked for callExportedApi/isModuleLoaded (TS-2).
+    bool ok = false;
+    try
     {
-      PluginManager::unloadPlugin(pluginName); // dlclose AFTER host-side teardown
+      ok = teardownModuleHostSideLocked(pluginName, /*notifyDependents=*/true);
+      if (ok)
+      {
+        PluginManager::unloadPlugin(pluginName); // dlclose AFTER host-side teardown
+      }
+    }
+    catch (...)
+    {
+      openGate(pluginName);
+      throw;
     }
     openGate(pluginName);
 
@@ -854,20 +980,37 @@ public:
       {
         continue; // a concurrent single-unload owns this claim
       }
+      // Self-unload skip (DP-7 / H-C): if this thread is inside a callExportedApi
+      // of this module, draining it would deadlock on our own in-flight count.
+      // SKIP it (do not claim, do not tear down) and report failure — rather than
+      // throw and abort the unrelated modules of a shutdown batch. Checked BEFORE
+      // the claim so no claim is leaked.
+      if (inFlightApiModules().count(name) > 0)
+      {
+        IORA_LOG_ERROR("Skipping unload of module " + name +
+                       " during unloadAllModules: it has an in-flight exported API call on this "
+                       "thread (self-unload deadlock).");
+        success = false;
+        continue;
+      }
       _apiUnloadingModules.insert(name);
+      beginApiDrain(name);
       names.push_back(name);
     }
 
-    // Clear all wrapper caches with _loadModulesMutex RELEASED (see
-    // unloadSingleModule): each clear serializes against in-flight invokes via
-    // cacheMutex and frees the plugin std::function before dlclose. Restore all
-    // claims on any throw so a failure does not brick modules as "unloading".
+    // Clear all wrapper caches AND drain in-flight callExportedApi copies with
+    // _loadModulesMutex RELEASED (see unloadSingleModule): each clear serializes
+    // against in-flight invokes via cacheMutex; each drain waits out in-flight
+    // callExportedApi invokes of that module — both COMPLETE before the teardown
+    // pass destroys any plugin object (DP-1b). Restore all claims AND gates on
+    // any throw so a failure does not brick modules as "unloading".
     try
     {
       guard.unlock();
       for (const auto &name : names)
       {
         clearSafeApiCaches(name);
+        drainApiCalls(name);
       }
       guard.lock();
     }
@@ -893,25 +1036,39 @@ public:
     // did NOT claim (one a concurrent unloadSingleModule owns, or one loaded during
     // the release window). Orphaned PluginManager entries from failed loads are
     // cleaned up at the source in loadSingleModule.
-    std::vector<std::string> toDlclose;
-    toDlclose.reserve(names.size());
-    for (const auto &name : names)
+    // The claim + gate for EVERY claimed name are released regardless of a
+    // teardown/dlclose throw (TS-2): a throw here must not skip the openGate loop,
+    // else the surviving names leak their claim + draining=true and are bricked.
+    try
     {
-      // notifyDependents=false for batch unload (everything is going away; matches
-      // the original unloadAllModules, which did not notify dependents).
-      if (teardownModuleHostSideLocked(name, /*notifyDependents=*/false))
+      std::vector<std::string> toDlclose;
+      toDlclose.reserve(names.size());
+      for (const auto &name : names)
       {
-        toDlclose.push_back(name);
+        // notifyDependents=false for batch unload (everything is going away; matches
+        // the original unloadAllModules, which did not notify dependents).
+        if (teardownModuleHostSideLocked(name, /*notifyDependents=*/false))
+        {
+          toDlclose.push_back(name);
+        }
+        else
+        {
+          success = false; // present-but-onUnload-threw, or already gone
+        }
       }
-      else
+      for (const auto &name : toDlclose)
       {
-        success = false; // present-but-onUnload-threw, or already gone
+        PluginManager::unloadPlugin(name); // dlclose only AFTER every host-side teardown
+        IORA_LOG_INFO("Plugin library " + name + " unloaded successfully.");
       }
     }
-    for (const auto &name : toDlclose)
+    catch (...)
     {
-      PluginManager::unloadPlugin(name); // dlclose only AFTER every host-side teardown
-      IORA_LOG_INFO("Plugin library " + name + " unloaded successfully.");
+      for (const auto &name : names)
+      {
+        openGate(name);
+      }
+      throw;
     }
     for (const auto &name : names)
     {
@@ -1635,8 +1792,16 @@ private:
   std::unordered_map<std::string, std::string> _apiToModule;
   // Lock order: _loadModulesMutex (outer) -> _apiMutex (inner). Any code
   // path that must hold both acquires _loadModulesMutex first. _apiCallGuard
-  // (declared below) is a leaf guarding only the SafeApiFunction registry —
-  // it is never nested with either of these two.
+  // (declared below) is a leaf guarding TWO unrelated concerns: the
+  // SafeApiFunction registry AND the callExportedApi drain gate (Slice B). It is
+  // taken alone by the gate accessors and the registry accessors; the unload
+  // paths hold _loadModulesMutex and then take _apiCallGuard (beginApiDrain /
+  // endApiDrain via openGate, and teardown -> pruneSafeApiRegistry) — the
+  // _loadModulesMutex -> _apiCallGuard edge is ACYCLIC and pre-existing; NO path
+  // takes _loadModulesMutex while holding _apiCallGuard, and callExportedApi
+  // enters/leaves the gate DISJOINT from its _apiMutex copy (never both held).
+  // (The load-failure drain adds another _loadModulesMutex -> _apiCallGuard site
+  // in Slice C, tracker 2026-09-07-9 — same acyclic direction.)
   mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
@@ -1659,7 +1824,9 @@ private:
   // _loadModulesMutex NOT held (this is what avoids a _loadModulesMutex->cacheMutex
   // edge cycling with operator()'s cacheMutex->_loadModulesMutex order — the exact
   // deadlock a naive clear-under-_loadModulesMutex would hit). _apiCallGuard is a
-  // leaf guarding only the registry (snapshot + registration).
+  // leaf guarding the registry (snapshot + registration) AND the callExportedApi
+  // drain gate (_apiCallGates + _apiDrainCv, Slice B) — see the lock-order note
+  // above.
   mutable std::mutex _apiCallGuard;
   // Modules currently unloading (claim). Guarded by _loadModulesMutex. Gates ALL
   // same-name module-map mutations: operator()/isModuleLoadedLocked report NOT
@@ -1669,9 +1836,35 @@ private:
   // the LEAF _apiCallGuard so registration is safe from a plugin onLoad (which
   // holds _loadModulesMutex). SHUTDOWN PRECONDITION: this map is destroyed with the
   // IoraService (destroyInstance) off _apiCallGuard, so — like the rest of the
-  // service — no thread may call getExportedApiSafe or (un)loadModule concurrently
-  // with service destruction (the documented destroyInstance() precondition).
+  // service — no thread may call getExportedApiSafe, callExportedApi, or
+  // (un)loadModule concurrently with service destruction (the documented
+  // destroyInstance() precondition). callExportedApi touches _apiMutex,
+  // _apiCallGuard, _apiExports, _apiCallGates and _apiDrainCv, all destroyed in
+  // ~IoraService, so a call racing destruction is the same UB class (TS-3).
   std::unordered_map<std::string, std::vector<std::weak_ptr<ISafeApiClearable>>> _safeApiRegistry;
+
+  // --- callExportedApi in-flight drain gate (Slice B, tracker 2026-09-07-3,
+  // architecture/iora/callexportedapi_gating.json). Closes the use-after-free
+  // in callExportedApi: it copies a plugin std::function out of _apiExports
+  // under _apiMutex, releases the lock, then invokes+destroys the copy with NO
+  // lock held. The copy captures the plugin OBJECT (e.g. a codec module's
+  // [this]{return *_registry;}); a concurrent unload's host-side teardown
+  // (onUnload + ~Plugin) + dlclose in that window makes the copy dereference
+  // destroyed state. The gate makes an unload WAIT for in-flight calls to a
+  // module before that module's host-side teardown (DP-1b: drain-before-
+  // teardown, not merely before dlclose).
+  //
+  // Per-module {inFlight count, draining flag} + a shared CV, guarded by the
+  // EXISTING leaf _apiCallGuard (which also guards _safeApiRegistry above — the
+  // two are unrelated concerns co-located under one leaf, justified on lock-
+  // order grounds: see the lock-order comment above and DP-5/DP-11).
+  struct ApiCallGate
+  {
+    std::size_t inFlight = 0;
+    bool draining = false;
+  };
+  std::unordered_map<std::string, ApiCallGate> _apiCallGates;
+  std::condition_variable _apiDrainCv;
 
 public:
   /// \brief Whether this thread currently holds _loadModulesMutex, so
@@ -1683,6 +1876,25 @@ public:
   /// guarantee a single TLS instance across a dlopen boundary. Mirrors
   /// Logger::handlerReentryDepth().
   static bool &ownsLoadModulesMutex();
+
+  /// \brief Thread-local MULTISET of module names with a callExportedApi call
+  /// currently in-flight on THIS thread (pushed at the drain-gate enter, popped
+  /// at leave). Consulted by the unload paths BEFORE they claim+drain a module:
+  /// if the module a thread is trying to unload is in this set, the unload would
+  /// wait on an in-flight count that includes the calling thread itself — a
+  /// self-unload deadlock — so the unloader throws/skips instead (DP-7). A
+  /// MULTISET (not a counter, not a single marker) so the transitive chain
+  /// callExportedApi(M.f) -> f calls callExportedApi(N.g) -> g unloads M holds
+  /// BOTH M and N, and a reentrant call of the SAME module nests correctly.
+  ///
+  /// Defined ONCE in src/core/iora_core.cpp (PAT-3), NOT as a header inline
+  /// thread_local: callExportedApi is a template instantiated into the host AND
+  /// into plugin .so's (loaded RTLD_LOCAL), and an inline thread_local does not
+  /// guarantee a single TLS instance across a dlopen boundary — the plugin-TU
+  /// push and the host-TU unload check would touch DIFFERENT sets and the guard
+  /// would silently fail. Mirrors ownsLoadModulesMutex() /
+  /// Logger::handlerReentryDepth().
+  static std::multiset<std::string> &inFlightApiModules();
 
 private:
   /// \brief Erase-remove expired weak_ptrs from a registry bucket. Caller holds
@@ -1759,6 +1971,117 @@ private:
     }
   }
 
+  // --- callExportedApi drain-gate methods (Slice B). All take the LEAF
+  // _apiCallGuard; none nests another lock under it. callExportedApi enters and
+  // leaves the gate DISJOINT from its _apiMutex copy (never both held). The
+  // unload paths call begin/end/drain while holding _loadModulesMutex (the
+  // acyclic _loadModulesMutex -> _apiCallGuard edge — same as
+  // teardownModuleHostSideLocked -> pruneSafeApiRegistry).
+
+  /// \brief Mark a callExportedApi call in-flight for a module. Returns false if
+  /// the module is draining (an unload has claimed it) — the caller then rejects
+  /// without taking a copy. operator[] is intended: enterApiCall is the gate's
+  /// creator. Guarded by the leaf _apiCallGuard.
+  bool enterApiCall(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    auto &g = _apiCallGates[moduleName];
+    if (g.draining)
+    {
+      return false;
+    }
+    ++g.inFlight;
+    return true;
+  }
+
+  /// \brief Mark an in-flight callExportedApi call complete. MUST use find() +
+  /// assert, NEVER operator[]: an absent entry followed by --inFlight would wrap
+  /// std::size_t to SIZE_MAX and hang the next drain forever (H-2). Notifies the
+  /// drain CV UNDER _apiCallGuard at the last in-flight departure — the woken
+  /// waiter proceeds to host-side teardown/dlclose (the destroyer shape), so
+  /// notify-under-lock is the correct discipline here (see
+  /// reference_cv_notify_under_lock_when_destroyer_observes). Also erases an idle
+  /// non-draining gate so the map does not accumulate {inFlight:0} entries for
+  /// the owner-swap orphan case or for unboundedly-many distinct module names.
+  void leaveApiCall(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    auto it = _apiCallGates.find(moduleName);
+    assert(it != _apiCallGates.end() && it->second.inFlight > 0 &&
+           "leaveApiCall without a matching enterApiCall");
+    if (it == _apiCallGates.end() || it->second.inFlight == 0)
+    {
+      return; // defensive: never underflow
+    }
+    if (--it->second.inFlight == 0)
+    {
+      if (it->second.draining)
+      {
+        _apiDrainCv.notify_all();
+      }
+      else
+      {
+        // No unload waiting on this gate — drop it so the map stays bounded.
+        _apiCallGates.erase(it);
+      }
+    }
+  }
+
+  /// \brief Begin draining a module: new enterApiCall for it is rejected. Set in
+  /// the SAME _loadModulesMutex critical section as the unload claim, so no new
+  /// call slips past the claim-to-drain gap. Guarded by the leaf _apiCallGuard.
+  void beginApiDrain(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    _apiCallGates[moduleName].draining = true;
+  }
+
+  /// \brief Block until no callExportedApi call to the module is in-flight. MUST
+  /// run with _loadModulesMutex RELEASED (DP-3): an in-flight call must be able
+  /// to complete (its copy+invoke never holds _loadModulesMutex), so waiting
+  /// under _loadModulesMutex could not make progress. The predicate is
+  /// gate-absent OR inFlight==0 (loop-safe against spurious wakeups).
+  ///
+  /// KNOWN LIMITATION (TS-1, unsupported topology): the thread-local in-flight set
+  /// (inFlightApiModules) breaks the SAME-thread self/transitive unload cycle
+  /// (DP-7) but NOT a cross-thread MUTUAL one — thread A, inside a callExportedApi
+  /// of module M, unloading N while thread B, inside a callExportedApi of N,
+  /// unloads M: A's drain of N waits for B's in-flight N, B's drain of M waits for
+  /// A's in-flight M -> a condition-variable wait-cycle (no lock is held across the
+  /// wait, so it is not a lock deadlock and TSan cannot see it). Unloading a module
+  /// from within an exported API call of a DIFFERENT still-in-flight module on
+  /// another thread is unsupported (no in-repo caller does this). Documented per a
+  /// human decision (2026-09-07) to not bound the wait (a bounded timeout would
+  /// spuriously abort legitimately-long in-flight calls the drain must wait for).
+  void drainApiCalls(const std::string &moduleName)
+  {
+    std::unique_lock<std::mutex> lock(_apiCallGuard);
+    _apiDrainCv.wait(lock,
+                     [&]
+                     {
+                       auto it = _apiCallGates.find(moduleName);
+                       return it == _apiCallGates.end() || it->second.inFlight == 0;
+                     });
+  }
+
+  /// \brief End draining a module and drop its gate once idle. Clears draining,
+  /// then erases the gate iff inFlight==0 (the exact erase precondition:
+  /// inFlight==0 && !draining after the clear). Guarded by the leaf
+  /// _apiCallGuard.
+  void endApiDrain(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    auto it = _apiCallGates.find(moduleName);
+    if (it != _apiCallGates.end())
+    {
+      it->second.draining = false;
+      if (it->second.inFlight == 0)
+      {
+        _apiCallGates.erase(it);
+      }
+    }
+  }
+
   /// \brief Run ALL host-side teardown for a claimed module — optional dependent
   /// notification, onUnload, unexport its APIs, unregister its ServiceRegistry
   /// entries, erase it from _loadedModules, clean dependency tracking, prune its
@@ -1815,8 +2138,17 @@ private:
     return erased;
   }
 
-  /// \brief Release the unloading claim. PRE: holds _loadModulesMutex.
-  void openGate(const std::string &moduleName) { _apiUnloadingModules.erase(moduleName); }
+  /// \brief Release the unloading claim AND end the callExportedApi drain for the
+  /// module (clears draining + drops the idle gate). Paired with the
+  /// beginApiDrain set at claim time, on BOTH the success path (after dlclose)
+  /// and the throw-restore path — so a failure never leaves a gate stuck
+  /// draining=true (which would reject every future call to the name). PRE: holds
+  /// _loadModulesMutex.
+  void openGate(const std::string &moduleName)
+  {
+    _apiUnloadingModules.erase(moduleName);
+    endApiDrain(moduleName);
+  }
 
   /// \brief True if the module is currently claimed unloading. PRE: holds
   /// _loadModulesMutex.

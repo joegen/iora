@@ -179,6 +179,20 @@ bool &IoraService::ownsLoadModulesMutex()
   return owns;
 }
 
+// callExportedApi drain gate's thread-local in-flight module MULTISET (Slice B,
+// tracker 2026-09-07-3). Defined ONCE here for the SAME PAT-3 reason as
+// ownsLoadModulesMutex() above: callExportedApi is a template instantiated into
+// the host AND into plugin .so's loaded RTLD_LOCAL, so a header-inline
+// thread_local would give per-.so instances — the plugin-TU push and the
+// host-TU self-unload check would touch DIFFERENT sets and the guard would
+// silently fail. A single instance behind this accessor keeps one set per
+// thread across the dlopen boundary.
+std::multiset<std::string> &IoraService::inFlightApiModules()
+{
+  static thread_local std::multiset<std::string> modules;
+  return modules;
+}
+
 namespace storage {
 
 std::set<JsonFileStore *> &JsonFileStore::registry()

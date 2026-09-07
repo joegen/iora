@@ -167,6 +167,7 @@ set(SERVICE_TESTS
     service/iora_test_plugin_isolation
     service/iora_test_features_config
     service/iora_test_api_module_reverse_map
+    service/iora_test_callexportedapi_gating
 )
 
 # Debug/helper tests (keep in root)
@@ -299,6 +300,15 @@ foreach(_probe_test ${IORA_LOGGER_IMMORTAL_PROBE_TESTS})
     endif()
 endforeach()
 
+# The callExportedApi drain-gate test (Slice B, tracker 2026-09-07-3) has
+# self-unload / transitive / reentrant liveness cases: a drain-deadlock
+# regression must FAIL via this TIMEOUT rather than wedge the suite. The worker-
+# thread bounding inside the test detaches a hung call so the case fails on its
+# own; this ctest TIMEOUT is the outer backstop (cpp17-1).
+if(TEST service::iora_test_callexportedapi_gating)
+    set_tests_properties(service::iora_test_callexportedapi_gating PROPERTIES TIMEOUT 120)
+endif()
+
 # Apply the opt-in sanitizer to the concurrency-sensitive test targets. Each of
 # these exercises header-only concurrency logic (TtlMap/TimerService, Transport
 # + TCP/UDP engines, WebSocketClient reconnect worker, ExpiringCache purge
@@ -306,6 +316,7 @@ endforeach()
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
     iora_test_plugin_drain
+    iora_test_callexportedapi_gating
     iora_test_plugin
     iora_test_logger
     iora_test_gzip
@@ -514,6 +525,19 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_api_module_reverse_map PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The callExportedApi drain-gate test (Slice B, tracker 2026-09-07-3)
+    # dlopen's plugins at runtime; depend on them so a targeted build of the
+    # test also builds the .so's it loads, and link libdl for dlopen.
+    if(TARGET iora_test_callexportedapi_gating)
+        foreach(_gating_plugin testplugin slowapiplugin selfunloadplugin
+                transitiveouterplugin transitiveinnerplugin reentrantselfplugin)
+            if(TARGET ${_gating_plugin})
+                add_dependencies(iora_test_callexportedapi_gating ${_gating_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_callexportedapi_gating PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 

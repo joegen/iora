@@ -80,3 +80,21 @@ create_iora_plugin_target(ownerplugin
 create_iora_plugin_target(ownerconflictplugin
     SOURCES OwnerConflictPlugin.cpp
 )
+
+# callExportedApi drain-gate probes (Slice B, tracker 2026-09-07-3,
+# architecture/iora/callexportedapi_gating.json T1/T2/T4/T6/T9)
+create_iora_plugin_target(slowapiplugin
+    SOURCES SlowApiPlugin.cpp
+)
+create_iora_plugin_target(selfunloadplugin
+    SOURCES SelfUnloadPlugin.cpp
+)
+create_iora_plugin_target(transitiveouterplugin
+    SOURCES TransitiveOuterPlugin.cpp
+)
+create_iora_plugin_target(transitiveinnerplugin
+    SOURCES TransitiveInnerPlugin.cpp
+)
+create_iora_plugin_target(reentrantselfplugin
+    SOURCES ReentrantSelfPlugin.cpp
+)
