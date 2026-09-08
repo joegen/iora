@@ -44,6 +44,14 @@ create_iora_plugin_target(onloadgetsafeplugin
     SOURCES OnLoadGetSafePlugin.cpp
 )
 
+# Load-failure teardown-hardening probes (tracker 2026-09-07-9, F-4 / S-2)
+create_iora_plugin_target(blockingonloadplugin
+    SOURCES BlockingOnLoadPlugin.cpp
+)
+create_iora_plugin_target(requiredepthenthrowplugin
+    SOURCES RequireDepThenThrowPlugin.cpp
+)
+
 # Indirect cycle test plugins
 create_iora_plugin_target(indirectcyclea
     SOURCES IndirectCycleA.cpp

@@ -586,6 +586,20 @@ public:
   /// calls.
   /// Throws std::runtime_error if the API is not found or the signature does
   /// not match.
+  ///
+  /// \warning UNSAFE across a concurrent module lifecycle change (DP-9). This
+  /// overload takes only _apiMutex — it applies NO is-loaded gate and NO
+  /// in-flight drain-gate protection (unlike callExportedApi and
+  /// getExportedApiSafe). The returned std::function is a bare copy of the
+  /// plugin-exported callable whose type-erased target lives in the plugin .so;
+  /// it has NO lifetime guarantee against a concurrent module UNLOAD **or a
+  /// module LOAD-FAILURE** (a plugin publishes its exports under _apiMutex during
+  /// onLoad — before it is fully loaded — so a copy taken then can outlive the
+  /// failed load's dlclose). Invoking or destroying the copy after the owning
+  /// module's .so is unmapped is a use-after-free. Do not retain, invoke, or
+  /// destroy it across any point where the owning module may unload or a load of
+  /// it may fail. Use getExportedApiSafe (SafeApiFunction) when the module may
+  /// unload, or callExportedApi for a single gated copy-and-invoke.
   template <typename FuncSignature>
   std::function<FuncSignature> getExportedApi(const std::string &name)
   {
@@ -1259,6 +1273,17 @@ protected:
             {
               _loadedModules.erase(lit); // ~Plugin while the .so is still mapped
             }
+            // (S-2) Also clear dependency tracking + prune the SafeApi registry —
+            // the tail teardownModuleHostSideLocked runs on unload, previously
+            // omitted here. If onLoad ran require() before throwing, this removes
+            // the partially-loaded module from its dependencies' _dependents
+            // lists. Runs while the .so is still mapped, before the outer catch
+            // dlcloses. NOTE (L-3): pruneSafeApiRegistry / removeExportsForModule
+            // above take a mutex whose lock() can in principle throw
+            // std::system_error and mask the original load error being rethrown
+            // below; this pre-exists and mirrors teardownModuleHostSideLocked's
+            // unguarded tail — accepted as effectively impossible.
+            pruneModuleTrackingLocked(pluginName);
             throw; // outer catch runs PluginManager::unloadPlugin (dlclose) after this
           }
         }
@@ -1800,8 +1825,10 @@ private:
   // _loadModulesMutex -> _apiCallGuard edge is ACYCLIC and pre-existing; NO path
   // takes _loadModulesMutex while holding _apiCallGuard, and callExportedApi
   // enters/leaves the gate DISJOINT from its _apiMutex copy (never both held).
-  // (The load-failure drain adds another _loadModulesMutex -> _apiCallGuard site
-  // in Slice C, tracker 2026-09-07-9 — same acyclic direction.)
+  // (The loadSingleModule failure-path inner catch adds another
+  // _loadModulesMutex -> _apiCallGuard site via pruneModuleTrackingLocked ->
+  // pruneSafeApiRegistry, tracker 2026-09-07-9 — same acyclic direction. The
+  // once-planned load-failure drain was withdrawn as vacuous, DP-10b.)
   mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
@@ -2126,8 +2153,23 @@ private:
     {
       IORA_LOG_ERROR("Failed to unload plugin: " + name + " - " + e.what());
     }
-    // Dependency-tracking + registry cleanup regardless of teardown outcome. We do
-    // NOT erase _dependents[name]: other plugins still depend on it across a reload.
+    // Dependency-tracking + registry cleanup regardless of teardown outcome.
+    // Shared with the loadSingleModule failure-path inner catch (S-2) so the two
+    // cleanup paths cannot drift.
+    pruneModuleTrackingLocked(name);
+    return erased;
+  }
+
+  /// \brief Remove a module from the dependency-tracking maps and prune its
+  /// SafeApi registry entry. Shared by teardownModuleHostSideLocked (the unload
+  /// path) and the loadSingleModule failure-path inner catch (a partial load),
+  /// so both converge on ONE cleanup routine and cannot diverge (S-2). Does NOT
+  /// erase _dependents[name] itself: other modules may still depend on `name`
+  /// across a reload. PRE: caller holds _loadModulesMutex (pruneSafeApiRegistry
+  /// takes the leaf _apiCallGuard — the existing acyclic
+  /// _loadModulesMutex -> _apiCallGuard edge, DP-11).
+  void pruneModuleTrackingLocked(const std::string &name)
+  {
     _pendingDependencies.erase(name);
     for (auto &dependentList : _dependents)
     {
@@ -2135,7 +2177,6 @@ private:
       dependents.erase(std::remove(dependents.begin(), dependents.end(), name), dependents.end());
     }
     pruneSafeApiRegistry(name);
-    return erased;
   }
 
   /// \brief Release the unloading claim AND end the callExportedApi drain for the

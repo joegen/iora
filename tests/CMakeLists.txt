@@ -168,6 +168,7 @@ set(SERVICE_TESTS
     service/iora_test_features_config
     service/iora_test_api_module_reverse_map
     service/iora_test_callexportedapi_gating
+    service/iora_test_loadfailure_teardown
 )
 
 # Debug/helper tests (keep in root)
@@ -309,6 +310,14 @@ if(TEST service::iora_test_callexportedapi_gating)
     set_tests_properties(service::iora_test_callexportedapi_gating PROPERTIES TIMEOUT 120)
 endif()
 
+# The load-failure teardown test (tracker 2026-09-07-9, F-4) has a blocking-
+# onLoad liveness case; a monolithic-hold regression that wedged a caller must
+# FAIL via this TIMEOUT rather than hang the suite (the in-test bounded waits are
+# the first line; this is the outer backstop).
+if(TEST service::iora_test_loadfailure_teardown)
+    set_tests_properties(service::iora_test_loadfailure_teardown PROPERTIES TIMEOUT 120)
+endif()
+
 # Apply the opt-in sanitizer to the concurrency-sensitive test targets. Each of
 # these exercises header-only concurrency logic (TtlMap/TimerService, Transport
 # + TCP/UDP engines, WebSocketClient reconnect worker, ExpiringCache purge
@@ -317,6 +326,7 @@ endif()
 set(IORA_SANITIZED_TEST_TARGETS
     iora_test_plugin_drain
     iora_test_callexportedapi_gating
+    iora_test_loadfailure_teardown
     iora_test_plugin
     iora_test_logger
     iora_test_gzip
@@ -538,6 +548,19 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_callexportedapi_gating PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The load-failure teardown-hardening test (tracker 2026-09-07-9, F-4/S-2)
+    # dlopen's plugins at runtime; depend on them so a targeted build of the
+    # test also builds the .so's it loads, and link libdl for dlopen.
+    if(TARGET iora_test_loadfailure_teardown)
+        foreach(_lf_plugin testplugin blockingonloadplugin requiredepthenthrowplugin
+                exportthenthrowplugin identityexportthenthrowplugin)
+            if(TARGET ${_lf_plugin})
+                add_dependencies(iora_test_loadfailure_teardown ${_lf_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_loadfailure_teardown PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 
