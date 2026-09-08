@@ -881,8 +881,21 @@ public:
     // throw, and a concurrent same-name load/unload fails fast. beginApiDrain in
     // the SAME critical section marks the callExportedApi gate draining so no new
     // call slips past the claim-to-drain gap.
-    _apiUnloadingModules.insert(pluginName);
-    beginApiDrain(pluginName);
+    // Claim/arm is not exception-safe on its own: _apiUnloadingModules.insert
+    // (bad_alloc) or beginApiDrain (_apiCallGates[name] node alloc / _apiCallGuard
+    // lock) can throw after a partial claim, which would brick the name as
+    // permanently "unloading". Release the partial claim (openGate is no-throw)
+    // and rethrow, so a failed claim leaves the name fully loaded and callable.
+    try
+    {
+      _apiUnloadingModules.insert(pluginName);
+      beginApiDrain(pluginName);
+    }
+    catch (...)
+    {
+      openGate(pluginName);
+      throw;
+    }
 
     // Clear every registered wrapper's cache AND drain in-flight callExportedApi
     // copies with _loadModulesMutex RELEASED. clearSafeApiCaches takes each
@@ -1001,32 +1014,54 @@ public:
     LoadModulesGuard guard(_loadModulesMutex);
     bool success = true;
 
-    // Claim every (not-already-unloading) module and snapshot the names to tear
-    // down, all while holding _loadModulesMutex.
     std::vector<std::string> names;
-    for (auto &kv : _loadedModules)
+    // Release the unload claim + drain gate for every name recorded in `names`.
+    // openGate is no-throw, so this runs in a catch or the success tail without
+    // stranding a later sibling on a mid-loop throw.
+    auto releaseAllClaimedGates = [&]()
     {
-      const std::string &name = kv.first;
-      if (isModuleUnloadingLocked(name))
+      for (const auto &name : names)
       {
-        continue; // a concurrent single-unload owns this claim
+        openGate(name);
       }
-      // Self-unload skip (DP-7 / H-C): if this thread is inside a callExportedApi
-      // of this module, draining it would deadlock on our own in-flight count.
-      // SKIP it (do not claim, do not tear down) and report failure — rather than
-      // throw and abort the unrelated modules of a shutdown batch. Checked BEFORE
-      // the claim so no claim is leaked.
-      if (inFlightApiModules().count(name) > 0)
+    };
+
+    // Claim every (not-already-unloading) module and snapshot the names to tear
+    // down, all while holding _loadModulesMutex. The claim (insert) and drain-arm
+    // (beginApiDrain) can throw (bad_alloc / lock); record the name in `names`
+    // BEFORE claiming so a mid-loop throw still releases it via the catch, and no
+    // already-claimed sibling is left stranded as permanently "unloading".
+    try
+    {
+      for (auto &kv : _loadedModules)
       {
-        IORA_LOG_ERROR("Skipping unload of module " + name +
-                       " during unloadAllModules: it has an in-flight exported API call on this "
-                       "thread (self-unload deadlock).");
-        success = false;
-        continue;
+        const std::string &name = kv.first;
+        if (isModuleUnloadingLocked(name))
+        {
+          continue; // a concurrent single-unload owns this claim
+        }
+        // Self-unload skip (DP-7 / H-C): if this thread is inside a callExportedApi
+        // of this module, draining it would deadlock on our own in-flight count.
+        // SKIP it (do not claim, do not tear down) and report failure — rather than
+        // throw and abort the unrelated modules of a shutdown batch. Checked BEFORE
+        // the claim so no claim is leaked.
+        if (inFlightApiModules().count(name) > 0)
+        {
+          IORA_LOG_ERROR("Skipping unload of module " + name +
+                         " during unloadAllModules: it has an in-flight exported API call on this "
+                         "thread (self-unload deadlock).");
+          success = false;
+          continue;
+        }
+        names.push_back(name); // record intent BEFORE claiming (see comment above)
+        _apiUnloadingModules.insert(name);
+        beginApiDrain(name);
       }
-      _apiUnloadingModules.insert(name);
-      beginApiDrain(name);
-      names.push_back(name);
+    }
+    catch (...)
+    {
+      releaseAllClaimedGates();
+      throw;
     }
 
     // Clear all wrapper caches AND drain in-flight callExportedApi copies with
@@ -1051,10 +1086,7 @@ public:
       {
         guard.lock();
       }
-      for (const auto &name : names)
-      {
-        openGate(name);
-      }
+      releaseAllClaimedGates();
       throw;
     }
 
@@ -1095,16 +1127,10 @@ public:
     }
     catch (...)
     {
-      for (const auto &name : names)
-      {
-        openGate(name);
-      }
+      releaseAllClaimedGates();
       throw;
     }
-    for (const auto &name : names)
-    {
-      openGate(name);
-    }
+    releaseAllClaimedGates();
 
     return success;
   }
@@ -2333,7 +2359,25 @@ private:
   void openGate(const std::string &moduleName)
   {
     _apiUnloadingModules.erase(moduleName);
-    endApiDrain(moduleName);
+    // Gate release MUST NOT throw. openGate runs in per-module LOOPS in
+    // unloadAllModules and at throw-restore catch sites immediately before a
+    // `throw;`. endApiDrain's only throw surface is _apiCallGuard.lock()
+    // (std::system_error, effectively impossible, L-3). If it escaped here it
+    // would either strand the remaining modules' gate release in the loop (a
+    // permanent claim + draining=true brick on those siblings) or mask the
+    // original exception being rethrown. Swallow it: the claim is already
+    // cleared above, and a stuck draining=true on THIS one name is the least-bad
+    // outcome (only that name rejects future calls; siblings still get released).
+    // catch(...) intentionally also swallows abi::__forced_unwind here, per the
+    // A8 convention (no pthread_cancel / std::jthread in-repo).
+    try
+    {
+      endApiDrain(moduleName);
+    }
+    catch (...)
+    {
+      // best-effort gate release; rationale above (L-3 / A8 forced_unwind).
+    }
   }
 
   /// \brief True if the module is currently claimed unloading. PRE: holds
