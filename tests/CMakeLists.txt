@@ -169,6 +169,7 @@ set(SERVICE_TESTS
     service/iora_test_api_module_reverse_map
     service/iora_test_callexportedapi_gating
     service/iora_test_loadfailure_teardown
+    service/iora_test_unload_teardown_exception
 )
 
 # Debug/helper tests (keep in root)
@@ -318,6 +319,13 @@ if(TEST service::iora_test_loadfailure_teardown)
     set_tests_properties(service::iora_test_loadfailure_teardown PROPERTIES TIMEOUT 120)
 endif()
 
+# The unload-path teardown-exception test (trackers 2026-09-08-4 / -3) exercises
+# onUnload/onDependencyUnloaded throw paths; a teardown/drain regression that
+# wedged an unload must FAIL via this TIMEOUT rather than hang the suite.
+if(TEST service::iora_test_unload_teardown_exception)
+    set_tests_properties(service::iora_test_unload_teardown_exception PROPERTIES TIMEOUT 120)
+endif()
+
 # Apply the opt-in sanitizer to the concurrency-sensitive test targets. Each of
 # these exercises header-only concurrency logic (TtlMap/TimerService, Transport
 # + TCP/UDP engines, WebSocketClient reconnect worker, ExpiringCache purge
@@ -327,6 +335,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_plugin_drain
     iora_test_callexportedapi_gating
     iora_test_loadfailure_teardown
+    iora_test_unload_teardown_exception
     iora_test_plugin
     iora_test_logger
     iora_test_gzip
@@ -564,6 +573,20 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_loadfailure_teardown PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The unload-path teardown-exception test (trackers 2026-09-08-4 / -3)
+    # dlopen's plugins at runtime; depend on them so a targeted build of the test
+    # also builds the .so's it loads, and link libdl for dlopen.
+    if(TARGET iora_test_unload_teardown_exception)
+        foreach(_ut_plugin testplugin unloaddepnonstdthrowplugin unloaddeprecordplugin
+                onunloadthrowstddeprecordplugin onunloadnonstdthrowplugin
+                unloaddepstdthrowplugin onunloadrecordplugin)
+            if(TARGET ${_ut_plugin})
+                add_dependencies(iora_test_unload_teardown_exception ${_ut_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_unload_teardown_exception PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 

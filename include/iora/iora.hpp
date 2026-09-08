@@ -1841,6 +1841,18 @@ protected:
             IORA_LOG_ERROR("Plugin " + dependent + " threw exception in onDependencyUnloaded(" +
                            moduleName + "): " + e.what());
           }
+          catch (...)
+          {
+            // Isolate a non-std::exception exactly like a std one (tracker
+            // 2026-09-08-4): a dependent's onDependencyUnloaded failure must not
+            // abort the depended-upon module's unload, and (because this arm does
+            // not rethrow and _pendingDependencies.push_back below is outside the
+            // try) must not skip notifying the remaining dependents. Mirrors the
+            // landed load-path swallows (notifyDependentsOfLoad / Plugin::require()).
+            IORA_LOG_ERROR("Plugin " + dependent +
+                           " threw a non-standard exception in onDependencyUnloaded(" + moduleName +
+                           ")");
+          }
         }
 
         // Add back to pending dependencies since the dependency is being unloaded
@@ -2195,6 +2207,9 @@ private:
   bool teardownModuleHostSideLocked(const std::string &name, bool notifyDependents)
   {
     bool erased = false;
+    bool teardownThrew = false; // the teardown try aborted before erase (a plugin
+                                // onUnload/onDependencyUnloaded threw) -> module
+                                // stays loaded; gate the prune on this (Option A).
     try
     {
       if (notifyDependents)
@@ -2223,12 +2238,33 @@ private:
     }
     catch (const std::exception &e)
     {
+      teardownThrew = true;
       IORA_LOG_ERROR("Failed to unload plugin: " + name + " - " + e.what());
     }
-    // Dependency-tracking + registry cleanup regardless of teardown outcome.
-    // Shared with the loadSingleModule failure-path inner catch (S-2) so the two
-    // cleanup paths cannot drift.
-    pruneModuleTrackingLocked(name);
+    catch (...)
+    {
+      // A non-std::exception from a plugin callback in the try (onUnload or
+      // onDependencyUnloaded via notifyDependentsOfUnload) is caught here so it
+      // does NOT escape to the unloadSingleModule / unloadAllModules catch(...)
+      // and RETHROW. A non-std onUnload throw now behaves exactly like a std one:
+      // erased stays false, the caller skips the dlclose, and the unload returns
+      // false instead of aborting (tracker 2026-09-08-4).
+      teardownThrew = true;
+      IORA_LOG_ERROR("Failed to unload plugin: " + name +
+                     " - non-standard (non-std::exception) throw");
+    }
+    // Dependency-tracking + registry cleanup, but ONLY when the teardown try did
+    // NOT throw: erased==true (fully torn down) or the module was already absent.
+    // When a plugin onUnload/onDependencyUnloaded threw, the module stays loaded
+    // and mapped, so its tracking (dependency edges + SafeApi registry) is left
+    // INTACT — a still-loaded module must remain self-consistent and retry-able,
+    // never loaded-but-untracked (Option A, tracker 2026-09-08-3).
+    // pruneModuleTrackingLocked is shared with the loadSingleModule partial-load
+    // cleanup (S-2), which has no onUnload and so always prunes.
+    if (!teardownThrew)
+    {
+      pruneModuleTrackingLocked(name);
+    }
     return erased;
   }
 

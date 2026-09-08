@@ -80,6 +80,29 @@ create_iora_plugin_target(requiredepnonstdthrowplugin
     SOURCES RequireDepNonStdThrowPlugin.cpp
 )
 
+# Unload-path teardown-exception probes (trackers 2026-09-08-4 / -3). D1 throws a
+# non-std from onDependencyUnloaded; D2 records its notification; OnUnloadThrowStd
+# is M-depends-on-testplugin whose onUnload throws std once (FX-U2 / MUT-U3);
+# OnUnloadNonStd throws a non-std from onUnload once (FX-U3 / MUT-U2).
+create_iora_plugin_target(unloaddepnonstdthrowplugin
+    SOURCES UnloadDepNonStdThrowPlugin.cpp
+)
+create_iora_plugin_target(unloaddeprecordplugin
+    SOURCES UnloadDepRecordPlugin.cpp
+)
+create_iora_plugin_target(onunloadthrowstddeprecordplugin
+    SOURCES OnUnloadThrowStdDepRecordPlugin.cpp
+)
+create_iora_plugin_target(onunloadnonstdthrowplugin
+    SOURCES OnUnloadNonStdThrowPlugin.cpp
+)
+create_iora_plugin_target(unloaddepstdthrowplugin
+    SOURCES UnloadDepStdThrowPlugin.cpp
+)
+create_iora_plugin_target(onunloadrecordplugin
+    SOURCES OnUnloadRecordPlugin.cpp
+)
+
 # Indirect cycle test plugins
 create_iora_plugin_target(indirectcyclea
     SOURCES IndirectCycleA.cpp
