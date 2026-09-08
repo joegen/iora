@@ -16,6 +16,7 @@
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
+#include <vector>
 
 #include "iora/core/logger.hpp"
 
@@ -167,31 +168,49 @@ public:
   static void unregisterModule(const std::string &moduleId) noexcept
   {
     Storage &s = storage();
-    std::unique_lock<std::shared_mutex> lock(s.mutex);
-    for (auto it = s.map.begin(); it != s.map.end();)
+    // Destruct the erased impls OFF-lock (TS-M1, tracker 2026-09-08-2). Each
+    // Entry.impl is a shared_ptr to a plugin service object; if this erase drops
+    // the last reference (typical on a partial-load / unload teardown, where no
+    // get<T>() caller holds one), the object's destructor — plugin code — runs.
+    // Running it under Storage::mutex lets a re-entrant dtor (one that calls
+    // get<T>()/unregister<T>(), which take this same non-recursive shared_mutex)
+    // self-deadlock. Move each matched impl into a local reserved to the map size
+    // (a single allocation, so the per-match moves never reallocate/throw — keeps
+    // this noexcept path allocation-free during teardown), erase the moved-from
+    // Entry (empty shared_ptr — no plugin dtor on-lock), release, then let the
+    // impls destruct after the lock is gone.
+    std::vector<std::shared_ptr<void>> deferred;
     {
-      if (it->second.moduleId == moduleId)
+      std::unique_lock<std::shared_mutex> lock(s.mutex);
+      deferred.reserve(s.map.size());
+      for (auto it = s.map.begin(); it != s.map.end();)
       {
-        it = s.map.erase(it);
-      }
-      else
-      {
-        // AH-2 survivor detection: an entry with an EMPTY moduleId is orphaned —
-        // owned by no module and never cleaned up. Plugin entries have a
-        // non-empty moduleId (H-2 rejects empty at set time) and core entries
-        // have the non-empty "\x00core" sentinel, so neither reaches this branch;
-        // only state injected outside the public API can. Checking .empty() alone
-        // is sufficient and surfaces an H-1 regression (an empty sentinel) loudly.
-        if (it->second.moduleId.empty())
+        if (it->second.moduleId == moduleId)
         {
-          IORA_LOG_ERROR("ServiceRegistry::unregisterModule: orphaned registration with empty "
-                         "moduleId survives unload of '" +
-                         moduleId + "' — registration owned by no module (AH-2 misuse)");
-          std::abort();
+          deferred.push_back(std::move(it->second.impl));
+          it = s.map.erase(it);
         }
-        ++it;
+        else
+        {
+          // AH-2 survivor detection: an entry with an EMPTY moduleId is orphaned —
+          // owned by no module and never cleaned up. Plugin entries have a
+          // non-empty moduleId (H-2 rejects empty at set time) and core entries
+          // have the non-empty "\x00core" sentinel, so neither reaches this branch;
+          // only state injected outside the public API can. Checking .empty() alone
+          // is sufficient and surfaces an H-1 regression (an empty sentinel) loudly.
+          if (it->second.moduleId.empty())
+          {
+            IORA_LOG_ERROR("ServiceRegistry::unregisterModule: orphaned registration with empty "
+                           "moduleId survives unload of '" +
+                           moduleId + "' — registration owned by no module (AH-2 misuse)");
+            std::abort();
+          }
+          ++it;
+        }
       }
     }
+    // deferred destructs here, off Storage::mutex: plugin service-object dtors run
+    // without the lock held.
   }
 
 private:
@@ -221,7 +240,10 @@ private:
   /// cycle. Otherwise this mutex is a LEAF — never held while acquiring
   /// HttpServer::_mutex or IoraService::_apiMutex, and no user callback is
   /// invoked while it is held (get returns the shared_ptr, then the caller
-  /// invokes interface methods lock-free).
+  /// invokes interface methods lock-free). unregisterModule likewise runs no
+  /// plugin code under the lock: it moves each erased Entry.impl into a local and
+  /// destructs it (the plugin service-object dtor) AFTER releasing the lock
+  /// (TS-M1) — a last-ref drop must not run a re-entrant dtor on-lock.
   struct Storage
   {
     std::unordered_map<std::type_index, Entry> map;

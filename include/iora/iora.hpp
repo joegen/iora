@@ -470,6 +470,23 @@ public:
       core::Logger::error("IoraService::exportApi() - Plugin API name cannot be empty");
       throw std::invalid_argument("Plugin API name cannot be empty");
     }
+    // An empty identity keys _apiToModule[name] on "" — which
+    // removeExportsForModule (value == module) can NEVER reclaim, so such an
+    // export dangles into the .so past dlclose (UAF at ~IoraService
+    // _apiExports.clear() / getExportedApi). The only way to reach here with an
+    // empty identity is to export from a plugin CONSTRUCTOR or a custom
+    // loadModule factory, i.e. BEFORE loadSingleModule assigns Plugin::_name
+    // (the factory runs before the name is set). Reject it at the boundary,
+    // mirroring the empty-NAME check above: a constructor/factory export then
+    // fails the load cleanly (nothing is inserted) instead of leaking. Export
+    // only from onLoad, where _name is set. (tracker 2026-09-08-2, Option A)
+    if (pluginIdentity.empty())
+    {
+      core::Logger::error("IoraService::exportApi() - Plugin API identity cannot be empty "
+                          "(export attempted before the plugin's name was assigned, e.g. from a "
+                          "constructor or a custom loadModule factory; export only from onLoad)");
+      throw std::invalid_argument("Plugin API identity cannot be empty");
+    }
     // Check-then-insert must be atomic under _apiMutex: reading _apiExports
     // outside the lock is a data race with concurrent exportApi calls and a
     // TOCTOU on the duplicate check.
@@ -1258,32 +1275,18 @@ protected:
             // outer catch dlcloses. Otherwise they dangle into the unmapped .so and
             // fault at the next call or at ~IoraService (_apiExports.clear()). (C1)
             //
-            // Authoritative teardown (A-C3, cpp17 H-1): resolve the exported
-            // names to remove from _apiToModule, keyed by pluginName, rather
-            // than from the (possibly moved-from / not-yet-captured)
-            // pluginInstance object. This covers BOTH the onLoad-throw
-            // sub-case (pluginInstance still owned, never inserted) and the
-            // insert/notify-throw sub-case (pluginInstance moved into
-            // _loadedModules) uniformly, and also covers identity-overload
-            // exports the old Plugin::_apiExports-based iteration never saw.
-            removeExportsForModule(pluginName);
-            ServiceRegistry::unregisterModule(pluginName);
-            auto lit = _loadedModules.find(pluginName);
-            if (lit != _loadedModules.end())
-            {
-              _loadedModules.erase(lit); // ~Plugin while the .so is still mapped
-            }
-            // (S-2) Also clear dependency tracking + prune the SafeApi registry —
-            // the tail teardownModuleHostSideLocked runs on unload, previously
-            // omitted here. If onLoad ran require() before throwing, this removes
-            // the partially-loaded module from its dependencies' _dependents
-            // lists. Runs while the .so is still mapped, before the outer catch
-            // dlcloses. NOTE (L-3): pruneSafeApiRegistry / removeExportsForModule
-            // above take a mutex whose lock() can in principle throw
-            // std::system_error and mask the original load error being rethrown
-            // below; this pre-exists and mirrors teardownModuleHostSideLocked's
-            // unguarded tail — accepted as effectively impossible.
-            pruneModuleTrackingLocked(pluginName);
+            // Authoritative host-side teardown, keyed by pluginName (A-C3,
+            // cpp17 H-1), via the shared cleanupPartialLoadLocked helper
+            // (tracker 2026-09-08-2, S-2) so the inner catch, the null-instance
+            // branch, and the outer catch all run the SAME cleanup before their
+            // dlclose. It covers BOTH the onLoad-throw sub-case (pluginInstance
+            // still owned, never inserted) and the insert/notify-throw sub-case
+            // (pluginInstance moved into _loadedModules) uniformly, and covers
+            // identity-overload exports the old Plugin::_apiExports iteration
+            // never saw. On this path it rethrows into the outer catch, which
+            // runs the helper AGAIN before dlclose — harmless (the helper is
+            // idempotent; see its contract).
+            cleanupPartialLoadLocked(pluginName);
             throw; // outer catch runs PluginManager::unloadPlugin (dlclose) after this
           }
         }
@@ -1297,6 +1300,15 @@ protected:
           // claimed — a concurrent-unload UAF).
           if (pluginRegistered)
           {
+            // A custom factory may have exported a pluginName-keyed API before
+            // returning null; unexport it HOST-SIDE before dlclose (unexport
+            // dominates unmap) so it does not dangle into the unmapped .so
+            // (tracker 2026-09-08-2, defect_1). Guarded by pluginRegistered so a
+            // concurrent load's "already loaded" entry is never swept. Cleanup
+            // and its throw semantics live in cleanupPartialLoadLocked (a throw
+            // here unwinds to the outer catch, which re-runs the idempotent
+            // cleanup and re-attempts the dlclose).
+            cleanupPartialLoadLocked(pluginName);
             PluginManager::unloadPlugin(pluginName);
           }
           return false;
@@ -1311,6 +1323,15 @@ protected:
         // belongs to a CONCURRENT load — never dlcloses that live module.
         if (pluginRegistered)
         {
+          // A custom factory that exported a pluginName-keyed API then THREW
+          // reaches here (the factory runs before the inner try, so the inner
+          // catch never saw it); unexport it HOST-SIDE before dlclose (tracker
+          // 2026-09-08-2, defect_1). On the onLoad-throw path the inner catch
+          // already ran this helper, so it runs a second time here — harmless
+          // (the helper is idempotent). Guarded by pluginRegistered; a cleanup
+          // throw safely skips the dlclose — see cleanupPartialLoadLocked's L-3
+          // note.
+          cleanupPartialLoadLocked(pluginName);
           PluginManager::unloadPlugin(pluginName);
         }
         throw; // Re-throw to provide detailed error information to the caller
@@ -1408,19 +1429,40 @@ protected:
   /// _loadModulesMutex -> _apiMutex lock order).
   void removeExportsForModule(const std::string &module)
   {
-    std::lock_guard<std::mutex> lock(_apiMutex);
-    for (auto it = _apiToModule.begin(); it != _apiToModule.end();)
+    // Collect the erased ApiWrapper owners and destruct them OFF-lock (TS-M1,
+    // tracker 2026-09-08-2). An ApiWrapper holds a plugin-supplied std::function
+    // whose destructor is plugin code; destroying it while _apiMutex is held lets
+    // a re-entrant dtor (one that calls exportApi/callExportedApi, which take
+    // _apiMutex) self-deadlock. Move each match out under the lock, erase the
+    // (now moved-from) map entries, release, then let the locals destruct after
+    // the lock is gone. deferredDestroy is declared BEFORE the lock so, even on
+    // an exception, it destructs AFTER the lock_guard releases — never on-lock.
+    std::vector<ApiWrapper> deferredDestroy;
     {
-      if (it->second == module)
+      std::lock_guard<std::mutex> lock(_apiMutex);
+      // Reserve to an upper bound so the per-match push_back stays allocation-free
+      // (symmetry with unregisterModule; keeps the erase loop non-reallocating).
+      deferredDestroy.reserve(_apiExports.size());
+      for (auto it = _apiToModule.begin(); it != _apiToModule.end();)
       {
-        _apiExports.erase(it->first);
-        it = _apiToModule.erase(it);
-      }
-      else
-      {
-        ++it;
+        if (it->second == module)
+        {
+          auto ex = _apiExports.find(it->first);
+          if (ex != _apiExports.end())
+          {
+            deferredDestroy.push_back(std::move(ex->second));
+            _apiExports.erase(ex);
+          }
+          it = _apiToModule.erase(it);
+        }
+        else
+        {
+          ++it;
+        }
       }
     }
+    // deferredDestroy destructs here, off _apiMutex: plugin functor dtors run
+    // without the lock held.
   }
 
   /// \brief Applies the merged configuration in _config to the service.
@@ -1825,10 +1867,13 @@ private:
   // _loadModulesMutex -> _apiCallGuard edge is ACYCLIC and pre-existing; NO path
   // takes _loadModulesMutex while holding _apiCallGuard, and callExportedApi
   // enters/leaves the gate DISJOINT from its _apiMutex copy (never both held).
-  // (The loadSingleModule failure-path inner catch adds another
-  // _loadModulesMutex -> _apiCallGuard site via pruneModuleTrackingLocked ->
-  // pruneSafeApiRegistry, tracker 2026-09-07-9 — same acyclic direction. The
-  // once-planned load-failure drain was withdrawn as vacuous, DP-10b.)
+  // (The loadSingleModule failure-path cleanup adds more
+  // _loadModulesMutex -> _apiCallGuard / _loadModulesMutex -> _apiMutex sites via
+  // cleanupPartialLoadLocked -> {removeExportsForModule, pruneModuleTrackingLocked
+  // -> pruneSafeApiRegistry}, run at ALL THREE dlclose sites — the inner catch
+  // (tracker 2026-09-07-9), and the null-instance branch + outer catch (tracker
+  // 2026-09-08-2) — same acyclic direction. The once-planned load-failure drain
+  // was withdrawn as vacuous, DP-10b.)
   mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
@@ -2177,6 +2222,43 @@ private:
       dependents.erase(std::remove(dependents.begin(), dependents.end(), name), dependents.end());
     }
     pruneSafeApiRegistry(name);
+  }
+
+  /// \brief Host-side teardown of a PARTIALLY-loaded module, run before every
+  /// loadSingleModule dlclose site (inner catch, null-instance branch, outer
+  /// catch) so any export / registry / dependency state a plugin created before
+  /// the load failed is removed while the .so is still mapped — never dangling
+  /// into the unmapped .so (UAF at ~IoraService _apiExports.clear() /
+  /// getExportedApi). Equals teardownModuleHostSideLocked MINUS onUnload +
+  /// notifyDependents (inapplicable to a partial load: onUnload must not run for
+  /// a module that never finished onLoad). Keyed on `name` (== the .so filename
+  /// == the _loadedModules / claim key), so it reclaims BOTH exportApi overloads
+  /// via the authoritative _apiToModule reverse map (removeExportsForModule).
+  ///
+  /// IDEMPOTENT by construction — safe to call more than once for the same name
+  /// (the onLoad-throw path runs it in the inner catch AND again in the outer
+  /// catch): removeExportsForModule is a value-match loop (2nd run finds none),
+  /// ServiceRegistry::unregisterModule is noexcept + a value-match loop,
+  /// _loadedModules.erase(name) is a no-op when absent, and
+  /// pruneModuleTrackingLocked's erase/remove/pruneSafeApiRegistry are all
+  /// absence-tolerant. (tracker 2026-09-08-2, M2.)
+  ///
+  /// PRE: caller holds _loadModulesMutex. Takes _apiMutex (removeExportsForModule)
+  /// and the leaf _apiCallGuard (pruneSafeApiRegistry) — the existing acyclic
+  /// _loadModulesMutex -> _apiMutex / _loadModulesMutex -> _apiCallGuard edges
+  /// (DP-11), identical to the inner catch and teardownModuleHostSideLocked.
+  /// NOTE (L-3): those lock() calls could in principle throw std::system_error
+  /// and, at a catch site, mask the load error being rethrown; this pre-exists,
+  /// mirrors teardownModuleHostSideLocked's unguarded tail, and is accepted as
+  /// effectively impossible. A throw here safely SKIPS the caller's dlclose (the
+  /// .so stays mapped, so the still-present export is not dangling — only the .so
+  /// leaks), so it is never ordered after the dlclose.
+  void cleanupPartialLoadLocked(const std::string &name)
+  {
+    removeExportsForModule(name);
+    ServiceRegistry::unregisterModule(name);
+    _loadedModules.erase(name); // ~Plugin (if present) while the .so is still mapped
+    pruneModuleTrackingLocked(name);
   }
 
   /// \brief Release the unloading claim AND end the callExportedApi drain for the

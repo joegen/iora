@@ -65,6 +65,20 @@ struct UnloadAllOnExit
     }
   }
 };
+
+// Assert a load FAILED cleanly and left no stale export: not loaded, the API
+// name absent from the export table, and the name resolving to "not found" via
+// the PUBLIC call path (resolveOwningModuleLocked is private and non-throwing).
+// Shared by the S-1 dlclose-site tests and the export-then-throw regression.
+void expectCleanFailedLoad(iora::IoraService &svc, const std::string &soName,
+                           const std::string &api)
+{
+  REQUIRE(tryLoad(svc, pluginPath(soName)) == false);
+  REQUIRE(svc.isModuleLoaded(soName) == false);
+  auto names = svc.getExportedApiNames();
+  REQUIRE(std::find(names.begin(), names.end(), api) == names.end());
+  REQUIRE_THROWS_AS(svc.callExportedApi<int>(api, 1, 2), std::runtime_error);
+}
 } // namespace
 
 // --- F-4: concurrent callExportedApi serializes behind a blocking onLoad ------
@@ -244,30 +258,78 @@ TEST_CASE("regression export-then-throw inner-catch cleanup + reloadable")
   iora::IoraService &svc = *globalSvc;
   UnloadAllOnExit cleanup{svc};
 
-  auto expectFailedLoad = [&](const std::string &soName, const std::string &api)
-  {
-    REQUIRE(tryLoad(svc, pluginPath(soName)) == false);
-    REQUIRE(svc.isModuleLoaded(soName) == false);
-    // No stale export survives.
-    auto names = svc.getExportedApiNames();
-    REQUIRE(std::find(names.begin(), names.end(), api) == names.end());
-    // The name resolves to "not found" via the PUBLIC call path (L-2:
-    // resolveOwningModuleLocked is private and non-throwing).
-    REQUIRE_THROWS_AS(svc.callExportedApi<int>(api, 1, 2), std::runtime_error);
-  };
-
   SECTION("Plugin& overload")
   {
-    expectFailedLoad("exportthenthrowplugin.so", "exportthenthrow.add");
+    expectCleanFailedLoad(svc, "exportthenthrowplugin.so", "exportthenthrow.add");
     // Reloadable (the failed load did not brick the name).
-    expectFailedLoad("exportthenthrowplugin.so", "exportthenthrow.add");
+    expectCleanFailedLoad(svc, "exportthenthrowplugin.so", "exportthenthrow.add");
   }
 
   SECTION("identity-string overload")
   {
-    expectFailedLoad("identityexportthenthrowplugin.so", "identityexportthenthrow.add");
-    expectFailedLoad("identityexportthenthrowplugin.so", "identityexportthenthrow.add");
+    expectCleanFailedLoad(svc, "identityexportthenthrowplugin.so", "identityexportthenthrow.add");
+    expectCleanFailedLoad(svc, "identityexportthenthrowplugin.so", "identityexportthenthrow.add");
   }
+}
+
+// --- S-1: unexport before EVERY dlclose site (tracker 2026-09-08-2) -----------
+// Two coupled load-failure defects the inner catch never covered:
+//   defect_2 (Option A): an export from a plugin CONSTRUCTOR / custom factory
+//     runs before loadSingleModule assigns _name, keying _apiToModule on "" —
+//     which removeExportsForModule(pluginName) (value-match) can never reclaim.
+//     exportApi now REJECTS an empty identity, so such an export is never
+//     inserted (FX-i).
+//   defect_1 (cleanup): the null-instance branch (FX-ii) and the outer catch
+//     (FX-iii) now run cleanupPartialLoadLocked(pluginName) before dlclose, so a
+//     pluginName-keyed factory export is unexported before the .so is unmapped.
+// Each test reloads the same failing module twice — the second attempt exercises
+// the idempotent double-cleanup path (M2) and proves the name is not bricked.
+TEST_CASE("S-1 empty-identity ctor export is rejected; null-instance branch leaves no stale export")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+  // Option A: exportApi(*this=empty identity, ...) throws inside the ctor -> the
+  // IORA_DECLARE_PLUGIN factory catches it -> nullptr -> null-instance branch.
+  // Nothing was ever inserted, so there is no stale export to reclaim.
+  expectCleanFailedLoad(svc, "ctorexportplugin.so", "ctorexport.add");
+  expectCleanFailedLoad(svc, "ctorexportplugin.so", "ctorexport.add");
+}
+
+TEST_CASE("S-1 factory export at the null-instance branch is unexported before dlclose")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+  // A hand-written factory exports a pluginName-keyed API then returns nullptr;
+  // cleanupPartialLoadLocked at the null-instance branch removes it before dlclose.
+  expectCleanFailedLoad(svc, "factorynullexportplugin.so", "factorynullexport.add");
+  expectCleanFailedLoad(svc, "factorynullexportplugin.so", "factorynullexport.add");
+}
+
+TEST_CASE("S-1 factory export at the outer catch is unexported before dlclose")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+  // A hand-written factory exports a pluginName-keyed API then throws (reaching
+  // the outer catch, which the macro can never reach); cleanupPartialLoadLocked
+  // at the outer catch removes it before dlclose.
+  expectCleanFailedLoad(svc, "factorythrowexportplugin.so", "factorythrowexport.add");
+  expectCleanFailedLoad(svc, "factorythrowexportplugin.so", "factorythrowexport.add");
+}
+
+// --- Option A boundary: exportApi rejects an empty identity directly ----------
+// The S-1 load tests reach Option A only indirectly (via a ctor export driving
+// the null-instance branch). This asserts the boundary itself: exportApi with an
+// empty identity throws std::invalid_argument (mirroring the empty-name reject),
+// so no ""-keyed export can ever be inserted to dangle past dlclose.
+TEST_CASE("Option A exportApi rejects an empty plugin identity")
+{
+  iora::IoraService &svc = *globalSvc;
+  REQUIRE_THROWS_AS(
+    svc.exportApi(std::string(""), "optiona.reject.probe", [](int a, int b) { return a + b; }),
+    std::invalid_argument);
+  // The rejected export was never registered.
+  auto names = svc.getExportedApiNames();
+  REQUIRE(std::find(names.begin(), names.end(), "optiona.reject.probe") == names.end());
 }
 
 int main(int argc, char *argv[])

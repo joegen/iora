@@ -555,7 +555,8 @@ if(IORA_BUILD_SERVICE_TESTS)
     # test also builds the .so's it loads, and link libdl for dlopen.
     if(TARGET iora_test_loadfailure_teardown)
         foreach(_lf_plugin testplugin blockingonloadplugin requiredepthenthrowplugin
-                exportthenthrowplugin identityexportthenthrowplugin)
+                exportthenthrowplugin identityexportthenthrowplugin
+                ctorexportplugin factorynullexportplugin factorythrowexportplugin)
             if(TARGET ${_lf_plugin})
                 add_dependencies(iora_test_loadfailure_teardown ${_lf_plugin})
             endif()

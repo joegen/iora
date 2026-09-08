@@ -52,6 +52,20 @@ create_iora_plugin_target(requiredepthenthrowplugin
     SOURCES RequireDepThenThrowPlugin.cpp
 )
 
+# S-1 dlclose-site unexport + empty-identity probes (tracker 2026-09-08-2,
+# FX-i/FX-ii/FX-iii). CtorExportPlugin uses IORA_DECLARE_PLUGIN (ctor throws ->
+# null-instance branch); the two Factory* plugins are HAND-WRITTEN loadModule
+# factories (FactoryNull -> null-instance branch, FactoryThrow -> outer catch).
+create_iora_plugin_target(ctorexportplugin
+    SOURCES CtorExportPlugin.cpp
+)
+create_iora_plugin_target(factorynullexportplugin
+    SOURCES FactoryNullExportPlugin.cpp
+)
+create_iora_plugin_target(factorythrowexportplugin
+    SOURCES FactoryThrowExportPlugin.cpp
+)
+
 # Indirect cycle test plugins
 create_iora_plugin_target(indirectcyclea
     SOURCES IndirectCycleA.cpp
