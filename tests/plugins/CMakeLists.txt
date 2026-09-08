@@ -66,6 +66,20 @@ create_iora_plugin_target(factorythrowexportplugin
     SOURCES FactoryThrowExportPlugin.cpp
 )
 
+# Load-failure NON-std::exception escape probes (tracker 2026-09-08-1, O-2 / D1).
+# NonStdOnLoad -> outer catch(...) via inner-miss; FactoryNonStdThrow -> outer
+# catch(...) direct; RequireDepNonStdThrow -> onDependencyLoaded non-std swallowed
+# at Plugin::require() :2628 (FX-C1) and notifyDependentsOfLoad :1768 (FX-C2).
+create_iora_plugin_target(nonstdonloadthrowplugin
+    SOURCES NonStdOnLoadThrowPlugin.cpp
+)
+create_iora_plugin_target(factorynonstdthrowexportplugin
+    SOURCES FactoryNonStdThrowExportPlugin.cpp
+)
+create_iora_plugin_target(requiredepnonstdthrowplugin
+    SOURCES RequireDepNonStdThrowPlugin.cpp
+)
+
 # Indirect cycle test plugins
 create_iora_plugin_target(indirectcyclea
     SOURCES IndirectCycleA.cpp

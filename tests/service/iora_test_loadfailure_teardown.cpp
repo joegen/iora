@@ -35,15 +35,19 @@ std::string pluginPath(const std::string &name)
   return iora::util::getExecutableDir() + "/plugins/" + name;
 }
 
-// Attempt a load that is expected to fail; returns loadSingleModule's result
-// (false whether it returned false or threw). Never throws.
+// Attempt a load; returns loadSingleModule's result (false whether it returned
+// false or threw). Never throws — the catch(...) arm is REQUIRED for the O-2
+// non-std fixtures (tracker 2026-09-08-1): loadSingleModule now rethrows a
+// NON-std::exception (`throw 42`) out of its outer catch(...), which a std-only
+// catch here would let propagate to std::terminate and abort the whole binary.
 bool tryLoad(iora::IoraService &svc, const std::string &path)
 {
   try
   {
     return svc.loadSingleModule(path);
   }
-  catch (const std::exception &)
+  catch (...) // catches std AND the O-2 non-std throws; a std-only catch here
+              // would let a rethrown non-std propagate to std::terminate.
   {
     return false;
   }
@@ -330,6 +334,95 @@ TEST_CASE("Option A exportApi rejects an empty plugin identity")
   // The rejected export was never registered.
   auto names = svc.getExportedApiNames();
   REQUIRE(std::find(names.begin(), names.end(), "optiona.reject.probe") == names.end());
+}
+
+// --- O-2: non-std::exception escapes the std-only load-failure handlers -------
+// (tracker 2026-09-08-1). loadSingleModule's inner (:1269) and outer (:1317)
+// catches, and the two onDependencyLoaded swallows (notifyDependentsOfLoad :1768,
+// Plugin::require() :2628), all caught only const std::exception&. A non-std
+// throw (`throw 42`) from onLoad / a custom factory / onDependencyLoaded escaped
+// them, leaving a load-path module's exports live + its .so mapped+registered
+// (load path), or breaking dependent-notify isolation asymmetrically (dep path).
+// Fix: an outer catch(...) in loadSingleModule (D2) + catch(...) on BOTH
+// onDependencyLoaded swallows (D1). NOTE: this is NOT a UAF at shutdown
+// (_apiExports.clear() precedes ~PluginManager's dlclose), so the discriminator
+// is the RUNTIME registration probe (expectCleanFailedLoad) / the load return
+// value, never an ASan fault.
+
+// FX-A: onLoad exports then throws a non-std -> loadSingleModule outer catch(...)
+// (via inner-miss) unexports before dlclose. Reloaded twice (idempotent cleanup,
+// name not bricked). MUT-1 (remove the outer catch(...) body) leaves the export
+// stale in getExportedApiNames() and bricks the name.
+TEST_CASE("O-2 non-std onLoad throw is unexported before dlclose (outer catch(...))")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+  expectCleanFailedLoad(svc, "nonstdonloadthrowplugin.so", "nonstdonload.add");
+  expectCleanFailedLoad(svc, "nonstdonloadthrowplugin.so", "nonstdonload.add");
+}
+
+// FX-B: a hand-written factory exports then throws a non-std BEFORE the inner try
+// -> reaches loadSingleModule's outer catch(...) directly.
+TEST_CASE("O-2 non-std factory throw is unexported before dlclose (outer catch(...))")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+  expectCleanFailedLoad(svc, "factorynonstdthrowexportplugin.so", "factorynonstdthrowexport.add");
+  expectCleanFailedLoad(svc, "factorynonstdthrowexportplugin.so", "factorynonstdthrowexport.add");
+}
+
+// FX-C1 (D1, require() site :2628): a dependent whose onDependencyLoaded throws a
+// non-std. onLoad require()s an already-loaded dep, firing onDependencyLoaded via
+// Plugin::require(). The widened catch(...) at :2628 swallows the non-std, so the
+// dependent load SUCCEEDS — dependent-notify isolation is exception-type-agnostic
+// (a std throw is already isolated here today). MUT-2ii (revert :2628 to
+// std-only) lets the non-std escape require() -> escape onLoad (pre-insert) ->
+// loadSingleModule's std catches miss -> outer catch(...) fails the load, so the
+// dependent would NOT be loaded.
+TEST_CASE("O-2 D1: non-std onDependencyLoaded via require() is isolated; dependent still loads")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+
+  // The dependency must be loaded first (require() throws if it is not).
+  REQUIRE(svc.loadSingleModule(pluginPath("testplugin.so")));
+  REQUIRE(svc.isModuleLoaded("testplugin.so"));
+
+  // The dependent's require() fires onDependencyLoaded (throws non-std), which the
+  // widened :2628 catch(...) swallows -> onLoad completes -> dependent LOADS.
+  // (tryLoad so that under MUT-2ii a rethrown non-std fails this cleanly instead
+  // of terminating the binary.)
+  REQUIRE(tryLoad(svc, pluginPath("requiredepnonstdthrowplugin.so")) == true);
+  REQUIRE(svc.isModuleLoaded("requiredepnonstdthrowplugin.so"));
+  REQUIRE(svc.isModuleLoaded("testplugin.so"));
+}
+
+// FX-C2 (D1, notify site :1768): with the dependent loaded (FX-C1 state), unload
+// then RELOAD the dep. The reload's notifyDependentsOfLoad re-fires
+// onDependencyLoaded (throws non-std) on the still-loaded dependent
+// (_dependents[dep] survives the unload). The widened catch(...) at :1768
+// swallows it, so the RELOAD SUCCEEDS. DISCRIMINATOR = the reload RETURN VALUE
+// (tryLoad(reload) == true): under MUT-2i (revert :1768 to std-only) the non-std
+// escapes -> loadSingleModule's outer catch(...) tears down the dep and rethrows
+// -> the reload returns false.
+TEST_CASE("O-2 D1: non-std onDependencyLoaded via reload-notify is isolated; reload succeeds")
+{
+  iora::IoraService &svc = *globalSvc;
+  UnloadAllOnExit cleanup{svc};
+
+  REQUIRE(svc.loadSingleModule(pluginPath("testplugin.so")));
+  REQUIRE(tryLoad(svc, pluginPath("requiredepnonstdthrowplugin.so")) == true);
+  REQUIRE(svc.isModuleLoaded("requiredepnonstdthrowplugin.so"));
+
+  // Unload the dep (the dependent stays loaded; onDependencyUnloaded is a no-op).
+  REQUIRE(svc.unloadSingleModule("testplugin.so"));
+  REQUIRE(svc.isModuleLoaded("testplugin.so") == false);
+
+  // Reload the dep -> notifyDependentsOfLoad fires onDependencyLoaded (non-std) on
+  // the still-loaded dependent -> :1768 catch(...) swallows -> reload SUCCEEDS.
+  REQUIRE(tryLoad(svc, pluginPath("testplugin.so")) == true);
+  REQUIRE(svc.isModuleLoaded("testplugin.so"));
+  REQUIRE(svc.isModuleLoaded("requiredepnonstdthrowplugin.so"));
 }
 
 int main(int argc, char *argv[])

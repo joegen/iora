@@ -1225,6 +1225,27 @@ protected:
       // then REJECTED (getExportedApiSafe throws) — its wrapper's vtable would live
       // in the plugin .so and use-after-dlclose (DP-F host-only enforcement).
       LoadModulesGuard loadGuard(_loadModulesMutex);
+
+      // Host-side teardown of the entry THIS call registered, run before each
+      // failure-path dlclose (the null-instance branch and BOTH outer catches).
+      // Named once so the pluginRegistered guard, the cleanup, and the dlclose
+      // order cannot drift across the three sites: unexport must dominate the
+      // dlclose (a stale export would dangle into the unmapped .so), and a
+      // cleanup throw safely SKIPS the dlclose (DP-12 — the .so stays mapped, so
+      // the still-present export is not dangling). Guarded by pluginRegistered so
+      // a "Plugin already loaded" throw — where the entry belongs to a CONCURRENT
+      // load — never dlcloses that live module. Idempotent (cleanupPartialLoadLocked
+      // is), so the onLoad-throw path running it in the inner catch AND here is
+      // harmless.
+      auto cleanupIfRegistered = [&]()
+      {
+        if (pluginRegistered)
+        {
+          cleanupPartialLoadLocked(pluginName);
+          PluginManager::unloadPlugin(pluginName);
+        }
+      };
+
       try
       {
         pluginName = entry.path().filename().string();
@@ -1293,48 +1314,42 @@ protected:
         else
         {
           IORA_LOG_ERROR("Module " + pluginName + " did not return a valid instance.");
-          // We registered this .so above; remove OUR entry so a failed load does
-          // not leave an orphaned _plugins entry ("already loaded" on retry). This
-          // source-level fix lets unloadAll* avoid a blanket
-          // PluginManager::unloadAll() (which would dlclose modules it never
-          // claimed — a concurrent-unload UAF).
-          if (pluginRegistered)
-          {
-            // A custom factory may have exported a pluginName-keyed API before
-            // returning null; unexport it HOST-SIDE before dlclose (unexport
-            // dominates unmap) so it does not dangle into the unmapped .so
-            // (tracker 2026-09-08-2, defect_1). Guarded by pluginRegistered so a
-            // concurrent load's "already loaded" entry is never swept. Cleanup
-            // and its throw semantics live in cleanupPartialLoadLocked (a throw
-            // here unwinds to the outer catch, which re-runs the idempotent
-            // cleanup and re-attempts the dlclose).
-            cleanupPartialLoadLocked(pluginName);
-            PluginManager::unloadPlugin(pluginName);
-          }
+          // We registered this .so above; a custom factory may have exported a
+          // pluginName-keyed API before returning null — unexport it HOST-SIDE
+          // before dlclose so it does not dangle, and remove OUR _plugins entry
+          // so unloadAll* need not blanket-unloadAll (tracker 2026-09-08-2,
+          // defect_1). See cleanupIfRegistered above.
+          cleanupIfRegistered();
           return false;
         }
       }
       catch (const std::exception &e)
       {
         IORA_LOG_ERROR("Failed to load module: " + entry.path().string() + " - " + e.what());
-        // Same source-level cleanup on any load failure AFTER we registered the
-        // entry (onLoad threw, resolve failed, etc.). Guarded by pluginRegistered
-        // so a "Plugin already loaded" throw from loadPlugin() — where the entry
-        // belongs to a CONCURRENT load — never dlcloses that live module.
-        if (pluginRegistered)
-        {
-          // A custom factory that exported a pluginName-keyed API then THREW
-          // reaches here (the factory runs before the inner try, so the inner
-          // catch never saw it); unexport it HOST-SIDE before dlclose (tracker
-          // 2026-09-08-2, defect_1). On the onLoad-throw path the inner catch
-          // already ran this helper, so it runs a second time here — harmless
-          // (the helper is idempotent). Guarded by pluginRegistered; a cleanup
-          // throw safely skips the dlclose — see cleanupPartialLoadLocked's L-3
-          // note.
-          cleanupPartialLoadLocked(pluginName);
-          PluginManager::unloadPlugin(pluginName);
-        }
+        // Any std load failure after we registered the entry (onLoad threw,
+        // resolve failed, or a factory that exported then threw — the factory
+        // runs before the inner try, so the inner catch never saw it). See
+        // cleanupIfRegistered above (idempotent — harmless if the inner catch
+        // already ran it on the onLoad-throw path).
+        cleanupIfRegistered();
         throw; // Re-throw to provide detailed error information to the caller
+      }
+      catch (...)
+      {
+        // A NON-std::exception (e.g. `throw 42;` from a plugin onLoad or a custom
+        // loadModule factory / non-std ctor via the macro) escapes the std-only
+        // catch above; without this arm it would leave the plugin's already-made
+        // exports live in _apiExports/_apiToModule and the .so mapped+registered
+        // in PluginManager, with no cleanup or dlclose (tracker 2026-09-08-1,
+        // O-2). Mirror the outer std arm (via cleanupIfRegistered above), minus
+        // the impossible e.what(). Ends in throw; (so it does NOT swallow
+        // abi::__forced_unwind). D2: the outer arm alone suffices — no inner
+        // catch(...) is needed (cleanupPartialLoadLocked is idempotent + keyed on
+        // pluginName + erases _loadedModules[pluginName]).
+        IORA_LOG_ERROR("Failed to load module: " + entry.path().string() +
+                       " - non-standard (non-std::exception) throw");
+        cleanupIfRegistered();
+        throw; // Re-throw the original non-std exception to the caller
       }
     } // End critical section - mutex released here
 
@@ -1769,6 +1784,18 @@ protected:
           {
             IORA_LOG_ERROR("Plugin " + dependent + " threw exception in onDependencyLoaded(" +
                            moduleName + "): " + e.what());
+          }
+          catch (...)
+          {
+            // A non-std::exception must be isolated exactly like a std one:
+            // dependent-notification failure never fails the loading module
+            // (tracker 2026-09-08-1, D1). Without this, a non-std here escapes to
+            // loadSingleModule's outer catch(...) and asymmetrically fails the
+            // (re)load. No .what() for an unknown type.
+            IORA_LOG_ERROR("Plugin " + dependent +
+                           " threw a non-standard (non-std::exception) exception in "
+                           "onDependencyLoaded(" +
+                           moduleName + ")");
           }
         }
 
@@ -2631,6 +2658,19 @@ inline void IoraService::Plugin::require(const std::string &moduleName)
   {
     IORA_LOG_ERROR("Plugin " + _name + " threw exception in onDependencyLoaded(" + moduleName +
                    "): " + e.what());
+  }
+  catch (...)
+  {
+    // A non-std::exception must be isolated exactly like a std one: a dependent's
+    // onDependencyLoaded failure must not fail the dependent's own load (tracker
+    // 2026-09-08-1, D1). This is the require()-path sibling of the
+    // notifyDependentsOfLoad swallow; every dependent reaches onDependencyLoaded
+    // via require() at onLoad, so without this a non-std here escapes onLoad into
+    // loadSingleModule's outer catch(...) and fails the dependent's load. No
+    // .what() for an unknown type.
+    IORA_LOG_ERROR("Plugin " + _name +
+                   " threw a non-standard (non-std::exception) exception in onDependencyLoaded(" +
+                   moduleName + ")");
   }
 }
 
