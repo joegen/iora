@@ -206,10 +206,11 @@ struct Config
   /// it is not an absolute guarantee: an intermediary (proxy/LB) with a sub-3 s
   /// idle timeout can still close a socket the client then reuses. That reset is
   /// retried on a fresh socket, but ONLY the closed-while-idle-before-the-write
-  /// case is provably-not-applied and therefore safe to retry per RFC 9110
-  /// §9.2.2; the retry loop does NOT currently restrict itself to that case (it
-  /// retries any exception, a double-submit hazard for non-idempotent POST) —
-  /// see tracker 2026-09-03-2. The window only lowers how often the race is hit.
+  /// case is provably-not-sent and therefore safe to retry per RFC 9110 §9.2.2.
+  /// The retry loop enforces exactly that: it retries only errors classified
+  /// provably-not-sent (isRequestProvablyNotSent), so a possibly-sent
+  /// non-idempotent POST is never double-submitted (the gate from tracker
+  /// 2026-09-03-2). The window only lowers how often the race is hit.
   /// TRADEOFF: against a
   /// long-keep-alive peer (nginx 75 s, ALB/GCP LBs) a workload with request gaps
   /// > 3 s pays a fresh TCP connect (and TLS handshake for https) per burst where

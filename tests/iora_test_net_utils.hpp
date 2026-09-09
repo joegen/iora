@@ -11,6 +11,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <system_error>
 #include <thread>
 #include <unistd.h>
@@ -163,6 +164,13 @@ inline std::string rawHttpRequest(int port, const std::string &requestBytes)
   {
     return "";
   }
+  // Bound the blocking recv loop: this helper reads until EOF, relying on the
+  // server honoring "Connection: close". A close-handling regression would
+  // otherwise hang the caller forever (no default socket timeout) — a generous
+  // receive timeout turns that into a diagnosable failure instead of a CI hang.
+  struct timeval rcvTimeout{};
+  rcvTimeout.tv_sec = 15;
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(static_cast<std::uint16_t>(port));

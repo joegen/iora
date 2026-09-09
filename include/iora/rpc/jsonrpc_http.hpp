@@ -303,7 +303,10 @@ public:
       {
         // Notification-only request or all-notification batch. 204 MUST carry no
         // content (RFC 9110 §15.3.5 / RFC 9112 §6.3). Belt-and-braces regardless of
-        // any dispatcher-side clear: erase body + framing/type headers.
+        // any dispatcher-side set: clear the body and erase the Content-Length and
+        // Content-Type entity headers. Transfer-Encoding/Trailer are never set on
+        // this path and are stripped for a 204 at the wire layer (HttpServer
+        // toWireFormat, HR-13/HR-17), so they need no erase here.
         res.status = 204;
         res.body.clear();
         res.headers.erase("Content-Length");

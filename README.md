@@ -78,7 +78,7 @@
   - [Plugin Dependency System](#plugin-dependency-system)
   - [Configuration](#configuration)
   - [Logging and Error Handling](#logging-and-error-handling)
-  - [JSON-RPC Server Module](#json-rpc-server-module)
+  - [JSON-RPC (now a library, not a plugin)](#json-rpc-now-a-library-not-a-plugin)
 - [🔒 Thread-Safe Plugin API Access](#-thread-safe-plugin-api-access)
 - [📝 License](#-license)
 
@@ -3471,34 +3471,27 @@ void robustServiceManagement() {
 
 ## 🔌 Available Plugins
 
-Iora ships with two production-ready plugins, with more planned:
+Iora ships with example plugins, with more planned.
 
-### 🌐 **JSON-RPC Server Plugin** (`mod_jsonrpc_server`)
-Full JSON-RPC 2.0 specification compliance with enterprise features:
-- **Batch request processing** for improved efficiency
-- **Method registration** with custom handlers
-- **Authentication support** with configurable security
-- **Real-time statistics** and monitoring
-- **Request timeout handling** and circuit breaking
-
-**API Methods:**
-- `jsonrpc.register(methodName, handler)` → Register RPC methods
-- `jsonrpc.getStats()` → Performance metrics and usage statistics
-- `jsonrpc.registerWithOptions(method, handler, options)` → Advanced registration
-
-### 📡 **JSON-RPC Client Plugin** (`mod_jsonrpc_client`)
-Robust client for consuming JSON-RPC services:
-- **Synchronous and asynchronous calls** for different use cases
-- **Batch request support** for optimized network usage
-- **Connection pooling** and automatic retry logic
-- **Custom headers** and authentication support
-- **Job tracking** for long-running async operations
-
-**API Methods:**
-- `jsonrpc.client.call(endpoint, method, params)` → Synchronous RPC calls
-- `jsonrpc.client.callAsync(endpoint, method, params)` → Async with job tracking
-- `jsonrpc.client.callBatch(endpoint, items)` → Batch processing
-- `jsonrpc.client.notify(endpoint, method, params)` → Fire-and-forget notifications
+> **JSON-RPC is no longer a plugin.** The JSON-RPC 2.0 client and server are now
+> a header-only part of the library under `iora::rpc`, composed directly with no
+> plugin load and no `IoraService`. See the **[JSON-RPC guide](docs/iora/jsonrpc.md)**.
+>
+> ```cpp
+> // Server: a dispatcher + an HTTP endpoint over an HttpServer.
+> iora::rpc::JsonRpcServer server;
+> server.registerMethod("echo",
+>     [](const iora::parsers::Json& params, iora::rpc::RpcContext&) { return params; });
+> iora::network::HttpServer http("0.0.0.0", 8080);
+> iora::rpc::JsonRpcHttpEndpoint endpoint(server, http); // registers POST /rpc
+> http.start();
+>
+> // Client: pooled, over a ThreadPool.
+> iora::core::ThreadPool pool(2, 8, std::chrono::seconds(30));
+> iora::rpc::JsonRpcClient client(pool, iora::rpc::Config{});
+> auto result = client.call("http://localhost:8080/rpc", "echo",
+>                           iora::parsers::Json("hi"), {});
+> ```
 
 ### 🚀 **Sample Microservice Plugin**
 Complete example demonstrating real-world usage:
@@ -3889,66 +3882,14 @@ To enable plugin loading, specify the directory containing your plugins in your 
 - If a plugin fails to load, it will be skipped, and the system will continue loading other plugins.
 - Use `Logger::setLogFormat()` with `%F`, `%l`, `%f` placeholders for source location in plugin logs.
 
-### JSON-RPC Server Module
+### JSON-RPC (now a library, not a plugin)
 
-The JSON-RPC Server module provides a JSON-RPC 2.0 compliant server that can be dynamically loaded as a plugin. It exposes the following API methods via `IoraService::exportApi`:
-
-#### API Methods
-
-- `jsonrpc.version()` → `std::uint32_t` - Returns the JSON-RPC server version
-- `jsonrpc.register(methodName, handler)` → `void` - Registers a method handler
-  - `methodName`: `const std::string&` - Name of the JSON-RPC method
-  - `handler`: `std::function<iora::parsers::Json(const iora::parsers::Json&)>` - Handler function that takes JSON params and returns JSON result
-- `jsonrpc.registerWithOptions(methodName, handler, options)` → `void` - Registers a method handler with options
-  - `methodName`: `const std::string&` - Name of the JSON-RPC method  
-  - `handler`: `std::function<iora::parsers::Json(const iora::parsers::Json&)>` - Handler function
-  - `options`: `const iora::parsers::Json&` - Options object with optional fields:
-    - `requireAuth`: `bool` - Whether authentication is required
-    - `timeout`: `int` - Timeout in milliseconds  
-    - `maxRequestSize`: `int` - Maximum request size in bytes
-- `jsonrpc.unregister(methodName)` → `bool` - Unregisters a method
-- `jsonrpc.has(methodName)` → `bool` - Checks if a method is registered
-- `jsonrpc.getMethods()` → `std::vector<std::string>` - Returns list of registered method names
-- `jsonrpc.getStats()` → `iora::parsers::Json` - Returns server statistics as JSON object with fields:
-  - `totalRequests`: Total number of requests processed
-  - `successfulRequests`: Number of successful requests
-  - `failedRequests`: Number of failed requests
-  - `timeoutRequests`: Number of timed out requests
-  - `batchRequests`: Number of batch requests
-  - `notificationRequests`: Number of notification requests
-- `jsonrpc.resetStats()` → `void` - Resets all statistics counters
-
-#### Usage Example
-
-```cpp
-// Initialize IoraService with configuration
-iora::IoraService::Config config;
-config.server.port = 8080;
-config.modules.directory = "/path/to/plugins";
-config.modules.autoLoad = false;
-iora::IoraService::init(config);
-
-// Get service instance and load the JSON-RPC server module
-auto& service = iora::IoraService::instanceRef();
-service.loadSingleModule("/path/to/mod_jsonrpc_server.so");
-
-// Register a simple echo method
-auto echoHandler = [](const iora::parsers::Json& params) -> iora::parsers::Json {
-    return params; // Echo back the parameters
-};
-service.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>>(
-    "jsonrpc.register", "echo", echoHandler);
-
-// Register a method with options
-auto authHandler = [](const iora::parsers::Json& params) -> iora::parsers::Json {
-    return iora::parsers::Json::object({{"authenticated", true}});
-};
-iora::parsers::Json options = iora::parsers::Json::object();
-options["requireAuth"] = true;
-options["timeout"] = 5000;
-service.callExportedApi<void, const std::string&, std::function<iora::parsers::Json(const iora::parsers::Json&)>, const iora::parsers::Json&>(
-    "jsonrpc.registerWithOptions", "secure_method", authHandler, options);
-```
+JSON-RPC is no longer loaded as a module. The JSON-RPC 2.0 client and server now
+live in the library under `iora::rpc` (`iora::rpc::JsonRpcServer`,
+`iora::rpc::JsonRpcHttpEndpoint`, `iora::rpc::JsonRpcClient`) and are composed
+directly — no `loadSingleModule`, no `callExportedApi`, no `IoraService`. See the
+**[JSON-RPC guide](docs/iora/jsonrpc.md)** for the full API, and the quick-start
+example in the [Available Plugins](#-available-plugins) section above.
 
 ## 🔒 Thread-Safe Plugin API Access
 

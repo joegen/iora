@@ -19,12 +19,12 @@
 /// Content-Encoding (and, symmetrically, Accept-Encoding) is a list-valued field
 /// (RFC 9110 §5.3/§8.4): duplicate field-lines COMBINE with a comma, and the
 /// combined value is an ordered comma-list of coding tokens. Both ingress paths of
-/// the negotiated-gzip feature — the server's request decode (mod_jsonrpc_server)
-/// and the client's response decode (jsonrpc_client) — need the SAME split of that
-/// combined value into ordered, OWS-trimmed, non-empty tokens. This shared free
-/// function is that one implementation (promoted out of the two verbatim per-module
-/// copies), sitting beside the Accept-Encoding acceptability primitive
-/// (accept_encoding.hpp) in the shared parsers layer both modules already consume.
+/// the negotiated-gzip feature — the server's request decode
+/// (iora::rpc::JsonRpcHttpEndpoint) and the client's response decode
+/// (iora::rpc::JsonRpcClient) — need the SAME split of that combined value into
+/// ordered, OWS-trimmed, non-empty tokens. This shared free function is that one
+/// implementation, sitting beside the Accept-Encoding acceptability primitive
+/// (accept_encoding.hpp) in the shared parsers layer both consumers use.
 ///
 /// Deliberately Content-Encoding-scoped (NOT a generic splitCommaList(delim)) — only
 /// content-coding lists need this today; a premature generalization would be unused

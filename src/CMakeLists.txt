@@ -10,7 +10,3 @@ configure_iora_target(iora
 install(TARGETS iora
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-
-# Build modules (always needed as they're fundamental components)
-add_subdirectory(modules/endpoints/jsonrpc_server)
-add_subdirectory(modules/connectors/jsonrpc_client)
