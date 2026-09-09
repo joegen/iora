@@ -10,6 +10,54 @@
         "rpc/jsonrpc_http.hpp",
         "rpc/jsonrpc_server.hpp"
       ]
+    },
+    "parsers/json.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/json.hpp"
+      ]
+    },
+    "parsers/xml.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/xml.hpp"
+      ]
+    },
+    "parsers/minimal_toml.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/minimal_toml.hpp"
+      ]
+    },
+    "parsers/mustache.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/mustache.hpp"
+      ]
+    },
+    "parsers/html_escape.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/html_escape.hpp"
+      ]
+    },
+    "parsers/http_message.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/http_message.hpp"
+      ]
+    },
+    "parsers/accept_encoding.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/accept_encoding.hpp"
+      ]
+    },
+    "parsers/content_coding.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/content_coding.hpp"
+      ]
     }
   }
 }

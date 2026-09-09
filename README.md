@@ -169,7 +169,14 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
 
 ### parsers
-- **Json**, **Xml**, **MinimalToml**, **Mustache**, **HtmlEscape**, **HttpMessage** (network namespace; cross-linked from the network HTTP guides), **AcceptEncoding**, **ContentCoding** — `docs/parsers/` _(planned)_
+- **JSON** — value model, parser & serializer (`\uXXXX`/surrogate decoding, RFC 8259) — [`docs/parsers/json.md`](docs/parsers/json.md)
+- **XML** — pull/SAX/DOM parser with numeric char-ref decoding — [`docs/parsers/xml.md`](docs/parsers/xml.md)
+- **MinimalToml** — parser & serializer for the config subset — [`docs/parsers/minimal_toml.md`](docs/parsers/minimal_toml.md)
+- **Mustache** — logic-less template engine (escape-by-default) — [`docs/parsers/mustache.md`](docs/parsers/mustache.md)
+- **HtmlEscape / URL & Form encoding** — HTML escaping plus percent/form encode/decode and form-body parsing — [`docs/parsers/html_escape.md`](docs/parsers/html_escape.md)
+- **HttpMessage** — HTTP request/response model (parse / serialize / build), `iora::network` namespace; cross-linked from the network HTTP guides — [`docs/parsers/http_message.md`](docs/parsers/http_message.md)
+- **AcceptEncoding** — RFC 9110 gzip acceptability (q-values) — [`docs/parsers/accept_encoding.md`](docs/parsers/accept_encoding.md)
+- **ContentCoding** — Content-Encoding list-splitting and log scrubbing — [`docs/parsers/content_coding.md`](docs/parsers/content_coding.md)
 
 ### util
 - **Gzip**, **TtlMap** / **ExpiringCache**, **Base64**, **Crc32**, **Filesystem** — `docs/util/` _(planned)_
