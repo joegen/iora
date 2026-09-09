@@ -617,8 +617,7 @@ inline ParsedUrl parseUrl(const std::string &url)
 /// from parseUrl. parseUrl was found to be unusable as the structural source for
 /// a pool key: (a) it folds a query-string into the host when no path precedes it
 /// (`http://h?q=1` → host `h?q=1`), which would fragment one origin into a pool
-/// per query; and (b) it lowercases the scheme with the locale-dependent
-/// `::tolower` and truncates the port through `static_cast<uint16_t>(std::stoi)`
+/// per query; and (b) it truncates the port through `static_cast<uint16_t>(std::stoi)`
 /// (`:65536` → 0). Deriving from the local authority scan also collapses the two
 /// URL parsers this key must otherwise reconcile down to one for this purpose.
 ///
@@ -940,7 +939,7 @@ public:
       parseHeaderLine(line, request.headers);
     }
 
-    // RFC 9112 §6.3 rule 4: two Content-Length field-lines with DIFFERING values, OR a
+    // RFC 9112 §6.3 rule 5: two Content-Length field-lines with DIFFERING values, OR a
     // single Content-Length with an invalid (non-1*DIGIT) value — e.g. an upstream-
     // combined "5, 6", a non-numeric, signed, or empty value — are an unrecoverable
     // framing error (request smuggling). Identical duplicates collapse to one and are
@@ -965,9 +964,9 @@ public:
     {
       throw HttpRequestError(400, "Both Transfer-Encoding and Content-Length present");
     }
-    // RFC 9112 §6.3: if Transfer-Encoding is present on a request, the chunked coding
-    // MUST be the final coding; otherwise the body length cannot be determined and the
-    // server MUST reject with 400.
+    // RFC 9112 §6.3 rule 4: if Transfer-Encoding is present on a request, the chunked
+    // coding MUST be the final coding; otherwise the body length cannot be determined
+    // and the server MUST reject with 400.
     if (sawTransferEncoding && !detail::isChunkedFinalCoding(transferEncodingValue))
     {
       throw HttpRequestError(400, "Transfer-Encoding without a final chunked coding");

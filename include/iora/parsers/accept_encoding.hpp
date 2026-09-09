@@ -82,7 +82,7 @@ inline bool asciiIEquals(std::string_view a, std::string_view b)
   return true;
 }
 
-/// \brief Locale-INDEPENDENT RFC 9110 §12.5.3 qvalue parse: ( "0" [ "."
+/// \brief Locale-INDEPENDENT RFC 9110 §12.4.2 qvalue parse: ( "0" [ "."
 /// 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] ). Returns the value in [0,1], or
 /// 0.0 for any malformed / out-of-range input (NOT std::stod, which is
 /// locale-sensitive and accepts scientific/out-of-range forms).
