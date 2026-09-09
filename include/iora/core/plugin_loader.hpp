@@ -6,13 +6,11 @@
 // details.
 
 #pragma once
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -49,10 +47,6 @@ public:
       throw std::runtime_error("Failed to load library: " + path + ", error: " + dlerror());
     }
 #endif
-    if (!_handle)
-    {
-      throw std::runtime_error("Failed to load library: " + path);
-    }
   }
 
   /// \brief Destructor closes the dynamic library
@@ -67,6 +61,13 @@ public:
 #endif
     }
   }
+
+  // Owns a single dlopen handle closed exactly once in the destructor. Copying
+  // would shallow-copy _handle and dlclose it twice; forbid it. The move members
+  // are not implicitly declared (suppressed by the user-declared destructor), so
+  // with copy deleted the type is non-copyable and non-movable. Held via unique_ptr.
+  PluginLoader(const PluginLoader &) = delete;
+  PluginLoader &operator=(const PluginLoader &) = delete;
 
   /// \brief Resolve a symbol from the loaded library
   /// \tparam T Function or object pointer type
@@ -89,7 +90,6 @@ public:
       throw std::runtime_error("Failed to resolve symbol: " + name);
     }
 
-    _symbolCache[name] = symbol;
     return reinterpret_cast<T>(symbol);
   }
 
@@ -98,7 +98,6 @@ public:
 
 private:
   void *_handle = nullptr;
-  std::unordered_map<std::string, void *> _symbolCache;
 };
 
 /// \brief Manages the lifecycle and symbol resolution of multiple dynamically
@@ -136,6 +135,13 @@ public:
   /// \return Resolved symbol cast to type T
   template <typename T> T resolve(const std::string &name, const std::string &symbol)
   {
+    // Hold _mutex across the find AND the delegated PluginLoader::resolve: every
+    // other accessor locks _mutex, so an unlocked read here would race a concurrent
+    // loadPlugin/unloadPlugin/unloadAll on _plugins (UB). Holding it across the
+    // dlsym also prevents unloadPlugin from freeing the PluginLoader mid-resolve.
+    // _mutex is a leaf (no PluginManager method acquires any other lock), so this
+    // never nests outward — the only ordering is <outer>->_mutex.
+    std::lock_guard<std::mutex> lock(_mutex);
     auto it = _plugins.find(name);
     if (it == _plugins.end())
     {
