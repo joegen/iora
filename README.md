@@ -155,15 +155,16 @@ Every public component has (or will have) an Architecture & Programmer's Guide u
 Each guide opens with a `Back to index` link to this README. The header-to-guide map lives in [`docs/manifest.json`](docs/manifest.json).
 
 ### Runtime / Getting Started
-- **IoraService** — the framework entry point: service lifecycle, component factories, HTTP wiring, route/event builders, exported-API access, plugin orchestration — `docs/iora_service.md` _(planned)_
-- **PluginLoader / PluginManager** — dynamic plugin loading and multi-plugin lifecycle — `docs/core/plugin_loader.md` _(planned)_
+- **IoraService** — the framework entry point: service lifecycle, Config reference, route/event builders, the exported-API drain-gate/SafeApiFunction model, plugin orchestration — [`docs/iora_service.md`](docs/iora_service.md)
+- **PluginLoader / PluginManager** — dynamic plugin loading (dlopen/dlclose) and multi-plugin lifecycle — [`docs/core/plugin_loader.md`](docs/core/plugin_loader.md)
 
 ### rpc
 - **JSON-RPC (client / HTTP endpoint / server)** — RFC-conformant JSON-RPC 2.0 over HTTP with negotiated gzip content-coding — [`docs/rpc/jsonrpc.md`](docs/rpc/jsonrpc.md)
 
 ### core
+- **ServiceRegistry** — type-erased, thread-safe module/service registry (drain-before-unload invariant) — [`docs/core/service_registry.md`](docs/core/service_registry.md)
 - **Result**, **Signal**, **StateMachine**, **StringUtils**, **RingBuffer**, **ConcurrentHashMap**, **Buffer primitives**, **Metrics**, **RateLimiter**, **TimingWheel** — foundation primitives — `docs/core/` _(planned)_
-- **ThreadPool** (`core::async` / `PooledFuture`), **Logger**, **BlockingQueue**, **ConfigLoader**, **EventQueue**, **TimerService**, **ServiceRegistry**, **errno_utils** — `docs/core/` _(planned)_
+- **ThreadPool** (`core::async` / `PooledFuture`), **Logger**, **BlockingQueue**, **ConfigLoader**, **EventQueue**, **TimerService**, **errno_utils** — `docs/core/` _(planned)_
 
 ### network
 - **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_

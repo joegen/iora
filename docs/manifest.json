@@ -58,6 +58,24 @@
       "headers": [
         "parsers/content_coding.hpp"
       ]
+    },
+    "iora_service.md": {
+      "area": "runtime",
+      "headers": [
+        "iora.hpp"
+      ]
+    },
+    "core/plugin_loader.md": {
+      "area": "runtime",
+      "headers": [
+        "core/plugin_loader.hpp"
+      ]
+    },
+    "core/service_registry.md": {
+      "area": "core",
+      "headers": [
+        "core/service_registry.hpp"
+      ]
     }
   }
 }
