@@ -16,8 +16,8 @@
 ///
 /// A shared header-parsing primitive that sits beside parsers/http_message.hpp:
 /// both the web application framework (web/application.hpp static-asset serving)
-/// and the endpoint/connector modules (mod_jsonrpc_server response negotiation)
-/// need the SAME q-value-correct "is gzip acceptable?" decision over an
+/// and the JSON-RPC HTTP endpoint (rpc/jsonrpc_http.hpp JsonRpcHttpEndpoint response
+/// negotiation) need the SAME q-value-correct "is gzip acceptable?" decision over an
 /// Accept-Encoding header value. It was originally a PRIVATE static member of
 /// iora::web::Application; promoting it here (rather than to iora/web/) keeps an
 /// endpoint module from reaching UP into the application-framework layer.

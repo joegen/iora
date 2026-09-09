@@ -299,12 +299,12 @@ struct Config
   /// configured intent. Default false. The compress path itself lands in phase 2.
   bool enableRequestCompression{false};
 
-  /// \brief Emit `Accept-Encoding: gzip` (single line, identity implicit) so the
-  /// server MAY compress responses, and enable client response-decode. Default true.
-  /// NOTE: this default is INERT scaffolding at foundation stage — there is no
-  /// emit site yet. Its actual emit AND the response-decode path MUST land TOGETHER
-  /// in phase 3 (advertising a coding the client cannot yet inflate would be a
-  /// regression); recorded here as a coordination guard.
+  /// \brief Emit `Accept-Encoding: gzip` (single line; else `identity`) so the
+  /// server MAY compress responses. Default true. This flag does NOT gate response
+  /// decoding: gzip/x-gzip responses are always inflated by
+  /// decodeResponseContentEncoding_ regardless of this flag, so setting it false
+  /// only positively refuses server compression on the wire (a conformant server
+  /// then returns identity).
   bool advertiseAcceptEncoding{true};
 
   /// \brief Minimum REQUEST-body size (bytes) to attempt request compression;

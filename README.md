@@ -7,7 +7,7 @@
 - [🐦 What's In The Name?](#-whats-in-the-name)
 - [🎯 Why Choose Iora?](#-why-choose-iora)
 - [🎯 Zero External Dependencies](#-zero-external-dependencies)
-- [✨ Core Features](#-core-features)
+- [Documentation](#documentation)
 - [🚀 High-Performance JSON Parser](#-high-performance-json-parser)
 - [🔧 Production-Ready XML Parser](#-production-ready-xml-parser)
 - [⏱️ High-Performance Timer System](#️-high-performance-timer-system)
@@ -16,14 +16,14 @@
   - [Usage Examples](#-usage-examples)
   - [Performance Characteristics](#-performance-characteristics)
 - [🔄 Thread-Safe Blocking Queue](#-thread-safe-blocking-queue)
-  - [Core Features](#-core-features-2)
+  - [Core Features](#-core-features)
   - [Key Operations](#️-key-operations)
   - [Use Cases](#-use-cases)
   - [Advanced Features](#-advanced-features-1)
   - [Performance Characteristics](#-performance-characteristics-1)
   - [Best Practices](#-best-practices-1)
 - [📝 Thread-Safe Logger](#-thread-safe-logger)
-  - [Core Features](#-core-features-3)
+  - [Core Features](#-core-features-2)
   - [Log Levels](#-log-levels)
   - [Logging Methods](#-logging-methods)
   - [Format Placeholders](#-format-placeholders)
@@ -148,34 +148,40 @@ Iora is **completely self-contained** with all functionality built-in:
 
 ---
 
-## ✨ Core Features
+## Documentation
 
-### 🌐 Network & Transport
-- **UnifiedSharedTransport** — High-performance transport layer with TCP/UDP support
-- **network::HttpClient** — Advanced HTTP client with connection pooling and retry logic
-- **network::HttpClientPool** — Thread-safe HTTP client pool with RAII-based resource management
-- **network::WebhookServer** — Production-grade webhook server with TLS and authentication
-- **network::CircuitBreaker** — Prevent cascade failures with configurable circuit breaking
-- **network::ConnectionHealth** — Real-time connection monitoring and automatic recovery
+Every public component has (or will have) an Architecture & Programmer's Guide under [`docs/`](docs/), grouped by area to mirror `include/iora/`. This section is the browsable index. Guides are being migrated and authored area by area; links marked _(planned)_ are not written yet.
 
-### 💾 Storage & State Management  
-- **storage::JsonFileStore** — JSON-backed persistent key-value store with background flushing
-- **storage::ConcreteStateStore** — Thread-safe in-memory key-value store with case-insensitive keys
-- **util::ExpiringCache<K,V>** — Thread-safe TTL cache with LRU eviction policies
+Each guide opens with a `Back to index` link to this README. The header-to-guide map lives in [`docs/manifest.json`](docs/manifest.json).
 
-### 🛠️ Development & Operations
-- **core::ThreadPool** — Dynamic, exception-safe thread pool with work stealing
-- **core::BlockingQueue<T>** — Thread-safe bounded queue with blocking operations and timeout support
-- **core::TimerService** — High-performance timer system with microsecond precision
-- **core::Logger** — Structured logging with async I/O and log rotation
-- **core::ConfigLoader** — Hot-reloadable TOML configuration with built-in parser (see [docs](docs/minimal_toml_parser.md))
-- **system::ShellRunner** — Secure shell command execution with timeout and sandboxing
-- **core::EventQueue** — High-throughput event processing with backpressure handling
+### Runtime / Getting Started
+- **IoraService** — the framework entry point: service lifecycle, component factories, HTTP wiring, route/event builders, exported-API access, plugin orchestration — `docs/iora_service.md` _(planned)_
+- **PluginLoader / PluginManager** — dynamic plugin loading and multi-plugin lifecycle — `docs/core/plugin_loader.md` _(planned)_
 
-### 🔌 Extensions & Modules
-- **iora::IoraService** — Plugin orchestration system with hot-loading support
-- **Dynamic Plugin Loading** — Runtime module loading without recompilation
-- **Extensible API System** — Clean interfaces for cross-plugin communication
+### rpc
+- **JSON-RPC (client / HTTP endpoint / server)** — RFC-conformant JSON-RPC 2.0 over HTTP with negotiated gzip content-coding — [`docs/rpc/jsonrpc.md`](docs/rpc/jsonrpc.md)
+
+### core
+- **Result**, **Signal**, **StateMachine**, **StringUtils**, **RingBuffer**, **ConcurrentHashMap**, **Buffer primitives**, **Metrics**, **RateLimiter**, **TimingWheel** — foundation primitives — `docs/core/` _(planned)_
+- **ThreadPool** (`core::async` / `PooledFuture`), **Logger**, **BlockingQueue**, **ConfigLoader**, **EventQueue**, **TimerService**, **ServiceRegistry**, **errno_utils** — `docs/core/` _(planned)_
+
+### network
+- **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
+
+### parsers
+- **Json**, **Xml**, **MinimalToml**, **Mustache**, **HtmlEscape**, **HttpMessage** (network namespace; cross-linked from the network HTTP guides), **AcceptEncoding**, **ContentCoding** — `docs/parsers/` _(planned)_
+
+### util
+- **Gzip**, **TtlMap** / **ExpiringCache**, **Base64**, **Crc32**, **Filesystem** — `docs/util/` _(planned)_
+
+### web
+- **Application**, **Htmx**, **Assets** (asset pipeline), **Channel** (SSE/WS), **Middleware interfaces** — `docs/web/` _(planned)_
+
+### storage
+- **KVStore**, **JsonFileStore**, **ConcreteStateStore** — `docs/storage/` _(planned)_
+
+### crypto / ids / system / common
+- **SecureRng**, **Uuid**, **ShellRunner**, **ILifecycleManaged** — `docs/{crypto,ids,system,common}/` _(planned)_
 
 ---
 
@@ -3475,7 +3481,7 @@ Iora ships with example plugins, with more planned.
 
 > **JSON-RPC is no longer a plugin.** The JSON-RPC 2.0 client and server are now
 > a header-only part of the library under `iora::rpc`, composed directly with no
-> plugin load and no `IoraService`. See the **[JSON-RPC guide](docs/iora/jsonrpc.md)**.
+> plugin load and no `IoraService`. See the **[JSON-RPC guide](docs/rpc/jsonrpc.md)**.
 >
 > ```cpp
 > // Server: a dispatcher + an HTTP endpoint over an HttpServer.
@@ -3888,7 +3894,7 @@ JSON-RPC is no longer loaded as a module. The JSON-RPC 2.0 client and server now
 live in the library under `iora::rpc` (`iora::rpc::JsonRpcServer`,
 `iora::rpc::JsonRpcHttpEndpoint`, `iora::rpc::JsonRpcClient`) and are composed
 directly — no `loadSingleModule`, no `callExportedApi`, no `IoraService`. See the
-**[JSON-RPC guide](docs/iora/jsonrpc.md)** for the full API, and the quick-start
+**[JSON-RPC guide](docs/rpc/jsonrpc.md)** for the full API, and the quick-start
 example in the [Available Plugins](#-available-plugins) section above.
 
 ## 🔒 Thread-Safe Plugin API Access

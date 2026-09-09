@@ -1,0 +1,15 @@
+{
+  "schema": "iora/docs-manifest/v1",
+  "version": 1,
+  "_comment": "Header-to-guide map for the iora documentation set. The DQ7=B docs-lint (a post-v1 fast-follow) reads this to know which public header is documented by which guide, including consolidations where one guide covers several headers. Each documentation slice APPENDS its entries here as guides land (do not pre-seed a guide that does not yet exist). Guide paths are relative to iora/docs/; header paths are relative to iora/include/iora/.",
+  "guides": {
+    "rpc/jsonrpc.md": {
+      "area": "rpc",
+      "headers": [
+        "rpc/jsonrpc_client.hpp",
+        "rpc/jsonrpc_http.hpp",
+        "rpc/jsonrpc_server.hpp"
+      ]
+    }
+  }
+}

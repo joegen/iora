@@ -1,5 +1,7 @@
 # Iora JSON-RPC (`iora::rpc`) — Architecture & Programmer's Guide
 
+[Back to index](../../README.md)
+
 | | |
 |---|---|
 | **Version** | 1.0 |
@@ -14,6 +16,7 @@
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-09-09 | Initial guide covering the migrated `iora::rpc` library: the carrier-agnostic `JsonRpcServer` dispatcher, the `JsonRpcHttpEndpoint` HTTP carrier, and the pooled `JsonRpcClient`. Documents direct composition (no plugin/`.so`/`IoraService`), the notification-204 contract, batch re-alignment, fail-closed bearer auth, negotiated gzip, the RFC 9110 §9.2.2 retry gate, and the D-LIFETIME raw-pointer teardown model. |
+| 1.1 | 2026-09-09 | Relocated to `docs/rpc/`. Folded the RFC 9110 content-coding negotiation material from the now-frozen companion (`coding_trackers/docs/iora/jsonrpc_gzip_compression.md`) into new §3.5, updated to the shipped `iora::rpc` surface (shared `iora::parsers` primitives; no plugin/CORS/`-32600` transport framing). Full re-verification of the whole guide against the `iora::rpc` source headers (`jsonrpc_server.hpp`, `jsonrpc_http.hpp`, `jsonrpc_client.hpp`, `accept_encoding.hpp`, `content_coding.hpp`, `http_message.hpp`). |
 
 ---
 
@@ -230,6 +233,32 @@ explicit JsonRpcClient(iora::core::ThreadPool &threadPool, Config config = {});
 
 **Blocking-quiesce destructor.** `~JsonRpcClient` calls `Impl::quiesce()` on the destroying (user) thread. It (1) latches `_closing` (terminating if called from inside the client's own callback — a self-deadlock), (2) `cancelInFlight()`s every pooled `HttpClient` so a receive-parked exchange unwinds, (3) waits unconditionally for `_inFlight == 0`, then (4) clears `_pools`. When it returns, no user callback is running and no counted call is in flight; the honest residual is a call parked inside the user `httpClientFactory`/`httpClientConfigurer`, which the design cannot cancel.
 
+### 3.5 Content-coding negotiation (RFC 9110)
+
+Request-body and response-body gzip are **two orthogonal, independently-switched negotiations** — never fused. The request direction (client compresses, server may refuse) is driven by config plus a per-origin 415 latch (§3.4); the response direction (server compresses, client decodes) is negotiated by `Accept-Encoding` / `Vary`. Four switches, four code paths: client `Config::enableRequestCompression` / `advertiseAcceptEncoding` (`jsonrpc_client.hpp:300`/`:308`), server `JsonRpcHttpOptions::enableRequestDecompression` / `enableResponseCompression` (`jsonrpc_http.hpp:68`/`:69`). A client that only wants compressed *responses* keeps the defaults (`enableRequestCompression=false`, `advertiseAcceptEncoding=true`). Note the asymmetry: the client's `Accept-Encoding` request header advertises its *response*-decode capability, not a request-compression probe — the client compresses requests from config alone and degrades via the 415 net, never by probing.
+
+Both ingress paths — the server request decode (`JsonRpcHttpEndpoint::handle`) and the client response decode (`JsonRpcClientImpl::decodeResponseContentEncoding_`) — share three stateless free functions in the `iora::parsers` layer (`accept_encoding.hpp`, `content_coding.hpp`), placed there so an endpoint never reaches up into the application-framework layer, plus two internal `iora::network::detail` header-parse helpers in `http_message.hpp`. The RFC 9110 rules they enforce:
+
+| # | Rule (RFC 9110) | Where enforced |
+|---|-----------------|----------------|
+| a | **Duplicate/multiple `Content-Encoding` (and `Accept-Encoding`) field-lines COMBINE** into one ordered comma-list, in order, rather than last-wins-collapsing (§5.3). | `iora::network::detail::addOrCombineHeader` (`http_message.hpp:411`) gated by the `isListValuedHeader` allow-list that now carries `Content-Encoding`/`Accept-Encoding` (`http_message.hpp:397-402`); invoked from **both** header-parse paths (`http_message.hpp:991` and `:1211`). |
+| b | **`Accept-Encoding` q-values:** `gzip;q=0` is **not** acceptable; `*` is the fallback; absent/empty header resolves to identity; a malformed/out-of-range q is conservatively 0.0. | `parsers::gzipAcceptable` (`accept_encoding.hpp:183`) over `parseQValue` (`:89`); server consults it at `jsonrpc_http.hpp:533`. |
+| c | **`x-gzip` honored on decode AND negotiation, never emitted** (§8.4.1: `x-gzip` == gzip). | Honored: `parsers::isGzipContentCoding` (`content_coding.hpp:63`) and `gzipAcceptable` (`accept_encoding.hpp:210`). Emitted value is always the literal `"gzip"` — server `jsonrpc_http.hpp:539`, client `jsonrpc_client.hpp:2530`. |
+| d | **Coding tokens compared case-insensitively** (§8.4.1). | `isGzipContentCoding` and the `identity` checks use `core::StringUtils::iequals`; `gzipAcceptable` uses an ASCII case-fold. |
+| e | **No 406.** An unsatisfiable `Accept-Encoding` (e.g. a third-party `identity;q=0` for a sub-threshold or disabled response) is served **identity**, not rejected (contrast §15.5.7). | The `else` branch of `writeSuccess` (`jsonrpc_http.hpp:542-545`) when `gzipAcceptable` is false. |
+| f | **Coding order:** codings are applied in list order and **DECODED outermost-first** (reverse of applied order) (§8.4). | Reverse-iterator decode loops: endpoint `jsonrpc_http.hpp:266`, client `jsonrpc_client.hpp:2736`. |
+| g | **Untrusted `Content-Encoding` is scrubbed before it can reach a log** (log-injection defense). | `parsers::sanitizeCodingForLog` (`content_coding.hpp:74`) at endpoint `jsonrpc_http.hpp:256` and client `jsonrpc_client.hpp:2715`/`:2729`/`:2731`. |
+| h | **Stacked codings hard-capped at ≤ 2 on TOTAL list length** (identity tokens counted) — bounds stacked-inflate CPU **and** rejects an `identity,…,gzip` padding attack. | Endpoint `jsonrpc_http.hpp:225`, client `jsonrpc_client.hpp:2710`. |
+| i | **Empty/whitespace-only list elements are SKIPPED** (§5.6.1 — a legal consequence of comma-combining, e.g. `"gzip,,"`). | `parsers::splitContentCodings` (`content_coding.hpp:43`, skip at `:50`); `addOrCombineHeader` likewise drops an empty element (`http_message.hpp:422-424`). |
+
+Both decode paths validate **every** coding before decoding any (fail loudly on an unknown coding, never feed undecoded octets to the parser), and inflate each layer under an **incrementally-enforced** cap (`util::Gzip::decompress`) — the server bounds each inflate to `maxRequestBytes`, the client to `maxDecodedResponseBytes` — so a zip bomb is rejected before the whole buffer materializes.
+
+**415 disambiguation.** The content-coding 415 advertises the decodable set — `Accept-Encoding: gzip, identity` when `enableRequestDecompression` is on, else `identity` (`jsonrpc_http.hpp:249-250`) — which is precisely what lets a client's per-origin latch fire instead of silently 200-ing a parse error. The **media-type** 415 by contrast carries **no** `Accept-Encoding` by design (`jsonrpc_http.hpp:132-135`), so a client can tell the two 415s apart. Because content-coding handling is pinned **after** auth, an unauthenticated caller can never force decompression CPU or probe supported codings.
+
+**Cache correctness and error hygiene.** `Vary: Accept-Encoding` is set on **every** negotiated 200 (compressed, identity-negotiated, and no-`Accept-Encoding`) when response compression is enabled (`jsonrpc_http.hpp:528`, RFC 9110 §12.5.5); when response compression is disabled no negotiation occurs and `Vary` is intentionally omitted. Every error envelope and the 204 path stay **identity**: `writeEnvelope` defensively erases `Content-Encoding`/`Vary` (`jsonrpc_http.hpp:502-503`), and the 204 path clears the body and both entity headers (`jsonrpc_http.hpp:310-314`), so a compression throw that unwinds into the catch can never leak a stray gzip header onto an error.
+
+The client's response-decode cap `maxDecodedResponseBytes` (default 16 MiB) is aligned as the JSON parse cap for **every** response parse (decoded and identity), so the JSON ceiling is encoding-transparent — the same JSON is accepted whether it arrived gzipped or plain.
+
 ---
 
 ## 4. Usage Guide
@@ -373,6 +402,24 @@ cfg.enableRequestCompression = true; // gzip request bodies over compressionThre
 cfg.compressionThreshold = 1024;
 ```
 
+### 4.6 Runnable flagship example (CI-built)
+
+A complete, self-contained program combining the server composition (§4.1), the
+synchronous client call (§4.2), and negotiated gzip in both directions (§4.5) lives
+at [`examples/jsonrpc_example.cpp`](../../examples/jsonrpc_example.cpp). It is built
+in CI (`BUILD_EXAMPLES=ON`), so a change that breaks this headline API breaks the
+build. Build and run it with:
+
+```sh
+cmake --build build --target jsonrpc_example
+./build/examples/jsonrpc_example      # prints: add(2, 3) = 5
+```
+
+The example sets `compressionThreshold = 0` on both the server options and the client
+config **for demonstration only** — that forces the gzip path to run even for the tiny
+request/response of `add(2, 3)`. Production code should keep the `1024` default shown
+in §4.5; gzipping bodies smaller than a KiB wastes CPU and can expand them.
+
 ### Anti-Patterns
 
 - **Do NOT destroy the `JsonRpcServer` or `HttpServer` before `HttpServer::stop()` returns.** The endpoint holds raw pointers to both; post-destruction dispatch is undefined behaviour. Declare the server before the HTTP server, destroy the endpoint first, and call `stop()` before either is torn down.
@@ -513,7 +560,7 @@ cfg.compressionThreshold = 1024;
 | `httpClientFactory` | `HttpClientFactory` | empty (default installed) | `(origin, derived HttpClient::Config) -> unique_ptr<HttpClient>`; runs on the calling thread with no lock held |
 | `httpClientConfigurer` | `std::function<void(const std::string&, HttpClient&)>` | empty | Post-creation hook (e.g. TLS); same re-entrancy contract as the factory |
 | `enableRequestCompression` | `bool` | `false` | Gzip request bodies over `compressionThreshold` |
-| `advertiseAcceptEncoding` | `bool` | `true` | Emit `Accept-Encoding: gzip` (else `identity`) and enable response decode |
+| `advertiseAcceptEncoding` | `bool` | `true` | Emit `Accept-Encoding: gzip` (else `identity`). Does NOT gate response decoding -- gzip/x-gzip responses are always inflated (`decodeResponseContentEncoding_`); setting `false` only positively refuses server compression on the wire |
 | `compressionThreshold` | `std::size_t` | `1024` | Minimum request-body size to attempt gzip |
 | `maxDecodedResponseBytes` | `std::size_t` | `16 * 1024 * 1024` (16 MiB) | Response decode cap and the aligned JSON parse cap for every response |
 

@@ -63,6 +63,13 @@ if(BUILD_SAMPLES)
     add_subdirectory(sample)
 endif()
 
+# Optional: Build documentation flagship examples (CI-built; a broken headline API
+# breaks the build). See docs/manifest.json and the doc-wiki initiative.
+option(BUILD_EXAMPLES "Build documentation example programs" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
 # Always build the main source
 add_subdirectory(src)
 
