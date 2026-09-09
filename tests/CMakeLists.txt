@@ -148,6 +148,9 @@ set(PARSERS_TESTS
     parsers/iora_test_minimal_toml_serializer_array_of_tables
     parsers/iora_test_minimal_toml_parser_malformed
     parsers/iora_test_http_header_combining
+    parsers/iora_test_http_message_hardening
+    parsers/iora_test_accept_encoding
+    parsers/iora_test_content_coding
 )
 
 # Util namespace tests

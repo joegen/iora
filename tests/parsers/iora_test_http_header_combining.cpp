@@ -139,11 +139,15 @@ TEST_CASE("Cookie request header is NOT combined (last-wins)", "[http][nocombine
   REQUIRE(req.headers.at("Cookie") == "b=2");
 }
 
-TEST_CASE("Content-Length is NOT combined (last-wins, no smuggling)", "[http][nocombine]")
+TEST_CASE("Content-Length is NOT combined (identical duplicates collapse, no smuggling)",
+          "[http][nocombine]")
 {
+  // Content-Length is not a list-valued field: identical duplicates collapse to the
+  // single value ("5"), never combined to "5, 5". (Conflicting-value REJECTION is
+  // owned by the [framing] case below and iora_test_http_message_hardening.cpp.)
   auto req = HttpRequest::fromWireFormat(
-    reqWith("Content-Length: 5\r\nContent-Length: 7\r\n"));
-  REQUIRE(req.headers.at("Content-Length") == "7"); // NOT "5, 7"
+    reqWith("Content-Length: 5\r\nContent-Length: 5\r\n"));
+  REQUIRE(req.headers.at("Content-Length") == "5"); // NOT "5, 5"
 }
 
 TEST_CASE("Date is NOT combined (last-wins)", "[http][nocombine]")
@@ -234,17 +238,26 @@ TEST_CASE("addOrCombineHeader branches", "[http][helper]")
 // ---------------------------------------------------------------------------
 // Body-framing independence (defense-in-depth)
 // ---------------------------------------------------------------------------
-TEST_CASE("Duplicate Content-Length: handler-visible header is last-wins, not combined",
+TEST_CASE("Duplicate Content-Length with conflicting values is rejected at the parser",
           "[http][framing]")
 {
-  // NOTE: the HttpServer frames the request body in its OWN header loop BEFORE
-  // fromWireFormat, so the parsed headers map is never consulted for body framing.
-  // Here we pin that the parsed (handler-visible) Content-Length stays last-wins ("7"),
-  // so even a future server-loop refactor that re-read the parsed map could not pick up
-  // a combined "5, 7" value.
-  auto req = HttpRequest::fromWireFormat(
-    "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nHELLO!!");
-  REQUIRE(req.headers.at("Content-Length") == "7");
+  // Stronger than the former last-wins pinning: a request carrying two DIFFERING
+  // Content-Length field-lines is rejected 400 (RFC 9112 §6.3) before any handler
+  // sees it, so no combined/ambiguous value can ever reach the parsed map — even a
+  // future server-loop refactor that re-read that map could not pick up a smuggled
+  // framing. Symmetric with the Multiple-Host rejection.
+  bool threw = false;
+  try
+  {
+    HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: example.test\r\n"
+                                "Content-Length: 5\r\nContent-Length: 7\r\n\r\nHELLO!!");
+  }
+  catch (const iora::network::HttpRequestError &e)
+  {
+    threw = true;
+    REQUIRE(e.status() == 400);
+  }
+  REQUIRE(threw);
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@
 // details.
 
 #pragma once
-/// \file json2.hpp
+/// \file json.hpp
 /// \brief Single-header JSON value, parser, and serializer for Iora.
 ///
 /// Features

@@ -244,6 +244,24 @@ struct CaseInsensitiveCompare
   {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : static_cast<char>(c);
   }
+  /// \brief ASCII case-insensitive equality — one pass with a size short-circuit,
+  /// the primitive callers should use instead of re-deriving equality from the
+  /// strict-weak-ordering operator() (the double-negative !cmp(a,b) && !cmp(b,a)).
+  static bool equals(const std::string &a, const std::string &b)
+  {
+    if (a.size() != b.size())
+    {
+      return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+      if (asciiLower(static_cast<unsigned char>(a[i])) != asciiLower(static_cast<unsigned char>(b[i])))
+      {
+        return false;
+      }
+    }
+    return true;
+  }
   bool operator()(const std::string &a, const std::string &b) const
   {
     return std::lexicographical_compare(
@@ -437,6 +455,45 @@ inline void addOrCombineHeader(HttpHeaders &headers, const std::string &key,
     it->second = value; // non-list field: last-wins (prior behavior)
   }
 }
+
+/// \brief RFC 9112 §6.1: the transfer-coding list is chunk-framed iff its LAST
+/// non-empty token is "chunked" (ASCII case-insensitive). Splits the (already
+/// §5.3-combined) Transfer-Encoding value on commas and compares the final
+/// OWS-trimmed, non-empty token — never a bare substring match, which would fire
+/// on "x-chunked" or a non-final "chunked, gzip". Trailing empty list elements
+/// (RFC 9110 §5.6.1, e.g. "chunked,") are skipped. Shared by the request framing
+/// check and the response de-chunk path.
+inline bool isChunkedFinalCoding(const std::string &transferEncoding)
+{
+  std::string lastToken; // last non-empty, OWS-trimmed coding token seen
+  std::size_t pos = 0;
+  while (true)
+  {
+    const auto comma = transferEncoding.find(',', pos);
+    const std::size_t end = (comma == std::string::npos) ? transferEncoding.size() : comma;
+    std::string tok = transferEncoding.substr(pos, end - pos);
+    // A transfer-coding may carry ";"-parameters (RFC 9112 §7); the coding NAME is
+    // the substring before the first ';'. Strip it before trimming so a parameterized
+    // final coding ("chunked;x=y") is still recognized as chunked.
+    const auto semi = tok.find(';');
+    if (semi != std::string::npos)
+    {
+      tok = tok.substr(0, semi);
+    }
+    const auto b = tok.find_first_not_of(" \t");
+    if (b != std::string::npos)
+    {
+      const auto e = tok.find_last_not_of(" \t");
+      lastToken = tok.substr(b, e - b + 1);
+    }
+    if (comma == std::string::npos)
+    {
+      break;
+    }
+    pos = comma + 1;
+  }
+  return CaseInsensitiveCompare::equals(lastToken, "chunked");
+}
 } // namespace detail
 
 /// \brief URL parsing structure
@@ -481,7 +538,12 @@ inline ParsedUrl parseUrl(const std::string &url)
   if (schemeEnd != std::string::npos)
   {
     result.scheme = remaining.substr(0, schemeEnd);
-    std::transform(result.scheme.begin(), result.scheme.end(), result.scheme.begin(), ::tolower);
+    // Locale-independent ASCII lower-casing. ::tolower is locale-sensitive AND is
+    // undefined behavior for a byte >= 0x80 on a signed-char platform (the arg is
+    // sign-extended to a negative int outside unsigned char / EOF); asciiLower is
+    // the safe, locale-free equivalent used throughout this header.
+    std::transform(result.scheme.begin(), result.scheme.end(), result.scheme.begin(),
+                   [](char c) { return CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(c)); });
     remaining = remaining.substr(schemeEnd + 3);
   }
   else
@@ -808,6 +870,12 @@ public:
     bool firstLine = true;
 
     int hostCount = 0;
+    // RFC 9112 §6.3: detect request-smuggling framing hazards the single-value
+    // header map would otherwise hide — conflicting duplicate Content-Length
+    // field-lines, and the Transfer-Encoding + Content-Length combination.
+    std::set<std::string> contentLengthValues;
+    bool sawTransferEncoding = false;
+    std::string transferEncodingValue;
     while (std::getline(headerStream, line))
     {
       // Remove \r if present
@@ -837,16 +905,72 @@ public:
       const auto colonPos = line.find(':');
       if (colonPos != std::string::npos)
       {
+        // RFC 9112 §5.1: no whitespace is allowed between the field name and the
+        // colon; a server MUST reject such a request (400). Trimming it silently
+        // (as the map parse does) is a request-routing / smuggling desync vector.
+        if (colonPos > 0 && (line[colonPos - 1] == ' ' || line[colonPos - 1] == '\t'))
+        {
+          throw HttpRequestError(400, "Whitespace between header field name and colon");
+        }
         std::string name = line.substr(0, colonPos);
         name.erase(0, name.find_first_not_of(" \t"));
         name.erase(name.find_last_not_of(" \t") + 1);
-        static const CaseInsensitiveCompare ci;
-        if (!ci(name, "Host") && !ci("Host", name)) // case-insensitive equality
+        auto trimmedValue = [&line, colonPos]()
+        {
+          std::string value = line.substr(colonPos + 1);
+          value.erase(0, value.find_first_not_of(" \t"));
+          const auto vend = value.find_last_not_of(" \t");
+          value.erase(vend == std::string::npos ? 0 : vend + 1);
+          return value;
+        };
+        if (CaseInsensitiveCompare::equals(name, "Host"))
         {
           ++hostCount;
         }
+        else if (CaseInsensitiveCompare::equals(name, "Content-Length"))
+        {
+          contentLengthValues.insert(trimmedValue());
+        }
+        else if (CaseInsensitiveCompare::equals(name, "Transfer-Encoding"))
+        {
+          sawTransferEncoding = true;
+          transferEncodingValue = trimmedValue();
+        }
       }
       parseHeaderLine(line, request.headers);
+    }
+
+    // RFC 9112 §6.3 rule 4: two Content-Length field-lines with DIFFERING values, OR a
+    // single Content-Length with an invalid (non-1*DIGIT) value — e.g. an upstream-
+    // combined "5, 6", a non-numeric, signed, or empty value — are an unrecoverable
+    // framing error (request smuggling). Identical duplicates collapse to one and are
+    // tolerated. Symmetric with the Multiple-Host rejection below.
+    if (contentLengthValues.size() > 1)
+    {
+      throw HttpRequestError(400, "Conflicting Content-Length header fields");
+    }
+    if (!contentLengthValues.empty())
+    {
+      const std::string &cl = *contentLengthValues.begin();
+      const bool valid = !cl.empty() &&
+                         std::all_of(cl.begin(), cl.end(), [](char c) { return c >= '0' && c <= '9'; });
+      if (!valid)
+      {
+        throw HttpRequestError(400, "Invalid Content-Length value");
+      }
+    }
+    // RFC 9112 §6.3 rule 3: a message with both Transfer-Encoding and Content-Length
+    // may be an attempt at request smuggling and MUST be treated as an error.
+    if (sawTransferEncoding && !contentLengthValues.empty())
+    {
+      throw HttpRequestError(400, "Both Transfer-Encoding and Content-Length present");
+    }
+    // RFC 9112 §6.3: if Transfer-Encoding is present on a request, the chunked coding
+    // MUST be the final coding; otherwise the body length cannot be determined and the
+    // server MUST reject with 400.
+    if (sawTransferEncoding && !detail::isChunkedFinalCoding(transferEncodingValue))
+    {
+      throw HttpRequestError(400, "Transfer-Encoding without a final chunked coding");
     }
 
     // RFC 9112 §3.2: more than one Host field-line -> 400 (host-confusion / smuggling).
@@ -1169,9 +1293,11 @@ public:
       }
     }
 
-    // Handle chunked transfer encoding
-    auto transferEncoding = response.getHeader("transfer-encoding");
-    if (transferEncoding.find("chunked") != std::string::npos)
+    // Handle chunked transfer encoding. RFC 9112 §6.1: "chunked" is the message
+    // framing only when it is the FINAL transfer-coding — a substring test would
+    // also fire on "x-chunked", "not-chunked", or a non-final "chunked, gzip" and
+    // mis-frame the body. Check the last comma-separated, OWS-trimmed token.
+    if (detail::isChunkedFinalCoding(response.getHeader("transfer-encoding")))
     {
       response.body = parseChunkedBody(response.body);
     }
@@ -1229,7 +1355,19 @@ private:
       if (line.empty())
         continue;
 
-      // Parse chunk size (hex)
+      // RFC 9112 §7.1: chunk-size = 1*HEXDIG [ chunk-ext ]. The first octet MUST be
+      // a hex digit. std::stoull(base 16) otherwise silently accepts a leading sign
+      // or whitespace, so "-1" would parse as SIZE_MAX and drive a huge allocation
+      // below; reject any non-HEXDIG lead byte here.
+      const unsigned char lead = static_cast<unsigned char>(line.front());
+      const bool leadIsHex = (lead >= '0' && lead <= '9') || (lead >= 'a' && lead <= 'f') ||
+                             (lead >= 'A' && lead <= 'F');
+      if (!leadIsHex)
+      {
+        break; // malformed chunk size
+      }
+
+      // Parse chunk size (hex); stoull stops at the ';' of any chunk-ext.
       std::size_t chunkSize;
       try
       {
@@ -1237,13 +1375,23 @@ private:
       }
       catch (...)
       {
-        break; // Invalid chunk size
+        break; // Invalid / out-of-range chunk size
       }
 
       if (chunkSize == 0)
       {
         // End of chunks
         break;
+      }
+
+      // The entire chunked payload is already buffered in chunkedData, so a single
+      // chunk can never legitimately exceed the total input size. Bounding the
+      // allocation against chunkedData.size() defeats a hostile chunk-size (e.g.
+      // 7fffffffffffffff) that would otherwise trigger memory exhaustion or an
+      // uncaught std::bad_alloc / std::length_error out of fromWireFormat.
+      if (chunkSize > chunkedData.size())
+      {
+        break; // oversized / malformed chunk size
       }
 
       // Read chunk data
@@ -1276,40 +1424,99 @@ private:
   std::vector<Part> _parts;
   std::string _boundary;
 
-public:
-  MultipartFormData()
+  /// \brief Reject a name/filename emitted INSIDE a Content-Disposition
+  /// quoted-string. RFC 7578 §4.2 / RFC 9110 §5.6.4: a double quote closes the
+  /// quoted-string and a backslash starts a quoted-pair (a trailing '\' escapes
+  /// the intended closing quote and runs the parser past the part boundary), so
+  /// both are rejected in addition to the CR/LF/NUL injection set.
+  static void rejectQuotedParam(const std::string &value, const char *what)
   {
-    // Generate random boundary
+    if (value.find('"') != std::string::npos || value.find('\\') != std::string::npos ||
+        headerHasInjection(value))
+    {
+      throw std::invalid_argument(std::string("Multipart ") + what +
+                                  " contains an illegal character (\", \\, CR, LF, or NUL)");
+    }
+  }
+
+  /// \brief Reject a value emitted as a BARE header value (Content-Type). Only
+  /// CR/LF/NUL corrupt framing there (RFC 9110 §5.5); a double quote is legitimate
+  /// in a media-type parameter (e.g. charset="utf-8") and must NOT be rejected.
+  static void rejectBareHeaderParam(const std::string &value, const char *what)
+  {
+    if (headerHasInjection(value))
+    {
+      throw std::invalid_argument(std::string("Multipart ") + what +
+                                  " contains an illegal character (CR, LF, or NUL)");
+    }
+  }
+
+  /// \brief Generate a fresh random multipart boundary token.
+  static std::string makeBoundary()
+  {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> dis(0, 15);
-
-    _boundary = "----IoraBoundary";
+    std::string boundary = "----IoraBoundary";
     for (int i = 0; i < 16; ++i)
     {
-      _boundary += "0123456789abcdef"[dis(gen)];
+      boundary += "0123456789abcdef"[dis(gen)];
+    }
+    return boundary;
+  }
+
+  /// \brief Ensure the boundary token does not occur in any part's (opaque) content,
+  /// which would let a boundary embedded in content forge a part separator. Part
+  /// content is never injection-filtered (it is opaque body data), so the boundary —
+  /// not the content — is what must move. Regenerating here keeps the boundary valid
+  /// at all times, so getBoundary()/getContentType()/build() stay consistent.
+  void ensureBoundaryDistinct()
+  {
+    auto collides = [this]()
+    {
+      for (const auto &p : _parts)
+      {
+        if (p.content.find(_boundary) != std::string::npos)
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+    while (collides())
+    {
+      _boundary = makeBoundary();
     }
   }
+
+public:
+  MultipartFormData() : _boundary(makeBoundary()) {}
 
   /// \brief Add text field
   void addField(const std::string &name, const std::string &value)
   {
+    rejectQuotedParam(name, "field name");
     Part part;
     part.name = name;
     part.content = value;
     _parts.push_back(part);
+    ensureBoundaryDistinct();
   }
 
   /// \brief Add file field
   void addFile(const std::string &name, const std::string &filename, const std::string &content,
                const std::string &contentType = "application/octet-stream")
   {
+    rejectQuotedParam(name, "field name");
+    rejectQuotedParam(filename, "filename");
+    rejectBareHeaderParam(contentType, "content type");
     Part part;
     part.name = name;
     part.filename = filename;
     part.contentType = contentType;
     part.content = content;
     _parts.push_back(part);
+    ensureBoundaryDistinct();
   }
 
   /// \brief Get boundary string

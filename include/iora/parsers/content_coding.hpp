@@ -40,7 +40,7 @@ namespace parsers
 /// (RFC 9110 §5.6.1 — a legal consequence of comma-combining, e.g. "gzip,," or
 /// ", gzip"). Tokens keep their original case; callers compare case-insensitively
 /// (RFC 9110 §8.4.1). Composes the foundation StringUtils::split/trim primitives.
-inline std::vector<std::string> splitContentCodings(const std::string &value)
+inline std::vector<std::string> splitContentCodings(std::string_view value)
 {
   std::vector<std::string> out;
   for (std::string_view tok : iora::core::StringUtils::split(value, ','))
@@ -83,7 +83,7 @@ inline std::string sanitizeCodingForLog(std::string_view value, std::size_t maxL
     {
       out.push_back(static_cast<char>(c));
     }
-    else if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+    else if (c == '\t' || c == '\r' || c == '\n')
     {
       out.push_back(' ');
     }

@@ -7,11 +7,13 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 
 #include <iora/core/string_utils.hpp>
+#include <iora/core/unicode.hpp>
 
 namespace iora
 {
@@ -52,23 +54,6 @@ inline std::string escapeHtml(std::string_view in)
 namespace detail
 {
 
-inline int hexNibble(unsigned char c)
-{
-  if (c >= '0' && c <= '9')
-  {
-    return c - '0';
-  }
-  if (c >= 'a' && c <= 'f')
-  {
-    return c - 'a' + 10;
-  }
-  if (c >= 'A' && c <= 'F')
-  {
-    return c - 'A' + 10;
-  }
-  return -1;
-}
-
 inline std::string percentDecode(std::string_view in, bool plusIsSpace)
 {
   std::string out;
@@ -82,9 +67,9 @@ inline std::string percentDecode(std::string_view in, bool plusIsSpace)
     {
       if (i + 2 < n)
       {
-        const int hi = hexNibble(static_cast<unsigned char>(in[i + 1]));
-        const int lo = hexNibble(static_cast<unsigned char>(in[i + 2]));
-        if (hi >= 0 && lo >= 0)
+        std::uint32_t hi = 0;
+        std::uint32_t lo = 0;
+        if (iora::core::hexDigitValue(in[i + 1], hi) && iora::core::hexDigitValue(in[i + 2], lo))
         {
           out += static_cast<char>((hi << 4) | lo);
           i += 3;
