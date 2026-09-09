@@ -723,3 +723,82 @@ TEST_CASE("XML Parser - Performance and Limits", "[xml][parser][performance]")
     REQUIRE(parser.error() == nullptr);
   }
 }
+
+TEST_CASE("XML numeric char refs - multi-byte, surrogate reject, overflow",
+          "[xml][entities][unicode]")
+{
+  // Numeric character references - multi-byte and range coverage. Locks the
+  // behavior preserved when appendCharRef was migrated to iora::core::appendUtf8
+  // and the accumulation gained an over-range guard.
+  SECTION("two-byte hex ref (U+00E9)")
+  {
+    std::string out;
+    Error err;
+    REQUIRE(Parser::decodeEntities("&#xE9;", out, &err));
+    REQUIRE(out == "\xC3\xA9");
+  }
+
+  SECTION("two-byte decimal ref (U+00E9)")
+  {
+    std::string out;
+    Error err;
+    REQUIRE(Parser::decodeEntities("&#233;", out, &err));
+    REQUIRE(out == "\xC3\xA9");
+  }
+
+  SECTION("three-byte hex ref (U+20AC)")
+  {
+    std::string out;
+    Error err;
+    REQUIRE(Parser::decodeEntities("&#x20AC;", out, &err));
+    REQUIRE(out == "\xE2\x82\xAC");
+  }
+
+  SECTION("four-byte hex ref (U+1F600)")
+  {
+    std::string out;
+    Error err;
+    REQUIRE(Parser::decodeEntities("&#x1F600;", out, &err));
+    REQUIRE(out == "\xF0\x9F\x98\x80");
+  }
+
+  SECTION("surrogate-half ref is rejected (U+D800)")
+  {
+    std::string out;
+    Error err;
+    REQUIRE_FALSE(Parser::decodeEntities("&#xD800;", out, &err));
+  }
+
+  SECTION("above-Unicode ref is rejected (U+110000)")
+  {
+    std::string out;
+    Error err;
+    REQUIRE_FALSE(Parser::decodeEntities("&#x110000;", out, &err));
+  }
+
+  SECTION("overflowing hex ref does not wrap to a valid code point")
+  {
+    // 0x100000041 would wrap uint32_t to 0x41 (A) without the in-loop guard.
+    std::string out;
+    Error err;
+    REQUIRE_FALSE(Parser::decodeEntities("&#x100000041;", out, &err));
+    REQUIRE(out.empty());
+  }
+
+  SECTION("overflowing decimal ref does not wrap to a valid code point")
+  {
+    std::string out;
+    Error err;
+    REQUIRE_FALSE(Parser::decodeEntities("&#4294967361;", out, &err));
+    REQUIRE(out.empty());
+  }
+
+  SECTION("empty hex ref is rejected, not decoded to NUL")
+  {
+    // "&#x;" has no hex digits; it must be rejected rather than yielding U+0000.
+    std::string out;
+    Error err;
+    REQUIRE_FALSE(Parser::decodeEntities("&#x;", out, &err));
+    REQUIRE(out.empty());
+  }
+}

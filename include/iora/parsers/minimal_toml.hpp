@@ -243,8 +243,16 @@ public:
       else
       {
         auto [key, value] = parseKeyValue();
-        if (!key.empty())
-          currentTable->insert(key, value);
+        // parseKeyValue only fails to advance _pos when parseKey found no
+        // key character at all (a line beginning with '@', '=', a quote,
+        // etc.). Treating that as a skippable empty key would spin the outer
+        // loop forever, so reject the malformed line instead.
+        if (key.empty())
+        {
+          throw std::runtime_error(
+            "Invalid line: expected a section header or 'key = value'");
+        }
+        currentTable->insert(key, value);
       }
       skipWhitespaceAndComments();
     }

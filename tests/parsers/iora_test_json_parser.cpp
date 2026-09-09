@@ -734,3 +734,123 @@ TEST_CASE("JSON Parser - Error Recovery", "[json][errors]")
     }
   }
 }
+
+TEST_CASE("JSON \\uXXXX unicode escapes decode to UTF-8", "[json][unicode]")
+{
+  // Inputs use raw string literals so the two characters backslash-u reach
+  // the parser verbatim and exercise the \\uXXXX decode path. A raw UTF-8
+  // literal here would instead hit the byte-passthrough branch and prove
+  // nothing about decoding.
+  SECTION("ASCII code point (U+0041)")
+  {
+    REQUIRE(Json::parseString(R"("\u0041")").get<std::string>() == "A");
+  }
+
+  SECTION("two-byte code point (U+00E9 e-acute)")
+  {
+    REQUIRE(Json::parseString(R"("\u00e9")").get<std::string>() ==
+            "\xC3\xA9");
+  }
+
+  SECTION("three-byte code point (U+20AC euro sign)")
+  {
+    REQUIRE(Json::parseString(R"("\u20ac")").get<std::string>() ==
+            "\xE2\x82\xAC");
+  }
+
+  SECTION("surrogate pair decodes to supplementary plane (U+1F600)")
+  {
+    REQUIRE(Json::parseString(R"("\uD83D\uDE00")").get<std::string>() ==
+            "\xF0\x9F\x98\x80");
+  }
+
+  SECTION("embedded NUL (U+0000) decodes to a single 0x00 byte")
+  {
+    std::string s = Json::parseString(R"("\u0000")").get<std::string>();
+    REQUIRE(s.size() == 1);
+    REQUIRE(s[0] == '\0');
+  }
+
+  SECTION("escape decodes, does not become a \'?\' placeholder")
+  {
+    REQUIRE(Json::parseString(R"("\u0041")").get<std::string>() != "?");
+  }
+
+  SECTION("uppercase and lowercase hex are equivalent")
+  {
+    REQUIRE(Json::parseString(R"("\u00E9")").get<std::string>() ==
+            Json::parseString(R"("\u00e9")").get<std::string>());
+  }
+
+  SECTION("escape decodes within surrounding literal text")
+  {
+    REQUIRE(Json::parseString(R"("a\u0042c")").get<std::string>() == "aBc");
+  }
+}
+
+TEST_CASE("JSON malformed \\u escapes are rejected", "[json][unicode]")
+{
+  auto rejects = [](const std::string &input)
+  {
+    bool threw = false;
+    try
+    {
+      Json::parseString(input);
+    }
+    catch (const std::exception &)
+    {
+      threw = true;
+    }
+    return threw;
+  };
+
+  SECTION("non-hex digit")
+  {
+    REQUIRE(rejects(R"("\u00zz")"));
+  }
+
+  SECTION("truncated escape at end of input")
+  {
+    REQUIRE(rejects(R"("\u12")"));
+  }
+
+  SECTION("unpaired high surrogate")
+  {
+    REQUIRE(rejects(R"("\uD83D")"));
+  }
+
+  SECTION("high surrogate followed by non-low-surrogate escape")
+  {
+    REQUIRE(rejects(R"("\uD83DA")"));
+  }
+
+  SECTION("lone low surrogate")
+  {
+    REQUIRE(rejects(R"("\uDE00")"));
+  }
+}
+
+TEST_CASE("JSON rejects unescaped control characters in strings",
+          "[json][strings]")
+{
+  SECTION("raw newline")
+  {
+    std::string input = "\"line\nbreak\"";
+    bool threw = false;
+    try
+    {
+      Json::parseString(input);
+    }
+    catch (const std::exception &)
+    {
+      threw = true;
+    }
+    REQUIRE(threw);
+  }
+
+  SECTION("escaped newline is still accepted")
+  {
+    REQUIRE(Json::parseString(R"("line\nbreak")").get<std::string>() ==
+            "line\nbreak");
+  }
+}

@@ -39,6 +39,8 @@
 #include <utility>
 #include <vector>
 
+#include "iora/core/unicode.hpp"
+
 #ifndef IORA_XML_ENABLE_SAX
 #define IORA_XML_ENABLE_SAX 1
 #endif
@@ -898,28 +900,26 @@ private:
     uint32_t code = 0;
     if (entBody[1] == 'x' || entBody[1] == 'X')
     {
-      // hex
+      // hex: require at least one hex digit after the 'x' ("&#x;" is malformed
+      // per XML 1.0; without this it would decode to a bogus U+0000).
+      if (entBody.size() < 3)
+      {
+        return false;
+      }
       for (std::size_t i = 2; i < entBody.size(); ++i)
       {
-        char c = entBody[i];
-        uint32_t v = 0;
-        if (c >= '0' && c <= '9')
-        {
-          v = static_cast<uint32_t>(c - '0');
-        }
-        else if (c >= 'a' && c <= 'f')
-        {
-          v = static_cast<uint32_t>(c - 'a' + 10);
-        }
-        else if (c >= 'A' && c <= 'F')
-        {
-          v = static_cast<uint32_t>(c - 'A' + 10);
-        }
-        else
+        std::uint32_t v = 0;
+        if (!iora::core::hexDigitValue(entBody[i], v))
         {
           return false;
         }
         code = (code << 4) | v;
+        // Reject before the next shift can wrap uint32_t; the shared encoder
+        // rejects the same ceiling but only after a wrap would have masked it.
+        if (code > 0x10FFFFu)
+        {
+          return false;
+        }
       }
     }
     else
@@ -933,45 +933,13 @@ private:
           return false;
         }
         code = code * 10u + static_cast<uint32_t>(c - '0');
+        if (code > 0x10FFFFu)
+        {
+          return false;
+        }
       }
     }
-    if (!encodeUtf8(code, out))
-    {
-      return false;
-    }
-    return true;
-  }
-
-  static bool encodeUtf8(uint32_t cp, std::string &out)
-  {
-    if (cp <= 0x7Fu)
-    {
-      out.push_back(static_cast<char>(cp));
-    }
-    else if (cp <= 0x7FFu)
-    {
-      out.push_back(static_cast<char>(0xC0u | ((cp >> 6) & 0x1Fu)));
-      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    }
-    else if (cp <= 0xFFFFu)
-    {
-      // Exclude UTF-16 surrogate halves
-      if (cp >= 0xD800u && cp <= 0xDFFFu)
-      {
-        return false;
-      }
-      out.push_back(static_cast<char>(0xE0u | ((cp >> 12) & 0x0Fu)));
-      out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    }
-    else if (cp <= 0x10FFFFu)
-    {
-      out.push_back(static_cast<char>(0xF0u | ((cp >> 18) & 0x07u)));
-      out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
-      out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    }
-    else
+    if (!iora::core::appendUtf8(out, code))
     {
       return false;
     }

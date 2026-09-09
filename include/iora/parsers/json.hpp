@@ -51,6 +51,8 @@
 #include <variant>
 #include <vector>
 
+#include "iora/core/unicode.hpp"
+
 namespace iora
 {
 namespace parsers
@@ -1271,6 +1273,34 @@ private:
     return true;
   }
 
+  /// \brief Decode the four hex digits of a \uXXXX escape.
+  /// Precondition: _pos indexes the 'u'. On success advances _pos to the last
+  /// hex digit (the caller's trailing ++_pos then consumes it) and stores the
+  /// 16-bit value in out. Returns false (setting _error) on truncation or a
+  /// non-hex digit.
+  bool _parseHex4(std::uint32_t &out)
+  {
+    if (_pos + 4 >= _text.size())
+    {
+      _error = "Incomplete \\u escape";
+      return false;
+    }
+    std::uint32_t value = 0;
+    for (std::size_t i = 1; i <= 4; ++i)
+    {
+      std::uint32_t d;
+      if (!iora::core::hexDigitValue(_text[_pos + i], d))
+      {
+        _error = "Invalid hex digit in \\u escape";
+        return false;
+      }
+      value = (value << 4) | d;
+    }
+    _pos += 4;
+    out = value;
+    return true;
+  }
+
   bool _parseString(Json &out)
   {
     if (_text[_pos] != '"')
@@ -1326,10 +1356,47 @@ private:
           str += '\t';
           break;
         case 'u':
-          // Unicode escape - simplified implementation
-          _pos += 4;  // Skip the 4 hex digits for now
-          str += '?'; // Placeholder
+        {
+          std::uint32_t cp;
+          if (!_parseHex4(cp))
+          {
+            return false;
+          }
+          if (cp >= 0xD800 && cp <= 0xDBFF)
+          {
+            // High surrogate: RFC 8259 requires a following low-surrogate
+            // escape to form a supplementary-plane code point.
+            if (_pos + 2 >= _text.size() || _text[_pos + 1] != '\\' ||
+                _text[_pos + 2] != 'u')
+            {
+              _error = "Unpaired high surrogate in \\u escape";
+              return false;
+            }
+            _pos += 2; // advance to the second 'u'
+            std::uint32_t lo;
+            if (!_parseHex4(lo))
+            {
+              return false;
+            }
+            if (lo < 0xDC00 || lo > 0xDFFF)
+            {
+              _error = "Invalid low surrogate in \\u escape";
+              return false;
+            }
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          }
+          else if (cp >= 0xDC00 && cp <= 0xDFFF)
+          {
+            _error = "Unexpected low surrogate in \\u escape";
+            return false;
+          }
+          if (!iora::core::appendUtf8(str, cp))
+          {
+            _error = "Invalid code point in \\u escape";
+            return false;
+          }
           break;
+        }
         default:
           _error = "Invalid escape sequence";
           return false;
@@ -1337,6 +1404,12 @@ private:
       }
       else
       {
+        unsigned char uc = static_cast<unsigned char>(_text[_pos]);
+        if (uc < 0x20)
+        {
+          _error = "Unescaped control character in string";
+          return false;
+        }
         str += _text[_pos];
       }
       ++_pos;
