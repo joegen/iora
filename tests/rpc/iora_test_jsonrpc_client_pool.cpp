@@ -21,9 +21,12 @@
 // so no std::set_terminate is installed.
 
 #define CATCH_CONFIG_RUNNER
-#include "iora/iora.hpp"
+#include "iora/core/thread_pool.hpp"
+#include "iora/network/http_client.hpp"
+#include "iora/network/http_server.hpp"
+#include "iora/parsers/json.hpp"
 
-#include "jsonrpc_client.hpp"
+#include "iora/rpc/jsonrpc_client.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +35,10 @@
 // connect-refusal discriminator test (tracker 2026-09-03-3). Included after
 // catch2/catch.hpp because the helper uses REQUIRE at construction.
 #include "iora_test_net_utils.hpp"
+// Shared testrpc::requestId (Slice-B review L9/S-4). The LIGHT id header (only
+// json + gzip) — client_pool uses only requestId, not the server-composition
+// fixture, so it must not transitively compile JsonRpcHttpEndpoint/JsonRpcServer.
+#include "jsonrpc_test_ids.hpp"
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -63,8 +70,8 @@
 #include <unistd.h>
 
 using namespace iora;
-using iora::modules::connectors::Config;
-using iora::modules::connectors::JsonRpcClient;
+using iora::rpc::Config;
+using iora::rpc::JsonRpcClient;
 
 // ---------------------------------------------------------------------------
 // task-1.2a — the POOL observation seam. Defined here (never in the shipped
@@ -76,9 +83,7 @@ using iora::modules::connectors::JsonRpcClient;
 // ---------------------------------------------------------------------------
 namespace iora
 {
-namespace modules
-{
-namespace connectors
+namespace rpc
 {
 struct JsonRpcClientTestAccess
 {
@@ -371,19 +376,18 @@ struct JsonRpcClientTestAccess
   /// documented once, at case (z) itself.
   static std::vector<iora::parsers::Json>
   sendBatchOnLeaseDirect(JsonRpcClient &c, detail::ConnectionLease &lease, const std::string &ep,
-                         const std::vector<iora::modules::connectors::BatchItem> &items)
+                         const std::vector<iora::rpc::BatchItem> &items)
   {
     return c._impl->sendBatchOnLease_(lease, ep, items, {});
   }
 };
-} // namespace connectors
-} // namespace modules
+} // namespace rpc
 } // namespace iora
 
-using iora::modules::connectors::JsonRpcClientTestAccess;
-using iora::modules::connectors::PoolExhaustedError;
-using iora::modules::connectors::detail::ConnectionLease;
-using iora::modules::connectors::detail::PooledConnection;
+using iora::rpc::JsonRpcClientTestAccess;
+using iora::rpc::PoolExhaustedError;
+using iora::rpc::detail::ConnectionLease;
+using iora::rpc::detail::PooledConnection;
 
 // task-2.2 — the pImpl facade must stay non-copyable AND non-movable; a facade
 // that could be copied or moved would share one JsonRpcClientImpl between two
@@ -588,7 +592,7 @@ std::function<void(std::exception_ptr)> shutdownErrorProbe(std::atomic<bool> &er
     {
       std::rethrow_exception(e);
     }
-    catch (const iora::modules::connectors::ClientShutdownError &)
+    catch (const iora::rpc::ClientShutdownError &)
     {
       wasShutdown.store(true);
     }
@@ -613,6 +617,19 @@ Config stubFactoryConfig()
 /// member, so parseResponseOrThrow_ returns the
 /// result rather than throwing RemoteError (task-1.3(D)).
 constexpr const char *kJsonRpcSuccessBody = R"({"jsonrpc":"2.0","result":{},"id":1})";
+
+/// \brief A JSON-RPC 2.0 success envelope ({"result":{}}) echoing the id of the
+/// request in \p requestBody. task-6.5 port: the migrated client enforces
+/// id-correlation (task-5b.3), so a fixture replying with a fixed id fails the
+/// second call of a multi-call case. Falls back to null id on an unparseable body.
+inline std::string echoSuccessBody(const std::string &requestBody)
+{
+  iora::parsers::Json env;
+  env["jsonrpc"] = "2.0";
+  env["result"] = iora::parsers::Json::object();
+  env["id"] = testrpc::requestId(requestBody); // Slice-B review L9: shared id extraction
+  return env.dump();
+}
 
 // -------------------------------------------------------------------------
 // task-1.3 (part 1) — LATCHED HTTP SERVER fixture. A POST handler signals its
@@ -639,7 +656,7 @@ public:
       : _waitBound(handlerWaitBound), _server("127.0.0.1", static_cast<int>(port))
   {
     _server.onPost("/rpc",
-                   [this](const iora::network::HttpServer::Request &,
+                   [this](const iora::network::HttpServer::Request &req,
                           iora::network::HttpServer::Response &res)
                    {
                      {
@@ -649,7 +666,10 @@ public:
                        // Bounded: return even if release() is never called.
                        _releaseCv.wait_for(lk, _waitBound, [this] { return _released; });
                      }
-                     res.set_content(kJsonRpcSuccessBody, "application/json");
+                     // task-6.5 port: ECHO the request id. The migrated client
+                     // enforces id-correlation (task-5b.3), so a fixed id:1 body
+                     // fails on the second call of a multi-call case (e.g. cr2).
+                     res.set_content(echoSuccessBody(req.body), "application/json");
                      std::lock_guard<std::mutex> lk(_m);
                      ++_completed;
                    });
@@ -973,7 +993,8 @@ private:
       }
       std::vector<std::string> fieldLines;
       std::string requestLine;
-      if (!readOneRequest(cs, carry, fieldLines, requestLine))
+      std::string requestBody;
+      if (!readOneRequest(cs, carry, fieldLines, requestLine, requestBody))
       {
         return; // peer closed, real error, or stop() during an idle wait
       }
@@ -999,7 +1020,7 @@ private:
       {
         return; // stop() requested during the scripted delay
       }
-      if (!writeAll(cs, _policy.rawResponseOverride.empty() ? buildResponse()
+      if (!writeAll(cs, _policy.rawResponseOverride.empty() ? buildResponse(requestBody)
                                                             : _policy.rawResponseOverride))
       {
         _writeError.store(true, std::memory_order_release); // cpp17 L-4
@@ -1040,7 +1061,7 @@ private:
   /// reconnect and break one-pool-one-socket assertions), while polling _stop for
   /// prompt teardown (ts M-1). Returns false on peer close, real error, or stop().
   bool readOneRequest(int cs, std::string &carry, std::vector<std::string> &fieldLines,
-                      std::string &requestLine)
+                      std::string &requestLine, std::string &requestBody)
   {
     std::string acc = std::move(carry);
     carry.clear();
@@ -1153,6 +1174,8 @@ private:
         return false;
       }
     }
+    // task-6.5 port: expose this request's body so buildResponse can echo its id.
+    requestBody = bodyAcc.substr(0, contentLength);
     // Keep any bytes beyond this request's body for the next request (web L-5).
     if (bodyAcc.size() > contentLength)
     {
@@ -1161,8 +1184,15 @@ private:
     return true;
   }
 
-  std::string buildResponse() const
+  std::string buildResponse(const std::string &requestBody) const
   {
+    // task-6.5 port: when the policy uses the DEFAULT success body, ECHO the
+    // request id (the migrated client enforces id-correlation, task-5b.3, so a
+    // fixed id:1 body fails the second call of a keep-alive / multi-call case). A
+    // policy that sets an explicit body (batch arrays, error envelopes) is sent
+    // verbatim — those cases drive a single call whose id already matches.
+    const std::string body =
+      (_policy.body == kJsonRpcSuccessBody) ? echoSuccessBody(requestBody) : _policy.body;
     std::string r =
       "HTTP/1.1 " + std::to_string(_policy.statusCode) + " " + _policy.reason + "\r\n";
     // web L-6: 1xx/204/304 carry no body and no Content-Length (RFC 9112 6.3
@@ -1173,7 +1203,7 @@ private:
     if (!bodyless)
     {
       r += "Content-Type: application/json\r\n";
-      r += "Content-Length: " + std::to_string(_policy.body.size()) + "\r\n";
+      r += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     }
     for (const auto &h : _policy.extraResponseHeaders)
     {
@@ -1186,7 +1216,7 @@ private:
     r += "\r\n";
     if (!bodyless)
     {
-      r += _policy.body;
+      r += body;
     }
     return r;
   }
@@ -1242,29 +1272,11 @@ Config::HttpClientFactory capturingFactory(iora::network::HttpClient::Config &ca
   };
 }
 
-/// \brief Bring up a single process-wide IoraService the client ctor requires.
-/// JsonRpcClient's constructor takes an IoraService& and a core::ThreadPool&,
-/// so the service must be initialized exactly once for the whole binary.
-iora::IoraService &testService()
-{
-  static bool initialized = false;
-  if (!initialized)
-  {
-    iora::IoraService::Config config;
-    // These pool tests never use the service's HTTP server (the client drives
-    // its own HttpClient instances and JsonRpcClient::_service is dead state),
-    // so disable it: that removes the fixed-port bind and, with it, the only
-    // path by which IoraService::init can throw here (iora.hpp:1175 gates the
-    // WebhookServer bind/listen on features.server).
-    config.features.server = false;
-    config.log.file = "jsonrpc_client_pool_test";
-    config.log.level = "info";
-    config.modules.autoLoad = false;
-    iora::IoraService::init(config);
-    initialized = true;
-  }
-  return iora::IoraService::instanceRef();
-}
+// PORT NOTE (task-6.5): the migrated JsonRpcClient no longer takes an
+// IoraService& (task-5.2), so the process-wide testService() the old ctor
+// required is gone, and every `JsonRpcClient c(svc, pool, cfg)` is now
+// `JsonRpcClient c(pool, cfg)`. The client drives its own HttpClient instances,
+// so no service is needed.
 
 } // namespace
 
@@ -1276,11 +1288,10 @@ iora::IoraService &testService()
 TEST_CASE("scaffold: JsonRpcClient constructs against a live service",
           "[jsonrpc][pool][scaffold]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
   Config cfg;
   cfg.maxConnectionsPerEndpoint = 2;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   REQUIRE(client.config().maxConnectionsPerEndpoint == 2);
 }
 
@@ -1291,11 +1302,10 @@ TEST_CASE("scaffold: JsonRpcClient constructs against a live service",
 TEST_CASE("seam: snapshot observes acquired connection identity",
           "[jsonrpc][pool][seam]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string ep = "http://rpc.test/rpc";
 
@@ -1338,7 +1348,6 @@ TEST_CASE("seam: snapshot observes acquired connection identity",
 TEST_CASE("fixture: latched HTTP server holds a request until released",
           "[jsonrpc][pool][fixture][latched]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(/*initial*/ 2, /*max*/ 2, std::chrono::seconds(1));
 
   const std::uint16_t serverPort = 18150;
@@ -1346,7 +1355,7 @@ TEST_CASE("fixture: latched HTTP server holds a request until released",
 
   Config cfg; // real (non-stub) factory so the client talks to the fixture
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   std::atomic<bool> callDone{false};
@@ -1403,12 +1412,11 @@ TEST_CASE("fixture: latched HTTP server holds a request until released",
 TEST_CASE("CR-1 fixed: identity-based release frees the leased connection, not a shifted neighbor",
           "[jsonrpc][pool][cr1]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3; // pinned to the exact number created (cpp17 H-C)
   cfg.idleTimeout = std::chrono::milliseconds(50);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string ep = "http://rpc.test/rpc";
 
@@ -1464,12 +1472,11 @@ TEST_CASE("CR-1 fixed: identity-based release frees the leased connection, not a
 TEST_CASE("task-4.3: purgeIdle evicts nothing while all connections are leased",
           "[jsonrpc][pool][phase4]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
   cfg.idleTimeout = std::chrono::milliseconds(10); // short, so expiry is not the reason
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://rpc.test/rpc";
 
   auto a = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
@@ -1511,12 +1518,11 @@ TEST_CASE("task-4.3: purgeIdle evicts nothing while all connections are leased",
 TEST_CASE("task-4.1b: purgeIdle evicts idle connections without blocking other endpoints",
           "[jsonrpc][pool][phase4]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 8;
   cfg.idleTimeout = std::chrono::milliseconds(40);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string epEvict = "http://evict.test/rpc";
   const std::string epLive = "http://live.test/rpc";
@@ -1594,11 +1600,10 @@ TEST_CASE("task-4.1b: purgeIdle evicts idle connections without blocking other e
 TEST_CASE("task-4.2/4.3: EndpointPool::erase throws on an absent or in-use handle",
           "[jsonrpc][pool][phase4]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://rpc.test/rpc";
 
   // (b) in-use guard: hold a lease so its connection is in use, then try to
@@ -1631,14 +1636,13 @@ TEST_CASE("task-4.2/4.3: EndpointPool::erase throws on an absent or in-use handl
 TEST_CASE("task-4.1c CR-1c: a lease releases cleanly into a pool erased from the map",
           "[jsonrpc][pool][phase4]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://rpc.test/rpc";
 
-  std::shared_ptr<iora::modules::connectors::detail::EndpointPool> detached;
+  std::shared_ptr<iora::rpc::detail::EndpointPool> detached;
   {
     auto lease = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
     const auto id = JsonRpcClientTestAccess::connectionIdOf(client, *lease);
@@ -1674,11 +1678,10 @@ TEST_CASE("task-4.1c CR-1c: a lease releases cleanly into a pool erased from the
 TEST_CASE("task-4.1b: the LRU eviction candidate is chosen by an iterator sentinel",
           "[jsonrpc][pool][phase4]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxEndpointPools = 1; // one pool at a time -> a second endpoint forces eviction
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   // task-7.5b — an empty-string endpoint is no longer a valid pool key: it has no
   // scheme, so normalizeOrigin rejects it and acquire_ throws before minting any
@@ -1719,13 +1722,12 @@ TEST_CASE("task-4.1b: the LRU eviction candidate is chosen by an iterator sentin
 TEST_CASE("task-4.1b: concurrent PoolExhaustedError throw races whole-pool eviction",
           "[jsonrpc][pool][phase4]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1; // one slot per endpoint -> deterministic throw
   cfg.globalMaxConnections = 0;      // unlimited: eviction not forced by global cap
   cfg.idleTimeout = std::chrono::milliseconds(5);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string epFull = "http://full.test/rpc";
   const std::string ev[3] = {"http://ev0.test/rpc", "http://ev1.test/rpc",
@@ -1826,7 +1828,6 @@ TEST_CASE("task-4.1b: concurrent PoolExhaustedError throw races whole-pool evict
 TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not by detaching it",
           "[jsonrpc][pool][cr2]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   const std::uint16_t serverPort = 18154;
@@ -1845,7 +1846,7 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
   // pre-fix mutation signal (revert task-5.2 -> empty snapshot) still reproduces.
   cfg.socketIdleTimeout = std::chrono::seconds(5);
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   // 1) First call succeeds -> one connection created, used and returned idle.
@@ -1909,13 +1910,12 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
 TEST_CASE("task-5.2: idle-expiry churn keeps _totalConnections exact and counts connectionsEvicted",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.globalMaxConnections = 4;
   cfg.maxConnectionsPerEndpoint = 4;
   cfg.idleTimeout = std::chrono::milliseconds(100);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://counter.test/rpc";
 
   // Two idle connections on ep.
@@ -1965,12 +1965,11 @@ TEST_CASE("task-5.2: idle-expiry churn keeps _totalConnections exact and counts 
 TEST_CASE("task-5.2 DP-2: LRU whole-pool eviction counts its connections in connectionsEvicted",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxEndpointPools = 1;         // a second endpoint forces whole-pool eviction
   cfg.maxConnectionsPerEndpoint = 4;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string epA = "http://A.test/rpc";
   {
@@ -2003,12 +2002,11 @@ TEST_CASE("task-5.2 DP-2: LRU whole-pool eviction counts its connections in conn
 TEST_CASE("task-5.2 DP-2: single idle-connection LRU eviction counts one in connectionsEvicted",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.globalMaxConnections = 2;         // saturating forces cross-pool idle-conn eviction
   cfg.maxConnectionsPerEndpoint = 2;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   // One IDLE connection on A (evictable), one IN-USE connection on B (held).
   {
@@ -2039,12 +2037,11 @@ TEST_CASE("task-5.2 DP-2: single idle-connection LRU eviction counts one in conn
 TEST_CASE("task-5.2 DP-2: purgeIdle counts every idle-expired connection in connectionsEvicted",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 4;
   cfg.idleTimeout = std::chrono::milliseconds(40);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   // Three idle connections across two endpoints.
   {
@@ -2073,11 +2070,10 @@ TEST_CASE("task-5.2 DP-2: purgeIdle counts every idle-expired connection in conn
 TEST_CASE("task-5.3: maxEndpointPools==0 is unlimited (default config never refuses)",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   REQUIRE(cfg.maxEndpointPools == 0); // the default
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   std::vector<std::unique_ptr<ConnectionLease>> leases;
   for (int i = 0; i < 5; ++i)
@@ -2097,7 +2093,6 @@ TEST_CASE("task-5.3: maxEndpointPools==0 is unlimited (default config never refu
 TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evict-and-admit)",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   SECTION("all pools in use -> a new endpoint is refused")
@@ -2105,7 +2100,7 @@ TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evic
     Config cfg = stubFactoryConfig();
     cfg.maxEndpointPools = 2;
     cfg.maxConnectionsPerEndpoint = 1;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
 
     auto l0 = std::make_unique<ConnectionLease>(
       JsonRpcClientTestAccess::acquire(client, "http://p0.test/rpc"));
@@ -2123,7 +2118,7 @@ TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evic
   {
     Config cfg = stubFactoryConfig();
     cfg.maxEndpointPools = 1;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
 
     {
       auto l = JsonRpcClientTestAccess::acquire(client, "http://idle.test/rpc");
@@ -2144,13 +2139,12 @@ TEST_CASE("task-5.3: a non-zero maxEndpointPools enforces the cap (refuse / evic
 TEST_CASE("task-5.1 Option A: a global-cap throw retires the empty pool (no spurious later refusal)",
           "[jsonrpc][pool][phase5]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.globalMaxConnections = 2;
   cfg.maxEndpointPools = 2;
   cfg.maxConnectionsPerEndpoint = 2;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string epA = "http://A.test/rpc";
   // A holds two IN-USE connections: pool A is never all-idle (not a whole-pool
@@ -2223,9 +2217,8 @@ TEST_CASE("task-5.1 Option A: a global-cap throw retires the empty pool (no spur
 TEST_CASE("phase3: quiesce snapshot reports embedded {inFlight,closing,owners}",
           "[jsonrpc][pool][phase3]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
-  JsonRpcClient client(svc, pool, stubFactoryConfig());
+  JsonRpcClient client(pool, stubFactoryConfig());
 
   const auto q = JsonRpcClientTestAccess::quiesceSnapshot(client);
   REQUIRE(q.inFlight == 0);
@@ -2238,11 +2231,10 @@ TEST_CASE("phase3: quiesce snapshot reports embedded {inFlight,closing,owners}",
 TEST_CASE("phase3: destructor with zero in-flight returns promptly",
           "[jsonrpc][pool][phase3]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   const auto t0 = std::chrono::steady_clock::now();
   {
-    JsonRpcClient client(svc, pool, stubFactoryConfig());
+    JsonRpcClient client(pool, stubFactoryConfig());
   } // ~JsonRpcClient -> quiesce()
   REQUIRE((std::chrono::steady_clock::now() - t0) < std::chrono::seconds(2));
 }
@@ -2256,10 +2248,9 @@ TEST_CASE("phase3: destructor with zero in-flight returns promptly",
 TEST_CASE("phase3: every counted channel refuses after closing is latched",
           "[jsonrpc][pool][phase3]")
 {
-  using iora::modules::connectors::ClientShutdownError;
-  auto &svc = testService();
+  using iora::rpc::ClientShutdownError;
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
-  JsonRpcClient client(svc, pool, stubFactoryConfig());
+  JsonRpcClient client(pool, stubFactoryConfig());
   const std::string ep = "http://rpc.test/rpc";
 
   JsonRpcClientTestAccess::latchClosing(client);
@@ -2269,7 +2260,7 @@ TEST_CASE("phase3: every counted channel refuses after closing is latched",
   REQUIRE_THROWS_AS(client.call(ep, "ping"), ClientShutdownError);
   REQUIRE_THROWS_AS(client.notify(ep, "ping"), ClientShutdownError);
   {
-    std::vector<iora::modules::connectors::BatchItem> items;
+    std::vector<iora::rpc::BatchItem> items;
     items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
     REQUIRE_THROWS_AS(client.callBatch(ep, items), ClientShutdownError);
   }
@@ -2291,7 +2282,7 @@ TEST_CASE("phase3: every counted channel refuses after closing is latched",
     REQUIRE_THROWS_AS(f.get(), ClientShutdownError);
   }
   {
-    std::vector<iora::modules::connectors::BatchItem> items;
+    std::vector<iora::rpc::BatchItem> items;
     items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
     std::future<std::vector<iora::parsers::Json>> f = client.callBatchAsync(ep, items);
     REQUIRE(f.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
@@ -2314,12 +2305,11 @@ TEST_CASE("phase3: every counted channel refuses after closing is latched",
 TEST_CASE("phase3 / CR-4 fixed: destructor waits for a queued async task",
           "[jsonrpc][pool][cr4][phase3]")
 {
-  using iora::modules::connectors::ClientShutdownError;
-  auto &svc = testService();
+  using iora::rpc::ClientShutdownError;
 
   // initial==max==1 so the async task is genuinely QUEUED behind the blocker.
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_unique<JsonRpcClient>(pool, stubFactoryConfig());
 
   BlockedWorker blocker(pool);
   REQUIRE(blocker.waitUntilRunning());
@@ -2377,14 +2367,13 @@ TEST_CASE("phase3 / CR-4 fixed: destructor waits for a queued async task",
 TEST_CASE("phase3: destructor cancels and waits for an in-flight synchronous call",
           "[jsonrpc][pool][phase3][latched]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t serverPort = 18151;
   LatchedHttpServer server(serverPort); // parks the handler until released
 
   Config cfg; // real factory so the client actually connects to the fixture
   cfg.maxRetries = 0;
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   std::atomic<bool> callReturned{false};
@@ -2436,7 +2425,6 @@ TEST_CASE("phase3: destructor cancels and waits for an in-flight synchronous cal
 TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
           "[jsonrpc][pool][phase3][latched]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t serverPort = 18152;
   LatchedHttpServer server(serverPort);
@@ -2444,7 +2432,7 @@ TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ok = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   // set_value: callAsync(future) resolves with the JSON-RPC result ({}).
@@ -2468,7 +2456,7 @@ TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
   // server — deferred to the deterministic phase-9 fixtures, task-9.1). An
   // unroutable endpoint makes callBatchCore_ throw; the future carries it.
   {
-    std::vector<iora::modules::connectors::BatchItem> items;
+    std::vector<iora::rpc::BatchItem> items;
     items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
     std::future<std::vector<iora::parsers::Json>> f =
       client.callBatchAsync("http://127.0.0.1:1/rpc", items);
@@ -2484,7 +2472,6 @@ TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
 TEST_CASE("phase3: callback callAsync delivers a result to onSuccess",
           "[jsonrpc][pool][phase3][latched]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t serverPort = 18153;
   LatchedHttpServer server(serverPort);
@@ -2492,7 +2479,7 @@ TEST_CASE("phase3: callback callAsync delivers a result to onSuccess",
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   std::promise<void> done;
@@ -2526,13 +2513,12 @@ TEST_CASE("phase3: callback callAsync delivers a result to onSuccess",
 TEST_CASE("phase3: enqueue failure routes through the token's channel, no throw to caller",
           "[jsonrpc][pool][phase3]")
 {
-  auto &svc = testService();
 
   // 1 worker + queue cap 1: occupy the worker, fill the single queue slot, then
   // every further enqueue throws "task queue is full".
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
                               /*maxQueueSize*/ 1);
-  JsonRpcClient client(svc, pool, stubFactoryConfig());
+  JsonRpcClient client(pool, stubFactoryConfig());
   const std::string ep = "http://rpc.test/rpc";
 
   // BlockedWorker owns its latches through a shared_ptr the task captures by
@@ -2564,7 +2550,7 @@ TEST_CASE("phase3: enqueue failure routes through the token's channel, no throw 
 
   // Batch future overload behaves identically.
   {
-    std::vector<iora::modules::connectors::BatchItem> items;
+    std::vector<iora::rpc::BatchItem> items;
     items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
     std::future<std::vector<iora::parsers::Json>> f;
     REQUIRE_NOTHROW(f = client.callBatchAsync(ep, items));
@@ -2583,11 +2569,10 @@ TEST_CASE("phase3: enqueue failure routes through the token's channel, no throw 
 TEST_CASE("phase3: onError completes before a concurrent destructor returns (enqueue-failure)",
           "[jsonrpc][pool][phase3]")
 {
-  auto &svc = testService();
 
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
                               /*maxQueueSize*/ 1);
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_unique<JsonRpcClient>(pool, stubFactoryConfig());
   const std::string ep = "http://rpc.test/rpc";
 
   BlockedWorker blocker(pool);
@@ -2668,13 +2653,12 @@ TEST_CASE("phase3: onError completes before a concurrent destructor returns (enq
 TEST_CASE("phase3: destructor interrupts a call parked in retry backoff",
           "[jsonrpc][pool][phase3]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxRetries = 5;
   cfg.initialRetryDelay = std::chrono::milliseconds(2000); // long, so interruption is unmistakable
   cfg.retryBackoffMultiplier = 2.0;
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
   const std::string ep = "http://127.0.0.1:1/rpc"; // connection refused -> retry loop
 
   std::atomic<bool> callReturned{false};
@@ -2796,7 +2780,7 @@ void runAcquire(JsonRpcClient &client, const std::string &ep, AcquireOutcome &ou
   {
     out.poolExhausted.store(true);
   }
-  catch (const iora::modules::connectors::ClientShutdownError &)
+  catch (const iora::rpc::ClientShutdownError &)
   {
     out.shutdown.store(true);
   }
@@ -2878,7 +2862,6 @@ bool waitUntilPending(JsonRpcClient &client, const std::string &ep, std::size_t 
 TEST_CASE("task-6.3 R-3: a factory throw rolls the reservation back exactly",
           "[jsonrpc][pool][phase6][rollback]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   std::atomic<int> factoryCalls{0};
@@ -2896,7 +2879,7 @@ TEST_CASE("task-6.3 R-3: a factory throw rolls the reservation back exactly",
     }
     return std::make_unique<iora::network::HttpClient>();
   };
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string epLive = "http://live.test/rpc";
   const std::string epDoomed = "http://doomed.test/rpc";
@@ -2951,7 +2934,6 @@ TEST_CASE("task-6.3 R-3: a factory throw rolls the reservation back exactly",
 TEST_CASE("task-6.3 R-3: a configurer throw rolls back too (client already built)",
           "[jsonrpc][pool][phase6][rollback]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   std::atomic<bool> armed{false};
@@ -2967,7 +2949,7 @@ TEST_CASE("task-6.3 R-3: a configurer throw rolls back too (client already built
       throw std::domain_error("configurer blew up");
     }
   };
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string ep = "http://cfg.test/rpc";
   const auto createdBefore = client.getStats().connectionsCreated;
@@ -3003,7 +2985,6 @@ TEST_CASE("task-6.3 R-3: a configurer throw rolls back too (client already built
 TEST_CASE("task-6.4a(a): a parked factory does not block another endpoint's acquire",
           "[jsonrpc][pool][phase6][window]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3013,7 +2994,7 @@ TEST_CASE("task-6.4a(a): a parked factory does not block another endpoint's acqu
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(epA, entered, release);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   AcquireOutcome outA;
   std::unique_ptr<ConnectionLease> leaseA;
@@ -3068,7 +3049,6 @@ TEST_CASE("task-6.4a(a): a parked factory does not block another endpoint's acqu
 TEST_CASE("task-6.4a(b): a reservation counts against the per-endpoint cap",
           "[jsonrpc][pool][phase6][window]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3078,7 +3058,7 @@ TEST_CASE("task-6.4a(b): a reservation counts against the per-endpoint cap",
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1; // pinned to 1 so the mutations discriminate
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   AcquireOutcome first;
   std::unique_ptr<ConnectionLease> leaseFirst;
@@ -3120,7 +3100,6 @@ TEST_CASE("task-6.4a(b): a reservation counts against the per-endpoint cap",
 TEST_CASE("task-6.4a(c): a re-entrant configurer completes and the pool survives it",
           "[jsonrpc][pool][phase6][window][cr3]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   JsonRpcClient *self = nullptr;
@@ -3166,7 +3145,7 @@ TEST_CASE("task-6.4a(c): a re-entrant configurer completes and the pool survives
       sawExhausted.store(true);
     }
   };
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   self = &client;
 
   // Bounded by ctest's TIMEOUT; pre-fix this line never returns.
@@ -3195,7 +3174,6 @@ TEST_CASE("task-6.4a(c): a re-entrant configurer completes and the pool survives
 TEST_CASE("task-6.4a(q): purgeIdle does not retire a pool with a creation in flight",
           "[jsonrpc][pool][phase6][pin]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3204,7 +3182,7 @@ TEST_CASE("task-6.4a(q): purgeIdle does not retire a pool with a creation in fli
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   AcquireOutcome out;
   std::unique_ptr<ConnectionLease> lease;
@@ -3248,7 +3226,6 @@ TEST_CASE("task-6.4a(q): purgeIdle does not retire a pool with a creation in fli
 TEST_CASE("task-6.4a(u): _closing latched during the window rolls the creation back",
           "[jsonrpc][pool][phase6][window][closing]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3257,7 +3234,7 @@ TEST_CASE("task-6.4a(u): _closing latched during the window rolls the creation b
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
 
   AcquireOutcome out;
   std::thread t([&] { runAcquire(*client, ep, out); });
@@ -3274,9 +3251,9 @@ TEST_CASE("task-6.4a(u): _closing latched during the window rolls the creation b
   // latched, so it never reaches callBatchCore_). The in-core batch fast-fail
   // added by task-6.1b(d) is a DIFFERENT guard, whose live discriminator is
   // case (z) — there the latch lands AFTER admission, on a reuse hit.
-  REQUIRE_THROWS_AS(client->callBatch(ep, {iora::modules::connectors::BatchItem{
+  REQUIRE_THROWS_AS(client->callBatch(ep, {iora::rpc::BatchItem{
                                             "ping", iora::parsers::Json::object()}}),
-                    iora::modules::connectors::ClientShutdownError);
+                    iora::rpc::ClientShutdownError);
 
   release.signal();
   t.join();
@@ -3314,7 +3291,6 @@ TEST_CASE("task-6.4a(u): _closing latched during the window rolls the creation b
 TEST_CASE("task-6.4a(v-pool): whole-pool LRU eviction skips a pool with a creation in flight",
           "[jsonrpc][pool][phase6][pin]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(3, 3, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3328,7 +3304,7 @@ TEST_CASE("task-6.4a(v-pool): whole-pool LRU eviction skips a pool with a creati
   cfg.maxConnectionsPerEndpoint = 2; // so X can hold an in-use conn AND reserve
   cfg.globalMaxConnections = 0;      // unlimited: keep the CONNECTION cap out of it
   cfg.httpClientFactory = parkingFactory(epX, entered, release);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   // 1. X gets one IN-USE connection (so the parked create below is forced to
   //    take the create path rather than reusing an idle connection).
@@ -3395,7 +3371,6 @@ TEST_CASE("task-6.4a(v-pool): whole-pool LRU eviction skips a pool with a creati
 TEST_CASE("task-6.4a(v-conn): idle-connection LRU eviction does not retire a pinned pool",
           "[jsonrpc][pool][phase6][pin]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(3, 3, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3408,7 +3383,7 @@ TEST_CASE("task-6.4a(v-conn): idle-connection LRU eviction does not retire a pin
   cfg.maxConnectionsPerEndpoint = 2;
   cfg.globalMaxConnections = 2; // the pressure this regime needs
   cfg.httpClientFactory = parkingFactory(epX, entered, release);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   auto leaseX = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, epX));
 
@@ -3478,7 +3453,6 @@ TEST_CASE("task-6.4a(v-conn): idle-connection LRU eviction does not retire a pin
 TEST_CASE("task-6.4a(p): releasing a lease concurrently with eviction drifts no counter",
           "[jsonrpc][pool][phase6][race]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(3, 3, std::chrono::seconds(1));
 
   Config cfg = stubFactoryConfig();
@@ -3486,7 +3460,7 @@ TEST_CASE("task-6.4a(p): releasing a lease concurrently with eviction drifts no 
   // Every freed connection is immediately purgeable, so the purge below has a
   // real target the instant the release lands.
   cfg.idleTimeout = std::chrono::milliseconds(0);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string ep = "http://racey.test/rpc";
   auto lease = std::make_unique<ConnectionLease>(JsonRpcClientTestAccess::acquire(client, ep));
@@ -3547,7 +3521,6 @@ TEST_CASE("task-6.4a(p): releasing a lease concurrently with eviction drifts no 
 TEST_CASE("task-6.4a(w): a rolled-back creation strands no pool in a maxEndpointPools slot",
           "[jsonrpc][pool][phase6][rollback]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   std::atomic<bool> armed{false};
@@ -3563,7 +3536,7 @@ TEST_CASE("task-6.4a(w): a rolled-back creation strands no pool in a maxEndpoint
     }
     return std::make_unique<iora::network::HttpClient>();
   };
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   // Slot 1: a live, IN-USE pool (not an eviction candidate).
   auto keep = std::make_unique<ConnectionLease>(
@@ -3597,7 +3570,6 @@ TEST_CASE("task-6.4a(w): a rolled-back creation strands no pool in a maxEndpoint
 TEST_CASE("task-6.4a(w2): one thread's rollback does not retire a pool another is creating on",
           "[jsonrpc][pool][phase6][pin][rollback]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(3, 3, std::chrono::seconds(1));
 
   const std::string epE = "http://E.test/rpc";
@@ -3626,7 +3598,7 @@ TEST_CASE("task-6.4a(w2): one thread's rollback does not retire a pool another i
     }
     return std::make_unique<iora::network::HttpClient>();
   };
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   AcquireOutcome survivor;
   std::unique_ptr<ConnectionLease> survivorLease;
@@ -3699,7 +3671,6 @@ TEST_CASE("task-6.4a(w2): one thread's rollback does not retire a pool another i
 TEST_CASE("task-4.2/6.1b(b): a pool detached during the window throws instead of publishing",
           "[jsonrpc][pool][phase6][identity]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -3708,7 +3679,7 @@ TEST_CASE("task-4.2/6.1b(b): a pool detached during the window throws instead of
 
   Config cfg = stubFactoryConfig();
   cfg.httpClientFactory = parkingFactory(ep, entered, release);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   std::atomic<bool> ok{false};
   std::atomic<bool> sawIdentityThrow{false};
@@ -3799,9 +3770,8 @@ TEST_CASE("task-4.2/6.1b(b): a pool detached during the window throws instead of
 TEST_CASE("task-6.4b(f)(i): a token discarded unrun releases its in-flight count",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_unique<JsonRpcClient>(pool, stubFactoryConfig());
 
   {
     auto closure = JsonRpcClientTestAccess::makeDiscardableAsyncClosure(*client, "http://x/rpc");
@@ -3826,9 +3796,8 @@ TEST_CASE("task-6.4b(f)(i): a token discarded unrun releases its in-flight count
 TEST_CASE("task-6.4b(t): a discarded future task resolves with broken_promise",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_unique<JsonRpcClient>(pool, stubFactoryConfig());
 
   auto task = JsonRpcClientTestAccess::makeDiscardableFutureTask(*client, "http://x/rpc");
   REQUIRE(JsonRpcClientTestAccess::quiesceSnapshot(*client).inFlight == 1);
@@ -3864,10 +3833,9 @@ TEST_CASE("task-6.4b(t): a discarded future task resolves with broken_promise",
 TEST_CASE("task-6.4b(i): a destruction after enqueue failures still terminates",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
-  auto &svc = testService();
 
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1), /*maxQueueSize*/ 1);
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_unique<JsonRpcClient>(pool, stubFactoryConfig());
 
   BlockedWorker blocker(pool);
   REQUIRE(blocker.waitUntilRunning());
@@ -3906,7 +3874,6 @@ TEST_CASE("task-6.4b(n)+(r): captured user state dies before the destructor retu
           "when onSuccess throws",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
-  auto &svc = testService();
 
   std::atomic<bool> destructorReturned{false};
   std::atomic<bool> probeDestroyed{false};
@@ -3938,7 +3905,7 @@ TEST_CASE("task-6.4b(n)+(r): captured user state dies before the destructor retu
   };
 
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_unique<JsonRpcClient>(pool, stubFactoryConfig());
 
   BlockedWorker blocker(pool);
   REQUIRE(blocker.waitUntilRunning());
@@ -4009,9 +3976,8 @@ TEST_CASE("task-6.4b(n)+(r): captured user state dies before the destructor retu
 TEST_CASE("task-6.4b(g): callAsync racing destruction resolves every call and never wedges",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  auto client = std::make_shared<JsonRpcClient>(svc, pool, stubFactoryConfig());
+  auto client = std::make_shared<JsonRpcClient>(pool, stubFactoryConfig());
 
   std::atomic<int> issued{0};
   std::atomic<int> resolved{0};
@@ -4069,13 +4035,12 @@ TEST_CASE("task-6.4b(g): callAsync racing destruction resolves every call and ne
 TEST_CASE("task-6.4b(j): a callback that enqueues another task cannot livelock the destructor",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
-  using iora::modules::connectors::ClientShutdownError;
+  using iora::rpc::ClientShutdownError;
 
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxRetries = 0; // no backoff between links: the chain must turn over fast
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
 
   std::atomic<int> links{0};
   std::atomic<int> refusals{0};
@@ -4147,14 +4112,13 @@ TEST_CASE("task-6.4b(j): a callback that enqueues another task cannot livelock t
 TEST_CASE("task-6.4b(h): a synchronous call unwinding under a concurrent destructor is clean",
           "[jsonrpc][pool][phase3][phase6][quiesce][latched]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t serverPort = 18155;
   LatchedHttpServer server(serverPort); // parks the handler: the call wedges
 
   Config cfg;
   cfg.maxRetries = 0;
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   // ts L-2: capture a STABLE raw pointer, never the `client` unique_ptr, which
@@ -4209,7 +4173,6 @@ TEST_CASE("task-6.4b(h): a synchronous call unwinding under a concurrent destruc
 TEST_CASE("task-6.4b(x): a destructor waits for a creation parked in the construction window",
           "[jsonrpc][pool][phase3][phase6][quiesce][window]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
@@ -4223,7 +4186,7 @@ TEST_CASE("task-6.4b(x): a destructor waits for a creation parked in the constru
     entered.signal();
     release.wait(std::chrono::seconds(10));
   };
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
 
   // ts L-2: a STABLE raw pointer, not the `client` unique_ptr the destroyer
   // thread resets below (same reasoning as case (h) and siblings (s)/(s2)).
@@ -4302,17 +4265,16 @@ TEST_CASE("task-6.4b(x): a destructor waits for a creation parked in the constru
 TEST_CASE("task-6.4b(z): a batch send fast-fails on a reused connection once closing is latched",
           "[jsonrpc][pool][phase3][phase6][quiesce][latched]")
 {
-  using iora::modules::connectors::BatchItem;
-  using iora::modules::connectors::ClientShutdownError;
+  using iora::rpc::BatchItem;
+  using iora::rpc::ClientShutdownError;
 
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t serverPort = 18156;
   LatchedHttpServer server(serverPort); // SILENT: the handler parks for 5 s
 
   Config cfg;
   cfg.maxRetries = 0;
-  auto client = std::make_unique<JsonRpcClient>(svc, pool, cfg);
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   // Pre-populate an idle connection, then take a lease on it: a REUSE HIT, so
@@ -4357,7 +4319,6 @@ TEST_CASE("task-6.4b(z): a batch send fast-fails on a reused connection once clo
 TEST_CASE("task-7.0a: raw-capture server records a request's exact field lines",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18160;
@@ -4365,7 +4326,7 @@ TEST_CASE("task-7.0a: raw-capture server records a request's exact field lines",
 
   Config cfg; // real (non-stub) factory so the client talks to the raw server
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   const auto result = client.call(ep, "ping");
@@ -4387,7 +4348,6 @@ TEST_CASE("task-7.0a: raw-capture server records a request's exact field lines",
 TEST_CASE("task-7.0a: the keep-alive loop serves two requests on one accepted connection",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18161;
@@ -4395,7 +4355,7 @@ TEST_CASE("task-7.0a: the keep-alive loop serves two requests on one accepted co
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   // Two sequential calls on the same endpoint: the pooled connection is reused
@@ -4414,7 +4374,6 @@ TEST_CASE("task-7.0a: the keep-alive loop serves two requests on one accepted co
 TEST_CASE("task-7.0a: the scripted response policy (delay + extra header + close) is honoured",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18162;
@@ -4426,7 +4385,7 @@ TEST_CASE("task-7.0a: the scripted response policy (delay + extra header + close
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -4457,7 +4416,6 @@ TEST_CASE("task-7.0a: the scripted response policy (delay + extra header + close
 TEST_CASE("task-7.1b: a custom factory receives the derived config with the knobs mapped",
           "[jsonrpc][pool][phase7][derivedconfig]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   Config cfg;
@@ -4470,7 +4428,7 @@ TEST_CASE("task-7.1b: a custom factory receives the derived config with the knob
   std::atomic<bool> gotIt{false};
   cfg.httpClientFactory = capturingFactory(captured, gotIt);
 
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   {
     // Force one connection creation; the stub-style factory never hits the wire.
     auto lease = JsonRpcClientTestAccess::acquire(client, "http://rpc.test/rpc");
@@ -4495,7 +4453,6 @@ TEST_CASE("task-7.1b: a custom factory receives the derived config with the knob
 TEST_CASE("task-7.1a: a sub-second socketIdleTimeout floors connectionIdleTimeout at 1 s",
           "[jsonrpc][pool][phase7][derivedconfig]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   Config cfg;
@@ -4504,7 +4461,7 @@ TEST_CASE("task-7.1a: a sub-second socketIdleTimeout floors connectionIdleTimeou
   iora::network::HttpClient::Config captured;
   std::atomic<bool> gotIt{false};
   cfg.httpClientFactory = capturingFactory(captured, gotIt);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   {
     auto lease = JsonRpcClientTestAccess::acquire(client, "http://rpc.test/rpc");
     (void)lease;
@@ -4522,7 +4479,6 @@ TEST_CASE("task-7.1a: a sub-second socketIdleTimeout floors connectionIdleTimeou
 TEST_CASE("task-7.1a: a sub-second socketIdleTimeout still permits reuse (default factory)",
           "[jsonrpc][pool][phase7][derivedconfig]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18165;
@@ -4531,7 +4487,7 @@ TEST_CASE("task-7.1a: a sub-second socketIdleTimeout still permits reuse (defaul
   Config cfg;
   cfg.maxRetries = 0;
   cfg.socketIdleTimeout = std::chrono::milliseconds(50); // floors to 1 s
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE(client.call(ep, "ping").is_object());
@@ -4551,7 +4507,6 @@ TEST_CASE("task-7.1a: a sub-second socketIdleTimeout still permits reuse (defaul
 TEST_CASE("task-7.1a: enableKeepAlive=false opens a fresh socket per call (default factory)",
           "[jsonrpc][pool][phase7][derivedconfig]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18163;
@@ -4560,7 +4515,7 @@ TEST_CASE("task-7.1a: enableKeepAlive=false opens a fresh socket per call (defau
   Config cfg;
   cfg.maxRetries = 0;
   cfg.enableKeepAlive = false;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE(client.call(ep, "ping").is_object());
@@ -4579,7 +4534,6 @@ TEST_CASE("task-7.1a: enableKeepAlive=false opens a fresh socket per call (defau
 TEST_CASE("task-7.1a: requestTimeout reaches HttpClient (below the response delay -> failure)",
           "[jsonrpc][pool][phase7][derivedconfig]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18164;
@@ -4590,7 +4544,7 @@ TEST_CASE("task-7.1a: requestTimeout reaches HttpClient (below the response dela
   Config cfg;
   cfg.maxRetries = 0;
   cfg.requestTimeout = std::chrono::milliseconds(200); // below the 600 ms delay
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   bool threw = false;
@@ -4624,13 +4578,12 @@ TEST_CASE("task-7.1a: requestTimeout reaches HttpClient (below the response dela
 TEST_CASE("task-7.1a: connectionTimeout reaches HttpClient (non-routable connect times out fast)",
           "[jsonrpc][pool][phase7][derivedconfig]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   Config cfg;
   cfg.maxRetries = 0;
   cfg.connectionTimeout = std::chrono::milliseconds(50); // mapped -> ~50 ms connect budget
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://192.0.2.1:80/rpc";
 
   bool threw = false;
@@ -4749,7 +4702,6 @@ TEST_CASE("task-7.6: closeAfterIdleMs closes an idle keep-alive socket (fixture 
 TEST_CASE("task-7.6: socketIdleTimeout below the server keep-alive floor recycles, one successful call",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18167;
@@ -4760,7 +4712,7 @@ TEST_CASE("task-7.6: socketIdleTimeout below the server keep-alive floor recycle
   Config cfg;
   cfg.maxRetries = 0;                              // no retry can mask a dead-socket reuse
   cfg.socketIdleTimeout = std::chrono::seconds(1); // client recycles its socket after 1 s (below server)
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE(client.call(ep, "ping").is_object()); // call 1 -> accept #1, pooled socket S1
@@ -4810,7 +4762,6 @@ TEST_CASE("task-7.6: socketIdleTimeout below the server keep-alive floor recycle
 TEST_CASE("task-7.6: a reused socket the server already closed is retried on a fresh one — one success",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18168;
@@ -4822,7 +4773,7 @@ TEST_CASE("task-7.6: a reused socket the server already closed is retried on a f
   cfg.maxRetries = 3;                              // recovery budget (the default)
   cfg.socketIdleTimeout = std::chrono::seconds(5); // ABOVE the server floor -> the client WILL reuse
   cfg.requestTimeout = std::chrono::seconds(2);    // bound dead-socket detection (web R2-L2)
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE(client.call(ep, "ping").is_object()); // call 1 -> accept #1, pooled socket S1
@@ -4857,7 +4808,6 @@ TEST_CASE("task-7.6: a reused socket the server already closed is retried on a f
 TEST_CASE("2026-09-03-2: a POST whose server read it then dropped before replying is NOT retried",
           "[jsonrpc][pool][phase7][raw][double-submit]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18192;
@@ -4867,7 +4817,7 @@ TEST_CASE("2026-09-03-2: a POST whose server read it then dropped before replyin
 
   Config cfg;
   cfg.maxRetries = 3; // retries ENABLED — the guard must still not retry a possibly-applied POST
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "mutate"));
@@ -4881,7 +4831,6 @@ TEST_CASE("2026-09-03-2: a POST whose server read it then dropped before replyin
 TEST_CASE("2026-09-03-2: a POST that times out on the response read is NOT retried",
           "[jsonrpc][pool][phase7][raw][double-submit][timeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18193;
@@ -4892,7 +4841,7 @@ TEST_CASE("2026-09-03-2: a POST that times out on the response read is NOT retri
   Config cfg;
   cfg.maxRetries = 3;
   cfg.requestTimeout = std::chrono::milliseconds(200); // response-read timeout fires quickly
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "mutate"));
@@ -4908,7 +4857,6 @@ TEST_CASE("2026-09-03-2: a POST that times out on the response read is NOT retri
 TEST_CASE("2026-09-03-2: a POST answered with a malformed (unframable) response is NOT retried",
           "[jsonrpc][pool][phase7][raw][double-submit]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18194;
@@ -4920,7 +4868,7 @@ TEST_CASE("2026-09-03-2: a POST answered with a malformed (unframable) response 
 
   Config cfg;
   cfg.maxRetries = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "mutate"));
@@ -4934,7 +4882,6 @@ TEST_CASE("2026-09-03-2: a POST answered with a malformed (unframable) response 
 TEST_CASE("2026-09-03-2: a POST whose response has an undecodable Content-Encoding is NOT retried",
           "[jsonrpc][pool][phase7][raw][double-submit]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18195;
@@ -4947,7 +4894,7 @@ TEST_CASE("2026-09-03-2: a POST whose response has an undecodable Content-Encodi
 
   Config cfg;
   cfg.maxRetries = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "mutate"));
@@ -4961,7 +4908,6 @@ TEST_CASE("2026-09-03-2: a POST whose response has an undecodable Content-Encodi
 TEST_CASE("2026-09-03-2: a POST answered with a well-framed but unparseable-JSON body is NOT retried",
           "[jsonrpc][pool][phase7][raw][double-submit]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18196;
@@ -4976,7 +4922,7 @@ TEST_CASE("2026-09-03-2: a POST answered with a well-framed but unparseable-JSON
 
   Config cfg;
   cfg.maxRetries = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "mutate"));
@@ -4990,7 +4936,6 @@ TEST_CASE("2026-09-03-2: a POST answered with a well-framed but unparseable-JSON
 TEST_CASE("2026-09-03-2: the BATCH path does not retry a possibly-applied failure",
           "[jsonrpc][pool][phase7][raw][double-submit][batch]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18197;
@@ -5000,10 +4945,10 @@ TEST_CASE("2026-09-03-2: the BATCH path does not retry a possibly-applied failur
 
   Config cfg;
   cfg.maxRetries = 3;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
-  std::vector<iora::modules::connectors::BatchItem> items;
+  std::vector<iora::rpc::BatchItem> items;
   items.emplace_back("mutate", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
   REQUIRE_THROWS(client.callBatch(ep, items));
 
@@ -5032,7 +4977,6 @@ TEST_CASE("2026-09-03-2: the BATCH path does not retry a possibly-applied failur
 TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   SECTION("default (advertiseAcceptEncoding=true): gzip, twice (keep-alive reuse)")
@@ -5041,7 +4985,7 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
     RawCaptureServer server(port);
     Config cfg;
     cfg.maxRetries = 0;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5065,7 +5009,7 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
     Config cfg;
     cfg.maxRetries = 0;
     cfg.advertiseAcceptEncoding = false;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5086,11 +5030,11 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
     RawCaptureServer server(port);
     Config cfg;
     cfg.maxRetries = 0;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
     const std::vector<std::pair<std::string, std::string>> headers{{"accept-encoding", "gzip"}};
     REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), headers),
-                      iora::modules::connectors::JsonRpcError);
+                      iora::rpc::JsonRpcError);
     server.stop();
   }
 }
@@ -5114,7 +5058,6 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
 TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   auto runCall = [&](std::uint16_t port, std::vector<std::string> extraResponseHeaders)
@@ -5124,7 +5067,7 @@ TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
     RawCaptureServer server(port, policy);
     Config cfg;
     cfg.maxRetries = 0;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
     return client.call(ep, "ping");
   };
@@ -5144,14 +5087,14 @@ TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
   SECTION("Content-Encoding: gzip over a non-gzip body -> throws (malformed inflate)")
   {
     REQUIRE_THROWS_AS(runCall(18174, {"Content-Encoding: gzip"}),
-                      iora::modules::connectors::JsonRpcError);
+                      iora::rpc::JsonRpcError);
   }
   SECTION("Content-Encoding: br (unknown coding) -> throws (unsupported coding)")
   {
     // An unknown coding must throw BEFORE any decode attempt (fail loudly), never
     // feed undecoded octets to the parser.
     REQUIRE_THROWS_AS(runCall(18175, {"Content-Encoding: br"}),
-                      iora::modules::connectors::JsonRpcError);
+                      iora::rpc::JsonRpcError);
   }
   SECTION("lowercase response header NAME 'content-encoding: br' -> throws (web W-1)")
   {
@@ -5160,7 +5103,7 @@ TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
     // miss this and feed the undecoded body to the parser. Mutation-proof:
     // comparing the lookup key case-sensitively fails it.
     REQUIRE_THROWS_AS(runCall(18178, {"content-encoding: br"}),
-                      iora::modules::connectors::JsonRpcError);
+                      iora::rpc::JsonRpcError);
   }
   SECTION("Content-Encoding value with OWS '\\tidentity ' -> succeeds (web W-2)")
   {
@@ -5191,14 +5134,13 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
 
   SECTION("a default client emits exactly one Content-Type and one Connection line")
   {
-    auto &svc = testService();
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
     const std::uint16_t port = 18176;
     RawCaptureServer server(port);
 
     Config cfg;
     cfg.maxRetries = 0; // enableKeepAlive defaults true -> reuseConnections true
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5214,7 +5156,6 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
 
   SECTION("enableKeepAlive=false yields exactly one Connection: close line")
   {
-    auto &svc = testService();
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
     const std::uint16_t port = 18177;
     RawCaptureServer server(port);
@@ -5222,7 +5163,7 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
     Config cfg;
     cfg.maxRetries = 0;
     cfg.enableKeepAlive = false; // -> reuseConnections false -> one Connection: close
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5240,7 +5181,6 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
     // dead: postJson overwrites Content-Type unconditionally, so re-seeding it in
     // defaultHeaders still yields exactly ONE wire line. If postJson ever stopped
     // overriding, this would flip to TWO and fail loudly.
-    auto &svc = testService();
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
     const std::uint16_t port = 18180;
     RawCaptureServer server(port);
@@ -5248,7 +5188,7 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"Content-Type", "application/json"}}; // the deleted default, restored
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5270,11 +5210,10 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
 TEST_CASE("task-7.3a: per-call framing/smuggling headers are rejected (case-insensitive)",
           "[jsonrpc][pool][phase7]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   // Rejection precedes the send, so this endpoint is never dialed.
   const std::string ep = "http://127.0.0.1:9/rpc";
 
@@ -5282,7 +5221,7 @@ TEST_CASE("task-7.3a: per-call framing/smuggling headers are rejected (case-inse
   {
     const std::vector<std::pair<std::string, std::string>> h{{name, value}};
     REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), h),
-                      iora::modules::connectors::JsonRpcError);
+                      iora::rpc::JsonRpcError);
   };
 
   SECTION("every framing field in the per-call set throws (canonical case)")
@@ -5307,19 +5246,18 @@ TEST_CASE("task-7.3a: per-call framing/smuggling headers are rejected (case-inse
 TEST_CASE("task-7.3a/7.3d: a framing field in defaultHeaders fails CONSTRUCTION",
           "[jsonrpc][pool][phase7]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
   SECTION("lowercase framing field in defaultHeaders throws at construction")
   {
     Config cfg;
     cfg.defaultHeaders = {{"transfer-encoding", "chunked"}};
-    REQUIRE_THROWS_AS(JsonRpcClient(svc, pool, cfg), iora::modules::connectors::JsonRpcError);
+    REQUIRE_THROWS_AS(JsonRpcClient(pool, cfg), iora::rpc::JsonRpcError);
   }
   SECTION("a default-constructed Config constructs and its defaultHeaders are empty")
   {
     Config cfg;
-    REQUIRE_NOTHROW(JsonRpcClient(svc, pool, cfg));
+    REQUIRE_NOTHROW(JsonRpcClient(pool, cfg));
   }
 }
 
@@ -5333,18 +5271,17 @@ TEST_CASE("task-7.3a/7.3d: a framing field in defaultHeaders fails CONSTRUCTION"
 TEST_CASE("task-7.3b: invalid header names and values are rejected per call",
           "[jsonrpc][pool][phase7]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:9/rpc";
 
   auto rejects = [&](const std::string &name, const std::string &value)
   {
     const std::vector<std::pair<std::string, std::string>> h{{name, value}};
     REQUIRE_THROWS_AS(client.call(ep, "ping", iora::parsers::Json::object(), h),
-                      iora::modules::connectors::JsonRpcError);
+                      iora::rpc::JsonRpcError);
   };
 
   SECTION("non-token names throw")
@@ -5378,14 +5315,13 @@ TEST_CASE("task-7.3b: invalid header names and values are rejected per call",
 TEST_CASE("task-7.3c: User-Agent is consumed from defaultHeaders and rejected per call",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
 
   SECTION("a per-call User-Agent throws with a diagnostic naming defaultHeaders")
   {
     iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
     Config cfg;
     cfg.maxRetries = 0;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::vector<std::pair<std::string, std::string>> h{{"User-Agent", "Mine/1.0"}};
     REQUIRE_THROWS_WITH(
       client.call("http://127.0.0.1:9/rpc", "ping", iora::parsers::Json::object(), h),
@@ -5401,7 +5337,7 @@ TEST_CASE("task-7.3c: User-Agent is consumed from defaultHeaders and rejected pe
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"User-Agent", "First/1.0"}, {"user-agent", "Second/2.0"}};
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5428,14 +5364,13 @@ TEST_CASE("task-7.3c: User-Agent is consumed from defaultHeaders and rejected pe
 TEST_CASE("task-7.3d: defaultHeaders is validated once at construction",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
 
   SECTION("a malformed defaultHeaders value fails construction, naming the field")
   {
     iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
     Config cfg;
     cfg.defaultHeaders = {{"X-Bad", "has\r\ninjection"}};
-    REQUIRE_THROWS_WITH(JsonRpcClient(svc, pool, cfg), Catch::Contains("X-Bad"));
+    REQUIRE_THROWS_WITH(JsonRpcClient(pool, cfg), Catch::Contains("X-Bad"));
   }
 
   SECTION("the README configuration (User-Agent + Accept) constructs and sends one UA line")
@@ -5447,7 +5382,7 @@ TEST_CASE("task-7.3d: defaultHeaders is validated once at construction",
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"User-Agent", "IoraClient"}, {"Accept", "application/json"}};
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5468,7 +5403,6 @@ TEST_CASE("task-7.3d: defaultHeaders is validated once at construction",
 TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   SECTION("a lowercase content-type in defaultHeaders yields exactly one Content-Type line")
@@ -5478,7 +5412,7 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"content-type", "application/json"}};
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5498,7 +5432,7 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"Accept", "application/json"}, {"accept", "text/plain"}};
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     REQUIRE(client.call(ep, "ping").is_object());
@@ -5519,7 +5453,7 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     RawCaptureServer server(port);
     Config cfg;
     cfg.maxRetries = 0;
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     const std::vector<std::pair<std::string, std::string>> h{{"content-type", "application/json-rpc"}};
@@ -5529,9 +5463,12 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     const auto reqs = server.capturedRequests();
     REQUIRE(reqs.size() == 1);
     CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
-    // The one line carries postJson's forced value, not the caller's (web R2-L1):
-    // accept-and-override is what makes canonicalise (vs reject) safe.
-    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json"));
+    // task-6.5 port / phase-5b.6 (fix_5): a caller-supplied Content-Type is now
+    // HONOURED and reaches the wire verbatim as exactly one canonicalised line
+    // (the client routes it via the string-body post() rather than postJson, which
+    // would force application/json). The pre-5b.6 "postJson forces the value"
+    // expectation is superseded.
+    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json-rpc"));
   }
 
   SECTION("a config-seed Content-Type PLUS a per-call content-type still yields one line (cpp17 R2-L1)")
@@ -5543,7 +5480,7 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"Content-Type", "application/xml"}};
-    JsonRpcClient client(svc, pool, cfg);
+    JsonRpcClient client(pool, cfg);
     const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
     const std::vector<std::pair<std::string, std::string>> h{{"content-type", "application/json-rpc"}};
@@ -5553,7 +5490,10 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     const auto reqs = server.capturedRequests();
     REQUIRE(reqs.size() == 1);
     CHECK(countFieldLinesNamed(reqs[0], "Content-Type") == 1);
-    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json")); // postJson forces the value
+    // task-6.5 port / phase-5b.6 (fix_5): the per-call caller Content-Type is
+    // honoured verbatim (one canonical line), overriding the config seed —
+    // superseding the pre-5b.6 "postJson forces application/json" expectation.
+    CHECK(hasFieldLine(reqs[0], "Content-Type: application/json-rpc"));
   }
 }
 
@@ -5565,13 +5505,12 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
 TEST_CASE("task-7.3b: obs-text and empty header values pass through to the wire",
           "[jsonrpc][pool][phase7][raw]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t port = 18186;
   RawCaptureServer server(port);
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   const std::string obsText("v\x80\xC3\xFF", 4); // obs-text octets 0x80-0xFF
@@ -5599,7 +5538,6 @@ TEST_CASE("task-7.3b: obs-text and empty header values pass through to the wire"
 TEST_CASE("task-7.5c: two paths on one origin share one pool and one socket",
           "[jsonrpc][pool][phase7][origin]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18190;
@@ -5607,7 +5545,7 @@ TEST_CASE("task-7.5c: two paths on one origin share one pool and one socket",
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string base = "http://127.0.0.1:" + std::to_string(port);
   const std::string epA = base + "/alpha";
@@ -5646,7 +5584,6 @@ TEST_CASE("task-7.5c: two paths on one origin share one pool and one socket",
 TEST_CASE("task-7.5c: factory and configurer receive the origin, the send the full URL",
           "[jsonrpc][pool][phase7][origin]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18191;
@@ -5665,7 +5602,7 @@ TEST_CASE("task-7.5c: factory and configurer receive the origin, the send the fu
   };
   cfg.httpClientConfigurer = [&](const std::string &origin, iora::network::HttpClient &)
   { configurerSaw = origin; };
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/deep/path?q=1";
   REQUIRE(client.call(ep, "ping").is_object());
@@ -5696,10 +5633,9 @@ TEST_CASE("task-7.5c: factory and configurer receive the origin, the send the fu
 TEST_CASE("task-7.5b: http and https to one host:port are distinct pools",
           "[jsonrpc][pool][phase7][origin]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   // http and https to the same host:port -> two DISTINCT origins.
   auto lHttp = JsonRpcClientTestAccess::acquire(client, "http://h:8443/a");
@@ -5723,10 +5659,9 @@ TEST_CASE("task-7.5b: http and https to one host:port are distinct pools",
 TEST_CASE("task-7.5b: malformed URL forms are rejected before a pool is minted",
           "[jsonrpc][pool][phase7][origin][reject]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig(); // never reaches the network — rejected before acquire
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::vector<std::string> bad = {
     "http://user@h/rpc",         // userinfo
@@ -5760,7 +5695,6 @@ TEST_CASE("task-7.5b: malformed URL forms are rejected before a pool is minted",
 TEST_CASE("M-12: a JSON-RPC error envelope increments failedRequests only, not successful",
           "[jsonrpc][pool][phase7][stats][m12]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   // ---- error envelope: parseResponseOrThrow_ throws RemoteError AFTER the send ----
@@ -5772,10 +5706,10 @@ TEST_CASE("M-12: a JSON-RPC error envelope increments failedRequests only, not s
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string errEp = "http://127.0.0.1:" + std::to_string(errPort) + "/rpc";
 
-  REQUIRE_THROWS_AS(client.call(errEp, "missing"), iora::modules::connectors::RemoteError);
+  REQUIRE_THROWS_AS(client.call(errEp, "missing"), iora::rpc::RemoteError);
   {
     const auto s = client.getStats();
     REQUIRE(s.totalRequests == 1);
@@ -5822,7 +5756,6 @@ TEST_CASE("M-12: a JSON-RPC error envelope increments failedRequests only, not s
 TEST_CASE("M-12 (batch): an error item in a batch increments failedRequests only",
           "[jsonrpc][pool][phase7][stats][m12]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18172;
@@ -5835,14 +5768,14 @@ TEST_CASE("M-12 (batch): an error item in a batch increments failedRequests only
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
-  std::vector<iora::modules::connectors::BatchItem> items;
+  std::vector<iora::rpc::BatchItem> items;
   items.emplace_back("ok", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
   items.emplace_back("fail", iora::parsers::Json::object(), static_cast<std::uint64_t>(2));
 
-  REQUIRE_THROWS_AS(client.callBatch(ep, items), iora::modules::connectors::RemoteError);
+  REQUIRE_THROWS_AS(client.callBatch(ep, items), iora::rpc::RemoteError);
 
   const auto s = client.getStats();
   REQUIRE(s.totalRequests == 1);
@@ -5866,7 +5799,6 @@ TEST_CASE("M-12 (batch): an error item in a batch increments failedRequests only
 TEST_CASE("task-7.8: a response-read timeout increments timeoutRequests (typed path)",
           "[jsonrpc][pool][phase7][stats][timeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18173;
@@ -5877,7 +5809,7 @@ TEST_CASE("task-7.8: a response-read timeout increments timeoutRequests (typed p
   Config cfg;
   cfg.maxRetries = 0;
   cfg.requestTimeout = std::chrono::milliseconds(200); // reaches HttpClient (task-7.1)
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "slow"));
@@ -5898,7 +5830,6 @@ TEST_CASE("task-7.8: a response-read timeout increments timeoutRequests (typed p
 TEST_CASE("task-7.8 (M2): a batch-path response timeout increments timeoutRequests",
           "[jsonrpc][pool][phase7][stats][timeout][batch]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18174;
@@ -5909,10 +5840,10 @@ TEST_CASE("task-7.8 (M2): a batch-path response timeout increments timeoutReques
   Config cfg;
   cfg.maxRetries = 0;
   cfg.requestTimeout = std::chrono::milliseconds(200);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
-  std::vector<iora::modules::connectors::BatchItem> items;
+  std::vector<iora::rpc::BatchItem> items;
   items.emplace_back("slow", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
 
   // Mutation-test: remove the catch(const std::exception&) classifier around
@@ -5939,7 +5870,6 @@ TEST_CASE("task-7.8 (M2): a batch-path response timeout increments timeoutReques
 TEST_CASE("task-7.8 (R2-1): a batch RemoteError whose message contains 'timeout' is NOT a transport timeout",
           "[jsonrpc][pool][phase7][stats][timeout][batch]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18175;
@@ -5949,13 +5879,13 @@ TEST_CASE("task-7.8 (R2-1): a batch RemoteError whose message contains 'timeout'
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
-  std::vector<iora::modules::connectors::BatchItem> items;
+  std::vector<iora::rpc::BatchItem> items;
   items.emplace_back("x", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
 
-  REQUIRE_THROWS_AS(client.callBatch(ep, items), iora::modules::connectors::RemoteError);
+  REQUIRE_THROWS_AS(client.callBatch(ep, items), iora::rpc::RemoteError);
   const auto s = client.getStats();
   REQUIRE(s.totalRequests == 1);
   REQUIRE(s.batchRequests == 1);
@@ -5975,7 +5905,6 @@ TEST_CASE("task-7.8 (R2-1): a batch RemoteError whose message contains 'timeout'
 TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 'timeout' is NOT a transport timeout",
           "[jsonrpc][pool][phase7][stats][timeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18176;
@@ -5986,10 +5915,10 @@ TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 't
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
-  REQUIRE_THROWS_AS(client.call(ep, "x"), iora::modules::connectors::RemoteError);
+  REQUIRE_THROWS_AS(client.call(ep, "x"), iora::rpc::RemoteError);
   const auto s = client.getStats();
   REQUIRE(s.totalRequests == 1);
   REQUIRE(s.failedRequests == 1);
@@ -6093,13 +6022,12 @@ static ConnectThrowProbe probeConnectThrow(JsonRpcClient &client, const std::str
 TEST_CASE("2026-09-03-3: a single-call connect timeout increments timeoutRequests (typed)",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   Config cfg;
   cfg.maxRetries = 0;
   cfg.connectionTimeout = std::chrono::milliseconds(50); // mapped -> ~50 ms connect budget
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const ConnectThrowProbe p = probeConnectThrow(client, kBlackHoleHttpEp);
   REQUIRE(p.threw);
@@ -6115,16 +6043,15 @@ TEST_CASE("2026-09-03-3: a single-call connect timeout increments timeoutRequest
 TEST_CASE("2026-09-03-3: a batch connect timeout increments timeoutRequests (shared classifier)",
           "[jsonrpc][pool][stats][timeout][connecttimeout][batch]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   Config cfg;
   cfg.maxRetries = 0;
   cfg.connectionTimeout = std::chrono::milliseconds(50);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = kBlackHoleHttpEp;
 
-  std::vector<iora::modules::connectors::BatchItem> items;
+  std::vector<iora::rpc::BatchItem> items;
   items.emplace_back("ping", iora::parsers::Json::object(), static_cast<std::uint64_t>(1));
 
   REQUIRE_THROWS(client.callBatch(ep, items));
@@ -6142,7 +6069,6 @@ TEST_CASE("2026-09-03-3: a batch connect timeout increments timeoutRequests (sha
 TEST_CASE("2026-09-03-3 (L1): a server 'Content-Encoding: x-timeout' is NOT counted as a timeout",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18188;
@@ -6152,7 +6078,7 @@ TEST_CASE("2026-09-03-3 (L1): a server 'Content-Encoding: x-timeout' is NOT coun
 
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_THROWS(client.call(ep, "x"));
@@ -6171,13 +6097,12 @@ TEST_CASE("2026-09-03-3 (L1): a server 'Content-Encoding: x-timeout' is NOT coun
 TEST_CASE("2026-09-03-3 (M-1): a connect refusal is NOT a connect timeout and is not counted",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   testnet::RefusingEndpoint refuser; // bound, not listening -> RST -> ECONNREFUSED
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(refuser.port()) + "/rpc";
 
   const ConnectThrowProbe p = probeConnectThrow(client, ep);
@@ -6196,14 +6121,13 @@ TEST_CASE("2026-09-03-3 (M-1): a connect refusal is NOT a connect timeout and is
 TEST_CASE("2026-09-03-3 (M-2): a connect timeout is retried and counted once at exhaustion",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   Config cfg;
   cfg.maxRetries = 2;
   cfg.initialRetryDelay = std::chrono::milliseconds(1);
   cfg.connectionTimeout = std::chrono::milliseconds(50);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = kBlackHoleHttpEp;
 
   REQUIRE_THROWS(client.call(ep, "ping"));
@@ -6231,13 +6155,12 @@ TEST_CASE("2026-09-03-3 (M-2): a connect timeout is retried and counted once at 
 TEST_CASE("2026-09-03-3 (L-1): an https connect timeout increments timeoutRequests",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   Config cfg;
   cfg.maxRetries = 0;
   cfg.connectionTimeout = std::chrono::milliseconds(50);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = kBlackHoleHttpsEp;
 
   REQUIRE_THROWS(client.call(ep, "ping"));
@@ -6251,14 +6174,13 @@ TEST_CASE("2026-09-03-3 (L-1): an https connect timeout increments timeoutReques
 TEST_CASE("2026-09-03-3 (L-2): a successful call leaves timeoutRequests unchanged",
           "[jsonrpc][pool][stats][timeout][connecttimeout]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t port = 18189;
   RawCaptureServer server(port); // default policy: a JSON-RPC success body
   Config cfg;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
 
   REQUIRE_NOTHROW(client.call(ep, "ping"));
@@ -6282,12 +6204,11 @@ TEST_CASE("2026-09-03-3 (L-2): a successful call leaves timeoutRequests unchange
 TEST_CASE("task-8.2 M-4: a pool-exhausted call() counts poolExhaustions AND failedRequests",
           "[jsonrpc][pool][phase8][stats]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1; // one slot -> deterministic exhaustion
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://exhaust.test/rpc";
 
   // Hold the single slot; every further acquire on this origin is now capped.
@@ -6309,17 +6230,16 @@ TEST_CASE("task-8.2 M-4: a pool-exhausted call() counts poolExhaustions AND fail
 TEST_CASE("task-8.2 M-4: a pool-exhausted callBatch() counts poolExhaustions AND failedRequests, matching call()",
           "[jsonrpc][pool][phase8][stats]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://exhaust-batch.test/rpc";
 
   ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
 
-  std::vector<iora::modules::connectors::BatchItem> items;
+  std::vector<iora::rpc::BatchItem> items;
   items.emplace_back("m", iora::parsers::Json::object(), std::uint64_t{1});
   REQUIRE_THROWS_AS(client.callBatch(ep, items), PoolExhaustedError);
 
@@ -6339,12 +6259,11 @@ TEST_CASE("task-8.2 M-4: a pool-exhausted callBatch() counts poolExhaustions AND
 TEST_CASE("task-8.5(b): a pool-exhausted callAsync (future) delivers PoolExhaustedError catchable BY TYPE",
           "[jsonrpc][pool][phase8][async]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://exhaust-async-fut.test/rpc";
 
   // `held` stays alive across get(): the worker's acquire_ throws while the slot
@@ -6357,12 +6276,11 @@ TEST_CASE("task-8.5(b): a pool-exhausted callAsync (future) delivers PoolExhaust
 TEST_CASE("task-8.5(b): a pool-exhausted callAsync (callback) delivers PoolExhaustedError to onError, catchable BY TYPE",
           "[jsonrpc][pool][phase8][async]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://exhaust-async-cb.test/rpc";
 
   ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
@@ -6411,23 +6329,22 @@ TEST_CASE("task-8.5(b): a pool-exhausted callAsync (callback) delivers PoolExhau
 TEST_CASE("task-8.6: getStats returns an independent by-value snapshot",
           "[jsonrpc][pool][phase8][stats]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 1;
   cfg.maxRetries = 0;
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://snap.test/rpc";
 
   ConnectionLease held = JsonRpcClientTestAccess::acquire(client, ep);
 
   REQUIRE_THROWS_AS(client.call(ep, "m"), PoolExhaustedError);
-  const iora::modules::connectors::ClientStatsSnapshot first = client.getStats();
+  const iora::rpc::ClientStatsSnapshot first = client.getStats();
   REQUIRE(first.failedRequests == 1);
 
   // More activity mutates the LIVE ClientStats...
   REQUIRE_THROWS_AS(client.call(ep, "m"), PoolExhaustedError);
-  const iora::modules::connectors::ClientStatsSnapshot second = client.getStats();
+  const iora::rpc::ClientStatsSnapshot second = client.getStats();
 
   // ...but `first` is a value copy, unaffected by the later increment. This is
   // the whole independence guarantee: a reference-returning getStats() could not
@@ -6452,7 +6369,6 @@ TEST_CASE("task-8.6: getStats returns an independent by-value snapshot",
 TEST_CASE("task-9.1: a latched in-flight call deterministically exhausts a cap-1 origin (counted)",
           "[jsonrpc][pool][phase9][latched]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   const std::uint16_t serverPort = 18210;
@@ -6461,7 +6377,7 @@ TEST_CASE("task-9.1: a latched in-flight call deterministically exhausts a cap-1
   Config cfg;                          // real factory: A actually sends and parks
   cfg.maxConnectionsPerEndpoint = 1;   // one slot -> deterministic throw
   cfg.maxRetries = 0;                  // (d)
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
   const std::string ep = "http://127.0.0.1:" + std::to_string(serverPort) + "/rpc";
 
   std::exception_ptr aErr;
@@ -6529,12 +6445,11 @@ TEST_CASE("task-9.1: a latched in-flight call deterministically exhausts a cap-1
 TEST_CASE("task-9.2: bounded concurrent acquire/release/purge preserves the pool invariants",
           "[jsonrpc][pool][phase9][concurrency]")
 {
-  auto &svc = testService();
   iora::core::ThreadPool pool(4, 4, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxConnectionsPerEndpoint = 8; // headroom over 4 threads -> never exhausts
   cfg.idleTimeout = std::chrono::milliseconds(2);
-  JsonRpcClient client(svc, pool, cfg);
+  JsonRpcClient client(pool, cfg);
 
   const std::string eps[3] = {"http://c0.test/rpc", "http://c1.test/rpc", "http://c2.test/rpc"};
 
@@ -6616,31 +6531,11 @@ TEST_CASE("task-9.2: bounded concurrent acquire/release/purge preserves the pool
 
 int main(int argc, char *argv[])
 {
-  // Initialize the service once and tear it down in an orderly fashion. Without
-  // AutoServiceShutdown the singleton's worker threads are still joinable at
-  // static-destruction time and the process aborts (SIGABRT) at exit, which on
-  // this host trips the WSL core-dump handler (task-1.1(e-pre)).
-  //
-  // testService() runs BEFORE Catch::Session, outside Catch2's exception
-  // guard, so an init throw here would escape main uncaught -> std::terminate
-  // -> SIGABRT -> the same multi-minute WSL core handler. Catch it and exit
-  // via std::_Exit(nonzero) (bypasses abort(), no signal, no core handler).
-  try
-  {
-    auto &svc = testService();
-    iora::IoraService::AutoServiceShutdown autoShutdown(svc);
-    return Catch::Session().run(argc, argv);
-  }
-  catch (const std::exception &e)
-  {
-    std::cerr << "[jsonrpc_client_pool] fatal init error: " << e.what() << std::endl;
-    std::_Exit(70); // EX_SOFTWARE; no abort(), so no piped-core stall
-  }
-  catch (...)
-  {
-    // A non-std::exception throw would otherwise escape main uncaught and
-    // defeat the very terminate/SIGABRT invariant this guard exists for.
-    std::cerr << "[jsonrpc_client_pool] fatal init error (non-std::exception)" << std::endl;
-    std::_Exit(70);
-  }
+  // PORT NOTE (task-6.5): the migrated client needs no IoraService, so the former
+  // testService()/AutoServiceShutdown bring-up-and-orderly-teardown guard is gone.
+  // Each JsonRpcClient owns its ThreadPool + HttpClient lifetime directly, so there
+  // is no process-wide singleton whose worker threads would abort at static
+  // destruction. The custom main is retained only because the suite uses
+  // CATCH_CONFIG_RUNNER.
+  return Catch::Session().run(argc, argv);
 }

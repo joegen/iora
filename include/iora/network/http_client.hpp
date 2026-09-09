@@ -752,7 +752,14 @@ public:
     // set first
   }
 
-  ~HttpClient() { cleanup(); }
+  // VIRTUAL (F-3): Config::httpClientFactory returns std::unique_ptr<HttpClient>
+  // that a caller may populate with a derived type; destroying that through the
+  // base pointer with a non-virtual destructor is UB. Only the destructor is
+  // virtualized — postJson stays non-virtual (D-6), so this fixes the UB without
+  // adding an indirect call to a hot path or inviting subclassing of the concrete
+  // type. Adds a vtable pointer, so HttpClient is no longer trivially destructible
+  // (see task-7.2: nothing depends on its size/triviality).
+  virtual ~HttpClient() { cleanup(); }
 
   // HttpClient is non-copyable AND non-movable: it owns a std::mutex,
   // std::condition_variable, and live lease/connection state. A std::mutex/CV

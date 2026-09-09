@@ -6,6 +6,7 @@
 # Examples:
 #   cmake -DIORA_BUILD_PARSERS_TESTS=ON        # Only parsers tests
 #   cmake -DIORA_BUILD_NETWORK_TESTS=ON        # Only network tests
+#   cmake -DIORA_BUILD_RPC_TESTS=ON            # Only rpc (JSON-RPC) tests
 #   cmake -DIORA_BUILD_ALL_TESTS=ON            # All test groups
 #
 # Available test groups:
@@ -16,11 +17,15 @@
 #   - STORAGE: Persistent storage (2 tests)
 #   - UTIL: Caching and utilities (1 test)
 #   - DEBUG: Debug and helper tests (2 tests)
+#   - WEB: Service registry, HTML/Mustache, HTTP auth, SSE, channels, HTMX (16 tests)
+#   - RPC: JSON-RPC server dispatcher, HTTP endpoint mapping, client, e2e
 #
 # Namespace-specific targets are created when enabled:
 #   make test_network    # Run all network tests
 #   make test_core       # Run all core tests
 #   make test_parsers    # Run all parsers tests
+#   make test_web        # Run all web tests
+#   make test_rpc        # Run all rpc tests
 #   etc.
 
 # Options to enable/disable test groups (all default to OFF)
@@ -32,6 +37,7 @@ option(IORA_BUILD_STORAGE_TESTS "Build storage namespace tests" OFF)
 option(IORA_BUILD_SERVICE_TESTS "Build service/plugin system tests" OFF)
 option(IORA_BUILD_DEBUG_TESTS "Build debug/helper tests" OFF)
 option(IORA_BUILD_WEB_TESTS "Build web namespace tests" OFF)
+option(IORA_BUILD_RPC_TESTS "Build rpc namespace tests" OFF)
 option(IORA_BUILD_ALL_TESTS "Build all test groups (overrides individual options)" OFF)
 
 # Opt-in sanitizer build path for the concurrency tests (default OFF so normal
@@ -51,6 +57,7 @@ if(IORA_BUILD_ALL_TESTS)
     set(IORA_BUILD_SERVICE_TESTS ON)
     set(IORA_BUILD_DEBUG_TESTS ON)
     set(IORA_BUILD_WEB_TESTS ON)
+    set(IORA_BUILD_RPC_TESTS ON)
 endif()
 
 # Network namespace tests
@@ -198,6 +205,28 @@ set(WEB_TESTS
     web/test_websocket_reconnect
 )
 
+# RPC namespace tests (tracker 2026-07-26-1). EXTENSION-LESS entries: the
+# registration loop appends ".cpp" and guards with if(EXISTS ...); a ".cpp"
+# suffix here yields "...cpp.cpp", EXISTS is false, and the entry is SILENTLY
+# skipped. At phase-2 this list carries ONLY the four base targets whose .cpp
+# files exist by phase-2. The C1-port targets (client_pool, gzip_request,
+# gzip_response, and the standalone quiesce/self-destruct executable) are
+# registered by their own phase-6 tasks (6.5/6.6/6.7) once those files exist.
+set(RPC_TESTS
+    rpc/iora_test_jsonrpc_server
+    rpc/iora_test_jsonrpc_http
+    rpc/iora_test_jsonrpc_client
+    rpc/iora_test_jsonrpc_e2e
+    # task-6.7: the client gzip-config foundation unit test (pure unit; its one
+    # former plugin case is rewritten to a direct JsonRpcHttpOptions defaults check).
+    rpc/iora_test_jsonrpc_gzip_foundation
+    # task-6.7: request-direction gzip (server side composes HttpServer +
+    # JsonRpcServer + JsonRpcHttpEndpoint; carries the _requestCompressionMutex probe).
+    rpc/iora_test_jsonrpc_gzip_request
+    # task-6.7: response-direction gzip (server compresses + Vary; client decodes).
+    rpc/iora_test_jsonrpc_gzip_response
+)
+
 # Combine enabled tests based on options
 set(ALL_TESTS)
 if(IORA_BUILD_NETWORK_TESTS)
@@ -223,6 +252,9 @@ if(IORA_BUILD_DEBUG_TESTS)
 endif()
 if(IORA_BUILD_WEB_TESTS)
     list(APPEND ALL_TESTS ${WEB_TESTS})
+endif()
+if(IORA_BUILD_RPC_TESTS)
+    list(APPEND ALL_TESTS ${RPC_TESTS})
 endif()
 
 # Function to create individual test executables
@@ -261,6 +293,102 @@ foreach(test_path ${ALL_TESTS})
         create_individual_test(${test_path})
     endif()
 endforeach()
+
+# task-1.4 carrier-agnostic invariant probe (registered by task-2.1): a
+# COMPILE-ONLY object-library target whose TU includes ONLY
+# iora/rpc/jsonrpc_server.hpp. It has no main() and is never run — building it
+# (cmake --build build --target iora_test_jsonrpc_standalone_include) proves the
+# protocol header compiles standalone. Not an add_test; not in ALL_TESTS.
+if(IORA_BUILD_RPC_TESTS AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rpc/iora_test_jsonrpc_standalone_include.cpp")
+    add_library(iora_test_jsonrpc_standalone_include OBJECT
+        rpc/iora_test_jsonrpc_standalone_include.cpp)
+    configure_iora_target(iora_test_jsonrpc_standalone_include ENABLE_OPENSSL)
+endif()
+
+# task-6.6 (C1): the standalone self-destruct -> std::terminate executable, ported
+# from src/modules/connectors/jsonrpc_client/tests/. A std::terminate takes down
+# the whole process, so it CANNOT be a Catch2 case in the shared rpc binary — it
+# is a STANDALONE executable whose scenarios are selected by argv[1], each
+# registered as its own ctest with PASS/FAIL_REGULAR_EXPRESSION (the flat
+# RPC_TESTS list cannot express these). Sanitizer flags come from the shared
+# IORA_SANITIZED_TEST_TARGETS loop below (the target is on that list), so the
+# target must be created here, before that loop runs.
+if(IORA_BUILD_RPC_TESTS AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rpc/iora_test_jsonrpc_quiesce_selfdestruct.cpp")
+    create_iora_test_target(iora_test_jsonrpc_quiesce_selfdestruct
+        SOURCES rpc/iora_test_jsonrpc_quiesce_selfdestruct.cpp)
+    target_include_directories(iora_test_jsonrpc_quiesce_selfdestruct PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    # WHY EVERY SCENARIO CARRIES A PASS_REGULAR_EXPRESSION (cpp17 L-6): the shared
+    # set_terminate handler _Exit(0)s on ANY terminate, so the exit code alone
+    # cannot tell "the self-destruct detector fired" from "something else
+    # terminated the process". Each positive scenario stamps a STAGE around the
+    # reset that must terminate and the handler echoes it, so matching the stage
+    # is what makes exit 0 mean the right thing. FAIL_REGULAR_EXPRESSION on
+    # "FAILURE" takes precedence over the pass regex, so a diagnostic the scenario
+    # prints on a wrong outcome can never be matched past. The configurer and
+    # enqfail scenarios deadlock in quiesce STEP 3 on a regression and hang to the
+    # TIMEOUT; only `selfdestruct` can reach its `return 1`.
+    add_test(NAME rpc::jsonrpc_quiesce_selfdestruct
+        COMMAND iora_test_jsonrpc_quiesce_selfdestruct)
+    set_tests_properties(rpc::jsonrpc_quiesce_selfdestruct PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "self-destruct detected\\) stage=own-callback"
+        FAIL_REGULAR_EXPRESSION "FAILURE")
+    add_test(NAME rpc::jsonrpc_quiesce_otherclient_no_terminate
+        COMMAND iora_test_jsonrpc_quiesce_selfdestruct otherclient)
+    set_tests_properties(rpc::jsonrpc_quiesce_otherclient_no_terminate PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "per-Impl isolation holds"
+        FAIL_REGULAR_EXPRESSION "FAILURE")
+    add_test(NAME rpc::jsonrpc_quiesce_enqfail_selfdestruct
+        COMMAND iora_test_jsonrpc_quiesce_selfdestruct enqfail)
+    set_tests_properties(rpc::jsonrpc_quiesce_enqfail_selfdestruct PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "self-destruct detected\\) stage=enqueue-failure-delivery"
+        FAIL_REGULAR_EXPRESSION "FAILURE")
+    add_test(NAME rpc::jsonrpc_quiesce_configurer_selfdestruct
+        COMMAND iora_test_jsonrpc_quiesce_selfdestruct configurer)
+    set_tests_properties(rpc::jsonrpc_quiesce_configurer_selfdestruct PROPERTIES TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "self-destruct detected\\) stage=configurer-window"
+        FAIL_REGULAR_EXPRESSION "FAILURE")
+endif()
+
+# task-6.5 (C1): the inherited pool concurrency suite, ported from
+# src/modules/connectors/jsonrpc_client/tests/. It uses FIXED loopback ports
+# (18150-18189) in its LatchedHttpServer / RawCaptureServer fixtures, so every
+# registration is RESOURCE_LOCK'd on a shared token. The default registration runs
+# the GREEN tag set; the four CR repros run as their own focused regression guards.
+# Created here (before the IORA_SANITIZED_TEST_TARGETS loop, to which it is added)
+# because the tag-filtered default + per-repro registrations cannot be expressed
+# by the flat RPC_TESTS create_individual_test path.
+if(IORA_BUILD_RPC_TESTS AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rpc/iora_test_jsonrpc_client_pool.cpp")
+    create_iora_test_target(iora_test_jsonrpc_client_pool
+        SOURCES rpc/iora_test_jsonrpc_client_pool.cpp)
+    target_include_directories(iora_test_jsonrpc_client_pool PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}) # iora_test_net_utils.hpp lives in tests/
+    add_test(NAME rpc::iora_test_jsonrpc_client_pool
+        COMMAND iora_test_jsonrpc_client_pool
+        "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6],[phase7],[connecttimeout]")
+    set_tests_properties(rpc::iora_test_jsonrpc_client_pool PROPERTIES
+        TIMEOUT 180 RESOURCE_LOCK jsonrpc_pool_ports)
+    # Per-repro standalone guards (CR-1..CR-4), each filtered to one Catch2 tag.
+    add_test(NAME rpc::jsonrpc_client_pool_cr1_identity
+        COMMAND iora_test_jsonrpc_client_pool "[cr1]")
+    set_tests_properties(rpc::jsonrpc_client_pool_cr1_identity PROPERTIES
+        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+    add_test(NAME rpc::jsonrpc_client_pool_cr2_freed_pool
+        COMMAND iora_test_jsonrpc_client_pool "[cr2]")
+    set_tests_properties(rpc::jsonrpc_client_pool_cr2_freed_pool PROPERTIES
+        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+    add_test(NAME rpc::jsonrpc_client_pool_cr3_deadlock
+        COMMAND iora_test_jsonrpc_client_pool "[cr3]")
+    set_tests_properties(rpc::jsonrpc_client_pool_cr3_deadlock PROPERTIES
+        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+    add_test(NAME rpc::jsonrpc_client_pool_cr4_quiesce_waits
+        COMMAND iora_test_jsonrpc_client_pool "[cr4]")
+    set_tests_properties(rpc::jsonrpc_client_pool_cr4_quiesce_waits PROPERTIES
+        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+endif()
 
 # Suppress a known GCC false-positive (-Wfree-nonheap-object) triggered by
 # vector::reserve inlined from KVStore::writeLogEntry. Matches the suppression
@@ -364,6 +492,21 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_logger_immortal_scenario2_static_sink_dtor
     iora_test_logger_immortal_exit_flush
     test_websocket_reconnect
+    # rpc group (tracker 2026-07-26-1). The four base targets registered at
+    # phase-2; the remaining C1-port targets (client_pool, gzip_request,
+    # gzip_response) are appended by their own phase-6 tasks 6.5/6.7.
+    iora_test_jsonrpc_server
+    iora_test_jsonrpc_http
+    iora_test_jsonrpc_client
+    iora_test_jsonrpc_e2e
+    # task-6.6: standalone self-destruct executable (created above, before this loop).
+    iora_test_jsonrpc_quiesce_selfdestruct
+    # task-6.7: gzip foundation unit test + request-direction (TSan probe) + response.
+    iora_test_jsonrpc_gzip_foundation
+    iora_test_jsonrpc_gzip_request
+    iora_test_jsonrpc_gzip_response
+    # task-6.5: inherited pool concurrency suite (created above, before this loop).
+    iora_test_jsonrpc_client_pool
 )
 foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
     if(TARGET ${_san_target})
@@ -507,6 +650,20 @@ if(IORA_BUILD_WEB_TESTS)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_path}.cpp")
             get_filename_component(test_name ${test_path} NAME)
             add_custom_command(TARGET test_web POST_BUILD
+                COMMAND ${test_name}
+                COMMENT "Running ${test_name}"
+                VERBATIM
+            )
+        endif()
+    endforeach()
+endif()
+
+if(IORA_BUILD_RPC_TESTS)
+    add_custom_target(test_rpc COMMENT "Running rpc tests")
+    foreach(test_path ${RPC_TESTS})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_path}.cpp")
+            get_filename_component(test_name ${test_path} NAME)
+            add_custom_command(TARGET test_rpc POST_BUILD
                 COMMAND ${test_name}
                 COMMENT "Running ${test_name}"
                 VERBATIM

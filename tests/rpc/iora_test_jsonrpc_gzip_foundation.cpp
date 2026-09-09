@@ -4,28 +4,38 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 //
+// PORTED (tracker 2026-07-26-1 task-6.7, C1) from
+// src/modules/connectors/jsonrpc_client/tests/iora_test_jsonrpc_gzip_foundation.cpp.
+// Changes: namespace iora::modules::connectors -> iora::rpc; include
+// "../jsonrpc_client.hpp" -> "iora/rpc/jsonrpc_client.hpp". The one server-config
+// case that loaded the DELETED mod_jsonrpc_server.so plugin and read
+// jsonrpc.getConfig over the .so boundary is REWRITTEN to a direct defaults check
+// on iora::rpc::JsonRpcHttpEndpoint's JsonRpcHttpOptions (the migrated server
+// config surface: no IoraService, no plugin). Every other (pure-unit) case ports
+// verbatim.
+//
 // Foundation tests for the JSON-RPC bidirectional negotiated-gzip Consumer C
 // (tracker 2026-09-04-2, arch architecture/iora/jsonrpc_gzip_compression.json).
-// Covers the foundation slice ONLY: the shared types, the client + server config
-// surface + its test seam, and the two cross-cutting prerequisite seams
-// (isListValuedHeader combine + the promoted iora::parsers::gzipAcceptable helper).
-// Request/response behavior lands in the phase-2/phase-3 trackers.
+// Covers the foundation slice: the shared types, the client + server config
+// surface, and the two cross-cutting prerequisite seams (isListValuedHeader
+// combine + the promoted iora::parsers::gzipAcceptable helper).
 
-#include "../jsonrpc_client.hpp" // Config, ContentCodingRejectedError, OriginRequestCompressionState
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch.hpp>
 
-#include "iora/iora.hpp"
-#include "iora/network/http_client.hpp"  // HttpClient::isRequestProvablyNotSent, HttpRequestNotSentError
+#include "iora/rpc/jsonrpc_client.hpp" // Config, ContentCodingRejectedError, OriginRequestCompressionState
+#include "iora/rpc/jsonrpc_http.hpp"   // JsonRpcHttpOptions (migrated server config surface)
+
+#include "iora/network/http_client.hpp"     // isRequestProvablyNotSent, HttpRequestNotSentError
 #include "iora/parsers/accept_encoding.hpp" // promoted gzipAcceptable
 #include "iora/parsers/http_message.hpp"    // isListValuedHeader, addOrCombineHeader, HttpRequest
 
-#include <catch2/catch.hpp>
-
 #include <chrono>
-#include <filesystem>
 #include <optional>
 #include <string>
+#include <type_traits>
 
-using namespace iora::modules::connectors;
+using namespace iora::rpc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // (a) ContentCodingRejectedError catch-shape (task-1.1)
@@ -129,39 +139,26 @@ TEST_CASE("gzip foundation: client Config compression defaults", "[gzip-foundati
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (c-server) mod_jsonrpc_server config defaults via the getConfig test seam
-//            (task-2.2). Loads the real server .so and reads back its effective
-//            config — the .so-boundary equivalent of "public const getters".
+// (c-server) Migrated server config surface: JsonRpcHttpEndpoint's
+//            JsonRpcHttpOptions defaults (task-2.2, ported). The old test loaded
+//            mod_jsonrpc_server.so and read jsonrpc.getConfig over the .so
+//            boundary; the migration DELETES that plugin, so the server config is
+//            now a plain struct — check its defaults directly (the .so-boundary
+//            getConfig readback becomes a direct field read).
 // ─────────────────────────────────────────────────────────────────────────────
-TEST_CASE("gzip foundation: server config defaults via getConfig seam",
-          "[gzip-foundation][config][plugin]")
+TEST_CASE("gzip foundation: server config defaults on JsonRpcHttpOptions",
+          "[gzip-foundation][config]")
 {
-  iora::IoraService::Config svcConfig;
-  svcConfig.server.port = 8138;
-  svcConfig.log.level = "info";
-
-  iora::IoraService::shutdown(); // ensure clean state
-  iora::IoraService::init(svcConfig);
-  iora::IoraService &svc = iora::IoraService::instanceRef();
-  iora::IoraService::AutoServiceShutdown autoShutdown(svc);
-
-  auto serverPluginPath = iora::util::resolveRelativePath(
-                            iora::util::getExecutableDir(),
-                            "../../../endpoints/jsonrpc_server/") +
-                          "/mod_jsonrpc_server.so";
-  REQUIRE(std::filesystem::exists(serverPluginPath));
-  REQUIRE(svc.loadSingleModule(serverPluginPath));
-
-  auto cfg = svc.callExportedApi<iora::parsers::Json>("jsonrpc.getConfig");
+  JsonRpcHttpOptions opts;
 
   // Negotiated-gzip server defaults (arch configSurface.serverFields).
-  REQUIRE(cfg["enableRequestDecompression"].get<bool>() == false);
-  REQUIRE(cfg["enableResponseCompression"].get<bool>() == false);
-  REQUIRE(cfg["compressionThreshold"].get<std::size_t>() == std::size_t{1024});
-  // The request cap the decode path reuses is the existing _maxRequestBytes
-  // (arch caps.server: one constant is BOTH the compressed-input pre-filter and
-  // the decoded maxOutputBytes cap). Default 1 MiB.
-  REQUIRE(cfg["maxRequestBytes"].get<std::size_t>() == std::size_t{1} * 1024 * 1024);
+  REQUIRE(opts.enableRequestDecompression == false);
+  REQUIRE(opts.enableResponseCompression == false);
+  REQUIRE(opts.compressionThreshold == std::size_t{1024});
+  // The request cap the decode path reuses is maxRequestBytes (arch caps.server:
+  // one constant is BOTH the compressed-input pre-filter and the decoded
+  // maxOutputBytes cap). Default 1 MiB.
+  REQUIRE(opts.maxRequestBytes == std::size_t{1} * 1024 * 1024);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

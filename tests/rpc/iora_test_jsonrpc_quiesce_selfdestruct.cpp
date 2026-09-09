@@ -5,6 +5,15 @@
 // License 2.0. See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for
 // details.
 //
+// PORTED (tracker 2026-07-26-1 task-6.6, C1) from
+// src/modules/connectors/jsonrpc_client/tests/iora_test_jsonrpc_quiesce_selfdestruct.cpp.
+// Changes limited to the mechanical move: namespace iora::modules::connectors ->
+// iora::rpc; include "jsonrpc_client.hpp" -> "iora/rpc/jsonrpc_client.hpp"; the
+// JsonRpcClient constructor no longer takes a leading IoraService& (task-5.2), so
+// the IoraService init/AutoServiceShutdown scaffolding is dropped and each client
+// is built as JsonRpcClient(pool, cfg). Behaviour and scenarios are otherwise
+// preserved verbatim.
+//
 // tracker 2026-07-26-2 PHASE 3 task-3.2 — self-destruct detection, and its
 // per-Impl-isolation negative.
 //
@@ -19,7 +28,7 @@
 // terminate.
 //
 // A std::terminate takes down the whole process, so this cannot live in the
-// shared Catch2 pool binary — it is a STANDALONE executable with two scenarios
+// shared Catch2 pool binary — it is a STANDALONE executable with scenarios
 // selected by argv[1], each registered as a ctest expecting exit 0:
 //   * "selfdestruct" (default): destroy the OWN client from its callback ->
 //     terminate EXPECTED. set_terminate handler _Exit(0) = PASS; reaching the
@@ -27,6 +36,8 @@
 //   * "configurer" (PHASE 6, task-6.4b(y)): destroy the client from inside the
 //     httpClientConfigurer, which since phase 6 runs on the CALLING thread in
 //     acquire_'s unlocked construction window -> terminate EXPECTED.
+//   * "enqfail" (TS-5): self-destruct on the SYNCHRONOUS enqueue-failure delivery
+//     path -> terminate EXPECTED.
 //   * "otherclient": destroy a DIFFERENT idle client (sharing the ThreadPool)
 //     from the first client's callback -> terminate FORBIDDEN. Reaching the end
 //     cleanly -> return 0 = PASS; a terminate -> handler _Exit(3) = FAIL.
@@ -36,9 +47,11 @@
 // callback's captured reference is provably the last one and ~JsonRpcClient runs
 // on the worker (self-destruct scenario) — never on main.
 
-#include "iora/iora.hpp"
+#include "iora/rpc/jsonrpc_client.hpp"
 
-#include "jsonrpc_client.hpp"
+#include "iora/core/thread_pool.hpp"
+#include "iora/network/http_client.hpp"
+#include "iora/parsers/json.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -49,8 +62,8 @@
 #include <string>
 #include <thread>
 
-using iora::modules::connectors::Config;
-using iora::modules::connectors::JsonRpcClient;
+using iora::rpc::Config;
+using iora::rpc::JsonRpcClient;
 
 namespace
 {
@@ -77,22 +90,6 @@ struct StageScope
   ~StageScope() { g_stage.store("none"); }
 };
 
-iora::IoraService &testService()
-{
-  static bool initialized = false;
-  if (!initialized)
-  {
-    iora::IoraService::Config config;
-    config.features.server = false;
-    config.log.file = "jsonrpc_quiesce_selfdestruct_test";
-    config.log.level = "info";
-    config.modules.autoLoad = false;
-    iora::IoraService::init(config);
-    initialized = true;
-  }
-  return iora::IoraService::instanceRef();
-}
-
 Config stubConfig()
 {
   Config cfg;
@@ -104,10 +101,10 @@ Config stubConfig()
 
 // Positive: destroy the OWN client from inside its own onError. The worker is in
 // this client's _owners, so quiesce STEP-1 must terminate.
-int runSelfDestruct(iora::IoraService &svc)
+int runSelfDestruct()
 {
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
-  auto client = std::make_shared<JsonRpcClient>(svc, pool, stubConfig());
+  auto client = std::make_shared<JsonRpcClient>(pool, stubConfig());
 
   std::atomic<bool> mainDidReset{false};
   client->callAsync(
@@ -139,7 +136,7 @@ int runSelfDestruct(iora::IoraService &svc)
 // client, quiesce STEP-1 must detect the caller in _owners (the callAsync
 // OwnerScope) and terminate — rather than deadlocking STEP-3 forever on a
 // still-counted token pinned in the caller's frame.
-int runEnqueueFailSelfDestruct(iora::IoraService &svc)
+int runEnqueueFailSelfDestruct()
 {
   // Queue cap 1; occupy the sole worker and fill the one slot so callAsync's
   // enqueue throws "task queue is full". The blocker parks forever — the process
@@ -153,7 +150,7 @@ int runEnqueueFailSelfDestruct(iora::IoraService &svc)
 
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1),
                               /*maxQueueSize*/ 1);
-  auto client = std::make_shared<JsonRpcClient>(svc, pool, stubConfig());
+  auto client = std::make_shared<JsonRpcClient>(pool, stubConfig());
 
   pool.enqueue(
     [&blockerStarted, &blockerF]()
@@ -213,7 +210,7 @@ int runEnqueueFailSelfDestruct(iora::IoraService &svc)
 // terminate at all would exit 0. The ctest registration adds
 // PASS_REGULAR_EXPRESSION on `stage=configurer-window`, so exiting 0 counts as a
 // pass only when the terminate fired during the reset inside the window.
-int runConfigurerSelfDestruct(iora::IoraService &svc)
+int runConfigurerSelfDestruct()
 {
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
 
@@ -227,7 +224,7 @@ int runConfigurerSelfDestruct(iora::IoraService &svc)
     holder.reset();
   };
 
-  holder = std::make_shared<JsonRpcClient>(svc, pool, cfg);
+  holder = std::make_shared<JsonRpcClient>(pool, cfg);
   JsonRpcClient *raw = holder.get();
   try
   {
@@ -248,11 +245,11 @@ int runConfigurerSelfDestruct(iora::IoraService &svc)
 // Negative: destroy a DIFFERENT idle client (sharing the ThreadPool) from inside
 // the first client's onError. The worker is in the FIRST client's _owners, not
 // the second's, so destroying the second must NOT terminate.
-int runOtherClient(iora::IoraService &svc)
+int runOtherClient()
 {
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
-  JsonRpcClient first(svc, pool, stubConfig());           // active; destroyed by main at end
-  auto second = std::make_shared<JsonRpcClient>(svc, pool, stubConfig()); // idle, shares the pool
+  JsonRpcClient first(pool, stubConfig());                           // active; destroyed by main at end
+  auto second = std::make_shared<JsonRpcClient>(pool, stubConfig()); // idle, shares the pool
 
   std::atomic<bool> mainDidReset{false};
   std::atomic<bool> callbackDone{false};
@@ -312,21 +309,19 @@ int main(int argc, char **argv)
 
   try
   {
-    auto &svc = testService();
-    iora::IoraService::AutoServiceShutdown autoShutdown(svc);
     if (scenario == "otherclient")
     {
-      return runOtherClient(svc);
+      return runOtherClient();
     }
     if (scenario == "enqfail")
     {
-      return runEnqueueFailSelfDestruct(svc);
+      return runEnqueueFailSelfDestruct();
     }
     if (scenario == "configurer")
     {
-      return runConfigurerSelfDestruct(svc);
+      return runConfigurerSelfDestruct();
     }
-    return runSelfDestruct(svc);
+    return runSelfDestruct();
   }
   catch (const std::exception &e)
   {

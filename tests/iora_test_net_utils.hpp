@@ -150,6 +150,39 @@ private:
   std::uint16_t _port{0};
 };
 
+/// \brief Send raw request bytes to a loopback TCP port and return the full raw
+/// HTTP response (or "" on any socket error). Used where HttpClient's map API
+/// cannot express the wire form — an OPTIONS preflight, or duplicate header
+/// field-lines (RFC 9110 §5.3). Reads until the peer closes, so the request
+/// SHOULD carry `Connection: close`. (Slice-B review L7: de-duplicated from the
+/// jsonrpc gzip request/response tests, which each had a byte-identical copy.)
+inline std::string rawHttpRequest(int port, const std::string &requestBytes)
+{
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0)
+  {
+    return "";
+  }
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+  std::string out;
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
+      ::send(fd, requestBytes.data(), requestBytes.size(), 0) ==
+        static_cast<ssize_t>(requestBytes.size()))
+  {
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0)
+    {
+      out.append(buf, static_cast<std::size_t>(n));
+    }
+  }
+  ::close(fd);
+  return out;
+}
+
 } // namespace testnet
 
 // RAII helper for epoll fd
