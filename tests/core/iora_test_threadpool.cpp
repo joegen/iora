@@ -1,6 +1,9 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -63,12 +66,68 @@ TEST_CASE("ThreadPool scales up under load", "[threadpool][scaling]")
 //
 TEST_CASE("ThreadPool handles queue overflow", "[threadpool][overflow]")
 {
-  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(5), 2); // max 2 tasks in queue
+  // Coordination primitives are declared BEFORE `pool` on purpose: at scope exit
+  // objects destruct in reverse declaration order, so `pool` destructs (and
+  // ~ThreadPool joins the worker) while `m`/`cv`/`release` are still alive. The
+  // worker, woken by the releaser below, reacquires `m` and reads `release` as it
+  // leaves cv.wait — declaring `pool` first would let that use race the
+  // destruction of the mutex it locks and the bool it reads (UB).
+  std::mutex m;
+  std::condition_variable cv;
+  bool release = false;
+  std::atomic<bool> workerBusy{false};
 
-  pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });
-  pool.enqueue([]() { std::this_thread::sleep_for(std::chrono::milliseconds(100)); });
+  iora::core::ThreadPool pool(1, 1, std::chrono::seconds(5), 2); // 1 worker, max 2 queued
 
-  REQUIRE_THROWS_AS(pool.enqueue([]() {}), std::runtime_error);
+  // Occupy the single worker on a latch so it cannot drain the queue; only then
+  // does the queue deterministically fill to its cap and the next enqueue
+  // overflow. Without the latch the lone worker races the enqueues — it may
+  // dequeue the first task before the third enqueue, leaving room and dropping
+  // the expected throw (a scheduling-dependent flake under load).
+  pool.enqueue(
+    [&]()
+    {
+      workerBusy.store(true);
+      std::unique_lock<std::mutex> lk(m);
+      cv.wait(lk, [&]() { return release; });
+    });
+
+  // Release the worker on scope exit — even if the assertion below fails and
+  // unwinds — so the pool destructor never blocks on the latched task. Declared
+  // AFTER `pool`, so it destructs BEFORE `pool`: notify_all() runs first, then
+  // ~ThreadPool joins the now-woken worker.
+  struct LatchReleaser
+  {
+    std::mutex &m;
+    std::condition_variable &cv;
+    bool &release;
+    ~LatchReleaser()
+    {
+      {
+        std::lock_guard<std::mutex> lk(m);
+        release = true;
+      }
+      cv.notify_all();
+    }
+  } releaser{m, cv, release};
+
+  // Wait (bounded) until the worker has actually picked up the blocker (queue now
+  // empty). A deadline + FAIL keeps a worker-spawn regression from hanging the
+  // test indefinitely instead of failing diagnosably.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!workerBusy.load())
+  {
+    if (std::chrono::steady_clock::now() >= deadline)
+    {
+      FAIL("worker never picked up the blocker task");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  pool.enqueue([]() {}); // queue depth 1
+  pool.enqueue([]() {}); // queue depth 2 (at cap)
+
+  REQUIRE_THROWS_AS(pool.enqueue([]() {}), std::runtime_error); // overflow
 }
 
 //
