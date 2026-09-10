@@ -145,7 +145,9 @@ public:
              std::size_t maxQueueSize = 1024,
              std::function<void(std::exception_ptr)> onTaskError = nullptr,
              ShutdownMode shutdownMode = ShutdownMode::IMMEDIATE)
-      : _initialSize(initialSize), _maxSize(maxSize), _idleTimeout(idleTimeout),
+      : _initialSize(clampInitial(initialSize)),
+        _maxSize(maxSize >= _initialSize ? maxSize : _initialSize),
+        _idleTimeout(idleTimeout),
         _maxQueueSize(maxQueueSize), _shutdown(false), _activeThreads(0), _busyThreads(0),
         _onTaskError(std::move(onTaskError)), _shutdownMode(shutdownMode)
   {
@@ -1149,6 +1151,9 @@ private:
   std::queue<std::function<void()>> _tasks;
   mutable std::mutex _mutex;
   std::condition_variable _condition;
+
+  /// Clamp a worker count to >=1 (hardware_concurrency() may return 0 -> 0-worker hang).
+  static constexpr std::size_t clampInitial(std::size_t n) { return n ? n : 1; }
 
   const std::size_t _initialSize;
   const std::size_t _maxSize;

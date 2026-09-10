@@ -8,6 +8,10 @@
 #include <catch2/catch.hpp>
 #include <iora/common/i_lifecycle_managed.hpp>
 #include <iora/core/thread_pool.hpp>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <thread>
 
 using namespace iora::core;
 using namespace iora::common;
@@ -458,4 +462,100 @@ TEST_CASE("ThreadPool lifecycle: Drain statistics accuracy", "[threadpool][lifec
   // All tasks should complete
   REQUIRE(stats.remaining == 0);
   REQUIRE(stats.completed == stats.inFlightAtStart);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: Zero-worker guard (hardware_concurrency()==0 -> silent hang)
+// Tracker 2026-09-06-10. The DISCRIMINATING case is (initialSize==0, maxSize==0):
+// a (0, N>0) pool self-heals on first enqueue (lazy-spawn gate 0<N), so only (0,0)
+// reproduces the hang. Waits are BOUNDED so a regression FAILS instead of hanging
+// the suite.
+// ══════════════════════════════════════════════════════════════════════════
+
+// Submit a value-returning task and require it drains within a BOUNDED wait, so a
+// 0-worker regression FAILS the assertion instead of hanging the suite.
+static void requireDrainsWithin(ThreadPool &pool, int value)
+{
+  auto future = pool.enqueueWithResult([value]() { return value; });
+  auto status = future.wait_for(std::chrono::seconds(5));
+  REQUIRE(status == std::future_status::ready);
+  REQUIRE(future.get() == value);
+}
+
+TEST_CASE("ThreadPool zero-worker: (0,0) pool has >=1 worker and drains a task",
+          "[threadpool][lifecycle][zero-worker]")
+{
+  ThreadPool pool(0, 0); // clampInitial forces _initialSize=1, _maxSize>=1
+
+  REQUIRE(pool.getTotalThreadCount() >= 1);
+  requireDrainsWithin(pool, 42);
+}
+
+TEST_CASE("ThreadPool zero-worker: (0,0) pool re-spawns a worker after reset()->start()",
+          "[threadpool][lifecycle][zero-worker][restart]")
+{
+  ThreadPool pool(0, 0);
+
+  // Running -> Draining -> Stopped
+  auto stopResult = pool.stop();
+  REQUIRE(stopResult.success == true);
+  REQUIRE(pool.getState() == LifecycleState::Stopped);
+
+  // Stopped -> Reset
+  auto resetResult = pool.reset();
+  REQUIRE(resetResult.success == true);
+  REQUIRE(pool.getState() == LifecycleState::Reset);
+
+  // Reset -> Running (spawn loop at :497 reads the CONST clamped _initialSize)
+  auto startResult = pool.start();
+  REQUIRE(startResult.success == true);
+  REQUIRE(pool.getState() == LifecycleState::Running);
+
+  // A "clamp a local" fix would leave the restart spawn reading an unclamped 0 here.
+  REQUIRE(pool.getTotalThreadCount() >= 1);
+  requireDrainsWithin(pool, 7);
+}
+
+TEST_CASE("ThreadPool zero-worker: (0,0) pool destructs cleanly within a bound",
+          "[threadpool][lifecycle][zero-worker][teardown]")
+{
+  // Heap-owned promise captured BY VALUE: if the pool hangs and this TEST_CASE
+  // unwinds (REQUIRE fails), a detached runner must not write to a destroyed
+  // stack promise (UAF). The shared_ptr keeps the shared state alive.
+  auto donePromise = std::make_shared<std::promise<void>>();
+  auto doneFuture = donePromise->get_future();
+
+  std::thread runner(
+    [donePromise]()
+    {
+      {
+        ThreadPool pool(0, 0);
+        auto future = pool.enqueueWithResult([]() { return 1; });
+        (void)future.wait_for(std::chrono::seconds(5));
+      } // ~ThreadPool: Phase-2 barrier + Phase-4 join on the forced worker
+      donePromise->set_value();
+    });
+
+  // Bounded: if the forced worker leaves the pool unable to tear down, this FAILS
+  // rather than hanging the suite (do NOT raise the timeout to pass).
+  auto status = doneFuture.wait_for(std::chrono::seconds(10));
+  if (status == std::future_status::ready)
+  {
+    runner.join();
+  }
+  else
+  {
+    runner.detach(); // avoid std::terminate on a joinable-thread dtor
+  }
+  REQUIRE(status == std::future_status::ready);
+}
+
+TEST_CASE("ThreadPool zero-worker: (initialSize>maxSize) is functional (maxSize invariant repair)",
+          "[threadpool][lifecycle][zero-worker][invariant]")
+{
+  // _maxSize is repaired to >= clamped _initialSize, so a (2,1) pool is valid.
+  ThreadPool pool(2, 1);
+
+  REQUIRE(pool.getTotalThreadCount() >= 1);
+  requireDrainsWithin(pool, 5);
 }
