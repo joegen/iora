@@ -82,9 +82,11 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -134,26 +136,101 @@ template <typename Pred> bool waitFor(Pred pred, int timeoutMs = 5000)
   return true;
 }
 
-// Runs `fn` and returns true iff it completed within timeoutMs. On timeout the
-// worker thread is DETACHED — a genuine deadlock then surfaces as a clean test
-// failure (this returns false) rather than wedging the whole binary. `fn` MUST be
-// self-contained: on the timeout path it keeps running after this returns, so it
-// may capture only by value / heap / shared state, never the caller's stack.
-bool completesWithin(std::function<void()> fn, int timeoutMs)
+// ── Cross-thread assertion channel (Catch2 issue #99) ────────────────────────
+// Catch2's assertion macros (REQUIRE/CHECK/INFO/WARN/FAIL) touch unsynchronized
+// global RunContext state and are single-thread-only: only the thread that
+// entered the TEST_CASE may use them. Every scenario body below runs on a
+// completesWithin() WORKER thread (DETACHED on timeout), so NO Catch2 macro may
+// execute inside a body. Instead the body records pass/fail into this heap-owned
+// result and the MAIN test thread asserts on it after the worker joins/times out.
+//
+// Synchronization: on the success path completesWithin() join()s the worker — the
+// join is the happens-before edge for the main thread's reads. On the TIMEOUT
+// path the worker is DETACHED and keeps running with NO join edge, so every
+// access to the non-atomic `_message` (the worker's write AND the main thread's
+// read) MUST hold `_m`; the mutex is mandatory, not defensive. The result is
+// heap-owned via shared_ptr and captured BY VALUE into the worker lambda, so a
+// leaked-on-timeout body never dangles into freed state.
+struct BodyResult
+{
+  mutable std::mutex _m;
+  bool _failed{false};  // guarded by _m
+  std::string _message; // guarded by _m; first recorded failure only
+
+  void record(const std::string &msg)
+  {
+    std::lock_guard<std::mutex> lk(_m);
+    if (!_failed) // keep the FIRST failure; the body aborts after the first anyway
+    {
+      _message = msg;
+      _failed = true;
+    }
+  }
+  // Single locked snapshot so the diagnostic message and the asserted flag come
+  // from the SAME critical section — a still-running detached body (timeout path)
+  // cannot slip a failure in between two separate locked reads.
+  std::pair<bool, std::string> snapshot() const
+  {
+    std::lock_guard<std::mutex> lk(_m);
+    return {_failed, _message};
+  }
+};
+
+// Thrown by bodyRequire() to abort a scenario body early — mirrors REQUIRE's
+// abort-on-failure. A PLAIN sentinel (NOT derived from std::exception) so
+// completesWithin()'s catch clauses distinguish a recorded assertion failure from
+// an unexpected exception. It never reaches Catch2 on the worker thread.
+struct BodyAbort
+{
+};
+
+// Worker-thread assertion: on failure record the message and abort the body.
+// Use in place of REQUIRE(cond) inside a completesWithin() body.
+inline void bodyRequire(BodyResult &r, bool cond, const std::string &msg)
+{
+  if (!cond)
+  {
+    r.record(msg);
+    throw BodyAbort{};
+  }
+}
+
+// Outcome of completesWithin: whether the body finished within the watchdog, plus
+// the shared result channel (co-owned with the — possibly detached — worker).
+struct BodyOutcome
+{
+  bool completed{false};
+  std::shared_ptr<BodyResult> result;
+};
+
+// Runs `fn(result)` on a worker thread and reports whether it finished within
+// timeoutMs. On timeout the worker is DETACHED — a genuine deadlock then surfaces
+// as completed==false (a clean main-thread failure) rather than wedging the whole
+// binary. `fn` MUST be self-contained: on the timeout path it keeps running after
+// this returns, so it may capture only by value / heap / shared state, never the
+// caller's stack.
+BodyOutcome completesWithin(std::function<void(BodyResult &)> fn, int timeoutMs)
 {
   auto done = std::make_shared<std::atomic<bool>>(false);
+  auto result = std::make_shared<BodyResult>();
   std::thread t(
-    [fn, done]()
+    [fn, done, result]() // shared_ptrs BY VALUE: outlive a detached body
     {
-      // A throw counts as "did not hang": the watchdog detects hangs, not
-      // exceptions. (An uncaught throw on a library I/O thread is a separate,
-      // process-level failure the binary will surface on its own.)
       try
       {
-        fn();
+        fn(*result);
+      }
+      catch (const BodyAbort &)
+      {
+        // A bodyRequire() failure — already recorded; nothing more to do.
+      }
+      catch (const std::exception &e)
+      {
+        result->record(std::string("unexpected exception: ") + e.what());
       }
       catch (...)
       {
+        result->record("unexpected non-standard exception");
       }
       done->store(true);
     });
@@ -166,7 +243,19 @@ bool completesWithin(std::function<void()> fn, int timeoutMs)
   {
     t.detach(); // intentional leak: the body is wedged; let the binary report.
   }
-  return ok;
+  return BodyOutcome{ok, result};
+}
+
+// MAIN-thread assertion over a completesWithin() outcome. The two REQUIREs
+// guarantee every scenario has >=2 main-thread assertions (no Catch2 "no
+// assertions in test case" warning). firstMessage() reads under the mutex, so it
+// is safe even against a still-running detached body on the timeout path.
+void requireOutcome(const BodyOutcome &o)
+{
+  const auto snap = o.result->snapshot(); // {failed, first message} in one lock
+  INFO("first recorded body failure: " << snap.second);
+  REQUIRE(o.completed);      // false == watchdog timeout (hang/deadlock)
+  REQUIRE_FALSE(snap.first); // a body-recorded assertion failure
 }
 
 // Exposes the protected TCP-level closeSession() so a test can drop a session at
@@ -230,16 +319,39 @@ struct HalfOpenListener
 
   explicit HalfOpenListener(int p) : port(p)
   {
+    // This ctor runs on the completesWithin() worker/body thread (h2/h3
+    // construct it inside the body), so it must NOT use Catch2 macros. Socket
+    // setup failures throw std::runtime_error, which completesWithin() records
+    // as a body failure via its std::exception catch. The ctor throw skips
+    // ~HalfOpenListener, so close listenFd here before throwing.
+    auto fail = [this](const char *what)
+    {
+      if (listenFd >= 0)
+      {
+        ::close(listenFd);
+        listenFd = -1;
+      }
+      throw std::runtime_error(std::string("HalfOpenListener: ") + what);
+    };
     listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
-    REQUIRE(listenFd >= 0); // runs on the test body thread (not the accept thread)
+    if (listenFd < 0)
+    {
+      fail("socket() failed");
+    }
     int one = 1;
     ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
     addr.sin_port = htons(static_cast<std::uint16_t>(port));
-    REQUIRE(::bind(listenFd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
-    REQUIRE(::listen(listenFd, 16) == 0);
+    if (::bind(listenFd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
+    {
+      fail("bind() failed");
+    }
+    if (::listen(listenFd, 16) != 0)
+    {
+      fail("listen() failed");
+    }
     acceptThread = std::thread(
       [this]()
       {
@@ -296,24 +408,29 @@ TEST_CASE("ws-reconnect: transport drop triggers a successful auto-reconnect (c)
           "[ws][reconnect][integration][c]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
-      REQUIRE(waitFor([&]() { return srv.connectCount.load() >= 1; }));
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions()),
+                  "(c) initial connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.connectCount.load() >= 1; }),
+                  "(c) server never saw the first connect");
 
       // Force a transport-level drop; the client must auto-reconnect.
       srv.dropLast();
-      REQUIRE(waitFor([&]() { return srv.connectCount.load() >= 2; }, 8000));
-      REQUIRE(waitFor(
-        [&]() { return client->getState() == WebSocketState::CONNECTED; }, 8000));
+      bodyRequire(r, waitFor([&]() { return srv.connectCount.load() >= 2; }, 8000),
+                  "(c) auto-reconnect: server never saw the second connect");
+      bodyRequire(r,
+                  waitFor([&]() { return client->getState() == WebSocketState::CONNECTED; },
+                          8000),
+                  "(c) client did not return to CONNECTED after reconnect");
 
       client->disconnect();
     },
     20000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (b) disconnect()-from-onClose — teardown-guard path ──────────────────────
@@ -325,8 +442,8 @@ TEST_CASE("ws-reconnect: disconnect() invoked from the onClose callback does not
           "[ws][reconnect][integration][b][negative-baseline]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
@@ -348,17 +465,19 @@ TEST_CASE("ws-reconnect: disconnect() invoked from the onClose callback does not
         });
 
       // No auto-reconnect here: isolate the teardown-from-callback path.
-      REQUIRE(client->connect("127.0.0.1", port));
-      REQUIRE(waitFor([&]() { return srv.lastSid.load() != 0; }));
+      bodyRequire(r, client->connect("127.0.0.1", port), "(b) connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.lastSid.load() != 0; }),
+                  "(b) server never saw the session");
 
       // Server initiates a graceful WS close -> client receives CLOSE frame ->
       // handleFrame -> _onClose -> disconnect() on the I/O thread.
       srv.server.sendClose(srv.lastSid.load(), 1000, "bye");
 
-      REQUIRE(waitFor([&]() { return closed->load(); }, 8000));
+      bodyRequire(r, waitFor([&]() { return closed->load(); }, 8000),
+                  "(b) onClose (disconnect-from-callback) never completed");
     },
     20000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (a) F-1 deadlock — reconnect-in-flight vs I/O-thread join ────────────────
@@ -371,16 +490,18 @@ TEST_CASE("ws-reconnect: rapid drop/reconnect cycling never deadlocks (a F-1)",
           "[ws][reconnect][integration][a][f1][negative-baseline]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
       // Near-zero reconnect delay maximizes the chance a reconnect is mid-stop()
       // when the next drop's handleDisconnect fires on that transport's I/O
       // thread (the F-1 window).
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 10)));
-      REQUIRE(waitFor([&]() { return srv.connectCount.load() >= 1; }));
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 10)),
+                  "(a) initial connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.connectCount.load() >= 1; }),
+                  "(a) server never saw the first connect");
 
       // Hammer the connection: each accepted session is dropped immediately, so
       // the client is perpetually reconnecting while the I/O thread keeps firing
@@ -397,7 +518,7 @@ TEST_CASE("ws-reconnect: rapid drop/reconnect cycling never deadlocks (a F-1)",
       client->disconnect();
     },
     25000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (d) concurrent-send-during-reconnect — member-sync stress ────────────────
@@ -408,13 +529,18 @@ TEST_CASE("ws-reconnect: concurrent send during repeated reconnect is race-clean
           "[ws][reconnect][integration][d][stress]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 10)));
-      REQUIRE(waitFor([&]() { return srv.connectCount.load() >= 1; }));
+      // Both asserts run BEFORE the sender/dropper threads are spawned: a
+      // bodyRequire() throw (BodyAbort) must never unwind past a joinable
+      // std::thread (that would std::terminate).
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 10)),
+                  "(d) initial connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.connectCount.load() >= 1; }),
+                  "(d) server never saw the first connect");
 
       auto stop = std::make_shared<std::atomic<bool>>(false);
 
@@ -445,7 +571,7 @@ TEST_CASE("ws-reconnect: concurrent send during repeated reconnect is race-clean
       client->disconnect();
     },
     25000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (e) connect-after-disconnect-from-callback lifecycle ─────────────────────
@@ -457,8 +583,8 @@ TEST_CASE("ws-reconnect: connect again after disconnect-from-callback still auto
           "[ws][reconnect][integration][e][lifecycle]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
@@ -480,29 +606,37 @@ TEST_CASE("ws-reconnect: connect again after disconnect-from-callback still auto
           }
         });
 
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
-      REQUIRE(waitFor([&]() { return srv.lastSid.load() != 0; }));
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions()),
+                  "(e) first connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.lastSid.load() != 0; }),
+                  "(e) server never saw the first session");
 
       // Graceful close -> onClose -> disconnect() on the I/O thread (skips join).
       srv.server.sendClose(srv.lastSid.load(), 1000, "bye");
-      REQUIRE(waitFor([&]() { return firstClosed->load(); }, 8000));
+      bodyRequire(r, waitFor([&]() { return firstClosed->load(); }, 8000),
+                  "(e) first close (disconnect-from-callback) never completed");
 
       // Second connect on the main thread must reap the old worker and respawn.
       const int beforeSecond = srv.connectCount.load();
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
-      REQUIRE(waitFor([&]() { return srv.connectCount.load() > beforeSecond; }, 8000));
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions()),
+                  "(e) second connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.connectCount.load() > beforeSecond; }, 8000),
+                  "(e) server never saw the reconnect after the second connect");
 
       // Auto-reconnect must still function after the second connect.
       const int beforeDrop = srv.connectCount.load();
       srv.dropLast();
-      REQUIRE(waitFor([&]() { return srv.connectCount.load() > beforeDrop; }, 8000));
-      REQUIRE(waitFor(
-        [&]() { return client->getState() == WebSocketState::CONNECTED; }, 8000));
+      bodyRequire(r, waitFor([&]() { return srv.connectCount.load() > beforeDrop; }, 8000),
+                  "(e) auto-reconnect after second connect never re-established");
+      bodyRequire(r,
+                  waitFor([&]() { return client->getState() == WebSocketState::CONNECTED; },
+                          8000),
+                  "(e) client did not return to CONNECTED after the post-reconnect drop");
 
       client->disconnect();
     },
     30000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (f) destroy-from-own-callback (I/O thread) ───────────────────────────────
@@ -525,8 +659,8 @@ TEST_CASE("ws-reconnect: dropping the last client ref from onClose (I/O thread) 
 {
   const int port = nextPort();
   auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
-  bool finished = completesWithin(
-    [port, weakProbe]()
+  BodyOutcome outcome = completesWithin(
+    [port, weakProbe](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
@@ -551,17 +685,19 @@ TEST_CASE("ws-reconnect: dropping the last client ref from onClose (I/O thread) 
         });
 
       // No auto-reconnect: isolate the destroy-from-I/O-callback path.
-      REQUIRE(client->connect("127.0.0.1", port));
-      REQUIRE(waitFor([&]() { return srv.lastSid.load() != 0; }));
+      bodyRequire(r, client->connect("127.0.0.1", port), "(f) connect failed");
+      bodyRequire(r, waitFor([&]() { return srv.lastSid.load() != 0; }),
+                  "(f) server never saw the session");
 
       client.reset(); // `slot` now holds the only strong ref to the client
 
       // Graceful close -> onClose on the I/O thread -> drops the last ref.
       srv.server.sendClose(srv.lastSid.load(), 1000, "bye");
-      REQUIRE(waitFor([&]() { return destroyed->load(); }, 8000));
+      bodyRequire(r, waitFor([&]() { return destroyed->load(); }, 8000),
+                  "(f) onClose (last-ref-drop on the I/O thread) never completed");
     },
     20000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
   // The client must actually have been destroyed (no leaked self-owning cycle).
   REQUIRE(waitFor([&]() { return weakProbe->expired(); }, 5000));
 }
@@ -588,11 +724,14 @@ TEST_CASE("ws-reconnect: dropping the last client ref from a worker callback (on
 {
   const int port = nextPort();
   auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
-  auto bodyThreadId = std::make_shared<std::atomic<std::thread::id>>();
-  auto destroyThreadId = std::make_shared<std::atomic<std::thread::id>>();
-  auto ioThreadId = std::make_shared<std::atomic<std::thread::id>>();
-  bool finished = completesWithin(
-    [port, weakProbe, bodyThreadId, destroyThreadId, ioThreadId]()
+  // Brace-init the contained id to the "no thread" sentinel explicitly (the
+  // trailing REQUIREs compare against std::thread::id{}); pre-C++20
+  // std::atomic<T> has a non-initializing default ctor.
+  auto bodyThreadId = std::make_shared<std::atomic<std::thread::id>>(std::thread::id{});
+  auto destroyThreadId = std::make_shared<std::atomic<std::thread::id>>(std::thread::id{});
+  auto ioThreadId = std::make_shared<std::atomic<std::thread::id>>(std::thread::id{});
+  BodyOutcome outcome = completesWithin(
+    [port, weakProbe, bodyThreadId, destroyThreadId, ioThreadId](BodyResult &r)
     {
       bodyThreadId->store(std::this_thread::get_id());
       WsTestServer srv(port);
@@ -629,21 +768,25 @@ TEST_CASE("ws-reconnect: dropping the last client ref from a worker callback (on
           }
         });
 
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
-      REQUIRE(waitFor([&]() { return connecting->load() >= 1; })); // initial CONNECTING
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions()),
+                  "(f2) connect failed");
+      bodyRequire(r, waitFor([&]() { return connecting->load() >= 1; }),
+                  "(f2) initial CONNECTING transition never observed");
       client.reset(); // `slot` now holds the only strong ref
 
       // Force a transport drop -> worker reconnects -> CONNECTING (#2) on the
       // worker drops the last ref mid-attempt.
       srv.dropLast();
-      REQUIRE(waitFor([&]() { return destroyed->load(); }, 10000));
+      bodyRequire(r, waitFor([&]() { return destroyed->load(); }, 10000),
+                  "(f2) worker-thread last-ref-drop (2nd CONNECTING) never ran");
       // Keep the server alive until ~client actually runs on the worker (the
       // reconnect succeeds, then the worker's self drops) — so the handshake is
       // not racing srv teardown.
-      REQUIRE(waitFor([&]() { return weak.expired(); }, 10000));
+      bodyRequire(r, waitFor([&]() { return weak.expired(); }, 10000),
+                  "(f2) client was not destroyed on the worker within the bound");
     },
     25000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
   REQUIRE(waitFor([&]() { return weakProbe->expired(); }, 5000));
   // Prove the destroy ran on the reconnect WORKER thread — a thread distinct from
   // BOTH the connect()/body thread AND the transport I/O thread (the worker
@@ -668,8 +811,8 @@ TEST_CASE("ws-reconnect: weak-only callbacks leave no self-owning cycle (g leak)
 {
   const int port = nextPort();
   auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
-  bool finished = completesWithin(
-    [port, weakProbe]()
+  BodyOutcome outcome = completesWithin(
+    [port, weakProbe](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
@@ -680,14 +823,16 @@ TEST_CASE("ws-reconnect: weak-only callbacks leave no self-owning cycle (g leak)
       client->setOnConnect([weak](const std::string &) { (void)weak; });
       client->setOnClose([weak](std::uint16_t, const std::string &) { (void)weak; });
 
-      REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions()));
-      REQUIRE(waitFor(
-        [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions()),
+                  "(g) connect failed");
+      bodyRequire(r,
+                  waitFor([&]() { return client->getState() == WebSocketState::CONNECTED; }),
+                  "(g) client never reached CONNECTED");
 
       client.reset(); // drop the SOLE strong ref
     },
     20000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
   // No leaked cycle: ~WebSocketClient ran (refcount hit 0) and the worker exited.
   REQUIRE(waitFor([&]() { return weakProbe->expired(); }, 5000));
 }
@@ -705,8 +850,8 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (
           "[ws][reconnect][integration][h][backoff]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       WsTestServer srv(port);
       auto client = WebSocketClient::create();
@@ -715,9 +860,10 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (
       o.autoReconnect = true;
       o.initialReconnectDelay = std::chrono::milliseconds(30000);
       o.maxReconnectDelay = std::chrono::milliseconds(30000);
-      REQUIRE(client->connect("127.0.0.1", port, "/", o));
-      REQUIRE(waitFor(
-        [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+      bodyRequire(r, client->connect("127.0.0.1", port, "/", o), "(h) connect failed");
+      bodyRequire(r,
+                  waitFor([&]() { return client->getState() == WebSocketState::CONNECTED; }),
+                  "(h) client never reached CONNECTED");
 
       // Drop -> worker wakes (requested) and parks in the 30s backoff sleep
       // before its first reconnect attempt.
@@ -729,10 +875,11 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (
       auto t0 = std::chrono::steady_clock::now();
       client->disconnect();
       auto elapsed = std::chrono::steady_clock::now() - t0;
-      REQUIRE(elapsed < std::chrono::seconds(5));
+      bodyRequire(r, elapsed < std::chrono::seconds(5),
+                  "(h) disconnect() did not interrupt the long backoff promptly");
     },
     20000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (h2) disconnect() interrupts a parked HANDSHAKE-SETTLE wait promptly (H-3) ─
@@ -748,15 +895,17 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a parked handshake-settle wait 
           "[ws][reconnect][integration][h2][negative-baseline]")
 {
   const int port = nextPort();
-  bool finished = completesWithin(
-    [port]()
+  BodyOutcome outcome = completesWithin(
+    [port](BodyResult &r)
     {
       auto client = WebSocketClient::create();
       {
         WsTestServer srv(port);
-        REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(5, 50)));
-        REQUIRE(waitFor(
-          [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+        bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions(5, 50)),
+                    "(h2) connect failed");
+        bodyRequire(r,
+                    waitFor([&]() { return client->getState() == WebSocketState::CONNECTED; }),
+                    "(h2) client never reached CONNECTED");
         // srv destructs here: the server stops, frees the port, and drops the
         // client's connection — the worker begins auto-reconnecting.
       }
@@ -765,17 +914,19 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a parked handshake-settle wait 
       // TCP-connect successfully but never receive a 101, parking the worker in
       // the handshake-settle wait.
       HalfOpenListener half(port);
-      REQUIRE(waitFor([&]() { return half.accepted.load() >= 1; }, 10000));
+      bodyRequire(r, waitFor([&]() { return half.accepted.load() >= 1; }, 10000),
+                  "(h2) half-open listener never accepted a reconnect attempt");
       // Let the worker enter the settle-wait after its TCP connect + upgrade send.
       std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
       auto t0 = std::chrono::steady_clock::now();
       client->disconnect();
       auto elapsed = std::chrono::steady_clock::now() - t0;
-      REQUIRE(elapsed < std::chrono::seconds(5));
+      bodyRequire(r, elapsed < std::chrono::seconds(5),
+                  "(h2) disconnect() did not interrupt the parked settle-wait promptly");
     },
     25000);
-  REQUIRE(finished);
+  requireOutcome(outcome);
 }
 
 // ── (h3) disconnect() racing the worker's ENTRY into the settle-wait (H-3-R2) ─
@@ -791,8 +942,8 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a parked handshake-settle wait 
 TEST_CASE("ws-reconnect: disconnect() racing settle-wait entry stays prompt across cycles (h3 H-3-R2)",
           "[ws][reconnect][integration][h3]")
 {
-  bool finished = completesWithin(
-    []()
+  BodyOutcome outcome = completesWithin(
+    [](BodyResult &r)
     {
       for (int i = 0; i < 8; ++i)
       {
@@ -800,9 +951,11 @@ TEST_CASE("ws-reconnect: disconnect() racing settle-wait entry stays prompt acro
         auto client = WebSocketClient::create();
         {
           WsTestServer srv(port);
-          REQUIRE(client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 5)));
-          REQUIRE(waitFor(
-            [&]() { return client->getState() == WebSocketState::CONNECTED; }));
+          bodyRequire(r, client->connect("127.0.0.1", port, "/", autoReconnectOptions(1, 5)),
+                      "(h3) connect failed");
+          bodyRequire(
+            r, waitFor([&]() { return client->getState() == WebSocketState::CONNECTED; }),
+            "(h3) client never reached CONNECTED");
         } // srv stops -> drops the client -> the worker begins reconnecting
         HalfOpenListener half(port);
         // Worker has TCP-connected to the half-open listener (now at/near the
@@ -810,13 +963,19 @@ TEST_CASE("ws-reconnect: disconnect() racing settle-wait entry stays prompt acro
         // A missed accept is acceptable (best-effort window setup): the disconnect
         // is still prompt via the rc->cv-covered backoff/top wait, so this cycle
         // just contributes less window coverage — explicitly discard the result.
-        (void)waitFor([&]() { return half.accepted.load() >= 1; }, 8000);
+        // Best-effort window setup (result discarded); keep the bound small so 8
+        // iterations cannot accumulate past the watchdog on a slow/ASan host.
+        (void)waitFor([&]() { return half.accepted.load() >= 1; }, 3000);
         std::this_thread::sleep_for(std::chrono::milliseconds(i % 4)); // 0..3ms
         auto t0 = std::chrono::steady_clock::now();
         client->disconnect();
-        REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+        bodyRequire(r, std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5),
+                    "(h3) disconnect() racing settle-wait entry was not prompt");
       }
     },
-    60000);
-  REQUIRE(finished);
+    // 8 iterations, each bounded by connect + waitFor(CONNECTED,5s) +
+    // waitFor(accepted,3s) + prompt disconnect(<5s): a comfortable watchdog that
+    // still backstops a genuine per-iteration hang.
+    120000);
+  requireOutcome(outcome);
 }
