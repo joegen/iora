@@ -854,3 +854,85 @@ TEST_CASE("JSON rejects unescaped control characters in strings",
             "line\nbreak");
   }
 }
+// Tracker 2026-09-09-3: the documented typed-error contract (Json::type_error /
+// Json::out_of_range) must be the exception ACTUALLY thrown on a type mismatch /
+// out-of-range access — never std::bad_variant_access nor a bare fake-prefixed
+// std::runtime_error escaping past the public API.
+TEST_CASE("Json typed-error contract")
+{
+  Json s = Json::parseString(R"("hi")");      // string
+  Json i = Json::parseString("42");            // int
+  Json arr = Json::parseString("[1,2]");       // array
+  Json obj = Json::parseString(R"({"k":1})");  // object
+
+  SECTION("scalar getters getBool/getInt/getDouble throw Json::type_error on wrong type")
+  {
+    REQUIRE_THROWS_AS(s.getBool(), Json::type_error);
+    REQUIRE_THROWS_AS(s.getInt(), Json::type_error);
+    REQUIRE_THROWS_AS(s.getDouble(), Json::type_error);
+    // Container getters (getString/getArray/getObject) are covered by the
+    // "mutable getters" and "const-ref getter overloads" sections below.
+  }
+
+  SECTION("mutable getters throw Json::type_error on wrong type")
+  {
+    REQUIRE_THROWS_AS(i.getString(), Json::type_error);
+    REQUIRE_THROWS_AS(i.getArray(), Json::type_error);
+    REQUIRE_THROWS_AS(i.getObject(), Json::type_error);
+  }
+
+  SECTION("const-ref getter overloads throw Json::type_error on a const value")
+  {
+    const Json &ci = i; // binds the const overloads of getString/getArray/getObject
+    REQUIRE_THROWS_AS(ci.getString(), Json::type_error);
+    REQUIRE_THROWS_AS(ci.getArray(), Json::type_error);
+    REQUIRE_THROWS_AS(ci.getObject(), Json::type_error);
+  }
+
+  SECTION("type_error IS-A std::runtime_error and is NOT std::bad_variant_access")
+  {
+    REQUIRE_THROWS_AS(s.getBool(), std::runtime_error);
+    REQUIRE_THROWS_AS(s.getBool(), std::exception);
+    bool caughtBadVariant = false;
+    bool caughtTypeError = false;
+    try
+    {
+      s.getBool();
+    }
+    catch (const Json::type_error &)
+    {
+      caughtTypeError = true;
+    }
+    catch (const std::bad_variant_access &)
+    {
+      caughtBadVariant = true;
+    }
+    REQUIRE(caughtTypeError);
+    REQUIRE_FALSE(caughtBadVariant);
+  }
+
+  SECTION("get<T>() throws Json::type_error on every mismatched branch")
+  {
+    REQUIRE_THROWS_AS(s.get<double>(), Json::type_error); // numeric-from-non-numeric
+    REQUIRE_THROWS_AS(s.get<bool>(), Json::type_error);
+    REQUIRE_THROWS_AS(s.get<std::int64_t>(), Json::type_error);
+    REQUIRE_THROWS_AS(i.get<std::string>(), Json::type_error);
+    REQUIRE_THROWS_AS(i.get<Json::Array>(), Json::type_error);
+    REQUIRE_THROWS_AS(i.get<Json::Object>(), Json::type_error);
+  }
+
+  SECTION("at()/size()/beginArray() throw Json::type_error on a type mismatch")
+  {
+    REQUIRE_THROWS_AS(i.at("k"), Json::type_error);  // at(key) on non-object
+    REQUIRE_THROWS_AS(i.at(std::size_t{0}), Json::type_error); // at(index) on non-array
+    REQUIRE_THROWS_AS(i.size(), Json::type_error);   // size() on a scalar
+    REQUIRE_THROWS_AS(i.beginArray(), Json::type_error); // iteration on non-array
+  }
+
+  SECTION("at() throws Json::out_of_range (IS-A std::out_of_range) on missing key / OOB index")
+  {
+    REQUIRE_THROWS_AS(obj.at("missing"), Json::out_of_range);
+    REQUIRE_THROWS_AS(arr.at(std::size_t{99}), Json::out_of_range);
+    REQUIRE_THROWS_AS(obj.at("missing"), std::out_of_range);
+  }
+}

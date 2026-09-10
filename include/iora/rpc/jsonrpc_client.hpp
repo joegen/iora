@@ -3207,8 +3207,8 @@ private:
     // ids. Guard on is_number_integer() BEFORE get<uint64_t>() — mirroring the
     // single-call correlateIdOrThrow_ type discipline (Slice-B review L1): a
     // non-numeric response id (string/float) would otherwise make get<uint64_t>()
-    // throw an untyped Json type error (bad_variant_access) rather than a
-    // JsonRpcError the documented client error base catches.
+    // throw Json::type_error rather than a JsonRpcError the documented client
+    // error base surfaces.
     std::unordered_map<std::uint64_t, iora::parsers::Json> responseMap;
     for (const auto &respItem : batchResp)
     {

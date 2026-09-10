@@ -351,12 +351,12 @@ private:
       return makeError(id, ErrorCode::InvalidRequest, "Request must be a JSON object");
     }
 
-    // W-H2 (§5.1): type-guard the jsonrpc member. The prior unguarded
-    // get<std::string>() threw std::bad_variant_access on a non-string member
-    // (a JSON number/bool/object/array/null) — a type that derives from
-    // std::exception but NOT from runtime_error/invalid_argument, so it escaped
-    // every catch below, became an HTTP 500, and (in a batch) discarded every
-    // already-computed sibling response. Mirror the method guard just below.
+    // W-H2 (§5.1): type-guard the jsonrpc member. An unguarded get<std::string>()
+    // on a non-string member (a JSON number/bool/object/array/null) throws
+    // Json::type_error; without this guard a malformed member surfaces as an
+    // exception instead of a proper per-request JSON-RPC error (and, in a batch,
+    // would risk discarding already-computed sibling responses). Mirror the
+    // method guard just below.
     const bool versionOk = req.contains("jsonrpc") && req["jsonrpc"].is_string() &&
                            req["jsonrpc"].get<std::string>() == "2.0";
     if (!versionOk)

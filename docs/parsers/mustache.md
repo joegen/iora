@@ -33,7 +33,7 @@
 - the non-`const` `operator[]` **default-inserts** (reading a missing key mutates the object);
 - `operator bool()` treats an **empty array/string as `true`** — the opposite of Mustache section falsiness;
 - `operator std::string()`/`dump()` render a double as `"1.000000"` and JSON-quote strings — wrong for HTML;
-- the `const` accessors (`getInt`, `getString`, …) **throw `std::bad_variant_access`** on a type mismatch, and `size()` throws for scalar kinds.
+- the `const` accessors (`getInt`, `getString`, …) **throw `Json::type_error`** on a type mismatch, and `size()` throws for scalar kinds.
 
 **Solution.** A single header-only class, `iora::parsers::Mustache`, with one public entry point:
 
@@ -42,7 +42,7 @@ static std::string render(std::string_view tmpl, const Json& data,
                           const PartialResolver& partials = {});
 ```
 
-It renders the **logic-less** Mustache subset against a `const Json&` context, HTML-escaping by default, and is built specifically to honor every `iora::parsers::Json` sharp edge: `const`-only traversal (cannot mutate the caller's data), bespoke truthiness, `isX()`-gated access (cannot throw `bad_variant_access`), explicit scalar formatting, and a render-recursion depth bound.
+It renders the **logic-less** Mustache subset against a `const Json&` context, HTML-escaping by default, and is built specifically to honor every `iora::parsers::Json` sharp edge: `const`-only traversal (cannot mutate the caller's data), bespoke truthiness, `isX()`-gated access (cannot throw `Json::type_error`), explicit scalar formatting, and a render-recursion depth bound.
 
 **Why it matters.**
 
@@ -460,7 +460,7 @@ class Mustache
 public:
   /// Render `tmpl` against `data`, resolving partials via `partials`.
   /// Throws MustacheError on a structural template error; never throws
-  /// std::bad_variant_access or Json type_error (all access is isX()-gated).
+  /// Json::type_error (all access is isX()-gated).
   static std::string render(std::string_view tmpl, const Json& data,
                             const PartialResolver& partials = {});
 };
@@ -497,7 +497,7 @@ public:
 | CONST-TRAP | `const Json&` only; resolve via `isObject()+contains()+const operator[]`, never `find()`. | Non-`const` `operator[]` default-inserts; `find()` throws on a non-object. A `const`-only engine cannot corrupt caller data. |
 | H-2 | Bespoke `isFalsy()`, never `operator bool()`. | `operator bool()` treats `[]`/`""` as `true` — opposite of Mustache. |
 | H-3 | Sections iterate arrays only. | `Json::Object` is an unordered map → nondeterministic member order. |
-| M-2 | `isX()`-gate every access. | `const` accessors throw `bad_variant_access`; `size()` throws for scalars. |
+| M-2 | `isX()`-gate every access. | `const` accessors throw `Json::type_error`; `size()` throws for scalars. |
 | SCALAR-FMT | Explicit `%g` via `snprintf`; never `dump()`/`to_chars<double>`. | `dump()` renders `1.000000`/quotes; `to_chars<double>` is not portable across iora's toolchains. |
 | RENDER-DEPTH | Bound *total* recursion (sections + partials) by `depthMax`. | A cyclic partial set or pathologically deep template would otherwise overflow the C++ stack. |
 | STANDALONE-LINE | Spec-conformant standalone stripping + standalone-partial **source** indentation. | Otherwise a section/comment/partial tag alone on its line leaves a stray blank line / broken indentation. Indenting the source (not the output) keeps data-injected newlines un-indented. |
@@ -552,7 +552,7 @@ These are *awareness* facts, not behaviors the engine fixes. The engine's contra
 | Group | What it pins |
 |---|---|
 | interpolation | strings, dotted paths, missing/null → empty, implicit `{{.}}`, present-head/missing-tail, no stack re-walk after the first segment, empty-segment `a..b`, whitespace-trimmed names |
-| scalar formatting | string/int/`%g` double (incl. `1e300`)/bool/null; array/object → empty; **no `bad_variant_access` for any type** |
+| scalar formatting | string/int/`%g` double (incl. `1e300`)/bool/null; array/object → empty; **no `Json::type_error` for any type** |
 | escaping | `<`/`>`/`&`/`"`; single-quote → exactly `&#39;`; byte-exact combined payload (no double-escape); `{{{}}}` and `{{&}}` verbatim |
 | XSS awareness | `javascript:` URI passthrough, JS-string-break payload, `{{{}}}` vs `{{}}` on `</script>`, unquoted-attribute injection, `data:` scheme passthrough |
 | sections — arrays | 3× in order, empty skipped, **byte-identical determinism** across repeated renders, nested, element shadowing, outer visibility |

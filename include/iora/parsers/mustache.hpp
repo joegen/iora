@@ -54,7 +54,7 @@ class Mustache
 public:
   /// Render @p tmpl against @p data, resolving partials via @p partials.
   /// Throws MustacheError on a structural template error; never throws
-  /// std::bad_variant_access or Json::type_error (all access is isX()-gated).
+  /// Json::type_error (all Json access is isX()-gated).
   static std::string render(std::string_view tmpl, const Json& data,
                             const PartialResolver& partials = {});
 

@@ -404,18 +404,69 @@ public:
   bool is_array() const { return isArray(); }
   bool is_object() const { return isObject(); }
 
-  // Value accessors
-  bool getBool() const { return std::get<bool>(_value); }
-  std::int64_t getInt() const { return std::get<std::int64_t>(_value); }
-  double getDouble() const { return std::get<double>(_value); }
-  const std::string &getString() const { return std::get<std::string>(_value); }
-  const Array &getArray() const { return std::get<Array>(_value); }
-  const Object &getObject() const { return std::get<Object>(_value); }
+private:
+  // Human-readable name of the alternative currently held (for type_error text).
+  const char *currentTypeName() const
+  {
+    switch (_value.index())
+    {
+    case 0:
+      return "null";
+    case 1:
+      return "bool";
+    case 2:
+      return "int";
+    case 3:
+      return "double";
+    case 4:
+      return "string";
+    case 5:
+      return "array";
+    case 6:
+      return "object";
+    default:
+      return "unknown";
+    }
+  }
+
+  // Checked variant access: throws Json::type_error (the documented contract) on
+  // a type mismatch instead of std::bad_variant_access, and also handles the
+  // valueless-by-exception state (holds_alternative is false there).
+  // Throws Json::type_error if the active alternative is not T (or the variant is
+  // valueless). Shared by both checkedGet overloads so the message lives once.
+  template <typename T> void requireAlternative(const char *expected) const
+  {
+    if (!std::holds_alternative<T>(_value))
+    {
+      throw type_error(std::string("Json: expected ") + expected + ", have " +
+                       currentTypeName());
+    }
+  }
+  template <typename T> const T &checkedGet(const char *expected) const
+  {
+    requireAlternative<T>(expected);
+    return std::get<T>(_value);
+  }
+  template <typename T> T &checkedGet(const char *expected)
+  {
+    requireAlternative<T>(expected);
+    return std::get<T>(_value);
+  }
+
+public:
+  // Value accessors. A wrong-type access throws Json::type_error (the documented
+  // typed-error contract), NOT std::bad_variant_access — see checkedGet().
+  bool getBool() const { return checkedGet<bool>("bool"); }
+  std::int64_t getInt() const { return checkedGet<std::int64_t>("int"); }
+  double getDouble() const { return checkedGet<double>("double"); }
+  const std::string &getString() const { return checkedGet<std::string>("string"); }
+  const Array &getArray() const { return checkedGet<Array>("array"); }
+  const Object &getObject() const { return checkedGet<Object>("object"); }
 
   // Mutable accessors
-  std::string &getString() { return std::get<std::string>(_value); }
-  Array &getArray() { return std::get<Array>(_value); }
-  Object &getObject() { return std::get<Object>(_value); }
+  std::string &getString() { return checkedGet<std::string>("string"); }
+  Array &getArray() { return checkedGet<Array>("array"); }
+  Object &getObject() { return checkedGet<Object>("object"); }
 
   // Generic value getter template
   template <typename T> T get() const
@@ -431,7 +482,7 @@ public:
       else if (isInt())
         return static_cast<T>(getInt());
       else
-        throw std::runtime_error("type_error: cannot get numeric type");
+        throw type_error("Json: cannot get a numeric type from a non-numeric value");
     }
     else if constexpr (std::is_same_v<T, std::string>)
       return getString();
@@ -514,42 +565,42 @@ public:
   Json &at(const std::string &key)
   {
     if (!isObject())
-      throw std::runtime_error("type_error: cannot use at() with non-object");
+      throw type_error("Json: at(key) called on a non-object value");
     auto &obj = getObject();
     auto it = obj.find(key);
     if (it == obj.end())
-      throw std::out_of_range("key '" + key + "' not found");
+      throw out_of_range("Json: key '" + key + "' not found");
     return it->second;
   }
 
   const Json &at(const std::string &key) const
   {
     if (!isObject())
-      throw std::runtime_error("type_error: cannot use at() with non-object");
+      throw type_error("Json: at(key) called on a non-object value");
     const auto &obj = getObject();
     auto it = obj.find(key);
     if (it == obj.end())
-      throw std::out_of_range("key '" + key + "' not found");
+      throw out_of_range("Json: key '" + key + "' not found");
     return it->second;
   }
 
   Json &at(std::size_t index)
   {
     if (!isArray())
-      throw std::runtime_error("type_error: cannot use at() with non-array");
+      throw type_error("Json: at(index) called on a non-array value");
     auto &arr = getArray();
     if (index >= arr.size())
-      throw std::out_of_range("array index " + std::to_string(index) + " out of range");
+      throw out_of_range("Json: array index " + std::to_string(index) + " out of range");
     return arr[index];
   }
 
   const Json &at(std::size_t index) const
   {
     if (!isArray())
-      throw std::runtime_error("type_error: cannot use at() with non-array");
+      throw type_error("Json: at(index) called on a non-array value");
     const auto &arr = getArray();
     if (index >= arr.size())
-      throw std::out_of_range("array index " + std::to_string(index) + " out of range");
+      throw out_of_range("Json: array index " + std::to_string(index) + " out of range");
     return arr[index];
   }
 
@@ -565,7 +616,7 @@ public:
     else if (isNull())
       return 0;
     else
-      throw std::runtime_error("type_error: cannot get size");
+      throw type_error("Json: size() called on a non-array/object value");
   }
 
   // Check if container is empty
@@ -785,25 +836,25 @@ public:
   Array::iterator beginArray()
   {
     if (!isArray())
-      throw std::runtime_error("type_error: cannot iterate over non-array");
+      throw type_error("Json: iteration requested on a non-array value");
     return getArray().begin();
   }
   Array::iterator endArray()
   {
     if (!isArray())
-      throw std::runtime_error("type_error: cannot iterate over non-array");
+      throw type_error("Json: iteration requested on a non-array value");
     return getArray().end();
   }
   Array::const_iterator beginArray() const
   {
     if (!isArray())
-      throw std::runtime_error("type_error: cannot iterate over non-array");
+      throw type_error("Json: iteration requested on a non-array value");
     return getArray().begin();
   }
   Array::const_iterator endArray() const
   {
     if (!isArray())
-      throw std::runtime_error("type_error: cannot iterate over non-array");
+      throw type_error("Json: iteration requested on a non-array value");
     return getArray().end();
   }
 
