@@ -100,6 +100,42 @@
       "headers": [
         "core/timing_wheel.hpp"
       ]
+    },
+    "core/blocking_queue.md": {
+      "area": "core",
+      "headers": [
+        "core/blocking_queue.hpp"
+      ]
+    },
+    "core/event_queue.md": {
+      "area": "core",
+      "headers": [
+        "core/event_queue.hpp"
+      ]
+    },
+    "core/ring_buffer.md": {
+      "area": "core",
+      "headers": [
+        "core/ring_buffer.hpp"
+      ]
+    },
+    "core/concurrent_hash_map.md": {
+      "area": "core",
+      "headers": [
+        "core/concurrent_hash_map.hpp"
+      ]
+    },
+    "core/buffer_primitives.md": {
+      "area": "core",
+      "headers": [
+        "core/buffer_view.hpp"
+      ]
+    },
+    "core/rate_limiter.md": {
+      "area": "core",
+      "headers": [
+        "core/rate_limiter.hpp"
+      ]
     }
   }
 }

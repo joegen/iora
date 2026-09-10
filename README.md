@@ -167,8 +167,14 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **ThreadPool** (`core::async` / `PooledFuture`) — worker pool with lifecycle drain plus the `std::async` drop-in — [`docs/core/thread_pool.md`](docs/core/thread_pool.md)
 - **TimerService** — single-`timerfd` + min-heap timer service (one-shot and periodic) — [`docs/core/timer.md`](docs/core/timer.md)
 - **TimingWheel** — hierarchical timing-wheel scheduler behind the `ITimerService` seam — [`docs/core/timing_wheel.md`](docs/core/timing_wheel.md)
-- **Result**, **Signal**, **StateMachine**, **StringUtils**, **RingBuffer**, **ConcurrentHashMap**, **Buffer primitives**, **Metrics**, **RateLimiter** — foundation primitives — `docs/core/` _(planned)_
-- **BlockingQueue**, **ConfigLoader**, **EventQueue**, **errno_utils** — `docs/core/` _(planned)_
+- **BlockingQueue** — bounded thread-safe blocking FIFO (blocking, timed, and non-blocking ops; close/drain) — [`docs/core/blocking_queue.md`](docs/core/blocking_queue.md)
+- **EventQueue** — worker-pool event dispatcher with id / name / regex-pattern handler routing — [`docs/core/event_queue.md`](docs/core/event_queue.md)
+- **RingBuffer** — SPSC lock-free ring buffer, fixed and dynamic (acquire/release ordering) — [`docs/core/ring_buffer.md`](docs/core/ring_buffer.md)
+- **ConcurrentHashMap** — lock-striped concurrent hash map (sharded `shared_mutex`, in-place callbacks) — [`docs/core/concurrent_hash_map.md`](docs/core/concurrent_hash_map.md)
+- **Buffer primitives** (`BufferView` / `BufferWriter` / `MutableBufferView`) — zero-copy byte views with network byte-order readers/writers — [`docs/core/buffer_primitives.md`](docs/core/buffer_primitives.md)
+- **RateLimiter** (`TokenBucket` / `SlidingWindowCounter` / `RateLimiterMap`) — token-bucket and sliding-window rate limiting — [`docs/core/rate_limiter.md`](docs/core/rate_limiter.md)
+- **Result**, **Signal**, **StateMachine**, **StringUtils**, **Metrics** — foundation primitives — `docs/core/` _(planned)_
+- **ConfigLoader**, **errno_utils** — `docs/core/` _(planned)_
 
 ### network
 - **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
