@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 2.0 |
+| **Version** | 2.1 |
 | **Date** | 2026-09-10 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/thread_pool.hpp` |
@@ -20,6 +20,7 @@
 |---|---|---|
 | 1.0 | 2026-09-07 | Original guide, published as `coding_trackers/docs/iora/async_pool.md`, titled *Async Pool (`iora::core::async` / `PooledFuture<R>`)*. Documented `generalAsyncPool()`, `PooledFuture<R>`, `async()` overloads, `detail::submitTo`, `AsyncRejectedError`, and the `HttpClient` retrofit. |
 | 2.0 | 2026-09-10 | **Renamed and re-scoped** to `docs/core/thread_pool.md` and re-titled for the class it mirrors, `iora::core::ThreadPool`. The pool class -- worker model, dynamic scaling, the `ILifecycleManaged` lifecycle (`start`/`drain`/`stop`/`reset`), and the five-phase shutdown sequence -- is now the headline; `iora::core::async` / `PooledFuture<R>` remains a prominent section (5) rather than the title. Every claim re-verified against the post-async-pool-rewrite `include/iora/core/thread_pool.hpp` (1368 lines) and the singleton definitions in `src/core/iora_core.cpp`; stale claims from the 1.0 guide corrected against the current source, and every remaining behavioral caveat routed to a concrete backlog tracker under `tasks/iora/backlog/`. Restructured to the 12-section guide template with contiguous numbered sections. |
+| 2.1 | 2026-09-10 | Synced to the removal of dead scaffolding from `thread_pool.hpp` (tracker `2026-09-10-4`): deleted the `volatile` canary / `VALIDATE_CANARY` instrumentation and the dead `_workerScaling` knob (idle-exit is now unconditional, floored by `> _initialSize`) and the write-only `_threadsStarted` counter. Removed the `_workerScaling` section and the canary/`_workerScaling` Known-Limitations bullets; the `_busyThreads` primitives-table entry is retained for the downstream P0 `2026-09-09-7`. |
 
 ---
 
@@ -98,7 +99,7 @@ Consumers (outside this component; shown for context):
 `ThreadPool` keeps its workers in a `std::unordered_map<std::thread::id, std::thread> _threads` and its work in a `std::queue<std::function<void()>> _tasks`, both guarded by a single `std::mutex _mutex` with one `std::condition_variable _condition`. Each worker runs the loop in `spawnWorker()`:
 
 1. Under `_mutex`, increment `_waitingThreads`, then `_condition.wait_for(lock, _idleTimeout, pred)` where `pred == (_shutdown || !_tasks.empty())`; decrement `_waitingThreads` on wake.
-2. If `wait_for` timed out (returned `false`) and worker-scaling is enabled, atomically claim an exit slot via CAS on `_threadsExited` -- but only if the live worker count would stay `> _initialSize`; on claiming, detach and erase self from `_threads` and return. Otherwise `continue`.
+2. If `wait_for` timed out (returned `false`), atomically claim an exit slot via CAS on `_threadsExited` -- but only if the live worker count would stay `> _initialSize`; on claiming, detach and erase self from `_threads` and return. Otherwise `continue`.
 3. If `_shutdown && _tasks.empty()`, increment `_threadsExited` and return.
 4. Otherwise pop one task, increment `_busyThreads`, release the lock, increment `_activeThreads`, run the task (catching exceptions into `onTaskError`), **destroy the task functor** (releasing captures) *before* decrementing `_activeThreads`, then decrement `_busyThreads`.
 
@@ -128,7 +129,7 @@ sequenceDiagram
 | Thread | Responsibility |
 |---|---|
 | Caller / application thread | Calls `enqueue`/`enqueueWithResult`/`tryEnqueue`, the lifecycle methods, and `iora::core::async`; owns any returned `std::future`/`PooledFuture`. |
-| Worker thread (`_threads`) | Runs the `spawnWorker` loop: waits on `_condition`, pops and runs tasks, self-exits on idle timeout (when scaling), or exits on shutdown. |
+| Worker thread (`_threads`) | Runs the `spawnWorker` loop: waits on `_condition`, pops and runs tasks, self-exits on idle timeout when the live count exceeds `_initialSize`, or exits on shutdown. |
 | Thread destroying the pool / calling `shutdown()` / `stop()` | Runs the five-phase shutdown (or the explicit `shutdown()` join loop) and blocks until all workers have exited. |
 | First caller of `generalAsyncPool()` / `blockingIoPool()` | Performs the one-time C++11 magic-static construction of that singleton. |
 
@@ -149,7 +150,7 @@ ThreadPool(std::size_t initialSize = std::thread::hardware_concurrency(),
            ShutdownMode shutdownMode = ShutdownMode::IMMEDIATE);
 ```
 
-The constructor stores the parameters (`_initialSize`, `_maxSize`, `_idleTimeout`, `_maxQueueSize` are `const`), sets `_accepting = true`, transitions `_lifecycleState` to `Running`, then spawns the initial worker set. Because the private `_workerScaling` flag is `true` (see 3.9), the initial count is `_initialSize`.
+The constructor stores the parameters (`_initialSize`, `_maxSize`, `_idleTimeout`, `_maxQueueSize` are `const`), sets `_accepting = true`, transitions `_lifecycleState` to `Running`, then spawns the initial worker set of `_initialSize` workers.
 
 `initialSize`, `maxSize`, `idleTimeout`, and `maxQueueSize` all have defaults; the defaults are stated in section 9. Copy and move are deleted -- a pool owns live threads and is neither copyable nor movable.
 
@@ -218,7 +219,7 @@ The mode is read/written under `_configMutex` via `getShutdownMode()` / `setShut
 - **`start()`** -- from `Created` it is a no-op that reports `Running` (the constructor already started the pool). From `Reset` it clears `_shutdown`, sets `_accepting = true`, transitions to `Running`, and re-spawns the initial worker set. Any other state is rejected.
 - **`drain(std::uint32_t timeoutMs = 30000)`** -- only valid from `Running`. Transitions to `Draining`, sets `_accepting = false` (new `enqueue` now throws, `tryEnqueue` returns `false`), and polls until `_activeThreads == 0 && pending == 0` or the timeout elapses (a `timeoutMs` of `0` means wait up to one hour). Returns a `LifecycleResult` carrying `DrainStats(inFlightAtStart, remaining, 0, completed)`.
 - **`stop()`** -- valid from `Running` or `Draining`. If still `Running`, it drains first (with the default 30 s timeout); then it calls `shutdown()` to join every worker and transitions to `Stopped`.
-- **`reset()`** -- only valid from `Stopped`. Clears the task queue and the (already-joined) `_threads` map, zeroes every counter (`_activeThreads`, `_busyThreads`, `_threadsCreated`, `_threadsStarted`, `_threadsExited`, `_waitingThreads`), and transitions to `Reset` so a subsequent `start()` can restart the pool.
+- **`reset()`** -- only valid from `Stopped`. Clears the task queue and the (already-joined) `_threads` map, zeroes every counter (`_activeThreads`, `_busyThreads`, `_threadsCreated`, `_threadsExited`, `_waitingThreads`), and transitions to `Reset` so a subsequent `start()` can restart the pool.
 - **`getState()`** / **`getInFlightCount()`** -- lock-free-ish observers (the latter takes `_mutex` for the pending count).
 
 ### 3.8 The five-phase shutdown (`~ThreadPool`)
@@ -249,10 +250,6 @@ sequenceDiagram
 ### 3.9 The explicit `shutdown()` method
 
 `shutdown()` is a public, idempotent, blocking join callable before destruction (it is also what `stop()` invokes). It sets `_shutdown` under `_mutex`, `notify_all()`s, waits up to 5000 ms for `_activeThreads == 0 && pending == 0` (logging progress every 500 ms), then performs a **"P0-3" double-check**: a 10 ms sleep followed by a re-read of the active/pending counts, and, if a straggler is found, a second bounded wait (up to 1000 ms). Finally it drains `_threads` by moving each joinable thread out under `_mutex` and joining it off-lock. The active-task wait exists so a task accessing objects being torn down cannot outlive them (a use-after-free guard).
-
-### 3.10 Worker-scaling flag (`_workerScaling`)
-
-`_workerScaling` is a private `bool` initialized to `true` with no setter and no constructor parameter, so it is effectively always `true` in production. It gates the initial worker count (`_workerScaling ? _initialSize : _maxSize`, in both the constructor and `start()`) and the idle-exit CAS block in the worker loop. With a fixed-size pool (`initialSize == maxSize`) the idle-exit branch never fires because the CAS refuses to drop the live count to or below `_initialSize`. The `? _maxSize` alternative and the "scaling disabled" behavior are unreachable through the current public API; the dead knob is tracked in `tasks/iora/backlog/2026-09-10-4_thread-pool-dead-canary-scaffolding-and-workerscaling_P1.json`.
 
 ---
 
@@ -397,7 +394,7 @@ ThreadPool &generalAsyncPool()
 
 Immortality (raw `new`, never `delete`d) mirrors the `LoggerData` precedent: an in-flight task at process exit could otherwise hang `ThreadPool`'s join during static destruction. Exit-time memory safety comes from `PooledFuture`'s per-future join, not from the leak.
 
-> The `idleTimeout` of 30 s passed to `generalAsyncPool()` is inert **for the idle-shrink path only**: with `initialSize == maxSize` the idle-exit CAS never fires (section 3.10), so no worker is ever reaped for idleness. The value is not otherwise dead, however -- it is still the `_condition.wait_for` wake interval, so each idle worker wakes every 30 s to re-check the predicate and (finding nothing) loops back to wait again. It affects only that idle re-check cadence, not the pool's steady-state size.
+> The `idleTimeout` of 30 s passed to `generalAsyncPool()` is inert **for the idle-shrink path only**: with `initialSize == maxSize` the idle-exit CAS never fires (the idle-shrink floor keeps the live count at `_initialSize`), so no worker is ever reaped for idleness. The value is not otherwise dead, however -- it is still the `_condition.wait_for` wake interval, so each idle worker wakes every 30 s to re-check the predicate and (finding nothing) loops back to wait again. It affects only that idle re-check cadence, not the pool's steady-state size.
 
 ### 5.2 `PooledFuture\<R\>`
 
@@ -639,8 +636,8 @@ Three mechanisms combine into one teardown-and-async safety contract, each speci
 | `std::mutex` | `_configMutex` (mutable) | `_onTaskError` and `_shutdownMode` (read in const methods, hence `mutable`). |
 | `std::atomic<bool>` | `_shutdown` | Shutdown-signalled flag (also written under `_mutex` in some paths). |
 | `std::atomic<bool>` | `_accepting` | Drain gate; checked lock-free at the top of `enqueueImpl`/`tryEnqueueImpl`. |
-| `std::atomic<std::size_t>` | `_activeThreads`, `_busyThreads` | Tasks executing / picked-up; read with `memory_order_acquire` in drain/shutdown. |
-| `std::atomic<int>` | `_threadsCreated`, `_threadsStarted`, `_threadsExited`, `_waitingThreads` | Worker lifecycle counters (drive the Phase-2 barrier and the idle-exit CAS). |
+| `std::atomic<std::size_t>` | `_activeThreads`, `_busyThreads` | `_activeThreads`: tasks executing, read with `memory_order_acquire` in drain/shutdown. `_busyThreads`: tasks picked up (write-only until the P0 quiescence work makes it a drain/shutdown read). |
+| `std::atomic<int>` | `_threadsCreated`, `_threadsExited`, `_waitingThreads` | Worker lifecycle counters (drive the Phase-2 barrier and the idle-exit CAS). |
 | `std::atomic<LifecycleState>` | `_lifecycleState` | `ILifecycleManaged` state, acquire/release. |
 
 ### 8.2 Operation-by-operation
@@ -650,7 +647,7 @@ Three mechanisms combine into one teardown-and-async safety contract, each speci
 | `enqueue` / `tryEnqueue` | lock-free `_accepting` check, then `_mutex` for the queue push + `_threads.size()` check; `spawnWorker()` and `notify_one()` outside the lock | `enqueue` throws under back-pressure; `tryEnqueue` returns `false`. The task functor's own try/catch reads `_onTaskError` under `_configMutex`. |
 | `enqueueWithResult` | as `enqueue` (submits `[task]{ (*task)(); }`) | Exception captured in the future, not routed to `onTaskError`. |
 | Worker loop | `_mutex` around `wait_for` + queue pop; task **run with no lock held**; task functor destroyed before `--_activeThreads` | The task destroy-before-decrement is the use-after-free guard the shutdown drain relies on. |
-| Idle-exit | `_mutex` held; CAS on `_threadsExited`; self-`detach()` + `_threads.erase(self)` under lock | Only when scaling and the live count would stay `> _initialSize`. |
+| Idle-exit | `_mutex` held; CAS on `_threadsExited`; self-`detach()` + `_threads.erase(self)` under lock | Only when the live count would stay `> _initialSize`. |
 | `shutdown()` | `_mutex` to set `_shutdown` + `notify_all`; polling waits off-lock; join loop moves threads out under `_mutex`, joins off-lock | Idempotent. Includes the P0-3 10 ms re-check. |
 | Phase 1-5 (`~ThreadPool`) | see 3.8 | Phase 2 barrier ensures no worker is in `wait_for` before `_condition` is destroyed. |
 | `drain` / `stop` / `reset` / `start` | `_lifecycleState` acquire/release; `_mutex` for queue/threads mutation in `reset`/`start` | State-guarded; wrong-state calls return a failed `LifecycleResult`. |
@@ -711,7 +708,7 @@ Neither pool installs an `onTaskError` handler or overrides `ShutdownMode` (both
 |---|---|---|
 | `iora_test_threadpool` | `iora_test_threadpool.cpp` | Basic execution, futures, scaling up/down, queue overflow, exception handling (with/without handler), destruction-completes-pending, rapid enqueue+shutdown, back-pressure. |
 | `iora_test_threadpool_lifecycle` | `iora_test_threadpool_lifecycle.cpp` | `start`/`drain`/`stop`/`reset` transitions, drain timeout/stats, `getInFlightCount`, full cycle, `tryEnqueue` vs drain. |
-| `iora_test_threadpool_cleanup` | `iora_test_threadpool_cleanup.cpp` | Idle-timeout shrink, no-zombie-threads, concurrent idle timeouts, counters-match-map, `_initialSize` floor, scaling-disabled, leak stress. |
+| `iora_test_threadpool_cleanup` | `iora_test_threadpool_cleanup.cpp` | Idle-timeout shrink, no-zombie-threads, concurrent idle timeouts, counters-match-map, `_initialSize` floor, initial==max no-shrink, leak stress. |
 | `iora_test_async_pool` | `iora_test_async_pool.cpp` | `async` value/void/move-only, `PooledFuture` join/move-assign/default-then-assign, reject-when-full, task-exception vs `AsyncRejectedError`, launch-policy overload, `wait_for`/`wait_until`. |
 | `iora_test_async_pool_crossso` | `iora_test_async_pool_crossso.cpp` (+ `core_test_async_pool_plugin`) | `&generalAsyncPool()` identity across an `RTLD_LOCAL` plugin boundary. |
 
@@ -863,12 +860,8 @@ auto async(std::launch policy, F &&func, Args &&...args)
 - **`ThreadPool` enqueue is not *generically* all-or-nothing.** For a scaling pool (`initialSize < maxSize`), `enqueueImpl` commits the task to `_tasks` *before* a possible post-commit `spawnWorker()` that can throw `std::system_error`. `generalAsyncPool()` sidesteps this by being fixed-size; a `ThreadPool`-level fix (making a scaling spawn failure non-fatal to an already-committed enqueue) is tracked separately (`tasks/iora/backlog/2026-09-06-11_threadpool-enqueue-all-or-nothing_P2.json`).
 - **Default-constructed `ThreadPool` is zero-worker when `hardware_concurrency() == 0`.** The header defaults `initialSize = hardware_concurrency()` and `maxSize = hardware_concurrency() * 4`; when the platform reports `0`, the pool starts with 0 workers and, because `enqueueImpl` only spawns while `_threads.size() < _maxSize == 0`, never spawns one -- tasks are queued and never run. `generalAsyncPool()` guards this locally (`hc == 0 -> 4`); the shared-header root fix is tracked (`tasks/iora/backlog/2026-09-06-10_threadpool-zero-worker-hardware-concurrency_P1.json`).
 - **`ShutdownMode::GRACEFUL` is not a distinct code path.** Phase 4 takes the identical `join()` branch for `IMMEDIATE` and `GRACEFUL`; only `DETACHED` diverges. The documented "wait for pthread cleanup before join" behavior is not implemented (tracked in `tasks/iora/backlog/2026-09-10-3_thread-pool-graceful-shutdown-mode-vacuous_P1.json`).
-- **`_workerScaling` is a dead configuration knob.** It is hard-coded `true` with no setter or constructor parameter, so the `? _maxSize` branch and the "scaling disabled" mode are unreachable through the public API. A cleanup pool test explicitly notes "`_workerScaling` is not configurable at runtime." Tracked in `tasks/iora/backlog/2026-09-10-4_thread-pool-dead-canary-scaffolding-and-workerscaling_P1.json`.
 - **Timing-based shutdown/drain waits.** `shutdown()`, `drain()`, and Phase 2/3 use bounded polling with fixed sleeps (a 10 ms P0-3 re-check, 50 ms drain polls, 100 us barrier spins). On a badly overloaded host a straggling task can still exceed the 5000 ms drain cap, in which case shutdown "proceeds anyway" with a logged warning; correctness then depends on DP-3's task-functor-destroy-before-decrement rather than on the wait completing.
-- **Leftover corruption-detection instrumentation in the worker hot loop.** Each worker carries a `volatile uint32_t canary` and a `VALIDATE_CANARY()` macro that `std::abort()`s on mismatch, threaded through the loop. This is debugging scaffolding, not a functional guard (the canary can only change under prior UB); tracked, together with the dead `_workerScaling` knob, in `tasks/iora/backlog/2026-09-10-4_thread-pool-dead-canary-scaffolding-and-workerscaling_P1.json`.
 - **Shared-pool starvation for `generalAsyncPool()` consumers.** One process-wide pool of `hardware_concurrency() * 4` workers serves `libiora_core.so` and every plugin; a slow/hung consumer can occupy all workers and (past 1024 queued) cause `AsyncRejectedError` for unrelated work. Mitigated at the `HttpClient` boundary by its finite-timeout gate; any *other* `iora::core::async` consumer must independently keep its work time-bounded (not enforced by the pool).
 - **DP-8 blocking-from-a-worker deadlock is documented, not enforced.** A callable running on a `generalAsyncPool()` worker that blocks on another pooled `PooledFuture` (`get`/`wait`/abandon/move-assign-over) can deadlock the fixed-size pool under saturation. Nothing checks this at runtime.
 - **`PooledFuture` cannot protect a capture that dies before it joins.** Join-on-destruction only protects a live capture from a later run, not a capture (e.g. raw `this`) whose lifetime already ended -- the same footgun `std::async` has.
 - **No runtime/env-var pool tuning.** All sizing is fixed at construction (and, for the singletons, at compile time in `iora_core.cpp`). Changing it requires a source edit and rebuild (deliberate, YAGNI).
-</content>
-</invoke>

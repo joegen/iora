@@ -155,8 +155,7 @@ public:
     _accepting.store(true, std::memory_order_release);
     _lifecycleState.store(iora::common::LifecycleState::Running, std::memory_order_release);
 
-    std::size_t workerCount = _workerScaling ? _initialSize : _maxSize;
-    for (std::size_t i = 0; i < workerCount; ++i)
+    for (std::size_t i = 0; i < _initialSize; ++i)
     {
       spawnWorker();
     }
@@ -496,8 +495,7 @@ public:
     _lifecycleState.store(LifecycleState::Running, std::memory_order_release);
 
     // Spawn initial threads if needed
-    std::size_t workerCount = _workerScaling ? _initialSize : _maxSize;
-    for (std::size_t i = 0; i < workerCount; ++i)
+    for (std::size_t i = 0; i < _initialSize; ++i)
     {
       spawnWorker();
     }
@@ -644,7 +642,6 @@ public:
     _activeThreads.store(0, std::memory_order_release);
     _busyThreads.store(0, std::memory_order_release);
     _threadsCreated.store(0, std::memory_order_release);
-    _threadsStarted.store(0, std::memory_order_release);
     _threadsExited.store(0, std::memory_order_release);
     _waitingThreads.store(0, std::memory_order_release);
 
@@ -754,40 +751,16 @@ private:
     std::thread t(
       [this]()
       {
-        // ══════════════════════════════════════════════════════════════════
-        // LAMBDA CORRUPTION DETECTION INSTRUMENTATION
-        // ══════════════════════════════════════════════════════════════════
-        const uint32_t CANARY = 0xDEADBEEF;
-        volatile uint32_t canary = CANARY;
-
-        // Lifecycle tracking: Thread created and started
+        // Lifecycle tracking: thread created
         _threadsCreated.fetch_add(1, std::memory_order_relaxed);
-        _threadsStarted.fetch_add(1, std::memory_order_relaxed);
-
-        // NOTE: Removed std::cerr ENTRY trace - std::cerr uses TLS and causes
-        // "double free or corruption (!prev)" during pthread TLS cleanup
-        // when multiple threads exit simultaneously
-
-        // Macro to validate canary before each this-> access
-        // NOTE: Removed std::cerr from canary validation - std::cerr uses TLS and causes
-        // "double free or corruption (!prev)" during pthread TLS cleanup
-        #define VALIDATE_CANARY() \
-          do { \
-            if (canary != CANARY) { \
-              std::abort(); \
-            } \
-          } while (0)
 
         while (true)
         {
-          VALIDATE_CANARY();
           std::function<void()> task;
 
           {
-            VALIDATE_CANARY();
             std::unique_lock<std::mutex> lock(_mutex);
 
-            VALIDATE_CANARY();
             // Track waiting threads to allow shutdown barrier to detect when
             // all threads have exited wait_for() and avoid destroying
             // condition_variable while threads are still waiting inside it.
@@ -798,112 +771,91 @@ private:
 
             if (!waitResult)
             {
-              VALIDATE_CANARY();
-              // P0-CRITICAL FIX: Idle timeout - worker just exits without touching _threads map
-              // The destructor will handle cleanup (join/detach) to prevent race condition
-              // REMOVED: it->second.detach() and _threads.erase(it) - caused heap corruption
+              // Idle timeout: claim an exit slot via CAS (below), then self-detach and
+              // erase our own _threads entry under the held _mutex before returning.
 
               // Use atomic CAS to safely claim exit slot - prevents race where multiple
               // threads simultaneously decide to exit and drop below _initialSize
-              if (_workerScaling)
+              int currentExited = _threadsExited.load(std::memory_order_acquire);
+              bool claimedExitSlot = false;
+
+              while (true)
               {
-                int currentExited = _threadsExited.load(std::memory_order_acquire);
-                bool claimedExitSlot = false;
-
-                while (true)
+                std::size_t workerCount = static_cast<std::size_t>(
+                  _threadsCreated.load(std::memory_order_acquire) - currentExited);
+                if (workerCount <= _initialSize)
                 {
-                  std::size_t workerCount = static_cast<std::size_t>(
-                    _threadsCreated.load(std::memory_order_acquire) - currentExited);
-                  if (workerCount <= _initialSize)
+                  // Would drop to or below minimum - don't exit
+                  break;
+                }
+                // Try to atomically claim this exit slot
+                // If another thread beats us, currentExited is updated and we retry
+                if (_threadsExited.compare_exchange_weak(
+                      currentExited,
+                      currentExited + 1,
+                      std::memory_order_acq_rel,
+                      std::memory_order_acquire))
+                {
+                  claimedExitSlot = true;
+                  break;
+                }
+                // CAS failed - currentExited has been updated, loop will recalculate
+              }
+
+              if (claimedExitSlot)
+              {
+                // Worker thread exits cleanly - clean up _threads map entry.
+                // _threadsExited already incremented by CAS above.
+
+                // Clean up our entry in the _threads map
+                // We already hold _mutex from the unique_lock above
+                auto myId = std::this_thread::get_id();
+                auto it = _threads.find(myId);
+                if (it != _threads.end())
+                {
+                  // Detach the thread so it can exit without being joined
+                  // This is safe - a thread can detach itself
+                  if (it->second.joinable())
                   {
-                    // Would drop to or below minimum - don't exit
-                    break;
+                    it->second.detach();
                   }
-                  // Try to atomically claim this exit slot
-                  // If another thread beats us, currentExited is updated and we retry
-                  if (_threadsExited.compare_exchange_weak(
-                        currentExited,
-                        currentExited + 1,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire))
-                  {
-                    claimedExitSlot = true;
-                    break;
-                  }
-                  // CAS failed - currentExited has been updated, loop will recalculate
+                  _threads.erase(it);
                 }
 
-                if (claimedExitSlot)
-                {
-                  VALIDATE_CANARY();
-                  // Worker thread exits cleanly - clean up _threads map entry
-                  // NOTE: Removed std::cerr trace - std::cerr uses TLS and causes
-                  // "double free or corruption (!prev)" during pthread TLS cleanup
-                  // _threadsExited already incremented by CAS above
-
-                  // Clean up our entry in the _threads map
-                  // We already hold _mutex from the unique_lock above
-                  auto myId = std::this_thread::get_id();
-                  auto it = _threads.find(myId);
-                  if (it != _threads.end())
-                  {
-                    // Detach the thread so it can exit without being joined
-                    // This is safe - a thread can detach itself
-                    if (it->second.joinable())
-                    {
-                      it->second.detach();
-                    }
-                    _threads.erase(it);
-                  }
-
-                  return;
-                }
+                return;
               }
               continue;
             }
 
-            VALIDATE_CANARY();
             if (_shutdown && _tasks.empty())
             {
-              VALIDATE_CANARY();
-              // NOTE: Removed std::cerr trace - std::cerr uses TLS and causes
-              // "double free or corruption (!prev)" during pthread TLS cleanup
               _threadsExited.fetch_add(1, std::memory_order_relaxed);
               return;
             }
 
-            VALIDATE_CANARY();
             if (!_tasks.empty())
             {
               task = std::move(_tasks.front());
               _tasks.pop();
-              VALIDATE_CANARY();
-              ++_busyThreads; // Thread has picked up work (for spawning
-                              // decisions)
+              ++_busyThreads; // Thread has picked up work
             }
           }
 
-          VALIDATE_CANARY();
           if (task)
           {
-            VALIDATE_CANARY();
             ++_activeThreads; // Thread is now executing (for monitoring)
             try
             {
-              VALIDATE_CANARY();
               task();
-              VALIDATE_CANARY();
             }
             catch (...)
             {
-              VALIDATE_CANARY();
               std::function<void(std::exception_ptr)> handlerCopy;
               {
                 std::lock_guard<std::mutex> lock(_configMutex);
                 handlerCopy = _onTaskError;
               }
 
-              VALIDATE_CANARY();
               if (handlerCopy)
               {
                 handlerCopy(std::current_exception());
@@ -914,29 +866,22 @@ private:
               }
             }
 
-            VALIDATE_CANARY();
             // CRITICAL FIX: Explicitly destroy task (releasing captured variables)
             // BEFORE decrementing _activeThreads. This prevents use-after-free when
             // ThreadPool destructor waits for _activeThreads == 0 but task's captured
             // variables are destroyed during shutdown.
             task = std::function<void()>{};
 
-            VALIDATE_CANARY();
             --_activeThreads; // Thread finished executing
-            VALIDATE_CANARY();
             --_busyThreads;   // Thread no longer busy
           }
         }
 
-        #undef VALIDATE_CANARY
       });
 
     std::lock_guard<std::mutex> lock(_mutex);
     auto threadId = t.get_id();
     _threads.emplace(threadId, std::move(t));
-
-    // NOTE: Exit acknowledgment flag is initialized INSIDE the lambda (at thread start)
-    // to avoid race condition. Do NOT initialize it here!
   }
 
 private:
@@ -1159,15 +1104,13 @@ private:
   const std::size_t _maxSize;
   const std::chrono::milliseconds _idleTimeout;
   const std::size_t _maxQueueSize;
-  bool _workerScaling { true };
 
   std::atomic<bool> _shutdown;
   std::atomic<std::size_t> _activeThreads; // Threads actively executing tasks
   std::atomic<std::size_t> _busyThreads;   // Threads that have picked up work
 
-  // Lambda corruption detection - thread lifecycle tracking
+  // Thread-lifecycle counters (idle-shrink CAS + shutdown quiescence barrier)
   std::atomic<int> _threadsCreated{0};   // Total threads spawned
-  std::atomic<int> _threadsStarted{0};   // Total threads that began executing
   std::atomic<int> _threadsExited{0};    // Total threads that returned from lambda
   std::atomic<int> _waitingThreads{0};   // Number of threads currently blocked on condition_variable
 

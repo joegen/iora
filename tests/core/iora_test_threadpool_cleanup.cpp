@@ -319,13 +319,10 @@ TEST_CASE("ThreadPool cleanup: Shutdown with zombie threads", "[threadpool][clea
   SUCCEED("Pool destroyed cleanly with mixed live/idle threads");
 }
 
-TEST_CASE("ThreadPool cleanup: Worker scaling disabled prevents idle exit", "[threadpool][cleanup][scaling-disabled]")
+TEST_CASE("ThreadPool cleanup: initial==max prevents idle exit", "[threadpool][cleanup][no-shrink-floor]")
 {
-  // When worker scaling is disabled, threads should NOT exit on idle timeout
-  // This is a configuration test
-
-  // Note: Currently _workerScaling is not configurable at runtime
-  // This test documents expected behavior when scaling is disabled
+  // With initialSize == maxSize, the idle-shrink floor (workerCount <= _initialSize)
+  // is always hit, so no worker exits on idle timeout and the pool stays at size.
   ThreadPool pool(4, 4, std::chrono::milliseconds(50));
 
   // Pool starts at initial size
