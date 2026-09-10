@@ -71,16 +71,22 @@ struct TcpFixture
     cbs.onData = [&](SessionId sid, iora::core::BufferView data,
                       std::chrono::steady_clock::time_point)
     {
-      std::lock_guard<std::mutex> lock(callbackMutex);
-      totalBytesReceived += data.size();
-      sessionData[sid].append(reinterpret_cast<const char *>(data.data()), data.size());
-
-      // Echo back from server; detect echo on client
-      if (sid == serverSid)
+      bool echo = false;
+      {
+        std::lock_guard<std::mutex> lock(callbackMutex);
+        totalBytesReceived += data.size();
+        sessionData[sid].append(reinterpret_cast<const char *>(data.data()), data.size());
+        echo = (sid == serverSid); // decide under the lock
+        dataCount++;
+      }
+      // Echo back from server OUTSIDE callbackMutex (copy-then-invoke): tx.send
+      // only enqueues today, but holding the fixture lock across an engine call
+      // would self-deadlock if send ever dispatched onError/onClose inline. The
+      // BufferView stays valid for the callback duration.
+      if (echo)
       {
         tx.send(sid, data.data(), data.size());
       }
-      dataCount++;
     };
     cbs.onClose = [&](SessionId sid, const TransportErrorInfo &err)
     {
@@ -121,6 +127,42 @@ struct TcpFixture
     }
     return condition();
   }
+
+  // Thread-safe snapshot of a session's accumulated bytes: the onData callback
+  // appends on the engine I/O thread under callbackMutex, so test bodies (and
+  // waitForCondition predicates) MUST read the same map under the same lock.
+  // Uses find(), never operator[], so a read never inserts a node and races the
+  // I/O-thread write; returns a copy the caller can size/compare/index freely.
+  std::string dataFor(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(callbackMutex);
+    auto it = sessionData.find(sid);
+    return it == sessionData.end() ? std::string{} : it->second;
+  }
+
+  // Locked snapshot of the accepted-session ids (onAccept push_back()s on the
+  // engine I/O thread under callbackMutex). A test body that reads the vector
+  // directly while the I/O thread is still pushing races it; take the lock.
+  std::vector<SessionId> acceptedSnapshot()
+  {
+    std::lock_guard<std::mutex> lock(callbackMutex);
+    return acceptedSessions;
+  }
+  std::vector<SessionId> connectedSnapshot()
+  {
+    std::lock_guard<std::mutex> lock(callbackMutex);
+    return connectedSessions;
+  }
+
+  // Size-only locked read: avoids copying the whole accumulated payload just to
+  // check its length in a waitForCondition poll (the large-data poll runs for
+  // seconds at 5ms granularity).
+  std::size_t dataSizeFor(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(callbackMutex);
+    auto it = sessionData.find(sid);
+    return it == sessionData.end() ? 0u : it->second.size();
+  }
 };
 } // namespace
 
@@ -147,15 +189,15 @@ TEST_CASE("TCP loopback echo", "[tcp][echo]")
 
   // Wait for accept/connect to fire
   REQUIRE(f.waitForCondition([&]() { return f.acceptCount > 0 && f.connectCount > 0; }));
-  REQUIRE(f.acceptedSessions.size() == 1);
-  REQUIRE(f.connectedSessions.size() == 1);
+  REQUIRE(f.acceptedSnapshot().size() == 1);
+  REQUIRE(f.connectedSnapshot().size() == 1);
 
   const char *msg = "hello tcp";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
 
   // Wait for echo data to come back
-  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() > 0; }));
-  REQUIRE(f.sessionData[cs] == "hello tcp");
+  REQUIRE(f.waitForCondition([&]() { return f.dataSizeFor(cs) > 0; }));
+  REQUIRE(f.dataFor(cs) == "hello tcp");
 
   // close client
   REQUIRE(f.tx.close(cs));
@@ -180,13 +222,13 @@ TEST_CASE("TCP named-host connect (event-driven resolve)", "[tcp][resolve]")
 
   // The resolve is async, so allow a little longer than the literal path.
   REQUIRE(f.waitForCondition([&]() { return f.connectCount > 0 && f.acceptCount > 0; }, 3000ms));
-  REQUIRE(f.connectedSessions.size() == 1);
+  REQUIRE(f.connectedSnapshot().size() == 1);
   REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve) on the happy path
 
   const char *msg = "hello named";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
-  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() > 0; }));
-  REQUIRE(f.sessionData[cs] == "hello named");
+  REQUIRE(f.waitForCondition([&]() { return f.dataSizeFor(cs) > 0; }));
+  REQUIRE(f.dataFor(cs) == "hello named");
 
   f.tx.stop();
 }
@@ -209,7 +251,7 @@ TEST_CASE("TCP named-host connect after restart (fresh post gate)", "[tcp][resol
   REQUIRE(cr.isOk());
 
   REQUIRE(f.waitForCondition([&]() { return f.connectCount > 0 && f.acceptCount > 0; }, 3000ms));
-  REQUIRE(f.connectedSessions.size() == 1);
+  REQUIRE(f.connectedSnapshot().size() == 1);
   REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve) after restart
 
   f.tx.stop();
@@ -243,7 +285,7 @@ TEST_CASE("TCP stats verification", "[tcp][stats]")
   size_t msgLen = std::strlen(msg);
   REQUIRE(f.tx.send(cs, msg, msgLen));
 
-  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() > 0; }));
+  REQUIRE(f.waitForCondition([&]() { return f.dataSizeFor(cs) > 0; }));
 
   auto stats3 = f.tx.getStats();
   REQUIRE(stats3.bytesOut >= msgLen);
@@ -281,8 +323,8 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
   REQUIRE(f.waitForCondition(
     [&]() { return f.acceptCount >= numClients && f.connectCount >= numClients; }));
 
-  REQUIRE(f.acceptedSessions.size() == numClients);
-  REQUIRE(f.connectedSessions.size() == numClients);
+  REQUIRE(f.acceptedSnapshot().size() == numClients);
+  REQUIRE(f.connectedSnapshot().size() == numClients);
 
   // Send data from each client
   for (size_t i = 0; i < numClients; ++i)
@@ -298,7 +340,7 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
       size_t clientsWithData = 0;
       for (auto client : clients)
       {
-        if (f.sessionData[client].size() > 0)
+        if (f.dataSizeFor(client) > 0)
           clientsWithData++;
       }
       return clientsWithData == numClients;
@@ -311,7 +353,7 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
     size_t clientsWithData = 0;
     for (auto client : clients)
     {
-      if (f.sessionData[client].size() > 0)
+      if (f.dataSizeFor(client) > 0)
         clientsWithData++;
     }
     REQUIRE(clientsWithData >= 1); // At least one client should succeed in concurrent scenario
@@ -320,10 +362,11 @@ TEST_CASE("TCP multiple clients to single server", "[tcp][multiconnect]")
   // Verify clients that received data got the correct echo
   for (size_t i = 0; i < numClients; ++i)
   {
-    if (f.sessionData[clients[i]].size() > 0)
+    std::string got = f.dataFor(clients[i]); // one consistent locked snapshot
+    if (got.size() > 0)
     {
       std::string expected = "client " + std::to_string(i);
-      REQUIRE(f.sessionData[clients[i]] == expected);
+      REQUIRE(got == expected);
     }
   }
 
@@ -371,13 +414,14 @@ TEST_CASE("TCP large data transfer", "[tcp][largedata]")
 
   REQUIRE(f.tx.send(cs, largeData.data(), largeData.size()));
 
-  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() == dataSize; }, 5000ms));
+  REQUIRE(f.waitForCondition([&]() { return f.dataSizeFor(cs) == dataSize; }, 5000ms));
 
-  // Verify data integrity
-  REQUIRE(f.sessionData[cs].size() == dataSize);
+  // Verify data integrity (one consistent locked snapshot)
+  std::string got = f.dataFor(cs);
+  REQUIRE(got.size() == dataSize);
   for (size_t i = 0; i < dataSize; ++i)
   {
-    REQUIRE(static_cast<uint8_t>(f.sessionData[cs][i]) == static_cast<uint8_t>(i));
+    REQUIRE(static_cast<uint8_t>(got[i]) == static_cast<uint8_t>(i));
   }
 
   f.tx.stop();
@@ -401,12 +445,14 @@ TEST_CASE("TCP binary data handling", "[tcp][binary]")
   std::vector<uint8_t> binaryData = {0x00, 0x01, 0xFF, 0x7F, 0x80, 0xAB, 0xCD, 0xEF};
   REQUIRE(f.tx.send(cs, binaryData.data(), binaryData.size()));
 
-  REQUIRE(f.waitForCondition([&]() { return f.sessionData[cs].size() == binaryData.size(); }));
+  REQUIRE(f.waitForCondition([&]() { return f.dataSizeFor(cs) == binaryData.size(); }));
 
-  // Verify binary data integrity
+  // Verify binary data integrity (one consistent locked snapshot)
+  std::string got = f.dataFor(cs);
+  REQUIRE(got.size() == binaryData.size());
   for (size_t i = 0; i < binaryData.size(); ++i)
   {
-    REQUIRE(static_cast<uint8_t>(f.sessionData[cs][i]) == binaryData[i]);
+    REQUIRE(static_cast<uint8_t>(got[i]) == binaryData[i]);
   }
 
   f.tx.stop();
@@ -513,13 +559,13 @@ TEST_CASE("TCP listener management", "[tcp][listeners]")
 
   // Wait for data with some tolerance for connection timing
   bool dataReceived = f.waitForCondition(
-    [&]() { return f.sessionData[cs1].size() > 0 && f.sessionData[cs2].size() > 0; });
+    [&]() { return f.dataSizeFor(cs1) > 0 && f.dataSizeFor(cs2) > 0; });
 
   // If immediate data transfer fails, allow for connection setup timing
   if (!dataReceived)
   {
     std::this_thread::sleep_for(200ms);
-    dataReceived = f.sessionData[cs1].size() > 0 && f.sessionData[cs2].size() > 0;
+    dataReceived = f.dataSizeFor(cs1) > 0 && f.dataSizeFor(cs2) > 0;
   }
 
   f.tx.stop();
@@ -567,9 +613,9 @@ TEST_CASE("TCP session ID uniqueness", "[tcp][sessionids]")
     clientIds.push_back(cr.value());
   }
 
-  REQUIRE(f.waitForCondition([&]() { return f.acceptedSessions.size() >= numConnections; }));
+  REQUIRE(f.waitForCondition([&]() { return f.acceptCount >= numConnections; }));
 
-  serverIds = f.acceptedSessions;
+  serverIds = f.acceptedSnapshot();
 
   // Verify all session IDs are unique
   std::set<SessionId> allIds(clientIds.begin(), clientIds.end());
@@ -604,12 +650,10 @@ TEST_CASE("TCP high frequency small messages", "[tcp][highfreq]")
     REQUIRE(f.tx.send(cs, msg.c_str(), msg.size()));
   }
 
-  // Wait for all data to be echoed back
+  // Wait for all data to be echoed back (the waitForCondition REQUIRE is the
+  // post-condition: it fails on timeout, and the accumulated size is monotonic).
   REQUIRE(
-    f.waitForCondition([&]() { return f.sessionData[cs].size() == totalExpectedBytes; }, 3000ms));
-
-  // Verify we received all the data
-  REQUIRE(f.sessionData[cs].size() == totalExpectedBytes);
+    f.waitForCondition([&]() { return f.dataSizeFor(cs) == totalExpectedBytes; }, 3000ms));
 
   f.tx.stop();
 }

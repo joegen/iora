@@ -26,11 +26,22 @@ struct UdpFixture
   std::atomic<bool> clientGotEcho{false};
   std::atomic<bool> anyClosed{false};
   std::atomic<bool> errored{false};
+  // A server-side echo send that FAILED, recorded off the test thread: onData
+  // runs on the engine I/O thread where Catch2 macros are UB (issue #99), so it
+  // records here and the MAIN thread asserts REQUIRE_FALSE(f.sendFailed).
+  std::atomic<bool> sendFailed{false};
   std::atomic<int> acceptCount{0};
   std::atomic<int> connectCount{0};
   std::atomic<int> dataCount{0};
   std::atomic<int> closeCount{0};
 
+  // I/O-THREAD-ONLY: serverSid/clientSid/connectedSessions/acceptedSessions/
+  // lastErrMsg are written in the callbacks on the single engine I/O thread and
+  // read ONLY from those callbacks (same thread) — they are NOT synchronized for
+  // a main-thread read. If a future test needs one from the test thread, guard it
+  // with a mutex + a locked snapshot accessor (as TcpFixture does), or gate it
+  // behind an atomic set AFTER the write. (lastData is the exception: it is
+  // published to the main thread via the clientGotEcho release/acquire edge.)
   SessionId serverSid{0};
   SessionId clientSid{0};
   std::string lastErrMsg;
@@ -63,16 +74,24 @@ struct UdpFixture
       dataCount++;
       auto *data = bv.data();
       auto n = bv.size();
-      // Echo on server; detect on client
+      // Echo on server; detect on client. This runs on the engine I/O thread —
+      // no Catch2 macro here (issue #99): record a failed send for the main
+      // thread to assert.
       if (std::find(acceptedSessions.begin(), acceptedSessions.end(), sid) !=
           acceptedSessions.end())
       {
-        REQUIRE(tx.send(sid, data, n));
+        if (!tx.send(sid, data, n))
+        {
+          sendFailed.store(true);
+        }
       }
       if (sid == clientSid)
       {
-        clientGotEcho = true;
+        // Write lastData BEFORE publishing clientGotEcho, so a main-thread
+        // waitFor(clientGotEcho) that then reads lastData has a correct
+        // happens-before edge (the flag must gate the data it advertises).
         lastData = std::string(reinterpret_cast<const char *>(data), n);
+        clientGotEcho = true;
       }
       {
         std::lock_guard<std::mutex> lock(dataMutex);
@@ -138,6 +157,7 @@ TEST_CASE("UDP loopback echo", "[udp][echo]")
   // Now wait for both acceptance (from first data) and echo response
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   REQUIRE(f.lastData == msg);
 
   // UDP "close" is semantic in your API; ensure it returns true and does not crash.
@@ -166,6 +186,7 @@ TEST_CASE("UDP named-host connect (event-driven resolve)", "[udp][resolve]")
   const char *msg = "udp named";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.clientGotEcho, 2000));
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   REQUIRE(f.lastData == "udp named");
 
   f.tx.stop();
@@ -268,6 +289,7 @@ TEST_CASE("UDP stats verification", "[udp][stats]")
 
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
 
   auto stats2 = f.tx.getStats();
   REQUIRE(stats2.connected == 1);
@@ -325,6 +347,7 @@ TEST_CASE("UDP multiple simultaneous connections", "[udp][multi]")
   REQUIRE(stats.connected == numClients);
   REQUIRE(stats.sessionsCurrent == numClients * 2); // Clients + server peers
 
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
 }
 
@@ -370,6 +393,7 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
     std::this_thread::sleep_for(5ms);
   REQUIRE(server2Received.load());
 
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
   tx2.stop();
 }
@@ -393,6 +417,7 @@ TEST_CASE("UDP basic operation after start", "[udp][config]")
 
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   REQUIRE(f.lastData == msg);
 
   f.tx.stop();
@@ -475,6 +500,7 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   // sessionsCurrent is unsigned, so >= 0 check is always true
   REQUIRE(true); // Sessions might be cleaned up
 
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
 }
 
@@ -516,6 +542,7 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   // sessionsCurrent is unsigned, so >= 0 check is always true
   REQUIRE(true); // Sessions might be cleaned up
 
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
 }
 
@@ -589,6 +616,7 @@ TEST_CASE("UDP IPv6 support", "[udp][ipv6]")
 
     REQUIRE(f.waitFor(f.accepted));
     REQUIRE(f.waitFor(f.clientGotEcho));
+    REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
     REQUIRE(f.lastData == msg);
   }
 
@@ -615,6 +643,7 @@ TEST_CASE("UDP large data transfer", "[udp][large]")
 
   REQUIRE(f.waitFor(f.accepted));
   REQUIRE(f.waitFor(f.clientGotEcho));
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   REQUIRE(f.lastData == largeMsg);
 
   // Verify integrity
@@ -667,6 +696,10 @@ TEST_CASE("UDP multiple listeners", "[udp][multi-listener]")
   REQUIRE(stats.accepted == 3);
   REQUIRE(stats.connected == 3);
 
+  // The echo send runs later in onData than the counter waited on above, so give
+  // the I/O thread time to execute it before reading sendFailed.
+  std::this_thread::sleep_for(100ms);
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
 }
 
@@ -687,6 +720,7 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
     const char *msg = "edge_test";
     REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
     REQUIRE(f.waitFor(f.clientGotEcho));
+    REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
     REQUIRE(f.lastData == msg);
 
     f.tx.stop();
@@ -707,6 +741,7 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
     const char *msg = "level_test";
     REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
     REQUIRE(f.waitFor(f.clientGotEcho));
+    REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
     REQUIRE(f.lastData == msg);
 
     f.tx.stop();
@@ -754,6 +789,9 @@ TEST_CASE("UDP session limits", "[udp][limits]")
   // The limit applies to preventing new server peer creation
   REQUIRE(stats2.sessionsCurrent <= 6); // Maximum possible: 3 clients + 3 peers
 
+  // Accepted sessions echo normally; a session rejected by the limit never
+  // reaches onData, so no echo is attempted for it — sendFailed must stay false.
+  REQUIRE_FALSE(f.sendFailed);
   f.tx.stop();
 }
 
@@ -774,6 +812,7 @@ TEST_CASE("UDP socket buffer configuration", "[udp][socket]")
   const char *msg = "buffer_test";
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.clientGotEcho));
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   REQUIRE(f.lastData == msg);
 
   f.tx.stop();
@@ -810,6 +849,10 @@ TEST_CASE("UDP self-loopback via listener", "[udp][loopback][via]")
     REQUIRE(f.receivedData[0] == msg);
   }
 
+  // The echo send runs later in onData than the dataCount wait above, so give the
+  // I/O thread time to execute it before reading sendFailed.
+  std::this_thread::sleep_for(100ms);
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
 }
 
@@ -885,6 +928,7 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
     REQUIRE(server2Data[2] == "msg3");
   }
 
+  REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
   tx2.stop();
 }
