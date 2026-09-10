@@ -320,9 +320,14 @@ public:
   /// or dequeue() operations will be woken up.
   void close()
   {
-    if (_closed.exchange(true, std::memory_order_acq_rel))
     {
-      return; // Already closed
+      // Mutate the close predicate under _mutex, else an untimed waiter in the
+      // check-false-but-not-yet-parked window misses the broadcast and hangs.
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_closed.exchange(true, std::memory_order_acq_rel))
+      {
+        return; // Already closed
+      }
     }
 
     // Wake all waiting threads

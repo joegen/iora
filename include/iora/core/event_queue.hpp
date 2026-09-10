@@ -10,7 +10,6 @@
 
 #include <condition_variable>
 #include <functional>
-#include <iostream>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -226,6 +225,11 @@ private:
         iora::core::Logger::error("EventQueue: Handler exception for event ID " + eventId + ": " +
                                   e.what());
       }
+      catch (...)
+      {
+        iora::core::Logger::error("EventQueue: Handler threw a non-std::exception for event ID " +
+                                  eventId);
+      }
     }
 
     for (const auto &handler : nameHandlers)
@@ -239,6 +243,11 @@ private:
       {
         iora::core::Logger::error("EventQueue: Handler exception for event name " + eventName +
                                   ": " + e.what());
+      }
+      catch (...)
+      {
+        iora::core::Logger::error("EventQueue: Handler threw a non-std::exception for event name " +
+                                  eventName);
       }
     }
 

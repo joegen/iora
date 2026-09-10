@@ -9,11 +9,8 @@
 
 #include <array>
 #include <atomic>
-#include <cassert>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
-#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -52,7 +49,7 @@ public:
   bool tryPush(const T& item) noexcept(std::is_nothrow_copy_assignable_v<T>)
   {
     auto head = _head.load(std::memory_order_relaxed);
-    auto tail = _tail.load(std::memory_order_relaxed);
+    auto tail = _tail.load(std::memory_order_acquire);
     if (head - tail >= Capacity)
     {
       return false;
@@ -66,7 +63,7 @@ public:
   bool tryPush(T&& item) noexcept(std::is_nothrow_move_assignable_v<T>)
   {
     auto head = _head.load(std::memory_order_relaxed);
-    auto tail = _tail.load(std::memory_order_relaxed);
+    auto tail = _tail.load(std::memory_order_acquire);
     if (head - tail >= Capacity)
     {
       return false;
@@ -109,7 +106,7 @@ public:
     noexcept(std::is_nothrow_copy_assignable_v<T>)
   {
     auto head = _head.load(std::memory_order_relaxed);
-    auto tail = _tail.load(std::memory_order_relaxed);
+    auto tail = _tail.load(std::memory_order_acquire);
     auto available = Capacity - (head - tail);
     auto toPush = count < available ? count : available;
 
@@ -193,7 +190,7 @@ public:
   bool tryPush(const T& item) noexcept(std::is_nothrow_copy_assignable_v<T>)
   {
     auto head = _head.load(std::memory_order_relaxed);
-    auto tail = _tail.load(std::memory_order_relaxed);
+    auto tail = _tail.load(std::memory_order_acquire);
     if (head - tail >= _capacity)
     {
       return false;
@@ -206,7 +203,7 @@ public:
   bool tryPush(T&& item) noexcept(std::is_nothrow_move_assignable_v<T>)
   {
     auto head = _head.load(std::memory_order_relaxed);
-    auto tail = _tail.load(std::memory_order_relaxed);
+    auto tail = _tail.load(std::memory_order_acquire);
     if (head - tail >= _capacity)
     {
       return false;
@@ -245,7 +242,7 @@ public:
     noexcept(std::is_nothrow_copy_assignable_v<T>)
   {
     auto head = _head.load(std::memory_order_relaxed);
-    auto tail = _tail.load(std::memory_order_relaxed);
+    auto tail = _tail.load(std::memory_order_acquire);
     auto available = _capacity - (head - tail);
     auto toPush = count < available ? count : available;
     for (std::size_t i = 0; i < toPush; ++i)
@@ -335,7 +332,10 @@ private:
     v |= v >> 4;
     v |= v >> 8;
     v |= v >> 16;
-    v |= v >> 32;
+    if constexpr (sizeof(std::size_t) > 4)
+    {
+      v |= v >> 32;
+    }
     return v + 1;
   }
 
