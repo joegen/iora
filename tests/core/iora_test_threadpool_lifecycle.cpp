@@ -429,39 +429,59 @@ TEST_CASE("ThreadPool lifecycle: Drain statistics accuracy", "[threadpool][lifec
   ThreadPool pool(2, 4);
 
   std::atomic<bool> tasksCanFinish{false};
+  std::atomic<int> ran{0};  // independent count of task bodies that actually executed
 
-  // Enqueue 5 tasks
+  // Enqueue 5 tasks that block until released.
   for (int i = 0; i < 5; ++i)
   {
     pool.enqueue([&]()
                  {
                    while (!tasksCanFinish.load())
                    {
-                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                    }
+                   ran.fetch_add(1);
                  });
   }
 
-  // Wait for some tasks to start
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // Hold all 5 in-flight (executing + queued) so inFlightAtStart is pinned at 5.
+  REQUIRE(iora::test::waitFor([&]() { return pool.getInFlightCount() == 5; },
+                              std::chrono::seconds(2)));
 
-  // Allow tasks to finish
-  tasksCanFinish.store(true);
+  // Release the tasks only AFTER drain() has transitioned to Draining (and so has
+  // already captured inFlightAtStart). The causal chain (observe Draining -> set
+  // flag -> worker polls -> worker finishes) is milliseconds; inFlightAtStart is
+  // captured nanoseconds after the Draining store, so it is deterministically 5.
+  std::thread releaser(
+    [&]()
+    {
+      if (iora::test::waitFor([&]() { return pool.getState() == LifecycleState::Draining; },
+                              std::chrono::seconds(2)))
+      {
+        tasksCanFinish.store(true);
+      }
+    });
+  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{releaser};
 
-  // Drain
   auto result = pool.drain(5000);
 
   REQUIRE(result.success == true);
   REQUIRE(result.drainStats.has_value());
 
-  auto& stats = result.drainStats.value();
+  auto &stats = result.drainStats.value();
   INFO("inFlightAtStart: " << stats.inFlightAtStart);
   INFO("completed: " << stats.completed);
   INFO("remaining: " << stats.remaining);
 
-  // All tasks should complete
+  // NON-VACUOUS: completed == inFlightAtStart is tautological on the success path
+  // (completed := inFlightAtStart - remaining, remaining == 0). Pin inFlightAtStart
+  // to the known count and cross-check against the independent execution counter so
+  // the derived stat is tied to real task executions.
   REQUIRE(stats.remaining == 0);
+  REQUIRE(stats.inFlightAtStart == 5);
+  REQUIRE(stats.completed == 5);
   REQUIRE(stats.completed == stats.inFlightAtStart);
+  REQUIRE(ran.load() == 5);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -558,4 +578,183 @@ TEST_CASE("ThreadPool zero-worker: (initialSize>maxSize) is functional (maxSize 
 
   REQUIRE(pool.getTotalThreadCount() >= 1);
   requireDrainsWithin(pool, 5);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: drain-quiescence gate counts a popped-but-not-yet-active task
+// (P0 2026-09-09-7). Uses the compiled-in test seam (ThreadPoolT<true>) to park
+// a worker in the window between releasing _mutex after the pop and incrementing
+// _activeThreads -- the busy-but-not-active state the OLD two-sample predicate
+// (_activeThreads + a separate getPendingTaskCount()) misreported as "drained".
+// A plain sleep in the task body cannot reproduce this: the body runs only after
+// _activeThreads is already incremented. MUTATION TEST: revert getInFlightCount()
+// to the _activeThreads-only read and this test FAILS (doneAtDrainReturn==false)
+// and, under ASan, reports a heap-use-after-free on the captured object.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool lifecycle: drain() gate counts a popped-but-not-active task (seam)",
+          "[threadpool][lifecycle][drain][seam]")
+{
+  constexpr int kIterations = 25;
+  for (int iter = 0; iter < kIterations; ++iter)
+  {
+    ThreadPoolT<true> pool(1, 1);  // single deterministic worker
+
+    auto heapObj = std::make_unique<std::atomic<int>>(0);
+    std::atomic<int> *raw = heapObj.get();
+    std::atomic<bool> done{false};
+
+    pool.testSeamArm();
+    pool.enqueue([raw, &done]()
+                 {
+                   raw->fetch_add(1);  // in-flight read/write of the heap object
+                   done.store(true, std::memory_order_release);
+                 });
+
+    // Release the parked worker WHILE drain() polls. Bounded so a hang FAILS
+    // instead of wedging the suite (do NOT raise the timeout to pass).
+    std::thread releaser(
+      [&]()
+      {
+        if (iora::test::waitFor([&]() { return pool.testSeamParked(); }, std::chrono::seconds(5)))
+        {
+          pool.testSeamRelease();
+        }
+      });
+    struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{releaser};
+
+    auto result = pool.drain(5000);
+
+    // The instant drain() reports success, an accurate quiescence gate guarantees
+    // the popped task already ran (done set before --_busyThreads). The broken
+    // predicate reports success while the worker is still parked -> done==false.
+    bool doneAtDrainReturn = done.load(std::memory_order_acquire);
+
+    REQUIRE(result.success == true);
+    REQUIRE(doneAtDrainReturn == true);  // NON-VACUOUS: fails against the unfixed predicate
+
+    // Worker has completed; safe to release the heap object it read in-flight.
+    REQUIRE(iora::test::waitFor([&]() { return done.load(); }, std::chrono::seconds(5)));
+    heapObj.reset();
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: stop() on a drain timeout detaches workers and refuses restart (D2,
+// P0 2026-09-09-7). A releasable "stuck" task (NOT an infinite loop) so the
+// detached worker can exit before the pool is destroyed -- destroy-while-stuck
+// is documented UB. stop() is driven on a worker thread under a bounded wait so a
+// real hang FAILS the test instead of wedging the suite.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool lifecycle: stop() on drain timeout detaches and refuses restart",
+          "[threadpool][lifecycle][stop][detached]")
+{
+  auto release = std::make_shared<std::atomic<bool>>(false);
+  auto pool = std::make_unique<ThreadPoolT<true>>(1, 1);  // <true>: exposes testWorkersExited()
+
+  // Occupy the single worker with a releasable stuck task.
+  std::atomic<bool> started{false};
+  pool->enqueue([release, &started]()
+                {
+                  started.store(true, std::memory_order_release);
+                  while (!release->load(std::memory_order_acquire))
+                  {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                  }
+                });
+  REQUIRE(iora::test::waitFor([&]() { return started.load(); }, std::chrono::seconds(2)));
+
+  // Reach Draining with the task still stuck (drain times out fast).
+  auto drainResult = pool->drain(300);
+  REQUIRE(drainResult.success == false);
+  REQUIRE(pool->getState() == LifecycleState::Draining);
+
+  // Drive stop() on a worker thread under a bounded wait: a real hang FAILS here.
+  std::promise<iora::common::LifecycleResult> stopPromise;
+  auto stopFuture = stopPromise.get_future();
+  std::thread stopper([&]() { stopPromise.set_value(pool->stop()); });
+  auto status = stopFuture.wait_for(std::chrono::seconds(5));
+  REQUIRE(status == std::future_status::ready);
+  stopper.join();
+
+  auto stopResult = stopFuture.get();
+  // Forced detach: bounded, no zombie Draining pool, terminal state Stopped.
+  REQUIRE(stopResult.success == false);
+  REQUIRE(pool->getState() == LifecycleState::Stopped);
+
+  // _detachedTerminal refuses restart in all three directions.
+  REQUIRE(pool->reset().success == false);
+  REQUIRE(pool->start().success == false);
+  REQUIRE(pool->stop().success == false);
+
+  // Release the stuck task and wait (test-observable) for the formerly-detached
+  // worker to fully RETURN from its lambda BEFORE destroying the pool -- destroy-
+  // while-stuck is documented UB (removed later by follow-on 2026-09-10-8).
+  // testWorkersExited() proves the exit (_threadsExited >= _threadsCreated),
+  // replacing a fixed sleep that could flake under CI load.
+  release->store(true, std::memory_order_release);
+  REQUIRE(iora::test::waitFor([&]() { return pool->testWorkersExited(); },
+                              std::chrono::seconds(5)));
+  pool = nullptr;  // destroy the pool
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: concurrent lifecycle transitions are serialized (M-1). Without the
+// _lifecycleMutex, threads racing start() from Reset each pass the check-then-act
+// on _lifecycleState and every winner spawns _initialSize workers (2x+ over-
+// spawn). With the mutex exactly one Reset->Running transition runs, so the pool
+// holds exactly _initialSize workers.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool lifecycle: concurrent start() from Reset does not over-spawn (M-1)",
+          "[threadpool][lifecycle][concurrency]")
+{
+  constexpr std::size_t kInitial = 3;
+  constexpr int kThreads = 16;
+  constexpr int kRounds = 40;  // many rounds x barrier-aligned threads catch the narrow window
+
+  ThreadPool pool(kInitial, kInitial);
+
+  for (int round = 0; round < kRounds; ++round)
+  {
+    // Drive to Reset.
+    REQUIRE(pool.stop().success == true);
+    REQUIRE(pool.reset().success == true);
+    REQUIRE(pool.getState() == LifecycleState::Reset);
+
+    // Align all racers on a barrier so they hit the Reset->Running check-then-act
+    // window simultaneously (maximizes the interleave a missing _lifecycleMutex
+    // would expose). start() is idempotent from Running, so several may report
+    // success, but only ONE transition may spawn workers.
+    std::atomic<bool> go{false};
+    std::atomic<int> ready{0};
+    std::vector<std::thread> racers;
+    for (int i = 0; i < kThreads; ++i)
+    {
+      racers.emplace_back(
+        [&]()
+        {
+          ready.fetch_add(1, std::memory_order_release);
+          while (!go.load(std::memory_order_acquire))
+          {
+            std::this_thread::yield();
+          }
+          (void)pool.start();
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads)
+    {
+      std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);  // release all at once
+    for (auto &t : racers)
+    {
+      t.join();
+    }
+
+    REQUIRE(pool.getState() == LifecycleState::Running);
+    // The discriminator: exactly kInitial workers, not up to kThreads * kInitial.
+    REQUIRE(pool.getTotalThreadCount() == kInitial);
+  }
 }

@@ -150,7 +150,7 @@ public:
   /// - Load balancing decisions
   ///
   /// The exact definition of "in-flight" is component-specific:
-  /// - ThreadPool: _taskQueue.size() + _activeThreads
+  /// - ThreadPool: _tasks.size() + _busyThreads
   /// - Timer: _activeTimers.size() + _callbacksExecuting
   /// - Transaction Layer: Number of non-terminated transactions
   ///

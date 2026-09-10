@@ -18,6 +18,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -36,12 +37,43 @@ namespace iora
 namespace core
 {
 
+namespace detail
+{
+/// Empty base for the production thread pool: the test seam contributes zero
+/// bytes (empty-base optimization) and zero hot-path cost.
+struct ThreadPoolNoSeam
+{
+};
+
+/// Test-only park-point state. Present ONLY in the ThreadPoolT<true>
+/// instantiation used by the drain-quiescence regression test: it lets a worker
+/// be parked in the window between releasing _mutex after popping a task and
+/// incrementing _activeThreads, reproducing the busy-but-not-active state the
+/// quiescence gate must observe. Never instantiated in production
+/// (ThreadPoolT<false> uses ThreadPoolNoSeam).
+struct ThreadPoolTestSeam
+{
+  std::atomic<bool> armed{false};    ///< One-shot: park the next worker at the seam.
+  std::atomic<bool> parked{false};   ///< A worker is currently parked at the seam.
+  std::atomic<bool> release{false};  ///< Release the parked worker.
+};
+} // namespace detail
+
 /// A dynamic thread pool that accepts void or result-returning lambdas with
 /// arbitrary arguments. Threads grow and shrink based on load and idle
 /// timeout. Exceptions in tasks can be reported.
 ///
 /// Implements ILifecycleManaged for graceful shutdown and reset capabilities.
-class ThreadPool : public iora::common::ILifecycleManaged
+///
+/// \tparam EnableTestSeam Compile-time flag that adds a test-only park point in
+///   the worker loop (see detail::ThreadPoolTestSeam). Defaults to false; the
+///   `ThreadPool` alias below pins it to false so production code and every
+///   consumer see an ordinary class. Tests instantiate ThreadPoolT<true>.
+template <bool EnableTestSeam = false>
+class ThreadPoolT
+  : public iora::common::ILifecycleManaged,
+    private std::conditional_t<EnableTestSeam, detail::ThreadPoolTestSeam,
+                               detail::ThreadPoolNoSeam>
 {
 public:
   // ═══════════════════════════════════════════════════════════════════
@@ -139,12 +171,12 @@ public:
   /// tasks.
   /// @param shutdownMode      Shutdown mode (IMMEDIATE, GRACEFUL, DETACHED).
   /// Default: IMMEDIATE (backward compatible).
-  ThreadPool(std::size_t initialSize = std::thread::hardware_concurrency(),
-             std::size_t maxSize = std::thread::hardware_concurrency() * 4,
-             std::chrono::milliseconds idleTimeout = std::chrono::seconds(30),
-             std::size_t maxQueueSize = 1024,
-             std::function<void(std::exception_ptr)> onTaskError = nullptr,
-             ShutdownMode shutdownMode = ShutdownMode::IMMEDIATE)
+  ThreadPoolT(std::size_t initialSize = std::thread::hardware_concurrency(),
+              std::size_t maxSize = std::thread::hardware_concurrency() * 4,
+              std::chrono::milliseconds idleTimeout = std::chrono::seconds(30),
+              std::size_t maxQueueSize = 1024,
+              std::function<void(std::exception_ptr)> onTaskError = nullptr,
+              ShutdownMode shutdownMode = ShutdownMode::IMMEDIATE)
       : _initialSize(clampInitial(initialSize)),
         _maxSize(maxSize >= _initialSize ? maxSize : _initialSize),
         _idleTimeout(idleTimeout),
@@ -161,7 +193,7 @@ public:
     }
   }
 
-  ~ThreadPool()
+  ~ThreadPoolT()
   {
     // Execute shutdown sequence using phased methods
 
@@ -186,10 +218,10 @@ public:
     shutdownPhase5_Validate();
   }
 
-  ThreadPool(const ThreadPool &) = delete;
-  ThreadPool &operator=(const ThreadPool &) = delete;
-  ThreadPool(ThreadPool &&) = delete;
-  ThreadPool &operator=(ThreadPool &&) = delete;
+  ThreadPoolT(const ThreadPoolT &) = delete;
+  ThreadPoolT &operator=(const ThreadPoolT &) = delete;
+  ThreadPoolT(ThreadPoolT &&) = delete;
+  ThreadPoolT &operator=(ThreadPoolT &&) = delete;
 
   /// Enqueue a fire-and-forget task (void-returning) with arguments.
   template <typename F, typename... Args> void enqueue(F &&func, Args &&...args)
@@ -205,21 +237,7 @@ public:
         }
         catch (...)
         {
-          // Always forward to exception handler if present
-          std::function<void(std::exception_ptr)> handlerCopy;
-          {
-            std::lock_guard<std::mutex> lock(_configMutex);
-            handlerCopy = _onTaskError;
-          }
-
-          if (handlerCopy)
-          {
-            handlerCopy(std::current_exception());
-          }
-          else
-          {
-            std::cerr << "[ThreadPool] Unhandled exception in void task" << std::endl;
-          }
+          reportTaskException(std::current_exception(), "void task");
         }
       });
   }
@@ -297,77 +315,17 @@ public:
     }
     _condition.notify_all();
 
-    // CRITICAL FIX: Wait for all active tasks to complete BEFORE joining threads
-    // This prevents use-after-free when tasks access objects being destroyed during shutdown
-    iora::core::Logger::debug("ThreadPool::shutdown() - Waiting for active tasks to complete...");
-    int waitMs = 0;
-    const int maxWaitMs = 5000;  // Maximum 5 seconds
-    while (waitMs < maxWaitMs)
+    // Wait for all in-flight work to complete BEFORE joining threads. This
+    // prevents use-after-free when a task accesses objects being torn down.
+    // The gate is the accurate single-critical-section getInFlightCount()==0 read
+    // (queue depth + _busyThreads under one lock); with that primary predicate the
+    // former P0-3 "sleep 10ms then re-check" race window is redundant and has been
+    // removed. shutdown()'s join below is safe by construction.
+    iora::core::Logger::debug("ThreadPool::shutdown() - Waiting for in-flight tasks to complete...");
+    if (!waitForQuiescence(5000))
     {
-      auto activeCount = _activeThreads.load(std::memory_order_acquire);
-      auto pendingCount = getPendingTaskCount();
-
-      if (activeCount == 0 && pendingCount == 0)
-      {
-        iora::core::Logger::debug("ThreadPool::shutdown() - All tasks completed after " +
-                                 std::to_string(waitMs) + "ms");
-        break;
-      }
-
-      if (waitMs % 500 == 0 && waitMs > 0)  // Log every 500ms
-      {
-        iora::core::Logger::debug("ThreadPool::shutdown() - Waiting... (active=" +
-                                 std::to_string(activeCount) + ", pending=" +
-                                 std::to_string(pendingCount) + ")");
-      }
-
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      waitMs += 50;
-    }
-
-    if (waitMs >= maxWaitMs)
-    {
-      iora::core::Logger::warning("ThreadPool::shutdown() - Task completion timeout after " +
-                                 std::to_string(maxWaitMs) + "ms - proceeding anyway");
-    }
-
-    // P0-3 FIX: Double-check after wait completes to close race window
-    // There's a narrow race where a thread could grab a task between when we check
-    // and when the wait exits. Add a short delay and re-verify.
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    auto finalActiveCount = _activeThreads.load(std::memory_order_acquire);
-    auto finalPendingCount = getPendingTaskCount();
-
-    if (finalActiveCount != 0 || finalPendingCount != 0)
-    {
-      iora::core::Logger::warning(std::string("ThreadPool::shutdown() - Race detected after wait! ") +
-                                 "Re-checking... (active=" + std::to_string(finalActiveCount) +
-                                 ", pending=" + std::to_string(finalPendingCount) + ")");
-
-      // Wait again for tasks to complete (shorter timeout since this is rare)
-      int raceWaitMs = 0;
-      const int raceMaxWaitMs = 1000;  // 1 second max
-      while (raceWaitMs < raceMaxWaitMs)
-      {
-        auto activeCount = _activeThreads.load(std::memory_order_acquire);
-        auto pendingCount = getPendingTaskCount();
-
-        if (activeCount == 0 && pendingCount == 0)
-        {
-          iora::core::Logger::debug("ThreadPool::shutdown() - Race resolved after " +
-                                   std::to_string(raceWaitMs) + "ms");
-          break;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        raceWaitMs += 50;
-      }
-
-      if (raceWaitMs >= raceMaxWaitMs)
-      {
-        iora::core::Logger::error("ThreadPool::shutdown() - Race resolution timeout! "
-                                 "This may indicate a deadlock or stuck task.");
-      }
+      iora::core::Logger::warning("ThreadPool::shutdown() - Task completion timeout after "
+                                  "5000ms - proceeding anyway");
     }
 
     // P0-CRITICAL FIX: Join threads directly in the map without moving or erasing
@@ -434,20 +392,7 @@ public:
         }
         catch (...)
         {
-          std::function<void(std::exception_ptr)> handlerCopy;
-          {
-            std::lock_guard<std::mutex> lock(_configMutex);
-            handlerCopy = _onTaskError;
-          }
-
-          if (handlerCopy)
-          {
-            handlerCopy(std::current_exception());
-          }
-          else
-          {
-            std::cerr << "[ThreadPool] Unhandled exception in void task" << std::endl;
-          }
+          reportTaskException(std::current_exception(), "void task");
         }
       });
   }
@@ -463,7 +408,19 @@ public:
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
 
+    // Serialize lifecycle transitions: start/drain/stop/reset take _lifecycleMutex
+    // for their whole body, so concurrent callers cannot interleave check-then-act
+    // on _lifecycleState (e.g. two start()s both spawning _initialSize workers).
+    // Lock order is ALWAYS _lifecycleMutex -> _mutex; workers never take
+    // _lifecycleMutex, so drain's quiescence wait cannot deadlock against them.
+    std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
+
     auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    if (auto refusal = refuseIfDetached(currentState, "start"))
+    {
+      return *refusal;
+    }
 
     // If already running, it's a no-op (idempotent)
     if (currentState == LifecycleState::Running)
@@ -503,10 +460,23 @@ public:
     return LifecycleResult(true, LifecycleState::Running, "ThreadPool started");
   }
 
-  /// Begin graceful drain (Running → Draining)
-  /// @param timeoutMs Maximum time to wait for in-flight work (0 = wait indefinitely)
-  /// @return Result with drain statistics
+  /// Begin graceful drain (Running → Draining).
+  /// @param timeoutMs Maximum time to wait for in-flight work, in milliseconds.
+  ///   A value of 0 waits up to a bounded cap of one hour (NOT truly unbounded --
+  ///   the cap keeps the held _lifecycleMutex from blocking other transitions
+  ///   indefinitely). Prefer a finite timeout: this call holds _lifecycleMutex for
+  ///   its whole duration, so a concurrent stop()/reset()/start() -- including a
+  ///   stop() meant to force-abort a stuck drain -- blocks until this drain returns.
+  /// @return Result with drain statistics.
   iora::common::LifecycleResult drain(std::uint32_t timeoutMs = 30000) override
+  {
+    std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
+    return drainImpl(timeoutMs);
+  }
+
+private:
+  /// Drain body; the caller MUST hold _lifecycleMutex (public drain() and stop()).
+  iora::common::LifecycleResult drainImpl(std::uint32_t timeoutMs)
   {
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
@@ -525,43 +495,23 @@ public:
     _lifecycleState.store(LifecycleState::Draining, std::memory_order_release);
     _accepting.store(false, std::memory_order_release);
 
-    // Capture initial in-flight count
+    // Capture initial in-flight count (exact single-critical-section read).
     std::uint32_t inFlightAtStart = getInFlightCount();
 
-    // Wait for all in-flight work to complete (using existing shutdown phase 3 logic)
-    int waitMs = 0;
+    // Wait for all in-flight work to complete. The predicate is the accurate
+    // getInFlightCount()==0 gate (queue depth + _busyThreads under one lock) --
+    // never a two-sample (_activeThreads then a separate getPendingTaskCount())
+    // read, which admits the pop->++_activeThreads TOCTOU this task fixes.
     const int maxWaitMs = (timeoutMs == 0) ? 3600000 : static_cast<int>(timeoutMs); // 1 hour if 0
+    bool timedOut = !waitForQuiescence(maxWaitMs);
 
-    std::uint32_t finalActiveCount = 0;
-    std::uint32_t finalPendingCount = 0;
-    bool timedOut = false;
-
-    while (waitMs < maxWaitMs)
-    {
-      auto activeCount = _activeThreads.load(std::memory_order_acquire);
-      auto pendingCount = getPendingTaskCount();
-
-      if (activeCount == 0 && pendingCount == 0)
-      {
-        finalActiveCount = 0;
-        finalPendingCount = 0;
-        break;
-      }
-
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      waitMs += 50;
-    }
-
-    if (waitMs >= maxWaitMs)
-    {
-      finalActiveCount = _activeThreads.load(std::memory_order_acquire);
-      finalPendingCount = static_cast<std::uint32_t>(getPendingTaskCount());
-      timedOut = true;
-    }
-
-    // Calculate drain statistics
-    std::uint32_t remaining = finalActiveCount + finalPendingCount;
-    std::uint32_t completed = inFlightAtStart - remaining;
+    // remaining is another exact read. On the success path _accepting is already
+    // false, so no task can be admitted after quiescence -- remaining stays 0 and
+    // completed == inFlightAtStart. On the timeout path a task admitted after the
+    // inFlightAtStart snapshot can make remaining exceed it, so clamp the
+    // subtraction to avoid a std::uint32_t underflow.
+    std::uint32_t remaining = getInFlightCount();
+    std::uint32_t completed = (inFlightAtStart >= remaining) ? (inFlightAtStart - remaining) : 0;
 
     DrainStats stats(inFlightAtStart, remaining, 0, completed);
 
@@ -577,6 +527,7 @@ public:
                            " tasks finished", stats);
   }
 
+public:
   /// Stop the thread pool (Draining → Stopped)
   /// @return Result indicating success and new state
   iora::common::LifecycleResult stop() override
@@ -584,7 +535,14 @@ public:
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
 
+    std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
+
     auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    if (auto refusal = refuseIfDetached(currentState, "stop"))
+    {
+      return *refusal;
+    }
 
     // Can stop from Running or Draining state
     if (currentState != LifecycleState::Running && currentState != LifecycleState::Draining)
@@ -593,18 +551,36 @@ public:
                              "Can only stop from Running or Draining state");
     }
 
-    // If not already draining, drain first
+    // Give in-flight work a bounded chance to finish.
+    //  - From Running: drainImpl() (its own timeout) is the drain window.
+    //  - From Draining: the caller already drained; check current quiescence.
+    bool quiesced;
     if (currentState == LifecycleState::Running)
     {
-      auto drainResult = drain();
-      if (!drainResult.success)
-      {
-        return LifecycleResult(false, LifecycleState::Draining,
-                               "Drain failed during stop: " + drainResult.message);
-      }
+      quiesced = drainImpl(30000).success;
+    }
+    else
+    {
+      quiesced = (getInFlightCount() == 0);
     }
 
-    // Call existing shutdown() method to join threads
+    if (!quiesced)
+    {
+      // D2: a task is still in flight after the drain window. shutdown()'s join
+      // loop ignores the shutdown mode and would HANG on the stuck task, so do
+      // NOT call it. Signal shutdown, detach every worker (never join), and mark
+      // the pool terminally detached so start()/reset()/stop() refuse to restart
+      // over a ghost worker whose late --_busyThreads/--_activeThreads would
+      // underflow a restarted pool's counters. Destroying a pool while a genuinely
+      // stuck task is still running remains undefined behaviour (documented).
+      forceDetachWorkers();
+      _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
+      return LifecycleResult(false, LifecycleState::Stopped,
+                             "ThreadPool stop timed out draining; workers detached "
+                             "(forced stop, in-flight tasks abandoned)");
+    }
+
+    // Quiescent: shutdown()'s join is bounded and safe by construction.
     shutdown();
 
     _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
@@ -619,7 +595,14 @@ public:
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
 
+    std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
+
     auto currentState = _lifecycleState.load(std::memory_order_acquire);
+
+    if (auto refusal = refuseIfDetached(currentState, "reset"))
+    {
+      return *refusal;
+    }
 
     // Can only reset from Stopped state
     if (currentState != LifecycleState::Stopped)
@@ -661,12 +644,171 @@ public:
   /// @return Number of tasks in queue + actively executing
   std::uint32_t getInFlightCount() const override
   {
-    auto pending = static_cast<std::uint32_t>(getPendingTaskCount());
-    auto active = static_cast<std::uint32_t>(_activeThreads.load(std::memory_order_acquire));
-    return pending + active;
+    // Single critical section: read the queue depth and the in-flight counter
+    // under ONE _mutex hold. _busyThreads is incremented atomic-with-the-pop
+    // under _mutex (see the worker loop), so a _mutex holder can never observe a
+    // dequeued-but-uncounted task -- closing the pop->++_activeThreads gap that a
+    // two-sample (_activeThreads + separate getPendingTaskCount()) read left open.
+    // acquire on _busyThreads pairs with the seq_cst --_busyThreads that is
+    // sequenced-after the task functor's destruction, so ==0 proves every functor
+    // released.
+    std::lock_guard<std::mutex> lock(_mutex);
+    const std::size_t inFlight = _tasks.size() + _busyThreads.load(std::memory_order_acquire);
+    // Saturate to the ILifecycleManaged uint32_t contract. A >4G in-flight count is
+    // physically unreachable (each queued task is dozens of bytes), but avoid a
+    // silent narrowing truncation rather than assert the impossible.
+    return inFlight > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<std::uint32_t>(inFlight);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Test seam accessors (no-ops unless EnableTestSeam; see the worker loop)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /// Arm the one-shot worker park point. Test-only (no-op in production).
+  void testSeamArm()
+  {
+    if constexpr (EnableTestSeam)
+    {
+      seam().armed.store(true, std::memory_order_release);
+    }
+  }
+
+  /// True while a worker is parked at the seam. Test-only (always false in production).
+  bool testSeamParked() const
+  {
+    if constexpr (EnableTestSeam)
+    {
+      return seam().parked.load(std::memory_order_acquire);
+    }
+    return false;
+  }
+
+  /// Release a worker parked at the seam. Test-only (no-op in production).
+  void testSeamRelease()
+  {
+    if constexpr (EnableTestSeam)
+    {
+      seam().release.store(true, std::memory_order_release);
+    }
+  }
+
+  /// True once every spawned worker has returned from its lambda. Test-only
+  /// (always false in production): lets the forced-detach test prove the detached
+  /// worker has exited before the pool is destroyed, rather than timing it.
+  bool testWorkersExited() const
+  {
+    if constexpr (EnableTestSeam)
+    {
+      return _threadsExited.load(std::memory_order_acquire) >=
+             _threadsCreated.load(std::memory_order_acquire);
+    }
+    return false;
   }
 
 private:
+  /// Shared lifecycle guard: if a forced stop left the pool terminally detached,
+  /// return the standard refusal for `verb`; otherwise std::nullopt. Callers hold
+  /// _lifecycleMutex.
+  std::optional<iora::common::LifecycleResult>
+  refuseIfDetached(iora::common::LifecycleState currentState, const char *verb) const
+  {
+    if (_detachedTerminal.load(std::memory_order_acquire))
+    {
+      return iora::common::LifecycleResult(
+        false, currentState,
+        std::string("ThreadPool terminally detached after a forced stop; cannot ") + verb);
+    }
+    return std::nullopt;
+  }
+
+  /// Copy-then-invoke the task-error handler (or log to std::cerr). Copies
+  /// _onTaskError under _configMutex, then calls it with NO lock held (the
+  /// copy-then-invoke rule -- never hold a lock across a user callback).
+  void reportTaskException(std::exception_ptr ep, const char *what) const
+  {
+    std::function<void(std::exception_ptr)> handlerCopy;
+    {
+      std::lock_guard<std::mutex> lock(_configMutex);
+      handlerCopy = _onTaskError;
+    }
+    if (handlerCopy)
+    {
+      handlerCopy(ep);
+    }
+    else
+    {
+      std::cerr << "[ThreadPool] Unhandled exception in " << what << std::endl;
+    }
+  }
+
+  /// Cast to the test-seam base. Only valid — and only instantiated — when
+  /// EnableTestSeam; every call site is inside an `if constexpr (EnableTestSeam)`,
+  /// so ThreadPoolT<false> never instantiates this ill-formed cast.
+  detail::ThreadPoolTestSeam &seam() noexcept
+  {
+    return static_cast<detail::ThreadPoolTestSeam &>(*this);
+  }
+  const detail::ThreadPoolTestSeam &seam() const noexcept
+  {
+    return static_cast<const detail::ThreadPoolTestSeam &>(*this);
+  }
+
+  /// Poll until in-flight work reaches zero or the budget is exhausted. Returns
+  /// true iff quiescent (getInFlightCount()==0) within maxWaitMs. Delegates to the
+  /// accurate single-critical-section getInFlightCount() and never holds _mutex
+  /// across the sleep (getInFlightCount takes and releases it internally).
+  bool waitForQuiescence(int maxWaitMs, int *elapsedMsOut = nullptr)
+  {
+    int waitMs = 0;
+    while (getInFlightCount() != 0)
+    {
+      if (waitMs >= maxWaitMs)
+      {
+        if (elapsedMsOut)
+        {
+          *elapsedMsOut = waitMs;
+        }
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      waitMs += 50;
+    }
+    if (elapsedMsOut)
+    {
+      *elapsedMsOut = waitMs;
+    }
+    return true;
+  }
+
+  /// Forced-stop path (drain timeout): signal shutdown and DETACH every worker
+  /// instead of joining -- shutdown()'s join loop ignores the shutdown mode and
+  /// would hang on a stuck task. Marks the pool terminally detached so
+  /// start()/reset()/stop() refuse to restart over a ghost worker whose late
+  /// counter decrement would underflow a restarted pool. Destroying the pool while
+  /// a genuinely stuck task is still running is undefined behaviour (documented).
+  void forceDetachWorkers()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _shutdown.store(true, std::memory_order_release);
+    }
+    _condition.notify_all();
+
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      for (auto it = _threads.begin(); it != _threads.end();)
+      {
+        if (it->second.joinable())
+        {
+          it->second.detach();
+        }
+        it = _threads.erase(it);
+      }
+    }
+
+    _detachedTerminal.store(true, std::memory_order_release);
+  }
+
   void enqueueImpl(std::function<void()> f)
   {
     // Check if accepting new work (for graceful drain support)
@@ -843,6 +985,27 @@ private:
 
           if (task)
           {
+            // Test seam (compiled out of production via if constexpr): park the
+            // worker HERE -- _mutex released, task popped, _busyThreads already
+            // incremented, but _activeThreads not yet -- to exercise the
+            // busy-but-not-active window the quiescence gate must observe. No lock
+            // is held across the park (getInFlightCount()/drain() stay live).
+            if constexpr (EnableTestSeam)
+            {
+              auto &s = seam();
+              if (s.armed.load(std::memory_order_acquire))
+              {
+                s.armed.store(false, std::memory_order_release);   // one-shot
+                s.parked.store(true, std::memory_order_release);
+                while (!s.release.load(std::memory_order_acquire))
+                {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                s.release.store(false, std::memory_order_release);  // re-arm for reuse
+                s.parked.store(false, std::memory_order_release);   // clear parked after release
+              }
+            }
+
             ++_activeThreads; // Thread is now executing (for monitoring)
             try
             {
@@ -850,30 +1013,19 @@ private:
             }
             catch (...)
             {
-              std::function<void(std::exception_ptr)> handlerCopy;
-              {
-                std::lock_guard<std::mutex> lock(_configMutex);
-                handlerCopy = _onTaskError;
-              }
-
-              if (handlerCopy)
-              {
-                handlerCopy(std::current_exception());
-              }
-              else
-              {
-                std::cerr << "[ThreadPool] Unhandled exception in task" << std::endl;
-              }
+              reportTaskException(std::current_exception(), "task");
             }
 
-            // CRITICAL FIX: Explicitly destroy task (releasing captured variables)
-            // BEFORE decrementing _activeThreads. This prevents use-after-free when
-            // ThreadPool destructor waits for _activeThreads == 0 but task's captured
-            // variables are destroyed during shutdown.
+            // CRITICAL: destroy the task functor (releasing its captured variables)
+            // BEFORE decrementing the in-flight counters -- in particular before
+            // --_busyThreads, the quiescence decrement getInFlightCount() gates on.
+            // Sequencing the destroy before the seq_cst --_busyThreads is what makes
+            // _busyThreads==0 (read under _mutex, acquire) prove every functor -- and
+            // its captures -- released, preventing a use-after-free during drain/teardown.
             task = std::function<void()>{};
 
-            --_activeThreads; // Thread finished executing
-            --_busyThreads;   // Thread no longer busy
+            --_activeThreads; // Thread finished executing (monitoring accessor only)
+            --_busyThreads;   // Quiescence decrement -- MUST stay after the functor destroy
           }
         }
 
@@ -961,38 +1113,28 @@ private:
   ShutdownPhase3Result shutdownPhase3_DrainTasks()
   {
     ShutdownPhase3Result result;
-    auto startTime = std::chrono::steady_clock::now();
-    (void)startTime;  // For future timing/debugging use
 
-    const int maxWaitMs = 5000;  // Maximum 5 seconds
-    int waitMs = 0;
-
-    while (waitMs < maxWaitMs)
+    // Quiescence gate: the accurate single-critical-section getInFlightCount()==0
+    // read via waitForQuiescence (never a two-sample check). The finalActive/
+    // finalPending fields on timeout are diagnostic only.
+    int elapsedMs = 0;
+    if (waitForQuiescence(5000, &elapsedMs))
     {
-      auto activeCount = _activeThreads.load(std::memory_order_acquire);
-      auto pendingCount = getPendingTaskCount();
-
-      if (activeCount == 0 && pendingCount == 0)
-      {
-        result.finalActiveCount = 0;
-        result.finalPendingCount = 0;
-        result.drainTimeMs = waitMs;
-        result.timedOut = false;
-        result.success = true;
-        return result;
-      }
-
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      waitMs += 50;
+      result.finalActiveCount = 0;
+      result.finalPendingCount = 0;
+      result.drainTimeMs = elapsedMs;
+      result.timedOut = false;
+      result.success = true;
     }
-
-    // Timeout occurred
-    result.finalActiveCount = _activeThreads.load(std::memory_order_acquire);
-    result.finalPendingCount = getPendingTaskCount();
-    result.drainTimeMs = waitMs;
-    result.timedOut = true;
-    result.success = false;  // Timeout is considered failure
-
+    else
+    {
+      // Timeout occurred (diagnostic snapshot).
+      result.finalActiveCount = _activeThreads.load(std::memory_order_acquire);
+      result.finalPendingCount = getPendingTaskCount();
+      result.drainTimeMs = elapsedMs;
+      result.timedOut = true;
+      result.success = false;  // Timeout is considered failure
+    }
     return result;
   }
 
@@ -1117,6 +1259,13 @@ private:
   mutable std::mutex _configMutex;  // mutable: allows locking in const methods
   std::function<void(std::exception_ptr)> _onTaskError;
 
+  // Serializes ILifecycleManaged transitions (start/drain/stop/reset) so concurrent
+  // callers cannot interleave check-then-act on _lifecycleState. Always acquired
+  // BEFORE _mutex (workers never take it), so the drain quiescence wait -- which
+  // takes _mutex internally via getInFlightCount() -- cannot deadlock against it.
+  // getState()/getInFlightCount() are lock-free of it (observers stay responsive).
+  std::mutex _lifecycleMutex;
+
   // Shutdown mode configuration (GRACEFUL shutdown support)
   ShutdownMode _shutdownMode{ShutdownMode::IMMEDIATE};  // Default: backward compatible
 
@@ -1125,7 +1274,19 @@ private:
   // ═══════════════════════════════════════════════════════════════════
   std::atomic<iora::common::LifecycleState> _lifecycleState{iora::common::LifecycleState::Created};
   std::atomic<bool> _accepting{false};  // Flag to control acceptance of new work during drain
+
+  // Set by forceDetachWorkers() when stop() times out draining and detaches its
+  // workers. Terminal: start()/reset()/stop() refuse to restart the pool while it
+  // is set, so a ghost worker's late --_busyThreads/--_activeThreads cannot
+  // underflow a restarted pool's counters.
+  std::atomic<bool> _detachedTerminal{false};
 };
+
+/// The production thread pool: an ordinary class to every consumer. The test-seam
+/// template parameter is pinned to false here so the seam contributes zero bytes
+/// (empty-base optimization) and zero runtime cost. Tests instantiate
+/// ThreadPoolT<true> to exercise the drain-quiescence park point.
+using ThreadPool = ThreadPoolT<false>;
 
 /// \brief Process-wide, immortal, hard-capped, reject-fast pool for BLOCKING I/O
 ///        (e.g. ::getaddrinfo) that must NEVER run on an event-loop thread.
