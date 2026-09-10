@@ -18,7 +18,7 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-10 | Initial Architecture & Programmer's Guide. Authored directly against `include/iora/core/blocking_queue.hpp` (386 lines) and cross-checked against `tests/core/iora_test_blocking_queue.cpp` (22 `TEST_CASE`s). The README "Thread-Safe Blocking Queue" section describes the same API but omits the shutdown/wakeup hazard documented here; this guide documents the **actual** shipped behavior, including a lost-wakeup defect in `close()` (see Known Limitations, section 12). |
-| 1.1 | 2026-09-10 | Synced with commit `1902df7`: the `close()` lost-wakeup hang is **fixed** (`_closed` is now mutated under `_mutex` before notifying) -- section 8.4 and Known Limitations flipped from defect to resolved. Reordered Thread Safety Model (now section 7) before Configuration Reference (now section 8) per the doc-writer template; sections renumbered contiguously. Escaped the template angle brackets in the section 3 heading. |
+| 1.1 | 2026-09-10 | Synced with commit `eec6356`: the `close()` lost-wakeup hang is **fixed** (`_closed` is now mutated under `_mutex` before notifying) -- section 8.4 and Known Limitations flipped from defect to resolved. Reordered Thread Safety Model (now section 7) before Configuration Reference (now section 8) per the doc-writer template; sections renumbered contiguously. Escaped the template angle brackets in the section 3 heading. |
 
 ---
 
@@ -44,7 +44,7 @@ A threaded C++17 framework repeatedly needs to hand work from one set of threads
 - **Back-pressure for free** -- a full queue blocks producers (`queue`), sheds load (`tryQueue`), or applies a deadline (`tryQueue(item, timeout)`); the choice is the caller's per call.
 - **Move-through** -- both the enqueue (`T&&` overload) and the dequeue (`out = std::move(_queue.front())`) sides move, so large payloads are not copied through the queue.
 - **No locks held across a copy/move of `T`** -- the item copy/move happens under `_mutex`, but the CV `notify_one` is issued after `lock.unlock()`, so a woken thread does not immediately contend on a still-held lock.
-- **Shutdown wakeup is race-free (fixed 2026-09-10, commit `1902df7`):** `close()` mutates `_closed` under `_mutex` before notifying, so no waiter can be caught in the check-false-but-not-yet-parked window; both the untimed and timed `queue()`/`dequeue()` variants observe shutdown reliably. Full analysis in section 7.4.
+- **Shutdown wakeup is race-free (fixed 2026-09-10, commit `eec6356`):** `close()` mutates `_closed` under `_mutex` before notifying, so no waiter can be caught in the check-false-but-not-yet-parked window; both the untimed and timed `queue()`/`dequeue()` variants observe shutdown reliably. Full analysis in section 7.4.
 
 ---
 
@@ -232,7 +232,7 @@ bool isClosed() const { return _closed.load(std::memory_order_acquire); }
 - `dequeue` continues to return queued items until the deque empties, then returns `false`.
 - The destructor `~BlockingQueue()` calls `close()`.
 
-**Lost-wakeup hazard FIXED (commit `1902df7`, 2026-09-10):** the `_closed` publication now happens **while holding `_mutex`** (the `lock_guard` scope above); only the two `notify_all` calls are issued after the lock is released. Because the predicate mutation is serialized against every waiter through `_mutex`, no waiter can be caught in the check-false-but-not-yet-parked window when the broadcast fires -- both the untimed and timed `queue()`/`dequeue()` waiters now observe shutdown reliably. See section 7.4 for the full before/after analysis.
+**Lost-wakeup hazard FIXED (commit `eec6356`, 2026-09-10):** the `_closed` publication now happens **while holding `_mutex`** (the `lock_guard` scope above); only the two `notify_all` calls are issued after the lock is released. Because the predicate mutation is serialized against every waiter through `_mutex`, no waiter can be caught in the check-false-but-not-yet-parked window when the broadcast fires -- both the untimed and timed `queue()`/`dequeue()` waiters now observe shutdown reliably. See section 7.4 for the full before/after analysis.
 
 ### 3.7 Observers -- `size`, `empty`, `full`, `capacity`
 
@@ -403,7 +403,7 @@ void drainAfterClose(BlockingQueue<int> &queue)
 
 | Do | Don't |
 |---|---|
-| Prefer the **timed** `dequeue(out, timeout)` / `tryQueue(item, timeout)` in consumers/producers where a bounded, predictable shutdown latency matters. | Assume an untimed `dequeue(out)` / `queue(item)` cannot make progress after `close()` -- since commit `1902df7` (section 7.4) `close()` reliably wakes both untimed and timed waiters; the timed forms remain useful for responsiveness, not as a hang workaround. |
+| Prefer the **timed** `dequeue(out, timeout)` / `tryQueue(item, timeout)` in consumers/producers where a bounded, predictable shutdown latency matters. | Assume an untimed `dequeue(out)` / `queue(item)` cannot make progress after `close()` -- since commit `eec6356` (section 7.4) `close()` reliably wakes both untimed and timed waiters; the timed forms remain useful for responsiveness, not as a hang workaround. |
 | `close()` first, then `join()` the producer/consumer threads. | Destroy the `BlockingQueue` while producer/consumer threads may still be inside a method -- the queue owns no threads and joins none, so destroying it under an in-flight waiter races the destruction of `_mutex`/`_condNotEmpty`/`_condNotFull`/`_queue` against that thread (use-after-free). |
 | Check the `bool` return of every `queue`/`tryQueue`/`dequeue`/`tryDequeue`. | Assume `queue()` always enqueues -- it returns `false` on a closed queue; assume `dequeue()` always yields an item -- it returns `false` when closed and empty. |
 | Use `tryQueue(item)` (or the timed form) to apply back-pressure. | Use `size()`/`full()` to gate a subsequent `queue()` -- the snapshot is stale the instant it returns; use the atomic `tryQueue`. |
@@ -504,7 +504,7 @@ All mutable state is guarded by a single `std::mutex _mutex`; the shutdown flag 
 
 | Primitive | Name | Guards / role |
 |---|---|---|
-| `std::mutex` | `_mutex` (mutable) | `_queue` (all reads/writes); the read of `_closed` inside every wait predicate and observer; and (since commit `1902df7`) the write of `_closed` in `close()`. |
+| `std::mutex` | `_mutex` (mutable) | `_queue` (all reads/writes); the read of `_closed` inside every wait predicate and observer; and (since commit `eec6356`) the write of `_closed` in `close()`. |
 | `std::condition_variable` | `_condNotEmpty` | Consumers park here; notified by any producer that added an item, and by `close()`. |
 | `std::condition_variable` | `_condNotFull` | Producers park here; notified by any consumer that removed an item, and by `close()`. |
 | `std::deque<T>` | `_queue` | FIFO storage; `push_back` (enqueue) / `front` + `pop_front` (dequeue). |
@@ -532,11 +532,11 @@ All mutable state is guarded by a single `std::mutex _mutex`; the shutdown flag 
 - **Predicate waits absorb spurious wakeups.** Every blocking site uses the `wait(lock, predicate)` / `wait_for(lock, timeout, predicate)` form, so a spurious wake re-tests the predicate under the lock and re-blocks -- there is no bare `wait()` that could return prematurely. The stress test (`rapid queue/dequeue`) and the 4x4 producer/consumer test exercise this under contention with a conserved-count assertion (`queuedCount == dequeuedCount`).
 - **Two homogeneous CVs.** Because producers and consumers park on separate CVs, `notify_one` on the steady-state paths cannot be "stolen" by a thread that cannot use it (section 2.3).
 - **Drain-after-close ordering.** `dequeue` checks emptiness *after* the wait, so a closed queue still yields its buffered items before reporting `false` (`can dequeue existing items after close`).
-- **`_closed` reads and writes are lock-protected.** Although `_closed` is atomic, every predicate reads it *while holding `_mutex`*, and (since commit `1902df7`) `close()` writes it *while holding `_mutex`* too, so the read side and the write side are both correctly synchronized. `notify_all` is issued after releasing the lock, which is fine because the mutation already happened under the lock -- see 7.4.
+- **`_closed` reads and writes are lock-protected.** Although `_closed` is atomic, every predicate reads it *while holding `_mutex`*, and (since commit `eec6356`) `close()` writes it *while holding `_mutex`* too, so the read side and the write side are both correctly synchronized. `notify_all` is issued after releasing the lock, which is fine because the mutation already happened under the lock -- see 7.4.
 
-### 7.4 The `close()` lost-wakeup hazard (fixed 2026-09-10, commit `1902df7`)
+### 7.4 The `close()` lost-wakeup hazard (fixed 2026-09-10, commit `eec6356`)
 
-The condition-variable usage contract (ISO C++, and the cppreference guidance the Iora codebase follows -- see the internal note *"a CV that a releaser/destructor destroys after observing a completion counter MUST be notified under the lock"*) requires that the variable a waiter's predicate reads be modified **while owning the mutex the waiter uses**, *even if that variable is atomic*, before the CV is notified. Until commit `1902df7`, `close()` violated this: it modified `_closed` and called `notify_all` **without ever taking `_mutex`**, which opened a losing interleaving for an untimed consumer `dequeue(out)` on an empty, open queue:
+The condition-variable usage contract (ISO C++, and the cppreference guidance the Iora codebase follows -- see the internal note *"a CV that a releaser/destructor destroys after observing a completion counter MUST be notified under the lock"*) requires that the variable a waiter's predicate reads be modified **while owning the mutex the waiter uses**, *even if that variable is atomic*, before the CV is notified. Until commit `eec6356`, `close()` violated this: it modified `_closed` and called `notify_all` **without ever taking `_mutex`**, which opened a losing interleaving for an untimed consumer `dequeue(out)` on an empty, open queue:
 
 1. Consumer acquires `_mutex`, enters `wait(lock, pred)`.
 2. `wait` evaluates `pred()` under the lock: `!empty` is false, `_closed` is false -> predicate false. The consumer is now committed to blocking, but has **not yet** atomically released `_mutex` and registered on `_condNotEmpty`.
@@ -657,14 +657,14 @@ Return-value contract, at a glance:
 | D-5 | Separate copy (`const T&`) and move (`T&&`) producer overloads; dequeue moves out of `front`. | Large payloads move through the queue without a copy; small/copyable types still work via the `const T&` overload. |
 | D-6 | `close()` is idempotent (guarded by `exchange`) and drains before reporting empty. | A service may `close()` from multiple paths (explicit + destructor); buffered work is not discarded -- consumers drain first, then observe closure. |
 | D-7 | Passive object: no owned thread, deleted copy/move. | The queue is a synchronization primitive, not a runtime; ownership and joining of producer/consumer threads stay with the caller. Copy/move are impossible because it holds a live mutex + CVs and may have parked threads. |
-| D-8 | `_closed` is `std::atomic<bool>`, read under `_mutex` in predicates. | Lets `isClosed()` be a lock-free query while keeping the predicate reads correctly synchronized. (Since commit `1902df7` the write side in `close()` is synchronized under `_mutex` too -- see D-9 / section 7.4.) |
-| D-9 | `close()` notifies both CVs to reach every parked thread. | Shutdown must wake all waiters, not one; hence `notify_all` rather than `notify_one`. (Since commit `1902df7` the `_closed` store is also serialized under `_mutex` before the notify, closing the lost-wakeup gap that previously existed here -- see section 7.4.) |
+| D-8 | `_closed` is `std::atomic<bool>`, read under `_mutex` in predicates. | Lets `isClosed()` be a lock-free query while keeping the predicate reads correctly synchronized. (Since commit `eec6356` the write side in `close()` is synchronized under `_mutex` too -- see D-9 / section 7.4.) |
+| D-9 | `close()` notifies both CVs to reach every parked thread. | Shutdown must wake all waiters, not one; hence `notify_all` rather than `notify_one`. (Since commit `eec6356` the `_closed` store is also serialized under `_mutex` before the notify, closing the lost-wakeup gap that previously existed here -- see section 7.4.) |
 
 ---
 
 ## 12. Known Limitations
 
-- **`close()` lost-wakeup race -- RESOLVED 2026-09-10 (commit `1902df7`).** `close()` now mutates `_closed` under `_mutex` before releasing the lock and notifying, closing the check-false-but-not-yet-parked window that previously let an untimed `queue()`/`dequeue()` waiter miss the shutdown broadcast and hang permanently. Full before/after analysis in section 7.4.
+- **`close()` lost-wakeup race -- RESOLVED 2026-09-10 (commit `eec6356`).** `close()` now mutates `_closed` under `_mutex` before releasing the lock and notifying, closing the check-false-but-not-yet-parked window that previously let an untimed `queue()`/`dequeue()` waiter miss the shutdown broadcast and hang permanently. Full before/after analysis in section 7.4.
 - **Caller contract: no thread may be inside a queue method at destruction (by design, not a destructor defect).** `BlockingQueue` owns no threads, so `~BlockingQueue()` has none to join -- this is not a gap in the destructor. The caller must ensure every producer/consumer thread has exited every queue method (or been joined) before the queue is destroyed; destroying it while a thread is still inside a method races that thread against the destruction of `_mutex`/`_condNotEmpty`/`_condNotFull`/`_queue` -- undefined behavior. With the `close()` lost-wakeup fix (section 7.4), the standard "close(), then join()" teardown (section 4.4) now reliably satisfies this contract: `close()` wakes every parked waiter, so a caller that joins after closing can be confident no thread remains inside a queue method.
 - **`IdType` template parameter is dead.** `template <typename T, typename IdType = std::size_t>` -- the header comment states `IdType` is "unused in current implementation." No member references it; it exists only in the class signature. Supplying a non-default `IdType` changes the type but nothing observable. Candidate for removal or for the intended item-identification feature to be implemented (tracked: iora backlog 2026-09-10-18).
 - **Fixed capacity, no resize.** `maxSize` is `const`; there is no way to grow or shrink a live queue. A workload whose desired bound changes must construct a new queue.
