@@ -59,11 +59,69 @@ TEST_CASE("ConfigLoader basic operations", "[config][ConfigLoader]")
     REQUIRE(tbl.at_path("section.int_val").is_value());
   }
 
-  SECTION("load throws on missing file")
+  SECTION("load() on missing file does not throw and leaves isLoaded() false")
   {
     iora::core::ConfigLoader badLoader("does_not_exist.toml");
     badLoader.load();
     REQUIRE_FALSE(badLoader.isLoaded());
+  }
+
+  std::filesystem::remove(cfgFile);
+}
+
+TEST_CASE("ConfigLoader reload isLoaded and last-known-good", "[config][ConfigLoader]")
+{
+  const std::string cfgFile = "test_config_reload.toml";
+  {
+    std::ofstream out(cfgFile);
+    out << "[section]\n";
+    out << "int_val = 42\n";
+    out << "str_val = 'hello'\n";
+  }
+
+  iora::core::ConfigLoader loader(cfgFile);
+
+  SECTION("reload() keeps isLoaded() true across a successful reload")
+  {
+    REQUIRE(loader.isLoaded());
+    REQUIRE(loader.reload());
+    REQUIRE(loader.isLoaded());
+    REQUIRE(loader.getInt("section.int_val").value() == 42);
+  }
+
+  SECTION("failed reload() preserves last-known-good config and isLoaded()")
+  {
+    REQUIRE(loader.isLoaded());
+    REQUIRE(loader.getInt("section.int_val").value() == 42);
+    REQUIRE(loader.getString("section.str_val").value() == "hello");
+
+    // Remove the file, then reload: reload() must return false, preserve the
+    // last-known-good values, and leave isLoaded() reflecting the prior
+    // successful load (config-preserved contract).
+    std::filesystem::remove(cfgFile);
+    REQUIRE_FALSE(loader.reload());
+    REQUIRE(loader.isLoaded());
+    REQUIRE(loader.getInt("section.int_val").value() == 42);
+    REQUIRE(loader.getString("section.str_val").value() == "hello");
+  }
+
+  SECTION("reload() of a malformed file preserves last-known-good config")
+  {
+    REQUIRE(loader.isLoaded());
+    REQUIRE(loader.getInt("section.int_val").value() == 42);
+
+    // Overwrite the file with malformed TOML. The last-known-good contract
+    // depends on the parser THROWING on malformed input (so reload()'s
+    // catch(...) leaves _table/_isLoaded untouched); this pins that contract.
+    {
+      std::ofstream out(cfgFile);
+      out << "[section\n";           // unterminated table header
+      out << "int_val = = 42\n";     // double '='
+    }
+    REQUIRE_FALSE(loader.reload());
+    REQUIRE(loader.isLoaded());
+    REQUIRE(loader.getInt("section.int_val").value() == 42);
+    REQUIRE(loader.getString("section.str_val").value() == "hello");
   }
 
   std::filesystem::remove(cfgFile);

@@ -360,3 +360,92 @@ TEST_CASE("Signal: concurrent stress — emit + connect/disconnect", "[signal][s
 
   REQUIRE(emitCount.load() == 4 * iterations);
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Concurrent Prune Dedup (single-pruner CAS gate under contention)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Signal: concurrent prune dedup under contention", "[signal][stress][prune]")
+{
+  // Drives the _needsPrune compare_exchange gate under contention: many emitter
+  // threads race to prune while a connector thread keeps attaching weak_ptr
+  // slots whose targets immediately expire, so emit() repeatedly sees expired
+  // slots and takes the prune path. This asserts CRASH-FREEDOM (TSan-sound)
+  // and EVENTUAL CONVERGENCE (a final quiescent emit prunes back to zero) under
+  // concurrency -- it does NOT by itself assert the single-pruner invariant
+  // (that exactly one emitter runs prune() at a time); verifying that invariant
+  // would need a test-only prune-depth seam (see metrics/signal backlog).
+  Signal<> sig;
+
+  struct Listener
+  {
+    void onEvent() {}
+  };
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> emitCount{0};
+  constexpr int connectIterations = 5000;
+
+  // Emitter threads: spin on emit() until the connector signals stop.
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 4; ++t)
+  {
+    threads.emplace_back([&]()
+    {
+      while (!stop.load(std::memory_order_relaxed))
+      {
+        sig.emit();
+        emitCount.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  // Connector thread: attach weak_ptr slots whose targets expire immediately.
+  std::thread connector([&]()
+  {
+    for (int i = 0; i < connectIterations; ++i)
+    {
+      auto sp = std::make_shared<Listener>();
+      sig.connect(std::weak_ptr<Listener>(sp), &Listener::onEvent);
+      sp.reset(); // expire the target → slot becomes prunable on next emit
+    }
+    stop.store(true, std::memory_order_relaxed);
+  });
+
+  connector.join();
+  for (auto& t : threads) t.join();
+
+  REQUIRE(emitCount.load() > 0);
+
+  // Final quiescent emit: no contention, single pruner wins CAS and removes
+  // every expired weak_ptr slot.
+  sig.emit();
+  REQUIRE(sig.connectionCount() == 0);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ScopedConnection teardown (normal path)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Signal: ScopedConnection destructor disconnects without throwing", "[signal][scoped]")
+{
+  // ~ScopedConnection and move-assignment call Signal::disconnect(). On the
+  // normal path disconnect() does not throw, so the implicitly-noexcept teardown
+  // is exception-free and the slot is removed on scope exit. (disconnect()
+  // allocates via cloneSlots()→make_shared and could only throw under genuine
+  // OOM, which would terminate from the noexcept dtor -- that teardown-under-OOM
+  // design issue is tracked, not fixed here.)
+  Signal<> sig;
+  int count = 0;
+
+  REQUIRE_NOTHROW([&]()
+  {
+    auto id = sig.connect([&]() { ++count; });
+    Signal<>::ScopedConnection sc(&sig, id);
+    sig.emit();
+  }()); // sc destroyed here → disconnectNoThrow
+
+  REQUIRE(count == 1);
+  sig.emit();
+  REQUIRE(count == 1); // slot was disconnected on scope exit
+}

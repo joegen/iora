@@ -207,6 +207,50 @@ TEST_CASE("toLower/toUpper: empty input", "[string_utils][case]")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// high bytes (>= 0x80): pass through verbatim, locale-independent fold
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("toLower/toUpper: high bytes pass through verbatim",
+          "[string_utils][case][highbyte]")
+{
+  // Build the high-byte input via numeric cast, NOT a typed char literal, so
+  // the source byte is exactly 0xC0 regardless of source-file glyph handling.
+  const std::string highByte(1, static_cast<char>(0xC0));
+  REQUIRE(StringUtils::toLower(highByte) == highByte);
+  REQUIRE(StringUtils::toUpper(highByte) == highByte);
+
+  // A mixed string: ASCII folds, the high byte does not.
+  std::string mixed = "A";
+  mixed += static_cast<char>(0xE9); // would be 'é' fold under a Latin-1 locale
+  mixed += "B";
+  std::string expectedLower = "a";
+  expectedLower += static_cast<char>(0xE9);
+  expectedLower += "b";
+  REQUIRE(StringUtils::toLower(mixed) == expectedLower);
+}
+
+TEST_CASE("iequals: high bytes compared verbatim (no locale fold)",
+          "[string_utils][iequals][highbyte]")
+{
+  // Two strings differing ONLY in a high byte must NOT be equal: the fold
+  // never maps distinct bytes >= 0x80 onto each other.
+  const std::string a(1, static_cast<char>(0xC0));
+  const std::string b(1, static_cast<char>(0xE0));
+  REQUIRE_FALSE(StringUtils::iequals(a, b));
+
+  // Identical high bytes are equal.
+  REQUIRE(StringUtils::iequals(a, std::string(1, static_cast<char>(0xC0))));
+
+  // ASCII case difference alongside an identical high byte is still equal:
+  // proves the ASCII fold runs while the high byte is passed through verbatim.
+  std::string upper = "X";
+  upper += static_cast<char>(0xC0);
+  std::string lower = "x";
+  lower += static_cast<char>(0xC0);
+  REQUIRE(StringUtils::iequals(upper, lower));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // CaseInsensitiveHash + CaseInsensitiveEqual
 // ══════════════════════════════════════════════════════════════════════════════
 

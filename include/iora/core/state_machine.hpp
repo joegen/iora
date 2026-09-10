@@ -185,12 +185,7 @@ public:
       }
 
       // Stable sort by (from, event) for equal_range lookup
-      std::stable_sort(_rules.begin(), _rules.end(),
-        [](const TransitionRule& a, const TransitionRule& b)
-        {
-          if (a.from != b.from) return a.from < b.from;
-          return a.event < b.event;
-        });
+      std::stable_sort(_rules.begin(), _rules.end(), &StateMachine::ruleLess);
 
       return StateMachine(
         _initialState,
@@ -364,11 +359,19 @@ private:
   {
     TransitionRule key{state, event, {}, nullptr, nullptr, std::nullopt};
     return std::equal_range(_rules.begin(), _rules.end(), key,
-      [](const TransitionRule& a, const TransitionRule& b)
-      {
-        if (a.from != b.from) return a.from < b.from;
-        return a.event < b.event;
-      });
+      &StateMachine::ruleLess);
+  }
+
+  /// \brief Strict-weak ordering on (from, event). Single source of truth for
+  /// both the build-time stable_sort and the lookup-time equal_range, so the
+  /// two can never drift apart.
+  static bool ruleLess(const TransitionRule& a, const TransitionRule& b)
+  {
+    if (a.from != b.from)
+    {
+      return a.from < b.from;
+    }
+    return a.event < b.event;
   }
 
   // Context-aware onEnter/onExit (for processEvent)

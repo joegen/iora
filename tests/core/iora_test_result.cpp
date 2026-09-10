@@ -10,8 +10,25 @@
 
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 using namespace iora::core;
+
+namespace
+{
+// Detected-invocable trait: true iff `const T&` == `const T&` is well-formed.
+// Used to lock the operator==/!= SFINAE guard (result.hpp ~:263-291, D-9 /
+// rule R-TPL-4) in place — proves a Result over a non-comparable T is itself
+// not equality-comparable.
+template<typename, typename = void>
+struct IsEqualityComparable : std::false_type {};
+
+template<typename T>
+struct IsEqualityComparable<
+  T, std::void_t<decltype(std::declval<const T&>() == std::declval<const T&>())>>
+  : std::true_type {};
+} // namespace
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Primary Template — Factories and Observers
@@ -64,6 +81,26 @@ TEST_CASE("Result: valueOr on rvalue moves value out", "[result]")
   auto r = Result<std::string, int>::ok("hello");
   std::string val = std::move(r).valueOr("fallback");
   REQUIRE(val == "hello");
+}
+
+TEST_CASE("Result: const-rvalue accessors and const-lvalue inspect", "[result]")
+{
+  // value() const&& — invoked by std::move on a const Result.
+  const auto cr = Result<int, std::string>::ok(42);
+  const int&& v = std::move(cr).value();
+  REQUIRE(v == 42);
+
+  // error() const&& — invoked by std::move on a const Result.
+  const auto ce = Result<int, std::string>::err("boom");
+  const std::string&& e = std::move(ce).error();
+  REQUIRE(e == "boom");
+
+  // inspect(...) const& — invoked on a const Result lvalue; returns *this.
+  const auto ok = Result<int, std::string>::ok(7);
+  int observed = 0;
+  const auto& ref = ok.inspect([&](int x) { observed = x; });
+  REQUIRE(observed == 7);
+  REQUIRE(&ref == &ok);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -259,6 +296,33 @@ TEST_CASE("Result: operator== and operator!=", "[result][comparison]")
   REQUIRE(err1 == err2);
   REQUIRE(err1 != err3);
   REQUIRE(ok1 != err1);
+}
+
+TEST_CASE("Result: non-equality-comparable T still compiles", "[result][comparison]")
+{
+  // A type with no operator==. The operator==/operator!= SFINAE guard
+  // (result.hpp ~:263-291, D-9 / R-TPL-4) must drop out so Result<NoEq, E>
+  // is still a usable type — just not equality-comparable itself.
+  struct NoEq
+  {
+    int x;
+  };
+  using R = Result<NoEq, std::string>;
+
+  // Lock the guard in place: Result over a non-comparable T is not comparable.
+  static_assert(!IsEqualityComparable<R>::value,
+    "Result<NoEq, E> must not be equality-comparable when T lacks operator==");
+  // Sanity check the trait itself against a comparable instantiation.
+  static_assert(IsEqualityComparable<Result<int, std::string>>::value,
+    "Result<int, std::string> is equality-comparable");
+
+  auto r = R::ok(NoEq{42});
+  REQUIRE(r.isOk());
+  REQUIRE(r.value().x == 42);
+
+  auto e = R::err("bad");
+  REQUIRE(e.isErr());
+  REQUIRE(e.error() == "bad");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -15,10 +15,8 @@
 #include <string>
 #include <vector>
 
-namespace iora
-{
-namespace core
-{
+namespace iora {
+namespace core {
 
 /// \brief Typed view over a nested TOML sub-table.
 ///
@@ -142,33 +140,33 @@ public:
   explicit ConfigLoader(const std::string &filename) : _filename(filename), _isLoaded(false) { load(); }
 
   /// \brief Reloads the configuration from disk.
+  ///
+  /// Failure contract: on a parse/read error the last-known-good configuration
+  /// is preserved. The file is parsed into a local table that is swapped into
+  /// _table only on success; on failure neither _table nor _isLoaded is
+  /// mutated, so isLoaded() continues to reflect the last successful load.
   bool reload()
   {
     try
     {
-      _table = parsers::toml::parse_file(_filename);
+      parsers::toml::table parsed = parsers::toml::parse_file(_filename);
+      _table = std::move(parsed);
+      _isLoaded = true;
       return true;
     }
     catch (...)
     {
-      _table = parsers::toml::table{};
       return false;
     }
   }
 
   const parsers::toml::table &load()
   {
-    if (_table.empty())
+    if (!_isLoaded)
     {
       if (!reload())
       {
-        // throw std::runtime_error("Failed to load configuration file: " + _filename);
         IORA_LOG_WARN("ConfigLoader: Failed to load configuration file: " << _filename);
-        _isLoaded = false;
-      }
-      else
-      {
-        _isLoaded = true;
       }
     }
     return _table;

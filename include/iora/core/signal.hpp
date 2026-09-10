@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -27,9 +28,11 @@ using ConnectionId = std::uint64_t;
 /// Supports multiple subscribers, weak_ptr auto-disconnect, per-slot
 /// exception handling, and ScopedConnection RAII.
 ///
-/// Thread safety: emit() is lock-free (COW snapshot). connect/disconnect
-/// take a mutex. Slots can safely call connect/disconnect on the same
-/// Signal during emit without deadlock.
+/// Thread safety: emit()'s slot dispatch is lock-free (COW snapshot); its
+/// prune path (triggered when expired weak_ptr slots are seen) acquires the
+/// mutex to rebuild the slot list. connect/disconnect take the mutex. Slots
+/// can safely call connect/disconnect on the same Signal during emit without
+/// deadlock.
 ///
 /// Non-copyable, non-movable.
 template<typename... Args>
@@ -120,8 +123,10 @@ public:
   }
 
   /// \brief Emit the signal to all connected slots.
-  /// Lock-free: reads a COW snapshot. Per-slot try/catch.
-  /// Expired weak_ptr slots are skipped and pruned after iteration.
+  /// Slot dispatch is lock-free: reads a COW snapshot. Per-slot try/catch.
+  /// Expired weak_ptr slots are skipped; if any were seen, a single emitter
+  /// then runs prune(), which acquires _mutex to rebuild the slot list (so
+  /// the prune path is not lock-free).
   void emit(const Args&... args)
   {
     auto snapshot = std::atomic_load(&_slots);
@@ -159,7 +164,18 @@ public:
       if (_needsPrune.compare_exchange_strong(expected, true,
             std::memory_order_relaxed))
       {
-        prune();
+        // Ensure the prune gate always clears, even if prune() throws
+        // (cloneSlots()→make_shared can throw bad_alloc); otherwise the
+        // gate stays stuck true forever and pruning never runs again.
+        try
+        {
+          prune();
+        }
+        catch (...)
+        {
+          _needsPrune.store(false, std::memory_order_relaxed);
+          throw;
+        }
         _needsPrune.store(false, std::memory_order_relaxed);
       }
     }

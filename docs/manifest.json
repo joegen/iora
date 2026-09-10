@@ -136,6 +136,48 @@
       "headers": [
         "core/rate_limiter.hpp"
       ]
+    },
+    "core/result.md": {
+      "area": "core",
+      "headers": [
+        "core/result.hpp"
+      ]
+    },
+    "core/string_utils.md": {
+      "area": "core",
+      "headers": [
+        "core/string_utils.hpp"
+      ]
+    },
+    "core/state_machine.md": {
+      "area": "core",
+      "headers": [
+        "core/state_machine.hpp"
+      ]
+    },
+    "core/signal.md": {
+      "area": "core",
+      "headers": [
+        "core/signal.hpp"
+      ]
+    },
+    "core/metrics.md": {
+      "area": "core",
+      "headers": [
+        "core/metrics.hpp"
+      ]
+    },
+    "core/config_loader.md": {
+      "area": "core",
+      "headers": [
+        "core/config_loader.hpp"
+      ]
+    },
+    "core/errno_utils.md": {
+      "area": "core",
+      "headers": [
+        "core/errno_utils.hpp"
+      ]
     }
   }
 }

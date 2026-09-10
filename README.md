@@ -173,8 +173,13 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **ConcurrentHashMap** — lock-striped concurrent hash map (sharded `shared_mutex`, in-place callbacks) — [`docs/core/concurrent_hash_map.md`](docs/core/concurrent_hash_map.md)
 - **Buffer primitives** (`BufferView` / `BufferWriter` / `MutableBufferView`) — zero-copy byte views with network byte-order readers/writers — [`docs/core/buffer_primitives.md`](docs/core/buffer_primitives.md)
 - **RateLimiter** (`TokenBucket` / `SlidingWindowCounter` / `RateLimiterMap`) — token-bucket and sliding-window rate limiting — [`docs/core/rate_limiter.md`](docs/core/rate_limiter.md)
-- **Result**, **Signal**, **StateMachine**, **StringUtils**, **Metrics** — foundation primitives — `docs/core/` _(planned)_
-- **ConfigLoader**, **errno_utils** — `docs/core/` _(planned)_
+- **Result** (`Result<T, E>`) — monadic success/error value type (ok/err, map/andThen/mapError, ref-qualified accessors) — [`docs/core/result.md`](docs/core/result.md)
+- **StringUtils** — ASCII, locale-independent string helpers (split/trim, case-insensitive compare/hash) — [`docs/core/string_utils.md`](docs/core/string_utils.md)
+- **StateMachine** — builder-configured finite state machine (guards, actions, transition hooks) — [`docs/core/state_machine.md`](docs/core/state_machine.md)
+- **Signal** — typed signal/slot with COW slot list, `weak_ptr` auto-disconnect, and `ScopedConnection` RAII — [`docs/core/signal.md`](docs/core/signal.md)
+- **Metrics** (`Counter` / `Gauge` / `Histogram` / `MetricsRegistry`) — lock-free metrics with Prometheus / JSON export — [`docs/core/metrics.md`](docs/core/metrics.md)
+- **ConfigLoader** — TOML-backed configuration loader with typed getters and reload — [`docs/core/config_loader.md`](docs/core/config_loader.md)
+- **errno_utils** (`errnoMessage`) — thread-safe `errno`-to-message conversion (`strerror_r` wrapper) — [`docs/core/errno_utils.md`](docs/core/errno_utils.md)
 
 ### network
 - **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -123,8 +125,14 @@ public:
   }
 
   /// \brief Increment by a fractional amount via CAS loop.
+  /// Non-finite inputs (NaN/Inf) are rejected without mutation — a single
+  /// poisoned value would otherwise permanently corrupt the accumulator.
   void increment(double amount)
   {
+    if (!std::isfinite(amount))
+    {
+      return;
+    }
     assert(amount >= 0.0 && "Counter::increment amount must be non-negative");
     double current = _doubleValue.load(std::memory_order_relaxed);
     double desired;
@@ -183,14 +191,24 @@ public:
   const std::string& help() const override { return _help; }
 
   /// \brief Set the gauge to an absolute value.
+  /// Non-finite inputs (NaN/Inf) are rejected without mutation.
   void set(double value)
   {
+    if (!std::isfinite(value))
+    {
+      return;
+    }
     _value.store(value, std::memory_order_relaxed);
   }
 
   /// \brief Increment the gauge by amount via CAS loop.
+  /// Non-finite inputs (NaN/Inf) are rejected without mutation.
   void increment(double amount = 1.0)
   {
+    if (!std::isfinite(amount))
+    {
+      return;
+    }
     double current = _value.load(std::memory_order_relaxed);
     double desired;
     do
@@ -306,6 +324,12 @@ public:
   /// Finds the bucket via binary search, increments it, updates sum and count.
   void observe(double value)
   {
+    // Non-finite inputs (NaN/Inf) are rejected without mutation — a single
+    // poisoned value would otherwise permanently corrupt _sum and buckets.
+    if (!std::isfinite(value))
+    {
+      return;
+    }
     // Find bucket: lower_bound gives first boundary >= value.
     // If value == boundary, lower_bound returns that boundary's iterator,
     // so idx equals that boundary's index — correctly counted in the le=boundary
@@ -400,7 +424,10 @@ public:
 #endif
 
   /// \brief Set the maximum number of metric series. Default 10,000.
-  void setMaxSeries(std::size_t max) { _maxSeries = max; }
+  void setMaxSeries(std::size_t max)
+  {
+    _maxSeries.store(max, std::memory_order_relaxed);
+  }
 
   /// \brief Get or create a Counter with the given name and labels.
   /// Throws std::logic_error on type conflict.
@@ -458,10 +485,11 @@ public:
         return static_cast<Histogram&>(*it->second);
       }
 
-      if (_metrics.size() >= _maxSeries)
+      const std::size_t maxSeries = _maxSeries.load(std::memory_order_relaxed);
+      if (_metrics.size() >= maxSeries)
       {
         throw std::runtime_error(
-          "MetricsRegistry: maxSeries limit (" + std::to_string(_maxSeries)
+          "MetricsRegistry: maxSeries limit (" + std::to_string(maxSeries)
           + ") exceeded registering '" + name + "'");
       }
 
@@ -494,7 +522,7 @@ public:
       {
         auto& c = static_cast<Counter&>(*metric);
         if (!firstCounter) out << ",";
-        out << "{\"name\":\"" << c.name() << "\",\"labels\":" << lbls
+        out << "{\"name\":\"" << escapeJson(c.name()) << "\",\"labels\":" << lbls
             << ",\"value\":" << formatDouble(c.value()) << "}";
         firstCounter = false;
         break;
@@ -503,7 +531,7 @@ public:
       {
         auto& g = static_cast<Gauge&>(*metric);
         if (!firstGauge) gaugeOut << ",";
-        gaugeOut << "{\"name\":\"" << g.name() << "\",\"labels\":" << lbls
+        gaugeOut << "{\"name\":\"" << escapeJson(g.name()) << "\",\"labels\":" << lbls
                  << ",\"value\":" << formatDouble(g.value()) << "}";
         firstGauge = false;
         break;
@@ -513,7 +541,7 @@ public:
         auto& h = static_cast<Histogram&>(*metric);
         auto snap = h.snapshot();
         if (!firstHistogram) histOut << ",";
-        histOut << "{\"name\":\"" << h.name() << "\",\"labels\":" << lbls
+        histOut << "{\"name\":\"" << escapeJson(h.name()) << "\",\"labels\":" << lbls
                 << ",\"buckets\":[";
         for (std::size_t i = 0; i < snap.bucketCounts.size(); ++i)
         {
@@ -542,39 +570,46 @@ public:
     std::shared_lock lock(_mutex);
     std::ostringstream out;
 
-    // Track which families have had their header emitted
-    std::unordered_map<std::string, bool> headerEmitted;
+    // Track which families have had their header emitted (seen-set keyed on
+    // the final export name)
+    std::unordered_set<std::string> emittedFamilies;
 
     for (const auto& [key, metric] : _metrics)
     {
       std::string sName = sanitizeName(metric->name());
 
-      // Emit # HELP and # TYPE once per family
-      if (!headerEmitted[metric->name()])
+      // Compute the final exported family name (counters gain a _total suffix)
+      // and TYPE. Dedup is keyed on this export name — not the raw name — so
+      // two raw names that sanitize to the same export name (e.g. "my.metric"
+      // and "my-metric" -> "my_metric") do not emit duplicate # TYPE/# HELP
+      // lines, which Prometheus rejects.
+      std::string exportName = sName;
+      std::string typeName;
+      switch (metric->type())
       {
-        std::string exportName = sName;
-        std::string typeName;
-        switch (metric->type())
-        {
-        case MetricType::COUNTER:
-          typeName = "counter";
-          exportName = counterExportName(sName);
-          break;
-        case MetricType::GAUGE:
-          typeName = "gauge";
-          break;
-        case MetricType::HISTOGRAM:
-          typeName = "histogram";
-          break;
-        }
+      case MetricType::COUNTER:
+        typeName = "counter";
+        exportName = counterExportName(sName);
+        break;
+      case MetricType::GAUGE:
+        typeName = "gauge";
+        break;
+      case MetricType::HISTOGRAM:
+        typeName = "histogram";
+        break;
+      }
 
+      // Emit # HELP and # TYPE once per family (insert().second is true only
+      // the first time this export name is seen)
+      if (emittedFamilies.insert(exportName).second)
+      {
         auto helpIt = _helpTexts.find(metric->name());
         if (helpIt != _helpTexts.end() && !helpIt->second.empty())
         {
-          out << "# HELP " << exportName << " " << helpIt->second << "\n";
+          out << "# HELP " << exportName << " "
+              << escapePrometheusHelp(helpIt->second) << "\n";
         }
         out << "# TYPE " << exportName << " " << typeName << "\n";
-        headerEmitted[metric->name()] = true;
       }
 
       // Emit metric values
@@ -583,7 +618,7 @@ public:
       case MetricType::COUNTER:
       {
         auto& c = static_cast<Counter&>(*metric);
-        out << counterExportName(sName) << promLabels(c.labels())
+        out << exportName << promLabels(c.labels())
             << " " << formatDouble(c.value()) << "\n";
         break;
       }
@@ -667,10 +702,11 @@ private:
         return static_cast<T&>(*it->second);
       }
 
-      if (_metrics.size() >= _maxSeries)
+      const std::size_t maxSeries = _maxSeries.load(std::memory_order_relaxed);
+      if (_metrics.size() >= maxSeries)
       {
         throw std::runtime_error(
-          "MetricsRegistry: maxSeries limit (" + std::to_string(_maxSeries)
+          "MetricsRegistry: maxSeries limit (" + std::to_string(maxSeries)
           + ") exceeded registering '" + name + "'");
       }
 
@@ -698,7 +734,19 @@ private:
     if (std::isinf(v)) return v > 0 ? "+Inf" : "-Inf";
     if (std::isnan(v)) return "NaN";
     std::ostringstream oss;
-    oss << v;
+    // Integer-valued doubles render as exact integers: the default 6-sig-fig
+    // stream precision collapsed large values (e.g. 16000000 -> "1.6e+07"),
+    // losing integer fidelity for counters/gauges. Fractional values keep the
+    // default formatting so compact boundaries like 0.1 stay "0.1" rather than
+    // expanding to their full round-trip form "0.10000000000000001".
+    if (std::floor(v) == v && std::fabs(v) < 1e16)
+    {
+      oss << std::fixed << std::setprecision(0) << v;
+    }
+    else
+    {
+      oss << v;
+    }
     return oss.str();
   }
 
@@ -739,6 +787,26 @@ private:
       {
       case '\\': result += "\\\\"; break;
       case '"':  result += "\\\""; break;
+      case '\n': result += "\\n"; break;
+      default:   result += c; break;
+      }
+    }
+    return result;
+  }
+
+  /// \brief Escape help text for the Prometheus text exposition format.
+  /// Per the format spec, HELP escapes only backslash (\ -> \\) and newline
+  /// (-> \n); double quotes are NOT escaped (unlike label values). This is why
+  /// escapeLabel must not be reused here — it also escapes quotes.
+  static std::string escapePrometheusHelp(const std::string& text)
+  {
+    std::string result;
+    result.reserve(text.size());
+    for (char c : text)
+    {
+      switch (c)
+      {
+      case '\\': result += "\\\\"; break;
       case '\n': result += "\\n"; break;
       default:   result += c; break;
       }
@@ -851,7 +919,7 @@ private:
   mutable std::shared_mutex _mutex;
   std::unordered_map<MetricKey, std::unique_ptr<MetricBase>, MetricKeyHash> _metrics;
   std::unordered_map<std::string, std::string> _helpTexts;
-  std::size_t _maxSeries = 10000;
+  std::atomic<std::size_t> _maxSeries{10000};
 };
 
 } // namespace core

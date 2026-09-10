@@ -9,8 +9,11 @@
 
 #include <iora/core/metrics.hpp>
 #include <iora/iora.hpp>
+#include <iora/parsers/json.hpp>
 
 #include <atomic>
+#include <cmath>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -465,4 +468,103 @@ TEST_CASE("Registry: Prometheus export — name sanitization", "[metrics][export
   registry.gauge("my.metric-name", {});
   std::string prom = registry.prometheusExport();
   REQUIRE(prom.find("my_metric_name") != std::string::npos);
+}
+
+TEST_CASE("Registry: JSON export escapes metric names", "[metrics][export]")
+{
+  MetricsRegistry registry;
+  // A name containing a quote and a backslash would produce malformed JSON
+  // if emitted raw.
+  registry.counter("bad\"name\\x", {}, "help");
+  std::string json = registry.snapshotJson();
+
+  // The output must parse as valid JSON (an unescaped quote/backslash breaks it).
+  REQUIRE_NOTHROW(iora::parsers::Json::parseOrThrow(json));
+  // The escaped byte sequence bad\"name\\x must be present verbatim.
+  REQUIRE(json.find("bad\\\"name\\\\x") != std::string::npos);
+}
+
+TEST_CASE("Registry: large integer values avoid scientific notation",
+          "[metrics][export]")
+{
+  MetricsRegistry registry;
+  registry.counter("big_counter", {}).increment(uint64_t(16000000));
+  registry.gauge("big_gauge", {}).set(16000000.0);
+
+  std::string prom = registry.prometheusExport();
+  std::string json = registry.snapshotJson();
+
+  REQUIRE(prom.find("16000000") != std::string::npos);
+  REQUIRE(prom.find("1.6e+07") == std::string::npos);
+  REQUIRE(json.find("16000000") != std::string::npos);
+  REQUIRE(json.find("1.6e+07") == std::string::npos);
+}
+
+TEST_CASE("Registry: Prometheus HELP text is escaped and single-line",
+          "[metrics][export]")
+{
+  MetricsRegistry registry;
+  // Help text with a newline and a backslash. Per the Prometheus text format,
+  // HELP escapes backslash (\\) and newline (\n) but NOT quotes.
+  registry.counter("helped_metric", {}, "line one\nline\\two");
+  std::string prom = registry.prometheusExport();
+
+  // The escaped HELP line appears with \n (backslash-n) and \\ (two backslashes),
+  // keeping it on a single line.
+  REQUIRE(prom.find("# HELP helped_metric_total line one\\nline\\\\two")
+          != std::string::npos);
+  // A raw newline must NOT appear within the help text.
+  REQUIRE(prom.find("line one\nline") == std::string::npos);
+}
+
+TEST_CASE("Registry: Prometheus dedups headers by export name",
+          "[metrics][export]")
+{
+  MetricsRegistry registry;
+  // Both raw names sanitize to the same export name "my_metric"; Prometheus
+  // rejects duplicate # TYPE/# HELP lines for one family.
+  registry.gauge("my.metric", {}).set(1.0);
+  registry.gauge("my-metric", {}).set(2.0);
+
+  std::string prom = registry.prometheusExport();
+  std::size_t first = prom.find("# TYPE my_metric gauge");
+  REQUIRE(first != std::string::npos);
+  // No second occurrence.
+  REQUIRE(prom.find("# TYPE my_metric gauge", first + 1) == std::string::npos);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Non-finite input rejection
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Histogram: observe rejects non-finite values", "[metrics][histogram]")
+{
+  Histogram h("finite_hist", {}, {1.0, 5.0}, "");
+  h.observe(std::numeric_limits<double>::quiet_NaN());
+  h.observe(std::numeric_limits<double>::infinity());
+  h.observe(-std::numeric_limits<double>::infinity());
+  h.observe(3.0);  // the only finite observation
+
+  auto snap = h.snapshot();
+  REQUIRE(snap.count == 1);
+  REQUIRE(std::isfinite(snap.sum));
+  REQUIRE(snap.sum == Approx(3.0));
+}
+
+TEST_CASE("Counter/Gauge reject non-finite inputs", "[metrics][counter][gauge]")
+{
+  Counter c("finite_counter", {}, "");
+  c.increment(std::numeric_limits<double>::infinity());
+  c.increment(std::numeric_limits<double>::quiet_NaN());
+  c.increment(2.5);
+  REQUIRE(std::isfinite(c.value()));
+  REQUIRE(c.value() == Approx(2.5));
+
+  Gauge g("finite_gauge", {}, "");
+  g.set(std::numeric_limits<double>::quiet_NaN());
+  REQUIRE(g.value() == 0.0);  // rejected — unchanged
+  g.set(7.0);
+  g.increment(std::numeric_limits<double>::infinity());
+  REQUIRE(std::isfinite(g.value()));
+  REQUIRE(g.value() == Approx(7.0));
 }
