@@ -76,6 +76,30 @@
       "headers": [
         "core/service_registry.hpp"
       ]
+    },
+    "core/logger.md": {
+      "area": "core",
+      "headers": [
+        "core/logger.hpp"
+      ]
+    },
+    "core/thread_pool.md": {
+      "area": "core",
+      "headers": [
+        "core/thread_pool.hpp"
+      ]
+    },
+    "core/timer.md": {
+      "area": "core",
+      "headers": [
+        "core/timer.hpp"
+      ]
+    },
+    "core/timing_wheel.md": {
+      "area": "core",
+      "headers": [
+        "core/timing_wheel.hpp"
+      ]
     }
   }
 }

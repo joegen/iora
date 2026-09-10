@@ -163,8 +163,12 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 
 ### core
 - **ServiceRegistry** — type-erased, thread-safe module/service registry (drain-before-unload invariant) — [`docs/core/service_registry.md`](docs/core/service_registry.md)
-- **Result**, **Signal**, **StateMachine**, **StringUtils**, **RingBuffer**, **ConcurrentHashMap**, **Buffer primitives**, **Metrics**, **RateLimiter**, **TimingWheel** — foundation primitives — `docs/core/` _(planned)_
-- **ThreadPool** (`core::async` / `PooledFuture`), **Logger**, **BlockingQueue**, **ConfigLoader**, **EventQueue**, **TimerService**, **errno_utils** — `docs/core/` _(planned)_
+- **Logger** — thread-safe async logging with file rotation, gzip compression, and external handlers — [`docs/core/logger.md`](docs/core/logger.md)
+- **ThreadPool** (`core::async` / `PooledFuture`) — worker pool with lifecycle drain plus the `std::async` drop-in — [`docs/core/thread_pool.md`](docs/core/thread_pool.md)
+- **TimerService** — single-`timerfd` + min-heap timer service (one-shot and periodic) — [`docs/core/timer.md`](docs/core/timer.md)
+- **TimingWheel** — hierarchical timing-wheel scheduler behind the `ITimerService` seam — [`docs/core/timing_wheel.md`](docs/core/timing_wheel.md)
+- **Result**, **Signal**, **StateMachine**, **StringUtils**, **RingBuffer**, **ConcurrentHashMap**, **Buffer primitives**, **Metrics**, **RateLimiter** — foundation primitives — `docs/core/` _(planned)_
+- **BlockingQueue**, **ConfigLoader**, **EventQueue**, **errno_utils** — `docs/core/` _(planned)_
 
 ### network
 - **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
