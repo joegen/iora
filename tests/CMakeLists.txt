@@ -465,6 +465,7 @@ endif()
 # thread) compiled directly into the test TU, so per-target instrumentation
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
+    iora_test_timing_wheel
     iora_test_plugin_drain
     iora_test_callexportedapi_gating
     iora_test_loadfailure_teardown

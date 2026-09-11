@@ -102,8 +102,15 @@ public:
     , _accepting{false}
     , _running{false}
   {
-    assert(ticksPerWheel > 0 && (ticksPerWheel & (ticksPerWheel - 1)) == 0);
+    // ticksPerWheel must be a power of two AND >= 2: a single-slot wheel
+    // (_tickMask == 0) collapses every bucket onto one slot, which defeats the
+    // over-range furthest-bucket clamp (the forced slot would equal the current
+    // bucket) and makes bucketing meaningless. No production config or test uses
+    // a 1-slot wheel (SIP uses 64; tests use 4/16/32/64).
+    assert(ticksPerWheel >= 2 && (ticksPerWheel & (ticksPerWheel - 1)) == 0);
     assert(numWheels > 0);
+    // tickDuration must be positive: insertEntry()/advance() divide by it.
+    assert(tickDuration.count() > 0);
     _wheels.resize(numWheels);
     for (auto& w : _wheels)
     {
@@ -213,17 +220,37 @@ public:
       }
       _lastAdvanceTime = now;
 
+      // Not-yet-due entries encountered while collecting/cascading are staged
+      // here and re-inserted AFTER the whole advance() pass (all tick iterations
+      // + the full cascadeDown recursion). Re-inserting inline could place an
+      // entry back into a bucket still being traversed -> re-process within one
+      // pass -> hang under _wheelMutex. Scope is the whole advance() invocation
+      // (the tick-drift loop shares one captured `now`); it is a LOCAL passed by
+      // reference exactly like `toFire`, never a member.
+      std::vector<TimerEntry*> deferred;
+
       for (std::size_t t = 0; t < ticksToProcess; ++t)
       {
         auto& level0 = _wheels[0];
         auto& bucket = level0.buckets[level0.currentTick & _tickMask];
-        collectFromBucket(bucket, toFire);
+        collectFromBucket(bucket, now, toFire, deferred);
         level0.currentTick++;
 
         if ((level0.currentTick & _tickMask) == 0)
         {
-          cascadeDown(1, now, toFire);
+          cascadeDown(1, now, toFire, deferred);
         }
+      }
+
+      // Drain deferred re-insertions under _wheelMutex, before releasing. Parked
+      // entries stayed in _entryMap (they are live timers) and were not freed;
+      // insertEntry only re-links them. currentTick now corresponds to `now`, so
+      // remaining = deadline - now places each entry at its true future bucket.
+      for (auto* e : deferred)
+      {
+        auto remaining = std::max(std::chrono::milliseconds(0),
+          std::chrono::duration_cast<std::chrono::milliseconds>(e->deadline - now));
+        insertEntry(e, remaining);
       }
     }
 
@@ -505,7 +532,11 @@ private:
   /// If the deadline has already passed or the computed bucket is behind
   /// currentTick (heavy load / scheduling during advance), the entry is
   /// placed in the CURRENT bucket of level 0 so it fires on the very
-  /// next advance() call.
+  /// next advance() call. If the delay exceeds the wheel's representable span
+  /// (over-range), the entry is FORCED into the furthest representable bucket
+  /// with entry->deadline preserved, so the collectFromBucket/cascadeDown
+  /// deadline gate re-defers it (never masks it into an earlier bucket → early
+  /// misfire / cascade hang).
   void insertEntry(TimerEntry* entry, std::chrono::milliseconds delay)
   {
     auto ticks = delay.count() / _tickDuration.count();
@@ -525,18 +556,34 @@ private:
     auto levelCap = static_cast<std::int64_t>(_ticksPerWheel);
     while (level < _numWheels - 1 && ticks >= levelCap)
     {
-      ticks /= static_cast<std::int64_t>(_ticksPerWheel);
+      ticks /= levelCap; // levelCap == int64_t(_ticksPerWheel)
       ++level;
     }
 
     auto& wheel = _wheels[level];
-    auto idx = (wheel.currentTick + static_cast<std::size_t>(ticks)) & _tickMask;
-
-    // If the computed bucket index equals the current tick's bucket,
-    // and we're at level > 0, this means the delay fits exactly at
-    // the boundary — place it so it fires when this bucket is processed.
-    // At level 0, if idx == currentTick & _tickMask, the entry will be
-    // processed on the next advance() call (current bucket). This is correct.
+    std::size_t idx;
+    if (ticks >= levelCap)
+    {
+      // Over-range: even at the top level the delay still exceeds this wheel's
+      // span (ticks >= _ticksPerWheel). Masking (currentTick + ticks) &
+      // _tickMask would silently fold it into an EARLIER bucket -> early misfire
+      // at numWheels==1 (collectFromBucket has no cascade) and a same-bucket
+      // cascade re-insert -> hang at numWheels>=2. Instead FORCE the furthest
+      // representable bucket and keep entry->deadline intact; the deadline gate
+      // in collectFromBucket/cascadeDown re-defers the entry (via advance()'s
+      // scratch list) until `remaining` is in range. Forcing the furthest bucket
+      // (never idx from over-range ticks) guarantees idx != currentTick for
+      // _ticksPerWheel >= 2, so a re-insert never lands in a bucket being
+      // traversed. Overflow-safe: `ticks` is already divided down by the
+      // promotion loop, so this never materializes ticksPerWheel^numWheels.
+      idx = (wheel.currentTick + (_ticksPerWheel - 1)) & _tickMask;
+    }
+    else
+    {
+      // In-range. At level 0, idx == currentTick & _tickMask means the entry is
+      // processed on the next advance() (current bucket) — correct.
+      idx = (wheel.currentTick + static_cast<std::size_t>(ticks)) & _tickMask;
+    }
 
     entry->wheelLevel = level;
     entry->bucketIndex = idx;
@@ -548,29 +595,60 @@ private:
     _wheels[entry->wheelLevel].buckets[entry->bucketIndex].unlink(entry);
   }
 
-  /// \brief Collect ALL entries from the current bucket for firing.
-  /// All entries in a level-0 bucket are due to fire when that bucket's
-  /// tick arrives — the deadline check is a safety net but should not
-  /// skip entries that were placed correctly. Entries whose deadline
-  /// is slightly in the future (placed between ticks) still fire —
-  /// this matches the tick-granularity contract.
-  void collectFromBucket(Bucket& bucket,
-                         std::vector<std::pair<TimerId, Callback>>& toFire)
+  /// \brief Drain one bucket: for each entry, FIRE it (if isDue) or DEFER it.
+  /// Shared by collectFromBucket and cascadeDown so the fire/defer bookkeeping —
+  /// and its ordering invariant (move the callback out BEFORE freeEntry(), which
+  /// nulls it) — lives in exactly one place. A fired entry is erased from
+  /// _entryMap and freed; a deferred (not-yet-due) entry is staged in `deferred`
+  /// but KEPT in _entryMap and NOT freed (it is a live timer; cancel() must still
+  /// find it), to be re-inserted at the end of the advance() pass. `isDue` is the
+  /// only semantic difference between the two callers.
+  template <typename DuePred>
+  void drainBucket(Bucket& bucket, DuePred isDue,
+                   std::vector<std::pair<TimerId, Callback>>& toFire,
+                   std::vector<TimerEntry*>& deferred)
   {
     auto* entry = bucket.head;
     while (entry)
     {
       auto* next = entry->next;
       bucket.unlink(entry);
-      _entryMap.erase(entry->id);
-      toFire.emplace_back(entry->id, std::move(entry->callback));
-      freeEntry(entry);
+      if (isDue(entry))
+      {
+        _entryMap.erase(entry->id);
+        toFire.emplace_back(entry->id, std::move(entry->callback));
+        freeEntry(entry); // MUST follow the move: freeEntry nulls callback
+      }
+      else
+      {
+        deferred.push_back(entry);
+      }
       entry = next;
     }
   }
 
+  /// \brief Collect due entries from the current level-0 bucket for firing.
+  /// This is the terminal firing path (level 0 has no cascade below it), shared
+  /// by every geometry including numWheels==1. Deadline gate: an entry fires
+  /// only when it is due within tick granularity (remaining < _tickDuration);
+  /// an entry a hair (< one tick) in the future still fires — you cannot fire
+  /// more precisely than a tick, which preserves the original tick-granularity
+  /// contract. An entry more than one tick in the future is a CLAMPED over-range
+  /// timer (insertEntry forced it into this bucket far before its real deadline
+  /// to avoid masking/misfire); it is re-deferred (staged to `deferred`, kept in
+  /// _entryMap, not freed) and re-inserted at the end of the advance() pass.
+  void collectFromBucket(Bucket& bucket, TimePoint now,
+                         std::vector<std::pair<TimerId, Callback>>& toFire,
+                         std::vector<TimerEntry*>& deferred)
+  {
+    drainBucket(bucket,
+      [&](TimerEntry* e) { return e->deadline - now < _tickDuration; },
+      toFire, deferred);
+  }
+
   void cascadeDown(std::size_t level, TimePoint now,
-                   std::vector<std::pair<TimerId, Callback>>& toFire)
+                   std::vector<std::pair<TimerId, Callback>>& toFire,
+                   std::vector<TimerEntry*>& deferred)
   {
     if (level >= _numWheels)
     {
@@ -580,31 +658,18 @@ private:
     auto& wheel = _wheels[level];
     auto& bucket = wheel.buckets[wheel.currentTick & _tickMask];
 
-    auto* entry = bucket.head;
-    while (entry)
-    {
-      auto* next = entry->next;
-      bucket.unlink(entry);
-
-      if (entry->deadline <= now)
-      {
-        _entryMap.erase(entry->id);
-        toFire.emplace_back(entry->id, std::move(entry->callback));
-        freeEntry(entry);
-      }
-      else
-      {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-          entry->deadline - now);
-        insertEntry(entry, remaining);
-      }
-      entry = next;
-    }
+    // A not-yet-due entry is DEFERRED (staged), never re-inserted inline: an
+    // inline insertEntry could re-enter this very bucket (an aligned over-range
+    // remainder) and be re-processed within this pass -> ping-pong -> hang under
+    // _wheelMutex. The terminal drain in advance() re-inserts it.
+    drainBucket(bucket,
+      [&](TimerEntry* e) { return e->deadline <= now; },
+      toFire, deferred);
 
     wheel.currentTick++;
     if ((wheel.currentTick & _tickMask) == 0)
     {
-      cascadeDown(level + 1, now, toFire);
+      cascadeDown(level + 1, now, toFire, deferred);
     }
   }
 
@@ -676,11 +741,18 @@ private:
     {
       while (_running.load(std::memory_order_acquire))
       {
-        std::unique_lock lock(_tickCvMutex);
-        _tickCv.wait_for(lock, _tickDuration, [this]()
         {
-          return !_running.load(std::memory_order_acquire);
-        });
+          std::unique_lock lock(_tickCvMutex);
+          _tickCv.wait_for(lock, _tickDuration, [this]()
+          {
+            return !_running.load(std::memory_order_acquire);
+          });
+        }
+        // _tickCvMutex released before advance(): advance() fires callbacks
+        // (collect-then-fire) and takes _wheelMutex, neither of which may run
+        // under the CV wait-mutex (no callback under a lock; avoids a nested
+        // _tickCvMutex -> _wheelMutex ordering), and a long drift-catch-up
+        // advance() must not delay stopTickThread()'s notify wakeup.
         if (_running.load(std::memory_order_acquire))
         {
           advance();
@@ -722,7 +794,9 @@ private:
   std::atomic<bool> _accepting;
   std::atomic<bool> _running;
 
-  // Tick thread
+  // Tick thread. Lock ordering: _tickCvMutex is a LEAF — it is only ever held
+  // by the tick loop across _tickCv.wait_for and is released BEFORE advance()
+  // (so it never nests over _wheelMutex/_poolMutex and no callback runs under it).
   std::thread _tickThread;
   std::mutex _tickCvMutex;
   std::condition_variable _tickCv;
