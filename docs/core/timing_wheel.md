@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 3.0 |
-| **Date** | 2026-09-10 |
+| **Version** | 3.1 |
+| **Date** | 2026-09-11 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/timing_wheel.hpp` |
 | **Namespace** | `iora::core` |
@@ -20,7 +20,8 @@
 | 1.0 | 2026-03-20 | Initial implementation. |
 | 1.2 | 2026-03-20 | Added `drain()` with deadline sorting, `Dispatcher` integration, `ITimerService` adapter. |
 | 2.0 | 2026-03-20 | Full architecture guide: hierarchical cascade mechanics, entry pooling internals, tick drift catch-up, mutex serialization analysis, lifecycle state machine. |
-| 3.0 | 2026-09-10 | Migrated into the iora doc-wiki at `docs/core/timing_wheel.md` and restructured to the 12-section guide template. Re-verified every claim against the current `include/iora/core/timing_wheel.hpp` (763 lines) and against the production consumers (`storage/kvstore.hpp`, `core/rate_limiter.hpp`). Corrected stale claims: the `ITimerService` interface and `TimingWheelAdapter` now expose `tickDuration()`; the memory ordering of `_accepting`/`_running` is acquire/release (not relaxed); and the executive-summary motivation was re-based against the *actual* sibling `TimerService` (a single-`timerfd` min-heap, not a timerfd-per-timer). Scope narrowed to `TimingWheel`, `TimingWheelAdapter`, and the `ITimerService` seam -- the epoll/`timerfd` `TimerService` (`core/timer.hpp`) is a separate component; see `docs/core/timer.md`. |
+| 3.0 | 2026-09-10 | Migrated into the iora doc-wiki at `docs/core/timing_wheel.md` and restructured to the 12-section guide template. Re-verified every claim against the current `include/iora/core/timing_wheel.hpp` and against the production consumers (`storage/kvstore.hpp`, `core/rate_limiter.hpp`). Corrected stale claims: the `ITimerService` interface and `TimingWheelAdapter` now expose `tickDuration()`; the memory ordering of `_accepting`/`_running` is acquire/release (not relaxed); and the executive-summary motivation was re-based against the *actual* sibling `TimerService` (a single-`timerfd` min-heap, not a timerfd-per-timer). Scope narrowed to `TimingWheel`, `TimingWheelAdapter`, and the `ITimerService` seam -- the epoll/`timerfd` `TimerService` (`core/timer.hpp`) is a separate component; see `docs/core/timer.md`. |
+| 3.1 | 2026-09-11 | Over-max-delay fix landed (iora `c7095c6`, tracker `tasks/iora/completed/2026-09-10-1`). A delay beyond the wheel span is no longer masked into an earlier bucket (early misfire at `numWheels==1`, cascade re-process/hang at `numWheels>=2`): `insertEntry` now clamps it to the furthest bucket with the real deadline preserved, and the `collectFromBucket`/`cascadeDown` deadline gate re-defers it until it is in range, so it fires within one tick of its deadline. Constructor now asserts `ticksPerWheel >= 2` and `tickDuration > 0`; the tick thread releases `_tickCvMutex` before `advance()`. Updated §5.2, §6.6, §12 accordingly. |
 
 ---
 
@@ -49,7 +50,7 @@ iora's other timer engine, `core::TimerService` (`core/timer.hpp`), is a single-
 
 - N concurrent timers use **0 file descriptors** (versus one `timerfd` + one `epoll` fd for `TimerService`, regardless of N).
 - Insert / cancel / reschedule are **`O(1)`** with no heap operations and no per-operation syscall.
-- **Tick-granularity contract:** a timer fires within one `tickDuration` of its deadline (at the tick boundary at or after the deadline). Sub-tick precision is not offered.
+- **Tick-granularity contract:** a timer fires within one `tickDuration` of its deadline (at the nearest tick boundary -- typically at or slightly before the deadline, or slightly after under tick drift). Sub-tick precision is not offered.
 - `drain()` fires all *already-expired* pending timers in strict deadline order during graceful shutdown, and cancels those still in the future.
 - An optional `Dispatcher` routes callbacks to an external thread pool, keeping the tick thread unblocked by slow callbacks.
 
@@ -69,7 +70,7 @@ iora::core (namespace)
 |-- TimingWheel                           (the engine; non-copyable, non-movable)
 |   |-- Configuration (const after construction)
 |   |     |-- _tickDuration               (std::chrono::milliseconds per tick)
-|   |     |-- _ticksPerWheel              (slots per level; MUST be power of two)
+|   |     |-- _ticksPerWheel              (slots per level; MUST be a power of two >= 2)
 |   |     |-- _tickMask = _ticksPerWheel - 1   (bitmask replaces modulo)
 |   |     |-- _numWheels                  (number of hierarchical levels)
 |   |     `-- _dispatcher                 (optional std::function<void(Callback)>)
@@ -117,7 +118,7 @@ sequenceDiagram
   TW->>Pool: allocEntry() [locks _poolMutex under _wheelMutex]
   Pool-->>TW: TimerEntry* (recycled or new)
   TW->>TW: insertEntry(entry, 500ms)
-  Note over TW: ticks = 500 / tickDuration; pick level; idx = (currentTick + ticks) & _tickMask
+  Note over TW: ticks = 500 / tickDuration; pick level; idx = (currentTick + ticks) & _tickMask (in-range; an over-range delay clamps to the furthest bucket -- see 3.2)
   TW->>Wheel: buckets[idx].pushBack(entry)
   TW->>TW: _entryMap[id] = entry
   TW-->>App: TimerId
@@ -159,37 +160,48 @@ TimingWheel(std::chrono::milliseconds tickDuration,
             Dispatcher dispatcher = nullptr);
 ```
 
-The constructor asserts `ticksPerWheel > 0 && (ticksPerWheel & (ticksPerWheel - 1)) == 0` (power of two) and `numWheels > 0`, then allocates `numWheels` `WheelLevel`s, each with `ticksPerWheel` empty `Bucket`s. `_tickMask` is precomputed as `ticksPerWheel - 1` so every "modulo `ticksPerWheel`" in the hot path becomes a single bitwise-and. All five configuration members (`_tickDuration`, `_ticksPerWheel`, `_tickMask`, `_numWheels`, `_dispatcher`) are `const` -- fixed at construction, never mutated, so they are read lock-free.
+The constructor asserts `ticksPerWheel >= 2 && (ticksPerWheel & (ticksPerWheel - 1)) == 0` (power of two, at least two slots -- a 1-slot wheel has `_tickMask == 0`, which defeats bucketing and the over-range clamp), `numWheels > 0`, and `tickDuration.count() > 0` (it is a divisor in the hot path), then allocates `numWheels` `WheelLevel`s, each with `ticksPerWheel` empty `Bucket`s. `_tickMask` is precomputed as `ticksPerWheel - 1` so every "modulo `ticksPerWheel`" in the hot path becomes a single bitwise-and. All five configuration members (`_tickDuration`, `_ticksPerWheel`, `_tickMask`, `_numWheels`, `_dispatcher`) are `const` -- fixed at construction, never mutated, so they are read lock-free.
 
 The type is **non-copyable and non-movable** (all four special members are `= delete`): it owns a running thread and raw `TimerEntry*` pointers threaded through intrusive lists and a map. Consumers that need to store one hold it by `std::unique_ptr` -- exactly what `KVStore` does for its TTL wheel.
 
 ### 3.2 Hierarchical cascade -- UP on insert, DOWN on advance
 
-**Insert (promote UP).** `insertEntry(entry, delay)` converts the delay to ticks (`delay.count() / _tickDuration.count()`). A delay of zero or one that rounds to `<= 0` ticks is placed directly in level 0's *current* bucket so it fires on the very next `advance()`. Otherwise the entry is promoted upward while it does not fit in the current level:
+**Insert (promote UP).** `insertEntry(entry, delay)` converts the delay to ticks (`delay.count() / _tickDuration.count()`). A delay of zero or one that rounds to `<= 0` ticks is placed directly in level 0's *current* bucket so it fires on the very next `advance()`. Otherwise the entry is promoted upward while it does not fit in the current level, then placed at its in-range slot -- or, if it is still over-range at the top level, **clamped to the furthest bucket with its deadline preserved**:
 
 ```cpp
 std::size_t level = 0;
 auto levelCap = static_cast<std::int64_t>(_ticksPerWheel);
 while (level < _numWheels - 1 && ticks >= levelCap)
 {
-  ticks /= static_cast<std::int64_t>(_ticksPerWheel);
+  ticks /= levelCap;
   ++level;
 }
 auto& wheel = _wheels[level];
-auto idx = (wheel.currentTick + static_cast<std::size_t>(ticks)) & _tickMask;
+std::size_t idx;
+if (ticks >= levelCap)
+{
+  // Over-range even at the top level: force the FURTHEST bucket (never mask
+  // (currentTick + ticks) & _tickMask into an earlier bucket). deadline is kept;
+  // the deadline gate below re-defers the entry until it is in range.
+  idx = (wheel.currentTick + (_ticksPerWheel - 1)) & _tickMask;
+}
+else
+{
+  idx = (wheel.currentTick + static_cast<std::size_t>(ticks)) & _tickMask;
+}
 entry->wheelLevel = level;
 entry->bucketIndex = idx;
 wheel.buckets[idx].pushBack(entry);
 ```
 
-The entry also records its absolute `deadline` (`Clock::now() + delay`). The lower-order bits discarded by the repeated division are *not* lost information -- they are recovered from `deadline` when the entry cascades down.
+The entry also records its absolute `deadline` (`Clock::now() + delay`). The lower-order bits discarded by the repeated division are *not* lost information -- they are recovered from `deadline` when the entry cascades down. An over-range entry is deliberately placed far before its deadline; forcing the *furthest* bucket (never `idx` derived from the over-range `ticks`) guarantees `idx != currentTick` for `ticksPerWheel >= 2`, so a re-inserted entry never lands in a bucket being traversed, and the deadline gate re-defers it each span cycle until it converges to its true bucket -- it never fires early or masks into a wrong bucket.
 
-**Advance (cascade DOWN).** `advance()` processes level 0's current bucket, increments `currentTick`, and when level 0 completes a full revolution (`(currentTick & _tickMask) == 0`) it calls `cascadeDown(1, now, toFire)`. `cascadeDown` walks the current bucket of the given level and, for each entry:
+**Advance (cascade DOWN).** `advance()` processes level 0's current bucket, increments `currentTick`, and when level 0 completes a full revolution (`(currentTick & _tickMask) == 0`) it calls `cascadeDown(1, now, toFire, deferred)`. Level 0's `collectFromBucket` and each level's `cascadeDown` both walk their current bucket through the shared `drainBucket` helper and, for each entry:
 
-- if `entry->deadline <= now`, collects it for firing;
-- otherwise re-inserts it via `insertEntry(entry, deadline - now)` -- i.e. by *remaining* time, so it lands in the correct finer-grained bucket even if the cascade ran slightly late.
+- if it is **due**, collect it for firing. The due test differs by level: `collectFromBucket` (the terminal level-0 path) fires when `deadline - now < _tickDuration` -- i.e. within one tick of the deadline, matching tick granularity -- while `cascadeDown` fires when `deadline <= now`.
+- otherwise (**not yet due** -- a level-N entry that must still descend, or an over-range entry sitting in its clamp bucket) stage it into a per-`advance()` `deferred` scratch list, keeping it in `_entryMap` and **not** freeing it.
 
-After processing, the level's `currentTick` is incremented, and if *that* level completes a revolution the cascade recurses to `level + 1`. `cascadeDown` returns immediately once `level >= _numWheels`.
+After the whole tick loop and the full cascade recursion finish, `advance()` drains the `deferred` list -- still under `_wheelMutex`, before the lock is released -- re-inserting each staged entry by its *remaining* time (`insertEntry(entry, deadline - now)`) so it lands in the correct finer-grained bucket. Re-insertion is deferred to this terminal drain rather than done inline, because an inline re-insert of an over-range remainder could land back in the very bucket being walked and be re-processed within a single pass -- a hang while `_wheelMutex` is held. After processing a level, its `currentTick` is incremented, and if *that* level completes a revolution the cascade recurses to `level + 1`. `cascadeDown` returns immediately once `level >= _numWheels`.
 
 ### 3.3 Single-mutex serialization (collect-then-fire)
 
@@ -385,7 +397,7 @@ Example -- `tickDuration = 10ms`, `ticksPerWheel = 64`, `numWheels = 3`:
 | KVStore TTL eviction | (per `KVStore::Config`) | (per config) | (per config) | per config |
 | Fine-grained (1ms resolution) | 1ms | 256 | 2 | ~65.5 s |
 
-Rule of thumb: `tickDuration` sets resolution; `ticksPerWheel^numWheels * tickDuration` sets the maximum schedulable delay. `ticksPerWheel` **must** be a power of two (asserted in the constructor). Scheduling a delay beyond the maximum span silently misfires -- see section 12.
+Rule of thumb: `tickDuration` sets resolution; `ticksPerWheel^numWheels * tickDuration` sets the maximum *efficient* delay. `ticksPerWheel` **must** be a power of two `>= 2` (asserted in the constructor, along with `tickDuration > 0`). Scheduling a delay beyond the maximum span is safe -- the entry is clamped to the furthest bucket with its real deadline preserved and re-deferred until it is in range, so it fires within one tick of its deadline (tick granularity), not a whole wheel-span early as before (see section 12). It does, however, re-clamp once per wheel-span cycle, so size the wheel to cover your longest delay.
 
 ---
 
@@ -501,7 +513,7 @@ tw.start();                         // reuse the wheel
 - **Do NOT call `advance()` while the tick thread is running.** `advance()` is public for testing only. A concurrent external call is memory-safe -- `_wheelMutex` serializes it against the tick thread -- but it logically *double-advances* the wheel: the second caller computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs. There is no internal guard against a second caller (`tasks/iora/backlog/2026-09-10-7_timing-wheel-lifecycle-transition-guards_P1.json`).
 - **Do NOT call `reset()` outside `STOPPED`.** It asserts in debug builds and is undefined behavior in release (the assert is compiled out under `NDEBUG`).
 - **Do NOT let a `TimingWheelAdapter` outlive its `TimingWheel`.** The adapter holds a bare reference.
-- **Do NOT schedule delays beyond `ticksPerWheel^numWheels * tickDuration`.** There is no range check; the bitmask wraps the entry into an earlier bucket and it fires at the wrong (earlier) time. For `numWheels >= 2` there is an added hazard: because entries re-insert by *remaining* time, `cascadeDown` can land the entry back in the bucket it is actively traversing, so it may be processed more than once per pass. Tracked in `tasks/iora/backlog/2026-09-10-1_timing-wheel-insertentry-max-delay-misfire_P0.json`.
+- **Prefer sizing the wheel to cover your longest delay.** An over-range delay (beyond `ticksPerWheel^numWheels * tickDuration`) is handled correctly -- `insertEntry` clamps it to the furthest bucket with the real deadline preserved and the deadline gate re-defers it until it is in range, so it fires within one tick of its deadline, not a whole wheel-span early -- but it re-clamps once per wheel-span cycle, so an appropriately-sized wheel avoids that repeated work. (Fixed 2026-09-11, iora `c7095c6`; previously an over-range delay was masked into an earlier bucket and misfired early, and at `numWheels >= 2` a re-insert into the actively-traversed bucket could hang the cascade under `_wheelMutex`.)
 - **Do NOT block in a callback when no `Dispatcher` is set.** A slow inline callback stalls the tick thread and delays every other timer, compounding drift.
 - **Do NOT assume `drain()` completion means dispatched callbacks finished.** With a `Dispatcher`, `drain()` returns after *posting* callbacks; drain your dispatcher separately before destroying their targets (header contract on `drain`).
 
@@ -536,7 +548,7 @@ tw.start();                         // reuse the wheel
 | 2 | `advance` | `lock_guard(_wheelMutex)` | `_wheelMutex` held |
 | 3 | `advance` | compute `ticksToProcess` from `now - _lastAdvanceTime`; set `_lastAdvanceTime = now` | `_wheelMutex` held |
 | 4 | `advance` | for each tick: `collectFromBucket(level0 current)` -> `toFire`; `currentTick++` | `_wheelMutex` held |
-| 5 | `advance` | on level-0 revolution: `cascadeDown(1, now, toFire)` (recurses on higher revolutions) | `_wheelMutex` held |
+| 5 | `advance` | on level-0 revolution: `cascadeDown(1, now, toFire, deferred)` (recurses on higher revolutions); after the tick loop, drain `deferred` (re-insert staged not-due entries) | `_wheelMutex` held |
 | 6 | `advance` | lock released | released |
 | 7 | `advance` | `fireCallback(id, cb)` for each in `toFire` (inline or via dispatcher) | **no lock held** |
 
@@ -587,8 +599,8 @@ tw.start();                         // reuse the wheel
 
 | Parameter | Type | Default | Constraints | Meaning |
 |---|---|---|---|---|
-| `tickDuration` | `std::chrono::milliseconds` | (required) | must be `> 0` (used as a divisor) | Time per tick; sets resolution. |
-| `ticksPerWheel` | `std::size_t` | (required) | power of two, `> 0` (asserted) | Slots per level; capacity multiplier. |
+| `tickDuration` | `std::chrono::milliseconds` | (required) | must be `> 0`, used as a divisor (asserted) | Time per tick; sets resolution. |
+| `ticksPerWheel` | `std::size_t` | (required) | power of two, `>= 2` (asserted) | Slots per level; capacity multiplier. |
 | `numWheels` | `std::size_t` | (required) | `> 0` (asserted) | Number of hierarchical levels. |
 | `dispatcher` | `Dispatcher` (`std::function<void(Callback)>`) | `nullptr` | nullable | If set, fired callbacks are routed here instead of running inline. |
 
@@ -739,7 +751,7 @@ public:
 
 ## 12. Known Limitations
 
-- **Maximum schedulable delay is unchecked.** A delay exceeding `ticksPerWheel^numWheels * tickDuration` is masked by `& _tickMask` into an earlier bucket and fires at the wrong (earlier) time. There is no runtime range check or error return -- a silent misfire. For `numWheels >= 2` there is an additional traversal-over-mutated-list hazard: because entries re-insert by *remaining* time, `cascadeDown` can re-insert an over-max-delay entry into the very bucket it is actively traversing, so that entry may be processed more than once in a single pass (theoretical non-termination while `_wheelMutex` is held). Tracked in `tasks/iora/backlog/2026-09-10-1_timing-wheel-insertentry-max-delay-misfire_P0.json` (`insertEntry` computes the top-level index without detecting the wraparound, plus the multi-level cascade hazard).
+- **Constructor preconditions are `assert`-only (compiled out under `NDEBUG`).** `ticksPerWheel` must be a power of two `>= 2`, `numWheels > 0`, and `tickDuration > 0`; these are asserted, so a release build handed an invalid geometry misbehaves silently (a 1-slot wheel has `_tickMask == 0`, defeating bucketing and the over-range clamp; a zero `tickDuration` divides by zero). No production caller passes invalid values. *(Resolved 2026-09-11, iora `c7095c6`: the former over-max-delay silent misfire / cascade hang is fixed -- an over-range delay is now clamped to the furthest bucket with its deadline preserved and re-deferred until in range, firing within one tick of its deadline (not a whole wheel-span early). It costs one re-clamp per wheel-span cycle, so size the wheel to cover the longest delay; tracker `tasks/iora/completed/2026-09-10-1`.)*
 - **`advance()` is public but not safe under the tick thread.** It is intended for tests. Calling it externally while `start()` has spawned the tick thread is memory-safe -- `_wheelMutex` serializes both callers -- but logically *double-advances* the wheel: the second call computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs. There is no internal guard. Tracked (with the `_tickThread` concurrent-lifecycle race and the debug-only `reset()` guard) in `tasks/iora/backlog/2026-09-10-7_timing-wheel-lifecycle-transition-guards_P1.json`.
 - **`schedule()` racing `drain()`/`stop()` can orphan a timer.** Because `_accepting` is checked before `_wheelMutex` is taken, a `schedule()` that observes `_accepting == true` immediately before a concurrent `drain()`/`stop()` flips it may insert an entry after the drain/stop collection has run. That entry never fires and is not counted in `DrainStats`; it is reclaimed only at the next `stop()`/`reset()`/destruction. Tracked in `tasks/iora/backlog/2026-09-10-6_timing-wheel-schedule-drain-toctou-orphan_P1.json`.
 - **No periodic-timer primitive.** Repeating timers must re-schedule from inside the callback (section 6.2). `TimerEntry::thenReschedule` exists but is explicitly "reserved for future schedulePeriodic support" and is not implemented.
