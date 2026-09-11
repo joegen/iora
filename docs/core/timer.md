@@ -18,6 +18,7 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-10 | Initial Architecture & Programmer's Guide. Authored directly against `include/iora/core/timer.hpp` (1846 lines) and cross-checked against `tests/core/iora_test_timer.cpp` and `tests/core/iora_test_timer_lifecycle.cpp`. The README "High-Performance Timer System" section describes an aspirational API that diverges from the shipped header (see Known Limitations); this guide documents the **actual** implementation. |
+| 1.1 | 2026-09-11 | Synced to the `drain`/`stop` fix (iora `a83dbc7`): `drain(0)` with active periodic timers now terminates (periodics are cancelled in both budgets by dual-marking the descriptor and its live record); a `_runLoopExited` liveness escape lets a `drain` parked on a pending timer return when a concurrent `stop()`/error-exit truncates the run loop; `stop()` forces `_accepting = false` at the terminal `Stopped` transition (`Stopped => !_accepting`); `runLoop` publishes liveness on every exit incl. exception unwind. Updated §4.7, §5.4, §5.5; removed the "`drain(0)` never completes" known limitation. |
 
 ---
 
@@ -42,7 +43,7 @@ A microservice framework needs a scheduler that can fire thousands of callbacks 
 - **O(log n) schedule, O(1) cancel, O(1) next-deadline peek.** Cancellation marks a `Record` and lets the run loop skip it -- no heap removal on the cancel path.
 - **Zero idle CPU.** `epoll_wait` blocks indefinitely (`epollTimeout = -1`) until the `timerfd` fires or the `eventfd` is poked; there is no polling tick.
 - **Callbacks never run under the scheduler lock.** The run loop collects due handlers into a local vector, releases `_mutex`, then invokes them (copy/collect-then-invoke), so a handler may freely re-enter `scheduleAfter`/`cancel` without self-deadlock.
-- **Graceful drain.** `drain(timeoutMs)` stops accepting new timers, cancels far-future timers that cannot complete in the budget, and blocks on a condition variable until in-flight callbacks finish.
+- **Graceful drain.** `drain(timeoutMs)` stops accepting new timers, cancels active periodic timers (both budgets) and far-future one-shots that cannot complete in a positive budget, and blocks on a condition variable until in-flight callbacks finish. `drain(0)` waits indefinitely for that work but still terminates, since periodics are cancelled rather than left to re-arm.
 
 **Relationship to `TimingWheel`.** `TimerService` is **not** built on `iora::core::TimingWheel`; they are two independent schedulers in the same namespace. `TimingWheel` (see [`docs/core/timing_wheel.md`](timing_wheel.md)) is a hierarchical timing wheel implementing the `iora::core::ITimerService` interface (`schedule`/`cancel`/`reschedule`, millisecond granularity). `TimerService` is a heap-plus-`timerfd` scheduler implementing `iora::common::ILifecycleManaged` instead, with a richer scheduling API (`scheduleAt`/`scheduleAfter`/`schedulePeriodic`) and nanosecond-programmed deadlines. They share only the *drain* vocabulary: both expose uniform `drain()` semantics. Choose `TimerService` when you want absolute-time scheduling, steady-clock precision, and per-service isolation; choose `TimingWheel` when you want O(1) amortized insert/cancel at a fixed tick and the `ITimerService` abstraction.
 
@@ -215,7 +216,7 @@ The loop, running on `_thread`:
 
 1. Under `_mutex`: if `!_running`, collect any already-due handlers, disarm the timerfd, and set `shouldExit`. Otherwise peek `heapTop()` for the next deadline and `programTimerfd(nextDue)`. If handlers were collected, pre-increment `_executingCallbacks` **under the lock** (so `drain()` cannot observe an empty `_records` with zero executing callbacks in the gap).
 2. Release `_mutex`; `safeRun` each collected handler (no lock held). Report any `programTimerfd` errno after the callbacks.
-3. If exiting, `notify_all` the drain CV and break.
+3. If exiting, `break`. The liveness publication and drain wakeup are not done here but by the RAII `ExitGuard` (declared as `runLoop`'s first statement): on the way out it sets `_runLoopExited = true` under `_mutex` and `notify_all`s `_drainCV`, covering the normal break **and** any exception unwind uniformly, so a `drain()` parked on `_drainCV` is always released via its `_runLoopExited` escape. (The thread lambda additionally wraps `runLoop()` in try/catch to avoid `std::terminate` on a stray throw.)
 4. `epoll_wait(_epollFd, ..., timeout)` where `timeout = epollTimeout` (default `-1` = block forever). On `EINTR`, continue; on other error, `handleError` and either break (`throwOnSystemError`) or continue.
 5. For each ready fd: if the `timerfd` is readable, mark `timerTriggered`; if the `eventfd` is readable, mark `woke`. Drain whichever fired (`drainEventfd`/`drainTimerfd`).
 6. Under `_mutex`: `collectDueLocked(now, ready)`; pre-increment `_executingCallbacks` if any; else, if draining, `notify_all` the drain CV.
@@ -391,7 +392,7 @@ service.start(); // Reset -> Running; re-creates fds and thread
 |---|---|
 | Treat a returned id of `0` as "rejected" and handle it. | Assume every `schedule*` call succeeds -- a draining service, an over-limit timeout, or an exceeded `maxConcurrentTimers` returns 0. |
 | Use a move-only capture only with `scheduleAt`/`scheduleAfter`. | Pass a move-only lambda to `schedulePeriodic` -- it copies into `std::function` and will not compile. |
-| Call `drain(timeoutMs)` with a **positive** budget when periodic timers are active. | Call `drain(0)` while a periodic timer is armed -- periodic timers are not cancelled at `timeoutMs == 0`, so the wait never completes (see Known Limitations). |
+| Use `drain(0)` freely -- it cancels active periodic timers and waits only for in-flight callbacks and pending one-shots to fire. | Assume `drain(0)` blocks until *every* pending one-shot fires instantly -- a far-future one-shot still delays `drain(0)` for its full remaining delay (finite, but long); pass a positive budget if you need a bound. |
 | Let the handler run to completion quickly, or dispatch heavy work elsewhere. | Block the handler -- there is one timer thread; a slow handler delays every later timer on that service. |
 | Cancel via `SteadyTimer::cancel()` / let it destruct. | Rely on cancelling a raw id you passed to `SteadyTimer` -- the service holds a wrapper token, not your id. |
 | Size `maxConcurrentTimers` to your load. | Rely on `maxHeapSize` / `maxHandlerExecutionTime` limits -- they are declared but not enforced (see Known Limitations). |
@@ -431,15 +432,17 @@ service.start(); // Reset -> Running; re-creates fds and thread
 | 5 | Timer thread | For each handler: `safeRun(h)` -- invoke user callback with **no lock held**; swallow exceptions. | no lock |
 | 6 | `CountGuard` (per handler) | On scope exit: decrement `_executingCallbacks`; if it hit 0, lock/unlock `_mutex` then `_drainCV.notify_all()`. | brief `_mutex` |
 
-### 5.4 `drain` (graceful, positive budget)
+### 5.4 `drain` (graceful)
 
 | Step | Actor | Action | Lock state |
 |---|---|---|---|
 | 1 | Caller | `drain(timeoutMs)`; under `_mutex`, CAS `Running -> Draining`; `_accepting = false`. | `_mutex` held |
-| 2 | `drain` | Under `_mutex`: count non-cancelled `_records` (`inFlightAtStart`); if `timeoutMs > 0`, cancel every `_records` entry whose `tp > now + timeoutMs`, and cancel **all** `_periodicTimers`. | `_mutex` held |
+| 2 | `drain` | Under `_mutex`: count non-cancelled `_records` (`inFlightAtStart`); if `timeoutMs > 0`, cancel every `_records` entry whose `tp > now + timeoutMs`; then, in **both** budgets, cancel **all** active periodic timers by dual-marking the descriptor **and** its live `_records` entry (so a periodic neither fires once more nor re-arms). Pending one-shots are left to fire naturally. | `_mutex` held |
 | 3 | `drain` | `poke()` so the run loop re-evaluates with the cancellations. | no lock |
-| 4 | `drain` | `_drainCV.wait_for(budget, drainDone)` where `drainDone = (no live _records) && (_executingCallbacks == 0)`. | `_mutex` (CV) |
-| 5 | `drain` | On timeout: CAS `Draining -> Running`, `_accepting = true` (retryable). Build `DrainStats`; return `LifecycleResult`. | brief `_mutex` |
+| 4 | `drain` | Wait on `_drainCV` (`wait` for `timeoutMs == 0`, `wait_for(budget)` otherwise) with `drainDone = _runLoopExited ? (_executingCallbacks == 0) : ((no live _records) && (_executingCallbacks == 0))`. The `_runLoopExited` escape lets a `drain` parked on a pending timer return when a concurrent `stop()` (or a run-loop error-exit) truncates the loop. | `_mutex` (CV) |
+| 5 | `drain` | If the wait was released by the liveness escape while records remain, mark the result truncated (`success == false`). On a genuine timeout with the run loop still alive (`!_runLoopExited`): CAS `Draining -> Running`, `_accepting = true` (retryable). Build `DrainStats`; return `LifecycleResult`. | brief `_mutex` |
+
+Because periodics are cancelled in **both** budgets, `drain(0)` ("wait indefinitely") terminates in the presence of active periodic timers -- it waits only for in-flight (executing) callbacks and for pending one-shots to fire.
 
 ### 5.5 `stop` (Running/Draining -> Stopped)
 
@@ -447,8 +450,8 @@ service.start(); // Reset -> Running; re-creates fds and thread
 |---|---|---|---|
 | 1 | Caller | `stop()`; if `Running`, first `drain(5000)`. | as 5.4 |
 | 2 | `stop` | CAS `_running true -> false`; `poke()`. | no lock |
-| 3 | `stop` | `_thread.join()` (run loop drains due timers, disarms timerfd, exits). | no lock |
-| 4 | `stop` | `cleanup()` closes eventfd/timerfd/epollfd; set state `Stopped`. | no lock |
+| 3 | `stop` | `_thread.join()` (run loop drains due timers, disarms timerfd, publishes `_runLoopExited` + notifies `_drainCV` via its exit guard, exits). | no lock |
+| 4 | `stop` | `cleanup()` closes eventfd/timerfd/epollfd; then under `_mutex` set `_accepting = false` **and** state `Stopped` in one critical section, so the terminal invariant `Stopped => !_accepting` holds even if step 1's internal `drain(5000)` timed out and restored `_accepting` (a Stopped service always rejects new timers). | brief `_mutex` |
 
 ---
 
@@ -471,7 +474,7 @@ stateDiagram-v2
 | Method | Precondition | Effect |
 |---|---|---|
 | `start()` | `Created` or `Reset` | From `Created` (auto-started) it is a success no-op; from `Reset` it re-runs `initialize()` (new fds + thread). |
-| `drain(timeoutMs = 30000)` | `Running` | Stops accepting; cancels far-future + all periodic timers (when `timeoutMs > 0`); waits on `_drainCV`; on timeout restores `Running`. `timeoutMs == 0` waits indefinitely. |
+| `drain(timeoutMs = 30000)` | `Running` | Stops accepting; cancels all active periodic timers (both budgets), plus far-future one-shots when `timeoutMs > 0`; waits on `_drainCV`; on a genuine timeout (run loop alive) restores `Running`. `timeoutMs == 0` waits indefinitely but still terminates (periodics cancelled); a concurrent `stop()`/error-exit releases it via the `_runLoopExited` escape (`success == false`). |
 | `stop()` | not `Stopped`/`Reset` | Drains 5s if `Running`, flips `_running`, joins the thread, closes fds -> `Stopped`. |
 | `reset()` | `Stopped` | Clears all timer maps/heap and `_nextId`; resets stats -> `Reset`. |
 | `getState()` | any | Returns the current `LifecycleState` (atomic acquire). |
@@ -515,7 +518,7 @@ When `TimerServiceConfig::enableStatistics` is `true` (the default), the service
 | `runLoop` collect | `std::lock_guard<std::mutex>` on `_mutex` around `collectDueLocked` + `programTimerfd`; `_executingCallbacks` pre-incremented **under** the lock. | Prevents `drain()` seeing empty `_records` + zero executing in the gap between collect and fire. |
 | **Handler invocation (`safeRun`)** | **No `_mutex` held.** Collect-then-invoke: handlers are moved into a local `std::vector<Handler>`, `_mutex` is released, then each is called. | A handler may re-enter `scheduleAfter`/`cancel` safely. Exceptions are caught and counted. |
 | `drain` | Under `_mutex` for the `Running->Draining` CAS + `_accepting` store + cancellation sweep + inflight count; then `_drainCV.wait_for` releasing `_mutex`. | `DrainStats` accounting computed after the wait. Timeout path CAS-restores `Running`. |
-| `stop` | `_running` CAS (acq_rel); `_thread.join()`; `cleanup()`; state store (release). | Joins the timer thread; safe to call from the destructor. |
+| `stop` | `_running` CAS (acq_rel); `_thread.join()`; `cleanup()`; then `finalizeStoppedLocked()` stores `_accepting = false` **and** `Stopped` together under `_mutex`. | Joins the timer thread; safe to call from the destructor. The joint terminal store enforces `Stopped => !_accepting` even if `stop`'s internal drain timed out and restored `_accepting`. |
 | `getStats` / `getConfig` | None (returns `const&`); counters are atomics. | `getInFlightCount` takes `_mutex`. |
 | `setLogger` / `setErrorHandler` / `loggerSnapshot` / `handleError` | `std::lock_guard<std::mutex>` on `_handlerMutex`. | Logger/handler are copied under `_handlerMutex` then invoked outside it. `_handlerMutex` is always the **inner** lock -- never held while acquiring `_mutex`. |
 
@@ -524,8 +527,9 @@ When `TimerServiceConfig::enableStatistics` is `true` (the default), the service
 - `std::mutex _mutex` (mutable) -- guards `_records`, `_periodicTimers`, `_heap`, `_nextId`.
 - `std::mutex _handlerMutex` (mutable) -- guards `_logger`, `_errorHandler`.
 - `std::condition_variable _drainCV` -- notified when a drain may complete (from `safeRun`'s `CountGuard`, from the run loop's draining branch, and on run-loop exit).
-- `std::atomic<bool> _running` -- run-loop keep-going flag.
-- `std::atomic<bool> _accepting` -- whether new timers are accepted (flipped by drain).
+- `std::atomic<bool> _running` -- run-loop keep-going flag (the stop *request*).
+- `std::atomic<bool> _runLoopExited` -- run-loop-*terminated* signal, set true (under `_mutex`, with a `_drainCV` notify) by the `ExitGuard` at every run-loop exit incl. exception unwind; reset false on (re)start. `drain()`'s predicate escapes on it. Distinct from `_running`: a system-error exit terminates the loop with `_running` still true, and that must still release a parked `drain()`.
+- `std::atomic<bool> _accepting` -- whether new timers are accepted (cleared at drain start; restored on a genuine drain timeout; forced false at the `Stopped` transition).
 - `std::atomic<std::uint32_t> _executingCallbacks` -- handlers currently inside `safeRun` (not yet reflected in `_records`).
 - `std::atomic<iora::common::LifecycleState> _lifecycleState` -- lifecycle state.
 - `std::atomic<int> _eventFd` -- the doorbell fd (accessed cross-thread by `poke()`); `_epollFd`/`_timerFd` are plain `int` touched only by the init/run-loop/cleanup single-thread sequence.
@@ -766,7 +770,6 @@ public:
 
 - **Linux-only.** Hard dependency on `timerfd`/`eventfd`/`epoll`; no portable fallback. Building on non-Linux will fail to compile.
 - **`TimerLimits::maxHeapSize` and `TimerLimits::maxHandlerExecutionTime` are not enforced.** Both fields are declared and defaulted (`50000`, `30s`) but are never read anywhere in `timer.hpp`. Admission control uses `maxConcurrentTimers` against `_records.size()`, not heap size; there is no watchdog on slow handlers. Configuring these values has no effect today (candidate defect -- tracked in `tasks/iora/backlog/2026-09-10-8_timer-dead-timerlimits-fields_P2.json`).
-- **`drain(0)` with an active periodic timer never completes.** When `timeoutMs == 0` the drain does not cancel periodic timers, and `collectDueLocked` re-arms them every interval, so the `drainDone` predicate (`no live _records`) is never satisfied. Use a positive budget when periodic timers may be armed. `stop()` is unaffected -- it drains with a 5000 ms budget. (Candidate defect -- tracked in `tasks/iora/backlog/2026-09-10-2_timer-drain-zero-hangs-with-periodic_P0.json`.)
 - **`getLeastLoadedService()` degenerates when statistics are disabled.** Load is `timersScheduled - timersExecuted`, both only incremented when `enableStatistics == true`; with statistics off, every service reports load 0 and the first service is always returned. (Statistics are on by default, so this bites only if explicitly disabled.) Tracked -- including the unsigned-underflow edge in the `timersScheduled - timersExecuted` subtraction -- in `tasks/iora/backlog/2026-09-10-9_timer-least-loaded-service-stats-disabled_P2.json`.
 - **Single thread per service.** All handlers on one service run serially on its timer thread; a long-running handler delays every subsequent timer on that service. Distribute heavy or blocking work across a `TimerServicePool` or hand off to a thread pool inside the handler.
 - **No `reschedule`.** Unlike `ITimerService`/`TimingWheel`, `TimerService` has no `reschedule(id, newDelay)`; cancel and re-schedule instead. (The README sketch lists `reschedule`; it does not exist.)
