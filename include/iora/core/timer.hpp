@@ -259,6 +259,24 @@ private:
   std::mutex _logMutex;
 };
 
+namespace detail
+{
+/// \brief Return the supplied logger, or a silent default ConsoleTimerLogger
+/// (disabled) when it is null.
+///
+/// Establishes the never-null logger invariant at every _logger assignment
+/// site (both TimerService constructors, TimerService::setLogger, and both
+/// TimerServicePool constructors) so that every downstream reader —
+/// loggerSnapshot(), handleError()'s direct copy, and TimerServicePool's
+/// direct _logger-> use — is null-safe by construction. A free function so all
+/// sites, including TimerServicePool, can share it. Pure function of its
+/// argument (no shared state).
+inline std::shared_ptr<TimerLogger> orDefaultLogger(std::shared_ptr<TimerLogger> logger)
+{
+  return logger ? std::move(logger) : std::make_shared<ConsoleTimerLogger>();
+}
+} // namespace detail
+
 /// \brief Linux epoll-based timer service.
 class TimerService : public iora::common::ILifecycleManaged
 {
@@ -311,16 +329,22 @@ public:
     std::function<void(TimerError error, const std::string &message, int errno_val)>;
 
   /// \brief Start the service with configuration.
+  /// Delegates to the custom-logger ctor with no logger; orDefaultLogger(nullptr)
+  /// yields the same silent ConsoleTimerLogger default, keeping the reserve +
+  /// initialize()/run-loop-spawn sequence defined in exactly one place.
   explicit TimerService(const TimerServiceConfig &config = {})
-      : _config(config), _logger(std::make_shared<ConsoleTimerLogger>())
+      : TimerService(config, nullptr)
   {
-    _heap.reserve(_config.initialHeapCapacity);
-    initialize();
   }
 
   /// \brief Start the service with custom logger.
+  ///
+  /// A null logger is normalized to a silent default in the member-init list
+  /// (via detail::orDefaultLogger), before initialize() spawns the run-loop
+  /// thread — this ordering is the happens-before edge that publishes _logger
+  /// to that thread, so the substitution must stay in the member-init list.
   TimerService(const TimerServiceConfig &config, std::shared_ptr<TimerLogger> logger)
-      : _config(config), _logger(std::move(logger))
+      : _config(config), _logger(detail::orDefaultLogger(std::move(logger)))
   {
     _heap.reserve(_config.initialHeapCapacity);
     initialize();
@@ -565,11 +589,15 @@ public:
     _errorHandler = std::move(handler);
   }
 
-  /// \brief Set logger.
+  /// \brief Set logger. A null logger is normalized to a silent default so it
+  /// cannot re-break the never-null invariant relied on by the run-loop thread's
+  /// loggerSnapshot() reads. The substitute is built before taking the lock to
+  /// keep the critical section minimal (no allocation under _handlerMutex).
   void setLogger(std::shared_ptr<TimerLogger> logger)
   {
+    auto next = detail::orDefaultLogger(std::move(logger));
     std::lock_guard<std::mutex> lock(_handlerMutex);
-    _logger = std::move(logger);
+    _logger = std::move(next);
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1745,7 +1773,7 @@ public:
   /// \brief Create pool with specified number of services.
   explicit TimerServicePool(std::size_t numServices = std::thread::hardware_concurrency(),
                             const TimerServiceConfig &config = {})
-      : _config(config)
+      : _config(config), _logger(std::make_shared<ConsoleTimerLogger>())
   {
     if (numServices == 0)
     {
@@ -1760,14 +1788,18 @@ public:
       _services.emplace_back(std::make_unique<TimerService>(serviceConfig));
     }
 
-    _logger = std::make_shared<ConsoleTimerLogger>();
     _logger->info("Timer service pool created with " + std::to_string(numServices) + " services");
   }
 
   /// \brief Create pool with custom logger.
+  ///
+  /// A null logger is normalized to a silent default in the member-init list
+  /// (via detail::orDefaultLogger), before the child-construction loop below
+  /// passes _logger into each child TimerService — a null there would crash
+  /// every child in its own initialize().
   TimerServicePool(std::size_t numServices, const TimerServiceConfig &config,
                    std::shared_ptr<TimerLogger> logger)
-      : _config(config), _logger(std::move(logger))
+      : _config(config), _logger(detail::orDefaultLogger(std::move(logger)))
   {
     if (numServices == 0)
     {
@@ -1883,7 +1915,11 @@ public:
 
 private:
   TimerServiceConfig _config;
-  std::shared_ptr<TimerLogger> _logger;
+  // Write-once in the constructor, immutable thereafter (the pool exposes no
+  // logger setter). const makes the compiler enforce that invariant, so any
+  // future setter must consciously add synchronization; normalized non-null by
+  // both ctors, so stop() reads it lock-free and safely.
+  const std::shared_ptr<TimerLogger> _logger;
   std::vector<std::unique_ptr<TimerService>> _services;
   std::atomic<std::size_t> _nextIndex{0};
 };

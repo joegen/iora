@@ -11,9 +11,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <future>
 #include <memory>
+#include <string>
 #include <thread>
+#include <unistd.h>
 
 using namespace iora::core;
 using namespace iora::common;
@@ -950,4 +953,223 @@ TEST_CASE("TimerService stop(): Stopped implies not-accepting even when the stop
   REQUIRE(timer.getState() == LifecycleState::Stopped);
   REQUIRE(timer.scheduleAfter(std::chrono::milliseconds(10), []() {}) == 0);
   REQUIRE(timer.schedulePeriodic(std::chrono::seconds(1), []() {}) == 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Null-logger safety (tracker 2026-09-10-5): the 2-arg TimerService ctor,
+// TimerService::setLogger, and the 3-arg TimerServicePool ctor must not crash
+// when handed a null shared_ptr<TimerLogger>; every downstream logger use
+// (loggerSnapshot() readers, handleError()'s direct copy, the pool's direct
+// _logger->, and the run-loop-thread lambda) must be null-safe by construction
+// via the substituted silent ConsoleTimerLogger. Under the UNFIXED code every
+// case below is a null-deref / crash.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace
+{
+/// Capture everything written to stdout (where ConsoleTimerLogger prints via
+/// std::printf + fflush) while `fn` runs, by redirecting fd 1 to a temp file.
+/// Used to prove — non-vacuously, with a positive control — that the null
+/// substitute is a *silent* (disabled) logger.
+///
+/// The restore/close/unlink runs from an RAII guard so that if `fn()` throws
+/// (e.g. a REQUIRE inside the redirected region fails) the stack can unwind
+/// without leaking fds or leaving fd 1 pointed at the deleted temp file — which
+/// would otherwise silently swallow all later test output, including the Catch2
+/// failure message itself.
+template <typename Fn> std::string captureStdout(Fn &&fn)
+{
+  std::fflush(stdout);
+  int saved = ::dup(::fileno(stdout));
+  char tmpl[] = "/tmp/timer_null_logger_cap_XXXXXX";
+  int fd = ::mkstemp(tmpl);
+  REQUIRE(saved >= 0);
+  REQUIRE(fd >= 0);
+
+  struct Guard
+  {
+    int saved;
+    int fd;
+    const char *path;
+    bool done{false};
+    void cleanup()
+    {
+      if (done)
+      {
+        return;
+      }
+      done = true;
+      std::fflush(stdout);
+      ::dup2(saved, ::fileno(stdout)); // restore fd 1 first, always
+      ::close(saved);
+      ::close(fd);
+      ::unlink(path);
+    }
+    ~Guard() { cleanup(); }
+  } guard{saved, fd, tmpl};
+
+  ::dup2(fd, ::fileno(stdout));
+  std::forward<Fn>(fn)();
+
+  // Read back the captured bytes while fd is still open, then restore + clean.
+  std::fflush(stdout);
+  ::lseek(fd, 0, SEEK_SET);
+  std::string out;
+  char buf[4096];
+  ssize_t n;
+  while ((n = ::read(fd, buf, sizeof(buf))) > 0)
+  {
+    out.append(buf, static_cast<std::size_t>(n));
+  }
+  guard.cleanup();
+  return out;
+}
+} // namespace
+
+// (a) 2-arg TimerService ctor with a null logger: construct, fire a one-shot,
+// stop, destruct — no crash.
+TEST_CASE("TimerService null logger: 2-arg ctor survives construct/fire/stop",
+          "[timer][lifecycle][logger][null]")
+{
+  TimerService timer(TimerServiceConfig{}, std::shared_ptr<TimerLogger>{});
+  std::atomic<bool> fired{false};
+  auto id = timer.scheduleAfter(std::chrono::milliseconds(20),
+                                [&fired]() { fired.store(true, std::memory_order_release); });
+  REQUIRE(id != 0);
+  REQUIRE(iora::test::waitFor([&]() { return fired.load(std::memory_order_acquire); },
+                            std::chrono::milliseconds(1000)));
+  auto r = timer.stop();
+  REQUIRE(r.success == true);
+}
+
+// (b) setLogger(nullptr) is a CROSS-THREAD regression: it must not re-break the
+// never-null invariant relied on by the run-loop thread. The cross-thread
+// property comes EXCLUSIVELY from the run-loop thread's "Timer service loop
+// finished" loggerSnapshot()->info() read during stop() (timer.hpp) — that read
+// happens strictly after setLogger(nullptr), so under the unfixed code the
+// run-loop thread would deref null. (enableDetailedLogging only adds extra
+// _logger reads on the CALLER thread at schedule/cancel, not on the run-loop
+// thread; do not rely on it for the cross-thread property — keep the stop().)
+// Run on the TSan target to prove the cross-thread path, not single-thread.
+TEST_CASE("TimerService null logger: setLogger(nullptr) is cross-thread safe",
+          "[timer][lifecycle][logger][null][setlogger]")
+{
+  TimerServiceConfig cfg;
+  cfg.enableDetailedLogging = true; // extra (caller-thread) _logger reads; not the cross-thread edge
+  TimerService timer(cfg);          // starts with a valid default logger
+  timer.setLogger(std::shared_ptr<TimerLogger>{}); // install null -> normalized to substitute
+
+  std::atomic<bool> fired{false};
+  auto id = timer.scheduleAfter(std::chrono::milliseconds(20),
+                                [&fired]() { fired.store(true, std::memory_order_release); });
+  REQUIRE(id != 0);
+  REQUIRE(iora::test::waitFor([&]() { return fired.load(std::memory_order_acquire); },
+                            std::chrono::milliseconds(1000)));
+  // stop() forces the run-loop thread's "loop finished" loggerSnapshot()->info()
+  // read strictly after setLogger(nullptr).
+  auto r = timer.stop();
+  REQUIRE(r.success == true);
+}
+
+// (c) handleError() reads _logger DIRECTLY (not via loggerSnapshot); force it
+// under a null logger via ServiceStopped (schedule after stop) and
+// InvalidTimeout (schedule beyond maxTimeout) — both must be null-safe.
+TEST_CASE("TimerService null logger: handleError paths are null-safe",
+          "[timer][lifecycle][logger][null][error]")
+{
+  TimerService timer(TimerServiceConfig{}, std::shared_ptr<TimerLogger>{});
+
+  // InvalidTimeout -> handleError -> logger->error(...)
+  auto tooFar = TimerService::Clock::now() + std::chrono::hours(48); // > 24h maxTimeout
+  REQUIRE(timer.scheduleAt(tooFar, []() {}) == 0);
+
+  // ServiceStopped -> handleError -> logger->error(...)
+  auto r = timer.stop();
+  REQUIRE(r.success == true);
+  REQUIRE(timer.scheduleAfter(std::chrono::milliseconds(10), []() {}) == 0);
+}
+
+// (d) periodic fire under a null logger, then cancel and stop — no crash.
+TEST_CASE("TimerService null logger: periodic fire/cancel/stop is null-safe",
+          "[timer][lifecycle][logger][null][periodic]")
+{
+  TimerService timer(TimerServiceConfig{}, std::shared_ptr<TimerLogger>{});
+  std::atomic<int> fires{0};
+  auto id = timer.schedulePeriodic(std::chrono::milliseconds(20),
+                                   [&fires]() { fires.fetch_add(1, std::memory_order_release); });
+  REQUIRE(id != 0);
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+  while (fires.load(std::memory_order_acquire) < 1 &&
+         std::chrono::steady_clock::now() < deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE(fires.load(std::memory_order_acquire) >= 1);
+  REQUIRE(timer.cancel(id) == true);
+  auto r = timer.stop();
+  REQUIRE(r.success == true);
+}
+
+// (e)/(f) direct drain()/stop() and resetStats() under a null logger — these
+// exercise the many loggerSnapshot()->info() sites in drain()/stop()/resetStats.
+TEST_CASE("TimerService null logger: drain/stop/resetStats are null-safe",
+          "[timer][lifecycle][logger][null][drain]")
+{
+  TimerService timer(TimerServiceConfig{}, std::shared_ptr<TimerLogger>{});
+  timer.resetStats(); // loggerSnapshot()->info("Timer statistics reset")
+  auto d = timer.drain(200);
+  REQUIRE(d.success == true);
+  auto r = timer.stop();
+  REQUIRE(r.success == true);
+}
+
+// (g) 3-arg TimerServicePool ctor with a null logger: the substitute must reach
+// each CHILD TimerService (not just the pool's own _logger). Schedule on a child
+// and fire it; then stop + destruct.
+TEST_CASE("TimerServicePool null logger: children get a non-null substitute",
+          "[timer][lifecycle][logger][null][pool]")
+{
+  TimerServicePool pool(2, TimerServiceConfig{}, std::shared_ptr<TimerLogger>{});
+  REQUIRE(pool.size() == 2);
+  std::atomic<bool> fired{false};
+  auto &svc = pool.getService();
+  auto id = svc.scheduleAfter(std::chrono::milliseconds(20),
+                              [&fired]() { fired.store(true, std::memory_order_release); });
+  REQUIRE(id != 0);
+  REQUIRE(iora::test::waitFor([&]() { return fired.load(std::memory_order_acquire); },
+                            std::chrono::milliseconds(1000)));
+  pool.stop(); // _logger->info(...) at both ends — null-safe via substitute
+}
+
+// (h) POSITIVE-CONTROL + silence pairing: prove the substitute is a *silent*
+// (disabled) logger, non-vacuously. First an explicitly ENABLED ConsoleTimerLogger
+// must produce captured output (proves the stdout-capture harness works); then
+// the null-substitute variant must produce NONE.
+TEST_CASE("TimerService null logger: substitute is silent (with positive control)",
+          "[timer][lifecycle][logger][null][silent]")
+{
+  // Positive control: an enabled logger DOES emit (validates the capture harness).
+  std::string enabledOut = captureStdout(
+    []()
+    {
+      auto enabled = std::make_shared<ConsoleTimerLogger>(TimerLogger::Level::Info, true);
+      TimerService timer(TimerServiceConfig{}, enabled); // logs "started successfully"
+      auto r = timer.stop();
+      REQUIRE(r.success == true);
+    });
+  REQUIRE(enabledOut.find("Timer service started successfully") != std::string::npos);
+
+  // Null substitute: MUST be silent (default ConsoleTimerLogger is disabled).
+  std::string nullOut = captureStdout(
+    []()
+    {
+      TimerService timer(TimerServiceConfig{}, std::shared_ptr<TimerLogger>{});
+      std::atomic<bool> fired{false};
+      timer.scheduleAfter(std::chrono::milliseconds(10),
+                          [&fired]() { fired.store(true, std::memory_order_release); });
+      (void)iora::test::waitFor([&]() { return fired.load(std::memory_order_acquire); },
+                            std::chrono::milliseconds(1000));
+      auto r = timer.stop();
+      REQUIRE(r.success == true);
+    });
+  REQUIRE(nullOut.empty());
 }
