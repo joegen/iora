@@ -79,18 +79,30 @@ public:
 class KVStore
 {
 public:
+  /// \brief Construct a KVStore.
+  /// \param path Backing-file path. An EMPTY path selects in-memory mode: the
+  ///   store keeps all data in-process and performs NO file I/O (no snapshot,
+  ///   log, or temp file; no background compaction) — data does not persist and
+  ///   is never shared between instances (KVStore-IM-1). A non-empty path is a
+  ///   persistent store as before.
   explicit KVStore(const std::string &path, const KVStoreConfig &config = {})
       : _config(config), _path(path), _logPath(path + ".log"), _tempPath(path + ".tmp"),
+        _inMemory(path.empty()),
         _shutdown(false), _ttlWheelMaxRange(computeAndValidateTtlRange(config)),
         _evictionStop(false), _ttlStarted(false), _evictionWriteErrors(0)
   {
     try
     {
-      load();
-      openLogFile();
-      if (_config.enableBackgroundCompaction)
+      // In-memory mode skips every file-backed step (load/log/compaction); the
+      // TTL wheel + eviction worker still run against in-process state.
+      if (!_inMemory)
       {
-        _compactionThread = std::thread(&KVStore::compactionWorker, this);
+        load();
+        openLogFile();
+        if (_config.enableBackgroundCompaction)
+        {
+          _compactionThread = std::thread(&KVStore::compactionWorker, this);
+        }
       }
       // End-of-ctor arming (KTP-7 / postLoadArming): after every fallible step
       // above has succeeded, lazily start the wheel + worker and arm the TTL
@@ -669,9 +681,14 @@ public:
       _compactionThread.join();
     }
 
-    // (6) Flush + close the log. No 'D'/'E'/'X' write occurs after this.
+    // (6) Flush + close the log. No 'D'/'E'/'X' write occurs after this. Guard
+    // on is_open() so an in-memory store (never-opened stream) and the idempotent
+    // second shutdown() do not set failbit on a discarded stream.
     flush();
-    _logStream.close();
+    if (_logStream.is_open())
+    {
+      _logStream.close();
+    }
   }
 
   /// \brief Get all (non-expired) keys in the store
@@ -1138,6 +1155,10 @@ private:
 
   bool shouldCompact() const
   {
+    if (_inMemory)
+    {
+      return false; // In-memory mode: nothing to compact (KVStore-IM-1).
+    }
     std::error_code ec;
     return std::filesystem::exists(_logPath, ec) && !ec &&
            std::filesystem::file_size(_logPath, ec) > _config.maxLogSizeBytes && !ec;
@@ -1157,6 +1178,10 @@ private:
   /// _mutex-holder may call the public compact()/flush() (non-recursive mutex).
   void compactLocked()
   {
+    if (_inMemory)
+    {
+      return; // In-memory mode: no on-disk log/snapshot to compact (KVStore-IM-1).
+    }
     try
     {
       const auto now = std::chrono::system_clock::now();
@@ -1553,6 +1578,10 @@ private:
   void writeLogEntry(char op, const std::string &key, const std::vector<std::uint8_t> &value,
                      int64_t expiryMs = 0)
   {
+    if (_inMemory)
+    {
+      return; // In-memory mode: no durable log (KVStore-IM-1).
+    }
     if (!_logStream.is_open())
     {
       throw KVStoreException("Log stream is not open");
@@ -1624,6 +1653,11 @@ private:
   const std::string _path;
   const std::string _logPath;
   const std::string _tempPath;
+  // In-memory mode: an empty path selects a purely in-process store — no
+  // snapshot/log/temp files are ever opened, written, or compacted, and each
+  // instance is fully isolated (KVStore-IM-1). Set from path.empty() in the ctor
+  // init list; declared here so its initializer runs after the path members.
+  const bool _inMemory;
 
   // File streams
   std::ofstream _logStream;
@@ -1632,7 +1666,15 @@ private:
   std::unordered_map<std::string, std::vector<std::uint8_t>> _kv;
   mutable std::unordered_map<std::string, CacheEntry> _cache;
 
-  // Threading and synchronization
+  // Threading and synchronization.
+  //
+  // Lock ordering (outer -> inner; acquire only in this order, never reversed):
+  //   _mutex -> _cacheMutex   (data mutation updates the warm cache under _mutex)
+  //   _mutex -> _evictionMutex (a TTL arm under _mutex synchronously enqueues via
+  //                             armTimerLocked -> wheel schedule -> enqueueEviction)
+  // _compactionMutex and _evictionMutex (worker side) are LEAVES: the compaction
+  // and eviction workers take their own mutex alone and release it before taking
+  // _mutex, so there is no _evictionMutex/_compactionMutex -> _mutex inversion.
   mutable std::shared_mutex _mutex;
   mutable std::shared_mutex _cacheMutex;
   std::mutex _compactionMutex;

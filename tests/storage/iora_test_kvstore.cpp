@@ -1817,3 +1817,117 @@ TEST_CASE("KVStore TTL same-second mass-expiry herd at shutdown", "[kvstore][ttl
   }
   cleanup(file);
 }
+
+// ===========================================================================
+// In-memory mode (empty path) — KVStore-IM-1
+// ===========================================================================
+
+TEST_CASE("KVStore in-memory mode: basic set/get/remove", "[kvstore][inmemory]")
+{
+  KVStore store(""); // empty path -> in-memory
+  std::vector<uint8_t> value = {9, 8, 7, 6};
+  store.set("foo", value);
+  auto got = store.get("foo");
+  REQUIRE(got.has_value());
+  REQUIRE(got.value() == value);
+  REQUIRE(store.exists("foo"));
+  REQUIRE(store.size() == 1);
+  store.remove("foo");
+  REQUIRE_FALSE(store.get("foo").has_value());
+  REQUIRE(store.size() == 0);
+}
+
+TEST_CASE("KVStore in-memory mode: creates NO files (the contamination guard)",
+          "[kvstore][inmemory][nofiles]")
+{
+  // Self-isolating: run inside a unique, empty temp CWD and assert the empty-path
+  // store leaves NOTHING on disk (no snapshot "", no ".log", no ".tmp"). This is
+  // the regression guard for the shared-".log"-in-CWD footgun that made
+  // storagePath="" NOT in-memory. The scoped chdir is restored by its destructor
+  // even if a REQUIRE throws, so the guard is immune to any stray ".log" another
+  // test leaves in the process CWD (no bare-sentinel cross-binary TOCTOU).
+  namespace fs = std::filesystem;
+  const fs::path base =
+    fs::temp_directory_path() /
+    ("kvstore_im_nofiles_" +
+     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  fs::remove_all(base);
+  fs::create_directories(base);
+  struct ScopedCwd
+  {
+    fs::path prev;
+    explicit ScopedCwd(const fs::path &p) : prev(fs::current_path()) { fs::current_path(p); }
+    ~ScopedCwd()
+    {
+      std::error_code ec;
+      fs::current_path(prev, ec);
+    }
+  } guard(base);
+
+  {
+    KVStore store("");
+    for (int i = 0; i < 50; ++i)
+    {
+      store.set("k" + std::to_string(i), randomBytes(64));
+    }
+    store.remove("k0");
+    store.expireAt("k1", std::chrono::system_clock::now() + std::chrono::seconds(1)); // TTL arm
+    store.forceCompact(); // safe no-op (no ".tmp")
+    store.flush();        // safe no-op
+  }
+  // The temp dir must be completely empty — the in-memory store created no files.
+  REQUIRE(fs::is_empty(base));
+  std::error_code ec;
+  fs::remove_all(base, ec);
+}
+
+TEST_CASE("KVStore in-memory mode: two instances are isolated (no shared state)",
+          "[kvstore][inmemory][isolation]")
+{
+  // The core contamination fix: separate empty-path stores must NOT see each
+  // other's data (previously they shared a single ".log" in the CWD).
+  KVStore a("");
+  KVStore b("");
+  a.set("shared", {1});
+  REQUIRE(a.exists("shared"));
+  REQUIRE_FALSE(b.exists("shared"));
+  REQUIRE(b.size() == 0);
+
+  b.set("shared", {2});
+  REQUIRE(a.get("shared").value() == std::vector<uint8_t>{1});
+  REQUIRE(b.get("shared").value() == std::vector<uint8_t>{2});
+}
+
+TEST_CASE("KVStore in-memory mode: TTL expiry still functions", "[kvstore][inmemory][ttl]")
+{
+  using namespace ttltest;
+
+  SECTION("active eviction without a read (the wheel fires in-memory)")
+  {
+    KVStore store("", fastConfig()); // ~20ms tick -> the eviction worker fires
+    store.set("k", {1});
+    store.expireAt("k", sysclock::now() + std::chrono::milliseconds(40));
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    // No read is performed: background eviction alone must drop the key in-memory.
+    REQUIRE(store.size() == 0);
+    REQUIRE_FALSE(store.exists("k"));
+  }
+
+  SECTION("lazy-read backstop hides an already-due key (no active fire)")
+  {
+    KVStore store("", noFireConfig());
+    store.set("k", {1});
+    store.expireAt("k", sysclock::now() - std::chrono::seconds(1)); // already due
+    REQUIRE_FALSE(store.get("k").has_value());
+  }
+
+  SECTION("persist() clears expiry in-memory (key survives its old deadline)")
+  {
+    KVStore store("", fastConfig());
+    store.set("keep", {1});
+    store.expireAt("keep", sysclock::now() + std::chrono::milliseconds(40));
+    store.persist("keep");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    REQUIRE(store.exists("keep"));
+  }
+}
