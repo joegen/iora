@@ -71,7 +71,7 @@ iora::core (thread_pool.hpp / iora_core.cpp)
 |   |-- shutdown()                             explicit blocking join (idempotent)
 |   |-- getPendingTaskCount / getActiveThreadCount / getTotalThreadCount / getInFlightCount
 |   |-- getQueueUtilization / isUnderHighLoad
-|   |-- ShutdownMode { IMMEDIATE, GRACEFUL, DETACHED }
+|   |-- ShutdownMode { IMMEDIATE, DETACHED }
 |   `-- ~ThreadPool()  ->  phase1..phase5 shutdown sequence
 |
 |-- blockingIoPool()   -> ThreadPool&   immortal singleton  new ThreadPool(2, 16, 30s, 128)
@@ -202,16 +202,15 @@ Same wrapping and exception forwarding as `enqueue`, but returns `false` instead
 ### 3.6 `ShutdownMode`
 
 ```cpp
-enum class ShutdownMode { IMMEDIATE, GRACEFUL, DETACHED };
+enum class ShutdownMode { IMMEDIATE, DETACHED };
 ```
 
 - **`IMMEDIATE`** (default) -- join workers as soon as their lambda returns; fastest.
-- **`GRACEFUL`** -- documented as waiting for pthread cleanup before join (extra latency, avoids a pthread-cleanup race).
 - **`DETACHED`** -- detach workers instead of joining; near-instant, but resources leak until the workers exit.
 
 The mode is read/written under `_configMutex` via `getShutdownMode()` / `setShutdownMode(mode)` and consulted only by shutdown **Phase 4** (3.8). Changing the mode while a shutdown is in progress is documented as undefined behavior.
 
-> **Behavioral note.** In the current implementation, `GRACEFUL` and `IMMEDIATE` take the identical join branch in Phase 4 -- both call `movedThread.join()`. Only `DETACHED` diverges (it calls `detach()`). `GRACEFUL`'s documented "wait for pthread cleanup before join" is not a separate code path (the mode is effectively vacuous); tracked in `tasks/iora/backlog/2026-09-10-3_thread-pool-graceful-shutdown-mode-vacuous_P1.json`.
+> **Behavioral note.** Only two modes exist: `IMMEDIATE` joins each worker in Phase 4 (`movedThread.join()`) and `DETACHED` detaches it. Teardown safety for the join path comes from the mode-independent drain+join (Phase 3 `waitForQuiescence` then the Phase 4 `join()`), NOT from any per-mode behavior; the Phase 2 synchronization barrier is only a best-effort backstop. (A former `GRACEFUL` mode was a vacuous alias of `IMMEDIATE` -- identical join branch -- and was removed.)
 
 ### 3.7 `ILifecycleManaged` lifecycle (`start`/`drain`/`stop`/`reset`)
 
@@ -240,14 +239,14 @@ sequenceDiagram
   Dtor->>W: Phase 3 -- DrainTasks
   Note over Dtor,W: poll (50ms) up to 5000ms until getInFlightCount()==0 (_tasks + _busyThreads)
   Dtor->>W: Phase 4 -- JoinThreads
-  Note over Dtor,W: per ShutdownMode: join (IMMEDIATE/GRACEFUL) or detach (DETACHED)<br/>move each thread out of _threads under lock, act off-lock
+  Note over Dtor,W: per ShutdownMode: join (IMMEDIATE) or detach (DETACHED)<br/>move each thread out of _threads under lock, act off-lock
   Dtor->>Dtor: Phase 5 -- Validate: all threads non-joinable && _tasks empty
 ```
 
 - **Phase 1 -- `shutdownPhase1_SignalShutdown`.** Sets `_shutdown = true` under `_mutex`; `notify_all()`. If already shut down (e.g. an explicit `shutdown()` ran), returns `wasAlreadyShutdown = true` and the destructor returns immediately.
 - **Phase 2 -- `shutdownPhase2_SynchronizationBarrier`.** The critical fix: spins (100 us intervals, up to ~200 ms) until `_waitingThreads == 0` **and** `_threadsExited >= _threadsCreated`, plus a 5 ms grace. This is a timeout-bounded best-effort aimed at ensuring no worker is still inside `_condition.wait_for` before `_condition` is destroyed, narrowing the `"double free or corruption (!prev)"` race window (see 8.4 for how Phase 4's `join()` supplies the real guarantee for `_threads`-tracked workers).
 - **Phase 3 -- `shutdownPhase3_DrainTasks`.** Polls (50 ms) up to 5000 ms via `waitForQuiescence` for `getInFlightCount() == 0` (`_tasks.size() + _busyThreads`); records `timedOut` on failure.
-- **Phase 4 -- `shutdownPhase4_JoinThreads`.** Reads `ShutdownMode` under `_configMutex`, then repeatedly moves one joinable thread out of `_threads` under `_mutex`, erases the slot, releases the lock, and joins (IMMEDIATE/GRACEFUL) or detaches (DETACHED) the moved-out thread off-lock -- so no thread is joined while `_mutex` is held.
+- **Phase 4 -- `shutdownPhase4_JoinThreads`.** Reads `ShutdownMode` under `_configMutex`, then repeatedly moves one joinable thread out of `_threads` under `_mutex`, erases the slot, releases the lock, and joins (IMMEDIATE) or detaches (DETACHED) the moved-out thread off-lock -- so no thread is joined while `_mutex` is held.
 - **Phase 5 -- `shutdownPhase5_Validate`.** Under `_mutex`, checks that every remaining thread is non-joinable and `_tasks` is empty.
 
 ### 3.9 The explicit `shutdown()` method
@@ -692,7 +691,7 @@ There is no runtime/env-var configuration; sizing is fixed at construction. **De
 | `idleTimeout` | `std::chrono::milliseconds` | `std::chrono::seconds(30)` | Idle duration after which a worker beyond `initialSize` may exit. |
 | `maxQueueSize` | `std::size_t` | `1024` | Queued-task cap; `enqueue` throws / `tryEnqueue` returns `false` at this bound. |
 | `onTaskError` | `std::function<void(std::exception_ptr)>` | `nullptr` | Optional handler for uncaught void-task exceptions. |
-| `shutdownMode` | `ShutdownMode` | `ShutdownMode::IMMEDIATE` | Join / graceful / detach at shutdown. |
+| `shutdownMode` | `ShutdownMode` | `ShutdownMode::IMMEDIATE` | Join (IMMEDIATE) or detach (DETACHED) at shutdown. |
 
 > **Divergence to be aware of (not a header default).** `IoraService` constructs its *own* per-service `ThreadPool` with different fallbacks -- `minThreads = 1`, `maxThreads = hardware_concurrency()` (or `4` if `0`), `queueSize = maxThreads * 2`, `idleTimeout = 60 s` -- and `src/iora.cpp`'s `--help` text hand-duplicates *those* values (`--threadpool-min` default `1`, `--threadpool-max` default "hardware concurrency, or 4", `--threadpool-queue` default "2 x max threads", `--threadpool-idle-timeout` default `60`). These are `IoraService`'s policy defaults, **not** the `ThreadPool` constructor defaults in the table above; the two sets do not match. When documenting or reasoning about a bare `ThreadPool`, use the header table; when reasoning about the framework-owned pool, use `IoraService`'s values.
 
@@ -732,7 +731,7 @@ namespace core
 class ThreadPool : public iora::common::ILifecycleManaged
 {
 public:
-  enum class ShutdownMode { IMMEDIATE, GRACEFUL, DETACHED };
+  enum class ShutdownMode { IMMEDIATE, DETACHED };
 
   // Public shutdown-phase result structs (unit-test hooks):
   struct ShutdownPhase1Result { bool wasAlreadyShutdown; bool success; };
@@ -863,7 +862,6 @@ auto async(std::launch policy, F &&func, Args &&...args)
 ## 12. Known Limitations
 
 - **`ThreadPool` enqueue is not *generically* all-or-nothing.** For a scaling pool (`initialSize < maxSize`), `enqueueImpl` commits the task to `_tasks` *before* a possible post-commit `spawnWorker()` that can throw `std::system_error`. `generalAsyncPool()` sidesteps this by being fixed-size; a `ThreadPool`-level fix (making a scaling spawn failure non-fatal to an already-committed enqueue) is tracked separately (`tasks/iora/backlog/2026-09-06-11_threadpool-enqueue-all-or-nothing_P2.json`).
-- **`ShutdownMode::GRACEFUL` is not a distinct code path.** Phase 4 takes the identical `join()` branch for `IMMEDIATE` and `GRACEFUL`; only `DETACHED` diverges. The documented "wait for pthread cleanup before join" behavior is not implemented (tracked in `tasks/iora/backlog/2026-09-10-3_thread-pool-graceful-shutdown-mode-vacuous_P1.json`).
 - **Timing-based shutdown/drain waits.** `shutdown()`, `drain()`, and Phase 2/3 use bounded polling with fixed sleeps (50 ms quiescence polls, 100 us barrier spins). On a badly overloaded host a straggling task can still exceed the 5000 ms drain cap, in which case shutdown "proceeds anyway" with a logged warning; correctness then depends on DP-3's task-functor-destroy-before-decrement rather than on the wait completing.
 - **`stop()` on a drain timeout detaches, and destroying that pool while a task is still stuck is UB.** If `stop()` cannot quiesce within its drain window it does **not** join (that would hang on the stuck task): it signals shutdown, `detach()`es every worker, and sets a pool-local terminal flag so `start()`/`reset()`/`stop()` refuse to restart the pool (a ghost worker's late `--_busyThreads`/`--_activeThreads` would otherwise underflow a restarted pool's counters). The detached worker still holds a raw `this`; destroying the `ThreadPool` while a genuinely stuck task is running is undefined behaviour -- the same immortal-pool caveat that `blockingIoPool()`/`generalAsyncPool()` sidestep by never being destroyed. A fully-safe detached-worker teardown (shared-ptr control block) is tracked in `tasks/iora/backlog/2026-09-10-8_threadpool-detached-worker-shared-control-block-teardown_P2.json`.
 - **Public `shutdown()` on a genuinely-stuck task hangs.** Unlike `stop()` (which detaches on a drain timeout), the public `shutdown()` (and the destructor's Phase 4) always *join*. A non-returning task therefore blocks `shutdown()` forever -- inherent to a blocking join, and the same immortal-pool property as the destroy-while-stuck caveat above. Callers with cancellable/finite work never hit it; routing `shutdown()` through the same detach-on-timeout path is a possible future enhancement (see `tasks/iora/backlog/2026-09-10-8`).

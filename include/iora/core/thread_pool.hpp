@@ -136,19 +136,14 @@ public:
   /// Shutdown mode for controlling thread lifecycle management
   enum class ShutdownMode
   {
-    /// IMMEDIATE: Join threads as soon as lambda returns (current behavior)
-    /// - Fast shutdown (10-50ms)
-    /// - Risk: May join during pthread cleanup (race condition)
-    /// - Use: Development, non-critical applications
-    /// - Default: YES (backward compatible)
+    /// IMMEDIATE: Join every worker once it returns (the default).
+    /// - Fast shutdown (10-50ms).
+    /// - The pthread-cleanup race is NOT a risk of this mode: teardown safety
+    ///   comes from the mode-independent drain+join (waitForQuiescence then
+    ///   join), NOT from any per-mode behavior; the destructor's Phase-2
+    ///   synchronization barrier is only a best-effort backstop.
+    /// - Default: YES.
     IMMEDIATE,
-
-    /// GRACEFUL: Wait for pthread cleanup before join
-    /// - Safe shutdown (+100-300ms extra)
-    /// - Guarantee: No pthread cleanup races
-    /// - Use: Production, critical applications
-    /// - Default: NO (opt-in for safety)
-    GRACEFUL,
 
     /// DETACHED: Detach threads instead of joining
     /// - Instant shutdown (<1ms)
@@ -169,7 +164,7 @@ public:
   /// throws.
   /// @param onTaskError       Optional handler for uncaught exceptions in
   /// tasks.
-  /// @param shutdownMode      Shutdown mode (IMMEDIATE, GRACEFUL, DETACHED).
+  /// @param shutdownMode      Shutdown mode (IMMEDIATE, DETACHED).
   /// Default: IMMEDIATE (backward compatible).
   ThreadPoolT(std::size_t initialSize = std::thread::hardware_concurrency(),
               std::size_t maxSize = std::thread::hardware_concurrency() * 4,
@@ -1096,13 +1091,16 @@ private:
       {
         // Small grace period to ensure any in-flight transitions complete
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        // Observed quiescence before the timeout. Diagnostic only; the default-init
+        // leaves this false on the ~200ms timeout path, and success stays true
+        // either way (best-effort backstop; see docs/core/thread_pool.md §8.4 / DP-2).
+        result.allThreadsAcknowledged = true;
         break;
       }
     }
 
     auto endTime = std::chrono::steady_clock::now();
     result.waitTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-    result.allThreadsAcknowledged = true;  // Conservative: assume success after wait
     result.success = true;
 
     return result;
@@ -1140,7 +1138,7 @@ private:
 
   /// Phase 4: Join all worker threads
   /// Waits for all threads to exit their worker loops
-  /// Supports IMMEDIATE, GRACEFUL, and DETACHED shutdown modes
+  /// Supports IMMEDIATE (join) and DETACHED (detach) shutdown modes
   ShutdownPhase4Result shutdownPhase4_JoinThreads()
   {
     ShutdownPhase4Result result;
@@ -1266,8 +1264,8 @@ private:
   // getState()/getInFlightCount() are lock-free of it (observers stay responsive).
   std::mutex _lifecycleMutex;
 
-  // Shutdown mode configuration (GRACEFUL shutdown support)
-  ShutdownMode _shutdownMode{ShutdownMode::IMMEDIATE};  // Default: backward compatible
+  // Shutdown mode configuration (IMMEDIATE=join, DETACHED=detach)
+  ShutdownMode _shutdownMode{ShutdownMode::IMMEDIATE};  // Default
 
   // ═══════════════════════════════════════════════════════════════════
   // ILifecycleManaged Interface Members

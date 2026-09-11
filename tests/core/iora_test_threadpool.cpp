@@ -500,3 +500,43 @@ TEST_CASE("ThreadPool backpressure and monitoring", "[threadpool][backpressure]"
     REQUIRE(pool.getActiveThreadCount() == 0);
   }
 }
+
+//
+// After the GRACEFUL removal (tracker 2026-09-10-3), ShutdownMode has exactly
+// two values: IMMEDIATE (Phase-4 join, the default) and DETACHED (Phase-4
+// detach). This pins that both survive: SECTION 1 exercises the IMMEDIATE
+// drain+join teardown (clean destruction is the real signal, verified under the
+// suite's TSan run), and SECTION 2 confirms DETACHED stays selectable via the
+// accessors. The DETACHED detach branch is not run behaviorally: destroying a
+// pool with a detached worker holding raw `this` is UB (see the guide's Known
+// Limitations), so SECTION 2 restores IMMEDIATE before teardown.
+//
+TEST_CASE("ThreadPool ShutdownMode surviving branches", "[threadpool][lifecycle][shutdownmode]")
+{
+  using iora::core::ThreadPool;
+
+  SECTION("default mode is IMMEDIATE and the pool destructs cleanly via join")
+  {
+    std::atomic<int> counter{0};
+    {
+      ThreadPool pool(2, 4);
+      REQUIRE(pool.getShutdownMode() == ThreadPool::ShutdownMode::IMMEDIATE);
+      for (int i = 0; i < 8; ++i)
+      {
+        pool.enqueue([&counter]() { counter.fetch_add(1); });
+      }
+      // ~ThreadPool drains then joins every worker on the IMMEDIATE branch.
+    }
+    REQUIRE(counter == 8);
+  }
+
+  SECTION("DETACHED remains selectable and round-trips through the accessors")
+  {
+    ThreadPool pool(2, 4);
+    REQUIRE(pool.getShutdownMode() == ThreadPool::ShutdownMode::IMMEDIATE);
+    pool.setShutdownMode(ThreadPool::ShutdownMode::DETACHED);
+    REQUIRE(pool.getShutdownMode() == ThreadPool::ShutdownMode::DETACHED);
+    // Restore IMMEDIATE so teardown joins (no detached-worker leak at dtor).
+    pool.setShutdownMode(ThreadPool::ShutdownMode::IMMEDIATE);
+  }
+}
