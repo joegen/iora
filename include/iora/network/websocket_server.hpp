@@ -44,7 +44,35 @@ public:
   {
   }
 
+  /// \brief WS-TS1: quiesce the transport I/O thread (which drives
+  /// onUpgradedData/onUpgradedClose into _sessions/_wsMutex) and drain the pool
+  /// BEFORE this subclass's members are destroyed. ~HttpServer runs only after
+  /// the derived members are already gone, so the base stop() alone would leave
+  /// a live I/O-thread frame dispatch racing the destruction of _sessions. Must
+  /// come first in this dtor. quiesceTransport() allocates (logging, engine stop)
+  /// and can throw; this is the call that does the real work (the base dtor's
+  /// stop() then early-outs), so it — not the base — must swallow exceptions to
+  /// keep this noexcept destructor from std::terminate-ing (quiesceTransportNoexcept).
+  ~WebSocketServer() override
+  {
+    quiesceTransportNoexcept("~WebSocketServer");
+  }
+
   // ── Callback Registration ──────────────────────────────────────────────
+  //
+  // CONTRACT: register all callbacks BEFORE start(). After start() they are read
+  // (unlocked) on the transport I/O thread for every frame/close, so mutating a
+  // callback concurrently with a live connection is a data race on the
+  // std::function. The dispatch sites snapshot the callback before invoking it
+  // (copy-then-invoke, outside any lock); they do NOT synchronize it against a
+  // concurrent setter.
+  //
+  // A CLOSE is reported to the application on exactly one channel: a normal or
+  // abrupt close fires _onClose once (see onUpgradedClose / the inbound-CLOSE
+  // path); a PROTOCOL-ERROR close (unmasked/reserved/oversize/invalid-UTF-8/
+  // bad-CLOSE) fires _onError and is its terminal signal — it deliberately does
+  // NOT also fire _onClose. An application that frees per-session state must treat
+  // _onError as a terminal close signal too, not rely on _onClose alone.
 
   void setOnConnect(ConnectCallback cb) { _onConnect = std::move(cb); }
   void setOnTextMessage(MessageCallback cb) { _onTextMessage = std::move(cb); }
@@ -353,6 +381,56 @@ protected:
     }
   }
 
+  /// \brief Transport-close teardown (2026-09-11-16). On an abrupt client
+  /// disconnect (TCP RST/FIN with no WS CLOSE frame — client crash, kill -9,
+  /// network drop) the protocol layer never runs its CLOSE path, so _sessions[sid]
+  /// leaks and the app's onClose never fires. The base transport onClose routes
+  /// here for upgraded sessions; prune the session and fire _onClose exactly once.
+  void onUpgradedClose(SessionId sid, const TransportErrorInfo &reason) override
+  {
+    bool wasPresent = false;
+    {
+      std::lock_guard<std::mutex> lock(_wsMutex);
+      wasPresent = _sessions.erase(sid) > 0;
+    }
+    // Membership in _sessions is the at-most-once guard: a WS-level CLOSE echo or
+    // a protocol-error eraseAndCloseSession has already erased the entry (and, for
+    // the CLOSE path, already fired _onClose with the peer's code), so this fires
+    // ONLY for a transport close we still owned (no protocol CLOSE was exchanged).
+    // Map the transport reason to an accurate application close code (RFC 6455
+    // §7.4.1): a whole-server going-away -> 1001; any other transport close with no
+    // close handshake (peer loss, write-stall timeout, idle-GC reap) -> 1006. Both
+    // are callback-only codes, NEVER placed on the wire. Snapshot _onClose into a
+    // local so the invocation runs OUTSIDE _wsMutex and cannot be torn down
+    // mid-call; correctness against a concurrent setOnClose rests on the
+    // register-before-start() contract documented at the setter cluster, not on
+    // this copy.
+    if (wasPresent)
+    {
+      const std::uint16_t code = isServerInitiatedClose(reason.code) ? 1001 : 1006;
+      const char *const why = (code == 1001) ? "going away" : "abnormal closure";
+      CloseCallback cb = _onClose;
+      if (cb)
+      {
+        cb(sid, code, why);
+      }
+    }
+  }
+
+  /// \brief True when a transport close means this endpoint is "going away" — a
+  /// whole-server stop() — so the application close code is RFC 6455 §7.4.1 1001.
+  /// A global stop() is detected via the shutdown flag (the engine's shutdown-drain
+  /// reports TransportError::Unknown, not a distinct code, so the flag — not the
+  /// code — is the reliable discriminator). Every other engine-initiated per-session
+  /// close exchanges NO close frame (PeerClosed, a write-stall Timeout, an idle-GC
+  /// reap), which is 1006 "abnormal closure", not 1001 — so they are NOT mapped to
+  /// 1001 here. TransportError::ShuttingDown is kept as a belt-and-suspenders match
+  /// for the flag.
+  bool isServerInitiatedClose(TransportError code) const
+  {
+    return getShutdownChecker().isShuttingDown() || code == TransportError::ShuttingDown;
+  }
+
 private:
   /// \brief Erase the per-session state under _wsMutex then tear the transport
   /// session down — the shared teardown for a protocol-error / bad-alloc close,
@@ -438,9 +516,12 @@ private:
         }
       }
 
-      if (_onClose)
+      // Copy-then-invoke outside any lock, matching onUpgradedClose (no lock is
+      // held here either); correctness against a concurrent setOnClose rests on
+      // the register-before-start() contract.
+      if (CloseCallback cb = _onClose)
       {
-        _onClose(sid, code, reason);
+        cb(sid, code, reason);
       }
 
       {

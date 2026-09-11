@@ -464,23 +464,35 @@ public:
 
       // Close callback - connection closed
       _transport->onClose(
-        [this](SessionId sid, const TransportErrorInfo &)
+        [this](SessionId sid, const TransportErrorInfo &reason)
         {
-          std::lock_guard<std::mutex> lock(_sessionMutex);
-          auto it = _sessionInfo.find(sid);
-          if (it != _sessionInfo.end())
+          bool wasUpgraded = false;
           {
-            iora::core::Logger::info(
-              "HttpServer: HTTP connection closed from " + it->second.peerAddress + ":" +
-              std::to_string(it->second.peerPort) + " (session " + std::to_string(sid) + ")");
-            _sessionInfo.erase(it);
-            _upgradedSessions.erase(sid);
+            std::lock_guard<std::mutex> lock(_sessionMutex);
+            wasUpgraded = _upgradedSessions.erase(sid) > 0;
+            auto it = _sessionInfo.find(sid);
+            if (it != _sessionInfo.end())
+            {
+              iora::core::Logger::info(
+                "HttpServer: HTTP connection closed from " + it->second.peerAddress + ":" +
+                std::to_string(it->second.peerPort) + " (session " + std::to_string(sid) + ")");
+              _sessionInfo.erase(it);
+            }
+            else
+            {
+              iora::core::Logger::debug("HttpServer: Connection closed (session " +
+                                        std::to_string(sid) + ")");
+            }
           }
-          else
+          // Transport-close teardown hook for upgraded (e.g. WebSocket) sessions,
+          // invoked with NO internal lock held so the override may take its own
+          // mutex and fire a user callback (copy-then-invoke). On an abrupt
+          // RST/FIN with no protocol-level CLOSE — the common real-world case —
+          // this is the ONLY event that reaches the protocol server, so it must
+          // prune per-session state and fire its close callback here (2026-09-11-16).
+          if (wasUpgraded)
           {
-            _upgradedSessions.erase(sid);
-            iora::core::Logger::debug("HttpServer: Connection closed (session " +
-                                      std::to_string(sid) + ")");
+            onUpgradedClose(sid, reason);
           }
         });
 
@@ -513,10 +525,39 @@ public:
     }
   }
 
-  /// \brief Stops the server gracefully.
-  void stop()
+  /// \brief Stops the server gracefully. Idempotent; safe to call repeatedly.
+  /// A subclass that adds state touched by the transport I/O thread or a pool
+  /// worker MUST call quiesceTransport() first in its own destructor (see that
+  /// method) — this public stop() only delegates there.
+  void stop() { quiesceTransport(); }
+
+protected:
+  /// \brief Quiesce the transport I/O thread and drain the worker pool, then
+  /// release the transport. Idempotent and safe to call from a SUBCLASS
+  /// DESTRUCTOR before its own members are torn down: a live I/O-thread
+  /// onUpgradedData/onUpgradedClose or an in-flight pool worker must not touch
+  /// subclass state after it is destroyed (WS-TS1/WS-TS2). Because ~HttpServer
+  /// runs only AFTER the subclass's members are already gone, every HttpServer
+  /// subclass adding such state must call this first in its own dtor; the base
+  /// dtor's stop() call then early-outs here (nothing left to quiesce).
+  void quiesceTransport()
   {
-    iora::core::Logger::debug("HttpServer::stop() - Starting graceful shutdown");
+    // Idempotent early-out keyed on _transport alone: _transport is non-null ONLY
+    // between a successful start() and the Phase-2 reset below, so a null transport
+    // means there is nothing to quiesce — a never-started server, or a second call
+    // (a subclass dtor already quiesced, then ~HttpServer's stop()). Snapshot the
+    // transport under _mutex so Phase 1 can stop() it WITHOUT holding _mutex.
+    std::shared_ptr<Transport> transport;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (!_transport)
+      {
+        return;
+      }
+      transport = _transport;
+    }
+
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Starting graceful shutdown");
 
     // Set shutdown flag atomically to stop new request processing
     _shutdown.store(true);
@@ -524,30 +565,28 @@ public:
     // Give a brief moment for in-flight requests to see the shutdown flag
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // SR-22: _mutex MUST NOT be held across the drain loop. An in-flight worker
-    // re-acquires _mutex (for sendRaw/closeSession/sendRawForSse and the
-    // deferred send-block close); holding _mutex across the drain wait would
-    // deadlock it until the timeout (and drop its close). So: take _mutex
-    // briefly to stop the transport, release it across the drain wait, then
-    // re-acquire it solely for the reset.
+    // SR-22 / LT-12: _mutex MUST NOT be held across transport->stop() NOR across
+    // the drain loop. stop() joins the I/O thread, and the shutdown-drain fires
+    // onClose on that thread — which for upgraded sessions reaches onUpgradedClose
+    // and takes _wsMutex. A peer thread in sendText/sendClose holds _wsMutex and is
+    // waiting on _mutex (the documented _wsMutex -> _mutex send order), so holding
+    // _mutex across stop() would close a 3-way deadlock cycle. Likewise an in-flight
+    // worker re-acquires _mutex (sendRaw/closeSession/sendRawForSse). So: snapshot
+    // the transport under _mutex (above), stop() the copy with NO lock held (the
+    // shared_ptr keeps it alive), drain with no lock, then re-acquire _mutex solely
+    // for the reset.
 
-    // Phase 1 (brief lock): stop the transport so it accepts no new connections.
-    iora::core::Logger::debug("HttpServer::stop() - Stopping transport to "
+    // Phase 1 (no lock held): stop the transport so it accepts no new connections.
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Stopping transport to "
                               "prevent new connections");
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (_transport)
-      {
-        _transport->stop();
-        iora::core::Logger::debug("HttpServer::stop() - Transport stopped gracefully");
-      }
-    }
+    transport->stop();
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Transport stopped gracefully");
 
     // Clear session information (standalone _sessionMutex scope, no _mutex held).
     {
       std::lock_guard<std::mutex> sessionLock(_sessionMutex);
       _sessionInfo.clear();
-      iora::core::Logger::debug("HttpServer::stop() - Cleared session information");
+      iora::core::Logger::debug("HttpServer::quiesceTransport() - Cleared session information");
     }
 
     // Wait for thread pool tasks to complete with a reasonable timeout, holding
@@ -557,7 +596,7 @@ public:
     auto startTime = std::chrono::steady_clock::now();
     const auto maxWaitTime = std::chrono::seconds(2); // Reasonable timeout for production
 
-    iora::core::Logger::debug("HttpServer::stop() - Waiting for handlers to complete (max 2s)");
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Waiting for handlers to complete (max 2s)");
 
     while (_threadPool.getPendingTaskCount() > 0 || _threadPool.getActiveThreadCount() > 0)
     {
@@ -567,7 +606,7 @@ public:
         auto pendingTasks = _threadPool.getPendingTaskCount();
         auto activeTasks = _threadPool.getActiveThreadCount();
         iora::core::Logger::warning(
-          std::string("HttpServer::stop() - Timeout waiting for handlers. ") +
+          std::string("HttpServer::quiesceTransport() - Timeout waiting for handlers. ") +
           "Forcing shutdown with " + std::to_string(pendingTasks) + " pending and " +
           std::to_string(activeTasks) + " active tasks. " +
           "Handlers should use getShutdownChecker() to detect shutdown.");
@@ -576,7 +615,7 @@ public:
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    iora::core::Logger::debug("HttpServer::stop() - Handler wait completed");
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Handler wait completed");
 
     // Phase 2 (re-acquire): reset the transport. Workers deref _transport only
     // under _mutex with the _transport && !_shutdown guard, so a straggler
@@ -586,16 +625,38 @@ public:
       std::lock_guard<std::mutex> lock(_mutex);
       if (_transport)
       {
-        iora::core::Logger::debug("HttpServer::stop() - Resetting transport");
+        iora::core::Logger::debug("HttpServer::quiesceTransport() - Resetting transport");
         _transport.reset();
-        iora::core::Logger::debug("HttpServer::stop() - Transport reset complete");
+        iora::core::Logger::debug("HttpServer::quiesceTransport() - Transport reset complete");
       }
     }
 
-    iora::core::Logger::debug("HttpServer::stop() - Graceful shutdown complete");
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Graceful shutdown complete");
   }
 
-protected:
+  /// \brief Noexcept wrapper around quiesceTransport() for subclass destructors.
+  /// An HttpServer subclass with state touched by the transport I/O thread or a
+  /// pool worker MUST quiesce FIRST in its own destructor (see quiesceTransport),
+  /// and that call must not throw from the (noexcept) destructor — quiesceTransport
+  /// allocates (logging, engine stop) and can throw. This centralizes the
+  /// swallow+log so every such dtor gets the correct incantation; `who` names the
+  /// destructor in the log. (~HttpServer wraps its own stop() separately.)
+  void quiesceTransportNoexcept(const char *who) noexcept
+  {
+    try
+    {
+      quiesceTransport();
+    }
+    catch (const std::exception &e)
+    {
+      iora::core::Logger::error(std::string(who) + " error: " + e.what());
+    }
+    catch (...)
+    {
+      iora::core::Logger::error(std::string(who) + " unknown error");
+    }
+  }
+
   // ── Upgrade support for WebSocket and other protocol upgrades ──────────
 
   /// \brief Mark a session as upgraded (e.g., to WebSocket).
@@ -612,6 +673,21 @@ protected:
                               std::size_t len)
   {
     (void)sid; (void)data; (void)len;
+  }
+
+  /// \brief Called on the transport I/O thread when an UPGRADED session's
+  /// transport connection closes — gracefully or abruptly (TCP RST/FIN) with no
+  /// protocol-level CLOSE. Override in a protocol server (e.g. WebSocketServer)
+  /// to prune per-session state and fire its close callback, which the
+  /// protocol-level CLOSE path may never reach on an abrupt disconnect. The
+  /// transport close reason is supplied so the override can report an accurate
+  /// close code (e.g. a server-initiated ShuttingDown/GCClosed vs a frameless
+  /// peer loss). Invoked with NO internal HttpServer lock held (the caller has
+  /// released _sessionMutex) so the override may take its own mutex and run a
+  /// user callback. The base is a no-op.
+  virtual void onUpgradedClose(SessionId sid, const TransportErrorInfo &reason)
+  {
+    (void)sid; (void)reason;
   }
 
   /// \brief Send raw bytes to a session (for WebSocket frame sending).

@@ -43,7 +43,26 @@ public:
   {
   }
 
-  ~WebhookServer() = default;
+  /// \brief WS-TS2: quiesce the transport and drain the worker pool BEFORE
+  /// _jsonConfig is destroyed. The onJsonGet/onJsonPost handlers run on pool
+  /// workers and read _jsonConfig; ~HttpServer drains the pool only after this
+  /// derived member is already gone, so a worker mid-handler would deref a
+  /// destroyed _jsonConfig. Must come first in this dtor.
+  ///
+  /// NOTE the guarantee is bounded, not absolute: quiesceTransport()'s drain is
+  /// capped (see HttpServer::quiesceTransport) and abandons the pool after the
+  /// timeout, so a handler that ignores getShutdownChecker() and runs past it
+  /// could still be live when _jsonConfig is destroyed. In practice _jsonConfig is
+  /// read only in the brief pre-handler section (size check + parse), which
+  /// completes well within the drain window; the general drain-policy hardening
+  /// (unbounded dtor drain / gate on activeThreadCount==0) is tracked separately.
+  /// quiesceTransport() can throw (allocation/logging); the noexcept wrapper
+  /// swallows so this destructor cannot std::terminate (the base dtor's stop()
+  /// early-outs).
+  ~WebhookServer() override
+  {
+    quiesceTransportNoexcept("~WebhookServer");
+  }
 
   /// \brief Sets the JSON parsing configuration
   void setJsonConfig(const JsonConfig &config)

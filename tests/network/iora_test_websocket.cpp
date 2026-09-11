@@ -239,6 +239,101 @@ TEST_CASE("WS Integration: server _onClose fires exactly once on client close",
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Abrupt client disconnect (TCP FIN/RST, NO WS CLOSE frame): server fires
+// _onClose(1006) exactly once and prunes the session (backlog 2026-09-11-16).
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Integration: abrupt client disconnect fires server _onClose(1006) once and prunes session",
+          "[ws][integration][close][abrupt]")
+{
+  auto port = nextPort();
+  WebSocketServer server("127.0.0.1", port);
+  std::atomic<int> serverCloseCount{0};
+  std::atomic<std::uint16_t> serverCloseCode{0};
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> gotSid{false};
+
+  server.setOnConnect([&](SessionId sid, const std::string&)
+  {
+    serverSid.store(sid);
+    gotSid.store(true);
+  });
+  server.setOnClose([&](SessionId, std::uint16_t code, const std::string&)
+  {
+    serverCloseCode.store(code);
+    serverCloseCount.fetch_add(1);
+  });
+
+  server.start();
+  std::this_thread::sleep_for(100ms);
+
+  auto client = WebSocketClient::create();
+  REQUIRE(client->connect("127.0.0.1", port));
+  REQUIRE(waitFor([&]() { return gotSid.load(); }, 3000ms));
+  SessionId sid = serverSid.load();
+
+  // Abrupt disconnect: drop the client WITHOUT calling disconnect() — ~WebSocketClient
+  // tears the socket down (gracefulClose=false), so the server sees a TCP FIN/RST with
+  // NO WebSocket CLOSE frame. The transport-close hook (onUpgradedClose) is then the
+  // only path that reaches the server, and the reason is PeerClosed -> code 1006.
+  client.reset();
+
+  REQUIRE(waitFor([&]() { return serverCloseCount.load() >= 1; }, 3000ms));
+  REQUIRE(serverCloseCode.load() == 1006);
+
+  // Settle: exactly one callback, and the session is pruned.
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(serverCloseCount.load() == 1);
+  REQUIRE_FALSE(server.isSessionActive(sid));
+
+  server.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Server shutdown with a still-open session: the transport shutdown-drain reaches
+// onUpgradedClose with a server-initiated reason, so the app callback reports
+// RFC 6455 §7.4.1 code 1001 (going away), NOT 1006.
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Integration: server shutdown fires _onClose(1001 going away) for an open session",
+          "[ws][integration][close][shutdown]")
+{
+  auto port = nextPort();
+  WebSocketServer server("127.0.0.1", port);
+  std::atomic<int> serverCloseCount{0};
+  std::atomic<std::uint16_t> serverCloseCode{0};
+  std::atomic<bool> gotSid{false};
+
+  server.setOnConnect([&](SessionId, const std::string&) { gotSid.store(true); });
+  server.setOnClose([&](SessionId, std::uint16_t code, const std::string&)
+  {
+    serverCloseCode.store(code);
+    serverCloseCount.fetch_add(1);
+  });
+
+  server.start();
+  std::this_thread::sleep_for(100ms);
+
+  auto client = WebSocketClient::create();
+  REQUIRE(client->connect("127.0.0.1", port));
+  REQUIRE(waitFor([&]() { return gotSid.load(); }, 3000ms));
+
+  // Stop the server while the session is still open and no CLOSE frame was exchanged.
+  // The engine shutdown-drain fires the transport onClose(ShuttingDown) for the live
+  // session -> onUpgradedClose -> _onClose(1001).
+  server.stop();
+
+  REQUIRE(waitFor([&]() { return serverCloseCount.load() >= 1; }, 3000ms));
+  REQUIRE(serverCloseCode.load() == 1001);
+
+  // Settle: exactly one callback for this session (at-most-once across shutdown).
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(serverCloseCount.load() == 1);
+
+  client.reset();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Oversized frame -> server 1009 close + session teardown
 // ══════════════════════════════════════════════════════════════════════════════
 
