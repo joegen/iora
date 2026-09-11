@@ -9,11 +9,13 @@
 
 #include "iora/network/http_server.hpp"
 #include "iora/network/websocket_frame.hpp"
+#include "iora/core/string_utils.hpp"
 #include "iora/crypto/secure_rng.hpp"
 #include "iora/util/base64.hpp"
 
 #include <functional>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -120,18 +122,25 @@ public:
     sendRaw(sid, wire.data(), wire.size());
   }
 
-  /// \brief Send a Close frame to a WebSocket session.
+  /// \brief Send a Close frame to a WebSocket session. IDEMPOTENT and
+  /// session-checked: if the session is unknown OR a CLOSE has already been sent,
+  /// this returns WITHOUT putting a second CLOSE on the wire. Every error-close
+  /// call site therefore fires at most one Close frame — the closeSent flag is the
+  /// single wire-level gate shared with the inbound-CLOSE echo.
   void sendClose(SessionId sid, std::uint16_t code = 1000,
                  const std::string& reason = "")
   {
+    // Hold _wsMutex across serialize + sendRaw (as sendText/sendBinary/sendPing
+    // do) so the closeSent claim and the wire-write are atomic w.r.t. the
+    // inbound-CLOSE teardown, closing a benign echo-drop race. Preserves the
+    // _wsMutex -> HttpServer::_mutex lock order established by sendText.
+    std::lock_guard<std::mutex> lock(_wsMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end() || it->second.closeSent)
     {
-      std::lock_guard<std::mutex> lock(_wsMutex);
-      auto it = _sessions.find(sid);
-      if (it != _sessions.end())
-      {
-        it->second.closeSent = true;
-      }
+      return; // unknown session, or a CLOSE was already sent — send at most once
     }
+    it->second.closeSent = true;
 
     auto frame = WebSocketFrame::makeClose(code, reason);
     auto wire = frame.serialize(false);
@@ -149,17 +158,15 @@ protected:
     auto wsKey = req.get_header_value("Sec-WebSocket-Key");
     auto wsVersion = req.get_header_value("Sec-WebSocket-Version");
 
-    // Case-insensitive check for "websocket" in Upgrade
-    std::string upgradeLower = upgradeVal;
-    std::transform(upgradeLower.begin(), upgradeLower.end(), upgradeLower.begin(), ::tolower);
-    if (upgradeLower != "websocket")
+    // Case-insensitive check for "websocket" in Upgrade (WS-W7: reuse the
+    // foundation ASCII case-fold instead of a hand-rolled std::transform lambda).
+    if (!iora::core::StringUtils::iequals(upgradeVal, "websocket"))
     {
       return false; // not a WebSocket upgrade
     }
 
     // Validate Connection contains "Upgrade" (case-insensitive)
-    std::string connLower = connectionVal;
-    std::transform(connLower.begin(), connLower.end(), connLower.begin(), ::tolower);
+    std::string connLower = iora::core::StringUtils::toLower(connectionVal);
     if (connLower.find("upgrade") == std::string::npos)
     {
       res.status = 400;
@@ -276,18 +283,57 @@ protected:
     std::size_t offset = 0;
     while (offset < localBuffer.size())
     {
-      core::BufferView view(localBuffer.data() + offset,
-                            localBuffer.size() - offset);
-      std::size_t consumed = 0;
-      auto frame = WebSocketFrame::parse(view, consumed);
-
-      if (!frame)
+      // Wrap the per-frame parse + dispatch so a std::bad_alloc / any codec throw
+      // closes THIS ONE session and breaks the loop — it MUST NOT escape into the
+      // transport I/O thread (WS-C1 defense-in-depth).
+      try
       {
+        core::BufferView view(localBuffer.data() + offset,
+                              localBuffer.size() - offset);
+        std::size_t consumed = 0;
+        WsParseError perr;
+        auto frame = WebSocketFrame::parse(view, consumed, _maxFrameSize, &perr);
+
+        if (!frame)
+        {
+          if (perr.isError)
+          {
+            sendClose(sid, perr.closeCode, "");
+            if (_onError)
+            {
+              _onError(sid, "protocol error: frame rejected (1002/1009)");
+            }
+            eraseAndCloseSession(sid);
+          }
+          break;
+        }
+
+        offset += consumed;
+        // handleFrame returns true when it tore the session down (inbound CLOSE,
+        // unmasked frame, reserved opcode, fragment / oversize / UTF-8 error).
+        // Stop parsing immediately so no further frame is dispatched on — or data
+        // accumulated for — a closed session (WS HIGH: double-callback / data-
+        // after-close).
+        if (handleFrame(sid, *frame))
+        {
+          break;
+        }
+      }
+      catch (...)
+      {
+        // The recovery itself allocates (sendClose serialize / make_shared) and
+        // can throw std::bad_alloc; wrap it so nothing escapes into the transport
+        // I/O thread and defeats this catch (WS-C1 defense-in-depth).
+        try
+        {
+          sendClose(sid, 1009, "");
+          eraseAndCloseSession(sid);
+        }
+        catch (...)
+        {
+        }
         break;
       }
-
-      offset += consumed;
-      handleFrame(sid, *frame);
     }
 
     // Put unconsumed remainder back
@@ -308,16 +354,42 @@ protected:
   }
 
 private:
-  void handleFrame(SessionId sid, const WebSocketFrame& frame)
+  /// \brief Erase the per-session state under _wsMutex then tear the transport
+  /// session down — the shared teardown for a protocol-error / bad-alloc close,
+  /// mirroring the inbound-CLOSE handling.
+  void eraseAndCloseSession(SessionId sid)
   {
+    {
+      std::lock_guard<std::mutex> lock(_wsMutex);
+      _sessions.erase(sid);
+    }
+    closeSession(sid);
+  }
+
+  /// \brief Dispatch one parsed frame. Returns true iff the session was torn down
+  /// and the parse loop MUST stop (no further frame may be dispatched on it).
+  /// Normal data / ping / pong return false.
+  bool handleFrame(SessionId sid, const WebSocketFrame& frame)
+  {
+    // WS-M1 (RFC 6455 §5.1): the server MUST close on ANY unmasked client frame.
+    if (!frame.masked)
+    {
+      sendClose(sid, 1002, "Unmasked frame");
+      if (_onError)
+      {
+        _onError(sid, "client frame not masked");
+      }
+      eraseAndCloseSession(sid);
+      return true;
+    }
+
     switch (frame.opcode)
     {
     case WsOpcode::TEXT:
     case WsOpcode::BINARY:
     case WsOpcode::CONTINUATION:
     {
-      handleDataFrame(sid, frame);
-      break;
+      return handleDataFrame(sid, frame);
     }
     case WsOpcode::PING:
     {
@@ -325,26 +397,43 @@ private:
       auto pong = WebSocketFrame::makePong(frame.payload);
       auto wire = pong.serialize(false);
       sendRaw(sid, wire.data(), wire.size());
-      break;
+      return false;
     }
     case WsOpcode::PONG:
     {
       // No-op — application can track keep-alive if needed
-      break;
+      return false;
     }
     case WsOpcode::CLOSE:
     {
+      // Validate the inbound CLOSE payload (RFC 6455 §5.5.1 / §7.4). A malformed
+      // length (1 byte), an invalid/reserved code, or a non-UTF-8 reason is a
+      // protocol error: close with the failCode and tear down WITHOUT firing the
+      // normal _onClose echo.
+      auto v = frame.validateClose();
+      if (!v.ok)
+      {
+        sendClose(sid, v.failCode, "");
+        if (_onError)
+        {
+          _onError(sid, "invalid CLOSE frame");
+        }
+        eraseAndCloseSession(sid);
+        return true;
+      }
+
       auto [code, reason] = frame.closePayload();
 
-      // Only echo close if we haven't already sent one (prevents infinite loop)
+      // WS-M4 + WS-L1: echo computed from the RECEIVED close (never blindly
+      // reflect the peer's code), closeSent-guarded so we echo at most once.
       {
         std::lock_guard<std::mutex> lock(_wsMutex);
         auto it = _sessions.find(sid);
         if (it != _sessions.end() && !it->second.closeSent)
         {
           it->second.closeSent = true;
-          auto closeResp = WebSocketFrame::makeClose(code, reason);
-          auto wire = closeResp.serialize(false);
+          auto response = WebSocketFrame::makeCloseEcho(frame);
+          auto wire = response.serialize(false);
           sendRaw(sid, wire.data(), wire.size());
         }
       }
@@ -360,22 +449,28 @@ private:
       }
 
       closeSession(sid);
-      break;
+      return true;
     }
     default:
     {
-      // Unknown/reserved opcode — protocol error (1002)
+      // Unknown/reserved opcode. parse() already rejects reserved opcodes (1002),
+      // so this is a safety net: close and tear down through the shared path so
+      // fragment state is dropped with the session entry.
       sendClose(sid, 1002, "Unsupported opcode");
       if (_onError)
       {
         _onError(sid, "Received reserved/unknown opcode");
       }
-      break;
+      eraseAndCloseSession(sid);
+      return true;
     }
     }
   }
 
-  void handleDataFrame(SessionId sid, const WebSocketFrame& frame)
+  /// \brief Accumulate/deliver a data frame. Returns true iff the session was torn
+  /// down (fragment / oversize / UTF-8 protocol error) and the parse loop must
+  /// stop; false on a normal (possibly incomplete-message) data frame.
+  bool handleDataFrame(SessionId sid, const WebSocketFrame& frame)
   {
     bool isStart = (frame.opcode == WsOpcode::TEXT || frame.opcode == WsOpcode::BINARY);
     bool isContinuation = (frame.opcode == WsOpcode::CONTINUATION);
@@ -383,6 +478,7 @@ private:
     // Accumulate under lock, then deliver outside lock
     bool messageComplete = false;
     bool tooLarge = false;
+    bool fragmentError = false; // WS-M5 fragmentation-sequence violation
     WsOpcode messageOpcode = WsOpcode::CONTINUATION;
     std::vector<std::uint8_t> messagePayload;
 
@@ -391,36 +487,74 @@ private:
       auto it = _sessions.find(sid);
       if (it == _sessions.end())
       {
-        return;
+        return true; // session already gone — stop the parse loop
       }
       auto& session = it->second;
 
+      // WS-M5: enforce the fragmentation sequence. A new data frame (TEXT/BINARY)
+      // arriving mid-fragment, or a CONTINUATION with no fragment in progress, is
+      // a protocol error (RFC 6455 §5.4).
       if (isStart)
       {
-        session.fragmentOpcode = frame.opcode;
-        session.fragmentBuffer = frame.payload;
+        if (session.fragmentInProgress)
+        {
+          fragmentError = true; // new data frame mid-fragment
+        }
+        else
+        {
+          session.fragmentOpcode = frame.opcode;
+          session.fragmentBuffer = frame.payload;
+          session.fragmentInProgress = !frame.fin;
+        }
       }
       else if (isContinuation)
       {
-        session.fragmentBuffer.insert(session.fragmentBuffer.end(),
-                                       frame.payload.begin(), frame.payload.end());
+        if (!session.fragmentInProgress)
+        {
+          fragmentError = true; // stray continuation
+        }
+        else
+        {
+          session.fragmentBuffer.insert(session.fragmentBuffer.end(),
+                                         frame.payload.begin(), frame.payload.end());
+          if (frame.fin)
+          {
+            session.fragmentInProgress = false;
+          }
+        }
       }
 
-      if (session.fragmentBuffer.size() > _maxFrameSize)
+      if (!fragmentError)
       {
-        tooLarge = true;
-      }
-      else if (frame.fin)
-      {
-        messageComplete = true;
-        messageOpcode = session.fragmentOpcode;
-        messagePayload = std::move(session.fragmentBuffer);
-        session.fragmentBuffer.clear();
-        session.fragmentOpcode = WsOpcode::CONTINUATION;
+        if (session.fragmentBuffer.size() > _maxFrameSize)
+        {
+          tooLarge = true;
+        }
+        else if (frame.fin)
+        {
+          messageComplete = true;
+          messageOpcode = session.fragmentOpcode;
+          messagePayload = std::move(session.fragmentBuffer);
+          session.fragmentBuffer.clear();
+          session.fragmentOpcode = WsOpcode::CONTINUATION;
+        }
       }
     }
 
-    // Fire callbacks outside lock
+    // Fire callbacks outside lock. Every error path routes through
+    // eraseAndCloseSession (which drops the whole session entry, including
+    // fragmentBuffer) so a torn-down session can never keep accumulating data.
+    if (fragmentError)
+    {
+      sendClose(sid, 1002, "Protocol error");
+      if (_onError)
+      {
+        _onError(sid, "fragmentation protocol error");
+      }
+      eraseAndCloseSession(sid);
+      return true;
+    }
+
     if (tooLarge)
     {
       sendClose(sid, 1009, "Message Too Big");
@@ -428,19 +562,23 @@ private:
       {
         _onError(sid, "Message exceeded maxFrameSize");
       }
-      return;
+      eraseAndCloseSession(sid);
+      return true;
     }
 
     if (messageComplete)
     {
       if (messageOpcode == WsOpcode::TEXT)
       {
-        WebSocketFrame temp;
-        temp.payload = messagePayload;
-        if (!temp.isValidUtf8())
+        if (!WebSocketFrame::isValidUtf8(messagePayload))
         {
           sendClose(sid, 1007, "Invalid UTF-8");
-          return;
+          if (_onError)
+          {
+            _onError(sid, "invalid UTF-8 in text message");
+          }
+          eraseAndCloseSession(sid);
+          return true;
         }
 
         if (_onTextMessage)
@@ -457,13 +595,18 @@ private:
         }
       }
     }
+    return false;
   }
 
   struct WsSessionState
   {
+    // Inbound accumulation buffer. Its growth is bounded: parse() rejects any
+    // frame whose declared length exceeds maxFrameSize (close 1009) BEFORE the
+    // payload is accumulated, so a peer cannot grow this without bound.
     std::vector<std::uint8_t> buffer;
     std::vector<std::uint8_t> fragmentBuffer;
     WsOpcode fragmentOpcode = WsOpcode::CONTINUATION;
+    bool fragmentInProgress = false; // WS-M5: a fragmented message is mid-assembly
     std::string negotiatedProtocol;
     bool closeSent = false; // prevents double close-frame echo
   };

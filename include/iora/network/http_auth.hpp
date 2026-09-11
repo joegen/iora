@@ -12,6 +12,7 @@
 #include "iora/util/base64.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <initializer_list>
 #include <stdexcept>
@@ -40,6 +41,24 @@ inline void secureZero(std::string &s)
     }
   }
   s.clear();
+}
+
+/// \brief Best-effort overwrite of a decoded-credential byte buffer, matching
+/// the std::string overload above: the base64-decoded `user:pass` bytes are
+/// wiped in place through a volatile pointer (so the compiler may not elide the
+/// writes) before the vector is destroyed, so cleartext does not linger in
+/// freed heap memory (defense-in-depth).
+inline void secureZero(std::vector<std::uint8_t> &v)
+{
+  if (!v.empty())
+  {
+    volatile std::uint8_t *p = v.data();
+    for (std::size_t i = 0; i < v.size(); ++i)
+    {
+      p[i] = 0;
+    }
+  }
+  v.clear();
 }
 
 /// \brief RAII scrubber: wipes a set of credential-bearing strings on scope
@@ -224,7 +243,7 @@ inline HttpServer::Handler requireBasicAuth(
     token = auth.substr(tokBegin, tokEnd - tokBegin);
 
     // 4. Decode the token (standard alphabet). Undecodable -> 401 (D-3).
-    const auto bytes = util::Base64::decode(token);
+    auto bytes = util::Base64::decode(token);
     if (!bytes)
     {
       emit401();
@@ -232,8 +251,12 @@ inline HttpServer::Handler requireBasicAuth(
     }
 
     // 5. Split on the FIRST ':' into user/pass; no ':' -> 401 (RFC 7617: the
-    //    user-id MUST NOT contain ':'; the password MAY).
+    //    user-id MUST NOT contain ':'; the password MAY). The decoded buffer
+    //    holds the cleartext credential, so wipe it in place as soon as it has
+    //    been copied into `cred` — the CredentialScrubber covers the strings
+    //    but not this vector (defense-in-depth).
     cred.assign(bytes->begin(), bytes->end());
+    detail::secureZero(*bytes);
     const std::size_t colon = cred.find(':');
     if (colon == std::string::npos)
     {

@@ -191,6 +191,11 @@ public:
   void setOnError(ErrorCallback cb) { _onError = std::move(cb); }
   void setOnStateChange(StateCallback cb) { _onStateChange = std::move(cb); }
 
+  /// \brief Cap on a single inbound frame's declared length and on a reassembled
+  /// message (WS-L3). MUST be set before connect() (same set-once-before-connect
+  /// contract as the callbacks — it is read lock-free on the I/O thread).
+  void setMaxFrameSize(std::size_t maxBytes) { _maxFrameSize = maxBytes; }
+
   // ── Connect / Disconnect ───────────────────────────────────────────────
 
   /// \brief Connect to a WebSocket server. Blocks until the handshake completes
@@ -540,6 +545,7 @@ private:
       _buffer.clear();
       _fragmentBuffer.clear();
       _fragmentOpcode = WsOpcode::CONTINUATION;
+      _fragmentInProgress = false;
     }
     _upgradeComplete.store(false);
     _closeEchoed.store(false); // re-arm the one-shot CLOSE echo for this connection
@@ -801,19 +807,64 @@ private:
     std::size_t offset = 0;
     while (offset < localBuffer.size())
     {
-      core::BufferView view(localBuffer.data() + offset,
-                            localBuffer.size() - offset);
-      std::size_t consumed = 0;
-      auto frame = WebSocketFrame::parse(view, consumed);
-      if (!frame) break;
-      offset += consumed;
+      // Wrap the per-frame parse + dispatch so a std::bad_alloc / any codec throw
+      // closes THIS connection and breaks the loop — it MUST NOT escape into the
+      // client I/O thread (WS-C1 defense-in-depth).
+      try
+      {
+        core::BufferView view(localBuffer.data() + offset,
+                              localBuffer.size() - offset);
+        std::size_t consumed = 0;
+        WsParseError perr;
+        auto frame = WebSocketFrame::parse(view, consumed, _maxFrameSize, &perr);
+        if (!frame)
+        {
+          if (perr.isError)
+          {
+            closeWithError(perr.closeCode);
+          }
+          break;
+        }
+        offset += consumed;
 
-      // handleFrame fires callbacks — must be outside lock
-      handleFrame(*frame);
+        // WS-L2 (RFC 6455 §5.1): a client MUST reject a MASKED server frame.
+        if (frame->masked)
+        {
+          closeWithError(1002);
+          break;
+        }
+
+        // handleFrame fires callbacks — must be outside lock
+        handleFrame(*frame);
+      }
+      catch (...)
+      {
+        // The recovery itself allocates (closeWithError serialize / make_shared)
+        // and can throw std::bad_alloc; wrap it so nothing escapes into the client
+        // I/O thread and defeats this catch (WS-C1 defense-in-depth).
+        try
+        {
+          closeWithError(1009);
+        }
+        catch (...)
+        {
+        }
+        break;
+      }
+
+      // Stop parsing once the connection has closed (CLOSE received, or an error
+      // close above) — no frames follow a CLOSE (RFC 6455 §5.5.1).
+      if (_state.load() == WebSocketState::CLOSED)
+      {
+        break;
+      }
     }
 
-    // Step 4: Put unconsumed remainder back under lock
-    if (offset < localBuffer.size())
+    // Step 4: Put unconsumed remainder back under lock. Skip the write-back once
+    // the connection has closed (closeWithError tore the transport down mid-loop):
+    // stale bytes must not accumulate on a dead connection.
+    if (offset < localBuffer.size()
+        && _state.load() != WebSocketState::CLOSED)
     {
       std::lock_guard<std::mutex> lock(_dataMutex);
       std::vector<std::uint8_t> remainder(
@@ -850,6 +901,17 @@ private:
     }
     case WsOpcode::CLOSE:
     {
+      // Validate the inbound CLOSE payload (RFC 6455 §5.5.1 / §7.4). A malformed
+      // length (1 byte), an invalid/reserved code, or a non-UTF-8 reason is a
+      // protocol error — close with the failCode and do NOT fire the normal
+      // _onClose echo (mirrors the server's validateClose handling).
+      auto v = frame.validateClose();
+      if (!v.ok)
+      {
+        closeWithError(v.failCode);
+        break;
+      }
+
       auto [code, reason] = frame.closePayload();
 
       // Echo the CLOSE frame back per RFC 6455 §5.5.1 EXACTLY ONCE. A one-shot
@@ -857,9 +919,17 @@ private:
       // check was dead (CLOSING is never stored), so a peer that sent two CLOSE
       // frames in one TCP segment would have been echoed twice. _closeEchoed is
       // reset per connection in doConnect().
+      //
+      // WS-M4 + WS-L1: the echo is computed from the RECEIVED close via
+      // makeCloseEcho — no code -> echo empty (never 1005); a valid received code
+      // -> normal-closure ack (1000); a reserved/invalid received code -> protocol
+      // error (1002). Never put 1005/1006/1015 on the wire.
       if (!_closeEchoed.exchange(true))
       {
-        sendClose(code, reason);
+        auto response = WebSocketFrame::makeCloseEcho(frame);
+        generateMaskKey(response.maskKey);
+        auto wire = response.serialize(true); // client MUST mask
+        sendRawBytes(wire.data(), wire.size());
       }
 
       setState(WebSocketState::CLOSED);
@@ -870,8 +940,57 @@ private:
       break;
     }
     default:
+      // parse() already rejects reserved opcodes (1002) before dispatch, so the
+      // loop closes before reaching here; this is a safety net so an undefined
+      // opcode can never be silently ignored.
+      closeWithError(1002);
       break;
     }
+  }
+
+  /// \brief Close the connection due to an inbound protocol error / oversize
+  /// message / codec throw (WS-C1 / WS-L2 / WS-L3 / WS-L4 — mirror of the server's
+  /// eraseAndCloseSession). Sends a CLOSE frame with \p code exactly once (masked,
+  /// client-side), transitions to CLOSED so a subsequent transport drop does NOT
+  /// auto-reconnect, notifies the application via _onError, and tears the
+  /// transport down. Runs on the I/O thread; teardownTransport skips stop()/join
+  /// there, so this is safe from within a dispatched onData callback.
+  void closeWithError(std::uint16_t code)
+  {
+    if (!_closeEchoed.exchange(true))
+    {
+      sendClose(code, "");
+    }
+    setState(WebSocketState::CLOSED);
+
+    // Defense-in-depth: clear the reconnect controller so a queued or in-flight
+    // reconnect cannot resurrect this connection after a terminal protocol-error
+    // close. The CLOSED-state check in handleDisconnect already suppresses the
+    // auto-reconnect on the transport drop teardownTransport triggers below; this
+    // additionally makes a CV-idle worker exit. _transportMutex is released BEFORE
+    // rc->m is taken (never nested), matching requestReconnect's lock order.
+    {
+      std::shared_ptr<ReconnectControl> rc;
+      {
+        std::lock_guard<std::mutex> lk(_transportMutex);
+        rc = _rc;
+      }
+      if (rc)
+      {
+        {
+          std::lock_guard<std::mutex> lk(rc->m);
+          rc->shouldRun.store(false);
+          rc->requested = false;
+        }
+        rc->cv.notify_one();
+      }
+    }
+
+    if (_onError)
+    {
+      _onError("WebSocket closed on protocol error (code " + std::to_string(code) + ")");
+    }
+    teardownTransport(/*gracefulClose=*/false);
   }
 
   void handleDataFrame(const WebSocketFrame& frame)
@@ -885,33 +1004,84 @@ private:
     WsOpcode opcode = WsOpcode::CONTINUATION;
     std::vector<std::uint8_t> payload;
     bool deliver = false;
+    bool fragmentError = false; // WS-M5 fragmentation-sequence violation
+    bool tooLarge = false;      // WS-L3 reassembled message exceeded _maxFrameSize
     {
       std::lock_guard<std::mutex> lock(_dataMutex);
+
+      // WS-M5: enforce the fragmentation sequence (RFC 6455 §5.4). A new data
+      // frame (TEXT/BINARY) mid-fragment, or a CONTINUATION with no fragment in
+      // progress, is a protocol error.
       if (isStart)
       {
-        _fragmentOpcode = frame.opcode;
-        _fragmentBuffer = frame.payload;
+        if (_fragmentInProgress)
+        {
+          fragmentError = true; // new data frame mid-fragment
+        }
+        else
+        {
+          _fragmentOpcode = frame.opcode;
+          _fragmentBuffer = frame.payload;
+          _fragmentInProgress = !frame.fin;
+        }
       }
       else if (isCont)
       {
-        _fragmentBuffer.insert(_fragmentBuffer.end(),
-                               frame.payload.begin(), frame.payload.end());
+        if (!_fragmentInProgress)
+        {
+          fragmentError = true; // stray continuation
+        }
+        else
+        {
+          _fragmentBuffer.insert(_fragmentBuffer.end(),
+                                 frame.payload.begin(), frame.payload.end());
+          if (frame.fin)
+          {
+            _fragmentInProgress = false;
+          }
+        }
       }
 
-      if (frame.fin)
+      if (!fragmentError)
       {
-        opcode = _fragmentOpcode;
-        payload = std::move(_fragmentBuffer);
-        _fragmentBuffer.clear();
-        _fragmentOpcode = WsOpcode::CONTINUATION;
-        deliver = true;
+        if (_fragmentBuffer.size() > _maxFrameSize)
+        {
+          tooLarge = true;
+        }
+        else if (frame.fin)
+        {
+          opcode = _fragmentOpcode;
+          payload = std::move(_fragmentBuffer);
+          _fragmentBuffer.clear();
+          _fragmentOpcode = WsOpcode::CONTINUATION;
+          deliver = true;
+        }
       }
+    }
+
+    if (fragmentError)
+    {
+      closeWithError(1002);
+      return;
+    }
+    if (tooLarge)
+    {
+      closeWithError(1009);
+      return;
     }
 
     if (deliver)
     {
       if (opcode == WsOpcode::TEXT)
       {
+        // WS-L4: validate UTF-8 before delivering a completed TEXT message; on
+        // failure close 1007 and do not deliver. Zero-copy static overload (mirrors
+        // the server site) — no throwaway WebSocketFrame / payload copy.
+        if (!WebSocketFrame::isValidUtf8(payload))
+        {
+          closeWithError(1007);
+          return;
+        }
         if (_onTextMessage)
         {
           std::string text(payload.begin(), payload.end());
@@ -985,12 +1155,15 @@ private:
   /// stop() is SKIPPED UNCONDITIONALLY — the loop terminator is the last-ref drop
   /// of the snapshot `t` (-> ~Transport deferred-self-destruct), not stop().
   ///
-  /// LEGAL I/O-thread entry points: ONLY the dispatched transport callbacks
-  /// onClose (handleDisconnect) and onError, whose frames sit on the loop's
-  /// event-processing stack so `while(_running)` re-checks on unwind without a
-  /// fresh epoll wakeup. A future I/O-thread path that drops the last Transport
-  /// ref OUTSIDE callback dispatch would leave the loop blocked in epoll_wait —
-  /// catch it in review.
+  /// LEGAL I/O-thread entry points: the dispatched transport callbacks onClose
+  /// (handleDisconnect) and onError, AND onData -> handleData -> closeWithError ->
+  /// teardownTransport (an inbound protocol-error / oversize / codec-throw close;
+  /// verified safe — the onIo gate below skips stop()/join on the I/O thread, and
+  /// the last-Transport-ref drop terminates the loop on unwind). All of these sit
+  /// on the loop's event-processing stack so `while(_running)` re-checks on unwind
+  /// without a fresh epoll wakeup. A future I/O-thread path that drops the last
+  /// Transport ref OUTSIDE callback dispatch would leave the loop blocked in
+  /// epoll_wait — catch it in review.
   void teardownTransport(bool gracefulClose, std::uint16_t code = 1000,
                          const std::string& reason = "") noexcept
   {
@@ -1222,6 +1395,12 @@ private:
   // Fragment reassembly (protected by _dataMutex)
   std::vector<std::uint8_t> _fragmentBuffer;
   WsOpcode _fragmentOpcode = WsOpcode::CONTINUATION;
+  bool _fragmentInProgress = false; // WS-M5: a fragmented message is mid-assembly
+
+  // Cap on a single inbound frame's declared length and on a reassembled message
+  // (WS-L3). Set-once-before-connect (see setMaxFrameSize); read lock-free on the
+  // I/O thread in handleData and under _dataMutex in handleDataFrame.
+  std::size_t _maxFrameSize = 16u * 1024u * 1024u;
 
   // Connect-handshake synchronization. NOT one of the leaf group locks; released
   // before any stop()/teardown (never held across them).

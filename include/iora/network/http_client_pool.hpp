@@ -76,7 +76,7 @@ public:
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // Forward all HttpClient blocking operations
+  // Forward HttpClient operations (blocking and async)
   // ═══════════════════════════════════════════════════════════════
 
   /// \brief Perform blocking HTTP GET request
@@ -128,6 +128,42 @@ public:
     return _client->postFile(url, fieldName, filePath, headers, maxRetries);
   }
 
+  /// \brief Perform blocking HTTP HEAD request
+  HttpClient::Response head(const std::string &url,
+                            const std::map<std::string, std::string> &headers = {},
+                            int maxRetries = 0)
+  {
+    validateClient();
+    return _client->head(url, headers, maxRetries);
+  }
+
+  /// \brief Stream HTTP response via callback (for server-sent events, etc.)
+  void postStream(const std::string &url, const parsers::Json &body,
+                  const std::map<std::string, std::string> &headers,
+                  const std::function<void(const std::string &)> &onChunk, int maxRetries = 0)
+  {
+    validateClient();
+    _client->postStream(url, body, headers, onChunk, maxRetries);
+  }
+
+  /// \brief Perform asynchronous HTTP GET request
+  core::PooledFuture<HttpClient::Response>
+  getAsync(const std::string &url, const std::map<std::string, std::string> &headers = {},
+           int maxRetries = 0)
+  {
+    validateClient();
+    return _client->getAsync(url, headers, maxRetries);
+  }
+
+  /// \brief Perform asynchronous HTTP POST request with JSON body
+  core::PooledFuture<HttpClient::Response>
+  postJsonAsync(const std::string &url, const parsers::Json &body,
+                const std::map<std::string, std::string> &headers = {}, int maxRetries = 0)
+  {
+    validateClient();
+    return _client->postJsonAsync(url, body, headers, maxRetries);
+  }
+
   /// \brief Check if client is valid (not returned to pool)
   bool isValid() const
   {
@@ -148,12 +184,13 @@ public:
     return *_client;
   }
 
-  /// \brief Configure TLS for this client
-  void setTlsConfig(const HttpClient::TlsConfig &tlsConfig)
-  {
-    validateClient();
-    _client->setTlsConfig(tlsConfig);
-  }
+  // CLI-F5: no setTlsConfig forwarder. HttpClient::setTlsConfig throws
+  // std::logic_error once the transport is initialized, and a pooled client is
+  // reused (its transport comes up on first request), so forwarding it always
+  // threw on a reused client. TLS for pooled clients is a construction-time
+  // concern: set HttpClientPool::Config::tlsConfig (applied in createClient
+  // before first use) or use a clientConfigurer. Advanced callers that truly need
+  // the raw handle can still reach client().setTlsConfig() on a fresh client.
 
 private:
   friend class HttpClientPool;
@@ -226,7 +263,12 @@ public:
     /// Enable HTTP keep-alive
     bool enableKeepAlive = true;
 
-    /// Enable gzip compression
+    /// RESERVED AND INERT: HttpClient has no compression path — no request/
+    /// response gzip logic exists — so this field is read by NOTHING (createClient
+    /// does not copy it, and HttpClient::Config has no corresponding field). It is
+    /// retained only for source/ABI stability. Do not rely on it; adding
+    /// compression would require a design pass, not merely honoring this flag
+    /// (CLI-F2).
     bool enableCompression = false;
 
     /// Whole-exchange deadline mirrored onto each pooled HttpClient
@@ -236,6 +278,16 @@ public:
     /// (tracker 2026-07-26-10 task-1.10 — the client field alone was
     /// unreachable through the pool).
     std::chrono::milliseconds totalRequestTimeout{0};
+
+    /// Lease-acquire deadline mirrored onto each pooled HttpClient
+    /// (HttpClient::Config::leaseAcquireTimeout). Zero (the default) waits
+    /// indefinitely for the per-host connection lease. This must be set to a
+    /// positive value ALONGSIDE totalRequestTimeout to use a pooled client's
+    /// async API: getAsync/postJsonAsync reject an unbounded request (both
+    /// bounds > 0 is HttpClient's DP-13 admission gate), and createClient did not
+    /// previously copy this field so it stayed 0 and the async path was
+    /// unreachable through the pool (CLI-F1).
+    std::chrono::milliseconds leaseAcquireTimeout{0};
 
     /// RESERVED AND INERT (defect_5): neither the pool nor HttpClient follows
     /// redirects — no Location / 3xx logic exists. These two fields are retained
@@ -468,6 +520,11 @@ private:
       clientConfig.requestTimeout = _config.requestTimeout;
       clientConfig.connectTimeout = _config.connectionTimeout;
       clientConfig.totalRequestTimeout = _config.totalRequestTimeout;
+      // CLI-F1: mirror the lease-acquire deadline so a pooled client's async API
+      // is reachable. rejectUnboundedPooledRequest gates getAsync/postJsonAsync on
+      // both totalRequestTimeout > 0 AND leaseAcquireTimeout > 0; without this copy
+      // leaseAcquireTimeout stayed 0 and the async path always rejected.
+      clientConfig.leaseAcquireTimeout = _config.leaseAcquireTimeout;
       clientConfig.followRedirects = _config.followRedirects;
       clientConfig.maxRedirects = _config.maxRedirects;
       clientConfig.userAgent = _config.userAgent;

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace iora {
@@ -35,6 +36,14 @@ inline bool isControlFrame(WsOpcode op)
   return op == WsOpcode::CLOSE || op == WsOpcode::PING || op == WsOpcode::PONG;
 }
 
+/// \brief Distinguishes an incomplete buffer from a protocol error when parse()
+/// returns std::nullopt.
+struct WsParseError
+{
+  bool isError = false;        // false => "incomplete, need more bytes"; true => protocol error, close
+  std::uint16_t closeCode = 0; // 1002 protocol error, 1009 message too big
+};
+
 /// \brief Parsed WebSocket frame.
 struct WebSocketFrame
 {
@@ -44,15 +53,45 @@ struct WebSocketFrame
   std::uint8_t maskKey[4] = {0, 0, 0, 0};
   std::vector<std::uint8_t> payload;
 
-  /// \brief Parse a frame from raw bytes.
-  /// Returns nullopt if the buffer is incomplete. Sets consumed to bytes used.
+  /// \brief Default cap on a single frame's declared payload length (64 MiB).
+  static constexpr std::size_t kDefaultMaxFrameSize = 64u * 1024u * 1024u;
+
+  /// \brief Parse a frame from raw bytes (tri-state).
+  ///
+  /// Sets \p consumed and, when \p outError is non-null, \p *outError on every
+  /// path:
+  ///   - Ok: returns the frame; consumed = bytes used; outError->isError = false.
+  ///   - Incomplete (need more bytes): returns nullopt; consumed = 0;
+  ///     outError->isError = false.
+  ///   - ProtocolError: returns nullopt; consumed = 0; outError->{isError = true,
+  ///     closeCode = ...} (1002 protocol error, 1009 message too big).
   static std::optional<WebSocketFrame> parse(core::BufferView data,
-                                             std::size_t& consumed)
+                                             std::size_t& consumed,
+                                             std::size_t maxFrameSize = kDefaultMaxFrameSize,
+                                             WsParseError* outError = nullptr)
   {
     consumed = 0;
+    if (outError != nullptr)
+    {
+      outError->isError = false;
+      outError->closeCode = 0;
+    }
+
+    auto protocolError = [&](std::uint16_t code) -> std::optional<WebSocketFrame>
+    {
+      consumed = 0;
+      if (outError != nullptr)
+      {
+        outError->isError = true;
+        outError->closeCode = code;
+      }
+      return std::nullopt;
+    };
+
+    // 1. Need at least the 2-byte fixed header.
     if (data.size() < 2)
     {
-      return std::nullopt;
+      return std::nullopt; // incomplete
     }
 
     WebSocketFrame frame;
@@ -62,60 +101,97 @@ struct WebSocketFrame
     std::uint8_t byte0 = data[pos++];
     frame.fin = (byte0 & 0x80) != 0;
     std::uint8_t rsv = (byte0 >> 4) & 0x07;
+    frame.opcode = static_cast<WsOpcode>(byte0 & 0x0F);
+
+    // 2. RSV bits set without a negotiated extension — protocol error (RFC 6455 §5.2).
     if (rsv != 0)
     {
-      // RSV bits set without extension — protocol error
-      // Return a frame with opcode that signals error to caller
-      frame.opcode = static_cast<WsOpcode>(byte0 & 0x0F);
-      frame.payload.clear();
-      consumed = data.size(); // consume all to prevent re-parse
-      return frame; // caller checks RSV via the raw byte if needed
+      return protocolError(1002);
     }
-    frame.opcode = static_cast<WsOpcode>(byte0 & 0x0F);
+
+    // 2b. Reject any opcode that is not one of the six defined ones (RFC 6455
+    //     §5.2). Centralizes reserved-opcode rejection for BOTH server and client
+    //     so neither dispatcher can silently accept an undefined opcode.
+    switch (frame.opcode)
+    {
+    case WsOpcode::CONTINUATION:
+    case WsOpcode::TEXT:
+    case WsOpcode::BINARY:
+    case WsOpcode::CLOSE:
+    case WsOpcode::PING:
+    case WsOpcode::PONG:
+      break;
+    default:
+      return protocolError(1002);
+    }
 
     // Byte 1: MASK, payload length
     std::uint8_t byte1 = data[pos++];
     frame.masked = (byte1 & 0x80) != 0;
     std::uint64_t payloadLen = byte1 & 0x7F;
 
-    // RFC 6455 Section 5.5: control frames MUST have payload <= 125 and FIN=1
+    // 3. RFC 6455 §5.5: control frames MUST have payload <= 125 and FIN=1.
     if (isControlFrame(frame.opcode))
     {
       if (payloadLen > 125 || !frame.fin)
       {
-        return std::nullopt; // protocol error — caller should close with 1002
+        return protocolError(1002);
       }
     }
 
+    // 4. 126-form: 16-bit extended length.
     if (payloadLen == 126)
     {
-      if (data.size() < pos + 2) return std::nullopt;
+      if (data.size() < pos + 2)
+      {
+        return std::nullopt; // incomplete
+      }
       payloadLen = data.readU16BE(pos);
       pos += 2;
     }
+    // 5. 127-form: 64-bit extended length.
     else if (payloadLen == 127)
     {
-      if (data.size() < pos + 8) return std::nullopt;
+      if (data.size() < pos + 8)
+      {
+        return std::nullopt; // incomplete
+      }
       payloadLen = data.readU64BE(pos);
       pos += 8;
+      // RFC 6455 §5.2: the most significant bit of a 64-bit length MUST be 0.
+      if ((payloadLen & 0x8000000000000000ULL) != 0)
+      {
+        return protocolError(1002);
+      }
     }
 
-    // Mask key (4 bytes if masked)
+    // 6. Reject an over-large declared length BEFORE any allocation.
+    if (payloadLen > maxFrameSize)
+    {
+      return protocolError(1009);
+    }
+
+    // 7. Mask key (4 bytes if masked)
     if (frame.masked)
     {
-      if (data.size() < pos + 4) return std::nullopt;
+      if (data.size() < pos + 4)
+      {
+        return std::nullopt; // incomplete
+      }
       frame.maskKey[0] = data[pos++];
       frame.maskKey[1] = data[pos++];
       frame.maskKey[2] = data[pos++];
       frame.maskKey[3] = data[pos++];
     }
 
-    // Payload
-    if (data.size() < pos + payloadLen)
+    // 8. Payload present? Use subtraction (pos <= data.size() is guaranteed by
+    //    the earlier checks) so the bound cannot wrap.
+    if (payloadLen > data.size() - pos)
     {
       return std::nullopt; // incomplete
     }
 
+    // 9. Copy + unmask.
     frame.payload.resize(static_cast<std::size_t>(payloadLen));
     if (payloadLen > 0)
     {
@@ -137,7 +213,8 @@ struct WebSocketFrame
   }
 
   /// \brief Serialize this frame to wire format.
-  /// If mask is true, applies a random mask key.
+  /// If \p applyMask is true, masks the payload with the caller-set stored
+  /// maskKey (no randomness is generated here — the caller populates maskKey).
   std::vector<std::uint8_t> serialize(bool applyMask = false) const
   {
     std::vector<std::uint8_t> out;
@@ -175,9 +252,10 @@ struct WebSocketFrame
     // Mask key + masked payload (or plain payload)
     if (applyMask)
     {
-      // Use stored mask key. Caller must set a non-zero mask key
-      // before calling serialize(true) for RFC 6455 compliance.
-      // For client-to-server frames, use SecureRng to generate random keys.
+      // Masks with the caller-set stored maskKey — no randomness is generated
+      // here. The caller MUST populate maskKey (e.g. via SecureRng for
+      // client-to-server frames) before calling serialize(true) for RFC 6455
+      // compliance.
       out.push_back(maskKey[0]);
       out.push_back(maskKey[1]);
       out.push_back(maskKey[2]);
@@ -213,6 +291,46 @@ struct WebSocketFrame
     return {code, reason};
   }
 
+  /// \brief True iff this frame carries a 2-byte close status code.
+  bool hasCloseCode() const { return payload.size() >= 2; }
+
+  /// \brief Result of validating an inbound CLOSE frame's payload.
+  struct CloseValidation
+  {
+    bool ok;                 // true => conforming CLOSE
+    std::uint16_t failCode;  // when !ok: the code to close with (1002 / 1007)
+  };
+
+  /// \brief Validate an inbound CLOSE frame per RFC 6455 §5.5.1 / §7.4. A
+  /// non-CLOSE frame and a no-code CLOSE (empty payload) are conforming. A 1-byte
+  /// payload is a malformed length (1002). With a code present, an invalid/reserved
+  /// code fails 1002 and a non-UTF-8 reason fails 1007.
+  CloseValidation validateClose() const
+  {
+    if (opcode != WsOpcode::CLOSE)
+    {
+      return {true, 0};
+    }
+    if (payload.size() == 0)
+    {
+      return {true, 0}; // no code — valid
+    }
+    if (payload.size() == 1)
+    {
+      return {false, 1002}; // malformed length
+    }
+    std::uint16_t code = closePayload().first;
+    if (!isValidCloseCode(code))
+    {
+      return {false, 1002};
+    }
+    if (!isValidUtf8(payload.data() + 2, payload.size() - 2))
+    {
+      return {false, 1007};
+    }
+    return {true, 0};
+  }
+
   /// \brief Create a Close frame with status code and reason.
   static WebSocketFrame makeClose(std::uint16_t code,
                                   const std::string& reason = "")
@@ -224,6 +342,51 @@ struct WebSocketFrame
     frame.payload.push_back(static_cast<std::uint8_t>(code));
     frame.payload.insert(frame.payload.end(), reason.begin(), reason.end());
     return frame;
+  }
+
+  /// \brief Create a Close frame with NO status code (empty payload). This is
+  /// the correct on-the-wire echo when the peer sent a Close with no code — it
+  /// must never put 1005 (or 1006/1015) on the wire.
+  static WebSocketFrame makeCloseNoCode()
+  {
+    WebSocketFrame frame;
+    frame.fin = true;
+    frame.opcode = WsOpcode::CLOSE;
+    return frame;
+  }
+
+  /// \brief True iff \p c is a valid close code to send on the wire (RFC 6455
+  /// §7.4): 1000-1003, 1007-1011, or 3000-4999. False for reserved/invalid
+  /// codes (1004, 1005, 1006, 1012-1015, <1000, 1016-2999).
+  static bool isValidCloseCode(std::uint16_t c)
+  {
+    if (c >= 3000 && c <= 4999)
+    {
+      return true;
+    }
+    if (c >= 1000 && c <= 1003)
+    {
+      return true;
+    }
+    if (c >= 1007 && c <= 1011)
+    {
+      return true;
+    }
+    return false;
+  }
+
+  /// \brief Build the correct on-the-wire CLOSE echo for a received CLOSE frame
+  /// (RFC 6455 §5.5.1). Dedupes the server/client echo policy: a peer CLOSE with
+  /// no status code echoes an empty CLOSE (never 1005/1006/1015); a valid received
+  /// code echoes a normal-closure ack (1000); a reserved/invalid received code
+  /// echoes a protocol error (1002).
+  static WebSocketFrame makeCloseEcho(const WebSocketFrame& received)
+  {
+    if (!received.hasCloseCode())
+    {
+      return makeCloseNoCode();
+    }
+    return makeClose(isValidCloseCode(received.closePayload().first) ? 1000 : 1002);
   }
 
   /// \brief Create a Ping frame.
@@ -278,14 +441,16 @@ struct WebSocketFrame
     return frame;
   }
 
-  /// \brief Validate UTF-8 encoding of the payload.
-  /// Returns true if valid UTF-8 (or empty).
-  bool isValidUtf8() const
+  /// \brief Validate UTF-8 encoding of an arbitrary byte range.
+  /// Returns true if valid UTF-8 (or empty). This is the single implementation;
+  /// the vector overload and the member overload delegate to it, avoiding a
+  /// throwaway temp-frame copy at call sites that only have raw bytes.
+  static bool isValidUtf8(const std::uint8_t* data, std::size_t len)
   {
     std::size_t i = 0;
-    while (i < payload.size())
+    while (i < len)
     {
-      std::uint8_t c = payload[i];
+      std::uint8_t c = data[i];
       std::size_t seqLen = 0;
 
       if (c <= 0x7F)
@@ -309,7 +474,7 @@ struct WebSocketFrame
         return false; // invalid leading byte
       }
 
-      if (i + seqLen > payload.size())
+      if (i + seqLen > len)
       {
         return false; // truncated
       }
@@ -317,7 +482,7 @@ struct WebSocketFrame
       // Validate continuation bytes
       for (std::size_t j = 1; j < seqLen; ++j)
       {
-        if ((payload[i + j] & 0xC0) != 0x80)
+        if ((data[i + j] & 0xC0) != 0x80)
         {
           return false;
         }
@@ -328,23 +493,23 @@ struct WebSocketFrame
       {
         return false; // overlong 2-byte
       }
-      if (seqLen == 3 && c == 0xE0 && payload[i + 1] < 0xA0)
+      if (seqLen == 3 && c == 0xE0 && data[i + 1] < 0xA0)
       {
         return false; // overlong 3-byte (< U+0800)
       }
-      if (seqLen == 4 && c == 0xF0 && payload[i + 1] < 0x90)
+      if (seqLen == 4 && c == 0xF0 && data[i + 1] < 0x90)
       {
         return false; // overlong 4-byte (< U+10000)
       }
 
       // Reject UTF-16 surrogates (U+D800..U+DFFF) encoded as 3-byte sequences
-      if (seqLen == 3 && c == 0xED && payload[i + 1] >= 0xA0)
+      if (seqLen == 3 && c == 0xED && data[i + 1] >= 0xA0)
       {
         return false;
       }
 
       // Reject code points above U+10FFFF
-      if (seqLen == 4 && (c > 0xF4 || (c == 0xF4 && payload[i + 1] > 0x8F)))
+      if (seqLen == 4 && (c > 0xF4 || (c == 0xF4 && data[i + 1] > 0x8F)))
       {
         return false;
       }
@@ -352,6 +517,20 @@ struct WebSocketFrame
       i += seqLen;
     }
     return true;
+  }
+
+  /// \brief Validate UTF-8 encoding of a byte vector. Delegates to the pointer
+  /// overload.
+  static bool isValidUtf8(const std::vector<std::uint8_t>& v)
+  {
+    return isValidUtf8(v.data(), v.size());
+  }
+
+  /// \brief Validate UTF-8 encoding of this frame's payload. Delegates to the
+  /// pointer overload over \c payload.
+  bool isValidUtf8() const
+  {
+    return isValidUtf8(payload.data(), payload.size());
   }
 };
 

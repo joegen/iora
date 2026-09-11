@@ -361,6 +361,246 @@ TEST_CASE("WS Frame: isControlFrame", "[ws][frame]")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Tri-state parse() protocol errors + maxFrameSize
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Frame: 64-bit length with MSB set is protocol error 1002", "[ws][frame][parse]")
+{
+  // FIN + BINARY, unmasked, 127-form length with the MSB of the 64-bit length set.
+  std::vector<std::uint8_t> wire = {
+    0x82,                                           // FIN + BINARY
+    0x7F,                                           // len = 127 (64-bit follows)
+    0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01  // MSB set (invalid per RFC 6455 §5.2)
+  };
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: declared length over maxFrameSize is 1009 regardless of payload presence",
+          "[ws][frame][parse]")
+{
+  // 126-form declaring 2000 bytes, but only the header is present. The size check
+  // precedes the payload-present check, so this is 1009 (message too big), not
+  // "incomplete".
+  std::vector<std::uint8_t> wire = {
+    0x82,        // FIN + BINARY
+    0x7E,        // len = 126 (16-bit follows)
+    0x07, 0xD0   // 2000
+  };
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, /*maxFrameSize=*/1024, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1009);
+}
+
+TEST_CASE("WS Frame: RSV bit set is protocol error 1002", "[ws][frame][parse]")
+{
+  // byte0 = FIN + RSV1 + TEXT: 0x80 | 0x40 | 0x01 = 0xC1.
+  std::vector<std::uint8_t> wire = {0xC1, 0x00};
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: control frame with 126-length field is protocol error 1002",
+          "[ws][frame][parse]")
+{
+  // PING (0x9) with FIN, 7-bit length field = 126 (a control frame may not use an
+  // extended length). This is a protocol error, distinguishable from incomplete.
+  std::vector<std::uint8_t> wire = {0x89, 0x7E};
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: hasCloseCode / isValidCloseCode / makeCloseNoCode", "[ws][frame][close]")
+{
+  WebSocketFrame empty;
+  empty.opcode = WsOpcode::CLOSE;
+  REQUIRE_FALSE(empty.hasCloseCode());
+
+  auto withCode = WebSocketFrame::makeClose(1000);
+  REQUIRE(withCode.hasCloseCode());
+
+  REQUIRE(WebSocketFrame::isValidCloseCode(1000));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1005));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1006));
+  REQUIRE(WebSocketFrame::isValidCloseCode(3000));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1015));
+
+  auto noCode = WebSocketFrame::makeCloseNoCode();
+  REQUIRE(noCode.opcode == WsOpcode::CLOSE);
+  REQUIRE(noCode.payload.empty());
+  REQUIRE_FALSE(noCode.hasCloseCode());
+}
+
+TEST_CASE("WS Frame: reserved data opcode 0x3 is protocol error 1002", "[ws][frame][parse]")
+{
+  // FIN + reserved data opcode 0x3, unmasked, zero-length. parse() must reject it
+  // (RFC 6455 §5.2) — not silently accept an undefined opcode.
+  std::vector<std::uint8_t> wire = {0x83, 0x00};
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: reserved control opcode 0xB is protocol error 1002", "[ws][frame][parse]")
+{
+  // FIN + reserved control opcode 0xB, unmasked, zero-length.
+  std::vector<std::uint8_t> wire = {0x8B, 0x00};
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// validateClose (RFC 6455 §5.5.1 / §7.4)
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Frame: validateClose accepts no-code and code+reason", "[ws][frame][close]")
+{
+  WebSocketFrame noCode;
+  noCode.opcode = WsOpcode::CLOSE; // empty payload
+  auto v0 = noCode.validateClose();
+  REQUIRE(v0.ok);
+  REQUIRE(v0.failCode == 0);
+
+  auto withReason = WebSocketFrame::makeClose(1000, "bye");
+  auto v1 = withReason.validateClose();
+  REQUIRE(v1.ok);
+  REQUIRE(v1.failCode == 0);
+}
+
+TEST_CASE("WS Frame: validateClose rejects 1-byte payload with 1002", "[ws][frame][close]")
+{
+  WebSocketFrame f;
+  f.opcode = WsOpcode::CLOSE;
+  f.payload = {0x03}; // malformed length (only 1 byte)
+  auto v = f.validateClose();
+  REQUIRE_FALSE(v.ok);
+  REQUIRE(v.failCode == 1002);
+}
+
+TEST_CASE("WS Frame: validateClose rejects invalid code with 1002", "[ws][frame][close]")
+{
+  // 1005 is a reserved code that MUST NOT appear on the wire.
+  WebSocketFrame f;
+  f.opcode = WsOpcode::CLOSE;
+  f.payload = {0x03, 0xED}; // 0x03ED == 1005
+  auto v = f.validateClose();
+  REQUIRE_FALSE(v.ok);
+  REQUIRE(v.failCode == 1002);
+}
+
+TEST_CASE("WS Frame: validateClose rejects invalid-UTF-8 reason with 1007", "[ws][frame][close]")
+{
+  WebSocketFrame f;
+  f.opcode = WsOpcode::CLOSE;
+  // code 1000 (0x03E8) followed by an invalid UTF-8 reason (0xFF 0xFE).
+  f.payload = {0x03, 0xE8, 0xFF, 0xFE};
+  auto v = f.validateClose();
+  REQUIRE_FALSE(v.ok);
+  REQUIRE(v.failCode == 1007);
+}
+
+TEST_CASE("WS Frame: validateClose passes valid code + valid reason", "[ws][frame][close]")
+{
+  auto f = WebSocketFrame::makeClose(1001, "going away");
+  auto v = f.validateClose();
+  REQUIRE(v.ok);
+  REQUIRE(v.failCode == 0);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// makeCloseEcho
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Frame: makeCloseEcho maps received close to the correct echo",
+          "[ws][frame][close]")
+{
+  // No code -> empty CLOSE (never 1005/1006/1015).
+  WebSocketFrame noCode;
+  noCode.opcode = WsOpcode::CLOSE;
+  auto echo0 = WebSocketFrame::makeCloseEcho(noCode);
+  REQUIRE(echo0.opcode == WsOpcode::CLOSE);
+  REQUIRE(echo0.payload.empty());
+  REQUIRE_FALSE(echo0.hasCloseCode());
+
+  // Valid received code -> normal-closure ack (1000).
+  auto valid = WebSocketFrame::makeClose(1000, "bye");
+  auto echo1 = WebSocketFrame::makeCloseEcho(valid);
+  REQUIRE(echo1.closePayload().first == 1000);
+
+  // Invalid/reserved received code -> protocol error (1002).
+  auto invalid = WebSocketFrame::makeClose(1005);
+  auto echo2 = WebSocketFrame::makeCloseEcho(invalid);
+  REQUIRE(echo2.closePayload().first == 1002);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// isValidCloseCode boundaries
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Frame: isValidCloseCode boundary values", "[ws][frame][close]")
+{
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(999));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1004));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1005));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1006));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1012));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1013));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1014));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1015));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(1016));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(2999));
+  REQUIRE(WebSocketFrame::isValidCloseCode(3000));
+  REQUIRE(WebSocketFrame::isValidCloseCode(4999));
+  REQUIRE_FALSE(WebSocketFrame::isValidCloseCode(5000));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // SHA-1 + Base64 for WebSocket Handshake
 // ══════════════════════════════════════════════════════════════════════════════
 

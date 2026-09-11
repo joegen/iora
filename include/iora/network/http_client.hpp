@@ -28,6 +28,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <arpa/inet.h> // ::inet_pton for IPv6-literal recognition (isIPAddress / parseUrl)
+
 #include "iora/core/thread_pool.hpp"
 #include "iora/crypto/secure_rng.hpp"
 #include "iora/network/dns_client.hpp"
@@ -81,8 +83,9 @@ public:
 
 /// \brief Thrown by parseUrl for a URL it refuses: a malformed URL, a URL
 /// carrying userinfo (`user@` / `user:pass@` — credentials must never land in
-/// the request-target, RFC 9112 §3.2), a bracketed IPv6 literal (not parsed —
-/// see the decision in parseUrl), or a port outside 1..65535 or that overflows
+/// the request-target, RFC 9112 §3.2), a MALFORMED IPv6 literal (a missing ']'
+/// or trailing garbage in the authority — a WELL-FORMED `[::1]` now parses,
+/// CLI-NEW2), or a port outside 1..65535 or that overflows
 /// (defect_7 / defect_15). It is a subclass of std::invalid_argument so the
 /// cross-repo contract that a malformed URL surfaces as std::invalid_argument is
 /// preserved (tmc_edge_proxy TmcStatefulPrimitives catches std::invalid_argument
@@ -254,14 +257,21 @@ public:
 /// https) are unit-testable without a socket (tracker 2026-07-26-10 task-1.7(a)).
 /// PRECONDITION: `host` must already be a validated uri-host — the sole
 /// production caller passes ParsedUrl::host from parseUrl, whose regex forbids
-/// CR/LF and ':'. This helper does NOT sanitize: a CR/LF in `host` would inject
-/// headers (the caller-header CRLF class is tracker-10 defect_7), and a bare IPv6
-/// literal would need bracketing (`[::1]`) which parseUrl does not yet parse
-/// (tracker-10 task-1.6) — neither is reachable through the current parse path.
+/// CR/LF. This helper does NOT sanitize: a CR/LF in `host` would inject headers
+/// (the caller-header CRLF class is tracker-10 defect_7), which is not reachable
+/// through the current parse path. An IPv6 literal host (parseUrl stores it
+/// WITHOUT brackets, CLI-NEW2) IS re-bracketed here — `Host: [::1]:8080` — per
+/// RFC 9112 §3.2 / RFC 7230, so the IPv6 authority round-trips onto the wire.
 inline std::string formatHostHeaderField(const std::string &host, std::uint16_t port, bool isHttps)
 {
   const std::uint16_t defaultPort = isHttps ? 443 : 80;
-  std::string line = "Host: " + host;
+  // An IPv6 literal is the only uri-host form that contains ':'; it MUST appear
+  // bracketed in the Host field (RFC 9112 §3.2 / RFC 7230). parseUrl stores the
+  // literal WITHOUT brackets, so re-bracket it here. IPv4 / reg-name hosts never
+  // contain ':' and are emitted verbatim.
+  const bool ipv6Literal = host.find(':') != std::string::npos;
+  std::string line = "Host: ";
+  line += ipv6Literal ? ("[" + host + "]") : host;
   if (port != defaultPort)
   {
     line += ":" + std::to_string(port);
@@ -1201,9 +1211,15 @@ private:
   /// is thread-safe).
   struct CompiledRegexes
   {
+    // icase (CLI-NEW1): RFC 3986 §3.1 makes the scheme case-insensitive, so an
+    // uppercase HTTP:// / HTTPS:// must match. icase affects only the literal
+    // `https?` letters here — the negated host/path/query character classes are
+    // unchanged — so IPv4 / reg-name parsing behavior is preserved. parseUrl
+    // lowercases the captured scheme so downstream comparisons see the canonical
+    // form.
     std::regex url{
-      R"(^(https?):\/\/([^:\/\s]+)(?::(\d+))?(\/?[^?\s]*)(?:\?([^#\s]*))?(?:#.*)?$)"};
-    std::regex ipv4{R"(^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$)"};
+      R"(^(https?):\/\/([^:\/\s]+)(?::(\d+))?(\/?[^?\s]*)(?:\?([^#\s]*))?(?:#.*)?$)",
+      std::regex::icase};
   };
 
   static const CompiledRegexes &compiledRegexes()
@@ -1212,23 +1228,42 @@ private:
     return regexes;
   }
 
+  /// \brief Parse a decimal port token and validate the 1..65535 range, throwing
+  /// HttpInvalidUrlError on any non-digit, trailing garbage, overflow, or
+  /// out-of-range value. The old static_cast<uint16_t>(std::stoi(...)) truncated
+  /// :65536 to port 0 (the client then connected to port 0) and let an unbounded
+  /// digit run throw std::out_of_range into the retry path (defect_15). Shared by
+  /// the reg-name/IPv4 and the IPv6 IP-literal authority paths so both reject an
+  /// invalid port identically.
+  std::uint16_t parsePortOrThrow(const std::string &portStr, const std::string &url) const
+  {
+    unsigned long portVal = 0;
+    const char *first = portStr.data();
+    const char *last = first + portStr.size();
+    const auto res = std::from_chars(first, last, portVal);
+    if (res.ec != std::errc() || res.ptr != last || portVal < 1 || portVal > 65535)
+    {
+      throw HttpInvalidUrlError("Invalid URL: port must be 1..65535: " + url);
+    }
+    return static_cast<std::uint16_t>(portVal);
+  }
+
   /// \brief Parse URL into components.
   ///
-  /// SCHEME CASE (decision, task-1.6): the scheme is matched case-SENSITIVELY —
-  /// only lowercase `http` / `https` parse; `HTTP://…` is rejected as a
-  /// malformed URL. (parsers::parseUrl lowercases the scheme; that divergence is
-  /// left as-is here — harmonizing it would reach across into the parsers layer
-  /// and tracker -2's origin key, out of this task's scope.)
+  /// SCHEME CASE (CLI-NEW1): RFC 3986 §3.1 makes the scheme case-INSENSITIVE, so
+  /// an uppercase `HTTP://` / `HTTPS://` parses; the captured scheme is
+  /// canonicalized to lowercase here so every downstream comparison (isHttps, the
+  /// port default, the cache key) sees the canonical form.
   ///
-  /// USERINFO / IPv6 (defect_7): the raw authority is inspected BEFORE trusting
-  /// the regex's host capture, because the host character class stops at ':' and
-  /// '/', so `user:pass@host` would otherwise fold the credentials into the path
-  /// (request-target) and `[::1]:8080` would yield host="[". Userinfo is
-  /// REJECTED (credentials must never reach the request-target). A bracketed
-  /// IPv6 literal is REJECTED rather than parsed: parsing it would couple to
-  /// bracket-aware changes in formatHostHeaderField and getHostPort (both do
-  /// `host + ":" + port`) for a form no in-tree caller uses (YAGNI). Both throw
-  /// HttpInvalidUrlError (a std::invalid_argument, non-retryable).
+  /// USERINFO / IPv6 (defect_7 / CLI-NEW2): the raw authority is inspected BEFORE
+  /// trusting the regex's host capture, because the host character class stops at
+  /// ':' and '/', so `user:pass@host` would otherwise fold the credentials into
+  /// the path (request-target) and `[::1]:8080` would yield host="[". Userinfo is
+  /// REJECTED (credentials must never reach the request-target). A bracketed IPv6
+  /// literal is PARSED per RFC 3986 §3.2.2 (`"[" IPv6address "]" [ ":" port ]`):
+  /// the host is stored WITHOUT the brackets and formatHostHeaderField re-brackets
+  /// it for the wire. A userinfo error, a malformed IPv6 literal, or a bad port all
+  /// throw HttpInvalidUrlError (a std::invalid_argument, non-retryable).
   ParsedUrl parseUrl(const std::string &url) const
   {
     ParsedUrl parsed;
@@ -1237,6 +1272,14 @@ private:
     if (!std::regex_match(url, match, compiledRegexes().url))
     {
       throw HttpInvalidUrlError("Invalid URL format: " + url);
+    }
+
+    // Canonicalize the scheme to lowercase (CLI-NEW1). ASCII-only — a URI scheme
+    // is US-ASCII — so use the shared ASCII lowercaser (no locale, no new include).
+    parsed.scheme = match[1].str();
+    for (char &ch : parsed.scheme)
+    {
+      ch = static_cast<char>(CaseInsensitiveCompare::asciiLower(static_cast<unsigned char>(ch)));
     }
 
     // Inspect the raw authority (between "://" and the first '/', '?' or '#')
@@ -1251,32 +1294,85 @@ private:
                                 "permitted; credentials must not appear in the "
                                 "request-target (RFC 9112 §3.2): " + url);
     }
+
     if (!authority.empty() && authority.front() == '[')
     {
-      throw HttpInvalidUrlError("Invalid URL: bracketed IPv6 literals are not "
-                                "supported: " + url);
+      // RFC 3986 §3.2.2 IP-literal authority: "[" IPv6address "]" [ ":" port ]
+      // (CLI-NEW2). The regex host class stops at ':' and cannot capture an IPv6
+      // literal, so parse the authority directly. The host is stored WITHOUT the
+      // brackets; formatHostHeaderField / the connect path re-form it as needed.
+      const std::size_t closeBracket = authority.find(']');
+      if (closeBracket == std::string::npos || closeBracket == 1)
+      {
+        throw HttpInvalidUrlError("Invalid URL: malformed IPv6 literal (missing ']' "
+                                  "or empty brackets): " + url);
+      }
+      parsed.host = authority.substr(1, closeBracket - 1);
+
+      // Validate the bracket contents as a real IPv6address (FIX-2). RFC 3986
+      // §3.2.2 IP-literal is `"[" IPv6address "]"`, but the brackets alone are not
+      // proof: without this, `[garbage]` / `[foo]` would "parse", and a colon-less
+      // `[foo]` would then round-trip as a reg-name (formatHostHeaderField keys its
+      // re-bracketing on ':'). inet_pton(AF_INET6) is the same oracle isIPAddress and
+      // the transport use. An RFC 6874 zone-id (`[fe80::1%25eth0]`) carries '%', which
+      // inet_pton rejects — so it is rejected cleanly here rather than stripped.
+      {
+        // parsed.host is non-empty here: the empty-bracket case (closeBracket == 1)
+        // is already rejected above, so no empty-string guard is needed.
+        unsigned char ipv6Buf[16];
+        if (::inet_pton(AF_INET6, parsed.host.c_str(), ipv6Buf) != 1)
+        {
+          throw HttpInvalidUrlError("Invalid URL: brackets must enclose a valid IPv6 "
+                                    "address (RFC 3986 §3.2.2): " + url);
+        }
+      }
+
+      if (closeBracket + 1 < authority.size())
+      {
+        if (authority[closeBracket + 1] != ':')
+        {
+          throw HttpInvalidUrlError("Invalid URL: unexpected characters after the IPv6 "
+                                    "literal in the authority: " + url);
+        }
+        parsed.port = parsePortOrThrow(authority.substr(closeBracket + 2), url);
+      }
+      else
+      {
+        parsed.port = parsed.isHttps() ? 443 : 80;
+      }
+
+      // Path / query / fragment come from the text after the authority — the
+      // regex host/path captures are invalid for an IPv6 authority. Mirror the
+      // regex: discard the fragment, split an optional query on '?'.
+      std::string rest = (authEnd == std::string::npos) ? std::string{} : url.substr(authEnd);
+      const std::size_t hash = rest.find('#');
+      if (hash != std::string::npos)
+      {
+        rest.erase(hash);
+      }
+      const std::size_t q = rest.find('?');
+      if (q != std::string::npos)
+      {
+        parsed.query = rest.substr(q + 1);
+        parsed.path = rest.substr(0, q);
+      }
+      else
+      {
+        parsed.path = rest;
+      }
+      if (parsed.path.empty())
+      {
+        parsed.path = "/";
+      }
+      return parsed;
     }
 
-    parsed.scheme = match[1].str();
     parsed.host = match[2].str();
 
     // Default ports
     if (match[3].matched)
     {
-      // Parse strictly and validate the 1..65535 range. The old
-      // static_cast<uint16_t>(std::stoi(...)) truncated :65536 to port 0 (the
-      // client then connected to port 0) and let an unbounded digit run throw
-      // std::out_of_range into the retry path (defect_15).
-      const std::string portStr = match[3].str();
-      unsigned long portVal = 0;
-      const char *first = portStr.data();
-      const char *last = first + portStr.size();
-      const auto res = std::from_chars(first, last, portVal);
-      if (res.ec != std::errc() || res.ptr != last || portVal < 1 || portVal > 65535)
-      {
-        throw HttpInvalidUrlError("Invalid URL: port must be 1..65535: " + url);
-      }
-      parsed.port = static_cast<std::uint16_t>(portVal);
+      parsed.port = parsePortOrThrow(match[3].str(), url);
     }
     else
     {
@@ -1411,10 +1507,44 @@ private:
     // (1) Reuse a live, non-idle cached connection (short critical section).
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      const auto now = std::chrono::steady_clock::now();
+
+      // CLI-CACHE: lazy sweep of idle-expired cached connections. Without it the
+      // _connections map is reaped only on next access to the SAME key (below),
+      // dropConnection, or cancelInFlight, so a long-lived client hitting many
+      // distinct hosts accumulates dead entries. Bounded to when the map grows
+      // past a small threshold so the common few-hosts case pays nothing. Skip
+      // any host whose slot is currently LEASED (its connection may be mid-
+      // exchange on another thread — evicting it would tear down a live request);
+      // and skip the target hostPort, which the explicit reuse/evict logic below
+      // handles (this thread already holds its lease). Closing under _mutex is the
+      // same enqueue-only, non-blocking teardown the idle-evict path below already
+      // performs (LEASE-7-safe; see dropConnection's SAFETY note), and SessionId
+      // monotonicity means a still-pending close cannot tear down a later reused
+      // id. Reads _leasedHosts but does not modify any lease or CV — the lease/
+      // notify protocol is unchanged.
+      constexpr std::size_t kIdleSweepThreshold = 16;
+      if (_connections.size() > kIdleSweepThreshold)
+      {
+        for (auto sweepIt = _connections.begin(); sweepIt != _connections.end();)
+        {
+          if (sweepIt->first != hostPort &&
+              _leasedHosts.find(sweepIt->first) == _leasedHosts.end() &&
+              now - sweepIt->second.lastUsed >= _config.connectionIdleTimeout)
+          {
+            _transport->close(sweepIt->second.id);
+            sweepIt = _connections.erase(sweepIt);
+          }
+          else
+          {
+            ++sweepIt;
+          }
+        }
+      }
+
       auto it = _connections.find(hostPort);
       if (it != _connections.end())
       {
-        auto now = std::chrono::steady_clock::now();
         if (now - it->second.lastUsed < _config.connectionIdleTimeout)
         {
           it->second.lastUsed = now;
@@ -1450,8 +1580,9 @@ private:
     // TLS client identity (RFC 6125/9525): the reference identity is the ORIGINAL
     // pre-resolution host (parsedUrl.host), NOT resolvedHost (an IP). Use the SAME
     // isIPAddress predicate that resolveHostAddress used (M-B) so the verifyName-
-    // empty decision matches the resolved address: an IP-literal URL passes
-    // verifyName EMPTY (the transport does an iPAddress match + sends NO SNI).
+    // empty decision matches the resolved address: an IP-literal URL — IPv4 OR IPv6
+    // (isIPAddress recognizes both, the IPv6 case via inet_pton — FIX-1) — passes
+    // verifyName EMPTY, so the transport does an iPAddress match and sends NO SNI.
     // kHttpsHostFlags is macro-free (M-A) so no <openssl/*> include is needed here.
     TlsClientOptions tlsOpts;
     if (tlsMode == TlsMode::Client)
@@ -1547,11 +1678,22 @@ private:
     _transport->close(sessionId);
   }
 
-  /// \brief Check if string is an IP address
+  /// \brief Check if string is an IP address (IPv4 or IPv6 literal, un-bracketed).
+  ///
+  /// An IPv6 literal MUST be recognized here too (FIX-1): otherwise resolveHostAddress
+  /// routes a colon-bearing "hostname" through DNS (spurious A/AAAA lookups — latency
+  /// plus an http:// DNS-redirection primitive) and acquireConnection hands the TLS
+  /// layer a non-empty verifyName for it. Both families use inet_pton, mirroring the
+  /// transport's own isIpLiteral (detail/tcp_engine.hpp) — so ONLY genuinely valid
+  /// literals qualify; an out-of-range dotted quad (e.g. 999.999.999.999) falls
+  /// through to reg-name / DNS handling. `str` is the BARE literal (no brackets),
+  /// which is exactly what inet_pton expects (parseUrl stores it unbracketed);
+  /// inet_pton("") returns 0, so an empty string is handled without a guard.
   bool isIPAddress(const std::string &str) const
   {
-    // Simple IPv4 check (could be enhanced for IPv6)
-    return std::regex_match(str, compiledRegexes().ipv4);
+    unsigned char buf[16];
+    return ::inet_pton(AF_INET, str.c_str(), buf) == 1
+           || ::inet_pton(AF_INET6, str.c_str(), buf) == 1;
   }
 
   /// \brief DP-13 enforcement for pooled async dispatch.

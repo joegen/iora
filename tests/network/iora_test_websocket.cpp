@@ -201,6 +201,166 @@ TEST_CASE("WS Integration: close handshake", "[ws][integration]")
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// Close fires _onClose exactly once
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Integration: server _onClose fires exactly once on client close",
+          "[ws][integration][close]")
+{
+  auto port = nextPort();
+  WebSocketServer server("127.0.0.1", port);
+  std::atomic<int> serverCloseCount{0};
+  std::atomic<std::uint16_t> serverCloseCode{0};
+
+  server.setOnClose([&](SessionId, std::uint16_t code, const std::string&)
+  {
+    serverCloseCode.store(code);
+    serverCloseCount.fetch_add(1);
+  });
+
+  server.start();
+  std::this_thread::sleep_for(100ms);
+
+  auto client = WebSocketClient::create();
+  REQUIRE(client->connect("127.0.0.1", port));
+
+  client->disconnect(1000, "normal close");
+
+  // The inbound CLOSE fires _onClose once; the session is then erased + torn down,
+  // so no path can re-fire it.
+  REQUIRE(waitFor([&]() { return serverCloseCount.load() >= 1; }, 3000ms));
+  REQUIRE(serverCloseCode.load() == 1000);
+
+  // Settle: confirm it stays exactly one (no double-callback after teardown).
+  std::this_thread::sleep_for(250ms);
+  REQUIRE(serverCloseCount.load() == 1);
+
+  server.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Oversized frame -> server 1009 close + session teardown
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("WS Integration: oversized frame closes 1009 and tears the session down",
+          "[ws][integration][toolarge]")
+{
+  auto port = nextPort();
+  WebSocketServer server("127.0.0.1", port);
+  server.setMaxFrameSize(1024); // small cap so a modest frame trips it
+
+  std::atomic<bool> gotSid{false};
+  std::atomic<SessionId> serverSid{0};
+  server.setOnConnect([&](SessionId sid, const std::string&)
+  {
+    serverSid.store(sid);
+    gotSid.store(true);
+  });
+
+  server.start();
+  std::this_thread::sleep_for(100ms);
+
+  auto client = WebSocketClient::create();
+  std::atomic<int> clientCloseCount{0};
+  std::atomic<std::uint16_t> clientCloseCode{0};
+  client->setOnClose([&](std::uint16_t code, const std::string&)
+  {
+    clientCloseCode.store(code);
+    clientCloseCount.fetch_add(1);
+  });
+
+  REQUIRE(client->connect("127.0.0.1", port));
+  REQUIRE(waitFor([&]() { return gotSid.load(); }));
+
+  // A single 4096-byte text frame exceeds the server's 1024-byte cap. The server
+  // rejects it (1009) and tears the session down through eraseAndCloseSession.
+  client->sendText(std::string(4096, 'x'));
+
+  // Client observes the CLOSE echo (1009).
+  REQUIRE(waitFor([&]() { return clientCloseCount.load() >= 1; }, 3000ms));
+  REQUIRE(clientCloseCode.load() == 1009);
+
+  // Server dropped the session (no unbounded buffer left behind).
+  REQUIRE(waitFor([&]() { return !server.isSessionActive(serverSid.load()); }, 3000ms));
+
+  // A subsequent send is a harmless no-op — the session is gone and the client is
+  // CLOSED, so nothing accumulates and _onClose does not re-fire.
+  client->sendText("after-close");
+  std::this_thread::sleep_for(150ms);
+  REQUIRE(clientCloseCount.load() == 1);
+  REQUIRE_FALSE(server.isSessionActive(serverSid.load()));
+
+  client->disconnect();
+  server.stop();
+}
+
+// The server sendText path (makeText) does NOT validate UTF-8 — it copies the bytes
+// verbatim — so it can emit an invalid-UTF-8 TEXT frame on the wire. The client MUST
+// reject the completed TEXT (RFC 6455 §8.1: text payloads are UTF-8), close 1007, and
+// NOT deliver it via onTextMessage (WS-L4 / C1).
+TEST_CASE("WS Integration: client rejects invalid-UTF-8 TEXT with 1007 and no delivery",
+          "[ws][integration][utf8]")
+{
+  auto port = nextPort();
+  WebSocketServer server("127.0.0.1", port);
+
+  std::atomic<bool> gotSid{false};
+  std::atomic<SessionId> serverSid{0};
+  server.setOnConnect([&](SessionId sid, const std::string&)
+  {
+    serverSid.store(sid);
+    gotSid.store(true);
+  });
+  // The client tears the connection down itself on the bad frame, so its terminal
+  // status surfaces on the WIRE as the CLOSE(1007) it sends — which the server
+  // observes here. (closeWithError fires the client's _onError, not _onClose.)
+  std::atomic<int> serverCloseCount{0};
+  std::atomic<std::uint16_t> serverCloseCode{0};
+  server.setOnClose([&](SessionId, std::uint16_t code, const std::string&)
+  {
+    serverCloseCode.store(code);
+    serverCloseCount.fetch_add(1);
+  });
+
+  server.start();
+  std::this_thread::sleep_for(100ms);
+
+  auto client = WebSocketClient::create();
+  std::atomic<int> clientTextCount{0};
+  std::atomic<int> clientErrorCount{0};
+  client->setOnTextMessage([&](const std::string&)
+  {
+    clientTextCount.fetch_add(1);
+  });
+  client->setOnError([&](const std::string&)
+  {
+    clientErrorCount.fetch_add(1);
+  });
+
+  REQUIRE(client->connect("127.0.0.1", port));
+  REQUIRE(waitFor([&]() { return gotSid.load(); }));
+
+  // Invalid UTF-8: a lone 0xFF 0xFE pair is not a valid encoding.
+  std::string invalid;
+  invalid.push_back(static_cast<char>(0xFF));
+  invalid.push_back(static_cast<char>(0xFE));
+  server.sendText(serverSid.load(), invalid);
+
+  // The client rejects the frame with a 1007 CLOSE (seen on the wire by the server)
+  // and transitions to CLOSED, without ever delivering the payload.
+  REQUIRE(waitFor([&]() { return serverCloseCount.load() >= 1; }, 3000ms));
+  REQUIRE(serverCloseCode.load() == 1007);
+  REQUIRE(waitFor([&]()
+                  { return client->getState() == WebSocketState::CLOSED; }, 3000ms));
+  std::this_thread::sleep_for(150ms);
+  REQUIRE(clientTextCount.load() == 0);
+  REQUIRE(clientErrorCount.load() >= 1);
+
+  client->disconnect();
+  server.stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Subprotocol Negotiation
 // ══════════════════════════════════════════════════════════════════════════════
 
