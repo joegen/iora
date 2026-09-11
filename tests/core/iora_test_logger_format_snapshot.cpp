@@ -166,6 +166,14 @@ namespace
 std::atomic<long> g_allocs{0};
 std::atomic<bool> g_countAllocs{false};
 } // namespace
+// These global replacement operators pair malloc with free, which IS matched.
+// gcc 12 nonetheless emits a false-positive -Werror=mismatched-new-delete on the
+// free() in the delete operators when it pairs them with the malloc-backed new;
+// suppress that one diagnostic locally (GNU, non-clang).
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void *operator new(std::size_t n)
 {
   if (g_countAllocs.load(std::memory_order_relaxed))
@@ -180,6 +188,9 @@ void *operator new(std::size_t n)
 }
 void operator delete(void *p) noexcept { std::free(p); }
 void operator delete(void *p, std::size_t) noexcept { std::free(p); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace
 {
