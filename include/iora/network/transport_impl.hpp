@@ -92,7 +92,8 @@ struct Transport::Impl
   //   syncMutex guards: pendingConnects, readModes, receiveBuffers, every
   //   SyncReceiveBuffer field ({data, hasData, closed, waiters, flushing,
   //   overflow}), every SyncConnectOp field ({done, result}), and the
-  //   teardown state {shuttingDown, activeFlushes, activeConnects}.
+  //   teardown state {shuttingDown, activeReceives, activeConnects,
+  //   activeFlushes, activeSends}.
   // Acquired by: connectSync (register/wait), receiveSync (buffer access/wait),
   //   sendSync (register/wait), setReadMode (mode update + flush), getReadMode
   //   (read mode), the I/O thread data/close handlers, and the teardown
@@ -100,20 +101,22 @@ struct Transport::Impl
   // NEVER held during user callback invocation. setReadMode releases syncMutex
   //   before flushing buffered data via the onData callback.
   //
-  // TEARDOWN HANDSHAKE (INV-5/INV-7): three classes of EXTERNAL (non-I/O)
+  // TEARDOWN HANDSHAKE (INV-5/INV-7): four classes of EXTERNAL (non-I/O)
   // thread park while holding syncMutex across a lock release and must be
   // waited out before _impl is destroyed, or destroying syncMutex /
-  // receiveBuffers / pendingConnects under them is a use-after-free:
-  //   (a) receiveSync waiters on a SyncReceiveBuffer::cv  -> counted by `waiters`
+  // receiveBuffers / pendingConnects / pendingSends under them is a
+  // use-after-free:
+  //   (a) receiveSync waiters on a SyncReceiveBuffer::cv  -> counted by `activeReceives`
   //   (b) connectSync waiters on a SyncConnectOp::cv       -> counted by `activeConnects`
   //   (c) setReadMode Sync->Async flushers (release the lock for onData)
   //                                                        -> counted by `activeFlushes`
-  // An exhaustive grep proves these are the only such classes (exactly two
-  // condition_variable members + the flush lock-release; getReadMode /
-  // non-flush setReadMode / sendSync take the lock single-shot, no CV wait).
+  //   (d) sendSync waiters on a SyncSendOp::cv             -> counted by `activeSends`
+  // These are the only such classes (three condition_variable member types +
+  // the flush lock-release; getReadMode / non-flush setReadMode take the lock
+  // single-shot, no CV wait).
   // Teardown sets `shuttingDown` (as the FIRST action, an ENTRY FENCE per
   // INV-8), notifies every parked CV, then waits on teardownCv until
-  // waiters==0 && activeConnects==0 && activeFlushes==0.
+  // activeReceives==0 && activeConnects==0 && activeFlushes==0 && activeSends==0.
   struct SyncConnectOp
   {
     std::condition_variable cv;
@@ -1605,8 +1608,9 @@ inline SendResult ITransport::sendSyncCancellable(
   {
     timeout = kFallbackSyncTimeout;
   }
-  // sendSync is non-blocking (enqueue-based), so it completes quickly.
-  // Check cancellation before and after — no sub-timeout loop needed.
+  // sendSync blocks until engine send completion; current engines complete
+  // synchronously at enqueue, so no sub-timeout cancellation loop is needed.
+  // Check cancellation before and after.
   auto result = sendSync(sid, data, timeout);
   if (token.isCancelled() && result.isOk())
   {
