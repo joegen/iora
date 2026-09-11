@@ -232,9 +232,32 @@ struct TlsClientOptions
 /// include. NEVER_CHECK_SUBJECT (0x20): CN MUST NOT identify a service.
 /// NO_PARTIAL_WILDCARDS (0x4): reject partial wildcards. NO_WILDCARDS stays
 /// UNSET so a single-label wildcard still matches one label. The value is locked
-/// to the real OpenSSL macros by a static_assert in tcp_engine.hpp (which
+/// to the real OpenSSL macros by a static_assert in detail/tcp_engine.hpp (which
 /// includes <openssl/x509v3.h>); do not change it here without updating that.
 static constexpr unsigned kHttpsHostFlags = 0x20u | 0x4u;
+
+/// \brief SIP/SIPS host-verification flags (RFC 5922 §7.1/§7.2), as a macro-free
+/// constant so consumers (SipTransport.hpp) can pass it WITHOUT an <openssl/*>
+/// include. NO_WILDCARDS (0x2): §7.2 PROHIBITS wildcard matching (the opposite of
+/// web PKI). NEVER_CHECK_SUBJECT (0x20): SIP identity is SAN-based (§7.1 prefers
+/// subjectAltName; CN is only a backward-compat fallback when no SAN appears) —
+/// we disable CN entirely, stricter than §7.1. This is the strict default. The
+/// value is locked to the real OpenSSL
+/// macros by a static_assert in detail/tcp_engine.hpp (which includes
+/// <openssl/x509v3.h>); do not change it here without updating that.
+static constexpr unsigned kSipHostFlags = 0x2u | 0x20u;
+
+/// \brief Per-peer opt-in relaxation of kSipHostFlags for trusted wildcard-cert
+/// SIP trunks (e.g. Twilio *.pstn.us1.twilio.com). NO_WILDCARDS is UNSET so
+/// wildcard SANs match; NEVER_CHECK_SUBJECT stays set (SAN-only always).
+/// NOTE: NO_PARTIAL_WILDCARDS (0x4) is deliberately NOT set, so this is a MAX-
+/// permissive opt-in — MORE permissive than kHttpsHostFlags (0x24u, which sets
+/// NO_PARTIAL_WILDCARDS to reject partial wildcards): it accepts partial wildcards
+/// (e.g. sip*.example.com) as well as full-label ones. This is NEVER a global
+/// relaxation — the SIP layer selects it only for a peer with an explicit
+/// trusted-wildcard config flag. Locked to the real OpenSSL macro by a
+/// static_assert in detail/tcp_engine.hpp.
+static constexpr unsigned kSipHostFlagsAllowWildcards = 0x20u;
 
 // Result<T,E> aliases for Transport API return types.
 // IoResult alias: deferred until legacy IoResult struct (above) is removed from

@@ -82,6 +82,18 @@ static_assert(kHttpsHostFlags ==
                 (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT | X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS),
               "kHttpsHostFlags must equal NEVER_CHECK_SUBJECT|NO_PARTIAL_WILDCARDS");
 
+// Lock the macro-free SIP host-check constants (transport_types.hpp) to the real
+// OpenSSL flags. kSipHostFlags is the strict RFC 5922 §7.2 default (NO wildcards,
+// SAN-only); kSipHostFlagsAllowWildcards is the per-peer opt-in relaxation
+// (wildcards permitted — full-label AND partial, since NO_PARTIAL_WILDCARDS is
+// unset; still SAN-only). See transport_types.hpp for the canonical rationale.
+// Parentheses around the OR are MANDATORY ('==' binds tighter than '|').
+static_assert(kSipHostFlags ==
+                (X509_CHECK_FLAG_NO_WILDCARDS | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT),
+              "kSipHostFlags must equal NO_WILDCARDS|NEVER_CHECK_SUBJECT");
+static_assert(kSipHostFlagsAllowWildcards == X509_CHECK_FLAG_NEVER_CHECK_SUBJECT,
+              "kSipHostFlagsAllowWildcards must equal NEVER_CHECK_SUBJECT");
+
 /// \brief Shared TCP/TLS transport (single-threaded epoll loop).
 /// \note Linux-only.
 ///
