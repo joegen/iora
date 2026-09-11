@@ -9,6 +9,12 @@
 #include <iora/common/i_lifecycle_managed.hpp>
 #include <iora/core/timer.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <thread>
+
 using namespace iora::core;
 using namespace iora::common;
 
@@ -472,4 +478,476 @@ TEST_CASE("TimerService lifecycle: Cancel scheduled timer before drain", "[timer
 
   // Timer should not have executed
   REQUIRE(counter.load() == 0);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Regression: drain(0) vs periodic timers (TM3 hang) + drain(0) vs concurrent
+// stop() (H-1 shutdown-escape).
+//   Tracker: tasks/iora/ongoing/2026-09-10-2_timer-drain-zero-hangs-with-periodic_P0
+//
+// drain(0) ("wait indefinitely") must terminate when a periodic timer is
+// active (periodics re-arm on every fire and would otherwise keep drainDone
+// unsatisfiable forever), must still wait for in-flight (executing) callbacks,
+// must let pending one-shot timers fire naturally, and must not hang if a
+// concurrent stop() truncates the run loop while it waits.
+// ══════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+/// Runs timer.drain(timeoutMs) on a worker thread joined with a bounded wait.
+/// Under the UNFIXED code drain(0) hangs forever with an active periodic; the
+/// bounded wait turns that into a test FAILURE rather than a suite hang. On a
+/// detected hang the worker is left detached (still blocked inside drain), so a
+/// hang-sensitive caller MUST leak its TimerService (never destroy it while the
+/// worker is inside drain) — see requireDrainedOrLeak.
+struct BoundedDrain
+{
+  bool completed{false};
+  LifecycleResult result;
+};
+
+BoundedDrain runBoundedDrain(TimerService &timer, std::uint32_t timeoutMs,
+                             std::chrono::milliseconds bound)
+{
+  auto prom = std::make_shared<std::promise<LifecycleResult>>();
+  auto fut = prom->get_future();
+  std::thread worker([&timer, timeoutMs, prom]() { prom->set_value(timer.drain(timeoutMs)); });
+
+  BoundedDrain out;
+  if (fut.wait_for(bound) == std::future_status::ready)
+  {
+    out.completed = true;
+    out.result = fut.get();
+    worker.join();
+  }
+  else
+  {
+    out.completed = false;
+    worker.detach(); // caller must leak `timer`
+  }
+  return out;
+}
+
+/// If the drain hung, leak the heap TimerService (its worker is still blocked
+/// inside drain, so it must never be destroyed) and FAIL. Otherwise a no-op.
+void requireDrainedOrLeak(BoundedDrain &bd, std::unique_ptr<TimerService> &timer, const char *what)
+{
+  if (!bd.completed)
+  {
+    timer.release(); // worker still inside drain(0) — leak, do not destroy
+    FAIL(what);
+  }
+}
+
+/// Runs drain() on a worker and signals `returned` (release) once it returns,
+/// storing the result. Used by the mid-execution cases that cannot use
+/// runBoundedDrain (they must observe the "did not return yet" state before
+/// releasing the callback). The result/flag live in a heap State owned by a
+/// shared_ptr captured BY VALUE into the worker lambda (never `this`), so a
+/// detached worker after a non-permanent hang writes only to still-live memory.
+struct DrainWorker
+{
+  struct State
+  {
+    std::atomic<bool> returned{false};
+    LifecycleResult result;
+  };
+  std::shared_ptr<State> state{std::make_shared<State>()};
+  std::thread worker;
+
+  void start(TimerService &timer, std::uint32_t timeoutMs)
+  {
+    auto st = state; // shared_ptr copy — keeps State alive for a detached worker
+    worker = std::thread(
+      [st, &timer, timeoutMs]()
+      {
+        LifecycleResult r = timer.drain(timeoutMs);
+        st->result = r;
+        st->returned.store(true, std::memory_order_release);
+      });
+  }
+
+  bool returnedNow() const { return state->returned.load(std::memory_order_acquire); }
+  const LifecycleResult &result() const { return state->result; }
+
+  bool waitReturned(std::chrono::milliseconds bound) const
+  {
+    auto deadline = std::chrono::steady_clock::now() + bound;
+    while (!state->returned.load(std::memory_order_acquire))
+    {
+      if (std::chrono::steady_clock::now() >= deadline)
+      {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+  }
+};
+
+/// RAII safety net for a DrainWorker driving a heap TimerService: on scope exit
+/// (including an assertion-failure unwind) it joins the worker if drain has
+/// returned, otherwise it detaches the worker and LEAKS the TimerService so the
+/// still-blocked worker never touches freed memory. This prevents std::terminate
+/// (a joinable thread destroyed during unwind) and a TimerService UAF. The
+/// worker's DrainWorker::State is heap-owned via shared_ptr, so it too survives
+/// a detach. The only stack state a detached worker could reference is a timer
+/// handler's captures — safe here because in every hang-eligible case no such
+/// handler is runnable at leak time (cases 2/2b release the callback before any
+/// hang; case 9's one-shot never fires and stop() joins the run loop first).
+struct DrainWorkerGuard
+{
+  DrainWorker &dw;
+  std::unique_ptr<TimerService> &timer;
+  ~DrainWorkerGuard()
+  {
+    if (dw.waitReturned(std::chrono::seconds(3)))
+    {
+      if (dw.worker.joinable())
+      {
+        dw.worker.join();
+      }
+    }
+    else
+    {
+      dw.worker.detach();
+      timer.release(); // leak: worker still inside drain
+    }
+  }
+};
+} // namespace
+
+// (1) DISCRIMINATING: a long-interval periodic must not delay drain(0). A fix
+// that only stops re-arming (leaving the live record uncancelled) would block
+// up to one interval — the 2s bound would trip and FAIL.
+TEST_CASE("TimerService drain(0): terminates promptly with a long-interval periodic",
+          "[timer][lifecycle][drain][periodic][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::atomic<int> fires{0};
+  auto id = timer->schedulePeriodic(std::chrono::seconds(30), [&fires]() { fires.fetch_add(1); });
+  REQUIRE(id != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  auto t0 = std::chrono::steady_clock::now();
+  auto bd = runBoundedDrain(*timer, 0, std::chrono::milliseconds(2000));
+  auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  requireDrainedOrLeak(bd, timer, "drain(0) hung with an active long-interval periodic (unfixed TM3)");
+  REQUIRE(bd.result.success == true);
+  REQUIRE(bd.result.drainStats.has_value());
+  REQUIRE(bd.result.drainStats->remaining == 0);
+  REQUIRE(elapsed < std::chrono::milliseconds(500)); // << 30s interval
+  REQUIRE(fires.load() == 0);                        // never fired
+}
+
+// (2) NON-VACUOUS requirement (b), ONE-SHOT: drain(0) must not return while a
+// one-shot callback is executing. Heap timer + DrainWorkerGuard so an
+// assertion-failure unwind can never std::terminate or UAF.
+TEST_CASE("TimerService drain(0): waits for an in-flight one-shot callback",
+          "[timer][lifecycle][drain][inflight][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::promise<void> entered;
+  std::atomic<bool> release{false};
+  std::atomic<bool> handlerDone{false};
+
+  auto id = timer->scheduleAfter(std::chrono::milliseconds(10),
+                                 [&]()
+                                 {
+                                   entered.set_value();
+                                   while (!release.load(std::memory_order_acquire))
+                                   {
+                                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                   }
+                                   handlerDone.store(true, std::memory_order_release);
+                                 });
+  REQUIRE(id != 0);
+  entered.get_future().wait(); // handler is now executing
+
+  DrainWorker dw;
+  dw.start(*timer, 0);
+  DrainWorkerGuard guard{dw, timer};
+
+  // Must NOT return while the callback is blocked.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(dw.returnedNow() == false);
+  REQUIRE(handlerDone.load() == false);
+
+  release.store(true, std::memory_order_release);
+  REQUIRE(dw.waitReturned(std::chrono::seconds(2)) == true);
+  REQUIRE(dw.result().success == true);
+  REQUIRE(handlerDone.load() == true);
+}
+
+// (2b) NON-VACUOUS requirement (b), PERIODIC mid-execution: drain(0) must wait
+// for an executing periodic callback AND, after returning, the re-armed record
+// must have been cancelled (no further fires).
+TEST_CASE("TimerService drain(0): waits for an in-flight periodic and stops further fires",
+          "[timer][lifecycle][drain][inflight][periodic][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::promise<void> entered;
+  std::atomic<bool> release{false};
+  std::atomic<int> fires{0};
+
+  auto id = timer->schedulePeriodic(std::chrono::milliseconds(20),
+                                    [&]()
+                                    {
+                                      int n = fires.fetch_add(1) + 1;
+                                      if (n == 1)
+                                      {
+                                        entered.set_value();
+                                        while (!release.load(std::memory_order_acquire))
+                                        {
+                                          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                                        }
+                                      }
+                                    });
+  REQUIRE(id != 0);
+  entered.get_future().wait(); // periodic handler mid-execution on first fire
+
+  DrainWorker dw;
+  dw.start(*timer, 0);
+  DrainWorkerGuard guard{dw, timer};
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(dw.returnedNow() == false);
+
+  release.store(true, std::memory_order_release);
+  REQUIRE(dw.waitReturned(std::chrono::seconds(2)) == true);
+  REQUIRE(dw.result().success == true);
+
+  int firesAtReturn = fires.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100)); // > several intervals
+  REQUIRE(fires.load() == firesAtReturn);                      // no fire after drain
+}
+
+// (3) Pending one-shot fires naturally under drain(0) and is NOT cancelled.
+TEST_CASE("TimerService drain(0): pending one-shot fires naturally, not cancelled",
+          "[timer][lifecycle][drain][oneshot][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::atomic<bool> fired{false};
+  auto id = timer->scheduleAfter(std::chrono::milliseconds(200),
+                                 [&fired]() { fired.store(true, std::memory_order_release); });
+  REQUIRE(id != 0);
+
+  auto bd = runBoundedDrain(*timer, 0, std::chrono::seconds(2));
+  requireDrainedOrLeak(bd, timer, "drain(0) hung with a pending one-shot");
+  REQUIRE(bd.result.success == true);
+  REQUIRE(fired.load() == true); // fired naturally
+  REQUIRE(bd.result.drainStats.has_value());
+  REQUIRE(bd.result.drainStats->cancelled == 0); // nothing cancelled
+}
+
+// (4) RACE: drain(0) concurrent with a rapidly-firing periodic (cancel sweep
+// vs re-arm). Primarily a TSan target; bounded so a hang FAILS here too.
+TEST_CASE("TimerService drain(0): concurrent with a firing periodic (race)",
+          "[timer][lifecycle][drain][periodic][race][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::atomic<int> fires{0};
+  auto id = timer->schedulePeriodic(std::chrono::milliseconds(5), [&fires]() { fires.fetch_add(1); });
+  REQUIRE(id != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30)); // fire a few times first
+
+  auto bd = runBoundedDrain(*timer, 0, std::chrono::seconds(2));
+  requireDrainedOrLeak(bd, timer, "drain(0) hung racing a firing periodic");
+  REQUIRE(bd.result.success == true);
+  REQUIRE(bd.result.drainStats.has_value());
+  REQUIRE(bd.result.drainStats->remaining == 0);
+}
+
+// (5) MIXED + fire-count discriminator: a predicate-only "drainable" fix would
+// return fast but leave the periodic FIRING; assert the fire-count is constant
+// after drain returns (proves real cancellation), the one-shot still fired, and
+// the naturally-completing one-shot is counted in `completed`.
+TEST_CASE("TimerService drain(0): mixed periodic + one-shot, periodic truly stops",
+          "[timer][lifecycle][drain][mixed][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::atomic<int> pfires{0};
+  std::atomic<bool> oneShotFired{false};
+  auto pid = timer->schedulePeriodic(std::chrono::milliseconds(20), [&pfires]() { pfires.fetch_add(1); });
+  auto oid = timer->scheduleAfter(std::chrono::milliseconds(50),
+                                  [&oneShotFired]() { oneShotFired.store(true, std::memory_order_release); });
+  REQUIRE(pid != 0);
+  REQUIRE(oid != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  auto bd = runBoundedDrain(*timer, 0, std::chrono::seconds(2));
+  requireDrainedOrLeak(bd, timer, "drain(0) hung with mixed periodic + one-shot");
+  REQUIRE(bd.result.success == true);
+  REQUIRE(bd.result.drainStats.has_value());
+  REQUIRE(bd.result.drainStats->cancelled == 1); // the periodic
+  REQUIRE(bd.result.drainStats->completed >= 1); // the naturally-fired one-shot
+
+  int atReturn = pfires.load();
+  REQUIRE(oneShotFired.load() == true); // one-shot fired naturally
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200)); // several intervals
+  REQUIRE(pfires.load() == atReturn);                          // periodic really stopped
+}
+
+// (6) stop() REGRESSION: stop() auto-drains with a 5000ms budget (timeoutMs>0
+// path). Confirm the fix did not disturb it — periodic cancelled, clean stop.
+TEST_CASE("TimerService stop(): cancels an active periodic (timeoutMs>0 path regression)",
+          "[timer][lifecycle][stop][periodic]")
+{
+  TimerService timer;
+  std::atomic<int> fires{0};
+  auto id = timer.schedulePeriodic(std::chrono::milliseconds(20), [&fires]() { fires.fetch_add(1); });
+  REQUIRE(id != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+  auto result = timer.stop();
+  REQUIRE(result.success == true);
+  REQUIRE(result.newState == LifecycleState::Stopped);
+
+  int atStop = fires.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  REQUIRE(fires.load() == atStop); // no further fires
+}
+
+// (7) DrainStats accuracy for a cancelled periodic: remaining 0, cancelled 1,
+// completed 0 (non-negative), and timersCanceled increments exactly once.
+TEST_CASE("TimerService drain(0): DrainStats accounting for a cancelled periodic",
+          "[timer][lifecycle][drain][stats][periodic][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  auto canceledBefore = timer->getStats().timersCanceled.load();
+  auto id = timer->schedulePeriodic(std::chrono::seconds(30), []() {});
+  REQUIRE(id != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  auto bd = runBoundedDrain(*timer, 0, std::chrono::seconds(2));
+  requireDrainedOrLeak(bd, timer, "drain(0) hung (stats case)");
+  REQUIRE(bd.result.success == true);
+  REQUIRE(bd.result.drainStats.has_value());
+  auto &s = bd.result.drainStats.value();
+  REQUIRE(s.remaining == 0);
+  REQUIRE(s.cancelled == 1);
+  REQUIRE(s.completed == 0);
+  REQUIRE(timer->getStats().timersCanceled.load() == canceledBefore + 1);
+}
+
+// (8) drain(0) then stop() from the resulting Draining state terminates cleanly
+// (stop()'s Running-only auto-drain is skipped from Draining).
+TEST_CASE("TimerService drain(0) then stop() from Draining terminates cleanly",
+          "[timer][lifecycle][drain][stop][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  auto id = timer->schedulePeriodic(std::chrono::seconds(30), []() {});
+  REQUIRE(id != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  auto bd = runBoundedDrain(*timer, 0, std::chrono::seconds(2));
+  requireDrainedOrLeak(bd, timer, "drain(0) hung (drain-then-stop case)");
+  REQUIRE(bd.result.success == true);
+  REQUIRE(bd.result.newState == LifecycleState::Draining);
+
+  auto sres = timer->stop();
+  REQUIRE(sres.success == true);
+  REQUIRE(sres.newState == LifecycleState::Stopped);
+}
+
+// (9) H-1 regression: a concurrent stop() while drain(0) is BLOCKED on a
+// pending (not-yet-due) one-shot must not hang the drain(0) caller. Under the
+// unfixed drainDone (no !_running escape) drain(0) waits forever because the
+// run-loop shutdown fires only DUE timers, so `remaining` never reaches 0.
+TEST_CASE("TimerService drain(0): concurrent stop() unblocks a drain waiting on a pending one-shot",
+          "[timer][lifecycle][drain][stop][shutdown][zero]")
+{
+  auto timer = std::make_unique<TimerService>();
+  std::atomic<bool> fired{false};
+  auto id = timer->scheduleAfter(std::chrono::milliseconds(300),
+                                 [&fired]() { fired.store(true, std::memory_order_release); });
+  REQUIRE(id != 0);
+
+  DrainWorker dw;
+  dw.start(*timer, 0);        // blocks on the pending one-shot (remaining == 1)
+  DrainWorkerGuard guard{dw, timer};
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50)); // let drain(0) park in the wait
+  REQUIRE(dw.returnedNow() == false);
+
+  auto sres = timer->stop();  // concurrent stop() must wake the blocked drain(0)
+
+  // FAILS (hangs -> bounded wait trips) under the unfixed code.
+  REQUIRE(dw.waitReturned(std::chrono::seconds(2)) == true);
+  REQUIRE(sres.success == true);
+  // drain(0) was truncated by shutdown, not completed -> success == false.
+  REQUIRE(dw.result().success == false);
+
+  // M-1 guard: the service must be genuinely Stopped and refuse new timers.
+  // Before this fix, a drain-timeout restore left _accepting==true,
+  // so a Stopped service still accepted schedules onto a dead run loop.
+  REQUIRE(timer->getState() == LifecycleState::Stopped);
+  REQUIRE(timer->schedulePeriodic(std::chrono::seconds(1), []() {}) == 0);
+  REQUIRE(timer->scheduleAfter(std::chrono::milliseconds(10), []() {}) == 0);
+}
+
+// (10) F-1 regression: timeoutMs>0 drain now cancels an active periodic
+// SYMMETRICALLY with drain(0) — the near-term periodic must NOT fire one last
+// time during the drain window, and it is counted as `cancelled`, not
+// `completed`. (Human-approved relaxation of the original "must not alter the
+// timeoutMs>0 path" requirement — see tracker decision_record.round2.F1.)
+TEST_CASE("TimerService drain(N): cancels an active periodic without a final fire",
+          "[timer][lifecycle][drain][periodic][timeout]")
+{
+  TimerService timer;
+  std::atomic<int> fires{0};
+  auto id = timer.schedulePeriodic(std::chrono::milliseconds(20), [&fires]() { fires.fetch_add(1); });
+  REQUIRE(id != 0);
+  // Let it arm but not necessarily fire; its next fire is within the drain
+  // window (20ms << 1000ms), i.e. the near-term case the old code let fire.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+  auto result = timer.drain(1000);
+  REQUIRE(result.success == true);
+  REQUIRE(result.drainStats.has_value());
+  REQUIRE(result.drainStats->remaining == 0);
+  REQUIRE(result.drainStats->cancelled == 1); // counted cancelled, not completed
+  REQUIRE(result.drainStats->completed == 0);
+
+  int atReturn = fires.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(150)); // several intervals
+  REQUIRE(fires.load() == atReturn); // no fire after drain (cancelled, not fired)
+}
+
+// (11) M-1 (genuine-timeout variant) regression: when stop()'s internal
+// drain(5000) TIMES OUT on a handler slower than its budget, drain's
+// timeout-restore re-opens _accepting; stop() must still finalize Stopped with
+// _accepting==false, so a Stopped service refuses new timers. Before the fix
+// (stop() forcing _accepting=false at the terminal transition) this left
+// Stopped + _accepting==true, silently accepting timers onto a dead run loop.
+// NOTE: intentionally slow (~5s) — the restore path is only reachable when
+// stop()'s hardcoded 5000ms drain budget is exceeded by an in-flight handler.
+TEST_CASE("TimerService stop(): Stopped implies not-accepting even when the stop-drain times out",
+          "[timer][lifecycle][stop][slow]")
+{
+  TimerService timer;
+  std::atomic<bool> handlerRan{false};
+  // Fires ~immediately, then blocks past stop()'s 5000ms drain budget so
+  // stop()'s internal drain times out and takes the restore path.
+  auto id = timer.scheduleAfter(std::chrono::milliseconds(10),
+                                [&handlerRan]()
+                                {
+                                  std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+                                  handlerRan.store(true, std::memory_order_release);
+                                });
+  REQUIRE(id != 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(30)); // ensure it is in-flight
+
+  auto result = timer.stop(); // internal drain(5000) times out on the slow handler
+  REQUIRE(result.success == true);
+  REQUIRE(result.newState == LifecycleState::Stopped);
+  REQUIRE(handlerRan.load() == true); // stop() joined the run loop (handler finished)
+
+  // The terminal invariant: Stopped => not accepting. A regression that leaves
+  // _accepting==true would let these schedules succeed onto a dead run loop.
+  REQUIRE(timer.getState() == LifecycleState::Stopped);
+  REQUIRE(timer.scheduleAfter(std::chrono::milliseconds(10), []() {}) == 0);
+  REQUIRE(timer.schedulePeriodic(std::chrono::seconds(1), []() {}) == 0);
 }

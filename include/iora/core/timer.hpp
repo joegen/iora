@@ -619,7 +619,11 @@ public:
   /// Begin graceful drain (Running → Draining)
   /// Fires already-expired timers, cancels future timers, waits for in-flight
   /// callbacks to complete. Uniform semantics with TimingWheel::drain().
-  /// @param timeoutMs Maximum time to wait for in-flight callbacks (0 = wait indefinitely)
+  /// @param timeoutMs Maximum time to wait for in-flight callbacks.
+  ///   0 = wait indefinitely: pending one-shot timers are left to fire
+  ///   naturally (finite work), while periodic timers — which re-arm on every
+  ///   fire and would otherwise keep drain() blocked forever — are cancelled
+  ///   up front. In-flight (executing) callbacks are always awaited.
   /// @return Result with drain statistics
   iora::common::LifecycleResult drain(std::uint32_t timeoutMs = 30000) override
   {
@@ -650,25 +654,24 @@ public:
     // The run loop is still running and will fire timers naturally, so
     // timers within the timeout window are left to fire. Only far-future
     // timers (deadline beyond drain deadline) are cancelled — their callback
-    // targets may be destroyed by the time they would expire.
+    // targets may be destroyed by the time they would expire. (This applies to
+    // the timeoutMs > 0 path; at timeoutMs == 0 there is no deadline, so
+    // one-shots always fire and only periodics are cancelled — see below.)
     std::uint32_t inFlightAtStart = 0;
     std::uint32_t cancelledCount = 0;
     {
       std::lock_guard<std::mutex> lock(_mutex);
 
-      // Inline getInFlightCount logic under the existing lock to avoid
-      // stale count (F3 fix). With unified IDs, counting _records alone
-      // is sufficient — every active periodic timer has a _records entry.
-      for (const auto &pair : _records)
-      {
-        if (!pair.second.canceled)
-        {
-          ++inFlightAtStart;
-        }
-      }
-      // When timeoutMs > 0, cancel timers beyond the drain deadline and all
-      // periodic timers. When timeoutMs == 0 (wait indefinitely), let all
-      // timers fire naturally — don't cancel anything upfront.
+      // Count under the existing lock to avoid a stale count (F3 fix).
+      inFlightAtStart = countActiveRecordsLocked();
+      // At timeoutMs > 0 the records-deadline loop cancels one-shots (and
+      // periodic records) whose deadline is beyond the drain window; at
+      // timeoutMs == 0 ("wait indefinitely") pending one-shots are left to fire
+      // naturally, so that loop is skipped. In BOTH modes every active periodic
+      // must be cancelled (the unconditional loop after this if): a periodic
+      // re-arms itself on every fire (collectDueLocked), so leaving it live
+      // would keep a _records entry forever and drainDone (remaining == 0) could
+      // never be satisfied, hanging the drain permanently.
       if (timeoutMs > 0)
       {
         auto drainDeadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -684,29 +687,38 @@ public:
             }
           }
         }
-        for (auto& [id, pt] : _periodicTimers)
+      }
+
+      // Cancel every active periodic (both timeout modes). Dual-mark BOTH the
+      // descriptor and its live _records entry (mirroring cancel(id) at
+      // ~498/~515) so drainDone stops counting the record immediately and
+      // collectDueLocked does not re-arm it. Mark only — do NOT erase
+      // _periodicTimers here (unlike cancel(id)): erasing during this range-for
+      // would invalidate the iterator (UB); collectDueLocked's else-branch
+      // reclaims the descriptor and record lazily. A far-future periodic record
+      // (timeoutMs > 0, tp > drainDeadline) was already cancelled AND counted by
+      // the records loop above, so the `!recIt->second.canceled` guard marks and
+      // counts only a still-live record here — no double count, no alreadyCounted
+      // flag. (Every active periodic has a live _records entry — both stores
+      // mutate together under _mutex — so recIt==end() never occurs.)
+      for (auto& [id, pt] : _periodicTimers)
+      {
+        if (!pt.canceled)
         {
-          if (!pt.canceled)
+          pt.canceled = true;
+          if (_config.enableStatistics)
           {
-            pt.canceled = true;
+            _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
+          }
+
+          auto recIt = _records.find(id);
+          if (recIt != _records.end() && !recIt->second.canceled)
+          {
+            recIt->second.canceled = true;
+            ++cancelledCount;
             if (_config.enableStatistics)
             {
-              _stats.periodicTimersActive.fetch_sub(1, std::memory_order_relaxed);
-            }
-
-            // Check if the records loop already canceled (and counted) this ID
-            auto recIt = _records.find(id);
-            bool alreadyCounted = (recIt != _records.end() && recIt->second.canceled);
-
-            if (_config.enableStatistics && !alreadyCounted)
-            {
               _stats.timersCanceled.fetch_add(1, std::memory_order_relaxed);
-            }
-
-            // Only count toward DrainStats if no corresponding _records entry
-            if (recIt == _records.end())
-            {
-              ++cancelledCount;
             }
           }
         }
@@ -726,18 +738,23 @@ public:
     // Uses _drainCV instead of polling to avoid lock contention with run loop.
     std::uint32_t remaining = 0;
     bool timedOut = false;
+    bool shutdownTruncated = false;
 
     auto drainDone = [this, &remaining]()
     {
-      // Inline count under lock (same logic as getInFlightCount, avoids deadlock)
-      // With unified IDs, counting _records alone is sufficient.
-      remaining = 0;
-      for (const auto &pair : _records)
+      remaining = countActiveRecordsLocked();
+      // Run-loop-liveness escape: if the run loop has EXITED (a concurrent
+      // stop()/~TimerService(), or a system-error exit) while we wait, pending
+      // timers can no longer fire, so `remaining` would never reach 0 and this
+      // predicate would block forever — the run loop's exit notify (see runLoop)
+      // is our only remaining wakeup. Stop waiting once nothing is still
+      // executing. Keyed on _runLoopExited, NOT !_running: an error-exit
+      // terminates the loop with _running still true, and that must escape too.
+      // Requirement (b) is preserved: an in-flight callback finishing decrements
+      // _executingCallbacks and re-notifies, so we still await executing work.
+      if (_runLoopExited.load(std::memory_order_acquire))
       {
-        if (!pair.second.canceled)
-        {
-          ++remaining;
-        }
+        return _executingCallbacks.load(std::memory_order_acquire) == 0;
       }
       return remaining == 0 && _executingCallbacks.load(std::memory_order_acquire) == 0;
     };
@@ -762,6 +779,16 @@ public:
           timedOut = !_drainCV.wait_for(lock, budget, drainDone);
         }
       }
+      // A wait released by the run-loop-liveness escape (see drainDone) leaves
+      // `remaining` > 0 — the pending timers can no longer fire. That is not a
+      // successful drain; report it as truncated. (A genuine timeoutMs>0 budget
+      // timeout already set timedOut and is not a shutdown, so it is not
+      // reclassified here.)
+      if (!timedOut && remaining != 0)
+      {
+        timedOut = true;
+        shutdownTruncated = true;
+      }
     }
 
     std::uint32_t accounted = remaining + cancelledCount;
@@ -772,9 +799,14 @@ public:
     std::string message;
     if (timedOut)
     {
-      // Restore to Running so drain can be retried. Use CAS (Draining→Running)
-      // so if stop() already transitioned to Stopped, we don't overwrite it.
-      // Both operations under _mutex for consistency with the drain entry gate.
+      // Restore to Running so drain can be retried — but ONLY on a genuine
+      // budget timeout with the run loop still alive. If the run loop has
+      // exited (shutdown/error → shutdownTruncated), do NOT restore: the
+      // service is terminating, and re-enabling _accepting would race stop()'s
+      // Stopped store and leave a Stopped service accepting timers onto a dead
+      // run loop. Use CAS (Draining→Running) so a concurrent stop() that
+      // already moved past Draining is not overwritten.
+      if (!_runLoopExited.load(std::memory_order_acquire))
       {
         std::lock_guard<std::mutex> lock(_mutex);
         auto drainExpected = LifecycleState::Draining;
@@ -786,7 +818,10 @@ public:
         }
         // If CAS failed, stop() already moved past Draining — don't restore
       }
-      message = "Drain timed out with " + std::to_string(remaining) + " timers remaining";
+      message = shutdownTruncated
+                  ? "Drain truncated by run-loop shutdown with " + std::to_string(remaining) +
+                      " timers remaining"
+                  : "Drain timed out with " + std::to_string(remaining) + " timers remaining";
     }
     else
     {
@@ -838,14 +873,14 @@ public:
       }
 
       cleanup();
-      _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
+      finalizeStoppedLocked();
       loggerSnapshot()->info("Timer service stopped");
 
       return LifecycleResult(true, LifecycleState::Stopped, "Timer service stopped");
     }
 
     // Already stopped
-    _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
+    finalizeStoppedLocked();
     return LifecycleResult(true, LifecycleState::Stopped, "Already stopped");
   }
 
@@ -895,23 +930,43 @@ public:
   std::uint32_t getInFlightCount() const override
   {
     std::lock_guard<std::mutex> lock(_mutex);
+    return countActiveRecordsLocked();
+  }
 
-    // Count non-canceled timers in _records.
-    // With unified IDs, every active periodic timer has a corresponding
-    // _records entry, so counting _records alone is sufficient.
-    std::uint32_t activeTimers = 0;
+private:
+  /// Count non-cancelled entries in _records. With unified IDs every active
+  /// periodic timer has a corresponding _records entry, so this alone is the
+  /// in-flight (scheduled) count. Caller MUST hold _mutex.
+  std::uint32_t countActiveRecordsLocked() const
+  {
+    std::uint32_t n = 0;
     for (const auto &pair : _records)
     {
       if (!pair.second.canceled)
       {
-        activeTimers++;
+        ++n;
       }
     }
-
-    return activeTimers;
+    return n;
   }
 
-private:
+  /// Establish the terminal invariant `Stopped ⟹ !_accepting`. drain()'s
+  /// timeout-restore path can legitimately re-open _accepting (Draining →
+  /// Running retry); if that drain was our own internal drain(5000) timing out
+  /// (a handler slower than the budget), or a concurrent drain(N) whose restore
+  /// raced this stop(), the service would otherwise finalize Stopped with
+  /// _accepting == true and silently accept later timers onto a dead run loop
+  /// loop. Force _accepting false in the SAME _mutex critical section as the
+  /// terminal state store, so a racing restore is either overwritten
+  /// (restore-first) or its Draining→Running CAS fails (Stopped-first). Acquires
+  /// _mutex (unlike the *Locked helpers that require it held).
+  void finalizeStoppedLocked()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _accepting.store(false, std::memory_order_release);
+    _lifecycleState.store(iora::common::LifecycleState::Stopped, std::memory_order_release);
+  }
+
   struct Record
   {
     TimePoint tp;
@@ -967,8 +1022,30 @@ private:
       addEpollFd(_timerFd, EPOLLIN);
       addEpollFd(_eventFd, EPOLLIN);
 
+      _runLoopExited.store(false, std::memory_order_release);
       _running.store(true, std::memory_order_release);
-      _thread = std::thread([this]() { this->runLoop(); });
+      _thread = std::thread(
+        [this]()
+        {
+          // A throw escaping the thread function would std::terminate the
+          // process. runLoop()'s ExitGuard has already published _runLoopExited
+          // + notified drain() during unwind, so contain the exception here and
+          // exit the thread gracefully (the service is left non-running; a
+          // parked drain() returns via its shutdown escape).
+          try
+          {
+            this->runLoop();
+          }
+          catch (const std::exception &e)
+          {
+            loggerSnapshot()->critical(std::string("Timer run loop terminated by exception: ") +
+                                       e.what());
+          }
+          catch (...)
+          {
+            loggerSnapshot()->critical("Timer run loop terminated by unknown exception");
+          }
+        });
 
       // Set thread name and priority if configured
       configureThread();
@@ -1195,10 +1272,7 @@ private:
       ssize_t n = ::read(fd, &val, sizeof(val));
       if (n < 0)
       {
-        if (errno == EAGAIN)
-        {
-          break;
-        }
+        // EAGAIN (counter drained) or any other error: stop reading.
         break;
       }
       if (n < static_cast<ssize_t>(sizeof(val)))
@@ -1373,6 +1447,28 @@ private:
 
   void runLoop()
   {
+    // Publish run-loop-exited liveness on EVERY exit from this function — a
+    // normal break OR an exception unwind — so a drain() parked on _drainCV is
+    // always released (its _runLoopExited escape fires) and a stray throw
+    // cannot leave waiters hung. Set under _mutex (barrier before notify, so a
+    // parked drain cannot miss it), then notify. This is the single point that
+    // covers all exit paths; the caller lambda additionally catches to avoid
+    // std::terminate. Declared FIRST — before the opening log below — so even a
+    // throw from that log is covered (the dtor takes only _mutex + notify_all,
+    // both non-throwing).
+    struct ExitGuard
+    {
+      TimerService *self;
+      ~ExitGuard()
+      {
+        {
+          std::lock_guard<std::mutex> lock(self->_mutex);
+          self->_runLoopExited.store(true, std::memory_order_release);
+        }
+        self->_drainCV.notify_all();
+      }
+    } exitGuard{this};
+
     loggerSnapshot()->info("Timer service loop started");
 
     std::vector<epoll_event> events(_config.maxEpollEvents);
@@ -1428,8 +1524,7 @@ private:
 
       if (shouldExit || (timerfdErr != 0 && _config.throwOnSystemError))
       {
-        // Wake drain() in case it's waiting — runLoop is exiting
-        _drainCV.notify_all();
+        // ExitGuard publishes _runLoopExited + notifies drain() on the way out.
         break;
       }
 
@@ -1516,6 +1611,9 @@ private:
       }
     }
 
+    // ExitGuard (declared at the top) publishes _runLoopExited + notifies
+    // drain() as this function returns — covering the normal break here and any
+    // exception unwind uniformly.
     loggerSnapshot()->info("Timer service loop finished");
   }
 
@@ -1524,12 +1622,16 @@ private:
   TimerServiceConfig _config;
   std::shared_ptr<TimerLogger> _logger;   // guarded by _handlerMutex
   ErrorHandler _errorHandler;             // guarded by _handlerMutex
+  // Lock ordering: _mutex (outer) then _handlerMutex (inner); never held
+  // together in practice (loggerSnapshot/handleError take _handlerMutex alone,
+  // never inside a _mutex-guarded block). Never acquire _mutex while holding
+  // _handlerMutex.
   mutable std::mutex _handlerMutex;       // protects _logger and _errorHandler
 
   // Statistics
   mutable TimerStats _stats;
 
-  // Timer bookkeeping
+  // Timer bookkeeping — see the lock-ordering note at _handlerMutex above.
   mutable std::mutex _mutex;
   std::unordered_map<std::uint64_t, Record> _records;
   std::unordered_map<std::uint64_t, PeriodicTimer> _periodicTimers;
@@ -1538,6 +1640,12 @@ private:
 
   // Threading and fds
   std::atomic<bool> _running{false};
+  // Set true (with a _drainCV notify) at EVERY run-loop exit — the authoritative
+  // run-loop-liveness signal drainDone escapes on. Distinct from _running:
+  // _running is the STOP request, while _runLoopExited is the run loop having
+  // actually terminated (which also happens on a system-error exit with
+  // _running still true). Reset to false when the run-loop thread is (re)started.
+  std::atomic<bool> _runLoopExited{false};
   std::thread _thread;
   int _epollFd{-1};              // only accessed from init/runLoop/cleanup (single thread)
   int _timerFd{-1};              // only accessed from init/runLoop/cleanup (single thread)
