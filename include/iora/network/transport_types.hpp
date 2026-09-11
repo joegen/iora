@@ -369,7 +369,6 @@ struct TransportConfig
   std::size_t syncBufferGcThreshold{1024};
   std::chrono::milliseconds defaultSyncTimeout{30000};
   bool allowReadModeSwitch{true};
-  bool autoHealthMonitoring{true};
 
   // === TLS ===
   struct TlsConfig
@@ -422,7 +421,6 @@ struct TransportConfig
     c.tcpKeepalive.idle = 120;
     c.maxPendingSyncOps = 64;
     c.defaultSyncTimeout = std::chrono::milliseconds(32000);
-    c.autoHealthMonitoring = true;
     c.dscpValue = 24; // CS3
     return c;
   }
@@ -435,7 +433,6 @@ struct TransportConfig
     c.maxSessions = 10000;
     c.maxPendingSyncOps = 64;
     c.defaultSyncTimeout = std::chrono::milliseconds(500);
-    c.autoHealthMonitoring = true;
     c.dscpValue = 24; // CS3
     return c;
   }

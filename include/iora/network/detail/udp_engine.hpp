@@ -11,8 +11,6 @@
 #endif
 
 #include "iora/core/errno_utils.hpp"
-#include "iora/network/circuit_breaker.hpp"
-#include "iora/network/connection_health.hpp"
 #include "iora/network/detail/engine_base.hpp"
 #include "iora/network/name_resolver.hpp"
 #include "iora/network/event_batch_processor.hpp"
@@ -22,6 +20,7 @@
 #include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cassert>
 #include <cstdio>
@@ -2121,8 +2120,6 @@ private:
   // New improvements
   ObjectPool<Session> _sessionPool;
   ObjectPool<Listener> _listenerPool;
-  HealthMonitor _healthMonitor;
-  CircuitBreakerManager _circuitBreakers;
 
   // Batch processor (created when batching is enabled)
   std::unique_ptr<EventBatchProcessor> _batchProcessor;

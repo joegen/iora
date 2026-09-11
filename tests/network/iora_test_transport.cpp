@@ -152,7 +152,6 @@ TEST_CASE("Config::forSipTcp() has correct defaults", "[transport][config]")
   REQUIRE(c.tcpKeepalive.idle == 120);
   REQUIRE(c.maxPendingSyncOps == 64);
   REQUIRE(c.defaultSyncTimeout == 32000ms);
-  REQUIRE(c.autoHealthMonitoring == true);
   REQUIRE(c.dscpValue == 24);
 }
 
