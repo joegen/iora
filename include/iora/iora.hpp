@@ -817,16 +817,10 @@ public:
         return false;
       }
 
-      // Additional security check for file extension
-      std::string extension = entry.extension().string();
-      const std::vector<std::string> allowedExtensions = {".so", ".dll", ".dylib"};
-      if (std::find(allowedExtensions.begin(), allowedExtensions.end(), extension) ==
-          allowedExtensions.end())
-      {
-        IORA_LOG_ERROR("Module has unsupported file extension: " + modulePath);
-        return false;
-      }
-
+      // The .so/.dll/.dylib extension allow-list is enforced (against the
+      // symlink-RESOLVED target) in the protected loadSingleModule(directory_entry)
+      // overload below — the single load funnel, so both this path and the
+      // loadModules() autoLoad directory scan are covered by one check.
       return loadSingleModule(std::filesystem::directory_entry(entry));
     }
     catch (const std::exception &e)
@@ -1142,6 +1136,15 @@ public:
   }
 
 private:
+  /// \brief The single source of truth for which shared-library extensions may be
+  /// loaded as modules. Used by BOTH the load funnel (on the symlink-resolved
+  /// target) and the loadModules() autoLoad directory pre-filter, so the two can
+  /// never drift.
+  static bool isSupportedModuleExtension(const std::string &extension)
+  {
+    return extension == ".so" || extension == ".dll" || extension == ".dylib";
+  }
+
   /// \brief Validates a module path: rejects parent-directory traversal, null
   /// bytes/control characters, and over-long paths, and requires the parent
   /// directory to resolve. A path component that merely begins with '.' (a
@@ -1286,6 +1289,10 @@ protected:
       try
       {
         pluginName = entry.path().filename().string();
+        // The ORIGINAL (as-requested) path is stored as the plugin's _path, so
+        // reloadModule() re-runs this funnel on the same path and re-derives the
+        // same basename identity. dlopen loads the RESOLVED path (see below), but
+        // identity must not follow a symlink target's basename.
         pluginPath = entry.path().string();
 
         // Fail-fast if this module name is mid-unload (claimed): loading over a
@@ -1299,8 +1306,36 @@ protected:
           return false;
         }
 
+        // Symlink-hardening (tracker 2026-09-11-12): resolve the path ONCE and
+        // (a) apply the .so/.dll/.dylib allow-list to the RESOLVED target's
+        // extension and (b) dlopen that same resolved path. A ".so"-named symlink
+        // whose real target is a non-".so" (or later re-pointed) file is thus
+        // rejected, and the file we load is exactly the file whose extension we
+        // checked — no link-name mismatch, no check-vs-load TOCTOU. Because this
+        // directory_entry overload is the single load funnel, the gate covers BOTH
+        // loadSingleModule(string) and the loadModules() autoLoad directory scan.
+        // The error_code overload keeps a vanished/unresolvable target a graceful
+        // skip (return false) rather than a throw out of a loadModules() batch.
+        std::error_code canonEc;
+        const std::filesystem::path resolvedPath =
+          std::filesystem::canonical(entry.path(), canonEc);
+        if (canonEc)
+        {
+          IORA_LOG_ERROR("Cannot resolve module path '" + entry.path().string() +
+                         "': " + canonEc.message());
+          return false;
+        }
+        if (!isSupportedModuleExtension(resolvedPath.extension().string()))
+        {
+          IORA_LOG_ERROR("Module has unsupported file extension (resolved target): " +
+                         resolvedPath.string());
+          return false;
+        }
+
         IORA_LOG_INFO("Loading module: " + pluginName);
-        loadPlugin(pluginName, pluginPath);
+        // dlopen the RESOLVED target (the file whose extension we just checked),
+        // not the original link — closes the check-vs-load symlink-repoint TOCTOU.
+        loadPlugin(pluginName, resolvedPath.string());
         pluginRegistered = true; // we now own the PluginManager entry for this name
 
         // Resolve and call the exported loadModule function
@@ -1436,12 +1471,10 @@ protected:
     }
     else
     {
-      const std::vector<std::string> supportedExtensions = {".so", ".dll"};
       for (const auto &entry : std::filesystem::directory_iterator(modulesPath))
       {
         if (entry.is_regular_file() &&
-            std::find(supportedExtensions.begin(), supportedExtensions.end(),
-                      entry.path().extension()) != supportedExtensions.end())
+            isSupportedModuleExtension(entry.path().extension().string()))
         {
           loadSingleModule(entry);
         }

@@ -24,6 +24,14 @@ void copyPluginTo(const std::filesystem::path &source, const std::filesystem::pa
   std::filesystem::create_directories(dest.parent_path());
   std::filesystem::copy_file(source, dest, std::filesystem::copy_options::overwrite_existing);
 }
+
+// Create a symlink at `link` pointing at `target`, asserting it succeeded.
+void makeSymlink(const std::filesystem::path &target, const std::filesystem::path &link)
+{
+  std::error_code ec;
+  std::filesystem::create_symlink(target, link, ec);
+  REQUIRE_FALSE(ec);
+}
 } // namespace
 
 TEST_CASE("validateModulePath: hidden directories accepted, '..' traversal rejected")
@@ -116,6 +124,42 @@ TEST_CASE("validateModulePath: hidden directories accepted, '..' traversal rejec
       sandbox / "real" / "sub" / ".." / ".." / "real" / "real.so";
     REQUIRE(std::filesystem::exists(interior));
     REQUIRE_FALSE(svc.loadSingleModule(interior.string()));
+  }
+
+  // --- N4 (symlink hardening): a ".so"-named symlink whose real target is a
+  // non-".so" file must be REJECTED. The extension allow-list is applied to the
+  // symlink-RESOLVED target, so a genuinely loadable plugin renamed to ".bin"
+  // and reached through a ".so" link cannot smuggle itself past the gate.
+  // Non-vacuous: the link resolves to an existing, otherwise-loadable file, so
+  // only the resolved-extension check produces the refusal. Mutation: reverting
+  // to the link-name extension (entry.extension()) flips this to a load.
+  {
+    const std::filesystem::path target = sandbox / "sym" / "resolved_target.bin";
+    copyPluginTo(sourcePlugin, target); // a valid .so payload, non-".so" name
+    const std::filesystem::path link = sandbox / "sym" / "plugin.so";
+    makeSymlink(target, link);
+    REQUIRE(std::filesystem::exists(link));                      // resolves to target
+    REQUIRE(std::filesystem::canonical(link).extension() == ".bin"); // real ext
+    REQUIRE_FALSE(svc.loadSingleModule(link.string())); // rejected: nothing loaded
+  }
+
+  // --- R1 (reload identity): a module loaded through a ".so"-named symlink whose
+  // basename differs from its real target must KEEP its link-name identity across
+  // reloadModule(). dlopen loads the resolved target, but the plugin's stored
+  // _path is the ORIGINAL link, so reload re-runs the funnel on the link and
+  // re-derives the same "alias_reload.so" key. Mutation: storing the resolved
+  // path in _path makes reload re-register under "real_reload.so", flipping the
+  // final isModuleLoaded("alias_reload.so") to false.
+  {
+    const std::filesystem::path realReload = sandbox / "reload" / "real_reload.so";
+    copyPluginTo(sourcePlugin, realReload);
+    const std::filesystem::path alias = sandbox / "reload" / "alias_reload.so";
+    makeSymlink(realReload, alias);
+    REQUIRE(svc.loadSingleModule(alias.string())); // valid .so target, loads
+    REQUIRE(svc.isModuleLoaded("alias_reload.so"));
+    REQUIRE(svc.reloadModule("alias_reload.so"));
+    REQUIRE(svc.isModuleLoaded("alias_reload.so")); // identity preserved
+    svc.unloadAllModules();
   }
 }
 
