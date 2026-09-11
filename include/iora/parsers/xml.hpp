@@ -39,7 +39,7 @@
 #include <utility>
 #include <vector>
 
-#include "iora/core/unicode.hpp"
+#include "iora/util/unicode.hpp"
 
 #ifndef IORA_XML_ENABLE_SAX
 #define IORA_XML_ENABLE_SAX 1

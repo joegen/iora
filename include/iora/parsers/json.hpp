@@ -51,7 +51,7 @@
 #include <variant>
 #include <vector>
 
-#include "iora/core/unicode.hpp"
+#include "iora/util/unicode.hpp"
 
 namespace iora
 {

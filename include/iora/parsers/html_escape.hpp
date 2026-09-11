@@ -13,7 +13,7 @@
 #include <unordered_map>
 
 #include <iora/core/string_utils.hpp>
-#include <iora/core/unicode.hpp>
+#include <iora/util/unicode.hpp>
 
 namespace iora
 {
