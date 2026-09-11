@@ -178,6 +178,28 @@
       "headers": [
         "core/errno_utils.hpp"
       ]
+    },
+    "network/transport.md": {
+      "area": "network",
+      "headers": [
+        "network/transport.hpp",
+        "network/transport_types.hpp",
+        "network/detail/engine_base.hpp",
+        "network/detail/tcp_engine.hpp",
+        "network/detail/udp_engine.hpp"
+      ]
+    },
+    "network/transport_sync_lifecycle.md": {
+      "area": "network",
+      "headers": [
+        "network/transport_impl.hpp"
+      ]
+    },
+    "network/transport_dns_resolution.md": {
+      "area": "network",
+      "headers": [
+        "network/name_resolver.hpp"
+      ]
     }
   }
 }

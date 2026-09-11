@@ -182,7 +182,10 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **errno_utils** (`errnoMessage`) — thread-safe `errno`-to-message conversion (`strerror_r` wrapper) — [`docs/core/errno_utils.md`](docs/core/errno_utils.md)
 
 ### network
-- **Transport**, **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **NameResolver**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
+- **Transport** — the unified TCP/UDP transport facade: engines, async + synchronous operations, TLS client identity, DSCP marking, and read-gating — [`docs/network/transport.md`](docs/network/transport.md)
+  - **Transport sync-op lifecycle** — `connectSync` / `receiveSync` / `sendSync`, the drain-before-close teardown handshake, the pending-sync-op cap, and the timeout sentinels — [`docs/network/transport_sync_lifecycle.md`](docs/network/transport_sync_lifecycle.md)
+  - **NameResolver / DNS host resolution** — off-thread `getaddrinfo` host resolution and per-connection TLS identity threaded through the resolve/resume (also the `NameResolver` vs `DnsClient` boundary) — [`docs/network/transport_dns_resolution.md`](docs/network/transport_dns_resolution.md)
+- **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
 
 ### parsers
 - **JSON** — value model, parser & serializer (`\uXXXX`/surrogate decoding, RFC 8259) — [`docs/parsers/json.md`](docs/parsers/json.md)
