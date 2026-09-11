@@ -291,8 +291,13 @@ public:
     return ListenResult::ok(lc.id);
   }
 
-  ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls) override
+  using detail::EngineBase::connect; // un-hide the 3-arg non-pure default
+
+  // Primitive 4-arg override. opts is inert on UDP (no TLS) — rejected below.
+  ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls,
+                        const TlsClientOptions &opts) override
   {
+    (void)opts; // UDP has no TLS; identity options are not applicable
     if (tls != TlsMode::None)
     {
       return ConnectResult::err(
@@ -610,6 +615,10 @@ private:
     SessionId sid{};
     std::string host;
     std::uint16_t port{};
+    // Inert on UDP (no TLS): present only to satisfy the shared 4-arg connect
+    // primitive signature (arch C1, kept per step-0 L-a). Never read.
+    std::string verifyName;
+    unsigned x509HostFlags{0};
   };
   struct ViaReq
   {

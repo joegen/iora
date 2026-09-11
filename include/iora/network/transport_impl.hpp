@@ -723,7 +723,13 @@ inline ListenResult Transport::addListener(const std::string &bindIp, std::uint1
 
 inline ConnectResult Transport::connect(const std::string &host, std::uint16_t port, TlsMode tls)
 {
-  return _impl->engine->connect(host, port, tls);
+  return connect(host, port, tls, TlsClientOptions{});
+}
+
+inline ConnectResult Transport::connect(const std::string &host, std::uint16_t port, TlsMode tls,
+                                        const TlsClientOptions &opts)
+{
+  return _impl->engine->connect(host, port, tls, opts);
 }
 
 inline ConnectResult Transport::connectViaListener(ListenerId lid, const std::string &host,
@@ -755,6 +761,13 @@ inline void Transport::sendAsync(SessionId sid, iora::core::BufferView data,
 inline ConnectResult Transport::connectSync(const std::string &host, std::uint16_t port,
                                             TlsMode tls, std::chrono::milliseconds timeout)
 {
+  return connectSync(host, port, tls, TlsClientOptions{}, timeout);
+}
+
+inline ConnectResult Transport::connectSync(const std::string &host, std::uint16_t port,
+                                            TlsMode tls, const TlsClientOptions &opts,
+                                            std::chrono::milliseconds timeout)
+{
   // Guard on thread-identity ALONE (HR-5/DQ-4): getIoThreadId()==_loop.get_id() is
   // the default std::thread::id pre-start/post-detach, so it matches only the real
   // running I/O thread. Dropping the isRunning() conjunct closes the window where
@@ -769,7 +782,7 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   // For UDP, connect is immediate — no handshake
   if (_impl->config.protocol == Protocol::UDP)
   {
-    return _impl->engine->connect(host, port, tls);
+    return _impl->engine->connect(host, port, tls, opts);
   }
 
   // Acquire syncMutex BEFORE calling engine->connect(). This ensures the
@@ -796,7 +809,7 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
       TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
   }
 
-  auto result = _impl->engine->connect(host, port, tls);
+  auto result = _impl->engine->connect(host, port, tls, opts);
   if (result.isErr())
   {
     // Defensive: the current TcpEngine::connect() always returns ok(sid) and
@@ -1271,7 +1284,7 @@ inline Protocol Transport::getProtocol() const
 
 inline ConnectResult ITransport::connectSyncCancellable(
   const std::string &host, std::uint16_t port, CancellationToken &token, TlsMode tls,
-  std::chrono::milliseconds timeout)
+  std::chrono::milliseconds timeout, const TlsClientOptions &opts)
 {
   if (token.isCancelled())
   {
@@ -1288,7 +1301,7 @@ inline ConnectResult ITransport::connectSyncCancellable(
   // Use the full timeout but poll cancellation via a short sub-timeout.
   // The first call starts the connection attempt.
   auto subTimeout = std::min(remaining, subInterval);
-  auto result = connectSync(host, port, tls, subTimeout);
+  auto result = connectSync(host, port, tls, opts, subTimeout);
   if (result.isOk())
   {
     return result;
@@ -1317,7 +1330,7 @@ inline ConnectResult ITransport::connectSyncCancellable(
       break;
     }
     subTimeout = std::min(remaining, subInterval);
-    result = connectSync(host, port, tls, subTimeout);
+    result = connectSync(host, port, tls, opts, subTimeout);
     if (result.isOk() || result.error().code != TransportError::Timeout)
     {
       return result;

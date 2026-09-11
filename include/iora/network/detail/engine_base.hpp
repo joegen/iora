@@ -84,12 +84,22 @@ public:
   virtual ListenResult addListener(const std::string &bindIp, std::uint16_t port,
                                    TlsMode tlsMode) = 0;
 
-  /// \brief Initiate an outbound connection (async).
+  /// \brief Initiate an outbound connection (async) with per-connection TLS
+  /// client identity options — the PRIMITIVE.
   ///
   /// MUST only enqueue a command — never process synchronously.
   /// See class-level documentation for the ordering invariant.
+  /// \param opts per-connection TLS client identity (verifyName + hostflags);
+  ///   default-constructed => no SNI/identity override (legacy behavior).
   virtual ConnectResult connect(const std::string &host, std::uint16_t port,
-                                TlsMode tlsMode) = 0;
+                                TlsMode tlsMode, const TlsClientOptions &opts) = 0;
+
+  /// \brief Legacy 3-arg connect — non-pure default delegating to the primitive
+  /// with empty options (so no implementor is forced to reimplement it).
+  ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tlsMode)
+  {
+    return connect(host, port, tlsMode, TlsClientOptions{});
+  }
   virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,
                                            std::uint16_t port) = 0;
   virtual bool close(SessionId sid) = 0;

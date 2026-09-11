@@ -203,6 +203,39 @@ struct TransportErrorInfo
 
 using ObserverId = std::uint64_t;
 
+/// \brief Per-connection TLS client identity options (data-only seam).
+///
+/// Threaded through the public connect API into the engine so the TLS client
+/// handshake can (a) present the reference identity via SNI and (b) verify the
+/// server certificate against it (RFC 6125/9525). The reference identity
+/// (verifyName) is DISTINCT from the connect address: both consumers pre-resolve
+/// to an IP literal before connect(), so the connect address is not the domain.
+///
+/// Data-only by design: no std::function, no OpenSSL type — transport_types.hpp
+/// is OpenSSL-include-free and is included by non-TLS TUs (udp_engine.hpp,
+/// sse_stream.hpp, connection_health.hpp, sockaddr_utils.hpp).
+/// See architecture/iora/transport_tls_sni_identity.json (C1).
+struct TlsClientOptions
+{
+  /// Reference identity (a DNS A-label, e.g. "example.com", or empty). Empty =>
+  /// the transport falls back to inspecting the connect address (IP literal =>
+  /// no SNI + iPAddress match; resolved name => SNI + DNS match). An IP literal
+  /// here is routed to the no-SNI/iPAddress branch, never sent as SNI.
+  std::string verifyName;
+  /// OpenSSL X509_CHECK_FLAG_* bitmask applied to the identity match. 0 = none.
+  /// HTTPS callers pass kHttpsHostFlags.
+  unsigned x509HostFlags{0};
+};
+
+/// \brief HTTPS host-verification flags (RFC 9525 §6.3), as a macro-free
+/// constant so consumers (http_client.hpp) can pass it WITHOUT an <openssl/*>
+/// include. NEVER_CHECK_SUBJECT (0x20): CN MUST NOT identify a service.
+/// NO_PARTIAL_WILDCARDS (0x4): reject partial wildcards. NO_WILDCARDS stays
+/// UNSET so a single-label wildcard still matches one label. The value is locked
+/// to the real OpenSSL macros by a static_assert in tcp_engine.hpp (which
+/// includes <openssl/x509v3.h>); do not change it here without updating that.
+static constexpr unsigned kHttpsHostFlags = 0x20u | 0x4u;
+
 // Result<T,E> aliases for Transport API return types.
 // IoResult alias: deferred until legacy IoResult struct (above) is removed from
 // engine internals. The legacy struct is used only by TcpEngine::lastFatalError().

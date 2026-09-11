@@ -55,6 +55,7 @@
 
 #include "iora/core/errno_utils.hpp"
 #include "iora/core/logger.hpp"
+#include "iora/core/string_utils.hpp" // StringUtils::toLower (locale-independent ASCII, SNI norm)
 #include "iora/core/timer.hpp"
 #include "iora/network/detail/engine_base.hpp"
 #include "iora/network/event_batch_processor.hpp"
@@ -64,11 +65,22 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h> // X509_CHECK_FLAG_*, X509_VERIFY_PARAM_set_hostflags/set1_ip_asc (M-A)
+
+#include <cctype> // std::tolower for SNI/host normalization
 
 namespace iora
 {
 namespace network
 {
+
+// Lock the macro-free kHttpsHostFlags (transport_types.hpp, OpenSSL-include-free)
+// to the real OpenSSL host-check flags. This TU includes <openssl/x509v3.h>; the
+// consumer (http_client.hpp) does not, so the constant lets it stay OpenSSL-free.
+// Parentheses around the OR are MANDATORY ('==' binds tighter than '|').
+static_assert(kHttpsHostFlags ==
+                (X509_CHECK_FLAG_NEVER_CHECK_SUBJECT | X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS),
+              "kHttpsHostFlags must equal NEVER_CHECK_SUBJECT|NO_PARTIAL_WILDCARDS");
 
 /// \brief Shared TCP/TLS transport (single-threaded epoll loop).
 /// \note Linux-only.
@@ -353,11 +365,15 @@ public:
     return ListenResult::ok(lc.id);
   }
 
+  using EngineBase::connect; // un-hide the 3-arg non-pure default (base delegates)
+
   /// \brief Begin an outbound connection (async); result via onConnect.
-  ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls) override
+  /// Primitive 4-arg override — carries per-connection TLS identity options.
+  ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls,
+                        const TlsClientOptions &opts) override
   {
     SessionId sid = _nextSessionId++;
-    ConnectReq cr{sid, host, port, tls};
+    ConnectReq cr{sid, host, port, tls, opts.verifyName, opts.x509HostFlags};
     // Surface the closed-queue reject (DD-5): if the transport is tearing down,
     // enqueue() returns false and the connect command is dropped — returning
     // ok(sid) here would promise a connection that will never complete or fire
@@ -576,6 +592,25 @@ protected:
     return true;  // Accept the natural result (success or failure)
   }
 
+  /// \brief Fetch the peer certificate for the completion-gate presence check.
+  /// \return the peer X509* (caller owns; X509_free), or nullptr if none was
+  ///   presented. Default = SSL_get1_peer_certificate (OpenSSL >=1.1.0) with a
+  ///   pre-1.1.0 fallback.
+  /// \note Test seam ONLY (fault injection), matching the beforeSslHandshake/
+  ///   afterSslHandshake B6 hooks. A test subclass returns nullptr to exercise the
+  ///   completion gate's no-peer-cert backstop — the anonymous/PSK case for which
+  ///   OpenSSL's SSL_VERIFY_PEER is IGNORED (so this gate, not the CTX, is the sole
+  ///   rejecter) and which a compliant client cannot negotiate black-box. Added
+  ///   with human sign-off 2026-09-11 (steps-4-8 M-A). Production never overrides.
+  virtual X509 *fetchPeerCertificate(SSL *ssl)
+  {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    return ::SSL_get_peer_certificate(ssl);
+#else
+    return ::SSL_get1_peer_certificate(ssl);
+#endif
+  }
+
   /// \brief Called before SSL_read() is invoked
   /// \param sid Session ID for the connection
   /// \return true to proceed with read, false to simulate read failure
@@ -720,6 +755,12 @@ private:
     std::string host;
     std::uint16_t port{};
     TlsMode tls{TlsMode::None};
+    // Per-connection TLS client identity (data-only seam; arch C1). Carried by
+    // value from the public connect API (and through the off-thread-resolve
+    // resume chain) to the SSL setup site (connectFromAddrs) for SNI + identity
+    // binding. Empty verifyName => the setup site inspects the connect address.
+    std::string verifyName;
+    unsigned x509HostFlags{0};
   };
 
   /// \brief I/O-thread-only record of a named-host connect awaiting off-thread
@@ -1673,13 +1714,18 @@ private:
     std::string host = cr.host;
     std::uint16_t port = cr.port;
     TlsMode tls = cr.tls;
-    return [this, gate, sid, host = std::move(host), port, tls](iora::network::ResolveResult r)
+    // Carry the TLS client identity BY VALUE through all resume capture layers so
+    // the resumed named-host path reaches the setup site with it (arch C1 HI-1).
+    std::string verifyName = cr.verifyName;
+    unsigned x509HostFlags = cr.x509HostFlags;
+    return [this, gate, sid, host = std::move(host), port, tls,
+            verifyName = std::move(verifyName), x509HostFlags](iora::network::ResolveResult r)
     {
       // Built OUTSIDE gate->m; on bad_alloc here r (and its addrs) frees on
       // unwind and the resolve-timeout backstops the missing terminal (#16).
       std::function<void()> resume =
-        [this, sid, host, port, tls, addrs = r.addrs, gai = r.gaiCode]
-        { resumeConnect(sid, host, port, tls, addrs, gai); };
+        [this, sid, host, port, tls, verifyName, x509HostFlags, addrs = r.addrs, gai = r.gaiCode]
+        { resumeConnect(sid, host, port, tls, verifyName, x509HostFlags, addrs, gai); };
       std::lock_guard<std::mutex> g(gate->m);
       if (gate->closed)
       {
@@ -1693,6 +1739,7 @@ private:
   /// erased the pending entry; a stale sid (already resolved/closed/torn down)
   /// no-ops and lets \p addrs free.
   void resumeConnect(SessionId sid, const std::string &host, std::uint16_t port, TlsMode tls,
+                     const std::string &verifyName, unsigned x509HostFlags,
                      std::shared_ptr<iora::network::OwnedAddrInfo> addrs, int gai)
   {
     auto it = _pendingConnects.find(sid);
@@ -1719,7 +1766,7 @@ private:
       err(TransportError::Resolve, std::string("resolve failed: ") + msg);
       return;
     }
-    connectFromAddrs(ConnectReq{sid, host, port, tls}, addrs->get());
+    connectFromAddrs(ConnectReq{sid, host, port, tls, verifyName, x509HostFlags}, addrs->get());
   }
 
   /// \brief Resolve-timeout, TimerService thread. MARSHALS to the I/O thread —
@@ -1853,27 +1900,100 @@ private:
     if (cr.tls == TlsMode::Client && _config.clientTls.enabled && _sslCli)
     {
       s->tlsMode = TlsMode::Client;
-      s->ssl = ::SSL_new(_sslCli);
-      if (!s->ssl)
+
+      // Single PRE-INSERTION fail-closed terminal for TLS-client setup. The session
+      // is not yet in _sessions / epoll, so closeNow MUST NOT be used here (it would
+      // decrement sessionsCurrent for a never-counted session and delEpoll an
+      // unregistered fd). Fires exactly one onClose(TLSHandshake), counts the TLS
+      // failure, cancels the connect timer, frees the SSL object (null-safe + nulled
+      // to keep the free-then-null invariant), and closes the fd. Shared by the
+      // SSL_new failure and every identity-binding failure so the fail-closed path
+      // cannot drift (arch FAIL-CLOSED-IDENTITY-BINDING).
+      auto failClosedPreInsertion = [&](const char *why)
       {
-        // Fire onClose for the sid the caller already received from connect()
-        // (consistent with the other doConnect failure paths, e.g. cfd<0 above).
-        // Without this, a connectSync parked on this sid never gets a terminal
-        // event and its pendingConnects entry would be orphaned (the session was
-        // never inserted into _sessions, so a later doClose finds nothing).
         decltype(_cbs.onClose) closeCb;
         { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
         if (closeCb)
         {
-          closeCb(cr.sid, TransportErrorInfo{TransportError::TLSHandshake, "SSL_new(client) failed"});
+          closeCb(cr.sid, TransportErrorInfo{TransportError::TLSHandshake, why});
         }
-        err(TransportError::TLSHandshake, "SSL_new(client) failed");
-        cancelConnectTimeout(s.get()); // release the timer scheduled at connect start (L-2)
+        err(TransportError::TLSHandshake, why);
+        _atomicStats.tlsFailures++;
+        cancelConnectTimeout(s.get()); // release the timer scheduled at connect start
+        if (s->ssl) { ::SSL_free(s->ssl); s->ssl = nullptr; }
         ::close(cfd);
+      };
+
+      s->ssl = ::SSL_new(_sslCli);
+      if (!s->ssl)
+      {
+        // A connectSync parked on this sid must still get a terminal (the session
+        // was never inserted, so a later doClose finds nothing).
+        failClosedPreInsertion("SSL_new(client) failed");
         return false; // not inserted yet => no tags to clean
       }
       ::SSL_set_fd(s->ssl, cfd);
       ::SSL_set_connect_state(s->ssl);
+
+      // ── TLS client SNI + certificate-identity binding (RFC 6125/9525) ──
+      // Per-connection calls on s->ssl only (never the shared _sslCli CTX). The
+      // reference identity (cr.verifyName) is DISTINCT from the connect address
+      // (cr.host is a pre-resolved IP on the resolved path). Identity follows
+      // verifyPeer. See architecture/iora/transport_tls_sni_identity.json (C1).
+      // refName: verifyName if set, else fall back to the connect address (LO-2).
+      const std::string &refName = !cr.verifyName.empty() ? cr.verifyName : cr.host;
+      if (_config.clientTls.verifyPeer)
+      {
+        // NORMALIZE FIRST (strip a trailing FQDN '.', ASCII-lowercase via
+        // StringUtils::toLower — locale-independent), THEN classify. Normalizing
+        // before the IP check ensures a dot-suffixed IP literal ("127.0.0.1.") is
+        // recognized as an IP and routed to the no-SNI/set1_ip_asc branch, never sent
+        // as SNI (cpp17 R2 #1; SNI-IS-FOR-NAMED-HOSTS-ONLY, RFC 6066 §3). Matching is
+        // case-insensitive; the SNI on the wire is the normalized form. Never a ':port'.
+        std::string name = refName;
+        if (!name.empty() && name.back() == '.') { name.pop_back(); }
+        name = iora::core::StringUtils::toLower(name);
+
+        // IP literal (both AF families) -> iPAddress match, NO SNI. inet_pton is
+        // recomputed here on the normalized string.
+        auto isIpLiteral = [](const std::string &v) -> bool
+        {
+          unsigned char buf[16];
+          return !v.empty() && (::inet_pton(AF_INET, v.c_str(), buf) == 1 ||
+                                ::inet_pton(AF_INET6, v.c_str(), buf) == 1);
+        };
+        X509_VERIFY_PARAM *vp = ::SSL_get0_param(s->ssl);
+        if (isIpLiteral(name))
+        {
+          if (::X509_VERIFY_PARAM_set1_ip_asc(vp, name.c_str()) != 1)
+          {
+            failClosedPreInsertion("TLS identity binding failed (set1_ip_asc)");
+            return false;
+          }
+        }
+        else
+        {
+          if (::SSL_set_tlsext_host_name(s->ssl, name.c_str()) != 1)
+          {
+            failClosedPreInsertion("TLS SNI set failed");
+            return false;
+          }
+          ::X509_VERIFY_PARAM_set_hostflags(vp, cr.x509HostFlags);
+          if (::SSL_set1_host(s->ssl, name.c_str()) != 1)
+          {
+            failClosedPreInsertion("TLS identity binding failed (set1_host)");
+            return false;
+          }
+        }
+      }
+      else
+      {
+        // verifyPeer=false: no SNI, no identity verification (explicitly insecure
+        // / test-only). Warn so the insecure mode is visible in operator logs.
+        IORA_LOG_WARN("TLS client identity verification disabled (verifyPeer=false) for "
+                      + refName);
+      }
+
       s->tlsState = TlsState::Handshake;
       s->tlsStart = MonoClock::now();
       s->tlsWantWrite = true; // Client needs to send ClientHello first
@@ -2149,6 +2269,48 @@ private:
         closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
         _atomicStats.tlsFailures++;
         return false;
+      }
+
+      // ── TLS client certificate-identity gate (RFC 6125/9525) ──
+      // Runs at handshake success, BEFORE onConnect below, so a failure yields
+      // exactly ONE onClose(TLSHandshake) and never a preceding onConnect. This
+      // is POST-insertion (session is in _sessions + epoll), so closeNow is the
+      // correct terminal here. Client-role guarded (R2-H1): driveHandshake is
+      // shared with server-accepted sessions (SSL_set_accept_state), which do not
+      // present a client cert by default — an unguarded peer-cert demand would
+      // reject every inbound TLS handshake on a dual-role engine.
+      // WHY BOTH CHECKS ARE GENUINE BACKSTOPS (not redundant with SSL_VERIFY_PEER):
+      //  - A cert PRESENT but failing chain/hostname aborts at SSL_do_handshake
+      //    (rc!=1) under SSL_VERIFY_PEER + SSL_set1_host, so the vr!=X509_V_OK check
+      //    is defense-in-depth for that case.
+      //  - A cert-less / ANONYMOUS handshake: per the OpenSSL contract SSL_VERIFY_PEER
+      //    is IGNORED when no certificate is sent, and SSL_get_verify_result() returns
+      //    X509_V_OK — so if an anon/PSK suite is negotiated the handshake COMPLETES
+      //    (rc==1) and THIS gate's !pc check is the SOLE rejecter. A compliant client
+      //    aborts anon at negotiation (verified: a TLS alert, rc!=1), so the !pc branch
+      //    is not reachable black-box; it is exercised via the fetchPeerCertificate
+      //    test seam (steps-4-8 M-A, human sign-off 2026-09-11). See
+      //    architecture/iora/transport_tls_sni_identity.json PEER-CERT-PRESENCE.
+      if (s->tlsMode == TlsMode::Client && _config.clientTls.enabled &&
+          _config.clientTls.verifyPeer)
+      {
+        X509 *pc = fetchPeerCertificate(s->ssl); // test seam; default = SSL_get1_peer_certificate
+        if (!pc)
+        {
+          closeNow(s, TransportError::TLSHandshake, "no peer certificate", 0);
+          _atomicStats.tlsFailures++;
+          return false;
+        }
+        long vr = ::SSL_get_verify_result(s->ssl);
+        if (vr != X509_V_OK)
+        {
+          ::X509_free(pc);
+          closeNow(s, TransportError::TLSHandshake, ::X509_verify_cert_error_string(vr),
+                   static_cast<int>(vr));
+          _atomicStats.tlsFailures++;
+          return false;
+        }
+        ::X509_free(pc);
       }
 
       s->tlsState = TlsState::Open;

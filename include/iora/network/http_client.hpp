@@ -556,10 +556,15 @@ private:
       transportConfig.defaultSyncTimeout = _config.requestTimeout;
       transportConfig.idleTimeout = _config.connectionIdleTimeout;
 
-      // Enable TLS for HTTPS with current TLS configuration
+      // Enable TLS for HTTPS with current TLS configuration. Plumb the FULL
+      // client TLS config (H5) — previously only verifyPeer was copied, so a
+      // custom CA / mTLS cert silently fell back to the system trust store.
       transportConfig.clientTls.enabled = true;
       transportConfig.clientTls.defaultMode = TlsMode::Client;
       transportConfig.clientTls.verifyPeer = _tlsConfig.verifyPeer;
+      transportConfig.clientTls.caFile = _tlsConfig.caFile;
+      transportConfig.clientTls.certFile = _tlsConfig.clientCertFile;
+      transportConfig.clientTls.keyFile = _tlsConfig.clientKeyFile;
 
       _transport = Transport::tcp(transportConfig); // HTTP client is TCP (S-3: shared_ptr factory)
       auto startResult = _transport->start();
@@ -772,12 +777,23 @@ public:
   HttpClient(HttpClient &&) = delete;
   HttpClient &operator=(HttpClient &&) = delete;
 
-  /// \brief Set TLS configuration
+  /// \brief Set TLS configuration. Must be called BEFORE the first request.
+  ///
+  /// The transport reads clientTls exactly once (at initialization), so a
+  /// post-initialization change would silently no-op. Rather than mislead, this
+  /// fails loud once the transport is initialized (read-only-after-start, arch
+  /// M-3/HI-6). Set the CA / client cert / verify mode before any request.
+  /// \throws std::logic_error if called after the transport is initialized.
   void setTlsConfig(const TlsConfig &config)
   {
     std::lock_guard<std::mutex> lock(_mutex);
+    if (_transport)
+    {
+      throw std::logic_error(
+        "HttpClient::setTlsConfig() called after the transport was initialized; TLS "
+        "configuration is read-only after the first request. Set it before use.");
+    }
     _tlsConfig = config;
-    // TLS config is applied per-connection during connect
   }
 
   /// \brief Set DNS servers for domain resolution
@@ -1431,7 +1447,20 @@ private:
       ? std::min(_config.connectTimeout, std::chrono::milliseconds(200))
       : _config.connectTimeout;
 
-    auto connectResult = _transport->connectSync(resolvedHost, parsedUrl.port, tlsMode, timeout);
+    // TLS client identity (RFC 6125/9525): the reference identity is the ORIGINAL
+    // pre-resolution host (parsedUrl.host), NOT resolvedHost (an IP). Use the SAME
+    // isIPAddress predicate that resolveHostAddress used (M-B) so the verifyName-
+    // empty decision matches the resolved address: an IP-literal URL passes
+    // verifyName EMPTY (the transport does an iPAddress match + sends NO SNI).
+    // kHttpsHostFlags is macro-free (M-A) so no <openssl/*> include is needed here.
+    TlsClientOptions tlsOpts;
+    if (tlsMode == TlsMode::Client)
+    {
+      tlsOpts.verifyName = isIPAddress(parsedUrl.host) ? std::string{} : parsedUrl.host;
+      tlsOpts.x509HostFlags = kHttpsHostFlags;
+    }
+    auto connectResult =
+      _transport->connectSync(resolvedHost, parsedUrl.port, tlsMode, tlsOpts, timeout);
     if (connectResult.isErr())
     {
       const std::string detail =
