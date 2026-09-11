@@ -183,6 +183,7 @@ set(SERVICE_TESTS
     service/iora_test_callexportedapi_gating
     service/iora_test_loadfailure_teardown
     service/iora_test_unload_teardown_exception
+    service/iora_test_validate_module_path
 )
 
 # Debug/helper tests (keep in root)
@@ -751,6 +752,17 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_unload_teardown_exception PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The validateModulePath traversal-guard test (tracker 2026-09-10-12) copies
+    # and loadSingleModule's testplugin.so from hidden/'..'-bearing paths at
+    # runtime; depend on the plugin so a targeted build also builds the .so it
+    # loads, and link libdl for dlopen.
+    if(TARGET iora_test_validate_module_path)
+        if(TARGET testplugin)
+            add_dependencies(iora_test_validate_module_path testplugin)
+        endif()
+        target_link_libraries(iora_test_validate_module_path PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 

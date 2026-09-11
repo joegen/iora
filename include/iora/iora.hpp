@@ -1142,45 +1142,56 @@ public:
   }
 
 private:
-  /// \brief Validates module path to prevent directory traversal and other
-  /// security issues.
+  /// \brief Validates a module path: rejects parent-directory traversal, null
+  /// bytes/control characters, and over-long paths, and requires the parent
+  /// directory to resolve. A path component that merely begins with '.' (a
+  /// legitimate hidden directory such as .worktrees, .install, or ~/.local) is
+  /// allowed — only a component exactly equal to ".." is a traversal token.
   static bool validateModulePath(const std::string &path)
   {
     try
     {
-      // Check for directory traversal attempts
-      if (path.find("..") != std::string::npos || path.find("/.") != std::string::npos ||
-          path.find("\\.") != std::string::npos)
+      // (1) Textual checks first, before any std::filesystem operation, so a
+      // malformed string is never handed to the OS path machinery.
+      if (path.empty() || path.size() > 4096) // Empty or too long
       {
         return false;
       }
-
-      // Canonicalize the path
-      std::filesystem::path canonicalPath =
-        std::filesystem::canonical(std::filesystem::path(path).parent_path()) /
-        std::filesystem::path(path).filename();
-
-      // Ensure the canonical path doesn't contain suspicious elements
-      std::string canonicalStr = canonicalPath.string();
-      if (canonicalStr.find("..") != std::string::npos)
-      {
-        return false;
-      }
-
-      // Additional checks for common attack patterns
-      if (path.empty() || path.size() > 4096) // Path too long
-      {
-        return false;
-      }
-
-      // Check for null bytes or other control characters
+      // Reject null bytes and other control characters. A tab is tolerated;
+      // newline and carriage return are not — beyond never appearing in a real
+      // module path, they would forge extra lines if the rejected path is echoed
+      // into a log message by the caller.
       for (char c : path)
       {
-        if (c == '\0' || (c >= 1 && c <= 31 && c != '\t' && c != '\n' && c != '\r'))
+        if (c == '\0' || (c >= 1 && c <= 31 && c != '\t'))
         {
           return false;
         }
       }
+
+      // (2) Directory-traversal guard: reject a path component exactly equal to
+      // ".." (parent-directory traversal). Native component iteration splits on
+      // the platform separator, so this correctly recognizes "\\" on Windows
+      // while treating it as an ordinary filename character on POSIX — the
+      // correct cross-platform replacement for the former "/." and "\\."
+      // substring scans, which false-rejected every hidden-directory component.
+      const std::filesystem::path fsPath(path);
+      const std::filesystem::path traversalComponent("..");
+      for (const auto &component : fsPath)
+      {
+        if (component == traversalComponent)
+        {
+          return false;
+        }
+      }
+
+      // (3) Require the parent directory to exist and be resolvable; canonical()
+      // throws otherwise (caught below). Its result is intentionally not scanned
+      // for "..": canonical() resolves away all "."/".."/symlink elements, so
+      // such a scan would be vacuous and would false-positive on a real name
+      // that merely embeds ".." (e.g. libfoo..bar.so). Traversal is already
+      // rejected component-wise in step (2).
+      static_cast<void>(std::filesystem::canonical(fsPath.parent_path()));
 
       return true;
     }
