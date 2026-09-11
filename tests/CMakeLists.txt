@@ -95,6 +95,7 @@ set(NETWORK_TESTS
     network/iora_test_websocket_frame
     network/iora_test_websocket
     network/iora_test_transport
+    network/iora_test_transport_sync_dscp_fixes
     network/iora_test_tls_identity
     network/iora_test_engine_introspection
     # Event-driven DNS-resolve tests (tracker 2026-09-06-4). The three below

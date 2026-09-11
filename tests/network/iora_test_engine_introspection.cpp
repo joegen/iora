@@ -588,10 +588,11 @@ TEST_CASE("UDP isOnIoThread: false off-thread, true inside data callback", "[udp
 
   std::atomic<bool> dataOnIo{false};
   std::atomic<int> dataCount{0};
+  std::atomic<bool> connected{false};
 
   iora::network::detail::EngineBase::Callbacks cbs{};
   cbs.onAccept = [&](SessionId, const TransportAddress &) {};
-  cbs.onConnect = [&](SessionId, const TransportAddress &) {};
+  cbs.onConnect = [&](SessionId, const TransportAddress &) { connected = true; };
   cbs.onData = [&](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point)
   { dataOnIo = tx.isOnIoThread(); dataCount++; };
   cbs.onClose = [&](SessionId, const TransportErrorInfo &) {};
@@ -606,6 +607,9 @@ TEST_CASE("UDP isOnIoThread: false off-thread, true inside data callback", "[udp
   REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
   auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
   REQUIRE(cr.isOk());
+  // Await onConnect before sending: connect() is async (the session is inserted on
+  // the I/O thread), and send() now rejects a not-yet-established session (CF-H1).
+  REQUIRE(waitFor([&] { return connected.load(); }));
 
   const char msg[] = "ping";
   REQUIRE(tx.send(cr.value(), msg, sizeof(msg)));

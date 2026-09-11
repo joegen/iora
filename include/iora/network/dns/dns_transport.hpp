@@ -27,7 +27,9 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <thread>
+#include <vector>
 
 namespace iora
 {
@@ -228,8 +230,14 @@ private:
                      std::chrono::steady_clock::time_point receiveTime);
 
   /// \brief Handle transport connection events
-  void handleConnect(SessionId sessionId, const TransportAddress &addr);
-  void handleClose(SessionId sessionId, const TransportErrorInfo &reason);
+  ///
+  /// \param isTcp true when invoked by the TCP transport, false for UDP. Required
+  ///        because the two engines mint colliding SessionIds and the same
+  ///        handler is wired to both transports' onConnect/onClose callbacks; the
+  ///        protocol bit disambiguates the per-session connect-deferral state and
+  ///        selects the correct framing / transport when draining buffered queries.
+  void handleConnect(SessionId sessionId, const TransportAddress &addr, bool isTcp);
+  void handleClose(SessionId sessionId, const TransportErrorInfo &reason, bool isTcp);
 
   /// \brief Process DNS response
   void processResponse(const std::uint8_t *data, std::size_t size, DnsTransportMode mode,
@@ -321,6 +329,26 @@ private:
   std::map<SessionId, std::pair<std::string, std::uint16_t>>
     sessionToServer_; // SessionId -> (server, port)
   mutable std::mutex sessionsMutex_;
+
+  // Per-session connect-deferral state (CF-H1). The transport now REJECTS a send
+  // to a session that is not yet registered/connected (sessionSendable == present
+  // in the engine's _sessions AND !closed). connect() only enqueues the session;
+  // it is inserted asynchronously on the I/O thread, and onConnect fires AFTER the
+  // insert. So a query issued for a NEW or still-connecting session is buffered
+  // here and (re)sent from handleConnect once the session is registered. Both
+  // containers are guarded by sessionsMutex_ (the same mutex guarding
+  // serverSessions_/sessionToServer_); no lock is held across a transport->send().
+  //
+  // Keyed by (isTcp, SessionId): the UDP and TCP engines mint SessionIds from
+  // independent counters (both start at 1 — see udp_engine.hpp/tcp_engine.hpp
+  // _nextSessionId{1}), so a UDP sid and a TCP sid CAN collide. handleConnect is
+  // shared by both transports and receives only the sid, so a bare-sid key would
+  // let a UDP connect event drain a colliding TCP session's buffer (wrong framing,
+  // session not yet connected) and vice versa. The protocol bit in the key makes
+  // these structures collision-safe.
+  std::set<std::pair<bool, SessionId>> connectedSessions_;
+  std::map<std::pair<bool, SessionId>, std::vector<std::shared_ptr<PendingQuery>>>
+    pendingOnConnect_;
 
   // TCP message framing (TCP DNS messages are length-prefixed)
   std::map<SessionId, std::deque<std::uint8_t>> tcpBuffers_;
@@ -470,11 +498,15 @@ inline void DnsTransport::stop()
     pendingQueries_.clear();
   }
 
-  // Clear session mappings
+  // Clear session mappings. The buffered queries in pendingOnConnect_ are also
+  // registered in pendingQueries_ (cleared/failed above), so dropping the buffer
+  // here does not lose them — it just discards the now-defunct connect state.
   {
     std::lock_guard<std::mutex> slock(sessionsMutex_);
     serverSessions_.clear();
     sessionToServer_.clear();
+    connectedSessions_.clear();
+    pendingOnConnect_.clear();
   }
 
   // Clear TCP buffers
@@ -687,10 +719,10 @@ inline std::shared_ptr<Transport> DnsTransport::createUdpTransport()
     { if (auto self = weak.lock()) { self->handleUdpData(sid, data, receiveTime); } });
   transport->onConnect(
     [weak](SessionId sid, const TransportAddress &addr)
-    { if (auto self = weak.lock()) { self->handleConnect(sid, addr); } });
+    { if (auto self = weak.lock()) { self->handleConnect(sid, addr, /*isTcp=*/false); } });
   transport->onClose(
     [weak](SessionId sid, const TransportErrorInfo &reason)
-    { if (auto self = weak.lock()) { self->handleClose(sid, reason); } });
+    { if (auto self = weak.lock()) { self->handleClose(sid, reason, /*isTcp=*/false); } });
   transport->onError(
     [weak](TransportError, const std::string &)
     {
@@ -715,10 +747,10 @@ inline std::shared_ptr<Transport> DnsTransport::createTcpTransport()
     { if (auto self = weak.lock()) { self->handleTcpData(sid, data, receiveTime); } });
   transport->onConnect(
     [weak](SessionId sid, const TransportAddress &addr)
-    { if (auto self = weak.lock()) { self->handleConnect(sid, addr); } });
+    { if (auto self = weak.lock()) { self->handleConnect(sid, addr, /*isTcp=*/true); } });
   transport->onClose(
     [weak](SessionId sid, const TransportErrorInfo &reason)
-    { if (auto self = weak.lock()) { self->handleClose(sid, reason); } });
+    { if (auto self = weak.lock()) { self->handleClose(sid, reason, /*isTcp=*/true); } });
   transport->onError(
     [weak](TransportError, const std::string &)
     {
@@ -743,6 +775,7 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
   // Get or create session to DNS server
   std::string serverKey = query->server + ":" + std::to_string(query->port);
   SessionId sessionId = 0;
+  bool sendNow = false;
 
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
@@ -750,10 +783,15 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
     if (it != serverSessions_.end())
     {
       sessionId = it->second;
+      // Cached session: send immediately only if it has already fired onConnect.
+      // If it is still connecting, CF-H1 would reject an immediate send, so defer.
+      sendNow = connectedSessions_.count(std::make_pair(false, sessionId)) != 0;
     }
     else
     {
-      // Create new session
+      // Create new session. connect() only enqueues the session; it is registered
+      // asynchronously on the I/O thread, so an immediate send would be rejected by
+      // CF-H1 (sessionSendable == false). Defer the send to handleConnect.
       auto cr = udpTransport_->connect(query->server, query->port, TlsMode::None);
       if (cr.isErr())
       {
@@ -762,23 +800,50 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
       sessionId = cr.value();
       serverSessions_[serverKey] = sessionId;
       sessionToServer_[sessionId] = {query->server, query->port};
+      sendNow = false;
+    }
+
+    if (!sendNow)
+    {
+      // Buffer while awaiting connect. Populated under sessionsMutex_ BEFORE it is
+      // released, so handleConnect (which also takes sessionsMutex_) cannot drain
+      // an empty buffer and lose this query. Dedup (L-2): a retry timer can re-issue
+      // this query while the session is still connecting; buffering it twice would
+      // double-send on connect.
+      auto &bucket = pendingOnConnect_[std::make_pair(false, sessionId)];
+      if (std::find(bucket.begin(), bucket.end(), query) == bucket.end())
+      {
+        bucket.push_back(query);
+      }
     }
   }
 
-  // Send query data
-  bool sent = udpTransport_->send(sessionId, query->queryData.data(), query->queryData.size());
-  if (!sent)
+  // copy-then-send: sessionsMutex_ is released above; never send under the lock.
+  if (sendNow)
   {
-    iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
-                              std::to_string(query->port));
-    throw DnsTransportException("Failed to send UDP query to " + query->server);
+    bool sent = udpTransport_->send(sessionId, query->queryData.data(), query->queryData.size());
+    if (!sent)
+    {
+      iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
+                                std::to_string(query->port));
+      throw DnsTransportException("Failed to send UDP query to " + query->server);
+    }
+
+    iora::core::Logger::debug("DNS UDP query sent: ID=" + std::to_string(query->queryId) + " to " +
+                              query->server + ":" + std::to_string(query->port) +
+                              " size=" + std::to_string(query->queryData.size()) + "bytes");
+  }
+  else
+  {
+    iora::core::Logger::debug(
+      "DNS UDP query deferred until connect: ID=" + std::to_string(query->queryId) + " to " +
+      query->server + ":" + std::to_string(query->port) +
+      " size=" + std::to_string(query->queryData.size()) + "bytes");
   }
 
-  iora::core::Logger::debug("DNS UDP query sent: ID=" + std::to_string(query->queryId) + " to " +
-                            query->server + ":" + std::to_string(query->port) +
-                            " size=" + std::to_string(query->queryData.size()) + "bytes");
-
-  // Schedule timeout timer for this query
+  // Schedule timeout timer + stats whether sent now or deferred, so a session that
+  // never connects still times out (and is retried by the cleanup thread) and the
+  // deferred send in handleConnect does NOT double-count stats or reschedule.
   scheduleQueryTimeout(query);
 
   // Atomic increments - no mutex needed
@@ -796,6 +861,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   // Get or create session to DNS server
   std::string serverKey = query->server + ":" + std::to_string(query->port) + ":tcp";
   SessionId sessionId = 0;
+  bool sendNow = false;
 
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
@@ -803,10 +869,15 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
     if (it != serverSessions_.end())
     {
       sessionId = it->second;
+      // Cached session: send immediately only if it has already fired onConnect.
+      // If it is still connecting, CF-H1 would reject an immediate send, so defer.
+      sendNow = connectedSessions_.count(std::make_pair(true, sessionId)) != 0;
     }
     else
     {
-      // Create new session
+      // Create new session. connect() only enqueues the session; TCP additionally
+      // needs the 3-way handshake before onConnect fires, so an immediate send would
+      // be rejected by CF-H1 (sessionSendable == false). Defer to handleConnect.
       auto cr = tcpTransport_->connect(query->server, query->port, TlsMode::None);
       if (cr.isErr())
       {
@@ -815,31 +886,55 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
       sessionId = cr.value();
       serverSessions_[serverKey] = sessionId;
       sessionToServer_[sessionId] = {query->server, query->port};
+      sendNow = false;
+    }
+
+    if (!sendNow)
+    {
+      // Buffer while awaiting connect (populated under the lock before release, so
+      // handleConnect cannot drain an empty buffer). handleConnect re-frames with
+      // the 2-byte length prefix, exactly as the immediate-send path below does.
+      auto &bucket = pendingOnConnect_[std::make_pair(true, sessionId)];
+      if (std::find(bucket.begin(), bucket.end(), query) == bucket.end()) // dedup (L-2)
+      {
+        bucket.push_back(query);
+      }
     }
   }
 
   // TCP DNS messages are length-prefixed
-  std::vector<std::uint8_t> tcpMessage;
   std::uint16_t length = static_cast<std::uint16_t>(query->queryData.size());
-  tcpMessage.push_back((length >> 8) & 0xFF);
-  tcpMessage.push_back(length & 0xFF);
-  tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
 
-  // Send query data
-  bool sent = tcpTransport_->send(sessionId, tcpMessage.data(), tcpMessage.size());
-  if (!sent)
+  // copy-then-send: sessionsMutex_ is released above; never send under the lock.
+  if (sendNow)
   {
-    iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
-                              std::to_string(query->port));
-    throw DnsTransportException("Failed to send TCP query to " + query->server);
+    std::vector<std::uint8_t> tcpMessage;
+    tcpMessage.push_back((length >> 8) & 0xFF);
+    tcpMessage.push_back(length & 0xFF);
+    tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
+
+    bool sent = tcpTransport_->send(sessionId, tcpMessage.data(), tcpMessage.size());
+    if (!sent)
+    {
+      iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
+                                std::to_string(query->port));
+      throw DnsTransportException("Failed to send TCP query to " + query->server);
+    }
+
+    iora::core::Logger::debug("DNS TCP query sent: ID=" + std::to_string(query->queryId) + " to " +
+                              query->server + ":" + std::to_string(query->port) +
+                              " size=" + std::to_string(length) + "bytes (+" +
+                              std::to_string(tcpMessage.size() - length) + " length prefix)");
+  }
+  else
+  {
+    iora::core::Logger::debug(
+      "DNS TCP query deferred until connect: ID=" + std::to_string(query->queryId) + " to " +
+      query->server + ":" + std::to_string(query->port) +
+      " size=" + std::to_string(length) + "bytes");
   }
 
-  iora::core::Logger::debug("DNS TCP query sent: ID=" + std::to_string(query->queryId) + " to " +
-                            query->server + ":" + std::to_string(query->port) +
-                            " size=" + std::to_string(length) + "bytes (+" +
-                            std::to_string(tcpMessage.size() - length) + " length prefix)");
-
-  // Schedule timeout timer for this query
+  // Schedule timeout timer for this query (whether sent now or deferred)
   scheduleQueryTimeout(query);
 
   // Atomic increments - no mutex needed
@@ -1049,13 +1144,88 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
 // callbacks, not via data callback IoResult. The onClose handler (handleClose) cleans up
 // sessions; the onError handler can be enhanced to retry pending queries if needed.
 
-inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddress &)
+inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddress &, bool isTcp)
 {
-  // Handle connection events
+  // Runs on the transport I/O thread AFTER the engine has registered the session,
+  // so a send() here passes CF-H1's sessionSendable check. Mark the session
+  // connected and drain any queries buffered while it was connecting.
+  std::vector<std::shared_ptr<PendingQuery>> toSend;
+  {
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    connectedSessions_.insert(std::make_pair(isTcp, sessionId));
+    auto it = pendingOnConnect_.find(std::make_pair(isTcp, sessionId));
+    if (it != pendingOnConnect_.end())
+    {
+      toSend = std::move(it->second);
+      pendingOnConnect_.erase(it);
+    }
+  }
+
+  if (toSend.empty())
+  {
+    return;
+  }
+
+  // copy-then-send: sessionsMutex_ released above; never send under the lock.
+  // Select the transport + framing from the protocol bit (sids can collide across
+  // the two engines, so we must not send a UDP datagram on the TCP transport or
+  // vice versa). Timeout/stats were already handled when the query was buffered,
+  // so a send failure here is left to the already-scheduled timeout/retry path.
+  std::shared_ptr<Transport> transport = isTcp ? tcpTransport_ : udpTransport_;
+  if (!transport)
+  {
+    return; // Transport torn down; buffered queries will time out.
+  }
+
+  for (auto &query : toSend)
+  {
+    // Skip a query that already completed/timed-out while buffered (L-1): sending it
+    // would be a wasted DNS query (its late response is dropped as "unknown query").
+    {
+      std::lock_guard<std::mutex> qlock(queriesMutex_);
+      if (pendingQueries_.find(QueryKey(query->queryId, query->server, query->port)) ==
+          pendingQueries_.end())
+      {
+        continue;
+      }
+    }
+    bool sent = false;
+    if (isTcp)
+    {
+      // TCP DNS messages are length-prefixed (same framing as sendTcpQuery).
+      std::vector<std::uint8_t> tcpMessage;
+      std::uint16_t length = static_cast<std::uint16_t>(query->queryData.size());
+      tcpMessage.push_back((length >> 8) & 0xFF);
+      tcpMessage.push_back(length & 0xFF);
+      tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
+      sent = transport->send(sessionId, tcpMessage.data(), tcpMessage.size());
+    }
+    else
+    {
+      sent = transport->send(sessionId, query->queryData.data(), query->queryData.size());
+    }
+
+    if (!sent)
+    {
+      iora::core::Logger::error(
+        "DNS deferred query failed to send on connect: ID=" + std::to_string(query->queryId) +
+        " to " + query->server + ":" + std::to_string(query->port) +
+        (isTcp ? " (TCP)" : " (UDP)"));
+      // Leave it to the scheduled timeout/retry — do not throw on the I/O thread.
+    }
+    else
+    {
+      iora::core::Logger::debug(
+        "DNS deferred query sent on connect: ID=" + std::to_string(query->queryId) + " to " +
+        query->server + ":" + std::to_string(query->port) + (isTcp ? " (TCP)" : " (UDP)"));
+    }
+  }
 }
 
-inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorInfo &)
+inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorInfo &, bool isTcp)
 {
+  std::vector<std::shared_ptr<PendingQuery>> orphaned;
+
   // Remove closed sessions from mappings
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
@@ -1071,12 +1241,37 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
       }
     }
     sessionToServer_.erase(sessionId);
+
+    // Drop the per-session connect-deferral state (keyed by protocol+sid). Take
+    // ownership of any queries still awaiting connect so they can be failed after
+    // the lock is released (copy-then-invoke).
+    connectedSessions_.erase(std::make_pair(isTcp, sessionId));
+    auto pit = pendingOnConnect_.find(std::make_pair(isTcp, sessionId));
+    if (pit != pendingOnConnect_.end())
+    {
+      orphaned = std::move(pit->second);
+      pendingOnConnect_.erase(pit);
+    }
   }
 
   // Clean up TCP buffers
   {
     std::lock_guard<std::mutex> lock(tcpBuffersMutex_);
     tcpBuffers_.erase(sessionId);
+  }
+
+  // Fail (do not silently drop) any query buffered on a session that closed before
+  // connecting. completeQuery takes queriesMutex_ (never held with sessionsMutex_)
+  // and is a no-op for a query already completed/timed-out, so a stale buffered
+  // entry is harmless. This mirrors the existing "failed to send" error handling.
+  if (!orphaned.empty())
+  {
+    auto error = std::make_exception_ptr(DnsTransportException(
+      "DNS session closed before connect (" + std::string(isTcp ? "TCP" : "UDP") + ")"));
+    for (auto &query : orphaned)
+    {
+      completeQuery(QueryKey(query->queryId, query->server, query->port), error);
+    }
   }
 }
 

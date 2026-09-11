@@ -69,6 +69,7 @@ enum class TransportError
   Timeout,
   BufferOverflow, // Sync receive buffer exceeded maxSyncReceiveBuffer (data dropped)
   ShuttingDown,   // Transport is being torn down; sync op released without completing
+  TooManyPendingSyncOps, // Concurrent parked sync ops reached maxPendingSyncOps
   Unknown
 };
 
@@ -268,6 +269,20 @@ using StartResult = Result<void, TransportErrorInfo>;
 using ListenResult = Result<ListenerId, TransportErrorInfo>;
 using ConnectResult = Result<SessionId, TransportErrorInfo>;
 
+// Sentinel default for the primary sync ops' `timeout` parameter: a negative
+// duration means "use TransportConfig::defaultSyncTimeout", resolved at the top of
+// each op's definition (where the config is available). SIP presets tune
+// defaultSyncTimeout (Timer B/F = 32000 ms TCP, T1 = 500 ms UDP); before this the
+// sync ops hardcoded 30000 ms and ignored the config. The *Cancellable variants are
+// ITransport methods with no config access, so they keep the literal 30000 default.
+static constexpr std::chrono::milliseconds kUseConfigSyncTimeout{-1};
+
+// The historical 30 s fallback sync timeout: the *Cancellable variants' literal
+// default (they have no config access), their negative/sentinel clamp target, and
+// resolveSyncTimeout's floor when config.defaultSyncTimeout is misconfigured to a
+// non-positive value (F-2). One constant so the policy value cannot drift.
+static constexpr std::chrono::milliseconds kFallbackSyncTimeout{30000};
+
 // Callback typedefs for Transport API.
 // AcceptCallback and ConnectCallback fire only on success (no error parameter).
 using AcceptCallback =
@@ -444,7 +459,8 @@ struct TransportConfig
     c.tcpKeepalive.idle = 120;
     c.maxPendingSyncOps = 64;
     c.defaultSyncTimeout = std::chrono::milliseconds(32000);
-    c.dscpValue = 24; // CS3
+    c.dscpValue = 24; // CS3 call-signaling (Cisco QoS convention; note RFC 4594 proper
+                      // assigns CS5 to Signaling and CS3 to Broadcast Video)
     return c;
   }
 
@@ -456,7 +472,8 @@ struct TransportConfig
     c.maxSessions = 10000;
     c.maxPendingSyncOps = 64;
     c.defaultSyncTimeout = std::chrono::milliseconds(500);
-    c.dscpValue = 24; // CS3
+    c.dscpValue = 24; // CS3 call-signaling (Cisco QoS convention; note RFC 4594 proper
+                      // assigns CS5 to Signaling and CS3 to Broadcast Video)
     return c;
   }
 

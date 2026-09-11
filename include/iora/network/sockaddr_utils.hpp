@@ -25,6 +25,7 @@
 #include "iora/network/ip_utils.hpp"
 #include "iora/network/transport_types.hpp"
 
+#include <cstdint>
 #include <cstring>
 
 #include <arpa/inet.h>
@@ -105,6 +106,53 @@ inline bool toSockaddr(const TransportAddress &addr, sockaddr_storage &out,
   std::memcpy(&sa6->sin6_addr, ip.ipv6().data(), ip.ipv6().size());
   outLen = sizeof(sockaddr_in6);
   return true;
+}
+
+/// \brief Apply a DSCP mark to a socket fd.
+///
+/// The socket family is determined via getsockname (works on a freshly-created,
+/// not-yet-connected socket too — the AF is set at socket() time). The DSCP value
+/// occupies the high 6 bits of the 8-bit TOS / IPv6 traffic-class byte
+/// (val = dscp << 2).
+///
+/// This was a byte-identical private static in BOTH detail/tcp_engine.hpp and
+/// detail/udp_engine.hpp — the same duplicate-copy anti-pattern already retired
+/// for addressFromSockaddr. Lifting it here retires both copies: each engine now
+/// forwards to it (CF-L1). Shared by the per-session setDscp() API and the
+/// at-creation application of config.dscpValue.
+///
+/// \return true on success; false if \p fd is negative, getsockname fails, or the
+///         setsockopt fails.
+inline bool applyDscpToFd(int fd, std::uint8_t dscp)
+{
+  if (fd < 0)
+  {
+    return false;
+  }
+  sockaddr_storage ss{};
+  socklen_t sl = sizeof(ss);
+  if (::getsockname(fd, reinterpret_cast<sockaddr *>(&ss), &sl) != 0)
+  {
+    return false;
+  }
+  int val = static_cast<int>(dscp) << 2;
+  if (ss.ss_family == AF_INET6)
+  {
+    // On a dual-stack AF_INET6 socket carrying an IPv4-mapped peer
+    // (::ffff:a.b.c.d), many kernels govern the egress IPv4 TOS byte via IP_TOS
+    // rather than IPV6_TCLASS, so a v6-only mark can be silently dropped for the
+    // mapped-IPv4 SIP signaling path this targets. Set IPV6_TCLASS as the
+    // family-primary option, then best-effort mirror the mark onto IP_TOS for
+    // the mapped-IPv4 egress. Some kernels reject IP_TOS on AF_INET6 — that
+    // secondary failure is ignored; success is decided by the primary option.
+    if (::setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &val, sizeof(val)) != 0)
+    {
+      return false;
+    }
+    (void)::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val));
+    return true;
+  }
+  return ::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) == 0;
 }
 
 } // namespace network

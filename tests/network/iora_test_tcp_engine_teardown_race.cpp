@@ -199,13 +199,16 @@ TEST_CASE("TcpEngine restart after stop reopens the command queue", "[tcp][teard
   TcpEngine tx{cfg};
 
   REQUIRE(tx.start().isOk());
-  const char ping[4] = {'p', 'i', 'n', 'g'};
-  REQUIRE(tx.send(static_cast<SessionId>(7), ping, sizeof(ping))); // accepted while running
+  // Probe the command-queue state via connect() (a command whose acceptance
+  // reflects whether the queue is open), NOT send(bogus_sid): send() now rejects an
+  // unknown/closed session synchronously (CF-H1), so it no longer probes queue
+  // state. connect()-returns-err-after-stop is the queue-closed signal this suite's
+  // DD-5 case below also relies on.
+  REQUIRE(tx.connect("127.0.0.1", 19997, TlsMode::None).isOk()); // accepted while running
   tx.stop();
-  REQUIRE_FALSE(tx.send(static_cast<SessionId>(7), ping, sizeof(ping))); // closed after stop
+  REQUIRE(tx.connect("127.0.0.1", 19997, TlsMode::None).isErr()); // closed after stop
 
-  REQUIRE(tx.start().isOk());                                           // restart
-  const char pong[4] = {'p', 'o', 'n', 'g'};
-  REQUIRE(tx.send(static_cast<SessionId>(7), pong, sizeof(pong)));      // queue reopened
+  REQUIRE(tx.start().isOk());                      // restart
+  REQUIRE(tx.connect("127.0.0.1", 19997, TlsMode::None).isOk());  // queue reopened
   tx.stop();
 }

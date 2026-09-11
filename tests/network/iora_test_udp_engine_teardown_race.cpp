@@ -159,14 +159,16 @@ TEST_CASE("UdpEngine restart after stop reopens the command queue", "[udp][teard
   UdpEngine tx{cfg};
 
   REQUIRE(tx.start().isOk());
-  const char ping[4] = {'p', 'i', 'n', 'g'};
-  REQUIRE(tx.send(static_cast<SessionId>(7), ping, sizeof(ping)));
+  // Probe the command-queue state via connect() (a command whose acceptance
+  // reflects whether the queue is open), NOT send(bogus_sid): send() now rejects an
+  // unknown/closed session synchronously (CF-H1). connect()-returns-err-after-stop
+  // is the queue-closed signal this suite's DD-5 case below also relies on.
+  REQUIRE(tx.connect("127.0.0.1", 19998, TlsMode::None).isOk());
   tx.stop();
-  REQUIRE_FALSE(tx.send(static_cast<SessionId>(7), ping, sizeof(ping)));
+  REQUIRE(tx.connect("127.0.0.1", 19998, TlsMode::None).isErr());
 
   REQUIRE(tx.start().isOk());
-  const char pong[4] = {'p', 'o', 'n', 'g'};
-  REQUIRE(tx.send(static_cast<SessionId>(7), pong, sizeof(pong)));
+  REQUIRE(tx.connect("127.0.0.1", 19998, TlsMode::None).isOk());
   tx.stop();
 }
 

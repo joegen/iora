@@ -592,7 +592,16 @@ private:
       return false;
     }
 
-    auto connectResult = t->connect(_host, _port, _options.tlsMode);
+    // Use connectSync (NOT async connect): it returns only once the session is
+    // established AND registered, so the synchronous upgrade sendSync below is
+    // guaranteed a sendable session. The former async connect() + sendSync relied on
+    // FIFO command ordering, which the send-time session-validity check (CF-H1) no
+    // longer honors — a send on a not-yet-registered session is rejected. This runs on
+    // the connect worker thread (never the I/O thread), so connectSync is safe here;
+    // the 5 s connect bound sits within the overall connect+upgrade budget. Mirrors
+    // http_client, which already connectSyncs before sendSync.
+    auto connectResult =
+      t->connectSync(_host, _port, _options.tlsMode, std::chrono::milliseconds(5000));
     if (connectResult.isErr())
     {
       setState(WebSocketState::DISCONNECTED);

@@ -104,7 +104,7 @@ public:
   virtual ConnectResult connectSync(const std::string &host, std::uint16_t port,
                                     TlsMode tls = TlsMode::None,
                                     std::chrono::milliseconds timeout =
-                                      std::chrono::milliseconds{30000}) = 0;
+                                      kUseConfigSyncTimeout) = 0;
 
   /// \brief connectSync with per-connection TLS client identity options. \c opts
   /// is NON-defaulted so the TlsClientOptions 4th arg (disjoint type from
@@ -113,33 +113,33 @@ public:
   virtual ConnectResult connectSync(const std::string &host, std::uint16_t port, TlsMode tls,
                                     const TlsClientOptions &opts,
                                     std::chrono::milliseconds timeout =
-                                      std::chrono::milliseconds{30000}) = 0;
+                                      kUseConfigSyncTimeout) = 0;
 
   virtual ConnectResult connectSyncCancellable(const std::string &host, std::uint16_t port,
                                                CancellationToken &token,
                                                TlsMode tls = TlsMode::None,
                                                std::chrono::milliseconds timeout =
-                                                 std::chrono::milliseconds{30000},
+                                                 kFallbackSyncTimeout,
                                                const TlsClientOptions &opts = {});
 
   // ===== Sync Data Operations =====
   virtual SendResult sendSync(SessionId sid, iora::core::BufferView data,
                               std::chrono::milliseconds timeout =
-                                std::chrono::milliseconds{30000}) = 0;
+                                kUseConfigSyncTimeout) = 0;
 
   virtual ReceiveResult receiveSync(SessionId sid, void *buffer, std::size_t &len,
                                     std::chrono::milliseconds timeout =
-                                      std::chrono::milliseconds{30000}) = 0;
+                                      kUseConfigSyncTimeout) = 0;
 
   virtual SendResult sendSyncCancellable(SessionId sid, iora::core::BufferView data,
                                          CancellationToken &token,
                                          std::chrono::milliseconds timeout =
-                                           std::chrono::milliseconds{30000});
+                                           kFallbackSyncTimeout);
 
   virtual ReceiveResult receiveSyncCancellable(SessionId sid, void *buffer, std::size_t &len,
                                                CancellationToken &token,
                                                std::chrono::milliseconds timeout =
-                                                 std::chrono::milliseconds{30000});
+                                                 kFallbackSyncTimeout);
 
   // ===== Read Modes =====
   virtual bool setReadMode(SessionId sid, ReadMode mode) = 0;
@@ -260,19 +260,19 @@ public:
   ConnectResult connectSync(const std::string &host, std::uint16_t port,
                             TlsMode tls = TlsMode::None,
                             std::chrono::milliseconds timeout =
-                              std::chrono::milliseconds{30000}) override;
+                              kUseConfigSyncTimeout) override;
   ConnectResult connectSync(const std::string &host, std::uint16_t port, TlsMode tls,
                             const TlsClientOptions &opts,
                             std::chrono::milliseconds timeout =
-                              std::chrono::milliseconds{30000}) override;
+                              kUseConfigSyncTimeout) override;
   using ITransport::connectSync; // keep both connectSync overloads visible
 
   SendResult sendSync(SessionId sid, iora::core::BufferView data,
                       std::chrono::milliseconds timeout =
-                        std::chrono::milliseconds{30000}) override;
+                        kUseConfigSyncTimeout) override;
   ReceiveResult receiveSync(SessionId sid, void *buffer, std::size_t &len,
                             std::chrono::milliseconds timeout =
-                              std::chrono::milliseconds{30000}) override;
+                              kUseConfigSyncTimeout) override;
 
   bool setReadMode(SessionId sid, ReadMode mode) override;
   bool getReadMode(SessionId sid, ReadMode &mode) const override;

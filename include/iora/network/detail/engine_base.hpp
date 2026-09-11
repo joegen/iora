@@ -106,6 +106,18 @@ public:
 
   // Data operations (raw pointer — Transport wraps in BufferView at the public API level)
   virtual bool send(SessionId sid, const void *data, std::size_t len) = 0;
+
+  /// \brief Queue a send and report the outcome through \p cb (may be null).
+  ///
+  /// COMPLETION CONTRACT (CF-L6): a conforming engine MUST invoke \p cb either
+  /// SYNCHRONOUSLY on the caller's thread, or — if it ever defers completion —
+  /// before the I/O thread is joined in stop(). It MUST NEVER invoke \p cb after
+  /// ~Impl. Callers (e.g. Transport::sendSync) capture raw state whose lifetime
+  /// is bounded by the engine, so a completion firing after teardown is a
+  /// use-after-free. Both current engines (TCP, UDP) complete SYNCHRONOUSLY on
+  /// the caller's thread. The result reflects whether the send command was
+  /// accepted by the I/O thread's queue (and, per CF-H1, that the session was
+  /// known and not closed at enqueue time), NOT whether bytes reached the peer.
   virtual void sendAsync(SessionId sid, const void *data, std::size_t len,
                          SendCompleteCallback cb) = 0;
 
@@ -122,6 +134,18 @@ public:
 
   // DSCP (per-session runtime change)
   virtual bool setDscp(SessionId sid, std::uint8_t dscp) = 0;
+
+  /// \brief Enable or disable delivery of read (EPOLLIN) events for a session.
+  ///
+  /// When \p enabled is false the engine removes the session's fd from EPOLLIN so
+  /// no further read events are delivered — avoiding the wasted recv() syscalls a
+  /// ReadMode::Disabled session would otherwise incur only to drop the data at the
+  /// transport callback. Re-enabling restores EPOLLIN. Returns true if the change
+  /// was applied or scheduled on the I/O thread.
+  /// \note For a shared-socket engine (UDP, where many virtual sessions share one
+  ///   socket) a per-session EPOLLIN removal is not possible, so this is a no-op
+  ///   that returns false.
+  virtual bool setReadEnabled(SessionId sid, bool enabled) = 0;
 
   // I/O thread identification (for deadlock detection in sync operations)
   virtual std::thread::id getIoThreadId() const = 0;

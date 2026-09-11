@@ -21,6 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace iora
@@ -93,9 +94,9 @@ struct Transport::Impl
   //   overflow}), every SyncConnectOp field ({done, result}), and the
   //   teardown state {shuttingDown, activeFlushes, activeConnects}.
   // Acquired by: connectSync (register/wait), receiveSync (buffer access/wait),
-  //   setReadMode (mode update + flush), getReadMode (read mode), the I/O
-  //   thread data/close handlers, and the teardown handshake in ~Transport /
-  //   operator=.
+  //   sendSync (register/wait), setReadMode (mode update + flush), getReadMode
+  //   (read mode), the I/O thread data/close handlers, and the teardown
+  //   handshake in ~Transport (move/copy are deleted; there is no operator=).
   // NEVER held during user callback invocation. setReadMode releases syncMutex
   //   before flushing buffered data via the onData callback.
   //
@@ -121,6 +122,29 @@ struct Transport::Impl
   };
   std::mutex syncMutex;
   std::unordered_map<SessionId, std::shared_ptr<SyncConnectOp>> pendingConnects;
+
+  // Sids owned by a TIMED-OUT connectSync that has issued its own engine->close(sid)
+  // (protected by syncMutex). The onClose global-suppression normally keys on
+  // pendingConnects[sid], but a connect that SUCCEEDS in the tiny window between the
+  // caller's timeout and its close lets onConnect erase that entry first — so the
+  // close's onClose would no longer find it and would fire the global onClose for a
+  // sid the user never received (Finding 1). This marker SURVIVES onConnect and is
+  // consumed by onClose, closing that race for both TCP and UDP.
+  std::unordered_set<SessionId> syncOwnedSuppress;
+
+  // Sync send completion ops (protected by syncMutex). Like pendingConnects, a
+  // parked sendSync registers here so the teardown handshake can wake it — sendSync
+  // has no data to drain, so its CV is ALWAYS woken on teardown (both the fence and
+  // the wait-out), exactly like connectSync. Keyed by a monotonic op id because
+  // multiple sendSync calls may be in flight concurrently on one session.
+  struct SyncSendOp
+  {
+    std::condition_variable cv;
+    bool done{false};
+    SendResult result{SendResult::err(TransportErrorInfo{TransportError::Timeout, "pending"})};
+  };
+  std::unordered_map<std::uint64_t, std::shared_ptr<SyncSendOp>> pendingSends;
+  std::uint64_t nextSendOpId{1};
 
   // Read modes (protected by syncMutex)
   std::unordered_map<SessionId, ReadMode> readModes;
@@ -154,6 +178,9 @@ struct Transport::Impl
   std::size_t activeReceives{0}; // parked receiveSync waiters, aggregate (INV-5)
   std::size_t activeFlushes{0}; // in-progress setReadMode flushers (INV-5)
   std::size_t activeConnects{0}; // parked connectSync waiters (INV-5/C-4)
+  std::size_t activeSends{0};    // parked sendSync waiters (INV-5)
+  std::size_t pendingSyncOps{0}; // in-flight parked sync ops (connect/receive/send)
+                                 // for the maxPendingSyncOps cap (0 = unlimited, C2)
   std::condition_variable teardownCv; // signalled by each guard's destructor when its counter hits the gate
 
   // RAII guard for a parked receiveSync / connectSync caller. The owner MUST
@@ -210,6 +237,57 @@ struct Transport::Impl
     FlushGuard &operator=(const FlushGuard &) = delete;
   };
 
+  // RAII counter for the maxPendingSyncOps cap (C2). The owner holds syncMutex for
+  // the whole lifetime (constructed under the entry lock; declared AFTER the
+  // unique_lock so it destructs FIRST, under the still-held lock). Purely the
+  // concurrent-op cap — NOT part of the teardown gate, so no teardownCv notify.
+  struct PendingSyncGuard
+  {
+    std::size_t &counter;
+    explicit PendingSyncGuard(std::size_t &c) : counter(c) { ++counter; }
+    ~PendingSyncGuard() { --counter; }
+    PendingSyncGuard(const PendingSyncGuard &) = delete;
+    PendingSyncGuard &operator=(const PendingSyncGuard &) = delete;
+  };
+
+  // True iff the concurrent parked-sync-op cap (config.maxPendingSyncOps; 0 =
+  // unlimited) is reached. Caller MUST hold syncMutex (reads pendingSyncOps). C2.
+  bool syncCapReached() const
+  {
+    return config.maxPendingSyncOps != 0 && pendingSyncOps >= config.maxPendingSyncOps;
+  }
+
+  // Resolve a sync-op timeout parameter. The sentinel kUseConfigSyncTimeout (any
+  // negative value) means "use the configured default"; a misconfigured non-positive
+  // config.defaultSyncTimeout is floored to 30 s so it can never silently degrade a
+  // sync op to a non-blocking poll (F-2). An explicit non-negative timeout (including
+  // 0 = non-blocking) is respected as-is.
+  std::chrono::milliseconds resolveSyncTimeout(std::chrono::milliseconds t) const
+  {
+    if (t < std::chrono::milliseconds::zero())
+    {
+      return config.defaultSyncTimeout > std::chrono::milliseconds::zero()
+               ? config.defaultSyncTimeout
+               : kFallbackSyncTimeout;
+    }
+    return t;
+  }
+
+  // Wake every parked connectSync AND sendSync waiter. Both classes have no data to
+  // drain, so teardown always wakes them (unlike receiveSync, which is drained first
+  // on the NORMAL path). Caller MUST hold syncMutex. C4/L3.
+  void wakeConnectAndSendWaiters()
+  {
+    for (auto &kv : pendingConnects)
+    {
+      kv.second->cv.notify_all();
+    }
+    for (auto &kv : pendingSends)
+    {
+      kv.second->cv.notify_all();
+    }
+  }
+
   // Run the teardown handshake under the assumption the caller is about to
   // destroy/replace _impl. Sets shuttingDown (entry fence), wakes every parked
   // CV, and blocks until all three external-thread counters reach zero so no
@@ -223,10 +301,7 @@ struct Transport::Impl
   {
     std::unique_lock<std::mutex> lk(syncMutex);
     shuttingDown = true; // set-then-notify under the lock (mirrors `closed`)
-    for (auto &kv : pendingConnects)
-    {
-      kv.second->cv.notify_all();
-    }
+    wakeConnectAndSendWaiters();
     if (notifyReceive)
     {
       for (auto &kv : receiveBuffers)
@@ -234,8 +309,9 @@ struct Transport::Impl
         kv.second->cv.notify_all();
       }
     }
-    teardownCv.wait(lk, [this]
-                    { return activeReceives == 0 && activeConnects == 0 && activeFlushes == 0; });
+    teardownCv.wait(lk, [this] {
+      return activeReceives == 0 && activeConnects == 0 && activeFlushes == 0 && activeSends == 0;
+    });
   }
 
   // Set the entry fence (shuttingDown) and wake parked connectSync waiters, but
@@ -247,10 +323,7 @@ struct Transport::Impl
   {
     std::lock_guard<std::mutex> lk(syncMutex);
     shuttingDown = true;
-    for (auto &kv : pendingConnects)
-    {
-      kv.second->cv.notify_all();
-    }
+    wakeConnectAndSendWaiters();
   }
 
   // Full teardown for the current _impl, covering all paths (INV-5a/5b). The
@@ -261,9 +334,9 @@ struct Transport::Impl
   void performTeardown()
   {
     // performTeardown handles ONLY the non-I/O-thread teardown paths. The
-    // I/O-thread (self-destruction) case is handled by Transport::~Transport /
-    // operator= via deferred self-destruction (they own the unique_ptr and can
-    // release it). If performTeardown were ever entered on the I/O thread it
+    // I/O-thread (self-destruction) case is handled by Transport::~Transport
+    // via deferred self-destruction (it owns the unique_ptr and can release
+    // it). If performTeardown were ever entered on the I/O thread it
     // would self-join on engine->stop() (NORMAL) or self-wait on teardownCv
     // (ALREADY-STOPPED) — so assert against it.
     assert(std::this_thread::get_id() != engine->getIoThreadId() &&
@@ -388,9 +461,11 @@ struct Transport::Impl
 
         if (mode == ReadMode::Disabled)
         {
-          // TODO(Phase 7): Call engine->setReadEnabled(sid, false) to remove fd
-          // from EPOLLIN, preventing unnecessary reads. Currently drops data here
-          // which is functionally correct but wastes CPU on recv() syscalls.
+          // setReadMode removed the fd from EPOLLIN via engine->setReadEnabled (C5),
+          // so on TCP no further reads are scheduled. This callback-level drop
+          // remains the fallback for (a) bytes already in flight when read was
+          // disabled and (b) UDP, whose shared socket cannot disable read per
+          // session (setReadEnabled is a no-op there).
           return;
         }
       } // syncMutex released before user callback
@@ -416,6 +491,7 @@ struct Transport::Impl
       //    the global onClose for a sid the user never received.
       {
         std::shared_ptr<SyncConnectOp> op;
+        bool suppressOwned = false;
         {
           std::lock_guard<std::mutex> lk(syncMutex);
           auto connIt = pendingConnects.find(sid);
@@ -425,6 +501,14 @@ struct Transport::Impl
             op->result = ConnectResult::err(reason);
             op->done = true;
             pendingConnects.erase(connIt);
+            syncOwnedSuppress.erase(sid); // also clear any timeout marker (no leak)
+          }
+          else if (syncOwnedSuppress.erase(sid) > 0)
+          {
+            // A timed-out connectSync issued close(sid) and marked it, and a racing
+            // onConnect already consumed pendingConnects[sid] (Finding 1). Suppress
+            // the global onClose for this user-never-received sid.
+            suppressOwned = true;
           }
         }
         // Notify outside syncMutex — same pattern as onConnect.
@@ -433,6 +517,12 @@ struct Transport::Impl
           op->cv.notify_one();
           // No global onClose, no observers, no tombstone — connectSync
           // session never escaped to user code, so nothing to clean up.
+          return;
+        }
+        if (suppressOwned)
+        {
+          // Same as above: the sid never escaped to user code (its connectSync timed
+          // out and closed it), so suppress the global onClose/observers/tombstone.
           return;
         }
       }
@@ -678,8 +768,13 @@ inline void Transport::stop()
 {
   if (_impl && _impl->engine)
   {
-    if (_impl->engine->isRunning() &&
-        std::this_thread::get_id() == _impl->engine->getIoThreadId())
+    // Guard on thread-identity ALONE (HR-5/DQ-4), uniform with the sync ops. The
+    // isRunning() conjunct is intentionally dropped so the guard also fires during
+    // shutdownDrain (_running==false) — a callback that reaches stop() on the I/O
+    // thread would self-join engine->stop(); rejecting it is the documented
+    // contract and removes the guard asymmetry with connectSync/receiveSync/
+    // sendSync/setReadMode.
+    if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
     {
       throw std::logic_error("stop() called from I/O thread — would deadlock. "
                              "Post to a worker thread instead.");
@@ -712,8 +807,10 @@ inline TransportErrorInfo Transport::lastError() const
 inline ListenResult Transport::addListener(const std::string &bindIp, std::uint16_t port,
                                            TlsMode tls)
 {
-  if (_impl->engine->isRunning() &&
-      std::this_thread::get_id() == _impl->engine->getIoThreadId())
+  // Guard on thread-identity ALONE (HR-5/DQ-4), uniform with stop()/the sync ops:
+  // reject a call from the I/O thread regardless of running state (dropping the
+  // isRunning() conjunct also avoids the unverified addListener-during-drain path).
+  if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
     throw std::logic_error("addListener() called from I/O thread — not permitted. "
                            "Call before start() or from a worker thread.");
@@ -779,11 +876,12 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
                            "Use connect() (async) instead, or post to a worker thread.");
   }
 
-  // For UDP, connect is immediate — no handshake
-  if (_impl->config.protocol == Protocol::UDP)
-  {
-    return _impl->engine->connect(host, port, tls, opts);
-  }
+  // Resolve the sentinel/default timeout (M-3/F-2). UDP no longer short-circuits
+  // here: it parks in pendingConnects like TCP and returns only once the session is
+  // registered (onConnect fires after the I/O thread inserts it), so the returned
+  // sid is immediately usable by a subsequent sync send. Otherwise the enqueue-time
+  // sessionSendable check (CF-H1) would race the async UDP session insert (F-1).
+  timeout = _impl->resolveSyncTimeout(timeout);
 
   // Acquire syncMutex BEFORE calling engine->connect(). This ensures the
   // I/O thread's onConnect callback (which acquires syncMutex) cannot fire
@@ -808,6 +906,17 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
     return ConnectResult::err(
       TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
   }
+
+  // Concurrent-op cap (C2): reject when maxPendingSyncOps parked sync ops are
+  // already in flight (0 = unlimited). capGuard is declared after `lk` so it
+  // decrements under the still-held lock at every exit, incl. the final
+  // unlock/close/relock window (lk is re-locked before return).
+  if (_impl->syncCapReached())
+  {
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::TooManyPendingSyncOps, "maxPendingSyncOps reached"});
+  }
+  Impl::PendingSyncGuard capGuard(_impl->pendingSyncOps);
 
   auto result = _impl->engine->connect(host, port, tls, opts);
   if (result.isErr())
@@ -866,8 +975,28 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   // returning so connectGuard's dtor (the activeConnects decrement, a syncMutex-
   // guarded mutation) runs UNDER the lock — it destructs before `lk` because it
   // is declared after it.
+  //
+  // Finding 1: mark this sid sync-owned (suppress globals) UNDER the lock BEFORE
+  // releasing it to issue close(sid). A racing onConnect can complete the connect and
+  // erase pendingConnects[sid] before our close's onClose runs; the marker survives
+  // onConnect so onClose still suppresses the global onClose for this
+  // user-never-received sid.
+  _impl->syncOwnedSuppress.insert(sid);
   lk.unlock();
-  _impl->engine->close(sid);
+  try
+  {
+    _impl->engine->close(sid);
+  }
+  catch (...)
+  {
+    // Symmetry with sendSync (CF-M1 / R2-LOW): re-acquire syncMutex before unwinding
+    // so connectGuard/capGuard decrement + the teardownCv notify run UNDER the lock.
+    // engine->close() -> enqueue() swallows std::exception today, but the
+    // Command::close argument is constructed BEFORE enqueue's try and could throw
+    // (bad_alloc) — do not rely on std::string SSO making the message non-allocating.
+    lk.lock();
+    throw;
+  }
   lk.lock();
   // We have ISSUED engine->close(sid) — the session is being torn down. Even if a
   // late onConnect set op->done==true in the unlock window, we MUST NOT return
@@ -893,19 +1022,106 @@ inline SendResult Transport::sendSync(SessionId sid, iora::core::BufferView data
   if (std::this_thread::get_id() == _impl->engine->getIoThreadId())
   {
     throw std::logic_error("sendSync() called from I/O thread — would deadlock. "
-                           "Use send() (async) instead.");
+                           "Use send()/sendAsync() instead, or post to a worker thread.");
   }
 
-  // Simple implementation: delegate to engine's sync send.
-  // The engine's send() is non-blocking (enqueues), so this blocks until
-  // the data is actually enqueued. For true blocking-until-sent semantics,
-  // Phase 7 will add proper completion tracking.
-  bool ok = _impl->engine->send(sid, data.data(), data.size());
-  if (ok)
+  timeout = _impl->resolveSyncTimeout(timeout); // sentinel -> config default; <=0 floored (M-3/F-2)
+
+  // Block until the async send is ACCEPTED/COMPLETED by the engine (or `timeout`
+  // elapses), honoring the timeout — the former implementation ignored it and
+  // returned as soon as the bytes were enqueued. "Completion" is whatever the
+  // engine's SendCompleteCallback signals: for the current TCP/UDP engines that is
+  // the synchronous, post-copy acceptance of the bytes into the engine (NOT wire
+  // transmission or a TLS flush), so today the completion is effectively immediate
+  // (UDP always; TCP on enqueue) and the timeout rarely elapses — the parked-waiter
+  // machinery below is forward-correct for a future engine that defers completion.
+  // Mirrors connectSync: register a completion op under syncMutex (so the teardown
+  // handshake can wake it — sendSync has no data to drain, so it is always woken on
+  // teardown), park on the op's CV, and count the parked sender in the teardown gate
+  // via a ParkGuard on activeSends.
+  auto op = std::make_shared<Impl::SyncSendOp>();
+  std::unique_lock<std::mutex> lk(_impl->syncMutex);
+
+  // Entry fence (INV-8): reject before registering/counting.
+  if (_impl->shuttingDown)
   {
-    return SendResult::ok(data.size());
+    return SendResult::err(
+      TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
   }
-  return SendResult::err(TransportErrorInfo{TransportError::Socket, "send failed"});
+
+  // Concurrent-op cap (C2): reject rather than block when maxPendingSyncOps parked
+  // sync ops are already in flight (0 = unlimited). Checked under the SAME lock as
+  // the increment so a race cannot exceed the cap.
+  if (_impl->syncCapReached())
+  {
+    return SendResult::err(
+      TransportErrorInfo{TransportError::TooManyPendingSyncOps, "maxPendingSyncOps reached"});
+  }
+
+  const std::uint64_t opId = _impl->nextSendOpId++;
+  _impl->pendingSends[opId] = op;
+  // Declared AFTER `lk` so both destruct under the still-held lock (LIFO: capGuard,
+  // then sendGuard which also wakes the teardown handshake).
+  Impl::ParkGuard sendGuard(_impl->activeSends, _impl->teardownCv);
+  Impl::PendingSyncGuard capGuard(_impl->pendingSyncOps);
+
+  // Issue the async send WITHOUT holding syncMutex: the engine may fire the
+  // completion SYNCHRONOUSLY on this thread (http_server SR-7), and the completion
+  // callback re-acquires syncMutex — invoking it under the held lock would
+  // self-deadlock. The op (shared_ptr) is captured so the callback stays valid even
+  // if we return (timeout) before it fires; capturing `this` is safe because the
+  // engine — and thus _impl — outlives every completion (the I/O thread is joined
+  // before ~Impl, and the activeSends gate blocks teardown until we return).
+  lk.unlock();
+  try
+  {
+    _impl->engine->sendAsync(sid, data.data(), data.size(),
+                             [op, this](SessionId, const SendResult &result)
+                             {
+                               {
+                                 std::lock_guard<std::mutex> cbLk(_impl->syncMutex);
+                                 if (!op->done)
+                                 {
+                                   op->result = result;
+                                   op->done = true;
+                                 }
+                               }
+                               // Notify OUTSIDE syncMutex (mirrors onConnect/onClose)
+                               // so the woken thread does not immediately re-block on
+                               // the mutex it is about to reacquire (CF-L5).
+                               op->cv.notify_one();
+                             });
+  }
+  catch (...)
+  {
+    // Re-acquire syncMutex before unwinding so sendGuard/capGuard (declared after
+    // `lk`) decrement activeSends/pendingSyncOps and fire teardownCv UNDER the lock;
+    // otherwise a concurrent teardown could lose the wake and hang, plus a data race
+    // on the non-atomic counters (CF-M1). Also erase this op's pendingSends entry —
+    // else it is orphaned (holding `op` alive) until ~Impl (R2-LOW). TcpEngine::send
+    // allocates a ByteBuffer OUTSIDE enqueue's catch, so sendAsync can throw (e.g.
+    // bad_alloc); connectSync's structurally-identical engine->close() window is
+    // wrapped the same way for symmetry.
+    lk.lock();
+    _impl->pendingSends.erase(opId);
+    throw;
+  }
+  lk.lock();
+
+  op->cv.wait_for(lk, timeout, [&op, this] { return op->done || _impl->shuttingDown; });
+
+  _impl->pendingSends.erase(opId);
+
+  if (op->done)
+  {
+    return std::move(op->result);
+  }
+  if (_impl->shuttingDown)
+  {
+    return SendResult::err(
+      TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
+  }
+  return SendResult::err(TransportErrorInfo{TransportError::Timeout, "sendSync timed out"});
 }
 
 inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::size_t &len,
@@ -917,6 +1133,8 @@ inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::si
     throw std::logic_error("receiveSync() called from I/O thread — would deadlock. "
                            "Use ReadMode::Async with onData() callback instead.");
   }
+
+  timeout = _impl->resolveSyncTimeout(timeout); // sentinel -> config default; <=0 floored (M-3/F-2)
 
   // Single continuous lock acquisition: find-or-create, the entry-fence/
   // single-waiter checks, the parked wait, and the drain all happen under one
@@ -931,6 +1149,16 @@ inline ReceiveResult Transport::receiveSync(SessionId sid, void *buffer, std::si
     return ReceiveResult::err(
       TransportErrorInfo{TransportError::ShuttingDown, "transport shutting down"});
   }
+
+  // Concurrent-op cap (C2): reject when maxPendingSyncOps parked sync ops are
+  // already in flight (0 = unlimited). capGuard is declared before the park guards
+  // so it decrements last (outermost), under the still-held lock.
+  if (_impl->syncCapReached())
+  {
+    return ReceiveResult::err(
+      TransportErrorInfo{TransportError::TooManyPendingSyncOps, "maxPendingSyncOps reached"});
+  }
+  Impl::PendingSyncGuard capGuard(_impl->pendingSyncOps);
 
   std::shared_ptr<Impl::SyncReceiveBuffer> buf;
   {
@@ -1070,6 +1298,22 @@ inline bool Transport::setReadMode(SessionId sid, ReadMode mode)
           _impl->receiveBuffers[sid] = std::make_shared<Impl::SyncReceiveBuffer>();
         }
       }
+
+      // C5: toggle the fd's EPOLLIN registration when crossing the Disabled
+      // boundary so Disabled mode stops incurring recv() syscalls. TCP removes the
+      // fd from EPOLLIN via an engine command; UDP's shared socket cannot disable
+      // read per session (setReadEnabled returns false there) so the onData drop
+      // remains the fallback. Enqueues an engine command — safe under syncMutex (it
+      // does not re-acquire syncMutex), like connectSync's engine->connect().
+      if (mode == ReadMode::Disabled && oldMode != ReadMode::Disabled)
+      {
+        _impl->engine->setReadEnabled(sid, false);
+      }
+      else if (mode != ReadMode::Disabled && oldMode == ReadMode::Disabled)
+      {
+        _impl->engine->setReadEnabled(sid, true);
+      }
+
       return true; // Early return for non-flush transitions
     }
   } // syncMutex released
@@ -1290,6 +1534,14 @@ inline ConnectResult ITransport::connectSyncCancellable(
   {
     return ConnectResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
+  // *Cancellable variants have no config access; clamp a negative/sentinel timeout to
+  // the 30 s literal default (avoids computing a past deadline that would return an
+  // immediate Timeout). They do NOT honor config.defaultSyncTimeout — use the
+  // non-cancellable connectSync/sendSync/receiveSync for config-tuned timeouts (F-3).
+  if (timeout < std::chrono::milliseconds::zero())
+  {
+    timeout = kFallbackSyncTimeout;
+  }
   // Sub-timeout loop: break the total timeout into intervals of at most 100ms
   // so that cancel() is checked between iterations. connectSync handles the
   // internal waiting, so each sub-call is capped.
@@ -1347,6 +1599,12 @@ inline SendResult ITransport::sendSyncCancellable(
   {
     return SendResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
+  // No config access here; clamp a negative/sentinel timeout to the 30 s literal
+  // default (F-3). sendSync itself resolves config for a non-negative value.
+  if (timeout < std::chrono::milliseconds::zero())
+  {
+    timeout = kFallbackSyncTimeout;
+  }
   // sendSync is non-blocking (enqueue-based), so it completes quickly.
   // Check cancellation before and after — no sub-timeout loop needed.
   auto result = sendSync(sid, data, timeout);
@@ -1365,12 +1623,23 @@ inline ReceiveResult ITransport::receiveSyncCancellable(
   {
     return ReceiveResult::err(TransportErrorInfo{TransportError::Cancelled, "cancelled"});
   }
+  // *Cancellable variants have no config access; clamp a negative/sentinel timeout to
+  // the 30 s literal default (avoids a past deadline → immediate Timeout without ever
+  // polling). They do NOT honor config.defaultSyncTimeout — use receiveSync for that (F-3).
+  if (timeout < std::chrono::milliseconds::zero())
+  {
+    timeout = kFallbackSyncTimeout;
+  }
   // Sub-timeout loop: break the total timeout into intervals so that
   // cancel() is detected between iterations.
   constexpr auto subInterval = std::chrono::milliseconds{100};
   auto deadline = std::chrono::steady_clock::now() + timeout;
 
-  while (std::chrono::steady_clock::now() < deadline)
+  // do/while guarantees at least one receiveSync poll even for an explicit
+  // timeout==0 (a non-blocking receive) — matching connectSyncCancellable, which
+  // always makes one attempt. A plain while(now<deadline) would do zero polls at
+  // timeout==0 (cpp17 R3-LOW).
+  do
   {
     if (token.isCancelled())
     {
@@ -1378,11 +1647,9 @@ inline ReceiveResult ITransport::receiveSyncCancellable(
     }
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
       deadline - std::chrono::steady_clock::now());
-    if (remaining <= std::chrono::milliseconds::zero())
-    {
-      break;
-    }
-    auto subTimeout = std::min(remaining, subInterval);
+    // Clamp negative remaining to zero so subTimeout is a valid (non-blocking) poll.
+    auto subTimeout =
+      std::min(std::max(remaining, std::chrono::milliseconds::zero()), subInterval);
     auto result = receiveSync(sid, buffer, len, subTimeout);
     if (result.isOk())
     {
@@ -1392,7 +1659,7 @@ inline ReceiveResult ITransport::receiveSyncCancellable(
     {
       return result; // Non-timeout error (PeerClosed, etc.) — return immediately
     }
-  }
+  } while (std::chrono::steady_clock::now() < deadline);
   return ReceiveResult::err(TransportErrorInfo{TransportError::Timeout, "receiveSync timed out"});
 }
 

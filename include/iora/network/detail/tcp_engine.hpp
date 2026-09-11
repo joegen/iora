@@ -405,6 +405,13 @@ public:
     {
       return true;
     }
+    // CF-H1: reject an unknown/closed session at enqueue time rather than
+    // enqueuing a command doSend would silently drop (which returned true —
+    // masking a dead connection from SIP RFC 3263 failover).
+    if (!sessionSendable(sid))
+    {
+      return false;
+    }
     IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() called for sid=" << sid << ", size=" << n);
     ByteBuffer b(n);
     std::memcpy(b.data(), data, n);
@@ -486,6 +493,20 @@ public:
   void sendAsync(SessionId sid, const void *data, std::size_t len,
                  SendCompleteCallback cb) override
   {
+    // CF-H1: validate synchronously — do NOT report OK for an unknown/closed
+    // session. The decision is copied out from under the session read lock and
+    // the lock released BEFORE cb runs (never invoke a user callback while
+    // holding _sessionRwMutex). Completion stays SYNCHRONOUS on the caller
+    // thread, the contract Transport::sendSync relies on (see EngineBase).
+    if (!sessionSendable(sid))
+    {
+      if (cb)
+      {
+        cb(sid,
+           SendResult::err(TransportErrorInfo{TransportError::Socket, "session not connected"}));
+      }
+      return;
+    }
     bool ok = send(sid, data, len);
     if (cb)
     {
@@ -553,19 +574,31 @@ public:
     {
       return false;
     }
-    int fd = it->second->fd;
-    sockaddr_storage ss{};
-    socklen_t sl = sizeof(ss);
-    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&ss), &sl) != 0)
+    return applyDscpToFd(it->second->fd, dscp);
+  }
+
+  /// \brief Enqueue an EPOLLIN enable/disable change for a session (C5). epoll_ctl
+  /// MUST run on the I/O thread, so this posts a command; the actual modEpoll runs
+  /// in doSetReadEnabled(). Returns true iff the command was queued.
+  bool setReadEnabled(SessionId sid, bool enabled) override
+  {
+    return enqueue(Command::setReadEnabled(sid, enabled));
+  }
+
+  /// \brief TEST-ONLY (CF-M4): return the raw socket fd backing session \p sid,
+  /// or -1 if unknown. Lets a test getsockopt(IP_TOS/IPV6_TCLASS) on the socket to
+  /// verify the DSCP mark was applied at session creation (see
+  /// iora_test_engine_introspection). Takes the session read lock. NOT part of
+  /// the production API — never used outside tests.
+  int testGetSessionFd(SessionId sid) const
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end())
     {
-      return false;
+      return -1;
     }
-    int val = static_cast<int>(dscp) << 2;
-    if (ss.ss_family == AF_INET6)
-    {
-      return ::setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &val, sizeof(val)) == 0;
-    }
-    return ::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) == 0;
+    return it->second->fd;
   }
 
 protected:
@@ -684,6 +717,32 @@ private:
 
   void delEpoll(int fd) { ::epoll_ctl(_epollFd, EPOLL_CTL_DEL, fd, nullptr); }
 
+  /// \brief Forwards to the shared iora::network::applyDscpToFd (see the
+  /// udp_engine twin — both were byte-identical private copies, the same
+  /// anti-pattern already retired for addressFromSockaddr). CF-L1. Shared by the
+  /// per-session setDscp() API and the at-creation application of
+  /// config.dscpValue in applySockOpts().
+  static bool applyDscpToFd(int fd, std::uint8_t dscp)
+  {
+    return iora::network::applyDscpToFd(fd, dscp);
+  }
+
+  /// \brief CF-H1: is \p sid a currently-known, not-closed session? Takes the
+  /// session read lock briefly. send()/sendAsync() call this to reject an
+  /// unknown/closed session synchronously at enqueue time — enqueuing a Send
+  /// command that doSend then silently drops reported false success and masked
+  /// connection failure (defeating SIP RFC 3263 failover). This is the SAME
+  /// validity notion doSend uses (present in _sessions AND !closed). A close
+  /// racing right after this check is the accepted narrow TOCTOU: it shrinks the
+  /// false-OK window from "always" to a rare race, and cannot be closed without
+  /// holding _sessionRwMutex across enqueue+dispatch.
+  bool sessionSendable(SessionId sid) const
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    return it != _sessions.end() && !it->second->closed;
+  }
+
   static std::string keyFromSockaddr(const sockaddr_storage &ss)
   {
     char h[NI_MAXHOST]{}, s[NI_MAXSERV]{};
@@ -800,6 +859,7 @@ private:
     Connect,
     Send,
     Close,
+    SetReadEnabled, // C5: enable/disable EPOLLIN for a session (I/O-thread epoll_ctl)
     RunOnIo // generic "run this closure on the I/O thread" (runOnIoThread seam)
   };
 
@@ -821,10 +881,19 @@ private:
     TransportError closeReason{TransportError::Unknown};
     std::string closeMsg;
     CloseOrigin closeOrigin{CloseOrigin::App};
+    SessionId readSid{};              // Cmd::SetReadEnabled target session
+    bool readEnabledVal{true};        // Cmd::SetReadEnabled desired EPOLLIN state
     std::shared_ptr<std::promise<bool>> listenerReady; // signals when addListener bind completes
     std::function<void()> fn; // Cmd::RunOnIo payload (std::function keeps Command copyable)
 
     static Command shutdown() { return Command{Cmd::Shutdown}; }
+    static Command setReadEnabled(SessionId sid, bool enabled)
+    {
+      Command x{Cmd::SetReadEnabled};
+      x.readSid = sid;
+      x.readEnabledVal = enabled;
+      return x;
+    }
     static Command runOnIo(std::function<void()> fn)
     {
       Command x{Cmd::RunOnIo};
@@ -1010,6 +1079,10 @@ private:
     std::deque<ByteBuffer> wq;
     bool wantWrite{false};
     bool closed{false};
+    // C5: when false, EPOLLIN is withheld from this session's epoll interest so
+    // the read/re-arm path (updateInterest) does not deliver read events for a
+    // ReadMode::Disabled session. I/O thread only. Defaults enabled.
+    bool readEnabled{true};
 
     MonoTime created{}, lastActivity{};
 
@@ -1452,6 +1525,9 @@ private:
           }
           break;
         }
+        case Cmd::SetReadEnabled:
+          doSetReadEnabled(c.readSid, c.readEnabledVal);
+          break;
         }
       }
       catch (const std::exception &ex)
@@ -1544,7 +1620,9 @@ private:
     lst->tls = lc.tls;
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     addEpoll(sfd, ev);
 
     Listener *rawLst = lst.get();
@@ -1629,7 +1707,9 @@ private:
 
       std::uint32_t ev = EPOLLIN;
       if (_config.useEdgeTriggered)
+      {
         ev |= EPOLLET;
+      }
       addEpoll(cfd, ev);
 
       auto tg = std::make_unique<Tag>();
@@ -2021,7 +2101,9 @@ private:
 
     std::uint32_t ev = EPOLLIN | EPOLLOUT;
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     addEpoll(cfd, ev);
     auto tg = std::make_unique<Tag>();
     tg->isListener = false;
@@ -2549,9 +2631,25 @@ private:
 
   void updateInterest(Session *s)
   {
-    std::uint32_t ev = EPOLLIN;
+    // C5: withhold EPOLLIN while read is disabled for this session. This is the
+    // single EPOLLIN re-arm site for established sessions, so gating here keeps a
+    // ReadMode::Disabled session from re-arming read events. EPOLLOUT (needWrite)
+    // and the edge-triggered flag below are unaffected.
+    std::uint32_t ev = 0;
+    // C5 read-gate (braced per R-FMT-5, CF-L4). CF-M2: during the TLS handshake
+    // force EPOLLIN regardless of readEnabled — handshake reads
+    // (SSL_ERROR_WANT_READ) are protocol-level, not application data, so
+    // withholding EPOLLIN mid-handshake would starve them and stall the session
+    // until the handshake timeout. The C5 read-disable only suppresses delivery
+    // of APPLICATION data.
+    if (s->readEnabled || s->tlsState == TlsState::Handshake)
+    {
+      ev |= EPOLLIN;
+    }
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     // CRITICAL FIX: Keep EPOLLOUT registered while connection is pending
     // This ensures we receive the EPOLLOUT event when TCP handshake completes,
     // even in edge-triggered mode where events can be missed if we unregister too early
@@ -2577,6 +2675,26 @@ private:
       ev |= EPOLLOUT;
     }
     modEpoll(s->fd, ev);
+  }
+
+  /// \brief C5 (I/O thread): apply a read enable/disable for a session. Sets the
+  /// per-session readEnabled flag then re-derives the epoll interest via
+  /// updateInterest, which withholds/restores EPOLLIN while preserving EPOLLOUT
+  /// (iff a write is pending) and the edge-triggered flag (iff config).
+  void doSetReadEnabled(SessionId sid, bool enabled)
+  {
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end())
+    {
+      return;
+    }
+    Session *s = it->second.get();
+    if (s->closed)
+    {
+      return;
+    }
+    s->readEnabled = enabled;
+    updateInterest(s);
   }
 
   void doSend(SendReq &&sr)
@@ -2889,6 +3007,14 @@ private:
       (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &_config.tcpKeepalive.idle, sizeof(int));
       (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &_config.tcpKeepalive.interval, sizeof(int));
       (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &_config.tcpKeepalive.count, sizeof(int));
+    }
+    // Apply the configured DSCP mark to the DATA socket at creation (C1). Called
+    // for every accepted server-peer fd and every connected client fd; 0 leaves
+    // the default best-effort marking. This is the production path — the SIP
+    // presets (forSipTcp) set dscpValue=24 (CS3) for signaling QoS.
+    if (_config.dscpValue != 0)
+    {
+      (void)applyDscpToFd(fd, _config.dscpValue);
     }
   }
 

@@ -11,3 +11,6 @@
 
 add_executable(jsonrpc_example jsonrpc_example.cpp)
 configure_iora_target(jsonrpc_example ENABLE_OPENSSL)
+
+add_executable(transport_example transport_example.cpp)
+configure_iora_target(transport_example ENABLE_OPENSSL)

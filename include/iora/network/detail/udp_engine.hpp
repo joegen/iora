@@ -334,6 +334,13 @@ public:
   {
     if (n == 0)
       return true;
+    // CF-H1: reject an unknown/closed session at enqueue time rather than
+    // enqueuing a command sendDo would silently drop (which returned true —
+    // masking a dead connection from SIP RFC 3263 failover).
+    if (!sessionSendable(sid))
+    {
+      return false;
+    }
     ByteBuffer b(n);
     std::memcpy(b.data(), p, n);
     SendReq sr;
@@ -389,6 +396,20 @@ public:
   void sendAsync(SessionId sid, const void *data, std::size_t len,
                  SendCompleteCallback cb) override
   {
+    // CF-H1: validate synchronously — do NOT report OK for an unknown/closed
+    // session. The decision is copied out from under the session read lock and
+    // the lock released BEFORE cb runs (never invoke a user callback while
+    // holding _sessionRwMutex). Completion stays SYNCHRONOUS on the caller
+    // thread, the contract Transport::sendSync relies on (see EngineBase).
+    if (!sessionSendable(sid))
+    {
+      if (cb)
+      {
+        cb(sid,
+           SendResult::err(TransportErrorInfo{TransportError::Socket, "session not connected"}));
+      }
+      return;
+    }
     bool ok = send(sid, data, len);
     if (cb)
     {
@@ -429,24 +450,10 @@ public:
       return {};
     }
     const auto *s = it->second.get();
-    int fd;
-    if (s->role == Role::ServerPeer)
+    int fd = backingFdFor(s);
+    if (fd < 0)
     {
-      // ServerPeer sessions share the listener's fd
-      auto lit = _listeners.find(s->owner);
-      if (lit == _listeners.end() || lit->second->fd < 0)
-      {
-        return {};
-      }
-      fd = lit->second->fd;
-    }
-    else
-    {
-      fd = s->fd;
-      if (fd < 0)
-      {
-        return {};
-      }
+      return {};
     }
     sockaddr_storage ss{};
     socklen_t sl = sizeof(ss);
@@ -498,36 +505,43 @@ public:
       return false;
     }
     const auto *s = it->second.get();
-    int fd;
-    if (s->role == Role::ServerPeer)
-    {
-      auto lit = _listeners.find(s->owner);
-      if (lit == _listeners.end() || lit->second->fd < 0)
-      {
-        return false;
-      }
-      fd = lit->second->fd;
-    }
-    else
-    {
-      fd = s->fd;
-      if (fd < 0)
-      {
-        return false;
-      }
-    }
-    sockaddr_storage ss{};
-    socklen_t sl = sizeof(ss);
-    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&ss), &sl) != 0)
+    int fd = backingFdFor(s);
+    if (fd < 0)
     {
       return false;
     }
-    int val = static_cast<int>(dscp) << 2;
-    if (ss.ss_family == AF_INET6)
+    return applyDscpToFd(fd, dscp);
+  }
+
+  /// \brief No-op on UDP (C5). UDP multiplexes many virtual sessions over ONE
+  /// shared socket, so EPOLLIN cannot be removed for an individual session without
+  /// disabling read for all of them; the transport layer keeps dropping reads at
+  /// the callback for UDP ReadMode::Disabled. Returns false (not applied).
+  bool setReadEnabled(SessionId sid, bool enabled) override
+  {
+    (void)sid;
+    (void)enabled;
+    return false;
+  }
+
+  /// \brief TEST-ONLY (CF-M4): return the socket fd carrying session \p sid, or
+  /// -1 if unknown/unbacked. Lets a test getsockopt(IP_TOS/IPV6_TCLASS) on the
+  /// socket to verify the DSCP mark was applied at creation (see
+  /// iora_test_engine_introspection). Mirrors setDscp's fd resolution: a
+  /// ClientConnected session uses its own fd; a ServerPeer session multiplexes
+  /// over its owning listener's shared socket, so that listener fd is returned
+  /// (the socket the DSCP mark was actually applied to). Takes the session read
+  /// lock. NOT part of the production API — never used outside tests.
+  int testGetSessionFd(SessionId sid) const
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    if (it == _sessions.end())
     {
-      return ::setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &val, sizeof(val)) == 0;
+      return -1;
     }
-    return ::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) == 0;
+    const auto *s = it->second.get();
+    return backingFdFor(s);
   }
 
 private:
@@ -547,6 +561,53 @@ private:
     return ::epoll_ctl(_epollFd, EPOLL_CTL_MOD, fd, &e) == 0;
   }
   void delEpoll(int fd) { ::epoll_ctl(_epollFd, EPOLL_CTL_DEL, fd, nullptr); }
+  /// \brief Forwards to the shared iora::network::applyDscpToFd (see the
+  /// tcp_engine twin — both were byte-identical private copies, the same
+  /// anti-pattern already retired for addressFromSockaddr). CF-L1. Shared by the
+  /// per-session setDscp() API and the at-creation application of
+  /// config.dscpValue.
+  static bool applyDscpToFd(int fd, std::uint8_t dscp)
+  {
+    return iora::network::applyDscpToFd(fd, dscp);
+  }
+
+  // Forward declaration of the nested Session (defined below): backingFdFor takes a
+  // `const Session *` PARAMETER, whose type must be declared here even though the
+  // body is parsed in complete-class context.
+  struct Session;
+
+  /// \brief Resolve the socket fd that actually backs session \p s: a ServerPeer
+  /// multiplexes over its owning listener's shared socket (that listener's fd);
+  /// any other role uses the session's own fd. Returns -1 if unbacked (owning
+  /// listener gone). The caller MUST already hold \c _sessionRwMutex (shared) —
+  /// this reads \c _listeners. Deduplicates the resolution formerly copied into
+  /// getLocalAddress, setDscp, and testGetSessionFd (CF-L1 twin).
+  int backingFdFor(const Session *s) const
+  {
+    if (s->role == Role::ServerPeer)
+    {
+      auto lit = _listeners.find(s->owner);
+      return (lit == _listeners.end()) ? -1 : lit->second->fd;
+    }
+    return s->fd;
+  }
+
+  /// \brief CF-H1: is \p sid a currently-known, not-closed session? Takes the
+  /// session read lock briefly. send()/sendAsync() call this to reject an
+  /// unknown/closed session synchronously at enqueue time — enqueuing a Send
+  /// command that sendDo then silently drops reported false success and masked
+  /// connection failure (defeating SIP RFC 3263 failover). This is the SAME
+  /// validity notion sendDo uses: present in _sessions AND !closed. UDP sessions
+  /// are virtual over the shared socket, but the engine DOES keep a per-session
+  /// registry (_sessions) with a per-session closed flag, so the check is
+  /// meaningful for both ClientConnected and ServerPeer sessions. A close racing
+  /// right after this check is the accepted narrow TOCTOU.
+  bool sessionSendable(SessionId sid) const
+  {
+    std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
+    auto it = _sessions.find(sid);
+    return it != _sessions.end() && !it->second->closed;
+  }
   void armGc(std::chrono::seconds s)
   {
     itimerspec its{};
@@ -1196,6 +1257,14 @@ private:
       ::setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &_config.soRcvBuf, sizeof(int));
     if (_config.soSndBuf > 0)
       ::setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &_config.soSndBuf, sizeof(int));
+    // Apply the configured DSCP mark to the shared listener/data socket at
+    // creation (C1). UDP multiplexes server-peer sessions over this one socket,
+    // so the mark is per-socket, not per-session; 0 leaves default best-effort.
+    // The SIP UDP preset (forSipUdp) sets dscpValue=24 (CS3) for signaling QoS.
+    if (_config.dscpValue != 0)
+    {
+      (void)applyDscpToFd(sfd, _config.dscpValue);
+    }
     if (::bind(sfd, reinterpret_cast<sockaddr *>(&ss), sl) < 0)
     {
       error(TransportError::Bind, "bind: " + lastErr());
@@ -1208,7 +1277,9 @@ private:
     lst->bind = lc.addr + ":" + std::to_string(lc.port);
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     addEpoll(sfd, ev);
     Listener *rawLst = lst.get();
     {
@@ -1225,9 +1296,13 @@ private:
   void onListener(Listener *lst, std::uint32_t events)
   {
     if (events & EPOLLIN)
+    {
       readFromListener(lst);
+    }
     if (events & EPOLLOUT)
+    {
       flushListener(lst);
+    }
   }
 
   void readFromListener(Listener *lst)
@@ -1331,9 +1406,13 @@ private:
   {
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     if (lst->wantWrite && !lst->wq.empty())
+    {
       ev |= EPOLLOUT;
+    }
     modEpoll(lst->fd, ev);
   }
 
@@ -1530,6 +1609,12 @@ private:
       error(TransportError::Connect, "UDP connect: " + connectErr);
       return false;
     }
+    // Apply the configured DSCP mark to the connected client socket at creation
+    // (C1); 0 leaves default best-effort marking.
+    if (_config.dscpValue != 0)
+    {
+      (void)applyDscpToFd(sfd, _config.dscpValue);
+    }
     auto s = std::make_unique<Session>();
     s->id = cr.sid;
     s->role = Role::ClientConnected;
@@ -1540,7 +1625,9 @@ private:
     s->connectPending = false; // UDP connect immediate
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     addEpoll(sfd, ev);
     Session *sPtr = s.get();
     {
@@ -1764,13 +1851,17 @@ private:
           break;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
           break;
+        }
         closeNow(s, TransportError::Socket, lastErr(), 0);
         return;
       }
     }
     if (events & EPOLLOUT)
+    {
       writeClient(s);
+    }
   }
 
   void writeClient(Session *s)
@@ -1805,9 +1896,13 @@ private:
   {
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
+    {
       ev |= EPOLLET;
+    }
     if (s->wantWrite && !s->wq.empty())
+    {
       ev |= EPOLLOUT;
+    }
     modEpoll(s->fd, ev);
   }
 
