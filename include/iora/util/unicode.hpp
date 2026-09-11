@@ -11,7 +11,7 @@
 
 namespace iora
 {
-namespace core
+namespace util
 {
 
 /// \brief Append a Unicode code point to out encoded as UTF-8.
@@ -75,5 +75,5 @@ inline bool hexDigitValue(char c, std::uint32_t &out)
   return true;
 }
 
-} // namespace core
+} // namespace util
 } // namespace iora

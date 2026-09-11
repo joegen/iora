@@ -909,7 +909,7 @@ private:
       for (std::size_t i = 2; i < entBody.size(); ++i)
       {
         std::uint32_t v = 0;
-        if (!iora::core::hexDigitValue(entBody[i], v))
+        if (!iora::util::hexDigitValue(entBody[i], v))
         {
           return false;
         }
@@ -939,7 +939,7 @@ private:
         }
       }
     }
-    if (!iora::core::appendUtf8(out, code))
+    if (!iora::util::appendUtf8(out, code))
     {
       return false;
     }

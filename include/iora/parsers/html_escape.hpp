@@ -69,7 +69,7 @@ inline std::string percentDecode(std::string_view in, bool plusIsSpace)
       {
         std::uint32_t hi = 0;
         std::uint32_t lo = 0;
-        if (iora::core::hexDigitValue(in[i + 1], hi) && iora::core::hexDigitValue(in[i + 2], lo))
+        if (iora::util::hexDigitValue(in[i + 1], hi) && iora::util::hexDigitValue(in[i + 2], lo))
         {
           out += static_cast<char>((hi << 4) | lo);
           i += 3;

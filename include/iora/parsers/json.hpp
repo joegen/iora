@@ -1340,7 +1340,7 @@ private:
     for (std::size_t i = 1; i <= 4; ++i)
     {
       std::uint32_t d;
-      if (!iora::core::hexDigitValue(_text[_pos + i], d))
+      if (!iora::util::hexDigitValue(_text[_pos + i], d))
       {
         _error = "Invalid hex digit in \\u escape";
         return false;
@@ -1441,7 +1441,7 @@ private:
             _error = "Unexpected low surrogate in \\u escape";
             return false;
           }
-          if (!iora::core::appendUtf8(str, cp))
+          if (!iora::util::appendUtf8(str, cp))
           {
             _error = "Invalid code point in \\u escape";
             return false;
