@@ -200,6 +200,34 @@
       "headers": [
         "network/name_resolver.hpp"
       ]
+    },
+    "network/http_basic_auth.md": {
+      "area": "network",
+      "headers": [
+        "network/http_auth.hpp"
+      ]
+    },
+    "network/http_client.md": {
+      "area": "network",
+      "headers": [
+        "network/http_client.hpp",
+        "network/http_client_pool.hpp"
+      ]
+    },
+    "network/http_server.md": {
+      "area": "network",
+      "headers": [
+        "network/http_server.hpp",
+        "network/webhook_server.hpp"
+      ]
+    },
+    "network/websocket.md": {
+      "area": "network",
+      "headers": [
+        "network/websocket_frame.hpp",
+        "network/websocket_server.hpp",
+        "network/websocket_client.hpp"
+      ]
     }
   }
 }

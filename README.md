@@ -185,7 +185,11 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **Transport** — the unified TCP/UDP transport facade: engines, async + synchronous operations, TLS client identity, DSCP marking, and read-gating — [`docs/network/transport.md`](docs/network/transport.md)
   - **Transport sync-op lifecycle** — `connectSync` / `receiveSync` / `sendSync`, the drain-before-close teardown handshake, the pending-sync-op cap, and the timeout sentinels — [`docs/network/transport_sync_lifecycle.md`](docs/network/transport_sync_lifecycle.md)
   - **NameResolver / DNS host resolution** — off-thread `getaddrinfo` host resolution and per-connection TLS identity threaded through the resolve/resume (also the `NameResolver` vs `DnsClient` boundary) — [`docs/network/transport_dns_resolution.md`](docs/network/transport_dns_resolution.md)
-- **HttpClient** / **HttpClientPool**, **HttpServer** / **WebhookServer**, **WebSocket**, **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
+- **HttpClient / HttpClientPool** — the synchronous HTTP client and its bounded connection pool: TLS client identity, timeouts and slow-peer hardening, case-insensitive schemes, IPv6-literal authorities, and pooled async — [`docs/network/http_client.md`](docs/network/http_client.md)
+- **HttpServer / WebhookServer** — the routing HTTP server and its JSON specialization: request framing and chunked de-chunking, RFC 9112 connection persistence, repeated Set-Cookie, and the WebSocket-upgrade subclass seam — [`docs/network/http_server.md`](docs/network/http_server.md)
+- **HTTP Basic Auth** — the `requireBasicAuth` route decorator: realm sanitization, constant-time verification, and credential scrubbing — [`docs/network/http_basic_auth.md`](docs/network/http_basic_auth.md)
+- **WebSocket** — the RFC 6455 frame codec, server, and client: tri-state frame parse with length/masking/RSV/control-frame conformance, fragmentation, and the abrupt-disconnect close hook — [`docs/network/websocket.md`](docs/network/websocket.md)
+- **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
 
 ### parsers
 - **JSON** — value model, parser & serializer (`\uXXXX`/surrogate decoding, RFC 8259) — [`docs/parsers/json.md`](docs/parsers/json.md)
