@@ -412,10 +412,16 @@ inline std::string formatHttpDate(std::time_t t)
 /// cap (e.g. the JSON-RPC decode path caps Content-Encoding at <=2) is enforced by
 /// that consumer, and the server's max-header-bytes limit is the backstop against a
 /// pathological repeat for consumers that impose no cap of their own.
+/// Connection is a #list field too (RFC 9110 §7.6.1: Connection = #connection-option):
+/// repeated field-lines MUST be combined before token-scanning, or a "close" token
+/// stranded on a non-final field-line ("Connection: keep-alive" / "Connection: close")
+/// is lost and the persistence decision (and the WebSocket upgrade check) reads only the
+/// last line. Combining is safe here — every Connection consumer token-splits the value.
 inline bool isListValuedHeader(const std::string &name)
 {
   static const std::set<std::string, CaseInsensitiveCompare> kListValued = {
-    "X-Forwarded-For", "Forwarded", "Via", "Content-Encoding", "Accept-Encoding"};
+    "X-Forwarded-For", "Forwarded",       "Via",
+    "Content-Encoding", "Accept-Encoding", "Connection"};
   return kListValued.count(name) != 0;
 }
 
@@ -1260,6 +1266,13 @@ public:
   HttpHeaders headers;
   std::string body;
 
+  /// \brief Repeatable Set-Cookie field-lines. RFC 6265 §3 requires each cookie to
+  /// be sent as its own Set-Cookie header and forbids folding them into one
+  /// comma-separated list; the single-valued `headers` map cannot hold more than one,
+  /// so multiple cookies live here and toWireFormat emits one field-line per entry.
+  /// A single cookie may still be set via `headers` — both sources are emitted.
+  std::vector<std::string> setCookies;
+
   /// \brief Construct empty response
   HttpResponse() = default;
 
@@ -1368,6 +1381,21 @@ public:
         continue;
       }
       ss << key << ": " << value << "\r\n";
+    }
+
+    // Set-Cookie: one field-line per cookie (RFC 6265 §3 — never comma-combined).
+    // These carry intrinsic commas (Expires date, attribute lists) so they can never
+    // live in the comma-list `headers` map. Same CR/LF/NUL response-splitting backstop
+    // as the header loop above: an injected cookie-string is dropped whole, not
+    // truncated. Emitted regardless of `bodyless` — Set-Cookie is a valid response
+    // header on a 204/304 (it is not a body-framing header).
+    for (const auto &cookie : setCookies)
+    {
+      if (headerHasInjection(cookie))
+      {
+        continue;
+      }
+      ss << "Set-Cookie: " << cookie << "\r\n";
     }
 
     // RFC 9110 §6.6.1: add a Date on 2xx/3xx/4xx when the builder set none. A

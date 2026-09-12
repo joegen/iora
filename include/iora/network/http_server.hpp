@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "iora/core/logger.hpp"
+#include "iora/core/string_utils.hpp"
 #include "iora/core/thread_pool.hpp"
 #include "iora/network/transport_impl.hpp"
 #include "iora/parsers/http_message.hpp"
@@ -72,6 +73,13 @@ public:
     std::string path;
     HttpHeaders headers;
     std::string body;
+    /// \brief Request parameters: query-string pairs plus captured named route
+    /// segments (a path segment wins over a same-named query key). A query name with
+    /// no '=' ("?flag") is stored with an empty value. SINGLE-VALUED: duplicate keys
+    /// are last-wins ("?a=1&a=2" -> a=="2"); the map cannot represent a multi-valued
+    /// parameter (a deliberate limitation of this API shape). Names and values are
+    /// stored RAW — they are NOT percent-decoded and '+' is NOT converted to space;
+    /// a handler needing decoded values calls parsers::formDecode / parsers::urlDecode.
     std::unordered_map<std::string, std::string> params;
     std::string remote_addr;       // Peer IP address for httplib compatibility
     std::uint16_t remote_port = 0; // Peer port for additional context
@@ -105,6 +113,12 @@ public:
     HttpHeaders headers;
     std::string body;
 
+    /// \brief Set-Cookie values emitted as SEPARATE field-lines (RFC 6265 §3). The
+    /// single-valued `headers` map holds at most one Set-Cookie, so setting two
+    /// cookies via headers silently drops one; use add_cookie for each cookie when a
+    /// response needs more than one (e.g. a session cookie plus a CSRF cookie).
+    std::vector<std::string> cookies;
+
     /// \brief When set true by a handler, the dispatcher sends NOTHING for this
     /// request (no terminal response, no keep-alive/close decision) — used by the
     /// SSE upgrade, which writes its own preamble directly to the socket and takes
@@ -132,6 +146,14 @@ public:
     }
 
     void set_header(const std::string &key, const std::string &value) { headers[key] = value; }
+
+    /// \brief Append one Set-Cookie field-line (the full cookie-string, e.g.
+    /// "sid=abc; Path=/; HttpOnly"). Each call adds one Set-Cookie header to the
+    /// response, so a handler can set several distinct cookies in one response
+    /// (RFC 6265 §3). The value is emitted verbatim (attributes are the caller's
+    /// responsibility); a value containing CR/LF/NUL is dropped by the response-
+    /// splitting guard rather than emitted.
+    void add_cookie(const std::string &setCookieValue) { cookies.push_back(setCookieValue); }
   };
 
   using Handler = std::function<void(const Request &, Response &)>;
@@ -1149,7 +1171,41 @@ protected:
       req.headers = httpReq.headers;
       req.body = httpReq.body;
 
-      // Populate peer address information
+      // Determine connection persistence for this request (RFC 9112 §9.3): HTTP/1.1+
+      // defaults to persistent, HTTP/1.0 (and earlier) to non-persistent; a Connection
+      // header token overrides the default — "close" always wins, and "keep-alive"
+      // makes an HTTP/1.0 request persistent. The Connection field is a comma-list
+      // (RFC 9110 §7.6.1), so it is token-parsed, not exact-matched.
+      bool connectionKeepAlive;
+      {
+        static const std::string kEmpty;
+        auto cIt = httpReq.headers.find("Connection");
+        const std::string &connValue = (cIt != httpReq.headers.end()) ? cIt->second : kEmpty;
+        // major > 1 is defensive: fromWireFormat already 505s any HTTP-version with
+        // major != 1 (and 400s HTTP/0.9), so only 1.0 / 1.1 reach here — but the check
+        // states the RFC 9112 §9.3 rule directly rather than relying on that upstream.
+        const bool isHttp11OrLater =
+          httpReq.version.major > 1 ||
+          (httpReq.version.major == 1 && httpReq.version.minor >= 1);
+        if (connectionListHasToken(connValue, "close"))
+        {
+          connectionKeepAlive = false;
+        }
+        else if (isHttp11OrLater)
+        {
+          connectionKeepAlive = true;
+        }
+        else
+        {
+          connectionKeepAlive = connectionListHasToken(connValue, "keep-alive");
+        }
+      }
+
+      // Populate peer address information. The per-request keep-alive decision above
+      // is consumed on this same worker stack at the send path (the local is still in
+      // scope); it is NOT written into shared SessionInfo, because pipelined requests
+      // on one session run on different pool workers and a shared per-session field
+      // would be clobbered by a concurrent sibling's decision (a logical race).
       {
         std::lock_guard<std::mutex> lock(_sessionMutex);
         auto it = _sessionInfo.find(sid);
@@ -1193,21 +1249,30 @@ protected:
       auto queryPos = req.path.find('?');
       if (queryPos != std::string::npos)
       {
-        // Parse query parameters
-        std::string queryString = req.path.substr(queryPos + 1);
+        // Split the query on '&' into name[=value] pairs. A pair is split on its
+        // FIRST '='; a name with no '=' ("?flag") is stored with an empty value so a
+        // handler can test presence of a bare flag (rather than the value being
+        // dropped). Empty pairs ("?&a=1", "?a=1&", "?a=1&&b=2") are skipped.
+        // NOTE: names and values are stored RAW — they are NOT percent-decoded and
+        // '+' is NOT converted to space here; a handler needing decoded values calls
+        // parsers::formDecode. (Consistent URI-component decoding is tracked; see the
+        // Request::params doc-comment.)
+        const std::string queryString = req.path.substr(queryPos + 1);
         req.path = req.path.substr(0, queryPos);
-
-        // Simple query parameter parsing
-        std::istringstream queryStream(queryString);
-        std::string param;
-        while (std::getline(queryStream, param, '&'))
+        for (const auto param : core::StringUtils::split(queryString, '&'))
         {
-          auto eqPos = param.find('=');
-          if (eqPos != std::string::npos)
+          if (param.empty())
           {
-            std::string key = param.substr(0, eqPos);
-            std::string value = param.substr(eqPos + 1);
-            req.params[key] = value;
+            continue;
+          }
+          const auto eqPos = param.find('=');
+          if (eqPos == std::string_view::npos)
+          {
+            req.params[std::string(param)] = "";
+          }
+          else
+          {
+            req.params[std::string(param.substr(0, eqPos))] = std::string(param.substr(eqPos + 1));
           }
         }
       }
@@ -1531,53 +1596,39 @@ protected:
         }
       }
 
-      // Determine connection behavior
-      bool shouldCloseConnection = false;
-      std::string connectionHeader = "keep-alive";
-
-      // Check for HTTP/1.0 or Connection: close
+      // Same response-splitting guard for the repeatable Set-Cookie lines (they
+      // bypass the headers map, so they need their own CR/LF/NUL check here in
+      // addition to the toWireFormat backstop). A cookie built from unvalidated
+      // input is the canonical Set-Cookie injection sink.
+      for (auto cit = res.cookies.begin(); cit != res.cookies.end();)
       {
-        std::lock_guard<std::mutex> lock(_sessionMutex);
-        auto it = _sessionInfo.find(sid);
-        if (it != _sessionInfo.end())
+        if (iora::network::headerHasInjection(*cit))
         {
-          if (it->second.httpVersion == "1.0")
-          {
-            shouldCloseConnection = true;
-            connectionHeader = "close";
-          }
-          else if (!it->second.connectionKeepAlive)
-          {
-            shouldCloseConnection = true;
-            connectionHeader = "close";
-          }
+          iora::core::Logger::error(
+            "HttpServer: dropped a Set-Cookie containing CR/LF/NUL "
+            "(response-splitting attempt) on " +
+            toString(req.method) + " " + req.path + " (session " + std::to_string(sid) + ")");
+          cit = res.cookies.erase(cit);
+        }
+        else
+        {
+          ++cit;
         }
       }
 
-      // Check request headers for connection preference
-      auto connectionIt = req.headers.find("Connection");
-      if (connectionIt != req.headers.end())
-      {
-        std::string connValue = connectionIt->second;
-        // Unsigned-char-safe lowercasing (a bare ::tolower on a negative-valued
-        // char is UB). NOTE: this still exact-matches "close"; parsing Connection
-        // as a comma-separated token list (RFC 9110 §7.6.1, e.g. "keep-alive,
-        // close") is SRV-M2, owned by tracker 2026-09-11-15 phase 4 (Group 4).
-        std::transform(connValue.begin(), connValue.end(), connValue.begin(),
-                       [](char c)
-                       { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
-        if (connValue == "close")
-        {
-          shouldCloseConnection = true;
-          connectionHeader = "close";
-        }
-      }
+      // Connection behavior: use the request-local persistence decision (RFC 9112
+      // §9.3) computed above on this worker stack — never a shared SessionInfo field
+      // (see the note at the peer-address block: a concurrent pipelined sibling would
+      // clobber it).
+      const bool shouldCloseConnection = !connectionKeepAlive;
+      const std::string connectionHeader = shouldCloseConnection ? "close" : "keep-alive";
 
       // Build HTTP response
       HttpResponse httpRes;
       httpRes.statusCode = res.status;
       httpRes.statusText = getStatusText(res.status);
       httpRes.headers = res.headers;
+      httpRes.setCookies = std::move(res.cookies);
       httpRes.body = res.body;
 
       // Add server headers
@@ -1930,6 +1981,25 @@ protected:
       result += methods[i];
     }
     return result;
+  }
+
+  /// \brief RFC 9110 §7.6.1: the Connection header field-value is a comma-separated
+  /// list of connection-option tokens. Returns true iff \p connectionValue contains
+  /// \p token as a member — each element OWS-trimmed and compared ASCII
+  /// case-insensitively. This is NEVER a bare substring match: a substring test would
+  /// both false-positive ("not-close" contains "close") and miss a member behind
+  /// another token ("keep-alive, close"). Used to honor "keep-alive, close" /
+  /// "close, foo" for the RFC 9112 §9.3 persistence decision.
+  static bool connectionListHasToken(const std::string &connectionValue, const char *token)
+  {
+    for (const auto element : core::StringUtils::split(connectionValue, ','))
+    {
+      if (core::StringUtils::iequals(core::StringUtils::trim(element), token))
+      {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// \brief Get the reason phrase for an HTTP status code.
@@ -2643,8 +2713,6 @@ private:
     std::string buffer;
     std::string peerAddress;
     std::uint16_t peerPort = 0;
-    bool connectionKeepAlive = true;
-    std::string httpVersion = "1.1"; // Default to HTTP/1.1
 
     // Buffer management constants
     static constexpr std::size_t MAX_BUFFER_SIZE = 1024 * 1024;    // 1MB max per session
