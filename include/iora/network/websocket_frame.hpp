@@ -148,6 +148,13 @@ struct WebSocketFrame
       }
       payloadLen = data.readU16BE(pos);
       pos += 2;
+      // RFC 6455 §5.2: the minimal number of bytes MUST be used to encode the
+      // length — a 16-bit form carrying a value <= 125 is a non-minimal
+      // encoding and is a protocol error.
+      if (payloadLen <= 125)
+      {
+        return protocolError(1002);
+      }
     }
     // 5. 127-form: 64-bit extended length.
     else if (payloadLen == 127)
@@ -160,6 +167,13 @@ struct WebSocketFrame
       pos += 8;
       // RFC 6455 §5.2: the most significant bit of a 64-bit length MUST be 0.
       if ((payloadLen & 0x8000000000000000ULL) != 0)
+      {
+        return protocolError(1002);
+      }
+      // RFC 6455 §5.2: minimal-length encoding — a 64-bit form carrying a value
+      // that fits the 16-bit form (<= 0xFFFF) is a non-minimal encoding and is
+      // a protocol error.
+      if (payloadLen <= 0xFFFFULL)
       {
         return protocolError(1002);
       }

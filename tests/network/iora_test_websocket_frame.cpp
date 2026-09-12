@@ -384,6 +384,152 @@ TEST_CASE("WS Frame: 64-bit length with MSB set is protocol error 1002", "[ws][f
   REQUIRE(err.closeCode == 1002);
 }
 
+TEST_CASE("WS Frame: non-minimal 16-bit length (value <= 125) is protocol error 1002",
+          "[ws][frame][parse]")
+{
+  // FIN + BINARY, 126-form carrying 5 — a value that fits the 7-bit form, so the
+  // 16-bit encoding is non-minimal (RFC 6455 §5.2 minimal-length-encoding MUST).
+  std::vector<std::uint8_t> wire = {
+    0x82,       // FIN + BINARY
+    0x7E,       // len = 126 (16-bit follows)
+    0x00, 0x05  // 5 (should have used the 7-bit form)
+  };
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: non-minimal 64-bit length (value <= 0xFFFF) is protocol error 1002",
+          "[ws][frame][parse]")
+{
+  // FIN + BINARY, 127-form carrying 256 — a value that fits the 16-bit form, so the
+  // 64-bit encoding is non-minimal (RFC 6455 §5.2 minimal-length-encoding MUST).
+  std::vector<std::uint8_t> wire = {
+    0x82,                                           // FIN + BINARY
+    0x7F,                                           // len = 127 (64-bit follows)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00  // 256 (should have used the 16-bit form)
+  };
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: 16-bit length carrying exactly 125 is protocol error 1002 (reject boundary)",
+          "[ws][frame][parse][length]")
+{
+  // The exact non-minimal reject boundary for the 16-bit form: 125 still fits the
+  // 7-bit form, so a 126-form carrying 125 MUST be rejected. Pins the `<= 125`
+  // predicate against a `< 125` off-by-one.
+  std::vector<std::uint8_t> wire = {
+    0x82,       // FIN + BINARY
+    0x7E,       // len = 126 (16-bit follows)
+    0x00, 0x7D  // 125 (largest value that still fits the 7-bit form)
+  };
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: 64-bit length carrying exactly 0xFFFF is protocol error 1002 (reject boundary)",
+          "[ws][frame][parse][length]")
+{
+  // The exact non-minimal reject boundary for the 64-bit form: 0xFFFF still fits the
+  // 16-bit form, so a 127-form carrying 65535 MUST be rejected. Pins the `<= 0xFFFF`
+  // predicate against a `< 0xFFFF` off-by-one.
+  std::vector<std::uint8_t> wire = {
+    0x82,                                           // FIN + BINARY
+    0x7F,                                           // len = 127 (64-bit follows)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF  // 65535 (largest value that fits the 16-bit form)
+  };
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == 1002);
+}
+
+TEST_CASE("WS Frame: minimal 16-bit length (126, value 126) parses",
+          "[ws][frame][parse][length]")
+{
+  // The smallest value that legitimately requires the 16-bit form: 126.
+  std::vector<std::uint8_t> payload(126, 0x61); // 126 'a' bytes
+  std::vector<std::uint8_t> wire = {0x82, 0x7E, 0x00, 0x7E};
+  wire.insert(wire.end(), payload.begin(), payload.end());
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE(parsed.has_value());
+  REQUIRE_FALSE(err.isError);
+  REQUIRE(parsed->payload.size() == 126);
+}
+
+TEST_CASE("WS Frame: minimal 64-bit length (127, value 65536) parses",
+          "[ws][frame][parse][length]")
+{
+  // The smallest value that legitimately requires the 64-bit form: 65536.
+  std::vector<std::uint8_t> payload(65536, 0x62); // 65536 'b' bytes
+  std::vector<std::uint8_t> wire = {
+    0x82, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00};
+  wire.insert(wire.end(), payload.begin(), payload.end());
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE(parsed.has_value());
+  REQUIRE_FALSE(err.isError);
+  REQUIRE(parsed->payload.size() == 65536);
+}
+
+TEST_CASE("WS Frame: maximal 16-bit length (126, value 65535) parses (accept boundary)",
+          "[ws][frame][parse][length]")
+{
+  // The largest value the 16-bit form may legitimately carry: 65535. Guards against
+  // a spurious upper-bound reject on the 126-form.
+  std::vector<std::uint8_t> payload(65535, 0x63); // 65535 'c' bytes
+  std::vector<std::uint8_t> wire = {0x82, 0x7E, 0xFF, 0xFF};
+  wire.insert(wire.end(), payload.begin(), payload.end());
+
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
+
+  REQUIRE(parsed.has_value());
+  REQUIRE_FALSE(err.isError);
+  REQUIRE(parsed->payload.size() == 65535);
+}
+
 TEST_CASE("WS Frame: declared length over maxFrameSize is 1009 regardless of payload presence",
           "[ws][frame][parse]")
 {
