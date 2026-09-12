@@ -15,7 +15,6 @@
 
 #include <functional>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -83,6 +82,16 @@ public:
   void setOriginCallback(OriginCallback cb) { _originCb = std::move(cb); }
 
   void setMaxFrameSize(std::size_t maxBytes) { _maxFrameSize = maxBytes; }
+
+  /// \brief 2026-09-11-23 (CORE): fault-injection seam phases inside
+  /// onUpgradeRequest, used by the race tests to serialize the pool worker
+  /// against the transport I/O thread. Production builds never override the hook.
+  enum class WsUpgradePhase
+  {
+    BeforeMark,      // pending entry created; markSessionUpgradedIfLive not yet called
+    AfterMark,       // upgraded + live; _onConnect not yet fired
+    BeforeCommit     // _onConnect delivered; P3 commit not yet run
+  };
 
   // ── Session Send Methods ───────────────────────────────────────────────
 
@@ -176,6 +185,20 @@ public:
   }
 
 protected:
+  /// \brief 2026-09-11-23 (CORE) test-only fault-injection seam. No-op in
+  /// production; a test subclass overrides it to drive a transport close (and a
+  /// rendezvous latch) at a precise phase of onUpgradeRequest, making the
+  /// upgrade-vs-close race deterministic. Runs on the pool worker.
+  virtual void onUpgradeRacePhase(SessionId /*sid*/, WsUpgradePhase /*phase*/) {}
+
+  /// \brief 2026-09-11-23 (CORE) test-only: number of live WS sessions
+  /// (_sessions). Used by the race tests to assert no session leak.
+  std::size_t wsSessionCountForTest() const
+  {
+    std::lock_guard<std::mutex> lock(_wsMutex);
+    return _sessions.size();
+  }
+
   // ── HTTP Upgrade Hook ──────────────────────────────────────────────────
 
   bool onUpgradeRequest(SessionId sid, const Request& req, Response& res) override
@@ -241,18 +264,16 @@ protected:
     auto requestedProtocols = req.get_header_value("Sec-WebSocket-Protocol");
     if (!requestedProtocols.empty() && _subprotocolCb)
     {
-      // Parse comma-separated protocol list
+      // Parse comma-separated protocol list, reusing the foundation split/trim
+      // (StringUtils, already used for the case-folds above) instead of a
+      // hand-rolled istringstream + find_first/last_not_of.
       std::vector<std::string> protocols;
-      std::istringstream ss(requestedProtocols);
-      std::string proto;
-      while (std::getline(ss, proto, ','))
+      for (std::string_view tok : iora::core::StringUtils::split(requestedProtocols, ','))
       {
-        // Trim whitespace
-        auto start = proto.find_first_not_of(" \t");
-        auto end = proto.find_last_not_of(" \t");
-        if (start != std::string::npos)
+        std::string_view t = iora::core::StringUtils::trim(tok);
+        if (!t.empty())
         {
-          protocols.push_back(proto.substr(start, end - start + 1));
+          protocols.emplace_back(t);
         }
       }
       negotiatedProtocol = _subprotocolCb(protocols);
@@ -268,20 +289,126 @@ protected:
       res.set_header("Sec-WebSocket-Protocol", negotiatedProtocol);
     }
 
-    // Mark session as upgraded
-    markSessionUpgraded(sid);
-
-    // Create per-session state
+    // 2026-09-11-23 (CORE): establish the session lifecycle so it is serialized
+    // against the transport I/O thread's onUpgradedClose.
+    //
+    // P1 + P13: create an ALWAYS-PRESENT pending entry (connectDelivered=false)
+    // BEFORE marking the session upgraded, via emplace so a racing concurrent
+    // upgrade for the same sid cannot clobber the winner. Because the I/O thread
+    // routes close/data to a session only after _upgradedSessions contains sid
+    // (set below, after this create), once the I/O thread can observe the session
+    // the _sessions entry already exists — so a later "absent" in onUpgradedClose
+    // means unambiguously "already destroyed".
     {
       std::lock_guard<std::mutex> lock(_wsMutex);
-      _sessions[sid] = WsSessionState{};
-      _sessions[sid].negotiatedProtocol = negotiatedProtocol;
+      // try_emplace default-constructs WsSessionState in place only when sid is
+      // absent — the P13 "insert iff not already upgrading/upgraded" duplicate
+      // guard, with no temporary + move.
+      if (!_sessions.try_emplace(sid).second)
+      {
+        // P13: a concurrent/duplicate upgrade for this sid is already in progress
+        // or complete. Suppress the 101 AND normal HTTP route dispatch (return
+        // true so the caller does not fall through to route dispatch, which would
+        // inject an HTTP response into the live WebSocket byte stream). Fire
+        // nothing — the winner owns the lifecycle.
+        res._suppressSend = true;
+        return true;
+      }
     }
 
-    // Fire onConnect callback
-    if (_onConnect)
+    onUpgradeRacePhase(sid, WsUpgradePhase::BeforeMark);
+
+    // P2 + P10: the ENTIRE mark->commit window is exception-safe under one guard.
+    // EVERY throwing op in it — the _upgradedSessions insert inside
+    // markSessionUpgradedIfLive, the allocating _onClose snapshot copy, and the
+    // user _onConnect — must, if it throws before connectDelivered is committed,
+    // run the abort-equivalent teardown on BOTH maps, or the always-present
+    // pending _sessions entry leaks with no onClose (the exact failure class this
+    // fix exists to kill). `committed` disarms the guard once the noexcept commit
+    // critical section has run (the session is then either live or already erased
+    // with its deferred close taken), so a throw from the post-commit user
+    // _onClose invocation does not re-abort an already-handled session.
+    bool committed = false;
+    try
     {
-      _onConnect(sid, negotiatedProtocol);
+      // P2: mark upgraded with a fused liveness check. If the transport already
+      // closed during the handshake window (its onClose erased _sessionInfo under
+      // _sessionMutex), abort: erase the pending entry and suppress the 101 (the
+      // a0 window — close-before-mark). The transport is already gone here, so no
+      // closeSession is owed — a plain return (not the abort guard) is enough.
+      if (!markSessionUpgradedIfLive(sid))
+      {
+        std::lock_guard<std::mutex> lock(_wsMutex);
+        _sessions.erase(sid);
+        res._suppressSend = true; // P7 verdict v1: caller skips the 101 + drain
+        return true;
+      }
+
+      onUpgradeRacePhase(sid, WsUpgradePhase::AfterMark);
+
+      // Snapshot the close callback (a std::function copy that MAY allocate)
+      // BEFORE firing _onConnect: once onConnect is delivered, a transport close
+      // deferred during it is then GUARANTEED a callback to fire (no lost-close-
+      // under-OOM window), and the commit critical section stays noexcept.
+      CloseCallback closeCb = _onClose;
+
+      // P3: fire _onConnect (copy-then-invoke, OUTSIDE any lock) while
+      // connectDelivered is still false.
+      if (ConnectCallback cb = _onConnect)
+      {
+        cb(sid, negotiatedProtocol);
+      }
+
+      onUpgradeRacePhase(sid, WsUpgradePhase::BeforeCommit);
+
+      // P3 commit (NOEXCEPT critical section — only flag sets, a uint read, a
+      // string MOVE, and erase). Set connectDelivered; if a transport close was
+      // deferred while we delivered onConnect, take its code/reason, erase, and
+      // fire _onClose exactly once AFTER onConnect.
+      bool fireClose = false;
+      std::uint16_t closeCode = 0;
+      std::string closeReason;
+      {
+        std::lock_guard<std::mutex> lock(_wsMutex);
+        auto it = _sessions.find(sid);
+        if (it != _sessions.end())
+        {
+          it->second.connectDelivered = true;
+          if (it->second.deferredClose)
+          {
+            fireClose = true;
+            closeCode = it->second.deferredCloseCode;
+            closeReason = std::move(it->second.deferredCloseReason);
+            _sessions.erase(it);
+          }
+        }
+      }
+      committed = true; // past the abort window: session is live, or erased above
+
+      if (fireClose)
+      {
+        // A transport close was deferred while we delivered onConnect. The
+        // session is already erased; skip the 101 + drain (P7) — the peer is
+        // gone — and fire _onClose exactly once, AFTER onConnect.
+        res._suppressSend = true;
+        if (closeCb)
+        {
+          closeCb(sid, closeCode, closeReason);
+        }
+      }
+    }
+    catch (...)
+    {
+      // A throw before the commit (the mark insert, the closeCb copy, or the user
+      // _onConnect) must not leak the pending session. Tear down BOTH maps + the
+      // transport, then RETHROW so the exception is still logged by the pool /
+      // processHttpRequest (the session is already fully torn down, so the outer
+      // 500-send is dropped on the closing socket). P10.ii.
+      if (!committed)
+      {
+        abortUpgradedSession(sid);
+      }
+      throw;
     }
 
     return true;
@@ -381,40 +508,23 @@ protected:
     }
   }
 
-  /// \brief Transport-close teardown (2026-09-11-16). On an abrupt client
-  /// disconnect (TCP RST/FIN with no WS CLOSE frame — client crash, kill -9,
-  /// network drop) the protocol layer never runs its CLOSE path, so _sessions[sid]
-  /// leaks and the app's onClose never fires. The base transport onClose routes
-  /// here for upgraded sessions; prune the session and fire _onClose exactly once.
+  /// \brief Transport-close teardown (2026-09-11-16 / 2026-09-11-23 CORE). On an
+  /// abrupt client disconnect (TCP RST/FIN with no WS CLOSE frame — client crash,
+  /// kill -9, network drop) the protocol layer never runs its CLOSE path, so the
+  /// session leaks and the app's onClose never fires. The base transport onClose
+  /// routes here for upgraded sessions. This runs on the I/O thread and may race
+  /// the upgrade handshake on a pool worker, so it does NOT unconditionally fire:
+  /// it defers to deferOrFireClose, which fires _onClose exactly once and only
+  /// after _onConnect has been delivered (connectDelivered), guaranteeing
+  /// onConnect-strictly-before-onClose. Map the transport reason to an accurate
+  /// application close code (RFC 6455 §7.4.1): a whole-server going-away -> 1001;
+  /// any other transport close with no close handshake (peer loss, write-stall
+  /// timeout, idle-GC reap) -> 1006. Both are callback-only codes, NEVER on the wire.
   void onUpgradedClose(SessionId sid, const TransportErrorInfo &reason) override
   {
-    bool wasPresent = false;
-    {
-      std::lock_guard<std::mutex> lock(_wsMutex);
-      wasPresent = _sessions.erase(sid) > 0;
-    }
-    // Membership in _sessions is the at-most-once guard: a WS-level CLOSE echo or
-    // a protocol-error eraseAndCloseSession has already erased the entry (and, for
-    // the CLOSE path, already fired _onClose with the peer's code), so this fires
-    // ONLY for a transport close we still owned (no protocol CLOSE was exchanged).
-    // Map the transport reason to an accurate application close code (RFC 6455
-    // §7.4.1): a whole-server going-away -> 1001; any other transport close with no
-    // close handshake (peer loss, write-stall timeout, idle-GC reap) -> 1006. Both
-    // are callback-only codes, NEVER placed on the wire. Snapshot _onClose into a
-    // local so the invocation runs OUTSIDE _wsMutex and cannot be torn down
-    // mid-call; correctness against a concurrent setOnClose rests on the
-    // register-before-start() contract documented at the setter cluster, not on
-    // this copy.
-    if (wasPresent)
-    {
-      const std::uint16_t code = isServerInitiatedClose(reason.code) ? 1001 : 1006;
-      const char *const why = (code == 1001) ? "going away" : "abnormal closure";
-      CloseCallback cb = _onClose;
-      if (cb)
-      {
-        cb(sid, code, why);
-      }
-    }
+    const std::uint16_t code = isServerInitiatedClose(reason.code) ? 1001 : 1006;
+    const char *const why = (code == 1001) ? "going away" : "abnormal closure";
+    deferOrFireClose(sid, code, why);
   }
 
   /// \brief True when a transport close means this endpoint is "going away" — a
@@ -432,6 +542,85 @@ protected:
   }
 
 private:
+  /// \brief 2026-09-11-23 (CORE P5): deliver a TRANSPORT-close _onClose callback,
+  /// gated on connectDelivered so it never precedes _onConnect. Runs on the I/O
+  /// thread (from onUpgradedClose). If the session's onConnect has NOT yet been
+  /// delivered (the close raced the upgrade handshake), DEFER: record the code/
+  /// reason on the pending entry and let the upgrade worker fire _onClose exactly
+  /// once after onConnect (P3 commit). If connectDelivered, fire now
+  /// (copy-then-invoke, OUTSIDE _wsMutex) and erase the entry — membership is the
+  /// at-most-once guard. Absence of the entry means already-destroyed (a WS-level
+  /// CLOSE / protocol-error erase, or the worker's deferred fire) -> nothing owed.
+  /// Only the TRANSPORT-close path is gated in the core; the inbound-WS-frame and
+  /// outbound ordering in the handshake window are tracker 2026-09-12-2.
+  void deferOrFireClose(SessionId sid, std::uint16_t code, const std::string &reason)
+  {
+    // WS-C1: this runs on the transport I/O thread, whose top-level catch treats
+    // any escaped exception as fatal (it tears down the whole engine loop, dropping
+    // EVERY session). Both allocating operations here — the deferredCloseReason
+    // copy under the lock and the _onClose snapshot copy — can throw std::bad_alloc,
+    // so the whole body is wrapped to swallow it (mirroring onUpgradedData's
+    // per-frame guard). Losing one session's close callback under OOM is strictly
+    // better than terminating the I/O loop.
+    try
+    {
+      bool fire = false;
+      {
+        std::lock_guard<std::mutex> lock(_wsMutex);
+        auto it = _sessions.find(sid);
+        if (it == _sessions.end())
+        {
+          return; // already destroyed
+        }
+        if (it->second.connectDelivered)
+        {
+          fire = true;
+          _sessions.erase(it);
+        }
+        else if (!it->second.deferredClose)
+        {
+          // First-writer-wins: only one transport close can reach here per session
+          // (the base onClose erases _upgradedSessions, gating a second call), so a
+          // single record suffices; the guard also keeps a follow-on call harmless.
+          it->second.deferredClose = true;
+          it->second.deferredCloseCode = code;
+          it->second.deferredCloseReason = reason;
+        }
+      }
+      if (fire)
+      {
+        // Snapshot + invoke OUTSIDE the lock, and only when actually firing (no
+        // wasted std::function copy / bad_alloc surface on the defer path).
+        if (CloseCallback cb = _onClose)
+        {
+          cb(sid, code, reason);
+        }
+      }
+    }
+    catch (...)
+    {
+      // Never let an allocation failure escape into the transport I/O loop.
+    }
+  }
+
+  /// \brief 2026-09-11-23 (CORE P10): abort-equivalent teardown for an upgraded
+  /// session whose onConnect delivery did not complete (a throwing _onConnect).
+  /// Erase _sessions FIRST (keeps the session routing "upgraded" so an inbound
+  /// byte arriving in the gap hits onUpgradedData and safely drops on the miss,
+  /// rather than being misrouted to the HTTP parser), THEN unmark the routing
+  /// gate, THEN tear the transport down. Fires no callback (a thrown onConnect is
+  /// not a completed connect, so no onClose is owed). The two erases are separate
+  /// sequential critical sections — the two mutexes are never co-held (P6).
+  void abortUpgradedSession(SessionId sid)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_wsMutex);
+      _sessions.erase(sid);
+    }
+    unmarkSessionUpgraded(sid);
+    closeSession(sid);
+  }
+
   /// \brief Erase the per-session state under _wsMutex then tear the transport
   /// session down — the shared teardown for a protocol-error / bad-alloc close,
   /// mirroring the inbound-CLOSE handling.
@@ -688,8 +877,15 @@ private:
     std::vector<std::uint8_t> fragmentBuffer;
     WsOpcode fragmentOpcode = WsOpcode::CONTINUATION;
     bool fragmentInProgress = false; // WS-M5: a fragmented message is mid-assembly
-    std::string negotiatedProtocol;
     bool closeSent = false; // prevents double close-frame echo
+    // 2026-09-11-23 (CORE): serialize the upgrade handshake (pool worker) against
+    // the transport I/O thread's onUpgradedClose. All four flags are plain and
+    // guarded EXCLUSIVELY by _wsMutex (the mutex supplies happens-before); never
+    // read or written outside _wsMutex, never made atomic.
+    bool connectDelivered = false;    // _onConnect has been delivered to the app
+    bool deferredClose = false;       // a transport close was observed pre-connect
+    std::uint16_t deferredCloseCode = 0;
+    std::string deferredCloseReason;
   };
 
   mutable std::mutex _wsMutex; // mutable so the const isSessionActive can lock it

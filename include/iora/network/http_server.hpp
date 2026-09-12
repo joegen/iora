@@ -489,22 +489,45 @@ public:
         [this](SessionId sid, const TransportErrorInfo &reason)
         {
           bool wasUpgraded = false;
+          bool hadInfo = false;
+          std::string peerAddress;
+          int peerPort = 0;
           {
             std::lock_guard<std::mutex> lock(_sessionMutex);
             wasUpgraded = _upgradedSessions.erase(sid) > 0;
             auto it = _sessionInfo.find(sid);
             if (it != _sessionInfo.end())
             {
-              iora::core::Logger::info(
-                "HttpServer: HTTP connection closed from " + it->second.peerAddress + ":" +
-                std::to_string(it->second.peerPort) + " (session " + std::to_string(sid) + ")");
+              // Move (noexcept) the fields needed for logging out, then erase, so
+              // the state teardown completes BEFORE any allocating log-string work
+              // and never depends on it.
+              hadInfo = true;
+              peerAddress = std::move(it->second.peerAddress);
+              peerPort = it->second.peerPort;
               _sessionInfo.erase(it);
+            }
+          }
+          // 2026-09-11-23 (CORE): logging runs on the transport I/O thread; a
+          // std::bad_alloc from the string concatenation must NOT escape into the
+          // engine's top-level catch, which treats it as fatal and tears down the
+          // whole loop (dropping every session). Swallow it — the teardown above
+          // already completed under the lock (WS-C1).
+          try
+          {
+            if (hadInfo)
+            {
+              iora::core::Logger::info("HttpServer: HTTP connection closed from " + peerAddress +
+                                       ":" + std::to_string(peerPort) + " (session " +
+                                       std::to_string(sid) + ")");
             }
             else
             {
               iora::core::Logger::debug("HttpServer: Connection closed (session " +
                                         std::to_string(sid) + ")");
             }
+          }
+          catch (...)
+          {
           }
           // Transport-close teardown hook for upgraded (e.g. WebSocket) sessions,
           // invoked with NO internal lock held so the override may take its own
@@ -516,6 +539,13 @@ public:
           {
             onUpgradedClose(sid, reason);
           }
+          // 2026-09-11-23 (CORE) test-only rendezvous seam: fires AFTER the
+          // _sessionMutex teardown (and onUpgradedClose) for EVERY transport
+          // close, including the a0 case where wasUpgraded is false and
+          // onUpgradedClose is not called. No-op in production; a race test
+          // overrides it to signal that the I/O thread has finished processing
+          // the close, so the worker can be released deterministically.
+          onTransportSessionClosed(sid);
         });
 
       // Error callback
@@ -687,6 +717,48 @@ protected:
   {
     std::lock_guard<std::mutex> lock(_sessionMutex);
     _upgradedSessions.insert(sid);
+  }
+
+  /// \brief 2026-09-11-23 (CORE P2): mark a session upgraded ONLY if the transport
+  /// session is still live, in one _sessionMutex critical section. Returns false
+  /// if the base per-session record (_sessionInfo) is already gone — the transport
+  /// closed during the upgrade handshake window. This is authoritative because the
+  /// transport onClose lambda erases _upgradedSessions AND _sessionInfo in a single
+  /// _sessionMutex section, so _sessionInfo absence here means the close already
+  /// ran. Relies on SessionIds being monotonic and never recycled (tcp_engine.hpp
+  /// _nextSessionId is fetch_add-only), so a live _sessionInfo entry cannot be a
+  /// different connection reusing sid. The plain markSessionUpgraded above is left
+  /// unchanged for the SSE upgrade path (sse_stream.hpp) and the test double.
+  bool markSessionUpgradedIfLive(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    if (_sessionInfo.find(sid) == _sessionInfo.end())
+    {
+      return false;
+    }
+    _upgradedSessions.insert(sid);
+    return true;
+  }
+
+  /// \brief 2026-09-11-23 (CORE P10): remove the upgraded-routing marker (used by
+  /// the WebSocket abort path when an upgrade is torn down before completion).
+  void unmarkSessionUpgraded(SessionId sid)
+  {
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    _upgradedSessions.erase(sid);
+  }
+
+  /// \brief 2026-09-11-23 (CORE) test-only rendezvous seam. Invoked on the I/O
+  /// thread at the end of the transport onClose handler for EVERY closed session
+  /// (upgraded or not), after the _sessionMutex teardown. No-op in production.
+  virtual void onTransportSessionClosed(SessionId /*sid*/) {}
+
+  /// \brief 2026-09-11-23 (CORE) test-only: number of live upgraded-session
+  /// markers (_upgradedSessions). Used by the race tests to assert no leak.
+  std::size_t upgradedSessionCountForTest() const
+  {
+    std::lock_guard<std::mutex> lock(_sessionMutex);
+    return _upgradedSessions.size();
   }
 
   /// \brief Called when data arrives on an upgraded session.
@@ -1288,48 +1360,65 @@ protected:
             Response upgradeRes;
             if (onUpgradeRequest(sid, req, upgradeRes))
             {
-              // Build HTTP response for the upgrade
-              HttpResponse httpUpgradeRes;
-              httpUpgradeRes.statusCode = upgradeRes.status;
-              httpUpgradeRes.statusText = getStatusText(upgradeRes.status);
-              httpUpgradeRes.headers = upgradeRes.headers;
-              httpUpgradeRes.body = upgradeRes.body;
-
-              httpUpgradeRes.setHeader("Server", "Iora/1.0");
-
-              std::string responseData = httpUpgradeRes.toWireFormat();
-              auto sharedResponseData = std::make_shared<std::string>(std::move(responseData));
-
+              // 2026-09-11-23 (CORE P7): the upgrade was HANDLED — always skip
+              // normal route dispatch (the `return` below) so an aborted /
+              // duplicate upgrade can never fall through to an HTTP response on a
+              // live WebSocket session. The upgrade override sets
+              // Response::_suppressSend=true for the abort (a0 / transport-dead)
+              // and duplicate verdicts, in which case the 101 handshake response
+              // and the buffer-drain must both be skipped (no live session, or
+              // the winning upgrade owns it).
+              if (!upgradeRes._suppressSend)
               {
-                std::lock_guard<std::mutex> lock(_mutex);
-                if (_transport && !_shutdown)
+                // Build HTTP response for the upgrade
+                HttpResponse httpUpgradeRes;
+                httpUpgradeRes.statusCode = upgradeRes.status;
+                httpUpgradeRes.statusText = getStatusText(upgradeRes.status);
+                httpUpgradeRes.headers = upgradeRes.headers;
+                httpUpgradeRes.body = upgradeRes.body;
+
+                httpUpgradeRes.setHeader("Server", "Iora/1.0");
+
+                std::string responseData = httpUpgradeRes.toWireFormat();
+                auto sharedResponseData = std::make_shared<std::string>(std::move(responseData));
+
                 {
-                  _transport->sendAsync(sid, sharedResponseData->data(), sharedResponseData->size(),
-                                        [sharedResponseData](SessionId session, const SendResult &result)
-                                        {
-                                          // Response sent; connection remains open for upgraded protocol
-                                        });
-                }
-              }
-              // Buffer-drain: feed any remaining bytes from session buffer
-              // to the upgraded protocol handler (e.g., WebSocket frame parser).
-              // The client may have sent WebSocket frames in the same TCP segment.
-              {
-                std::string remaining;
-                {
-                  std::lock_guard<std::mutex> lock(_sessionMutex);
-                  auto it = _sessionInfo.find(sid);
-                  if (it != _sessionInfo.end() && !it->second.buffer.empty())
+                  std::lock_guard<std::mutex> lock(_mutex);
+                  if (_transport && !_shutdown)
                   {
-                    remaining = std::move(it->second.buffer);
-                    it->second.buffer.clear();
+                    _transport->sendAsync(sid, sharedResponseData->data(), sharedResponseData->size(),
+                                          [sharedResponseData](SessionId session, const SendResult &result)
+                                          {
+                                            // Response sent; connection remains open for upgraded protocol
+                                          });
                   }
                 }
-                if (!remaining.empty())
+                // Buffer-drain: feed any remaining bytes from session buffer to
+                // the upgraded protocol handler (e.g., WebSocket frame parser) —
+                // the client may have sent WebSocket frames in the same TCP
+                // segment. Only on a SUCCESSFUL switch (101): on an upgrade
+                // REJECTION (400/403/426) no protocol was switched, so draining
+                // would feed pipelined bytes to onUpgradedData which drops them
+                // (no _sessions entry) — leave them in the buffer for normal HTTP
+                // processing instead (2026-09-11-23 web LOW).
+                if (upgradeRes.status == 101)
                 {
-                  onUpgradedData(sid,
-                    reinterpret_cast<const std::uint8_t*>(remaining.data()),
-                    remaining.size());
+                  std::string remaining;
+                  {
+                    std::lock_guard<std::mutex> lock(_sessionMutex);
+                    auto it = _sessionInfo.find(sid);
+                    if (it != _sessionInfo.end() && !it->second.buffer.empty())
+                    {
+                      remaining = std::move(it->second.buffer);
+                      it->second.buffer.clear();
+                    }
+                  }
+                  if (!remaining.empty())
+                  {
+                    onUpgradedData(sid,
+                      reinterpret_cast<const std::uint8_t*>(remaining.data()),
+                      remaining.size());
+                  }
                 }
               }
               return; // Skip normal route dispatch
