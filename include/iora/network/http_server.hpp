@@ -862,79 +862,174 @@ protected:
       std::size_t contentLength = 0;
       bool isChunked = false;
 
-      // Parse headers
+      // Collect the framing-relevant fields, then decide the body length once
+      // below. The framing decision MUST reach the SAME verdict as the strict
+      // parser (HttpRequest::fromWireFormat): if the framer picks a different
+      // request boundary than the parser, the two disagree on where the request
+      // ends (RFC 9112 §6.3 request smuggling). So gather every Content-Length
+      // field-line and — exactly as the parser does — the LAST Transfer-Encoding
+      // field-line's value (§6.1: the effective coding is the last field-line's
+      // final token; an OR over all lines would frame "chunked" then "gzip" as
+      // chunked while the parser rejects it).
+      std::unordered_set<std::string> clValues;
+      bool sawTransferEncoding = false;
+      std::string lastTransferEncoding;
+      bool malformedHeaderLine = false;
       std::istringstream headerStream(headerSection);
       std::string line;
+      bool firstHeaderLine = true;
       while (std::getline(headerStream, line))
       {
         if (!line.empty() && line.back() == '\r')
         {
           line.pop_back();
         }
+        if (firstHeaderLine)
+        {
+          firstHeaderLine = false; // skip the request-line
+          continue;
+        }
+
+        // Reject the SAME field-line grammar the strict parser rejects, so the
+        // framer never HONORS a Content-Length / Transfer-Encoding on a line the
+        // parser would 400 (which would make the framer compute a body boundary
+        // the parser never assigns -> request-smuggling desync, RFC 9112 §6.3):
+        //  - obs-fold: a field-line beginning with SP/HTAB (§5.2), and
+        //  - whitespace between the field-name and the colon (§5.1).
+        if (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+        {
+          malformedHeaderLine = true;
+          break;
+        }
 
         auto colonPos = line.find(':');
         if (colonPos != std::string::npos)
         {
+          if (colonPos > 0 && (line[colonPos - 1] == ' ' || line[colonPos - 1] == '\t'))
+          {
+            malformedHeaderLine = true;
+            break;
+          }
           std::string key = line.substr(0, colonPos);
           std::string value = line.substr(colonPos + 1);
 
-          // Trim whitespace
+          // Trim OWS
           key.erase(0, key.find_first_not_of(" \t"));
           key.erase(key.find_last_not_of(" \t") + 1);
           value.erase(0, value.find_first_not_of(" \t"));
           value.erase(value.find_last_not_of(" \t") + 1);
 
-          // Convert key to lowercase for comparison
-          std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-
-          if (key == "content-length")
+          // Match field names case-insensitively via the SAME comparator the
+          // parser uses (locale-independent ASCII; no hand-rolled ::tolower).
+          if (CaseInsensitiveCompare::equals(key, "Content-Length"))
           {
-            try
-            {
-              contentLength = std::stoull(value);
-              if (contentLength > SessionInfo::MAX_BODY_SIZE)
-              {
-                iora::core::Logger::error("HttpServer: Body size limit exceeded for session " +
-                                          std::to_string(sid) + " - sending 413 and closing");
-                // Declared Content-Length over the body cap -> 413 Content Too Large
-                // (RFC 9110 §15.5.14). No lock held; sendErrorResponse guards under
-                // _mutex, sends headers-only, then closes + cleans up the session.
-                sendErrorResponse(sid, 413, getStatusText(413), "", /*headersOnly=*/true);
-                return;
-              }
-            }
-            catch (...)
-            {
-              iora::core::Logger::error("HttpServer: Invalid "
-                                        "content-length header for session " +
-                                        std::to_string(sid) + " - closing connection");
-              // An invalid Content-Length is a 400 Bad Request (RFC 9112 §6.3). The
-              // request-side framing fix (400 emission, chunked hardening) is owned
-              // by tracker 2026-07-26-7; here we keep the safe bare close and route
-              // the 400 there rather than fold a request-parser change into this
-              // response-conformance tracker. No lock held; guarded close.
-              closeSession(sid);
-              return;
-            }
+            clValues.insert(value);
           }
-          else if (key == "transfer-encoding")
+          else if (CaseInsensitiveCompare::equals(key, "Transfer-Encoding"))
           {
-            // Convert value to lowercase for comparison
-            std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-            if (value.find("chunked") != std::string::npos)
-            {
-              isChunked = true;
-            }
+            sawTransferEncoding = true;
+            lastTransferEncoding = value; // last field-line wins (parser semantics)
           }
         }
       }
+
+      // Reach the parser's framing verdict. Unrecoverable framing errors
+      // (RFC 9112 §6.3): a conflicting duplicate Content-Length; Content-Length
+      // together with Transfer-Encoding; or a Transfer-Encoding whose final
+      // coding is not chunked (§6.1). Any of these makes the request boundary
+      // ambiguous, so the framer MUST NOT frame or dispatch anything further on
+      // this connection: emit 400 and CLOSE, poisoning it. Framing an empty body
+      // and continuing the pipelining loop would dispatch the trailing bytes as a
+      // SMUGGLED request (CL.TE / dup-CL desync), because framing (this I/O
+      // thread) and handler dispatch (pool) are decoupled — the next request is
+      // enqueued before the parser's 400+close for this one runs.
+      const bool teFinalChunked =
+        sawTransferEncoding && detail::isChunkedFinalCoding(lastTransferEncoding);
+      const bool ambiguousFraming = malformedHeaderLine || (clValues.size() > 1) ||
+                                    (!clValues.empty() && sawTransferEncoding) ||
+                                    (sawTransferEncoding && !teFinalChunked);
+      if (ambiguousFraming)
+      {
+        iora::core::Logger::error("HttpServer: Ambiguous request framing (duplicate "
+                                  "Content-Length, Content-Length+Transfer-Encoding, or "
+                                  "non-final chunked coding) for session " +
+                                  std::to_string(sid) + " - sending 400 and closing");
+        // RFC 9110 §15.5.1. sendErrorResponse guards under _mutex, sends
+        // headers-only, then closes + cleans up the session. Return WITHOUT
+        // framing/dispatching any further buffered bytes on this connection.
+        sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
+        return;
+      }
+
+      if (!clValues.empty())
+      {
+        // Single Content-Length: it MUST be 1*DIGIT (RFC 9112 §6.3). std::stoull
+        // is lenient (leading sign/whitespace, "-1" -> ULLONG_MAX), so validate
+        // the token strictly before it drives the request boundary.
+        const std::string &cl = *clValues.begin();
+        const bool valid =
+          !cl.empty() && std::all_of(cl.begin(), cl.end(),
+                                     [](char c) { return c >= '0' && c <= '9'; });
+        if (!valid)
+        {
+          iora::core::Logger::error("HttpServer: Invalid "
+                                    "content-length header for session " +
+                                    std::to_string(sid) + " - sending 400 and closing");
+          // An invalid Content-Length is a 400 Bad Request (RFC 9112 §6.3 /
+          // RFC 9110 §15.5.1); a bare close is indistinguishable from a crash and
+          // makes clients retry. Emit the 400 like the adjacent ambiguous-framing
+          // path (tracker 2026-07-26-7 covers the DIFFERENT CL+TE case, not this).
+          sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
+          return;
+        }
+        try
+        {
+          contentLength = std::stoull(cl);
+        }
+        catch (...)
+        {
+          // 1*DIGIT but numerically out of range (> 2^64) -> unframeable -> 400.
+          iora::core::Logger::error("HttpServer: Out-of-range "
+                                    "content-length header for session " +
+                                    std::to_string(sid) + " - sending 400 and closing");
+          sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
+          return;
+        }
+        if (contentLength > SessionInfo::MAX_BODY_SIZE)
+        {
+          iora::core::Logger::error("HttpServer: Body size limit exceeded for session " +
+                                    std::to_string(sid) + " - sending 413 and closing");
+          // Declared Content-Length over the body cap -> 413 Content Too Large
+          // (RFC 9110 §15.5.14). No lock held; sendErrorResponse guards under
+          // _mutex, sends headers-only, then closes + cleans up the session.
+          sendErrorResponse(sid, 413, getStatusText(413), "", /*headersOnly=*/true);
+          return;
+        }
+      }
+      // Ambiguous CL/TE combinations already returned above; here CL and TE are
+      // mutually exclusive, so chunked framing applies iff TE's final coding is
+      // chunked.
+      isChunked = teFinalChunked;
 
       std::size_t requestEndPos;
 
       if (isChunked)
       {
-        // Handle chunked encoding
-        requestEndPos = findChunkedRequestEnd(dataStr, headerEnd + 4);
+        // Handle chunked encoding. framingError distinguishes a DEFINITIVELY
+        // malformed chunked body (bad chunk-size, missing chunk-data CRLF) from
+        // a merely-incomplete one: the parser/decoder answers 400 for the former,
+        // so the framer must too (poison the connection) rather than wait forever
+        // for bytes that will never make it valid — and must never frame+dispatch
+        // the trailing bytes as a smuggled request.
+        bool framingError = false;
+        requestEndPos = findChunkedRequestEnd(dataStr, headerEnd + 4, framingError);
+        if (framingError)
+        {
+          iora::core::Logger::error("HttpServer: Malformed chunked request framing for session " +
+                                    std::to_string(sid) + " - sending 400 and closing");
+          sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
+          return;
+        }
         if (requestEndPos == std::string::npos)
         {
           break; // Need more data for chunked body
@@ -1121,9 +1216,9 @@ protected:
       {
         for (const auto &[hdrKey, hdrVal] : req.headers)
         {
-          std::string lowerKey = hdrKey;
-          std::transform(lowerKey.begin(), lowerKey.end(), lowerKey.begin(), ::tolower);
-          if (lowerKey == "upgrade")
+          // Match case-insensitively via the shared ASCII comparator (a bare
+          // ::tolower on a negative-valued char is UB; locale-independent here).
+          if (CaseInsensitiveCompare::equals(hdrKey, "Upgrade"))
           {
             Response upgradeRes;
             if (onUpgradeRequest(sid, req, upgradeRes))
@@ -1464,7 +1559,13 @@ protected:
       if (connectionIt != req.headers.end())
       {
         std::string connValue = connectionIt->second;
-        std::transform(connValue.begin(), connValue.end(), connValue.begin(), ::tolower);
+        // Unsigned-char-safe lowercasing (a bare ::tolower on a negative-valued
+        // char is UB). NOTE: this still exact-matches "close"; parsing Connection
+        // as a comma-separated token list (RFC 9110 §7.6.1, e.g. "keep-alive,
+        // close") is SRV-M2, owned by tracker 2026-09-11-15 phase 4 (Group 4).
+        std::transform(connValue.begin(), connValue.end(), connValue.begin(),
+                       [](char c)
+                       { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
         if (connValue == "close")
         {
           shouldCloseConnection = true;
@@ -1622,9 +1723,15 @@ protected:
                               std::to_string(sid));
   }
 
-  /// \brief Find the end of a chunked request body
-  std::size_t findChunkedRequestEnd(const std::string &data, std::size_t bodyStart) const
+  /// \brief Find the end of a chunked request body. Sets framingError=true when
+  /// the body is DEFINITIVELY malformed (bad chunk-size, or a chunk-data run not
+  /// terminated by CRLF) — the caller poisons the connection (400+close) rather
+  /// than wait for more data or scan past a bad terminator. Returns npos with
+  /// framingError=false only for a genuinely incomplete (still-arriving) body.
+  std::size_t findChunkedRequestEnd(const std::string &data, std::size_t bodyStart,
+                                    bool &framingError) const
   {
+    framingError = false;
     std::size_t pos = bodyStart;
 
     while (pos < data.length())
@@ -1636,16 +1743,40 @@ protected:
         return std::string::npos; // Need more data
       }
 
-      // Parse chunk size (hex)
+      // chunk-size = 1*HEXDIG [ chunk-ext ]; the size ends at the first ';'
+      // (chunk-ext) or the CRLF. std::stoul silently accepts a leading sign or
+      // whitespace and drives a bogus frame length, so strip any chunk-ext, trim
+      // OWS, and validate 1*HEXDIG before parsing.
       std::string chunkSizeStr = data.substr(pos, chunkSizeLine - pos);
+      const auto semi = chunkSizeStr.find(';');
+      if (semi != std::string::npos)
+      {
+        chunkSizeStr = chunkSizeStr.substr(0, semi);
+      }
+      const auto lastNonWs = chunkSizeStr.find_last_not_of(" \t");
+      chunkSizeStr.erase(lastNonWs == std::string::npos ? 0 : lastNonWs + 1);
+      if (chunkSizeStr.empty() ||
+          !std::all_of(chunkSizeStr.begin(), chunkSizeStr.end(),
+                       [](char c)
+                       {
+                         const unsigned char u = static_cast<unsigned char>(c);
+                         return (u >= '0' && u <= '9') || (u >= 'a' && u <= 'f') ||
+                                (u >= 'A' && u <= 'F');
+                       }))
+      {
+        iora::core::Logger::error("HttpServer: Invalid chunk size in chunked encoding");
+        framingError = true;
+        return std::string::npos;
+      }
       std::size_t chunkSize;
       try
       {
-        chunkSize = std::stoul(chunkSizeStr, nullptr, 16);
+        chunkSize = std::stoull(chunkSizeStr, nullptr, 16);
       }
       catch (...)
       {
         iora::core::Logger::error("HttpServer: Invalid chunk size in chunked encoding");
+        framingError = true;
         return std::string::npos;
       }
 
@@ -1653,21 +1784,59 @@ protected:
 
       if (chunkSize == 0)
       {
-        // Final chunk, look for final \r\n
-        auto finalCRLF = data.find("\r\n", pos);
-        if (finalCRLF == std::string::npos)
+        // Terminating chunk: consume the trailer-section (zero or more field-lines,
+        // RFC 9112 §7.1 / §7.1.2) up to the closing empty line. Stopping at the
+        // FIRST CRLF after the 0-line under-reads a trailered request and desyncs
+        // from decodeChunkedRequestBody (which DOES consume trailers) — both layers
+        // must consume the trailer-section identically or they disagree on the
+        // request boundary.
+        while (true)
         {
-          return std::string::npos; // Need more data
+          // Reject an obs-fold (SP/HTAB-led) trailer field-line, matching both the
+          // decoder (decodeChunkedRequestBody) and the framer's own header-section
+          // handling (RFC 9112 §5.2 / §7.1.2). Without this the framer would accept
+          // a trailer the decoder 400s, and — because framing and dispatch are
+          // decoupled — dispatch the next pipelined request before that 400 closes.
+          if (pos < data.length() && (data[pos] == ' ' || data[pos] == '\t'))
+          {
+            framingError = true;
+            return std::string::npos;
+          }
+          auto tcrlf = data.find("\r\n", pos);
+          if (tcrlf == std::string::npos)
+          {
+            return std::string::npos; // Need more data (trailer not fully arrived)
+          }
+          const bool emptyLine = (tcrlf == pos);
+          pos = tcrlf + 2;
+          if (emptyLine)
+          {
+            return pos; // past the closing empty line
+          }
         }
-        return finalCRLF + 2;
       }
 
-      // Skip chunk data + trailing \r\n
-      pos += chunkSize + 2;
-      if (pos > data.length())
+      // Skip chunk data + trailing \r\n. Bound the chunk against the remaining
+      // buffer with SUBTRACTION: `pos += chunkSize + 2` wraps size_t when
+      // chunkSize has its MSB set (e.g. ffffffffffffffff), bypassing the
+      // `pos > length` guard and mis-framing the request (a boundary-confusion /
+      // smuggling primitive). `pos <= data.length()` holds, so `remaining` does
+      // not underflow; `remaining - chunkSize` is guarded by the prior check.
+      const std::size_t remaining = data.length() - pos;
+      if (chunkSize > remaining || (remaining - chunkSize) < 2)
       {
-        return std::string::npos; // Need more data
+        return std::string::npos; // Need more data (chunk data / CRLF not yet arrived)
       }
+      // The 2 bytes after chunk-data MUST be CRLF (RFC 9112 §7.1); they are
+      // present now. If they are not CRLF the framing is definitively malformed
+      // (decodeChunkedRequestBody 400s the same input) — signal a framing error
+      // rather than scan past a bad terminator (a framer/decoder desync).
+      if (data.compare(pos + chunkSize, 2, "\r\n") != 0)
+      {
+        framingError = true;
+        return std::string::npos;
+      }
+      pos += chunkSize + 2;
     }
 
     return std::string::npos;

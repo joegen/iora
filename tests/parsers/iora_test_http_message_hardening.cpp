@@ -211,10 +211,13 @@ TEST_CASE("request with whitespace before a header colon is rejected 400", "[htt
 // a final chunked coding is accepted.
 TEST_CASE("request Transfer-Encoding must end in chunked", "[http_message][smuggling]")
 {
-  REQUIRE_NOTHROW(
-    HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"));
+  // A chunked-final coding is accepted; the body is a well-formed (minimal)
+  // chunked body so the now-mandatory decode (RFC 9112 §7.1) sees a complete
+  // message rather than incomplete framing.
   REQUIRE_NOTHROW(HttpRequest::fromWireFormat(
-    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"));
+    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+  REQUIRE_NOTHROW(HttpRequest::fromWireFormat(
+    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"));
   REQUIRE_THROWS_AS(
     HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n"),
     HttpRequestError);
@@ -239,18 +242,18 @@ TEST_CASE("request Content-Length digit validation edge cases", "[http_message][
 TEST_CASE("request Transfer-Encoding trailing-empty and parameterized chunked accepted",
           "[http_message][smuggling]")
 {
-  REQUIRE_NOTHROW(
-    HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked,\r\n\r\n"));
   REQUIRE_NOTHROW(HttpRequest::fromWireFormat(
-    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked;x=y\r\n\r\n"));
+    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked,\r\n\r\n0\r\n\r\n"));
+  REQUIRE_NOTHROW(HttpRequest::fromWireFormat(
+    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked;x=y\r\n\r\n0\r\n\r\n"));
 }
 
 // cpp17-L2 / web-L3: two Transfer-Encoding field-lines whose (last) final coding is
 // chunked are accepted; a last line that is not chunked-final is rejected.
 TEST_CASE("request with multiple Transfer-Encoding lines", "[http_message][smuggling]")
 {
-  REQUIRE_NOTHROW(HttpRequest::fromWireFormat(
-    "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"));
+  REQUIRE_NOTHROW(HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: "
+                                              "gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
   REQUIRE_THROWS_AS(
     HttpRequest::fromWireFormat(
       "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n"),
@@ -297,4 +300,111 @@ TEST_CASE("MultipartFormData boundary never appears in part content", "[http_mes
     ++count;
   }
   REQUIRE(count == 2);
+}
+
+// ---------------------------------------------------------------------------
+// SRV-H1: a chunked REQUEST body is DECODED before delivery (RFC 9112 §7.1),
+// not handed to the handler as raw chunk framing.
+// ---------------------------------------------------------------------------
+namespace
+{
+std::string reqChunked(const std::string &teValue, const std::string &chunkedBody)
+{
+  return "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: " + teValue + "\r\n\r\n" + chunkedBody;
+}
+} // namespace
+
+TEST_CASE("request chunked body is decoded, not delivered as raw framing",
+          "[http_message][chunked]")
+{
+  // Single chunk.
+  REQUIRE(HttpRequest::fromWireFormat(reqChunked("chunked", "5\r\nHello\r\n0\r\n\r\n")).body == "Hello");
+  // Multiple chunks concatenate; a zero-length body is empty.
+  REQUIRE(HttpRequest::fromWireFormat(reqChunked("chunked", "3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n")).body ==
+          "foobar");
+  REQUIRE(HttpRequest::fromWireFormat(reqChunked("chunked", "0\r\n\r\n")).body.empty());
+  // gzip, chunked: chunked is the final coding -> de-chunked (the payload stays
+  // gzip-coded; only the transfer framing is stripped here).
+  REQUIRE(HttpRequest::fromWireFormat(reqChunked("gzip, chunked", "5\r\nHello\r\n0\r\n\r\n")).body ==
+          "Hello");
+}
+
+TEST_CASE("request chunked decode strips chunk extensions and trailers",
+          "[http_message][chunked]")
+{
+  // chunk-ext on the size line is ignored.
+  REQUIRE(HttpRequest::fromWireFormat(reqChunked("chunked", "5;name=value\r\nHello\r\n0\r\n\r\n"))
+            .body == "Hello");
+  // Trailer field-lines after the terminating 0-chunk are consumed, not body.
+  REQUIRE(HttpRequest::fromWireFormat(
+            reqChunked("chunked", "5\r\nHello\r\n0\r\nX-Trailer: v\r\nX-Two: w\r\n\r\n"))
+            .body == "Hello");
+}
+
+// ---------------------------------------------------------------------------
+// SRV-H2: a hostile chunk-size cannot mis-frame or over-allocate. Every
+// malformed chunk-size is a 400 on the request path (a smuggling desync).
+// ---------------------------------------------------------------------------
+TEST_CASE("request chunked decode rejects a hostile / malformed chunk-size 400",
+          "[http_message][chunked][smuggling]")
+{
+  auto throws400 = [](const std::string &chunkedBody)
+  {
+    try
+    {
+      HttpRequest::fromWireFormat(reqChunked("chunked", chunkedBody));
+    }
+    catch (const HttpRequestError &e)
+    {
+      return e.status() == 400;
+    }
+    return false;
+  };
+  // MSB-set 64-bit size: `pos + size` would wrap; must be rejected, not framed.
+  REQUIRE(throws400("ffffffffffffffff\r\nx\r\n0\r\n\r\n"));
+  // Out-of-range (> 64-bit) size.
+  REQUIRE(throws400("fffffffffffffffff\r\nx\r\n0\r\n\r\n"));
+  // Sign-prefixed / non-HEXDIG lead (std::stoull would accept "-1" as SIZE_MAX).
+  REQUIRE(throws400("-1\r\nx\r\n0\r\n\r\n"));
+  REQUIRE(throws400(" 5\r\nHello\r\n0\r\n\r\n"));
+  REQUIRE(throws400("zz\r\nx\r\n0\r\n\r\n"));
+  // A chunk-size larger than the data actually present is not "guess and frame".
+  REQUIRE(throws400("9\r\nHello\r\n0\r\n\r\n"));
+  // Missing CRLF after chunk-data.
+  REQUIRE(throws400("5\r\nHelloXX0\r\n\r\n"));
+  // Whitespace-only chunk-size token (trims to empty -> not 1*HEXDIG).
+  REQUIRE(throws400(" \r\nx\r\n0\r\n\r\n"));
+  // Obs-fold (SP/HTAB-led continuation) in the trailer section is rejected.
+  REQUIRE(throws400("5\r\nHello\r\n0\r\n\tX-Fold: v\r\n\r\n"));
+  // Bytes after the terminating chunk (with no trailer) are not part of the
+  // complete message and are rejected (RFC 9112 §7.1) — guards the NEW-L4 fix.
+  REQUIRE(throws400("0\r\n\r\nEXTRA"));
+  REQUIRE(throws400("5\r\nHello\r\n0\r\n\r\nEXTRA"));
+}
+
+TEST_CASE("request chunked decode accepts uppercase HEXDIG chunk-size",
+          "[http_message][chunked]")
+{
+  // 0xA == 10 -> ten data bytes.
+  REQUIRE(HttpRequest::fromWireFormat(reqChunked("chunked", "A\r\n0123456789\r\n0\r\n\r\n")).body ==
+          "0123456789");
+}
+
+// SRV-M3 / incomplete framing: a chunked request with NO terminating 0-chunk is
+// incomplete framing (RFC 9112 §7.1) and must be rejected 400 at the parser, not
+// delivered as a partial body. (Through HttpServer the framer withholds it as
+// "need more data"; a direct fromWireFormat caller gets the 400.)
+TEST_CASE("request incomplete chunked body (no terminating chunk) is rejected 400",
+          "[http_message][chunked][smuggling]")
+{
+  bool got400 = false;
+  try
+  {
+    HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n");
+  }
+  catch (const HttpRequestError &e)
+  {
+    got400 = (e.status() == 400);
+  }
+  REQUIRE(got400);
 }

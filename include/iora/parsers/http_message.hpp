@@ -971,6 +971,16 @@ public:
     {
       throw HttpRequestError(400, "Transfer-Encoding without a final chunked coding");
     }
+    // RFC 9112 §7.1: when the final transfer-coding is chunked, the body arrives
+    // chunk-framed and MUST be DECODED before it is delivered to a handler — the
+    // raw chunk framing is not the entity body. Framing (findChunkedRequestEnd)
+    // only delimits the request on the wire; stripping chunk-size lines, chunk
+    // extensions, and trailers happens here. Without this a chunked JSON webhook
+    // hands the handler "5\r\n{...}\r\n0\r\n\r\n" and every JSON parse fails.
+    if (sawTransferEncoding)
+    {
+      request.body = decodeChunkedRequestBody(request.body);
+    }
 
     // RFC 9112 §3.2: more than one Host field-line -> 400 (host-confusion / smuggling).
     if (hostCount > 1)
@@ -1004,6 +1014,130 @@ private:
   /// well below SessionInfo::MAX_HEADER_SIZE (64 KB) so the deterministic 414
   /// fires before the transport's silent header-size close. (Tracker 2026-06-02-1.)
   static constexpr std::size_t MAX_REQUEST_TARGET_SIZE = 8192;
+
+  /// \brief Cap on the DECODED length of a chunked request body, mirroring the
+  /// HttpServer 10 MB Content-Length body limit so both framing paths share one
+  /// policy limit (a chunked body previously escaped the Content-Length cap).
+  /// A breach is 413 Content Too Large. NOTE on layering: via HttpServer this
+  /// cap is defense-in-depth — the 1 MB per-session MAX_BUFFER_SIZE bounds the
+  /// raw wire (and the decoded length can never exceed the raw framed length),
+  /// so the buffer cap trips first there. This cap is the effective limit only
+  /// for direct HttpRequest::fromWireFormat callers.
+  static constexpr std::size_t MAX_CHUNKED_BODY_SIZE = 10 * 1024 * 1024;
+
+  /// \brief Decode a chunked request body (RFC 9112 §7.1) STRICTLY. A server must
+  /// not guess request boundaries, so any malformed framing is a 400 (a
+  /// request-smuggling desync vector), and a decoded body over
+  /// MAX_CHUNKED_BODY_SIZE is a 413. Strips chunk extensions (";"-parameters on
+  /// the chunk-size line), stops at the terminating 0-size chunk, and consumes
+  /// trailer field-lines. Every chunk-size is bounded against the remaining input
+  /// using SUBTRACTION — never `pos + size`, which wraps size_t when the size has
+  /// its MSB set (e.g. ffffffffffffffff) and bypasses the bounds check.
+  static std::string decodeChunkedRequestBody(const std::string &data)
+  {
+    std::string out;
+    std::size_t pos = 0;
+    const std::size_t n = data.size();
+    while (true)
+    {
+      const auto crlf = data.find("\r\n", pos);
+      if (crlf == std::string::npos)
+      {
+        throw HttpRequestError(400, "Chunked body: missing chunk-size CRLF");
+      }
+      // chunk-size = 1*HEXDIG [ chunk-ext ]; the size ends at the first ';'
+      // (chunk-ext). Strip the extension, then trim trailing OWS.
+      std::string sizeTok = data.substr(pos, crlf - pos);
+      const auto semi = sizeTok.find(';');
+      if (semi != std::string::npos)
+      {
+        sizeTok = sizeTok.substr(0, semi);
+      }
+      const auto lastNonWs = sizeTok.find_last_not_of(" \t");
+      sizeTok.erase(lastNonWs == std::string::npos ? 0 : lastNonWs + 1);
+      // Reject an empty token or any non-HEXDIG octet: std::stoull would otherwise
+      // accept a leading sign or whitespace and drive a bogus chunk size.
+      if (sizeTok.empty() || !std::all_of(sizeTok.begin(), sizeTok.end(),
+                                          [](char c)
+                                          {
+                                            const unsigned char u =
+                                              static_cast<unsigned char>(c);
+                                            return (u >= '0' && u <= '9') ||
+                                                   (u >= 'a' && u <= 'f') ||
+                                                   (u >= 'A' && u <= 'F');
+                                          }))
+      {
+        throw HttpRequestError(400, "Chunked body: malformed chunk-size");
+      }
+      std::size_t chunkSize;
+      try
+      {
+        chunkSize = std::stoull(sizeTok, nullptr, 16);
+      }
+      catch (...)
+      {
+        throw HttpRequestError(400, "Chunked body: chunk-size out of range");
+      }
+      pos = crlf + 2; // consume the chunk-size line's CRLF
+
+      if (chunkSize == 0)
+      {
+        // Terminating chunk: consume any trailer field-lines up to the final
+        // empty line. Their content is not part of the body (trailers are
+        // dropped, not merged into the header map).
+        while (true)
+        {
+          // Reject obs-fold (a trailer field-line beginning with SP/HTAB) for
+          // parity with the strict header-section parse (RFC 9112 §5.2 / §7.1.2).
+          if (pos < n && (data[pos] == ' ' || data[pos] == '\t'))
+          {
+            throw HttpRequestError(400, "Chunked body: obs-fold in trailer section");
+          }
+          const auto tcrlf = data.find("\r\n", pos);
+          if (tcrlf == std::string::npos)
+          {
+            throw HttpRequestError(400, "Chunked body: missing trailer terminator");
+          }
+          const bool emptyLine = (tcrlf == pos);
+          pos = tcrlf + 2;
+          if (emptyLine)
+          {
+            break;
+          }
+        }
+        // The chunked body ends at the closing empty line. Any octets beyond it
+        // are not part of this (complete) message; a caller that passes trailing
+        // bytes is malformed (RFC 9112 §7.1). The server framer trims the request
+        // at its boundary so pos == data.size() there; a direct fromWireFormat
+        // caller with trailing bytes is rejected 400.
+        if (pos != n)
+        {
+          throw HttpRequestError(400, "Chunked body: unexpected data after terminating chunk");
+        }
+        return out;
+      }
+
+      // Bound the chunk against the remaining input with SUBTRACTION (pos <= n
+      // here, so n - pos does not underflow); then bound the accumulated decoded
+      // length against the body cap (out.size() <= cap holds before every append).
+      if (chunkSize > n - pos)
+      {
+        throw HttpRequestError(400, "Chunked body: chunk-size exceeds available data");
+      }
+      if (chunkSize > MAX_CHUNKED_BODY_SIZE - out.size())
+      {
+        throw HttpRequestError(413, "Chunked body exceeds maximum size");
+      }
+      out.append(data, pos, chunkSize);
+      pos += chunkSize;
+      // Each chunk-data is followed by CRLF.
+      if (pos + 2 > n || data.compare(pos, 2, "\r\n") != 0)
+      {
+        throw HttpRequestError(400, "Chunked body: missing chunk-data CRLF");
+      }
+      pos += 2;
+    }
+  }
 
   static void parseRequestLine(const std::string &line, HttpRequest &request)
   {
