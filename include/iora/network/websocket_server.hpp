@@ -50,8 +50,11 @@ public:
   /// a live I/O-thread frame dispatch racing the destruction of _sessions. Must
   /// come first in this dtor. quiesceTransport() allocates (logging, engine stop)
   /// and can throw; this is the call that does the real work (the base dtor's
-  /// stop() then early-outs), so it — not the base — must swallow exceptions to
-  /// keep this noexcept destructor from std::terminate-ing (quiesceTransportNoexcept).
+  /// stop() then early-outs), so it — not the base — uses quiesceTransportNoexcept
+  /// to keep a THROWN exception from escaping this noexcept destructor. That wrapper
+  /// does NOT prevent std::abort(): if a handler runs past drainDeadline(),
+  /// quiesceTransport()'s circuit breaker aborts the process (see
+  /// HttpServer::quiesceTransport).
   ~WebSocketServer() override
   {
     quiesceTransportNoexcept("~WebSocketServer");

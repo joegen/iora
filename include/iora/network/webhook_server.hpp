@@ -49,16 +49,14 @@ public:
   /// derived member is already gone, so a worker mid-handler would deref a
   /// destroyed _jsonConfig. Must come first in this dtor.
   ///
-  /// NOTE the guarantee is bounded, not absolute: quiesceTransport()'s drain is
-  /// capped (see HttpServer::quiesceTransport) and abandons the pool after the
-  /// timeout, so a handler that ignores getShutdownChecker() and runs past it
-  /// could still be live when _jsonConfig is destroyed. In practice _jsonConfig is
-  /// read only in the brief pre-handler section (size check + parse), which
-  /// completes well within the drain window; the general drain-policy hardening
-  /// (unbounded dtor drain / gate on activeThreadCount==0) is tracked separately.
-  /// quiesceTransport() can throw (allocation/logging); the noexcept wrapper
-  /// swallows so this destructor cannot std::terminate (the base dtor's stop()
-  /// early-outs).
+  /// quiesceTransport() drains the pool UNBOUNDED to quiescence (getInFlightCount()
+  /// == 0), so on return no worker is still reading _jsonConfig — the UAF is fully
+  /// closed, not merely bounded. If a handler ignores getShutdownChecker() and runs
+  /// past drainDeadline(), quiesceTransport() aborts the process rather than
+  /// destroy _jsonConfig under a live worker (see HttpServer::quiesceTransport's
+  /// circuit breaker). The noexcept wrapper keeps a THROW (quiesceTransport
+  /// allocates: logging, engine stop) from escaping this destructor — it does NOT
+  /// prevent that std::abort().
   ~WebhookServer() override
   {
     quiesceTransportNoexcept("~WebhookServer");

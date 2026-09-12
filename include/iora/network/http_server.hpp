@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -581,6 +582,14 @@ public:
   /// A subclass that adds state touched by the transport I/O thread or a pool
   /// worker MUST call quiesceTransport() first in its own destructor (see that
   /// method) — this public stop() only delegates there.
+  ///
+  /// \warning May std::abort() the process. stop() delegates to quiesceTransport(),
+  /// which drains the worker pool to quiescence and, if a handler ignores
+  /// getShutdownChecker() and is still running past drainDeadline() (default 30s),
+  /// aborts the process to avoid a use-after-free (see quiesceTransport). Also:
+  /// do NOT call stop() from within one of this server's own request handlers
+  /// (a pool worker) — the caller counts itself in-flight, so the drain can never
+  /// complete and will abort at the deadline (a self-deadlock).
   void stop() { quiesceTransport(); }
 
 protected:
@@ -592,6 +601,30 @@ protected:
   /// runs only AFTER the subclass's members are already gone, every HttpServer
   /// subclass adding such state must call this first in its own dtor; the base
   /// dtor's stop() call then early-outs here (nothing left to quiesce).
+  ///
+  /// \par Pool drain (memory-safety barrier). After stopping the transport, this
+  /// drains the worker pool UNBOUNDED to quiescence — polling the pool's
+  /// single-critical-section getInFlightCount() (queue depth + workers past the
+  /// pop, read under one pool-mutex hold) until it reaches 0. It does NOT abandon
+  /// the drain with work in flight: an in-flight worker executing a handler may
+  /// dereference a soon-to-be-destroyed derived member, so returning early is the
+  /// residual use-after-free this barrier exists to prevent (tracker 2026-09-11-22).
+  /// getInFlightCount()==0 provably dominates every handler's member access
+  /// (the pool destroys the task functor before its seq_cst --_busyThreads, which
+  /// this drain's acquire read pairs with), so on return no worker is live.
+  ///
+  /// \warning May std::abort() the process (fail-fast circuit breaker). C++ cannot
+  /// forcibly cancel a running std::thread — the only cooperative brake is
+  /// getShutdownChecker(). A handler that ignores it and never returns would hang
+  /// the drain (and would already hang the later unconditional ~ThreadPool join).
+  /// To bound that, if the drain has not reached quiescence within drainDeadline()
+  /// (default 30s) this writes a fatal diagnostic to stderr and calls std::abort()
+  /// — a core dump instead of a silent hang or a use-after-free. Every diagnostic
+  /// on the timed drain→abort path is a direct stderr write, never the async
+  /// Logger (whose data.mutex a wedged handler could hold, defeating the abort).
+  /// Do NOT call this (or stop(), or destroy the server) from within one of this
+  /// server's own request handlers: the calling worker counts itself in-flight, so
+  /// the drain can never reach 0 and will abort at the deadline (a self-deadlock).
   void quiesceTransport()
   {
     // Idempotent early-out keyed on _transport alone: _transport is non-null ONLY
@@ -641,28 +674,73 @@ protected:
       iora::core::Logger::debug("HttpServer::quiesceTransport() - Cleared session information");
     }
 
-    // Wait for thread pool tasks to complete with a reasonable timeout, holding
-    // NO _mutex so in-flight handlers can acquire it, complete, and drain.
-    // Handlers should use getShutdownChecker() to detect shutdown and exit
-    // gracefully.
-    auto startTime = std::chrono::steady_clock::now();
-    const auto maxWaitTime = std::chrono::seconds(2); // Reasonable timeout for production
+    // Drain the worker pool to quiescence, holding NO _mutex so in-flight handlers
+    // can re-acquire it, complete, and drain. getInFlightCount() is the pool's
+    // single-critical-section count (queue depth + workers past the pop, read under
+    // one pool-mutex hold) — NOT a two-sample getPendingTaskCount()/
+    // getActiveThreadCount() read, which admits the pop->++_activeThreads TOCTOU
+    // (a worker that popped but has not yet incremented _activeThreads is invisible
+    // to both samples). This drain is UNBOUNDED: it is the pre-destruction barrier
+    // a subclass dtor relies on (WS-TS2), so it must not return with a worker still
+    // executing a handler that may deref a soon-destroyed derived member. The
+    // transport is already stopped (Phase 1) and _shutdown is set, so no new tasks
+    // enqueue. This drain-to-zero is sound ONLY while the transport-driven
+    // _threadPool.tryEnqueue (see processHttpRequest, the sole enqueue site) is the
+    // only enqueuer: a future background enqueuer (timer, SSE keep-alive) would let
+    // in-flight bounce >0 after reaching 0 and must be quiesced before this drain.
+    //
+    // Circuit breaker: a handler that ignores getShutdownChecker() and never
+    // returns cannot be force-cancelled (C++ has no std::thread cancel) and would
+    // already hang the later unconditional ~ThreadPool join. So past drainDeadline()
+    // we std::abort() — a core dump instead of a silent hang or a UAF. EVERY
+    // diagnostic on this timed path is a DIRECT stderr write, never the async Logger
+    // (a wedged handler could hold the Logger's data.mutex and block us before the
+    // abort, re-admitting the hang). The only lock touched on the timed path is
+    // getInFlightCount()'s pool-mutex, which workers hold only across the brief pop
+    // — never across handler execution — so a wedged handler cannot block it.
+    // Capture the clock AFTER the last pre-loop log so no blockable call sits
+    // between clock-start and abort.
+    iora::core::Logger::debug("HttpServer::quiesceTransport() - Draining worker pool to quiescence");
+    const auto deadline = drainDeadline();
+    const auto warnAfter =
+      (std::min<std::chrono::milliseconds>)(std::chrono::seconds(2), deadline / 2);
+    const long long deadlineMs = deadline.count();
+    const long long warnMs = warnAfter.count();
+    const auto startTime = std::chrono::steady_clock::now();
+    bool warned = false;
 
-    iora::core::Logger::debug("HttpServer::quiesceTransport() - Waiting for handlers to complete (max 2s)");
-
-    while (_threadPool.getPendingTaskCount() > 0 || _threadPool.getActiveThreadCount() > 0)
+    // Sample getInFlightCount() ONCE per iteration (a single pool-mutex read) and
+    // reuse it in the loop condition AND both diagnostics, so the message prints
+    // exactly the count that tripped the branch. Re-reading in the fprintf could
+    // race the last worker completing and print a contradictory "0 handler(s)".
+    for (;;)
     {
-      auto elapsed = std::chrono::steady_clock::now() - startTime;
-      if (elapsed > maxWaitTime)
+      const auto inFlight = _threadPool.getInFlightCount();
+      if (inFlight == 0)
       {
-        auto pendingTasks = _threadPool.getPendingTaskCount();
-        auto activeTasks = _threadPool.getActiveThreadCount();
-        iora::core::Logger::warning(
-          std::string("HttpServer::quiesceTransport() - Timeout waiting for handlers. ") +
-          "Forcing shutdown with " + std::to_string(pendingTasks) + " pending and " +
-          std::to_string(activeTasks) + " active tasks. " +
-          "Handlers should use getShutdownChecker() to detect shutdown.");
         break;
+      }
+      const auto elapsed = std::chrono::steady_clock::now() - startTime;
+      if (elapsed > deadline)
+      {
+        std::fprintf(
+          stderr,
+          "fatal: HttpServer::quiesceTransport(): %u handler(s) still in flight after %lld ms; "
+          "aborting to avoid a use-after-free. A handler is ignoring getShutdownChecker() (or "
+          "stop()/destroy was called from within a handler).\n",
+          static_cast<unsigned>(inFlight), deadlineMs);
+        std::fflush(stderr);
+        std::abort();
+      }
+      if (!warned && elapsed > warnAfter)
+      {
+        warned = true;
+        std::fprintf(
+          stderr,
+          "warning: HttpServer::quiesceTransport(): %u handler(s) still in flight after %lld ms; "
+          "continuing to wait (deadline %lld ms). Handlers should honor getShutdownChecker().\n",
+          static_cast<unsigned>(inFlight), warnMs, deadlineMs);
+        std::fflush(stderr);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -693,6 +771,12 @@ protected:
   /// allocates (logging, engine stop) and can throw. This centralizes the
   /// swallow+log so every such dtor gets the correct incantation; `who` names the
   /// destructor in the log. (~HttpServer wraps its own stop() separately.)
+  ///
+  /// \warning This wrapper prevents an EXCEPTION from escaping the noexcept
+  /// destructor; it does NOT prevent std::abort(). If a handler is still running
+  /// past drainDeadline(), quiesceTransport() aborts the process — a swallowed
+  /// exception is not the same as a bounded, non-fatal teardown (see
+  /// quiesceTransport's circuit breaker).
   void quiesceTransportNoexcept(const char *who) noexcept
   {
     try
@@ -708,6 +792,18 @@ protected:
       iora::core::Logger::error(std::string(who) + " unknown error");
     }
   }
+
+  /// \brief Maximum time quiesceTransport() waits for the worker pool to drain
+  /// before it aborts the process (fail-fast circuit breaker). Default 30s.
+  ///
+  /// Override to tune shutdown patience. The override is honored when
+  /// quiesceTransport() runs while the overriding subclass is still alive — from
+  /// that subclass's own destructor, or from an explicit stop()/quiesceTransport()
+  /// on a fully-constructed instance. It is NOT honored on the ~HttpServer
+  /// base-subobject leg (during ~HttpServer the dynamic type is HttpServer, so the
+  /// base default applies — but there the transport is already reset and
+  /// quiesceTransport() early-outs anyway).
+  virtual std::chrono::milliseconds drainDeadline() const { return std::chrono::seconds(30); }
 
   // ── Upgrade support for WebSocket and other protocol upgrades ──────────
 

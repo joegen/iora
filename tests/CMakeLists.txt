@@ -72,6 +72,7 @@ set(NETWORK_TESTS
     network/iora_test_http
     network/iora_test_http_request_framing
     network/iora_test_http_server_connection
+    network/iora_test_http_server_quiesce_drain
     network/iora_test_http_client_pool
     network/iora_test_http_client_lease
     network/iora_test_http_client_response_framing
