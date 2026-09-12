@@ -141,6 +141,8 @@ set(CORE_TESTS
     core/iora_test_signal
     core/iora_test_rate_limiter
     core/iora_test_timing_wheel
+    core/iora_test_timing_wheel_lifecycle
+    core/iora_test_timing_wheel_reset_ndebug
 )
 
 # Parsers namespace tests
@@ -411,6 +413,21 @@ if(TARGET iora_test_logger)
     target_compile_definitions(iora_test_logger PRIVATE IORA_ENABLE_TEST_HOOKS)
 endif()
 
+# TimingWheel lifecycle/orphan tests need the header's test-injection seams
+# (_testScheduleGate, testAdvanceCount) — compiled in ONLY for these targets;
+# production builds of timing_wheel.hpp have none.
+# The reset-ndebug target ALSO defines NDEBUG so the former debug-only reset()
+# precondition assert is compiled out, proving the runtime CAS is the guard
+# (tracker 2026-09-10-7 T4/R1).
+if(TARGET iora_test_timing_wheel_lifecycle)
+    target_compile_definitions(iora_test_timing_wheel_lifecycle
+        PRIVATE IORA_TIMING_WHEEL_TEST_HOOKS)
+endif()
+if(TARGET iora_test_timing_wheel_reset_ndebug)
+    target_compile_definitions(iora_test_timing_wheel_reset_ndebug
+        PRIVATE IORA_TIMING_WHEEL_TEST_HOOKS NDEBUG)
+endif()
+
 # LoggerData-immortal probes (tracker 2026-07-23-4): each drives a process EXIT
 # (std::exit from a handler, static-destruction ordering, or a forked child that
 # exits). Their assertion is a CLEAN EXIT within a bounded time — a regression
@@ -468,6 +485,8 @@ endif()
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
     iora_test_timing_wheel
+    iora_test_timing_wheel_lifecycle
+    iora_test_timing_wheel_reset_ndebug
     iora_test_timer_lifecycle
     iora_test_plugin_drain
     iora_test_callexportedapi_gating

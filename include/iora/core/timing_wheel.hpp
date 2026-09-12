@@ -27,6 +27,14 @@ namespace core {
 using TimerId = std::uint64_t;
 inline constexpr TimerId InvalidTimerId = 0;
 
+/// \brief Lifecycle state. Legal transitions (all serialized by _lifecycleMutex):
+///   start(): CREATED->RUNNING, RESET->RUNNING (NO STOPPED->RUNNING edge — a
+///            restart requires reset() first).
+///   drain(): ->DRAINING->STOPPED.  stop(): ->STOPPED.  reset(): STOPPED->RESET.
+/// stop() and drain() are IDEMPOTENT quiescers: they transition to STOPPED from
+/// ANY source state (CREATED/RUNNING/STOPPED), which is intentional (a stop() on
+/// a never-started or already-stopped wheel is a safe no-op-equivalent). reset()
+/// and start() are the only guarded (CAS'd) transitions and reject other sources.
 enum class TimingWheelState
 {
   CREATED,
@@ -121,11 +129,13 @@ public:
 
   ~TimingWheel()
   {
-    if (_running.load(std::memory_order_acquire))
-    {
-      stopTickThread();
-    }
-    clearAllEntries();
+    // Contract (tracker 2026-09-10-7 R6): NO lifecycle call may be in flight at
+    // destruction (the standard C++ object-model rule — concurrent destruction +
+    // any member call is UB regardless). The dtor therefore takes no
+    // _lifecycleMutex; stopTickThread() is idempotent (joinable()-gated).
+    stopTickThread(); // idempotent (joinable()-gated) — unconditional, like stop()/drain()
+    auto toDestroy = collectAllEntries(); // destroyed at scope end, outside locks
+    (void)toDestroy;
     drainFreeList();
   }
 
@@ -146,6 +156,10 @@ public:
 
   TimerId schedule(std::chrono::milliseconds delay, Callback callback)
   {
+    // Fast-path accept gate (lock-free). This acquire load pairs with the
+    // _accepting.store(false, release) that drain()/stop() perform BEFORE they
+    // acquire _wheelMutex — the store-before-lock ordering the re-check below
+    // depends on (tracker 2026-09-10-6 R3). Do NOT weaken these to relaxed.
     if (!_accepting.load(std::memory_order_acquire))
     {
       return InvalidTimerId;
@@ -154,7 +168,27 @@ public:
     auto id = _nextId.fetch_add(1, std::memory_order_relaxed);
     auto deadline = Clock::now() + delay;
 
+#ifdef IORA_TIMING_WHEEL_TEST_HOOKS
+    // Test-only: pause a schedule() that has PASSED the fast-path gate but not
+    // yet taken _wheelMutex, so a test can deterministically drive the
+    // post-collection orphan window. Compiled out in production builds.
+    if (_testScheduleGate)
+    {
+      _testScheduleGate();
+    }
+#endif
+
     std::lock_guard lock(_wheelMutex);
+    // Re-check the accept gate UNDER _wheelMutex, BEFORE allocEntry (tracker
+    // 2026-09-10-6). drain()/stop() flip _accepting=false before acquiring
+    // _wheelMutex, so a schedule() that wins the lock only AFTER their
+    // collection completed observes false here and inserts no orphan; one that
+    // won the lock first is collected normally. A declined schedule allocates
+    // nothing (the burned _nextId leaves a harmless monotonic gap).
+    if (!_accepting.load(std::memory_order_acquire))
+    {
+      return InvalidTimerId;
+    }
     auto* entry = allocEntry(); // alloc under _wheelMutex to prevent ABBA with _poolMutex
     entry->id = id;
     entry->callback = std::move(callback);
@@ -198,8 +232,18 @@ public:
 
   /// \brief Process expired timers. Handles tick drift by processing
   /// multiple ticks if behind. Returns number of callbacks fired.
+  /// \note TEST-ONLY entry point. In production advance() is driven solely by
+  /// the internal tick thread (startTickThread). It is memory-safe under
+  /// concurrent invocation (serialized by _wheelMutex) but two concurrent calls
+  /// logically double-advance the wheel (early/desynced firings); it must NOT be
+  /// called while the tick thread is running (tracker 2026-09-10-7 T3/R8).
   std::size_t advance()
   {
+#ifdef IORA_TIMING_WHEEL_TEST_HOOKS
+    // Test-only observability: lets a test detect a live/zombie tick thread by
+    // watching whether advance() keeps being called. Compiled out in production.
+    _testAdvanceCount.fetch_add(1, std::memory_order_relaxed);
+#endif
     auto now = Clock::now();
     std::vector<std::pair<TimerId, Callback>> toFire;
 
@@ -267,6 +311,13 @@ public:
 
   void start()
   {
+    // Whole body under _lifecycleMutex (tracker 2026-09-10-7 R5): the _state CAS,
+    // the _accepting/_lastAdvanceTime writes, AND startTickThread()'s _tickThread
+    // assignment are serialized against every other lifecycle call, so no
+    // concurrent stop()/drain() can leave a zombie tick thread or race the
+    // std::thread object. Legal source states are CREATED and RESET only — there
+    // is no STOPPED->RUNNING edge; a restart requires reset() first (R11).
+    std::lock_guard lifecycle(_lifecycleMutex);
     auto expected = TimingWheelState::CREATED;
     if (!_state.compare_exchange_strong(expected, TimingWheelState::RUNNING))
     {
@@ -284,88 +335,109 @@ public:
     startTickThread();
   }
 
-  /// \brief Drain all pending timers, firing them in deadline order.
-  /// Stops the tick thread first, collects all entries, sorts by deadline,
-  /// fires them in order. If timeout is exceeded, remaining timers are
-  /// cancelled (not fired) and counted in DrainStats.remaining.
-  /// \brief Drain the timing wheel: fire expired timers, cancel future ones.
+  /// \brief Drain the timing wheel: fire expired timers in deadline order,
+  /// cancel future ones. Stops the tick thread first, collects all entries,
+  /// sorts by deadline, fires them in order. If the timeout is exceeded, the
+  /// remaining timers are cancelled (not fired) and counted in
+  /// DrainStats.remaining.
   /// \note When a Dispatcher is set, expired callbacks are posted to the
   ///       dispatcher (e.g., a thread pool) and may still be in-flight when
   ///       drain() returns. The caller must drain the dispatcher separately
   ///       to ensure all callbacks have completed before destroying targets.
   DrainStats drain(std::chrono::milliseconds timeoutMs = std::chrono::milliseconds(30000))
   {
-    _accepting.store(false, std::memory_order_release);
-    _state.store(TimingWheelState::DRAINING, std::memory_order_release);
-    stopTickThread();
-
     DrainStats stats;
     auto startTime = Clock::now();
 
-    // Collect pending entries from all buckets, sorted by deadline.
-    // Cancelled callbacks are moved outside the lock scope so their
-    // destructors (which may release shared_ptr captures) don't run
-    // while _wheelMutex is held.
+    // Entries to fire (populated under the locks, fired AFTER releasing them —
+    // no user callback runs under _lifecycleMutex or _wheelMutex, tracker
+    // 2026-09-10-7 R4).
     std::vector<std::pair<TimerId, Callback>> toFire;
-    std::vector<Callback> toDiscard;
     {
-      std::lock_guard lock(_wheelMutex);
-
-      // Gather entries with their deadlines for sorting
-      struct DrainEntry
+      // Cancelled callbacks are destroyed at the end of THIS block — outside
+      // both _wheelMutex and _lifecycleMutex — so their destructors (which may
+      // release shared_ptr captures, or re-enter cancel()/a lifecycle method)
+      // never run under a lock (tracker 2026-09-10-7 M-1 / L-3).
+      std::vector<Callback> toDiscard;
       {
-        TimerId id;
-        Callback callback;
-        TimePoint deadline;
-      };
-      std::vector<DrainEntry> entries;
-      entries.reserve(_entryMap.size());
+        // Whole collection under _lifecycleMutex (R5): the _accepting/_state
+        // transitions, stopTickThread()'s join (R9: never called while
+        // _wheelMutex is held), and the entry collection are serialized against
+        // every other lifecycle call. Released BEFORE the fire loop below (R4).
+        std::lock_guard lifecycle(_lifecycleMutex);
+        // R3 INVARIANT: _accepting=false is stored (release) BEFORE _wheelMutex
+        // is acquired below — schedule()'s under-lock re-check depends on this
+        // store-before-lock ordering to observe false and decline an orphan. Do
+        // NOT reorder the store after the _wheelMutex acquire (tracker -6 R3).
+        _accepting.store(false, std::memory_order_release);
+        _state.store(TimingWheelState::DRAINING, std::memory_order_release);
+        stopTickThread();
 
-      for (auto& w : _wheels)
-      {
-        for (auto& b : w.buckets)
+        std::lock_guard lock(_wheelMutex);
+
+        // Gather entries with their deadlines for sorting
+        struct DrainEntry
         {
-          auto* entry = b.head;
-          while (entry)
+          TimerId id;
+          Callback callback;
+          TimePoint deadline;
+        };
+        std::vector<DrainEntry> entries;
+        entries.reserve(_entryMap.size());
+
+        for (auto& w : _wheels)
+        {
+          for (auto& b : w.buckets)
           {
-            auto* next = entry->next;
-            b.unlink(entry);
-            entries.push_back({entry->id, std::move(entry->callback), entry->deadline});
-            freeEntry(entry);
-            entry = next;
+            auto* entry = b.head;
+            while (entry)
+            {
+              auto* next = entry->next;
+              b.unlink(entry);
+              entries.push_back({entry->id, std::move(entry->callback), entry->deadline});
+              freeEntry(entry);
+              entry = next;
+            }
           }
         }
-      }
-      _entryMap.clear();
+        _entryMap.clear();
 
-      // Sort by deadline (earliest first)
-      std::sort(entries.begin(), entries.end(),
-        [](const DrainEntry& a, const DrainEntry& b)
-        {
-          return a.deadline < b.deadline;
-        });
+        // Sort by deadline (earliest first)
+        std::sort(entries.begin(), entries.end(),
+          [](const DrainEntry& a, const DrainEntry& b)
+          {
+            return a.deadline < b.deadline;
+          });
 
-      // Only fire timers whose deadline has passed. Timers scheduled for the
-      // future are cancelled — firing them would execute callbacks at unexpected
-      // times, risking use-after-free on targets that expect the timer to fire
-      // much later (or never, if cancelled before then).
-      auto now = Clock::now();
-      for (auto& e : entries)
-      {
-        if (e.deadline <= now)
+        // Only fire timers whose deadline has passed. Timers scheduled for the
+        // future are cancelled — firing them would execute callbacks at
+        // unexpected times, risking use-after-free on targets that expect the
+        // timer to fire much later (or never, if cancelled before then).
+        // INVARIANT: EVERY entry's callback MUST be moved out here (into toFire
+        // or toDiscard) before this block closes — `entries` is destroyed while
+        // _wheelMutex/_lifecycleMutex are still held, so any callback left in it
+        // would run a user destructor under a lock (a future early-`continue`
+        // that skips a callback would regress the no-user-code-under-lock rule).
+        auto now = Clock::now();
+        for (auto& e : entries)
         {
-          toFire.emplace_back(e.id, std::move(e.callback));
+          if (e.deadline <= now)
+          {
+            toFire.emplace_back(e.id, std::move(e.callback));
+          }
+          else
+          {
+            toDiscard.push_back(std::move(e.callback));
+            ++stats.cancelled;
+          }
         }
-        else
-        {
-          toDiscard.push_back(std::move(e.callback));
-          ++stats.cancelled;
-        }
-      }
-    }
-    // toDiscard destroyed here, outside the lock
+      } // _wheelMutex + _lifecycleMutex released here
+    }   // toDiscard destroyed here, outside every lock
 
-    // Fire expired timers in deadline order, respecting timeout
+    // Fire expired timers in deadline order, respecting timeout. Runs with NO
+    // lock held: a callback may safely call schedule/cancel/reschedule, and a
+    // reentrant lifecycle call (contract-discouraged) no-ops via the DRAINING
+    // state gate below rather than self-deadlocking on _lifecycleMutex.
     for (auto& [id, cb] : toFire)
     {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -374,7 +446,7 @@ public:
       {
         stats.remaining = toFire.size() - stats.fired;
         stats.elapsed = elapsed;
-        _state.store(TimingWheelState::STOPPED, std::memory_order_release);
+        publishDrainStopped();
         return stats;
       }
 
@@ -384,33 +456,68 @@ public:
 
     stats.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       Clock::now() - startTime);
-    _state.store(TimingWheelState::STOPPED, std::memory_order_release);
+    publishDrainStopped();
     return stats;
   }
 
   void stop()
   {
-    _accepting.store(false, std::memory_order_release);
-    stopTickThread();
-    clearAllEntries();
-    _state.store(TimingWheelState::STOPPED, std::memory_order_release);
+    // Whole body under _lifecycleMutex (R5) EXCEPT the destruction of collected
+    // callbacks (M-1): a captured-resource destructor may re-enter a lifecycle
+    // method, which would self-deadlock on the non-recursive _lifecycleMutex.
+    std::vector<Callback> toDestroy;
+    {
+      std::lock_guard lifecycle(_lifecycleMutex);
+      // R3 INVARIANT: _accepting=false stored (release) BEFORE collectAllEntries
+      // takes _wheelMutex — schedule()'s under-lock re-check depends on this
+      // store-before-lock ordering to decline an orphan (tracker -6 R3).
+      _accepting.store(false, std::memory_order_release);
+      stopTickThread(); // R9: _wheelMutex not held here
+      toDestroy = collectAllEntries();
+      _state.store(TimingWheelState::STOPPED, std::memory_order_release);
+    }
+    // toDestroy destroyed here, outside _lifecycleMutex and _wheelMutex (M-1)
   }
 
   void reset()
   {
-    assert(_state.load(std::memory_order_relaxed) == TimingWheelState::STOPPED);
-    clearAllEntries();
+    // Whole body under _lifecycleMutex (R5/H2) so no concurrent start()
+    // (RESET->RUNNING) can interleave mid-teardown. The former debug-only assert
+    // is replaced by an unconditional CAS: a non-STOPPED reset SILENTLY NO-OPS
+    // (R1), so under NDEBUG it can no longer corrupt logical state while RUNNING.
+    std::vector<Callback> toDestroy;
     {
-      std::lock_guard lock(_wheelMutex);
-      for (auto& w : _wheels)
+      std::lock_guard lifecycle(_lifecycleMutex);
+      auto expected = TimingWheelState::STOPPED;
+      if (!_state.compare_exchange_strong(expected, TimingWheelState::RESET))
       {
-        w.currentTick = 0;
+        return; // not STOPPED -> no-op (consistent with start()'s failed CAS)
       }
-      _lastAdvanceTime = TimePoint{};
+      // STOPPED implies _entryMap is already empty (stop()/drain() cleared it),
+      // so collectAllEntries() returns an empty vector in-contract and no
+      // callback destructor runs; the assignment is a defensive net.
+      toDestroy = collectAllEntries();
+      {
+        std::lock_guard lock(_wheelMutex);
+        for (auto& w : _wheels)
+        {
+          w.currentTick = 0;
+        }
+        _lastAdvanceTime = TimePoint{};
+      }
+      drainFreeList();
+      // _nextId is deliberately NOT reset — it stays MONOTONIC across resets
+      // (tracker 2026-09-10-7 H-1). schedule() fetches its id (fetch_add) BEFORE
+      // taking _wheelMutex, so a schedule() preempted across a stop()->reset()->
+      // start() restart holds an already-issued id; zeroing the counter here
+      // would let a post-restart schedule re-issue that same id -> _entryMap
+      // overwrite (leaked entry) + TimerId aliasing (cancel/reschedule hit the
+      // wrong timer). TimerIds are opaque handles, so monotonicity is the
+      // correct invariant; the stale in-flight timer simply fires in the
+      // restarted wheel (a valid, non-orphan outcome per -6 R1).
+      // _state is already RESET (set by the CAS above) — no redundant store.
     }
-    drainFreeList();
-    _nextId.store(1, std::memory_order_relaxed);
-    _state.store(TimingWheelState::RESET, std::memory_order_relaxed);
+    // toDestroy destroyed here, outside every lock (defensive; empty in-contract)
   }
 
   void shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds(30000))
@@ -704,34 +811,35 @@ private:
     }
   }
 
-  void clearAllEntries()
+  /// \brief Unlink+free every entry under _wheelMutex and RETURN their callbacks
+  /// so the CALLER destroys them outside every lock. A moved-out callback's
+  /// captured-resource destructor may re-enter cancel() or a lifecycle method,
+  /// so it must run under neither _wheelMutex NOR _lifecycleMutex (tracker
+  /// 2026-09-10-7 M-1). Callers (stop/reset/dtor) keep the returned vector alive
+  /// until after releasing _lifecycleMutex.
+  [[nodiscard]] std::vector<Callback> collectAllEntries()
   {
-    // Move callbacks out so their destructors run outside _wheelMutex,
-    // same pattern as drain()'s toDiscard. Prevents deadlock if a callback
-    // destructor re-enters the wheel (e.g., via cancel()).
     std::vector<Callback> toDestroy;
+    std::lock_guard lock(_wheelMutex);
+    toDestroy.reserve(_entryMap.size());
+    for (auto& [id, entry] : _entryMap)
     {
-      std::lock_guard lock(_wheelMutex);
-      toDestroy.reserve(_entryMap.size());
-      for (auto& [id, entry] : _entryMap)
+      if (entry->callback)
       {
-        if (entry->callback)
-        {
-          toDestroy.push_back(std::move(entry->callback));
-        }
-        freeEntry(entry);
+        toDestroy.push_back(std::move(entry->callback));
       }
-      _entryMap.clear();
-      for (auto& w : _wheels)
+      freeEntry(entry);
+    }
+    _entryMap.clear();
+    for (auto& w : _wheels)
+    {
+      for (auto& b : w.buckets)
       {
-        for (auto& b : w.buckets)
-        {
-          b.head = nullptr;
-          b.tail = nullptr;
-        }
+        b.head = nullptr;
+        b.tail = nullptr;
       }
     }
-    // toDestroy destroyed here, outside the lock
+    return toDestroy;
   }
 
   void startTickThread()
@@ -764,11 +872,32 @@ private:
   void stopTickThread()
   {
     _running.store(false, std::memory_order_release);
+    // notify_all is INTENTIONALLY issued without holding _tickCvMutex (tracker
+    // 2026-09-10-7 L-1): the tick loop's wait_for(lock, _tickDuration, pred)
+    // re-checks !_running after a bounded timeout, so there is no permanent lost
+    // wakeup and join() is bounded by <= one tick. (Contrast the no-timeout
+    // completion-counter case in reference_cv_notify_under_lock, which DID need
+    // notify-under-lock.) Idempotent: after a join the thread is non-joinable,
+    // so a second call (stop/drain/dtor across a restart cycle) is a safe no-op.
     _tickCv.notify_all();
     if (_tickThread.joinable())
     {
       _tickThread.join();
     }
+  }
+
+  /// \brief Publish drain()'s terminal STOPPED transition WITHOUT clobbering a
+  /// concurrent stop()+reset() that advanced _state past DRAINING during the
+  /// fire window (tracker 2026-09-10-7 R10). Runs outside _lifecycleMutex (post
+  /// fire loop), so a conditional CAS lets the concurrent transition win. A
+  /// fresh `expected` is used per call (compare_exchange mutates it on failure);
+  /// success=release, failure=relaxed (never release) — coherence on the single
+  /// enum suffices (LT-2: the mix with start()/reset()'s CAS is intentional).
+  void publishDrainStopped()
+  {
+    auto expected = TimingWheelState::DRAINING;
+    _state.compare_exchange_strong(expected, TimingWheelState::STOPPED,
+      std::memory_order_release, std::memory_order_relaxed);
   }
 
   // Configuration (immutable after construction)
@@ -778,15 +907,27 @@ private:
   const std::size_t _numWheels;
   const Dispatcher _dispatcher;
 
+  // Lifecycle serialization. Lock ordering (outermost -> innermost):
+  //   _lifecycleMutex -> _wheelMutex -> _poolMutex   (_tickCvMutex is a LEAF)
+  // _lifecycleMutex serializes start/stop/drain/reset among themselves so the
+  // _tickThread object is never raced (joinable/join/move/assignment) and no
+  // concurrent transition leaves a zombie tick thread. It MUST NOT be acquired
+  // by the tick thread, advance(), any user callback, or any callback-resource
+  // destructor (tracker 2026-09-10-7 R3/R4/R9) — the join() taken under it would
+  // otherwise deadlock, and a callback re-entering a lifecycle method would
+  // self-deadlock on this non-recursive mutex. Hot paths (schedule/cancel/
+  // reschedule/advance/pendingCount) take only _wheelMutex, never this.
+  std::mutex _lifecycleMutex;
+
   // Wheel structure
   std::vector<WheelLevel> _wheels;
   std::unordered_map<TimerId, TimerEntry*> _entryMap;
-  mutable std::mutex _wheelMutex; // Lock ordering: _wheelMutex BEFORE _poolMutex
+  mutable std::mutex _wheelMutex; // Lock ordering: after _lifecycleMutex, before _poolMutex
   TimePoint _lastAdvanceTime{};
 
   // Entry pool (free-list)
   TimerEntry* _freeListHead = nullptr;
-  std::mutex _poolMutex; // Lock ordering: _wheelMutex BEFORE _poolMutex
+  std::mutex _poolMutex; // Lock ordering: innermost (after _wheelMutex)
 
   // State
   std::atomic<TimerId> _nextId;
@@ -803,6 +944,21 @@ private:
 
   // Error handling (thread-safe via atomic shared_ptr)
   std::shared_ptr<ErrorCallback> _errorCallback;
+
+#ifdef IORA_TIMING_WHEEL_TEST_HOOKS
+public:
+  // Test-only injection seam (compiled out in production). See schedule():
+  // parks a caller in the post-accept-check / pre-_wheelMutex orphan window.
+  std::function<void()> _testScheduleGate;
+  // Monotonic count of advance() calls — a live/zombie tick thread keeps
+  // incrementing it; a properly stopped one leaves it frozen.
+  std::atomic<std::uint64_t> _testAdvanceCount{0};
+  std::uint64_t testAdvanceCount() const
+  {
+    return _testAdvanceCount.load(std::memory_order_relaxed);
+  }
+private:
+#endif
 };
 
 /// \brief Adapter wrapping TimingWheel with ITimerService interface.
