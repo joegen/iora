@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 3.1 |
-| **Date** | 2026-09-11 |
+| **Version** | 3.2 |
+| **Date** | 2026-09-12 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/timing_wheel.hpp` |
 | **Namespace** | `iora::core` |
@@ -22,6 +22,7 @@
 | 2.0 | 2026-03-20 | Full architecture guide: hierarchical cascade mechanics, entry pooling internals, tick drift catch-up, mutex serialization analysis, lifecycle state machine. |
 | 3.0 | 2026-09-10 | Migrated into the iora doc-wiki at `docs/core/timing_wheel.md` and restructured to the 12-section guide template. Re-verified every claim against the current `include/iora/core/timing_wheel.hpp` and against the production consumers (`storage/kvstore.hpp`, `core/rate_limiter.hpp`). Corrected stale claims: the `ITimerService` interface and `TimingWheelAdapter` now expose `tickDuration()`; the memory ordering of `_accepting`/`_running` is acquire/release (not relaxed); and the executive-summary motivation was re-based against the *actual* sibling `TimerService` (a single-`timerfd` min-heap, not a timerfd-per-timer). Scope narrowed to `TimingWheel`, `TimingWheelAdapter`, and the `ITimerService` seam -- the epoll/`timerfd` `TimerService` (`core/timer.hpp`) is a separate component; see `docs/core/timer.md`. |
 | 3.1 | 2026-09-11 | Over-max-delay fix landed (iora `c7095c6`, tracker `tasks/iora/completed/2026-09-10-1`). A delay beyond the wheel span is no longer masked into an earlier bucket (early misfire at `numWheels==1`, cascade re-process/hang at `numWheels>=2`): `insertEntry` now clamps it to the furthest bucket with the real deadline preserved, and the `collectFromBucket`/`cascadeDown` deadline gate re-defers it until it is in range, so it fires within one tick of its deadline. Constructor now asserts `ticksPerWheel >= 2` and `tickDuration > 0`; the tick thread releases `_tickCvMutex` before `advance()`. Updated §5.2, §6.6, §12 accordingly. |
+| 3.2 | 2026-09-12 | Lifecycle-serialization + schedule/drain-orphan fixes landed (iora `8cb9c31`, trackers `tasks/iora/completed/2026-09-10-6` and `.../2026-09-10-7`). Added an outermost `_lifecycleMutex` serializing `start`/`stop`/`drain`/`reset` (order `_lifecycleMutex -> _wheelMutex -> _poolMutex`; never held during firing or callback-destruction, so the tick-thread `join()` and callback re-entry cannot deadlock). `schedule()` now re-checks `_accepting` under `_wheelMutex` (drain/stop store it false before the lock) -- no more orphaned timer racing shutdown. `reset()` replaced its debug-only `assert(STOPPED)` with a `compare_exchange(STOPPED->RESET)` **silent no-op** (safe under `NDEBUG`); `drain()`'s terminal transition is a conditional `CAS(DRAINING->STOPPED)` (no clobber of a concurrent `stop()+reset()`); `_nextId` is kept **monotonic** across `reset()` (was zeroed) to prevent TimerId aliasing of an in-flight `schedule()`. Updated §6.5 (lifecycle), §8 (thread-safety table, lock ordering, callback re-entry), §11 (design decisions), §12 (limitations: the three lifecycle hazards are RESOLVED). |
 
 ---
 
@@ -85,6 +86,9 @@ iora::core (namespace)
 |   |-- Entry pool  (guarded by _poolMutex)
 |   |     `-- _freeListHead: TimerEntry*   (intrusive singly-linked free-list via ->next)
 |   |
+|   |-- Lifecycle serialization
+|   |     `-- _lifecycleMutex: std::mutex   (OUTERMOST lock; serializes start/stop/drain/reset)
+|   |
 |   |-- Tick thread
 |   |     |-- _tickThread: std::thread
 |   |     `-- _tickCvMutex + _tickCv       (condition variable; wakes on stop)
@@ -115,6 +119,7 @@ sequenceDiagram
   TW->>TW: id = _nextId.fetch_add(1, relaxed)
   TW->>TW: deadline = Clock::now() + 500ms
   TW->>TW: lock_guard(_wheelMutex)
+  Note over TW: re-check _accepting.load(acquire) under the lock -- if false, return InvalidTimerId (orphan guard)
   TW->>Pool: allocEntry() [locks _poolMutex under _wheelMutex]
   Pool-->>TW: TimerEntry* (recycled or new)
   TW->>TW: insertEntry(entry, 500ms)
@@ -225,9 +230,9 @@ Two properties follow:
 1. **No re-entrancy deadlock.** Because `_wheelMutex` is not held while callbacks run, a callback may call `schedule()`, `cancel()`, or `reschedule()` -- the recurring-timer idiom depends on this.
 2. **Minimal lock hold time.** The lock covers only `O(1)`-per-entry pointer manipulation, never arbitrary user code.
 
-### 3.4 Two mutexes, one lock order
+### 3.4 Three mutexes, one lock order
 
-`_wheelMutex` guards the wheel and map; a *separate* `_poolMutex` guards the free-list. The declared invariant (comment at the `_wheelMutex` and `_poolMutex` declarations) is **`_wheelMutex` BEFORE `_poolMutex`**. In every hot path `allocEntry()` / `freeEntry()` (which take `_poolMutex`) are called while `_wheelMutex` is already held -- `schedule`, `cancel`, `drain`, `clearAllEntries`, `collectFromBucket`. The one path that takes `_poolMutex` alone is `drainFreeList()`, called only from `reset()` and the destructor, when the wheel is already stopped and no other thread holds `_wheelMutex` -- so the ordering is never inverted.
+An outermost **`_lifecycleMutex`** serializes the lifecycle methods; `_wheelMutex` guards the wheel and map; a *separate* `_poolMutex` guards the free-list. The declared order (comments at the mutex declarations) is **`_lifecycleMutex` -> `_wheelMutex` -> `_poolMutex`** (`_tickCvMutex` is a leaf). `_lifecycleMutex` is taken only by `start`/`stop`/`drain`/`reset` and never by the tick thread, `advance()`, or a callback. In every hot path `allocEntry()` / `freeEntry()` (which take `_poolMutex`) are called while `_wheelMutex` is already held -- `schedule`, `cancel`, `drain`, `collectAllEntries`, `collectFromBucket`. The one path that takes `_poolMutex` alone is `drainFreeList()`, called only from `reset()` and the destructor, when the wheel is already stopped and no other thread holds `_wheelMutex` -- so the ordering is never inverted.
 
 ### 3.5 Entry pooling (intrusive free-list)
 
@@ -344,11 +349,13 @@ CREATED --start()--> RUNNING --drain()--> DRAINING --(completes)--> STOPPED
                        |                                               |
                        +--stop()---------------------------------> STOPPED
                                                                        |
-                                                     reset() (asserts STOPPED)
+                                                  reset() (CAS: STOPPED-only)
                                                                        |
                                                                        v
                                                      RESET --start()--> RUNNING
 ```
+
+All four lifecycle transitions (`start`/`stop`/`drain`/`reset`) are serialized by a dedicated **`_lifecycleMutex`** — the outermost lock (order: `_lifecycleMutex -> _wheelMutex -> _poolMutex`, with `_tickCvMutex` a leaf). It is never acquired by the tick thread, `advance()`, or any user callback, so the tick-thread `join()` taken under it cannot deadlock and a callback re-entering a lifecycle method cannot self-deadlock (see Thread Safety Model). This makes concurrent lifecycle calls safe: the `std::thread` object is never raced (no concurrent `join`/`joinable`/assignment) and no concurrent transition leaves a zombie tick thread. There is **no `STOPPED -> RUNNING` edge** — a restart requires an interposed `reset()` first.
 
 | State | `_accepting` | `_running` | `schedule()` returns |
 |---|---|---|---|
@@ -358,13 +365,13 @@ CREATED --start()--> RUNNING --drain()--> DRAINING --(completes)--> STOPPED
 | `STOPPED` | false | false | `InvalidTimerId` |
 | `RESET` | false | false | `InvalidTimerId` |
 
-- **`start()`** -- `compare_exchange_strong` from `CREATED` (else retried from `RESET`); any other current state is a silent no-op (returns without starting). On success sets `_accepting = true` (release), records `_lastAdvanceTime` under `_wheelMutex`, spawns the tick thread. Because acceptance is guarded by `_accepting`, `schedule()` before `start()` returns `InvalidTimerId`.
-- **`drain(timeoutMs = 30000ms)`** -- sets `_accepting = false`, transitions to `DRAINING`, stops the tick thread, then under the lock collects every pending entry across all levels, sorts by deadline, and fires those already due in order while respecting the timeout. Future-dated entries are cancelled (see 3-b in section 7). Ends in `STOPPED` and returns `DrainStats`.
-- **`stop()`** -- sets `_accepting = false`, stops the tick thread, `clearAllEntries()` (discards pending callbacks *without* firing), transitions to `STOPPED`.
-- **`reset()`** -- **asserts** the current state is `STOPPED`, then clears entries, zeroes each level's `currentTick`, clears `_lastAdvanceTime`, drains the free-list, resets `_nextId` to 1, transitions to `RESET`. In an `NDEBUG` build the assert is compiled out (see Known Limitations).
+- **`start()`** -- under `_lifecycleMutex`: `compare_exchange_strong` from `CREATED` (else retried from `RESET`); any other current state is a silent no-op (returns without starting). On success sets `_accepting = true` (release), records `_lastAdvanceTime` under `_wheelMutex`, spawns the tick thread. Because acceptance is guarded by `_accepting`, `schedule()` before `start()` returns `InvalidTimerId`.
+- **`drain(timeoutMs = 30000ms)`** -- under `_lifecycleMutex`: sets `_accepting = false` (release, *before* taking `_wheelMutex`), transitions to `DRAINING`, stops the tick thread, then under `_wheelMutex` collects every pending entry across all levels, **sorts by deadline, and splits due-vs-future (cancelling future-dated entries -- see 3-b in section 7) -- all still under both locks**. It then **releases `_lifecycleMutex` and `_wheelMutex`** and, with no lock held, fires the already-due callbacks in deadline order while respecting the timeout (the cancelled future callbacks are destroyed off-lock). The terminal transition to `STOPPED` is published with a **conditional `compare_exchange(DRAINING -> STOPPED)`**, not an unconditional store, so a concurrent `stop()+reset()` that advanced the state during the fire window is not clobbered. Returns `DrainStats`.
+- **`stop()`** -- under `_lifecycleMutex`: sets `_accepting = false` (release, before the lock), stops the tick thread, collects pending entries (`collectAllEntries()`, discarding callbacks *without* firing), transitions to `STOPPED`; the collected callbacks are destroyed **after** `_lifecycleMutex` is released.
+- **`reset()`** -- under `_lifecycleMutex`: a **`compare_exchange(STOPPED -> RESET)`** guard -- a non-`STOPPED` reset is a **silent no-op** (it does *not* assert, and is safe under `NDEBUG`). On success it clears entries, zeroes each level's `currentTick`, clears `_lastAdvanceTime`, and drains the free-list. `_nextId` is **not** reset: it stays monotonic across resets (see Design Decisions).
 - **`shutdown(timeout = 30000ms)`** -- a thin alias that calls `drain(timeout)`.
 
-`clearAllEntries()` uses the same off-lock destruction discipline as `drain()`: it moves each pending callback into a local `toDestroy` vector under `_wheelMutex`, empties the map and buckets, releases the lock, and only then lets `toDestroy` (and any captured resources) destruct -- so a callback's destructor that re-enters the wheel cannot deadlock.
+`collectAllEntries()` (used by `stop()`, `reset()`, and the destructor) uses an off-lock destruction discipline: it moves each pending callback into a vector under `_wheelMutex`, empties the map and buckets, and **returns the vector to the caller**, which destroys it outside all locks -- `stop()`/`reset()` after releasing `_lifecycleMutex`, and the destructor (which holds no `_lifecycleMutex` at all) at scope exit -- so a callback's destructor that re-enters the wheel (even a lifecycle method) cannot deadlock.
 
 ---
 
@@ -510,8 +517,8 @@ tw.start();                         // reuse the wheel
 
 ### 6.6 Anti-patterns
 
-- **Do NOT call `advance()` while the tick thread is running.** `advance()` is public for testing only. A concurrent external call is memory-safe -- `_wheelMutex` serializes it against the tick thread -- but it logically *double-advances* the wheel: the second caller computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs. There is no internal guard against a second caller (`tasks/iora/backlog/2026-09-10-7_timing-wheel-lifecycle-transition-guards_P1.json`).
-- **Do NOT call `reset()` outside `STOPPED`.** It asserts in debug builds and is undefined behavior in release (the assert is compiled out under `NDEBUG`).
+- **Do NOT call `advance()` while the tick thread is running.** `advance()` is public for testing only. A concurrent external call is memory-safe -- `_wheelMutex` serializes it against the tick thread -- but it logically *double-advances* the wheel: the second caller computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs. This is a documented test-only contract with no internal guard by design (a production wheel is driven solely by its own tick thread).
+- **`reset()` outside `STOPPED` is a safe no-op.** The `compare_exchange(STOPPED -> RESET)` guard makes a non-`STOPPED` `reset()` return without effect in *every* build (including `NDEBUG`), rather than corrupting a running wheel. A restart is therefore `stop()` -> `reset()` -> `start()`.
 - **Do NOT let a `TimingWheelAdapter` outlive its `TimingWheel`.** The adapter holds a bare reference.
 - **Prefer sizing the wheel to cover your longest delay.** An over-range delay (beyond `ticksPerWheel^numWheels * tickDuration`) is handled correctly -- `insertEntry` clamps it to the furthest bucket with the real deadline preserved and the deadline gate re-defers it until it is in range, so it fires within one tick of its deadline, not a whole wheel-span early -- but it re-clamps once per wheel-span cycle, so an appropriately-sized wheel avoids that repeated work. (Fixed 2026-09-11, iora `c7095c6`; previously an over-range delay was masked into an earlier bucket and misfired early, and at `numWheels >= 2` a re-insert into the actively-traversed bucket could hang the cascade under `_wheelMutex`.)
 - **Do NOT block in a callback when no `Dispatcher` is set.** A slow inline callback stalls the tick thread and delays every other timer, compounding drift.
@@ -529,6 +536,7 @@ tw.start();                         // reuse the wheel
 | 2 | `schedule` | `_accepting.load(acquire)`; if false, return `InvalidTimerId` | none |
 | 3 | `schedule` | `id = _nextId.fetch_add(1, relaxed)`; `deadline = now + delay` | none |
 | 4 | `schedule` | `lock_guard(_wheelMutex)` | `_wheelMutex` held |
+| 4-b | `schedule` | **re-check** `_accepting.load(acquire)` under the lock; if false (a concurrent `drain()`/`stop()` won the lock first), return `InvalidTimerId` before allocating -- the orphan guard (§8 "Drain-time schedule race") | `_wheelMutex` held |
 | 5 | `schedule` | `allocEntry()` -> takes/releases `_poolMutex` | `_wheelMutex` + `_poolMutex` nested |
 | 6 | `schedule` | populate entry; `insertEntry(entry, delay)`; `_entryMap[id] = entry` | `_wheelMutex` held |
 | 7 | `schedule` | lock released on scope exit; return `id` | released |
@@ -557,12 +565,12 @@ tw.start();                         // reuse the wheel
 | Step | Actor | Action | Lock state |
 |---|---|---|---|
 | 1 | Caller | `drain(timeoutMs)` | none |
-| 2 | `drain` | `_accepting = false` (release); state `-> DRAINING`; `stopTickThread()` (join) | none |
-| 3 | `drain` | `lock_guard(_wheelMutex)`; walk all levels/buckets, move each entry into `entries`, `freeEntry`, clear `_entryMap` | `_wheelMutex` held |
-| 3-b | `drain` | sort `entries` by deadline; split: due (`deadline <= now`) -> `toFire`; future -> `toDiscard`, `++cancelled` | `_wheelMutex` held |
-| 4 | `drain` | lock released; `toDiscard` destructs off-lock | released |
-| 5 | `drain` | fire `toFire` in order; before each, if `elapsed >= timeoutMs`: set `remaining`, state `STOPPED`, return early | no lock held |
-| 6 | `drain` | set `elapsed`; state `-> STOPPED`; return `DrainStats` | none |
+| 2 | `drain` | `lock_guard(_lifecycleMutex)`; `_accepting = false` (release); state `-> DRAINING`; `stopTickThread()` (join) | `_lifecycleMutex` held |
+| 3 | `drain` | `lock_guard(_wheelMutex)`; walk all levels/buckets, move each entry into `entries`, `freeEntry`, clear `_entryMap` | `_lifecycleMutex` + `_wheelMutex` held |
+| 3-b | `drain` | sort `entries` by deadline; split: due (`deadline <= now`) -> `toFire`; future -> `toDiscard`, `++cancelled` | `_lifecycleMutex` + `_wheelMutex` held |
+| 4 | `drain` | both locks released (block close); `toDiscard` destructs off-lock | released |
+| 5 | `drain` | fire `toFire` in order; before each, if `elapsed >= timeoutMs`: set `remaining`, `publishDrainStopped()` (CAS `DRAINING->STOPPED`), return early | no lock held |
+| 6 | `drain` | set `elapsed`; `publishDrainStopped()` (CAS `DRAINING->STOPPED`); return `DrainStats` | no lock held |
 
 ---
 
@@ -575,21 +583,22 @@ tw.start();                         // reuse the wheel
 | `reschedule(id, delay)` | `_wheelMutex` | Unlink + recompute deadline + re-insert. No `_accepting` gate; returns `false` if `id` absent. |
 | `advance()` | `_wheelMutex` (collect phase only) | Callbacks fire outside the lock (collect-then-fire). Tick-drift catch-up runs under the same lock. **A concurrent external call is memory-safe (serialized by `_wheelMutex`) but logically double-advances the wheel -- do not call while the tick thread runs.** |
 | `pendingCount()` / `getInFlightCount()` | `_wheelMutex` | `getInFlightCount()` is an alias returning `_entryMap.size()`. |
-| `drain()` | `_wheelMutex` (collect), `_poolMutex` (freeEntry) | Tick thread stopped first. Firing and `toDiscard` destruction happen off-lock. |
-| `stop()` | `_wheelMutex` (via `clearAllEntries`) | Tick thread stopped first; callbacks discarded without firing, destructed off-lock. |
-| `reset()` | `_wheelMutex`, then `_poolMutex` (via `drainFreeList`) | Asserts `STOPPED`. Zeroes ticks, drains pool, resets `_nextId`. |
-| `start()` | `_wheelMutex` (brief, for `_lastAdvanceTime`) | `compare_exchange_strong` on `_state`; sets `_accepting` (release); spawns tick thread. |
+| `drain()` | `_lifecycleMutex` -> `_wheelMutex` (collect), `_poolMutex` (freeEntry) | Tick thread stopped first (all under `_lifecycleMutex`). `_lifecycleMutex` released before the fire loop; firing and `toDiscard` destruction happen off-lock. Terminal `STOPPED` via conditional CAS (`DRAINING->STOPPED`). |
+| `stop()` | `_lifecycleMutex` -> `_wheelMutex` (via `collectAllEntries`), `_poolMutex` | Tick thread stopped first; collected callbacks destroyed **after** `_lifecycleMutex` is released. |
+| `reset()` | `_lifecycleMutex` -> `_wheelMutex` -> `_poolMutex` (via `drainFreeList`) | `compare_exchange(STOPPED -> RESET)` guard (silent no-op otherwise). Zeroes ticks, drains pool. Does **not** reset `_nextId` (kept monotonic). |
+| `start()` | `_lifecycleMutex` -> `_wheelMutex` (brief, for `_lastAdvanceTime`) | Whole body under `_lifecycleMutex`: `compare_exchange_strong` on `_state` (CREATED/RESET only); sets `_accepting` (release); spawns tick thread. |
 | `setErrorCallback(cb)` | none (`atomic_store` on `shared_ptr`) | Safe from any thread at any time. |
 | `tickDuration()` | none | Reads `const _tickDuration`; lock-free by design (scheduling-path consumers must not couple to `_wheelMutex`). |
 | `_accepting` / `_running` | atomic, `acquire`/`release` | Advisory gates; the wheel lock provides the actual mutual exclusion for entry state. |
-| `_state` | atomic; `seq_cst` CAS in `start()`; `release` store in `drain()`/`stop()`, but `relaxed` store for `reset()`'s terminal transition to `RESET`; `relaxed` load elsewhere | `getState()` and `reset()`'s assert load use `relaxed`. Note `reset()` publishes `RESET` with a `relaxed` (not `release`) store. |
+| `_state` | atomic; `seq_cst` CAS in `start()` and `reset()` (`STOPPED->RESET`); `release` store to `DRAINING` in `drain()` and to `STOPPED` in `stop()`; `drain()`'s terminal `STOPPED` via conditional CAS (`DRAINING->STOPPED`, success=release / failure=relaxed); `relaxed` load in `getState()` | Writer transitions are additionally serialized by `_lifecycleMutex`; the atomic orderings only need to guard the lock-free `getState()` reader. |
+| `_lifecycleMutex` | `std::mutex` (outermost) | Serializes start/stop/drain/reset among themselves. Never taken by the tick thread, `advance()`, or a callback. |
 | `_nextId` | atomic, `relaxed` | Monotonic id source; `relaxed` suffices (uniqueness, not ordering). |
 
-**Lock ordering.** Exactly one edge exists: `_wheelMutex -> _poolMutex`. It is honored in `schedule`/`cancel`/`drain`/`clearAllEntries`/`collectFromBucket` (all take `_poolMutex` under `_wheelMutex`); `drainFreeList()` takes `_poolMutex` alone but only when the wheel is stopped, so there is no reverse edge and no cycle.
+**Lock ordering.** The order is `_lifecycleMutex -> _wheelMutex -> _poolMutex` (`_tickCvMutex` is a leaf). `_lifecycleMutex` is the outermost lock, taken only by the four lifecycle methods and never by the tick thread, `advance()`, or a callback -- so the tick-thread `join()` taken under it cannot deadlock. The `_wheelMutex -> _poolMutex` edge is honored in `schedule`/`cancel`/`drain`/`collectAllEntries`/`collectFromBucket` (all take `_poolMutex` under `_wheelMutex`); `drainFreeList()` takes `_poolMutex` alone but only when the wheel is stopped. No reverse edge, no cycle.
 
-**Callback re-entry.** `schedule()`, `cancel()`, and `reschedule()` are safe to call from inside a firing callback because `_wheelMutex` is never held during firing.
+**Callback re-entry.** `schedule()`, `cancel()`, and `reschedule()` are safe to call from inside a firing callback because `_wheelMutex` is never held during firing. Lifecycle methods (`start`/`stop`/`drain`/`reset`) MUST NOT be called from a timer callback: from the tick thread that would self-join (`join()` from within the joined thread = UB); from `drain()`'s own (main-thread) fire loop a reentrant lifecycle call is defensively no-op'd by the `DRAINING` state gate (`_lifecycleMutex` is released before firing, so it does not self-deadlock) but is still contract-forbidden. This three-case contract is documented at `fireCallback()`.
 
-**Concurrent `advance()` and drain-time race.** Two hazards the header does not guard against, documented here for honesty: (1) calling `advance()` externally while the tick thread runs is memory-safe -- both callers serialize on `_wheelMutex` -- but logically *double-advances* the wheel: the second call computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs (`tasks/iora/backlog/2026-09-10-7_timing-wheel-lifecycle-transition-guards_P1.json`); (2) a `schedule()` that passes the `_accepting` check just as `drain()`/`stop()` flips `_accepting` and stops the thread can insert an entry after the drain collection has run -- it is then neither fired nor counted, and is reclaimed only at the next `stop()`/`reset()`/destruction (`tasks/iora/backlog/2026-09-10-6_timing-wheel-schedule-drain-toctou-orphan_P1.json`). Both are noted again in section 12.
+**Drain-time schedule race (FIXED).** A `schedule()` that passes the lock-free `_accepting` check just as `drain()`/`stop()` flips `_accepting` no longer orphans a timer: `schedule()` **re-checks `_accepting` under `_wheelMutex`** before allocating, and `drain()`/`stop()` store `_accepting = false` (release) *before* they take `_wheelMutex`, so a `schedule()` that wins the lock only after the collection observes `false` and returns `InvalidTimerId` (a `schedule()` that wins first is collected normally). The `advance()` double-advance below is the only remaining caveat, and it is a deliberate test-only contract.
 
 ---
 
@@ -744,6 +753,8 @@ public:
 | **`setErrorCallback` via atomic `shared_ptr`** | Thread-safe swap with no mutex; one throwing callback can never kill the tick thread. |
 | **`condition_variable::wait_for` for the tick sleep** | `stop()`/`drain()` set `_running = false` and `notify_all()`, so the thread wakes immediately for clean shutdown instead of sleeping out the full tick. |
 | **`_accepting`/`_running` acquire-release; `_state` CAS** | Advisory gates published with release / observed with acquire; `start()` uses a `compare_exchange_strong` so only one caller wins the `CREATED`/`RESET` -> `RUNNING` transition. |
+| **Outermost `_lifecycleMutex` serializing start/stop/drain/reset** | The `_state` CAS alone cannot serialize the `std::thread` object ops (`join`/`joinable`/assignment) that accompany a transition; a dedicated outermost mutex does, so concurrent lifecycle calls never race the tick-thread object or leave a zombie. It is never taken by the tick thread/`advance()`/a callback (so the `join()` under it cannot deadlock) and is released before any callback fires or is destroyed (so a callback re-entering a lifecycle method cannot self-deadlock). `drain()`'s terminal transition is a conditional `CAS(DRAINING->STOPPED)` -- run after the mutex is released for the fire loop -- so a concurrent `stop()+reset()` in the fire window is not clobbered. |
+| **`_nextId` monotonic across `reset()`** | `reset()` deliberately does NOT zero `_nextId`. `schedule()` fetches its id (`fetch_add`) before taking `_wheelMutex`, so a `schedule()` preempted across a `stop()->reset()->start()` restart holds an already-issued id; zeroing the counter would let a post-restart `schedule()` re-issue that id -> `_entryMap` overwrite (leaked entry) + `TimerId` aliasing (`cancel`/`reschedule` hitting the wrong timer). TimerIds are opaque handles, so monotonicity is the correct invariant. |
 | **`ITimerService::tickDuration()` non-pure with 0 sentinel** | Keeps 30+ existing implementers source-compatible; a `0` return means "granularity unknown" and consumers must fail closed rather than divide by it. |
 | **Non-copyable, non-movable** | The wheel owns a live thread and raw intrusive pointers; consumers hold it by `unique_ptr` (e.g. `KVStore`). |
 
@@ -752,14 +763,14 @@ public:
 ## 12. Known Limitations
 
 - **Constructor preconditions are `assert`-only (compiled out under `NDEBUG`).** `ticksPerWheel` must be a power of two `>= 2`, `numWheels > 0`, and `tickDuration > 0`; these are asserted, so a release build handed an invalid geometry misbehaves silently (a 1-slot wheel has `_tickMask == 0`, defeating bucketing and the over-range clamp; a zero `tickDuration` divides by zero). No production caller passes invalid values. *(Resolved 2026-09-11, iora `c7095c6`: the former over-max-delay silent misfire / cascade hang is fixed -- an over-range delay is now clamped to the furthest bucket with its deadline preserved and re-deferred until in range, firing within one tick of its deadline (not a whole wheel-span early). It costs one re-clamp per wheel-span cycle, so size the wheel to cover the longest delay; tracker `tasks/iora/completed/2026-09-10-1`.)*
-- **`advance()` is public but not safe under the tick thread.** It is intended for tests. Calling it externally while `start()` has spawned the tick thread is memory-safe -- `_wheelMutex` serializes both callers -- but logically *double-advances* the wheel: the second call computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs. There is no internal guard. Tracked (with the `_tickThread` concurrent-lifecycle race and the debug-only `reset()` guard) in `tasks/iora/backlog/2026-09-10-7_timing-wheel-lifecycle-transition-guards_P1.json`.
-- **`schedule()` racing `drain()`/`stop()` can orphan a timer.** Because `_accepting` is checked before `_wheelMutex` is taken, a `schedule()` that observes `_accepting == true` immediately before a concurrent `drain()`/`stop()` flips it may insert an entry after the drain/stop collection has run. That entry never fires and is not counted in `DrainStats`; it is reclaimed only at the next `stop()`/`reset()`/destruction. Tracked in `tasks/iora/backlog/2026-09-10-6_timing-wheel-schedule-drain-toctou-orphan_P1.json`.
+- **`advance()` is public and test-only.** Calling it externally while the tick thread runs is memory-safe (`_wheelMutex` serializes both callers) but logically *double-advances* the wheel: the second call computes ~0 elapsed since `_lastAdvanceTime` yet still advances one tick, so timers fire early and the cascade desyncs. This has **no internal guard by design** -- a production wheel is driven solely by its own tick thread. Do not call `advance()` while the tick thread runs. (Tracker `tasks/iora/completed/2026-09-10-7`.)
 - **No periodic-timer primitive.** Repeating timers must re-schedule from inside the callback (section 6.2). `TimerEntry::thenReschedule` exists but is explicitly "reserved for future schedulePeriodic support" and is not implemented.
 - **`drain()` timeout drops due callbacks silently.** Once the global elapsed time reaches `timeoutMs`, remaining *due* timers are counted in `DrainStats.remaining` but their callbacks are never invoked (they were already unlinked and freed). A single slow callback consumes the budget for those after it.
 - **`drain()` completion does not imply dispatched callbacks finished.** With a `Dispatcher`, `drain()` counts callbacks as `fired` when *posted*, not completed. The header requires the caller to drain the dispatcher separately before destroying callback targets.
 - **Free-list grows monotonically.** A burst of N timers that all fire leaves N pooled entries resident until `reset()` or destruction; there is no automatic shrink.
 - **Tick precision is bounded by `condition_variable::wait_for`.** On hosts with coarse clock/scheduler resolution the actual tick interval jitters by several milliseconds; the wheel is unsuitable for sub-millisecond precision.
-- **`reset()` guard is a debug-only `assert`.** Calling `reset()` outside `STOPPED` asserts in debug builds but is undefined behavior under `NDEBUG` (the assert is compiled out). Tracked (with the concurrent-lifecycle `_tickThread` race and the unguarded `advance()`) in `tasks/iora/backlog/2026-09-10-7_timing-wheel-lifecycle-transition-guards_P1.json`.
-- **`drain()`/`stop()` have no state guards.** Unlike `start()` (which CAS-guards its transition), `drain()` and `stop()` execute unconditionally from any state -- stopping an already-stopped thread and draining empty buckets are harmless no-ops, but there is no rejection of a misordered call.
+- **Lifecycle races and the `reset()` guard (RESOLVED 2026-09-12, iora `8cb9c31`).** `reset()` outside `STOPPED` is now a `compare_exchange`-guarded **silent no-op in every build** (including `NDEBUG`), and the schedule/drain orphan is closed (`schedule()` re-checks `_accepting` under `_wheelMutex`; `drain()`/`stop()` store `_accepting=false` before the lock). All four lifecycle methods are serialized by the outermost `_lifecycleMutex`, so concurrent `start`/`stop`/`drain`/`reset` no longer race the `_tickThread` object or leave a zombie thread, and `drain()`'s terminal transition uses a conditional CAS so a concurrent `stop()+reset()` is not clobbered. Trackers `tasks/iora/completed/2026-09-10-6` and `.../2026-09-10-7`.
+- **`drain()`/`stop()` are unconditional idempotent quiescers.** Unlike `start()`/`reset()` (CAS-guarded), `drain()` and `stop()` transition to `STOPPED` from any state -- stopping an already-stopped thread and draining empty buckets are harmless no-ops. This is intentional (see the state-transition contract in section 6); there is no rejection of a misordered call.
+- **Destruction must not race an in-flight lifecycle call.** Concurrent `start`/`stop`/`drain`/`reset` calls are fully serialized by `_lifecycleMutex`, but the destructor deliberately takes **no** `_lifecycleMutex` (it relies on the idempotent, `joinable()`-gated `stopTickThread()`). Per the standard C++ object-model rule, destroying an object while another thread calls a member on it is undefined behavior; the caller must ensure no lifecycle call is in flight when the wheel is destroyed (the wheel is typically held by `unique_ptr` in a single owner, so this holds naturally).
 - **`atomic_load`/`atomic_store` on `shared_ptr` is deprecated in C++20.** `setErrorCallback` and `fireCallback` use the free-function overloads, deprecated in favor of `std::atomic<std::shared_ptr<T>>`. Correct under C++17 (this project's standard); a forward-compatibility note.
 - **This guide documents `TimingWheel` only.** The sibling `core::TimerService` (epoll + `timerfd` + min-heap) is a separate engine; see `docs/core/timer.md`.
