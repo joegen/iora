@@ -19,12 +19,13 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-10 | Consolidated the two frozen source guides -- `coding_trackers/docs/iora/logger_external_handlers.md` (v3.8) and `coding_trackers/docs/iora/logger_gzip_compression.md` (v1.0) -- plus the README "Thread-Safe Logger" seed into one doc-wiki guide at `docs/core/logger.md`, restructured to the 12-section template. Every signature, default, mutex name, and threading claim was re-verified against the current `include/iora/core/logger.hpp` (3220 lines) and `src/core/iora_core.cpp`. Corrected stale claims: `init()` now takes a sixth `compressAfterDays` argument (the prior external-handlers guide's API reference showed the 5-argument form); there is no `setRetentionDays()` method (README stale) -- retention is an `init()` argument. |
+| 1.1 | 2026-09-12 | **Mechanism B (deferred tear-out), tracker 2026-07-23-1.** The frozen-inflight accounting (`FrozenScope`/`FrozenReleaser`/`externalHandlerFrozen`/park-notify) was RETIRED. A depth>0 self-clear/set now DEFERS (`nullGateAndDeferLocked`): it nulls the gate, records `pendingTearOut`/`pendingInstall` (last-writer-wins), and returns non-waiting; the last in-flight invocation applies it (`applyDeferredTearOutLocked`). The drain predicate is reduced to `inflight == handlerReentryDepth()`; `init()` at depth>0 is non-waiting; a DEBUG `DepthGtTeardownParkerGuard` guards the `≤ 1 depth>0 teardown parker` invariant. Sections 3.6/3.7/3.10, the class map, the lock-timeline, notify-sites, design records D-2/D-3, and Known Limitations updated. |
 
 Historical milestones carried from the frozen sources (behaviour, not tracking):
 
 | Milestone | Change |
 |---|---|
-| v2.0 / v3.0 (2026-07) | Sync `log()` stopped holding the mutex across the callback; per-thread reentry depth added; the self-tear-out drain moved to **frozen-inflight accounting** after the earlier `inflight == depth` scheme deadlocked with two concurrent self-tearing invocations. |
+| v2.0 / v3.0 (2026-07) | Sync `log()` stopped holding the mutex across the callback; per-thread reentry depth added; the self-tear-out drain moved to **frozen-inflight accounting** after the earlier `inflight == depth` scheme deadlocked with two concurrent self-tearing invocations. (Frozen accounting was later RETIRED for mechanism B -- see v1.1 above.) |
 | v3.5 (2026-07-24) | `LoggerData` became an **immortal, never-destroyed** singleton; the exit-time drain/flush moved from `~LoggerData` to a `std::atexit` reap-without-destroy (`atexitReapNoDestroy`). |
 | v3.6 (2026-07-24) | `setExternalHandler({})` / `(nullptr)` became a lossless **uninstall** (the enable flag is derived from `static_cast<bool>(handler)`); a one-shot `fileReopenPending` reopens the same-day file after a handler cycle. |
 | v3.7 (2026-07-25) | The handler is held as `std::shared_ptr<const ExternalHandler>`, so the dispatch copy, tear-out swap, and install swap run no user code under the mutex; the compiled format is an immutable `FormatSnapshot` published behind a `shared_ptr<const FormatSnapshot>`. |
@@ -49,7 +50,7 @@ A production service needs one logging facility that is safe to call from every 
 
 - A single non-recursive `data.mutex` orders all sink I/O and all state transitions; a strict-leaf `data.compressorMutex` handles the compressor's O(1) queue hand-off.
 - The `LoggerData` singleton is **immortal** (heap-allocated, never deleted); a `std::atexit` reap flushes and joins the worker at process exit **without destroying** the object.
-- External-handler tear-out uses **frozen-inflight accounting**: a tear-out issued from inside the handler registers the frame it cannot drain and waits `inflight == frozen`, while an outside (depth-0) caller waits a genuine full drain `inflight == 0` and is the only one permitted to destroy captured state.
+- External-handler tear-out uses **deferred tear-out** (mechanism B): a tear-out issued from inside the handler (depth > 0) nulls the gate and DEFERS -- it records the request (`pendingTearOut`/`pendingInstall`, last-writer-wins) and returns non-waiting, and the last in-flight invocation applies it. An outside (depth-0) caller waits a genuine full drain `inflight == 0` (the general predicate is `inflight == handlerReentryDepth()`) and is the only one permitted to destroy captured state.
 - The handler and the compiled format are both held behind `std::shared_ptr<const ...>`, so copies and swaps under the lock are refcount bumps, never user code.
 - Aged rotated files gzip **off** the hot path on a dedicated compressor thread, published atomically and fsync-durably.
 
@@ -77,7 +78,9 @@ iora::core
 |   |   |-- queue                   normal sink backlog (formatted strings)
 |   |   |-- rawQueue                handler backlog ({Level, message}); filled only in async mode
 |   |   |-- externalHandler / useExternalHandler          the handler "gate"
-|   |   |-- externalHandlerInflight / externalHandlerFrozen   drain accounting
+|   |   |-- externalHandlerInflight             in-flight-invocation drain count
+|   |   |-- pendingTearOut / pendingInstall     deferred depth>0 tear-out request
+|   |   |-- externalHandlerDepthGtTeardownParkers   ≤1-parker guard counter (assert DEBUG-only)
 |   |   |-- _formatSnapshot         shared_ptr<const FormatSnapshot> (COW format config)
 |   |   |-- fileStream / logBasePath / currentLogDate / fileReopenPending
 |   |   |-- retentionDays / compressAfterDays / compressionEffective
@@ -87,7 +90,7 @@ iora::core
 |   |   |-- compressorInFlight / compressorExit / compressorRunning
 |   |   `-- exit, asyncMode, minLevel   (atomics)
 |   |-- handlerReentryDepth() -> int&   (ONE thread_local instance process-wide -- section 3.9)
-|   `-- RAII guards (private): HandlerInvocationScope, FrozenScope, FrozenReleaser, HandlerCopyDropper
+|   `-- RAII guards (private): HandlerInvocationScope, HandlerCopyDropper, DepthGtTeardownParkerGuard
 |-- LoggerStream                    (ostream-style proxy; flushes on destruct / << endl)
 |-- LoggerProxy                     (operator<< Level -> LoggerStream)
 `-- Logger  (inline LoggerProxy object; enables the << streaming spelling)
@@ -136,7 +139,7 @@ sequenceDiagram
 | Logger worker (`runWorker`) | Spawned by `init()` when `async == true`. Waits on `cv`, drains `rawQueue` to the handler then `queue` to the sink. Its **last action under the lock** clears `workerRunning`/`workerThreadId` and `notify_all`s `externalHandlerDone` -- the only wakeup for worker-exit waiters. |
 | Compressor (`compressorLoop`) | Spawned by `init()` iff `compressionEffective`. The only thread that gzips. Runs off-lock, takes `data.mutex` only for the brief metadata-only publish, and **never calls any `Logger::` API** (diagnostics go straight to `std::cerr`). |
 | Process-exit thread | The `std::atexit` reap `atexitReapNoDestroy` -> `teardownAndReapWorker`: reaps the worker, flushes buffered output, and joins the compressor **without destroying** the immortal singleton. May itself be at depth 1 if a handler called `std::exit()`. |
-| Any thread inside a handler | Depth 1. May re-enter `Logger`; its nested logs are depth-gated to the normal sink; a tear-out from here takes the self-tearer branch. |
+| Any thread inside a handler | Depth 1. May re-enter `Logger`; its nested logs are depth-gated to the normal sink; a clear/set from here DEFERS (non-waiting). |
 
 ---
 
@@ -144,7 +147,7 @@ sequenceDiagram
 
 ### 3.1 State ownership -- the immortal `LoggerData` singleton
 
-All mutable state is a single `LoggerData` returned by `getData()`. In the supported shared build (`IORA_CORE_SHARED` / `IORA_CORE_BUILDING`) `getData()` is defined once in `src/core/iora_core.cpp`; otherwise a byte-identical header-only fallback compiles one copy per image. The singleton is heap-allocated with `new LoggerData()` and **never deleted** -- deliberately leaked -- so its `mutex`, condition variables, queues, and worker bookkeeping outlive every static object that might log from its own destructor and every self-tearer still parked at process exit. The same magic-static initializer registers `std::atexit(&Logger::atexitReapNoDestroy)` exactly once (a failed registration is reported to `cerr`).
+All mutable state is a single `LoggerData` returned by `getData()`. In the supported shared build (`IORA_CORE_SHARED` / `IORA_CORE_BUILDING`) `getData()` is defined once in `src/core/iora_core.cpp`; otherwise a byte-identical header-only fallback compiles one copy per image. The singleton is heap-allocated with `new LoggerData()` and **never deleted** -- deliberately leaked -- so its `mutex`, condition variables, queues, and worker bookkeeping outlive every static object that might log from its own destructor and the depth>0 teardown parked at process exit (a handler calling `std::exit()`). The same magic-static initializer registers `std::atexit(&Logger::atexitReapNoDestroy)` exactly once (a failed registration is reported to `cerr`).
 
 `~LoggerData` still exists in the source (delegating to `teardownAndReapWorker` with `report=false`) but is **never invoked in a normal build**; it is retained only for a test mutant that reverts to a destroyed singleton.
 
@@ -197,50 +200,55 @@ Traps: the macro is spelled `IORA_LOG_WARN`, but the function is `Logger::warnin
 
 The "gate" is the pair `externalHandler` (a `shared_ptr<const ExternalHandler>`) and `useExternalHandler` (a bool). They are written together under the lock; dispatch reads both (`useExternalHandler && externalHandler`) while `rotateLogFileIfNeeded` keys on `useExternalHandler` alone. Because the flag is derived from `static_cast<bool>(handler)`, that flag-alone read is honest.
 
-The hard part is **removing** a handler safely, because it captures the object that owns it. The one place the drain protocol is argued is `tearOutGateAndDrainInflightLocked`:
+The hard part is **removing** a handler safely, because it captures the object that owns it. A tear-out has two cases that turn on `handlerReentryDepth()`.
+
+**Depth 0** (an ordinary thread, including `shutdown()`) nulls the gate and DRAINS via `nullGateAndDrainLocked`:
 
 ```cpp
 data.externalHandler.swap(doomed);   // pointer/refcount exchange -- no user code under the lock
 data.useExternalHandler = false;
 const int depth = handlerReentryDepth();
-if (depth > 0)                       // self-tearer: called from inside the handler
-{
-  frozenSlot.emplace(data, depth);   // register the frame we cannot drain
-  data.externalHandlerDone.notify_all();
-  waitWithStallDiagnosticLocked(lock, data, "...",
-    [&] { return data.externalHandlerInflight == data.externalHandlerFrozen; });
-}
-else                                 // external caller (depth 0)
-{
-  waitWithStallDiagnosticLocked(lock, data, "...",
-    [&] { return data.externalHandlerInflight == 0; });
-}
+waitWithStallDiagnosticLocked(lock, data, "...",
+  [&] { return data.externalHandlerInflight == depth; });   // depth == 0 here: a full drain
 ```
+
+**Depth > 0** (a handler clearing/swapping *itself*) cannot wait -- its own frame is pinned in `externalHandlerInflight`, so a drain to `inflight == 0` (or even to `inflight == depth` while an equally-pinned peer waits) is a circular wait. Instead it DEFERS via `nullGateAndDeferLocked`:
+
+```cpp
+data.externalHandler.swap(doomed);       // null the gate NOW (the safe half is unconditional)
+data.useExternalHandler = false;
+// absorb any prior deferred request into `doomed` (last-writer-wins), then record ours:
+data.pendingTearOut = true;
+data.pendingInstall = std::move(incoming); // the handler to install (null == deferred CLEAR)
+return;                                    // NON-WAITING
+```
+
+The LAST in-flight invocation to drive `externalHandlerInflight` to 0 then applies the request on its way out (`applyDeferredTearOutLocked`, fired from `fireDeferredTearOutIfDrainedLocked` at **both** `runHandlerUnlocked` decrement sites -- the normal and the catch/rethrow path).
 
 Design points:
 
-- **Nulling the gate here, not at the call site,** prevents any *new* invocation of the torn-out handler from starting (every dispatch site tests `useExternalHandler` under the same lock). So observing the predicate is a genuine quiescent point for the torn-out handler, which now lives in `doomed`.
+- **Nulling the gate here, not at the call site,** prevents any *new* invocation of the torn-out handler from starting (every dispatch site tests `useExternalHandler` under the same lock). So the depth-0 drain predicate is a genuine quiescent point for the torn-out handler (which now lives in `doomed`), and during the deferred window no new invocation of the old handler can begin.
 - **`swap`, not move-assign.** The displaced handler rides out on a caller-owned `doomed` local (declared **before** the lock) and is destroyed after the lock releases, so the last-reference capture destructors never run under the mutex. Because the handler is a `shared_ptr`, the swap runs no user code on any platform.
-- **The predicate is live** (re-read on every wakeup), which is what lets a peer's registration satisfy a parked waiter.
-- **`frozen` accounting.** A tear-out issued *from inside the handler* is pinned in its own invocation and can never satisfy `inflight == 0`. It instead registers its depth in `externalHandlerFrozen` (invariant `0 <= frozen <= inflight`) and waits `inflight == frozen`, draining every non-frozen invocation. The earlier scheme (wait for `inflight == own depth`) deadlocked when two self-tearing invocations ran concurrently -- each waited on the other, which was equally pinned.
+- **Last-writer-wins.** A superseding depth>0 call moves the prior `pendingInstall` out through `doomed` (`nullGateAndAbsorbPendingLocked`, invariant: at most one live handler in `doomed`) before storing its own, so a deferred SET is never silently degraded into an uninstall and no superseded handler leaks.
+- **`pendingInstall` carries the handler.** A bool-only "pending" flag would lose a deferred SET's new handler; `pendingInstall` (a `shared_ptr<const ExternalHandler>`, null for a deferred CLEAR) is what delivers the caller's intent at the drain point. Both `pendingTearOut` and `pendingInstall` are plain fields, mutated and read only under `data.mutex` (never atomics).
 
 The two caller classes receive **different guarantees**:
 
-| Caller | Waits | On return |
+| Caller | Behaviour | On return |
 |---|---|---|
-| **Depth 0** (any tear-out from an ordinary thread, incl. `shutdown()`) | `inflight == 0` | No invocation of the torn-out handler is running. **The only safe basis for destroying an object the handler captured.** |
-| **Depth 1** (`clear`/`set`/teardown *by* the handler) | `inflight == frozen` | Only non-self-tearing invocations have exited; peer self-tearers may still be running handler code. **Never** destroy captured state on this basis. |
+| **Depth 0** (any tear-out from an ordinary thread, incl. `shutdown()`) | DRAINS `inflight == 0` | No invocation of the torn-out handler is running. **The only safe basis for destroying an object the handler captured.** |
+| **Depth > 0** (`clear`/`set` *by* the handler) | DEFERS (non-waiting) | The gate is nulled but the drain -- hence "no invocation running" -- is completed later by the last in-flight invocation. **Never** destroy captured state on the strength of your own self-clear. |
 
-**Why the registration site notifies.** For `clear`/`set` the incrementer observes the gap and promptly drives a notifying `--inflight`. But a **teardown** caller (`shutdown()`/atexit reap) keeps its registration across `worker.join()` without decrementing, so the peer it just satisfied would have no wakeup -- hence the `notify_all` at the frozen registration. The `FrozenScope` **destructor** needs no notify: since `frozen <= inflight`, a frozen decrement can only falsify `inflight == frozen` and never affects `inflight == 0`.
+**The `≤ 1 depth>0 lifecycle parker/deferrer interacting with a teardown` design principle.** Because depth>0 clear/set DEFER (non-waiting) and `init()` at depth>0 returns non-waiting, the only remaining depth>0 *waiter* is a teardown reached via `std::exit()` from inside a handler (`teardownAndReapWorker` drains `inflight == handlerReentryDepth()`, leaving its own pinned frame). A `DepthGtTeardownParkerGuard` asserts at most one such teardown parker is ever active -- the assert is DEBUG-only, but the counter it guards is maintained in all builds as a post-mortem aid (in Release the plurality case merely hangs -- never UB -- and is unreachable under the no-consumers envelope). The sibling residuals (a deferred clear/set racing a depth>0 teardown; a stale `pendingTearOut` firing after a teardown nulled the gate) are accepted: they degrade to a bounded leak/hang under the immortal singleton, never UB.
 
 ### 3.7 The dispatch bracket and the RAII guards
 
-`runHandlerUnlocked` is the one in-flight bracket: given the lock held and the handler already copied under it, it `++inflight`, unlocks, runs the callback, then relocks, `--inflight`, and `notify_all`s -- **on every path, including the exception path** (which relocks, decrements, notifies, and rethrows). Four private RAII guards keep the window correct:
+`runHandlerUnlocked` is the one in-flight bracket: given the lock held and the handler already copied under it, it `++inflight`, unlocks, runs the callback, then relocks and calls `decrementInflightAndFireLocked` (`--inflight`, `notify_all`, then apply a pending deferred tear-out if this drove `inflight` to 0) -- **on every path, including the exception path** (which relocks, decrements+fires, and rethrows). Any handler the deferred fire displaces is carried out through a `displacedOut` out-param, threaded to every caller (worker, `flush()`, sync `logDispatch`) and destroyed with the lock released. Two private RAII guards keep the window correct:
 
 - **`HandlerInvocationScope`** -- `++/--handlerReentryDepth()` around the callback (declared first, destroyed last).
-- **`HandlerCopyDropper`** -- resets the dispatch site's handler `shared_ptr` copy inside the unlocked window and while depth is still `>= 1` (declared second, destroyed first). Both properties are required: unlocked so the last-reference capture destructors do not run under the mutex, and at depth `>= 1` so a destructor that re-enters `clear`/`set` takes the self-tearer branch rather than waiting `inflight == 0` on its own pinned frame. Its `reset()` is wrapped in a swallow (a throwing capture destructor inside a `noexcept` destructor would `std::terminate`).
-- **`FrozenScope`** -- `+=/-=` `externalHandlerFrozen`, constructed and destroyed under the mutex; never notifies.
-- **`FrozenReleaser`** -- releases a caller-owned `FrozenScope` under the mutex on every exit path, including a throw. Teardown holds its frozen registration across the join, so it cannot ride the `unique_lock`'s scope the way `clear`/`set` do.
+- **`HandlerCopyDropper`** -- resets the dispatch site's handler `shared_ptr` copy inside the unlocked window and while depth is still `>= 1` (declared second, destroyed first). Both properties are required: unlocked so the last-reference capture destructors do not run under the mutex, and at depth `>= 1` so a destructor that re-enters `clear`/`set` takes the DEFER branch (`nullGateAndDeferLocked`) rather than the depth-0 DRAIN branch waiting `inflight == 0` on its own pinned frame. Its `reset()` is wrapped in a swallow (a throwing capture destructor inside a `noexcept` destructor would `std::terminate`).
+
+A third guard, **`DepthGtTeardownParkerGuard`** (in `teardownAndReapWorker`), maintains a counter across the whole parked window of a depth>0 teardown (drain → join → post-join wait) -- kept in all builds as a post-mortem aid -- and DEBUG-asserts the `≤ 1 depth>0 teardown parker` invariant (section 3.6). The frozen-accounting guards (`FrozenScope`/`FrozenReleaser`) were removed with mechanism B.
 
 `formatAndInvokeRawHandler` (the async drain step) orders the guards deliberately and does the throwable formatting **inside** both guards: a throw before the dropper existed would unwind through `runHandlerUnlocked`'s catch (which relocks) and leave the caller destroying the handler copy under the lock. Rule: everything throwable belongs inside the guards.
 
@@ -263,7 +271,7 @@ The tear-out drain branches on `handlerReentryDepth()`, so correctness requires 
 
 ### 3.10 The stall diagnostic
 
-`waitWithStallDiagnosticLocked` wraps every drain and worker-exit wait in a `wait_for(kStallReportInterval)` with `kStallReportInterval = std::chrono::seconds(5)`, printing `inflight`, `frozen`, and `workerRunning` each time it fires and repeating for as long as the wait lasts. **It never gives up and proceeds** -- proceeding early would be a use-after-free, strictly worse than a hang. No correctness property may depend on this constant; every satisfying state change notifies (with the two documented exceptions in the notify-sites table of section 6).
+`waitWithStallDiagnosticLocked` wraps every drain and worker-exit wait in a `wait_for(kStallReportInterval)` with `kStallReportInterval = std::chrono::seconds(5)`, printing `inflight` and `workerRunning` each time it fires and repeating for as long as the wait lasts. **It never gives up and proceeds** -- proceeding early would be a use-after-free, strictly worse than a hang. No correctness property may depend on this constant; every satisfying state change notifies (with the two documented exceptions in the notify-sites table of section 6).
 
 ---
 
@@ -454,7 +462,7 @@ private:
 
 | Do | Don't |
 |---|---|
-| Clear the handler from a depth-0 thread before destroying its captured object. | Destroy captured state on the strength of a self-tear-out (depth-1 clear returns while peers may still run -- section 3.6). |
+| Clear the handler from a depth-0 thread before destroying its captured object. | Destroy captured state on the strength of a self-tear-out (a depth>0 clear DEFERS and returns before the tear-out completes -- section 3.6). |
 | Return promptly from the handler. | Tear the handler out (or log) while holding a lock the handler also acquires -- permanent hang; the drain never times out. |
 | Prefer `clearExternalHandler()` to `setExternalHandler({})` for clarity. | Assume `clearExternalHandler()` returns with no handler installed -- a racing `set` may reinstall one. |
 | Write the sink to a real file or stdout. | Install a logging `std::streambuf` on `cout`/`cerr` -- sink I/O runs under `data.mutex`, so it self-deadlocks. |
@@ -479,7 +487,7 @@ private:
 | 7 | Worker | `runHandlerUnlocked`: `++inflight`, unlock | release |
 | 8 | Worker | `HandlerInvocationScope` (depth 1) -> `HandlerCopyDropper` -> format -> invoke handler | none |
 | 9 | Worker | `~HandlerCopyDropper` (copy dies unlocked, depth 1), then `~HandlerInvocationScope` (depth -> 0) | none |
-| 10 | Worker | relock, `--inflight`, `externalHandlerDone.notify_all()` | acquire |
+| 10 | Worker | relock, `decrementInflightAndFireLocked` (`--inflight`, `notify_all`, apply any deferred tear-out if `inflight` hit 0) | acquire |
 | 11 | Worker | loop until drain returns false; then `drainNormalQueueLocked` | held |
 
 ### 6.2 Depth-0 tear-out racing an in-flight invocation
@@ -487,10 +495,10 @@ private:
 | # | Thread | Action | Lock |
 |---|---|---|---|
 | 1 | App | `clearExternalHandler`; `doomed` declared **before** the lock | none |
-| 2 | App | acquire; `frozen` slot declared after it | acquire |
-| 3 | App | `tearOutGateAndDrainInflightLocked`: `swap` into `doomed`, `useExternalHandler = false` | held |
-| 4 | App | depth 0 -> wait `inflight == 0`; no frozen registration | released in wait |
-| 5 | Worker | finishes 6.1 steps 8-10 -> `--inflight` -> `notify_all` | -- |
+| 2 | App | acquire the lock | acquire |
+| 3 | App | `nullGateAndDrainLocked`: `swap` into `doomed`, `useExternalHandler = false` | held |
+| 4 | App | depth 0 -> wait `inflight == handlerReentryDepth()` (== 0) | released in wait |
+| 5 | Worker | finishes 6.1 steps 8-10 -> `--inflight` -> `notify_all` -> deferred-fire check | -- |
 | 6 | App | predicate true; gate still null -> reroute `rawQueue`, wake the worker | held |
 | 7 | App | end of locked scope; lock released | release |
 | 8 | App | `~doomed` -- user capture destructors run **unlocked** | none |
@@ -546,7 +554,7 @@ The compressor finishes only its in-flight file and abandons the rest of the que
 | `std::atomic<Level> data.minLevel` | Read on the lock-free hot-path level gate; written by `init()`/`setLevel()`. Relaxed. |
 | `thread_local int handlerReentryDepth()` | Per-thread handler reentry depth. Owning thread only, no lock; **one instance process-wide** (section 3.9). Never assign to it. |
 
-All other `LoggerData` members (`queue`, `rawQueue`, `externalHandler`/`useExternalHandler`, `externalHandlerInflight`/`externalHandlerFrozen`, `_formatSnapshot`, `fileStream`/`logBasePath`/`currentLogDate`/`fileReopenPending`, `retentionDays`/`compressAfterDays`/`compressionEffective`, `workerRunning`/`workerGeneration`/`workerThreadId`, and the `compressor*` members) are plain scalars mutated **and read only under** their owning mutex.
+All other `LoggerData` members (`queue`, `rawQueue`, `externalHandler`/`useExternalHandler`, `externalHandlerInflight`, `pendingTearOut`/`pendingInstall`, `externalHandlerDepthGtTeardownParkers`, `_formatSnapshot`, `fileStream`/`logBasePath`/`currentLogDate`/`fileReopenPending`, `retentionDays`/`compressAfterDays`/`compressionEffective`, `workerRunning`/`workerGeneration`/`workerThreadId`, and the `compressor*` members) are plain scalars mutated **and read only under** their owning mutex.
 
 ### 7.2 Lock ordering
 
@@ -566,7 +574,7 @@ The **one** user-code path that remains under `mutex` is sink/diagnostic I/O thr
 
 ### 7.5 Notify sites
 
-Every state change that can satisfy a waiting predicate notifies. `externalHandlerDone` (many waiters, `notify_all`): the two `--inflight` sites in `runHandlerUnlocked` (normal + throw), the frozen registration in `tearOutGateAndDrainInflightLocked`, the frozen registration in `init()` at depth > 0, and the worker's exit publication. `cv` (one waiter, `notify_one`): the `logDispatch` enqueue, the reroute in `clearExternalHandler` and in `setExternalHandler`'s empty-uninstall, and the `exit` publication in `teardownAndReapWorker`. `compressorCv` (`notify_one`): the age-sweep enqueue (after releasing the leaf) and the teardown `compressorExit` set.
+Every state change that can satisfy a waiting predicate notifies. `externalHandlerDone` (many waiters, `notify_all`): the two `--inflight` sites in `runHandlerUnlocked` (normal + catch, both via `decrementInflightAndFireLocked`) and the worker's exit publication. (There is no longer a frozen-registration notify: depth>0 clear/set DEFER and `init()` at depth>0 returns non-waiting, so neither parks on this CV.) `cv` (one waiter, `notify_one`): the `logDispatch` enqueue, the reroute in `clearExternalHandler`, in `setExternalHandler`'s empty-uninstall, and in the deferred-CLEAR branch of `applyDeferredTearOutLocked`, and the `exit` publication in `teardownAndReapWorker`. `compressorCv` (`notify_one`): the age-sweep enqueue (after releasing the leaf) and the teardown `compressorExit` set.
 
 Two predicate terms deliberately do **not** notify, safe only under local arguments: `++workerGeneration` (reachable only after `workerRunning` first goes false, which does notify), and `setExternalHandler(real)`'s `useExternalHandler = true` (safe because `rawQueue = {}` executes earlier under the same uninterrupted lock hold, so the worker's predicate cannot flip). A future change to either site silently reintroduces a stall.
 
@@ -709,12 +717,12 @@ The `TestHooks` struct and `testHooks()` accessor are compiled in **only** under
 | ID | Decision | Rationale |
 |---|---|---|
 | D-1 | The tear-out drain never times out; the 5 s interval is diagnostic only. | A bounded-wait-then-tear-out would destroy live captured state -- a use-after-free, strictly worse than a hang. |
-| D-2 | Depth-0 waits `inflight == 0` and never subtracts `frozen`; depth-1 waits `inflight == frozen`. | Skipping is UAF-safe only for a self-tearer, whose captured object is provably alive on its own stack; an external caller may destroy that object. |
-| D-3 | The frozen registration is caller-owned and the **registration site** notifies, while the `FrozenScope` destructor does not. | A teardown caller stays pinned across `join()` without decrementing, so a peer it satisfied needs the registration-site wakeup; a frozen decrement can only falsify `inflight == frozen`, never `inflight == 0`. |
+| D-2 | Depth-0 clear/set/teardown DRAIN `inflight == handlerReentryDepth()` (== 0 for an external caller); depth>0 clear/set DEFER (non-waiting). | A depth-0 caller may destroy the handler's captured object, so it needs a genuine quiescent point; a depth>0 caller's own frame is pinned, so waiting is a circular deadlock -- it defers and lets the last in-flight invocation complete the tear-out. |
+| D-3 | The deferred request (`pendingTearOut`/`pendingInstall`) is applied by the last in-flight invocation, fired at BOTH `runHandlerUnlocked` decrement sites (normal + catch/rethrow) via `decrementInflightAndFireLocked`; last-writer-wins consolidates concurrent depth>0 requests. | Firing at only the normal decrement would strand a request whose last live invocation threw; a bool-only flag would lose a deferred SET's handler; a superseding request must carry the prior `pendingInstall` out for unlocked destruction (no leak, no double-install). |
 | D-4 | Sink and diagnostic I/O run **under** `data.mutex`. | Ordering of log lines is prioritized over the latency of holding the lock across file I/O; this orders the stream locks below `mutex` and is why the logging-streambuf anti-pattern exists. |
 | D-5 | `setExternalHandler(real)` **drops** the previous backlog while `clear`/empty-uninstall **reroute** it. | After a clear the normal sink is correct; after a real set, rerouting would print while the new handler is active and delivering would be misdelivery. |
 | D-6 | The handler and the format config are held behind `shared_ptr<const ...>`. | Makes the under-lock copy/swap a refcount bump -- no user copy/move constructor and no segment-vector deep copy run under the mutex. |
-| D-7 | `LoggerData` is an immortal, never-destroyed singleton; the exit-time flush is a `std::atexit` reap-without-destroy. | Static objects (and self-tearers at `std::exit`) may touch the logger during static destruction; destroying it first would lock a destroyed mutex. |
+| D-7 | `LoggerData` is an immortal, never-destroyed singleton; the exit-time flush is a `std::atexit` reap-without-destroy. | Static objects (and the depth>0 teardown reached via `std::exit()` from inside a handler) may touch the logger during static destruction; destroying it first would lock a destroyed mutex. |
 | D-8 | Every dispatch site refuses to invoke the handler at depth > 0. | A handler that logs would otherwise re-invoke itself: unbounded recursion (sync) or a `rawQueue` livelock (async). Nested logs take the normal sink. |
 | D-9 | Two condition variables: `cv` (worker) and `externalHandlerDone` (drain + worker-exit). | Keeps drain waiters from consuming the worker's wakeups; `cv` has one waiter (`notify_one`), `externalHandlerDone` many (`notify_all`). |
 | D-10 | `getData()` and `handlerReentryDepth()` are defined once in `libiora_core.so`. | Vague-linkage merging is not guaranteed under `RTLD_LOCAL`; a plugin with its own copy would branch the drain wrong and self-deadlock silently in Release. |
@@ -736,7 +744,7 @@ The `TestHooks` struct and `testHooks()` accessor are compiled in **only** under
 **Accepted limitations (design around them):**
 
 - **`init()` is not concurrency-safe against active logging.** It clears both queues under the lock without draining in-flight handler invocations, so queued raw entries can be silently dropped. Call it once at startup or while quiescent. It also does **not** uninstall an active handler.
-- **A self-tear-out drains only non-tearing invocations.** A depth-1 `clear`/`set` returns while peer self-tearing invocations may still be running handler code -- the price of deadlock freedom. Never destroy captured state on this basis; route lifetime-critical teardown through a depth-0 call.
+- **A depth>0 self-tear-out is DEFERRED, not drained.** A `clear`/`set` from inside the handler returns immediately (non-waiting) with the gate nulled but the drain not yet complete -- the last in-flight invocation finishes the tear-out. Never destroy captured state on the strength of your own self-clear; route lifetime-critical teardown through a depth-0 call, which drains `inflight == 0` before returning.
 - **`clearExternalHandler()` may return with a handler installed.** A racing `set` can reinstall one while a depth-0 clear is parked. The guarantee for the *previous* handler is intact (not a UAF); the set's handler winning is intended.
 - **Drain starvation under self-swap plus sustained logging.** A repeatedly self-reinstalling handler under concurrent logging can hold `inflight` above a waiter's target -- starvation, not deadlock, self-resolving once traffic stops. The looping 5 s stall diagnostic makes it visible.
 - **A `lock()` that throws `std::system_error`** in `runHandlerUnlocked` leaves `inflight` un-decremented and hangs a drain-waiter. Treated as a terminal condition, consistent with every other lock site.
