@@ -15,9 +15,9 @@ public:
                    []() -> std::uint64_t
                    { return reinterpret_cast<std::uint64_t>(&iora::IoraService::getInstancePtr); });
 
-    // The frozen-inflight drain selects its self-tearer vs external branch on
-    // Logger::handlerReentryDepth()'s thread_local (tracker 2026-07-21-3), so the
-    // R-12 invariant the drain depends on is: the thread_local
+    // The tear-out DEFER-vs-DRAIN branch selects on
+    // Logger::handlerReentryDepth()'s thread_local (mechanism B, tracker
+    // 2026-07-23-1), so the R-12 invariant the branch depends on is: the thread_local
     // INSTANCE must be one object process-wide. Probe the instance, not the
     // function symbol — the symbol is not the invariant (a header-inline member
     // can be emitted per-.so under optimization while the thread_local still

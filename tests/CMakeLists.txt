@@ -121,6 +121,7 @@ set(CORE_TESTS
     core/iora_test_logger
     core/iora_test_logger_external_handler_race
     core/iora_test_logger_self_clear_deadlock
+    core/iora_test_logger_init_teardown_race
     core/iora_test_logger_format_snapshot
     core/iora_test_logger_handler_file_restore
     core/iora_test_logger_immortal_scenario1_exit_from_handler
@@ -415,6 +416,14 @@ if(TARGET iora_test_logger)
     target_compile_definitions(iora_test_logger PRIVATE IORA_ENABLE_TEST_HOOKS)
 endif()
 
+# The init()-vs-teardown race test drives init()'s depth>0 branch and the
+# worker-generation race through the compile-gated park seams in logger.hpp
+# (pauseWorkerBeforeExitPublish / pauseTeardownAfterJoin / testInvokeAtHandlerDepth),
+# which only exist under IORA_ENABLE_TEST_HOOKS (tracker 2026-07-23-2).
+if(TARGET iora_test_logger_init_teardown_race)
+    target_compile_definitions(iora_test_logger_init_teardown_race PRIVATE IORA_ENABLE_TEST_HOOKS)
+endif()
+
 # TimingWheel lifecycle/orphan tests need the header's test-injection seams
 # (_testScheduleGate, testAdvanceCount) — compiled in ONLY for these targets;
 # production builds of timing_wheel.hpp have none.
@@ -455,6 +464,24 @@ foreach(_probe_test ${IORA_LOGGER_IMMORTAL_PROBE_TESTS})
         endif()
     endif()
 endforeach()
+
+# The init()-vs-teardown race test (tracker 2026-07-23-2) drives worker-self
+# shutdown()+init() cycles; a regression (init() self-waiting on the worker, or a
+# stale workerRunning leaving async with no drainer) must FAIL via this TIMEOUT
+# rather than wedge the suite. The in-test bounded waits are the first line; this is
+# the outer backstop.
+if(TEST core::iora_test_logger_init_teardown_race)
+    set_tests_properties(core::iora_test_logger_init_teardown_race PROPERTIES TIMEOUT 120)
+endif()
+
+# The self-clear deadlock suite (tracker 2026-07-21-3 / 2026-07-23-1) is the canonical
+# logger tear-out deadlock suite; a regression in a bounded-rendezvous discriminator
+# can wedge a worker whose leftover in-flight frame then hangs process-exit teardown.
+# Outer backstop on top of the in-test bounded waits (mirrors the sibling deadlock
+# tests). (cpp17 review M1, 2026-09-12.)
+if(TEST core::iora_test_logger_self_clear_deadlock)
+    set_tests_properties(core::iora_test_logger_self_clear_deadlock PROPERTIES TIMEOUT 120)
+endif()
 
 # The callExportedApi drain-gate test (Slice B, tracker 2026-09-07-3) has
 # self-unload / transitive / reentrant liveness cases: a drain-deadlock
@@ -516,6 +543,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_http_client_cancel
     iora_test_logger_external_handler_race
     iora_test_logger_self_clear_deadlock
+    iora_test_logger_init_teardown_race
     iora_test_logger_format_snapshot
     iora_test_logger_handler_file_restore
     iora_test_logger_immortal_scenario1_exit_from_handler

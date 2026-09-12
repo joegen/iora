@@ -50,10 +50,11 @@ TEST_CASE("Singleton isolation: Logger and IoraService shared across plugin boun
 
   SECTION("Logger::handlerReentryDepth resolves to ONE thread_local instance host<->plugin")
   {
-    // R-12: the self-clear/self-swap frozen-inflight drain (tracker 2026-07-21-3)
-    // branches on this thread_local's depth. A divergent copy in a plugin would
-    // make its self-clear misread depth==0, take the external inflight==0 branch,
-    // and self-deadlock on its own pinned frame.
+    // R-12: the self-clear/self-swap DEFER-vs-DRAIN branch (mechanism B, tracker
+    // 2026-07-23-1) selects on this thread_local's depth. A divergent copy in a
+    // plugin would make its depth>0 self-clear misread depth==0, take the depth-0
+    // DRAIN branch (wait inflight==0) instead of deferring, and self-deadlock on its
+    // own pinned frame.
     //
     // Assert the INSTANCE, not the function symbol — it is the property the drain's
     // depth branch depends on, and it holds regardless of how the function is

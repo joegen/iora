@@ -723,9 +723,10 @@ TEST_CASE("Logger Handler May Clear Itself Without Hanging", "[logger][handler][
 {
   // Self-call detection (handler-reentry depth, replacing the former
   // workerThreadId scheme): a handler that tears itself out via
-  // clearExternalHandler from inside its own invocation takes the self-tearer
-  // branch (wait inflight == externalHandlerFrozen) rather than the external full
-  // drain, or it would wait forever on its own pinned in-flight frame.
+  // clearExternalHandler from inside its own invocation takes the DEFERRED tear-out
+  // branch (nulls the gate and returns immediately; the last in-flight invocation
+  // completes it) rather than the depth-0 full drain, which would wait forever on
+  // its own pinned in-flight frame (tracker 2026-07-23-1).
   // Exercised on both the sync path (handler runs on the calling thread) and the
   // async path (handler runs on the worker or the flushing thread).
   // ORDERING IS LOAD-BEARING: the second message must be logged only AFTER the
@@ -781,9 +782,8 @@ TEST_CASE("Logger Self-Logging Handler Does Not Recurse Unbounded",
   // gates on handlerReentryDepth()==0, routing a re-entrant handler-bound message
   // to the normal queue/console path, so the handler runs exactly once for one
   // outer message. Because all dispatch sites are gated, a handler cannot trigger
-  // a nested handler invocation (depth stays <= 1), so the tear-out drain's
-  // self-tearer branch (wait inflight==externalHandlerFrozen) sees frozen as a
-  // plain count of parked self-tearers — tracker 2026-07-21-3.
+  // a nested handler invocation (depth stays <= 1), so a self-tearing clear/set is
+  // always at depth 1 and takes the deferred branch — tracker 2026-07-23-1.
   auto selfLogging = [](bool async)
   {
     std::atomic<int> calls{0};

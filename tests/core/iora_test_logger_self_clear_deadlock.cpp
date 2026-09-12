@@ -4,15 +4,19 @@
 // This file is part of Iora, which is licensed under the Mozilla Public License 2.0.
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 //
-// Tests for Logger self-tear-out DEADLOCK under concurrent invocation (tracker
-// 2026-07-21-3). The external-handler inflight-drain must remain deadlock-free
-// AND use-after-free-free when a self-clearing/self-swapping handler runs
-// concurrently on 2+ threads. A per-thread drain target (wait inflight==ownDepth)
-// deadlocks when >=2 self-tearers each block waiting for the global in-flight
-// count to fall to their own depth while the peers are equally pinned. The fix
-// (Option 2, frozen-inflight accounting): self-tearers (depth>0) wait the LIVE
-// predicate inflight==externalHandlerFrozen; external callers (depth==0) wait a
-// genuine full drain inflight==0.
+// Tests for Logger self-tear-out under concurrent invocation (trackers
+// 2026-07-21-3, 2026-07-23-1). A handler that clears/swaps itself runs at
+// handlerReentryDepth() > 0 with its own frame pinned in externalHandlerInflight,
+// so it CANNOT wait for the drain — waiting on its own (or an equally-pinned peer's)
+// frame is a deadlock. Since tracker 2026-07-23-1 the mechanism is DEFERRED TEAR-OUT
+// (mechanism B): a depth>0 clear/set nulls the gate and RETURNS IMMEDIATELY, and the
+// LAST in-flight invocation to drain (inflight -> 0) applies the recorded request on
+// its way out. Concurrent depth>0 tear-outs LAST-WRITER-WIN. The frozen-inflight
+// accounting (the earlier fix) was RETIRED — no depth>0 caller waits any longer;
+// only DEPTH-0 clear/set (and teardown) still wait a genuine drain
+// inflight == handlerReentryDepth() (0 for external callers). These cases assert the
+// deferral is (1) deadlock-free under concurrency, (2) completes the tear-out once
+// in-flight drains, and (3) delivers the caller's intent (install B / clear).
 //
 // FORCED RENDEZVOUS: every race test blocks the handler on a latch and drives the
 // concurrent tear-out only after >=2 invocations have provably entered their
@@ -79,15 +83,16 @@ constexpr int kSlowLoopIters = 100;
 // that later unblocks would write into a destroyed stack object.
 
 // A self-CLEARING handler body: after the gate is released, it clears the handler
-// from INSIDE itself (handlerReentryDepth()==1 -> the self-tearer drain path).
-// On a release TIMEOUT it skips the self-clear and just exits, so a stuck test
-// unwinds as a bounded failure rather than a wedged handler.
+// from INSIDE itself (handlerReentryDepth()==1 -> the DEFERRED tear-out path, which
+// returns immediately without waiting). On a release TIMEOUT it skips the self-clear
+// and just exits, so a stuck test unwinds as a bounded failure rather than a wedged
+// handler.
 void selfClearingHandlerBody(const CtlPtr &c)
 {
   c->onEnter();
   if (c->waitReleased())
   {
-    Logger::clearExternalHandler(); // self-tear-out under concurrency
+    Logger::clearExternalHandler(); // depth>0 -> DEFERS (non-waiting)
   }
   c->onExit();
 }
@@ -103,8 +108,11 @@ void teardownLogger()
 } // namespace
 
 // ── (a) canonical deadlock repro: TWO self-clears in flight (worker + concurrent
-//    flush). Pre-fix both block at inflight==1 forever; post-fix both drain. ─────
-TEST_CASE("two self-clearing invocations (worker + flush) both drain — no deadlock",
+//    flush). With the retired per-thread/frozen drain both could block forever; with
+//    mechanism B both DEFER and return, so both invocations exit promptly.
+//    MUTATION: make the depth>0 clear WAIT (drain to inflight==depth) instead of
+//    defer -> the two equally-pinned self-clears deadlock -> bounded waitExited FAILS.
+TEST_CASE("two self-clearing invocations (worker + flush) both defer — no deadlock",
           "[logger][deadlock][a]")
 {
   for (int i = 0; i < kLoopIters; ++i)
@@ -144,8 +152,11 @@ TEST_CASE("two self-clearing invocations (worker + flush) both drain — no dead
 
 // ── (a2) the literal P0 symptom: shutdown() ITSELF is the concurrent drainer. Its
 //    internal flush() delivers the second entry, so the worker invocation and the
-//    shutdown-flush invocation both self-clear. Bounded so a regression FAILS. ───
-TEST_CASE("shutdown() as the concurrent drainer: worker + shutdown-flush self-clears drain",
+//    shutdown-flush invocation both self-clear (both DEFER under mechanism B).
+//    shutdown() runs at depth 0 on its own thread, so it waits a genuine drain and
+//    must RETURN (the original P0 was "shutdown() hangs forever"). Bounded so a
+//    regression FAILS. ────────────────────────────────────────────────────────────
+TEST_CASE("shutdown() as the concurrent drainer: worker self-clear defers, shutdown returns",
           "[logger][deadlock][a2]")
 {
   for (int i = 0; i < kSlowLoopIters; ++i)
@@ -187,87 +198,17 @@ TEST_CASE("shutdown() as the concurrent drainer: worker + shutdown-flush self-cl
   }
 }
 
-// ── (a3) the TWO CONCURRENT flush() CALLERS shape: exactly the two flush-driven
-//    invocations self-tear, while the worker's invocation is a plain blocking body
-//    that never tears out. That is a different frozen/non-frozen mix from (g)
-//    (where all three self-tear): here the two parked self-tearers must ALSO drain
-//    a third, NON-frozen invocation. A worker-free variant is unreachable through
-//    the public API — async mode always starts the worker, and sync mode never
-//    populates rawQueue, so flush() would have nothing to deliver. ──────────────
-TEST_CASE("two concurrent flush() callers self-clear while a non-tearing worker invocation is live",
-          "[logger][deadlock][a3]")
-{
-  for (int i = 0; i < kLoopIters; ++i)
-  {
-    Logger::init(Logger::Level::Info, "", /*async=*/true);
-    auto workerCtl = makeCtl(); // the non-tearing worker invocation
-    auto flushCtl = makeCtl();  // the two self-tearing flush invocations
-    auto firstIsWorker = makeFlag(true);
-    // Positive discriminator: each self-tearer records whether the NON-frozen
-    // worker invocation had already exited when its own tear-out returned. A
-    // skip-based drain would return early and score 0.
-    auto waitedForWorker = makeCounter();
-
-    Logger::setExternalHandler(
-      [workerCtl, flushCtl, firstIsWorker, waitedForWorker](Logger::Level, const std::string &,
-                                                            const std::string &)
-      {
-        if (firstIsWorker->exchange(false))
-        {
-          // Worker invocation: occupy an in-flight slot WITHOUT tearing out, so it
-          // is a non-frozen invocation both self-tearers must wait for.
-          iora::test::blockingHandlerBody(*workerCtl);
-        }
-        else
-        {
-          flushCtl->onEnter();
-          if (flushCtl->waitReleased())
-          {
-            Logger::clearExternalHandler(); // must drain the non-frozen worker
-            if (workerCtl->exitedCount() >= 1)
-            {
-              waitedForWorker->fetch_add(1);
-            }
-          }
-          flushCtl->onExit();
-        }
-      });
-
-    Logger::info("1");
-    const bool workerIn = workerCtl->waitEntered(1); // worker parked, not tearing out
-    CHECK(workerIn);
-    Logger::info("2");
-    Logger::info("3");
-    std::thread f1([] { Logger::flush(); });
-    std::thread f2([] { Logger::flush(); });
-    const bool bothFlushesIn = flushCtl->waitEntered(2); // both self-tearers in flight
-    CHECK(bothFlushesIn);
-
-    // Release the two self-tearers FIRST and let them commit to their drain wait,
-    // then release the non-frozen worker invocation they must wait for.
-    flushCtl->releaseAll();
-    std::this_thread::sleep_for(20ms);
-    workerCtl->releaseAll();
-
-    const bool workerDrained = workerCtl->waitExited(1);
-    const bool drained = flushCtl->waitExited(2);
-    CHECK(workerDrained);
-    CHECK(drained);
-
-    joinOrDetach(workerDrained && drained, {&f1, &f2});
-    if (!(workerDrained && drained))
-    {
-      break;
-    }
-    // Both self-tearers must have waited out the non-frozen worker invocation.
-    CHECK(waitedForWorker->load() == 2);
-    teardownLogger();
-  }
-}
+// (a3) RETIRED (tracker 2026-07-23-1): it asserted that two self-tearing flush
+// invocations WAIT OUT a concurrent non-frozen worker invocation before returning —
+// the frozen-drain behavior mechanism B removed. Depth>0 self-clears now DEFER
+// (return without waiting); that deferral, past a concurrent in-flight invocation,
+// is covered by iora_test_logger_external_handler_race T9(b) ("worker self-call
+// DEFERS past a concurrent flush invocation").
 
 // ── (b) SYNC-mode two concurrent log() self-clears (no worker/flush). The handler
-//    is invoked under runHandlerUnlocked on each logging thread. ────────────────
-TEST_CASE("sync-mode two concurrent log() self-clears both drain — no deadlock",
+//    is invoked under runHandlerUnlocked on each logging thread; both DEFER and
+//    return. MUTATION: drain-instead-of-defer -> the two pinned self-clears deadlock.
+TEST_CASE("sync-mode two concurrent log() self-clears both defer — no deadlock",
           "[logger][deadlock][b][sync]")
 {
   for (int i = 0; i < kLoopIters; ++i)
@@ -302,10 +243,11 @@ TEST_CASE("sync-mode two concurrent log() self-clears both drain — no deadlock
 }
 
 // ── (c) single-level self-clear (depth 1) with ONE concurrent non-self invocation
-//    in flight. Exercises the depth-1 frozen path with a peer present. NOTE:
-//    depth>=2 is UNREACHABLE (all dispatch sites gate handlerReentryDepth()==0),
-//    so no depth>=2 test exists; the frozen+=depth generality is defensive-only. ─
-TEST_CASE("single self-clear with a concurrent non-self invocation both drain",
+//    in flight. The self-clear DEFERS and returns; the non-self peer, as the last
+//    in-flight invocation to drain, completes the deferred tear-out. NOTE: depth>=2
+//    is UNREACHABLE (all dispatch sites gate handlerReentryDepth()==0), so no
+//    depth>=2 test exists. ────────────────────────────────────────────────────────
+TEST_CASE("single self-clear defers while a concurrent non-self invocation drains",
           "[logger][deadlock][c]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
@@ -358,52 +300,39 @@ TEST_CASE("single self-clear with a concurrent non-self invocation both drain",
   }
 }
 
-// ── (d) EXTERNAL clearExternalHandler (depth 0) racing an in-flight self-clear.
-//    Discriminator for C-1: the self-tearer clears FIRST (so the gate is already
-//    null) and is held in flight; only THEN does the depth-0 caller run. A
-//    skip-based fix ("return if the gate is already null") returns immediately and
-//    the post-gate touch has not happened => the CHECK fails. The correct fix
-//    waits the genuine full drain inflight==0. ──────────────────────────────────
-TEST_CASE("external clear (depth 0) racing an ALREADY-self-cleared in-flight invocation",
+// ── (d) EXTERNAL clearExternalHandler (depth 0) racing an in-flight NON-self
+//    invocation. The depth-0 caller (its own frame is NOT pinned) must wait a
+//    genuine full drain inflight==0 before returning, so a [this]-capturing handler
+//    cannot have its captured object destroyed mid-invocation. Discriminator: the
+//    clear observes the invocation already EXITED on return. (The retired
+//    "already-self-cleared in-flight peer" half of this case is gone — a depth>0
+//    self-clear no longer parks; it defers, covered by (c) and T9(b).) A skip-based
+//    depth-0 fix that returned while the invocation was live would score false. ────
+TEST_CASE("external clear (depth 0) waits a full drain of a live non-self invocation",
           "[logger][deadlock][d][uaf]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
   auto target = makeTarget();
-  auto ctl = makeCtl();      // gate 1: hold the invocation before it self-clears
-  auto postClear = makeCtl(); // gate 2: hold it AFTER it self-cleared
+  auto ctl = makeCtl(); // holds a plain (non-self) invocation in flight
 
   Logger::setExternalHandler(
-    [target, ctl, postClear](Logger::Level, const std::string &, const std::string &)
-    {
-      target->touch();
-      ctl->onEnter();
-      if (ctl->waitReleased())
-      {
-        Logger::clearExternalHandler(); // self-tear-out: the gate is now NULL
-        postClear->onEnter();           // tell the test the gate is already null
-        postClear->waitReleased();      // ...and stay in flight while it acts
-      }
-      target->touch(); // post-gate access — must complete before ANY tear-out returns
-      ctl->onExit();
-    });
+    [target, ctl](Logger::Level, const std::string &, const std::string &)
+    { blockingHandlerBody(*ctl, target.get()); });
 
-  Logger::info("trigger"); // worker enters the self-clearing handler, blocks
+  Logger::info("trigger"); // worker enters the handler and parks
   REQUIRE(ctl->waitEntered(1));
-  ctl->releaseAll();
-  REQUIRE(postClear->waitEntered(1)); // the handler HAS self-cleared and is still running
 
   auto handlerDoneAtExternalClearReturn = makeFlag(); // by-value: may be DETACHED
   std::thread externalClear(
     [handlerDoneAtExternalClearReturn, ctl]
     {
-      // Depth 0 with the gate ALREADY null: must still block until the in-flight
-      // invocation exits (this is exactly what the rejected Option 1 would skip).
+      // Depth 0: must block until the in-flight invocation exits (full drain).
       Logger::clearExternalHandler();
       handlerDoneAtExternalClearReturn->store(ctl->exitedCount() >= 1);
     });
 
-  std::this_thread::sleep_for(50ms); // external clear must still be blocked
-  postClear->releaseAll();
+  std::this_thread::sleep_for(50ms); // external clear must still be blocked draining
+  ctl->releaseAll();
   const bool drained = ctl->waitExited(1);
   CHECK(drained);
 
@@ -411,7 +340,7 @@ TEST_CASE("external clear (depth 0) racing an ALREADY-self-cleared in-flight inv
   {
     externalClear.join();
     CHECK(handlerDoneAtExternalClearReturn->load()); // external clear waited full drain
-    CHECK(target->touches.load() == 2);
+    CHECK(target->touches.load() == 2); // blockingHandlerBody touches on enter + exit
     CHECK(target->canary.load() == 0x5A5A);
     teardownLogger();
   }
@@ -421,80 +350,19 @@ TEST_CASE("external clear (depth 0) racing an ALREADY-self-cleared in-flight inv
   }
 }
 
-// ── (e) self-clear racing a concurrent NON-self invocation on a 3rd thread. The
-//    self-clearer MUST wait for the non-self invocation to drain (it contributes
-//    to inflight but NOT to frozen). Discriminator for C-2 (a self-skip fix would
-//    tear out while the non-self invocation is still dereferencing its capture). ─
-TEST_CASE("self-clear waits for a concurrent non-self invocation to drain",
-          "[logger][deadlock][e][uaf]")
-{
-  Logger::init(Logger::Level::Info, "", /*async=*/true);
-  auto target = makeTarget();
-  auto selfCtl = makeCtl();
-  auto otherCtl = makeCtl();
-  auto useSelf = makeFlag(true);
-  auto otherExitedAtSelfClearReturn = makeFlag();
-
-  Logger::setExternalHandler(
-    [target, selfCtl, otherCtl, useSelf, otherExitedAtSelfClearReturn](
-      Logger::Level, const std::string &, const std::string &)
-    {
-      if (useSelf->exchange(false))
-      {
-        selfCtl->onEnter();
-        if (selfCtl->waitReleased())
-        {
-          Logger::clearExternalHandler(); // self-tear-out: must drain the non-self peer
-          otherExitedAtSelfClearReturn->store(otherCtl->exitedCount() >= 1);
-        }
-        selfCtl->onExit();
-      }
-      else
-      {
-        iora::test::blockingHandlerBody(*otherCtl, target.get());
-      }
-    });
-
-  Logger::info("1"); // handler #1 self-clearing (worker)
-  REQUIRE(selfCtl->waitEntered(1));
-  Logger::info("2");
-  std::thread flushThread([] { Logger::flush(); }); // handler #2 non-self
-  const bool otherIn = otherCtl->waitEntered(1);    // inflight == 2 (frozen will be 1)
-  CHECK(otherIn);
-  if (!otherIn)
-  {
-    selfCtl->releaseAll();
-    otherCtl->releaseAll();
-    joinOrDetach(false, {&flushThread});
-    return;
-  }
-
-  // Release the self-clearer and give it time to commit to its inflight==frozen
-  // wait (frozen==1, inflight==2) BEFORE releasing the non-self peer, so the
-  // self-clear must provably wait out the peer's drain (strengthens the C-2
-  // discriminator; mirrors the 50ms commit delay in (d)/(h)).
-  selfCtl->releaseAll();
-  std::this_thread::sleep_for(50ms);
-  otherCtl->releaseAll();
-  const bool selfDrained = selfCtl->waitExited(1);
-  const bool otherDrained = otherCtl->waitExited(1);
-  CHECK(selfDrained);
-  CHECK(otherDrained);
-
-  joinOrDetach(selfDrained && otherDrained, {&flushThread});
-  if (selfDrained && otherDrained)
-  {
-    CHECK(otherExitedAtSelfClearReturn->load()); // self-clear waited for the non-self peer
-    CHECK(target->touches.load() == 2);
-    teardownLogger();
-  }
-}
+// (e) RETIRED (tracker 2026-07-23-1): it asserted that a self-clear WAITS for a
+// concurrent non-self invocation to drain (the frozen-drain behavior). Depth>0
+// self-clears now DEFER (return without waiting); the non-self peer, as the last
+// in-flight invocation, completes the tear-out — asserted by (c). The depth-0
+// external-clear full-drain guarantee is asserted by (d).
 
 // ── (f) self-SWAP setExternalHandler concurrency: two in-flight invocations each
-//    self-swap to a new handler B. Both drain (no deadlock) AND handler B is the
-//    installed handler afterwards. Discriminator for H-1 (a skip-based set would
-//    fail to install). ─────────────────────────────────────────────────────────
-TEST_CASE("two self-swapping setExternalHandler invocations drain and install B",
+//    self-swap to a new handler B. Both DEFER (no deadlock) AND the DEFERRED SET
+//    installs handler B once in-flight drains. Discriminator for the mechanism-B
+//    data model (H1): a bool-only "pending tear-out" that dropped `pendingInstall`
+//    would degrade the deferred SET into an UNINSTALL — B never installed, bCalls
+//    stays 0. ──────────────────────────────────────────────────────────────────
+TEST_CASE("two self-swapping setExternalHandler invocations defer and install B",
           "[logger][deadlock][f]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
@@ -544,9 +412,10 @@ TEST_CASE("two self-swapping setExternalHandler invocations drain and install B"
   }
 }
 
-// ── (g) N>=3 concurrent self-clearers (worker + 2 flushes). Stresses the frozen-
-//    count resolution for >2 parkers. ──────────────────────────────────────────
-TEST_CASE("N=3 concurrent self-clearing invocations all drain — no deadlock",
+// ── (g) N>=3 concurrent self-clearers (worker + 2 flushes). All three DEFER and
+//    return; the last to drain completes the tear-out. Stresses the deferral under
+//    >2 concurrent depth>0 tear-outs (the case the retired frozen count handled). ─
+TEST_CASE("N=3 concurrent self-clearing invocations all defer — no deadlock",
           "[logger][deadlock][g]")
 {
   for (int i = 0; i < kLoopIters; ++i)
@@ -631,20 +500,15 @@ TEST_CASE("external set (depth 0) racing an in-flight invocation drains before i
   }
 }
 
-// ── (i) concurrent clear vs set tear-out. Both invocations are in flight; the
-//    CLEAR is released first and given time to commit to its park, so the SET
-//    self-catches (frozen==inflight) and installs B without ever parking.
-//    HANDLER B ALWAYS WINS, in either entry order — asserted unconditionally:
-//      * set enters second -> it self-catches and installs B; the parked clear
-//        nulled the gate at ENTRY (before registering frozen) and never re-nulls
-//        on wake, so B survives.
-//      * set enters first  -> the clear is the parked one, so the set's install is
-//        the LAST write to externalHandler; B survives.
-//    "Clear wins" would need the set to complete before the clear enters, which
-//    needs the set not to park, which needs the clear already frozen —
-//    contradiction. So a conditional assertion here would silently accept a
-//    skip-based regression that never installs B.
-TEST_CASE("concurrent self-clear vs self-set both drain and set's handler wins",
+// ── (i) concurrent self-clear vs self-set tear-out, both DEFERRED. The CLEAR is
+//    released first and its deferral recorded first (pendingInstall=null); the SET
+//    is released second and its deferral SUPERSEDES it (LAST-WRITER-WINS —
+//    pendingInstall=B, the superseded null carried out via `doomed`). When in-flight
+//    drains, the deferred fire installs B. HANDLER B WINS because the set's deferral
+//    is the last write to the pending request; a mechanism that let the earlier
+//    clear win, or that dropped the superseded pending, would fail the "B receives"
+//    assertion. ────────────────────────────────────────────────────────────────
+TEST_CASE("concurrent self-clear vs self-set both defer and set's handler wins",
           "[logger][deadlock][i]")
 {
   for (int i = 0; i < kSlowLoopIters; ++i)
@@ -700,9 +564,9 @@ TEST_CASE("concurrent self-clear vs self-set both drain and set's handler wins",
       break;
     }
 
-    // Release the CLEAR first and let it commit to its tear-out park (frozen==1,
-    // inflight==2) before releasing the SET, so the set deterministically takes
-    // the self-catch path. Same commit-delay idiom as (d)/(e)/(h).
+    // Release the CLEAR first so its deferral is recorded BEFORE the SET's, then
+    // release the SET: the set's deferral SUPERSEDES the clear (last-writer-wins ->
+    // B installed when in-flight drains). Same commit-delay idiom as (h).
     clearCtl->releaseAll();
     std::this_thread::sleep_for(50ms);
     setCtl->releaseAll();
@@ -733,12 +597,14 @@ TEST_CASE("concurrent self-clear vs self-set both drain and set's handler wins",
   }
 }
 
-// ── (k) DEPTH>0 TEARDOWN with a parked peer — the shape that deadlocked at
-//    worker.join() when the teardown thread's frozen registration was released at
-//    the end of its wait instead of being held across the join. The worker parks
-//    in its own self-clear; a second invocation calls Logger::shutdown() from
-//    INSIDE the handler (depth 1, its own frame pinned). shutdown() must RETURN. ─
-TEST_CASE("shutdown() from inside a handler with a peer parked in its own tear-out returns",
+// ── (k) DEPTH>0 TEARDOWN — shutdown() from INSIDE a handler (depth 1, its own frame
+//    pinned across the worker join) is the SOLE depth>0 waiter under mechanism B: it
+//    drains to inflight == handlerReentryDepth() (its own frame), never inflight==0,
+//    so it does not wait on itself. A concurrent worker invocation self-clears
+//    (DEFERS — it no longer parks), then exits; shutdown() must RETURN, bounded well
+//    below the 5s stall backstop, and the DEBUG parker guard must see exactly one
+//    depth>0 teardown. ─────────────────────────────────────────────────────────────
+TEST_CASE("shutdown() from inside a handler (depth>0 teardown) returns while a peer self-clears",
           "[logger][deadlock][k][teardown]")
 {
   for (int i = 0; i < kSlowLoopIters; ++i)
@@ -789,8 +655,8 @@ TEST_CASE("shutdown() from inside a handler with a peer parked in its own tear-o
       break;
     }
 
-    // Release the worker into its self-clear park FIRST, then let the peer call
-    // shutdown() while the worker is parked — the deadlock shape.
+    // Release the worker into its self-clear (which DEFERS and exits) FIRST, then
+    // let the peer call shutdown() from inside its own handler frame (depth 1).
     workerCtl->releaseAll();
     std::this_thread::sleep_for(20ms);
     const auto teardownStart = std::chrono::steady_clock::now();
@@ -799,8 +665,8 @@ TEST_CASE("shutdown() from inside a handler with a peer parked in its own tear-o
     // NOTE: kMaxTeardown is deliberately far BELOW the production stall backstop
     // (kStallReportInterval, 5s). If they were equal, a path that only unblocks
     // when the backstop fires would pass by clock luck and the test would MASK
-    // the stall instead of exposing it — which is exactly what happened before the
-    // park-site notify was added (every iteration silently cost 5.0s).
+    // the stall instead of exposing it. The depth>0 teardown drains to
+    // inflight==depth, so it must complete promptly, not wait out the backstop.
     constexpr auto kMaxTeardown = std::chrono::seconds(2);
     const bool teardownDrained = teardownCtl->waitExited(1, kMaxTeardown);
     CHECK(teardownDrained);
@@ -951,18 +817,25 @@ TEST_CASE("sync-mode capture destructor logging at uninstall runs unlocked and t
 //            dispatch copy, so the capture dtor runs at `doomed` destruction on the
 //            clearer's thread at depth 0, unlocked, AFTER the drain; its re-entrant
 //            clear finds the member already null and returns.
-//      (l3b) SELF tear-out: the handler body self-clears first (nulling the member),
-//            so the dispatch copy becomes last-ref and the dropper destroys the
-//            capture at reentry-depth >= 1 — its re-entrant clear must take the
-//            self-tearer branch (inflight==frozen).
+//      (l3b) SELF tear-out: the handler body self-clears first (deferring, nulling
+//            the member), so the dispatch copy becomes last-ref and the dropper
+//            destroys the capture at reentry-depth >= 1 — its re-entrant clear must
+//            take the DEFER branch (nullGateAndDeferLocked), not the depth-0 DRAIN
+//            branch on its own pinned frame (inflight==0, unsatisfiable → hang).
 //    Both are BOUNDED on the flag of the thread that can hang, so a regression is a
 //    FAILED CHECK, never a wedged join.
 namespace
 {
 struct ClearingOnDestroy
 {
-  std::shared_ptr<std::atomic<bool>> armed; // set only AFTER installation
-  std::shared_ptr<std::atomic<bool>> cleared;
+  std::shared_ptr<std::atomic<bool>> armed;   // set only AFTER installation
+  std::shared_ptr<std::atomic<bool>> cleared; // set BEFORE the clear (the dtor ran)
+  // set AFTER the clear RETURNS — the real hang discriminator. `cleared` alone is an
+  // ABSOLUTE (set by the same statement that precedes the risky call), so it stays
+  // true even when the clear wedges; a case that waits on `cleared` cannot fail
+  // bounded on its own mutation. Wait on `clearReturned` (a DELTA past the risky
+  // call) instead. Optional (null for cases that don't need it, e.g. l3a).
+  std::shared_ptr<std::atomic<bool>> clearReturned;
   ~ClearingOnDestroy()
   {
     // ARMED-gated: the temporary built at the setExternalHandler call site is
@@ -971,6 +844,10 @@ struct ClearingOnDestroy
     if (armed && armed->load() && !cleared->exchange(true))
     {
       Logger::clearExternalHandler(); // re-entrant tear-out from a capture dtor
+      if (clearReturned)
+      {
+        clearReturned->store(true); // reached ONLY if the clear did not wedge
+      }
     }
   }
 };
@@ -1031,29 +908,30 @@ TEST_CASE("(l3a) capture destructor clears at the EXTERNAL tear-out (doomed, dep
   teardownLogger();
 }
 
-TEST_CASE("(l3b) capture destructor clears at the DROPPER (depth >= 1, self-tearer) — no deadlock",
+TEST_CASE("(l3b) capture destructor clears at the DROPPER (depth >= 1) DEFERS — no deadlock",
           "[logger][deadlock][l3b][uaf]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
   auto ctl = makeCtl();
   auto armed = makeFlag();
   auto cleared = makeFlag();
+  auto clearReturned = makeFlag(); // set AFTER the dtor's clear returns (the real
+                                   // discriminator — see ClearingOnDestroy)
   auto handlerDone = makeFlag();
 
-  // The BODY self-clears after release (depth 1) — nulling the member so the
-  // dispatch copy becomes the last reference — AND the capture ALSO clears in its
+  // The BODY self-clears after release (depth 1, deferring) — nulling the member so
+  // the dispatch copy becomes the last reference — AND the capture ALSO clears in its
   // dtor. On body return the dropper destroys the capture at depth >= 1; that
-  // re-entrant clear must take the self-tearer branch (inflight==frozen), not the
-  // depth-0 external branch on its own pinned frame.
+  // re-entrant clear must take the DEFER branch (nullGateAndDeferLocked), not the
+  // depth-0 DRAIN branch on its own pinned frame.
   Logger::setExternalHandler(
-    [probe = ClearingOnDestroy{armed, cleared}, ctl, handlerDone](Logger::Level,
-                                                                  const std::string &,
-                                                                  const std::string &)
+    [probe = ClearingOnDestroy{armed, cleared, clearReturned}, ctl, handlerDone](
+      Logger::Level, const std::string &, const std::string &)
     {
       ctl->onEnter();
       if (ctl->waitReleased())
       {
-        Logger::clearExternalHandler(); // self-tear from the BODY (depth 1)
+        Logger::clearExternalHandler(); // self-tear from the BODY (depth 1) -> DEFERS
       }
       ctl->onExit();
       handlerDone->store(true);
@@ -1071,14 +949,18 @@ TEST_CASE("(l3b) capture destructor clears at the DROPPER (depth >= 1, self-tear
   ctl->releaseAll();
 
   // The capture dtor runs on the WORKER at the dropper AFTER the body returns; if it
-  // took the wrong (depth-0) branch it would wait inflight==0 on its own pinned
-  // frame and the worker would wedge — cleared never set. Bounded on the worker's
-  // own effect (cleared), so a regression is a FAILED CHECK.
-  const bool clearedRan = waitFor([cleared] { return cleared->load(); });
+  // took the wrong (depth-0 DRAIN) branch its re-entrant clear would wait inflight==0
+  // on the worker's own still-pinned frame and the worker would wedge. The
+  // discriminator is `clearReturned` (set AFTER the dtor's clear returns): a wedged
+  // clear leaves it false -> bounded FAIL. `cleared` alone is set BEFORE the clear so
+  // it cannot discriminate the hang. teardownLogger() is gated on clearReturned: if
+  // the worker wedged, a main-thread depth-0 clear would itself hang on inflight==0.
+  const bool clearReturnedOk = waitFor([clearReturned] { return clearReturned->load(); });
   const bool handlerReturned = waitFor([handlerDone] { return handlerDone->load(); });
-  CHECK(handlerReturned); // body's own self-clear did not hang
-  CHECK(clearedRan);      // capture dtor's clear at the dropper took the self-tearer branch
-  if (!clearedRan || !handlerReturned)
+  CHECK(cleared->load());     // the clearing capture dtor really ran
+  CHECK(handlerReturned);     // body's own self-clear did not hang
+  CHECK(clearReturnedOk);     // capture dtor's clear at the dropper DEFERRED (did not wedge)
+  if (!clearReturnedOk || !handlerReturned)
   {
     return; // worker may be wedged; do NOT teardown (would hang) — FAIL already recorded
   }
@@ -1179,55 +1061,66 @@ TEST_CASE("worker lifecycle: re-init after shutdown drains again; double shutdow
   }
 }
 
-// ── (j) THROWING self-tearer with a concurrent parked peer: the worker-driven
-//    invocation self-clears then THROWS, exercising runHandlerUnlocked's catch
-//    path (relock / --inflight / notify_all / rethrow). The catch-path decrement
-//    must still release the concurrent (flush) self-clearer. The worker swallows
-//    the exception (no std::terminate); the flush handler does NOT throw (flush()
-//    would rethrow to the flush thread). ───────────────────────────────────────
-TEST_CASE("throwing self-tearer still drains a concurrent parked peer (catch path)",
+// ── (j) THROWING self-tearer: a handler self-SETS to B (deferred, depth 1) and then
+//    THROWS. It is the SOLE in-flight invocation, so its runHandlerUnlocked CATCH
+//    path is the last decrement (inflight -> 0) — the deferred SET must fire THERE,
+//    on the catch/rethrow decrement, not only on the normal path. The worker
+//    swallows the exception (no std::terminate); afterwards B must be installed and
+//    receiving. MUTATION: fire the deferred tear-out only on the normal decrement
+//    (not the catch path) -> B is never installed -> bCalls stays 0. ──────────────
+TEST_CASE("throwing self-setter's deferred SET fires on the catch/rethrow path",
           "[logger][deadlock][j]")
 {
-  for (int i = 0; i < kLoopIters; ++i)
+  for (int i = 0; i < kSlowLoopIters; ++i)
   {
     Logger::init(Logger::Level::Info, "", /*async=*/true);
     auto ctl = makeCtl();
-    auto throwOnFirst = makeFlag(true);
+    auto bCalls = makeCounter();
+    auto handlerB = [bCalls](Logger::Level, const std::string &, const std::string &)
+    { bCalls->fetch_add(1); };
+
     Logger::setExternalHandler(
-      [ctl, throwOnFirst](Logger::Level, const std::string &, const std::string &)
+      [ctl, handlerB](Logger::Level, const std::string &, const std::string &)
       {
-        const bool doThrow = throwOnFirst->exchange(false); // only the first (worker) throws
         ctl->onEnter();
         if (ctl->waitReleased())
         {
-          Logger::clearExternalHandler(); // self-tear-out (both invocations)
+          Logger::setExternalHandler(handlerB); // depth 1 -> DEFERS a SET of B
         }
         ctl->onExit();
-        if (doThrow)
-        {
-          throw std::runtime_error("self-tearer throws after clear");
-        }
+        throw std::runtime_error("self-setter throws after deferring the swap");
       });
 
-    Logger::info("1"); // worker -> handler #1 (will throw after self-clear)
+    Logger::info("1"); // worker -> sole invocation (will throw after deferring)
     REQUIRE(ctl->waitEntered(1));
-    Logger::info("2");
-    std::thread flushThread([] { Logger::flush(); }); // handler #2 (no throw)
-    const bool bothIn = ctl->waitEntered(2);          // inflight == 2
-    CHECK(bothIn);
-    if (!bothIn)
+    ctl->releaseAll();
+    const bool drained = ctl->waitExited(1); // invocation exited (threw; worker swallows)
+    CHECK(drained);
+    if (!drained)
     {
-      ctl->releaseAll();
-      joinOrDetach(false, {&flushThread});
       break;
     }
 
-    ctl->releaseAll();
-    const bool drained = ctl->waitExited(2); // both must drain despite the throw
-    CHECK(drained);
-
-    joinOrDetach(drained, {&flushThread});
-    if (!drained)
+    // The catch-path decrement drives inflight to 0 and must FIRE the deferred SET,
+    // installing B. onExit() (which waitExited observes) fires BEFORE the throw, so
+    // the install happens slightly AFTER we resume — poll (log + flush) until B
+    // receives. Before B is installed a probe takes the normal sink; once installed
+    // it reaches B. MUTATION (no catch-path fire): B is never installed, every probe
+    // misses -> bReceived stays false.
+    bCalls->store(0);
+    bool bReceived = false;
+    for (int t = 0; t < 400 && !bReceived; ++t)
+    {
+      Logger::info("probe");
+      Logger::flush();
+      bReceived = bCalls->load() >= 1;
+      if (!bReceived)
+      {
+        std::this_thread::sleep_for(5ms);
+      }
+    }
+    CHECK(bReceived); // false => the deferred SET did not fire on the catch path
+    if (!bReceived)
     {
       break;
     }

@@ -70,8 +70,10 @@ ThreadPool &generalAsyncPool()
 // whose ~dtor calls Logger::clearExternalHandler(), the documented teardown
 // pattern (scenario 2, a static-destruction-ORDER bug: [basic.start.term] would
 // otherwise destroy this singleton FIRST and the later destructor would lock a
-// destroyed mutex); and (2) any self-tearer still parked on externalHandlerDone
-// when std::exit() runs static destructors from inside a handler (scenario 1).
+// destroyed mutex); and (2) the depth>0 teardown parked on externalHandlerDone when
+// std::exit() runs atexit/static destructors from inside a handler (scenario 1;
+// under mechanism B a self-clear/set DEFERS rather than parks — the teardown is the
+// sole depth>0 parker).
 // This mirrors how the C++ runtime keeps the objects backing std::cout/std::cerr
 // alive (std::ios_base::Init) so they outlive user statics that log at teardown.
 // Do NOT revert to `static LoggerData data;` and do NOT delete this pointer — that
@@ -127,9 +129,10 @@ Logger::LoggerData &Logger::getData()
 }
 #endif
 
-// Single definition of the handler-reentrancy depth (R-12). The frozen-inflight
-// tear-out drain branches on this, so it MUST be one instance process-wide —
-// including across dlopen'd plugins, which are loaded RTLD_LOCAL.
+// Single definition of the handler-reentrancy depth (R-12). The tear-out DEFER
+// decision and the drain predicate (inflight == depth) branch on this, so it MUST
+// be one instance process-wide — including across dlopen'd plugins loaded
+// RTLD_LOCAL.
 int &Logger::handlerReentryDepth()
 {
   static thread_local int depth = 0;

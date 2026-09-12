@@ -5,15 +5,16 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 //
 // Tests for Logger external-handler tear-out synchronization (tracker 2026-05-08-1).
-// clearExternalHandler / setExternalHandler must DRAIN any in-flight async handler
-// invocation (runWorker + concurrent flush()) before returning, so a handler that
-// captures [this]/[obj] cannot have its captured object destroyed mid-invocation
-// (use-after-free). Idempotent of the worker-vs-flush count (can exceed 1); a
-// self-tearing invocation waits the LIVE predicate inflight==externalHandlerFrozen
-// (drains every NON-frozen invocation, not its own pinned frames, and not peers
-// equally parked in a tear-out — tracker 2026-07-21-3), while an external (depth-0)
-// caller waits a genuine full drain inflight==0; a throwing handler is swallowed on
-// the worker (no std::terminate) and rethrown by flush().
+// A DEPTH-0 clearExternalHandler / setExternalHandler must DRAIN any in-flight async
+// handler invocation (runWorker + concurrent flush()) before returning, so a handler
+// that captures [this]/[obj] cannot have its captured object destroyed mid-invocation
+// (use-after-free). Idempotent of the worker-vs-flush count (can exceed 1); a depth-0
+// caller waits a genuine full drain inflight==0. A DEPTH>0 self-tearing invocation
+// (a handler clearing/swapping itself) CANNOT wait on its own pinned frame, so since
+// tracker 2026-07-23-1 it DEFERS: it nulls the gate and returns immediately, and the
+// LAST in-flight invocation to drain completes the tear-out on its way out
+// (mechanism B — the frozen-inflight accounting was retired). A throwing handler is
+// swallowed on the worker (no std::terminate) and rethrown by flush().
 //
 // FORCED RENDEZVOUS: every race test blocks the handler on a gate and drives the
 // tear-out only after the handler has provably entered its window — never a timing
@@ -449,26 +450,28 @@ TEST_CASE("handler self-calling clearExternalHandler does not deadlock (sole in-
 }
 
 // ── T9(b): worker self-call WHILE a concurrent flush invocation is live must
-//    BLOCK until the flush invocation exits. The self-tearer waits the LIVE
-//    predicate inflight==externalHandlerFrozen; the flush invocation is NOT
-//    frozen (it never tears out), so it must be drained. With a skip-based fix
-//    the self-call returns early and the assertion fails. ──────────────────────
-TEST_CASE("worker self-call waits for a concurrent flush invocation to drain",
-          "[logger_race][selfcall][concurrent]")
+//    DEFER (mechanism B, tracker 2026-07-23-1): the depth>0 self-clear nulls the
+//    gate and RETURNS IMMEDIATELY — it does NOT wait on the still-blocked flush
+//    invocation (its own frame is pinned; waiting would deadlock). The tear-out is
+//    completed by the LAST in-flight invocation (the flush) on its way out.
+//    MUTATION: make the depth>0 clear WAIT (drain to inflight==depth) and this
+//    hangs on the still-blocked flush -> selfClearReturnedPromptly stays false. ──
+TEST_CASE("worker self-call DEFERS past a concurrent flush invocation (mechanism B)",
+          "[logger_race][selfcall][concurrent][deferred]")
 {
   Logger::init(Logger::Level::Info, "", /*async=*/true);
   auto target = makeTarget();
-  // SEPARATE gates so the self-clearer can be committed to its wait BEFORE the
-  // flush invocation is allowed to exit. A single shared gate releases both at
-  // once, which lets `flushExitedAtSelfClear` read true by luck even under a
-  // skip-based (rejected) implementation — a non-discriminating test.
+  // SEPARATE gates so the self-clearer is released and its return observed BEFORE
+  // the flush invocation is allowed to exit. That ordering is the whole
+  // discriminator: a deferring self-clear returns while flush is STILL BLOCKED; a
+  // draining (rejected) one would not.
   auto selfCtl = makeCtl();
   auto flushCtl = makeCtl();
   auto which = makeCounter();
-  auto flushExitedAtSelfClear = makeFlag();
+  auto selfClearReturnedPromptly = makeFlag();
 
   Logger::setExternalHandler(
-    [target, selfCtl, flushCtl, which, flushExitedAtSelfClear](
+    [target, selfCtl, flushCtl, which, selfClearReturnedPromptly](
       Logger::Level, const std::string &, const std::string &)
     {
       if (which->fetch_add(1) == 0)
@@ -478,14 +481,17 @@ TEST_CASE("worker self-call waits for a concurrent flush invocation to drain",
         selfCtl->onEnter();
         if (selfCtl->waitReleased())
         {
-          Logger::clearExternalHandler(); // must drain the non-frozen flush invocation
-          flushExitedAtSelfClear->store(flushCtl->exitedCount() >= 1);
+          // DEFERRED: returns without draining the still-blocked flush invocation.
+          // Record that it returned while the flush is provably still in-flight.
+          Logger::clearExternalHandler();
+          selfClearReturnedPromptly->store(flushCtl->exitedCount() == 0);
         }
         selfCtl->onExit();
       }
       else
       {
-        // flush invocation: a plain blocking body (never tears out -> not frozen).
+        // flush invocation: a plain blocking body. As the LAST invocation to drain,
+        // it is the one that completes the deferred tear-out on its way out.
         iora::test::blockingHandlerBody(*flushCtl, target.get());
       }
     });
@@ -505,24 +511,32 @@ TEST_CASE("worker self-call waits for a concurrent flush invocation to drain",
     return;
   }
 
-  // Release the self-clearer FIRST and give it time to commit to its drain wait,
-  // then release the flush invocation: the self-clear must provably wait it out.
+  // Release the self-clearer and WAIT for it to exit WHILE the flush is still
+  // blocked: a deferring self-clear returns immediately (its onExit fires); a
+  // draining one would be stuck inside clearExternalHandler until we release flush.
   selfCtl->releaseAll();
-  std::this_thread::sleep_for(50ms);
-  flushCtl->releaseAll();
-
-  const bool flushDrained = flushCtl->waitExited(1);
   const bool selfDrained = selfCtl->waitExited(1);
+  CHECK(selfDrained); // deferring: returns without the flush having been released
+  if (!selfDrained)
+  {
+    flushCtl->releaseAll();
+    flushThread.detach();
+    return;
+  }
+
+  // Now release the flush invocation; as the last in-flight it completes the
+  // deferred tear-out.
+  flushCtl->releaseAll();
+  const bool flushDrained = flushCtl->waitExited(1);
   CHECK(flushDrained);
-  CHECK(selfDrained);
-  iora::test::joinOrDetach(flushDrained && selfDrained, {&flushThread});
-  if (!(flushDrained && selfDrained))
+  iora::test::joinOrDetach(flushDrained, {&flushThread});
+  if (!flushDrained)
   {
     return;
   }
 
-  CHECK(flushExitedAtSelfClear->load()); // self-call observed the flush invocation drained
-  CHECK(target.use_count() == 1); // no handler copy survives the tear-out
+  CHECK(selfClearReturnedPromptly->load()); // self-clear returned before flush drained
+  CHECK(target.use_count() == 1); // no handler copy survives the completed tear-out
   target.reset();
   Logger::shutdown();
 }
