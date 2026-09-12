@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.1 |
-| **Date** | 2026-09-12 |
+| **Version** | 1.2 |
+| **Date** | 2026-09-13 |
 | **Status** | IMPLEMENTED |
 | **Headers** | `include/iora/network/http_server.hpp` (HttpServer + routing), `include/iora/network/webhook_server.hpp` (WebhookServer) |
 | **Namespace** | `iora::network` |
@@ -17,6 +17,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.2 | 2026-09-13 | **`quiesceTransport()` drain hardening (iora `2026-09-11-22`).** The pool drain (step 5) no longer caps at 2 s and abandons: it is now **unbounded to `getInFlightCount() == 0`** (the pool's single-critical-section in-flight count, replacing the two-sample `getPendingTaskCount()`/`getActiveThreadCount()` read that admitted the pop->`++_activeThreads` TOCTOU), closing the residual use-after-free where a worker past the 2 s cap dereferenced a destroyed derived member (e.g. `WebhookServer::_jsonConfig`). A `protected virtual drainDeadline()` (default 30 s) backs it with a **fatal-abort circuit breaker** -- past the deadline it writes to stderr and `std::abort()`s (a core dump instead of a silent hang or a UAF; every timed-path diagnostic is a direct stderr write, never the async Logger). Applies uniformly to public `stop()` and every subclass dtor. Doc: `stop()`/`quiesceTransport()`/`quiesceTransportNoexcept()` may abort; `noexcept` stops an exception escaping, not `abort()`; a `stop()`/destroy call from within a handler self-deadlocks. Known-limitation 2 s-drain-cap entry moved to RESOLVED with the generalized LT-8 rule. |
 | 1.1 | 2026-09-12 | **Re-sync to landed fixes (iora `e00906e` / `475ffb2` / `c2b332e`).** Request framing hardened: chunked request bodies are now **de-chunked** before delivery (`HttpRequest::fromWireFormat` -> `decodeChunkedRequestBody`), so handlers and `WebhookServer::onJsonPost` see the decoded payload; the framer (`findChunkedRequestEnd`) now reaches the SAME framing verdict as the strict parser (conflicting (differing-value) duplicate `Content-Length`, `CL`+`TE`, non-final chunked coding, and invalid/out-of-range `Content-Length` all poison the connection with 400 + close), parses chunk-size as `1*HEXDIG` with subtraction bounds (no `size_t` wrap), uses the token-aware `detail::isChunkedFinalCoding` for chunked detection, and enforces the 10 MB body cap on the decoded chunked length (413). Connection management: the `Connection` header is parsed as a comma-separated token list (`connectionListHasToken`, RFC 9110 §7.6.1) and repeated `Connection` field-lines combine; RFC 9112 §9.3 version-aware persistence is computed on the per-request **worker-stack local** (HTTP/1.0 defaults to close) -- the shared `SessionInfo.connectionKeepAlive` / `SessionInfo.httpVersion` fields were **removed** (a pipelined-sibling race). Response: repeated `Set-Cookie` via `Response::add_cookie` / `HttpResponse::setCookies` (separate field-lines, RFC 6265 §3, CR/LF/NUL-guarded); a bare query key with no `=` now stores an empty value. Teardown: the subclass-quiesce invariant (`quiesceTransport` / `quiesceTransportNoexcept` + `onUpgradedClose`) is documented. Corrected the fabricated `explicit` on the `HttpServer`/`WebhookServer` constructors and the `WebhookServer` "defaulted destructor" claim; added 413/414/505 to the parse-error status set; documented the `Date` synthesis in `toWireFormat`. Still-open items retagged with tracker refs. |
 | 1.0 | 2026-09-11 | **Consolidated guide.** Folds the former `http_server.md` (v3.0, 2026-09-06) and `http_routing.md` (v1.0.0, 2026-05-30) into one document under `docs/network/`, and re-verified every claim against the current headers. Corrected drift: `_transport` is a `std::shared_ptr<Transport>` created by the `Transport::tcp()` factory (S-3), not a `std::unique_ptr`; added the `setIdleTimeout`/`setGcInterval` accessors and the `_idleTimeout` (600 s) / `_gcInterval` (5 s) fields and their `start()`-time transport config; documented the `bool headersOnly` parameter on `sendErrorResponse`; expanded the `getStatusText` table to the real code set; and recorded that several formerly-tracked limitations are now closed in source (unguarded `handleIncomingData` closes, unsupported-method 501). Newly reported code findings: undecoded chunked request bodies, the chunked/`Content-Length` body-cap asymmetry, the dead `MAX_PENDING_REQUESTS` constant and the hard-coded `1024` in the overload log, and the never-populated HTTP/1.0 / keep-alive session fields. |
 
@@ -225,10 +226,23 @@ idempotent `quiesceTransport()`, which performs the carefully staged graceful sh
    `onUpgradedClose` (which takes a subclass `_wsMutex`), and a peer thread holding `_wsMutex` and
    waiting on `_mutex` (the documented `_wsMutex -> _mutex` send order) would close a 3-way deadlock.
 4. Under `_sessionMutex` only, clear `_sessionInfo`.
-5. **Holding no `_mutex`**, wait up to 2 s for the thread pool to drain
-   (`getPendingTaskCount` / `getActiveThreadCount`), polling every 50 ms; on timeout it logs a
-   warning and forces on. `_mutex` must not be held here either, because an in-flight worker re-acquires
-   `_mutex` for its `sendRaw`/`closeSession`/deferred-close.
+5. **Holding no `_mutex`**, drain the thread pool to quiescence, polling
+   `_threadPool.getInFlightCount()` (a single-critical-section read of queue depth + workers past the
+   pop, under one pool-mutex hold) every 50 ms until it reaches 0. This is the **single-sample**
+   predicate -- **not** the old two-sample `getPendingTaskCount() || getActiveThreadCount()` read, which
+   admitted the pop->`++_activeThreads` TOCTOU (a worker popped-but-not-yet-counted was invisible to
+   both). `_mutex` must not be held here either, because an in-flight worker re-acquires `_mutex` for its
+   `sendRaw`/`closeSession`/deferred-close. The drain is **unbounded** (it must not return while a worker
+   is still in a handler that may deref a soon-destroyed derived member -- the residual UAF this closes),
+   guarded by a **fatal-abort circuit breaker**: past `drainDeadline()` (a `protected virtual`, default
+   30 s) it writes a fatal diagnostic to **stderr** and calls `std::abort()` -- a core dump rather than a
+   silent hang or a use-after-free (C++ cannot force-cancel a wedged `std::thread`; a never-returning
+   handler would already hang the later unconditional `~ThreadPool` join). Every diagnostic on the timed
+   drain->abort path is a direct `stderr` write, never the async `Logger` (whose `data.mutex` a wedged
+   handler could hold, blocking the drain before the abort); the clock is captured after the last
+   pre-loop log. A one-time "handlers are slow" warning is emitted (also via stderr) at `min(2 s,
+   deadline/2)`. Sound only while the transport-driven `_threadPool.tryEnqueue` (in `processHttpRequest`)
+   is the **sole** enqueuer.
 6. Re-acquire `_mutex` and `_transport.reset()`.
 
 **Subclass-quiesce teardown invariant (WS-TS1/WS-TS2).** `~HttpServer` runs only *after* a subclass's
@@ -239,8 +253,17 @@ destructor** -- `WebSocketServer` and `WebhookServer` do (`WebhookServer::~Webho
 noexcept wrapper `quiesceTransportNoexcept("~WebhookServer")` before `_jsonConfig` is destroyed). The
 base `~HttpServer` then calls `stop()`, whose `quiesceTransport()` early-outs (nothing left to
 quiesce). `quiesceTransportNoexcept(who)` centralizes the swallow-and-log so a throwing quiesce
-(logging/engine-stop can allocate) never escapes a noexcept destructor. This invariant is bounded, not
-absolute -- see Known Limitations (`2026-09-11-22`) for the 2 s-drain-cap residual.
+(logging/engine-stop can allocate) never escapes a noexcept destructor -- but note the wrapper stops an
+**exception** escaping, **not** `std::abort()`: a handler wedged past `drainDeadline()` aborts the
+process through the wrapper. The unbounded drain (step 5) makes this invariant **absolute** for the
+memory-safety guarantee -- `quiesceTransport()` returns only once `getInFlightCount() == 0`, so on return
+no worker is still reading a derived member (`getInFlightCount() == 0` provably dominates every handler's
+member access: the pool destroys the task functor before the `seq_cst --_busyThreads` the drain's acquire
+read pairs with). The residual case is instead the wedged-handler fail-fast: past the deadline the
+process aborts rather than destroy members under a live worker. **Do not** call `stop()`/destroy the
+server from within one of its own request handlers -- the calling worker counts itself in-flight, so the
+drain can never reach 0 and aborts at the deadline (a self-deadlock; accurate diagnostic tracked in
+`2026-09-12-10`).
 
 Handlers should poll `getShutdownChecker().isShuttingDown()` (a `ShutdownChecker` holding a
 `const std::atomic<bool>&`) in long loops and return early with a 503. The virtual base destructor calls
@@ -988,7 +1011,7 @@ code falls back to its RFC 9110 §15 class phrase (`Informational` / `Successful
 | Size caps + `tryEnqueue` 503 backpressure | 1 MB buffer / 64 KB header / 10 MB body; bounded pool | Slow-loris / oversized-request / queue-flood DoS resistance. |
 | Copy-then-release before virtuals | `_sessionMutex` released before `onUpgradedData` | Prevents ABBA deadlock when an override re-enters transport/session state. |
 | Capture-only send completions + deferred close | Enqueue under `_mutex`, close after release | The engine fires completions synchronously under the held lock; re-locking would recursive-deadlock. |
-| `stop()` narrowed off the drain loop | `_mutex` not held across the 2 s pool drain | An in-flight worker's deferred close (and the I/O-thread `onUpgradedClose` taking `_wsMutex`) would otherwise deadlock shutdown. |
+| `stop()` narrowed off the drain loop | `_mutex` not held across the (unbounded) pool drain | An in-flight worker's deferred close (and the I/O-thread `onUpgradedClose` taking `_wsMutex`) would otherwise deadlock shutdown. |
 | Subclass-quiesce teardown (WS-TS1/2) | `quiesceTransport()` first in every subclass dtor | `~HttpServer` drains only after subclass members are gone; quiescing first stops the I/O thread / pool before subclass state is destroyed. |
 | Per-request keep-alive, not per-session (SRV-M3) | RFC 9112 §9.3 decided on the worker stack | Pipelined siblings run on different workers; a shared `SessionInfo` field would be clobbered (logical race). HTTP/1.0 correctly defaults to close. |
 | `Connection` parsed as a token list (SRV-M2) | `connectionListHasToken` (RFC 9110 §7.6.1) | Honors `close, foo` / `keep-alive, close`; a bare substring test both false-positives and misses members. |
@@ -1010,7 +1033,7 @@ defect dressed up as "by design". The genuinely by-design entries are API-shape 
 | **Duplicate query keys are last-wins** | `req.params` is a single-valued `std::unordered_map`, so `?a=1&a=2` yields `a=="2"`; the API cannot represent a multi-valued query parameter. | Documented API-shape limitation. |
 | **Pipelined requests may dispatch past a parse-400 sibling** | Framing (I/O thread) and handler dispatch (pool) are decoupled, so a request already `tryEnqueue`d before a *later* sibling's parse-400+close runs may still be dispatched. The framing-time smuggling checks (SRV-M4) return-without-framing on the poisoned connection, but this general ordering property remains. | **Open -- P2**, tracked `2026-09-12-5`. |
 | **Request-parser hardening for bare-CR / NUL / bare-LF / leading empty line** | `fromWireFormat` does not yet fully reject every RFC 9112 §2.2 bare-CR / NUL / bare-LF / leading-empty-line case in the request parser. | **Open -- P2**, tracked `2026-09-12-3`. |
-| **`quiesceTransport` 2 s-drain cap: residual UAF for pool-read members** | The drain is capped at 2 s and then forces on; a handler that ignores `getShutdownChecker()` and runs past the cap could still be live when a subclass member (e.g. `WebhookServer::_jsonConfig`) is destroyed. The subclass-quiesce invariant bounds but does not eliminate this. | **Open -- P0**, tracked `2026-09-11-22`. |
+| **`quiesceTransport` drain (formerly a 2 s-cap residual UAF)** | ~~The drain is capped at 2 s and then forces on...~~ **RESOLVED (`2026-09-11-22`).** The drain is now **unbounded to `getInFlightCount() == 0`** with a `drainDeadline()` (30 s) `std::abort()` backstop, so `quiesceTransport()` never returns while a worker is still reading a derived member. **General rule (LT-8):** a base teardown primitive whose worker drain *abandons with work in flight* leaves a residual UAF for any derived member a worker may deref; a derived dtor delegating to it must drain **unbounded** to quiescence via a single-critical-section in-flight count (with a fatal-abort backstop for non-cooperative handlers, since `std::thread` cannot be force-cancelled), OR confine worker access to those members to a shutdown-checked pre-section. | **Resolved -- landed `2026-09-11-22`.** Follow-on: accurate self-call diagnostic `2026-09-12-10` (P2). |
 | **Upgrade-vs-transport-close handshake-window race** | A split-brain race exists in the narrow window between accepting a protocol upgrade and the transport-close path, where the two views of the session can disagree. | **Open -- P0**, tracked `2026-09-11-23`. |
 | **Framer and parser share logic that is duplicated, not hoisted** | The framing-verdict / chunk-size / trailer-walker logic is implemented in both `handleIncomingData`/`findChunkedRequestEnd` and `fromWireFormat`/`decodeChunkedRequestBody`. They are kept in agreement by construction (SRV-M4), but a shared helper is planned so they cannot drift. This is a refactor, not a behavior gap. | **Open -- P0** (refactor), tracked `2026-09-12-1`. |
 | **`MAX_PENDING_REQUESTS` is dead; overload log hard-codes `1024`** | `MAX_PENDING_REQUESTS = 1000` is declared but never referenced; the pool-overload log line prints the literal denominator `1024` (a copy of the transport `maxWriteQueue`), not the `ThreadPool`'s actual pending-task capacity. | **Open -- Low** (cosmetic / observability); no tracker filed. |
