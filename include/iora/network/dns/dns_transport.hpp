@@ -70,6 +70,11 @@ public:
   }
 };
 
+// Test seam (tracker 2026-09-11-5): forward-declared so DnsTransport can befriend it
+// (see the friend declaration in the private section). Defined only by the sid-keying
+// regression test; no production code depends on it.
+struct DnsTransportSidKeyingTestAccess;
+
 /// \brief DNS transport implementation using Iora's Transport
 class DnsTransport : public std::enable_shared_from_this<DnsTransport>
 {
@@ -146,6 +151,12 @@ public:
   void resetStatistics();
 
 private:
+  // Test seam (tracker 2026-09-11-5): the sid-keying regression test drives the
+  // private I/O-thread handlers and inspects the per-session maps directly, so the
+  // cross-engine SessionId collision is reproduced deterministically without real
+  // sockets or timing. Test-only; no production code path depends on it.
+  friend struct DnsTransportSidKeyingTestAccess;
+
   /// \brief Composite key for pending queries to avoid ID collisions
   ///
   /// IMPORTANT: Server string normalization rules:
@@ -293,12 +304,42 @@ private:
   /// \brief Create TCP transport
   std::shared_ptr<Transport> createTcpTransport();
 
+  /// \brief Build the serverSessions_ string key for a (server, port, protocol).
+  ///        UDP => "server:port"; TCP => "server:port:tcp". Single source of the
+  ///        ":tcp" suffix convention, reused by sendUdpQuery/sendTcpQuery/handleClose
+  ///        so the protocol-qualified key is constructed identically everywhere.
+  static std::string serverKey(const std::string &server, std::uint16_t port, bool isTcp);
+
   // Configuration
   DnsConfig config_;
 
   // Transport instances
   std::shared_ptr<Transport> udpTransport_;
   std::shared_ptr<Transport> tcpTransport_;
+
+  // ---------------------------------------------------------------------------
+  // LOCK ORDERING (HR-2) — acquire outer -> inner; never acquire an outer lock
+  // while holding an inner one:
+  //   stateMutex_ / cleanupMutex_  >  tcpBuffersMutex_  >  queriesMutex_  >  sessionsMutex_
+  //
+  // OUTERMOST: stateMutex_ (start/stop/updateConfig) and cleanupMutex_ (the cleanup
+  // thread's CV mutex) are each held ACROSS inner locks — stop() holds stateMutex_
+  // across (sequentially) queriesMutex_, then sessionsMutex_, then tcpBuffersMutex_;
+  // the cleanup thread holds cleanupMutex_ across cleanupExpiredQueries() ->
+  // queriesMutex_. So NEVER acquire stateMutex_ or cleanupMutex_ from inside any
+  // inner critical section (e.g. a query/session path) — that would deadlock against
+  // stop()/the cleanup thread. (No current path does.)
+  //
+  // INNER co-holds (at most two inner locks held at once): handleTcpData holds
+  // tcpBuffersMutex_ across sessionsMutex_ (the sessionToServer_ read) and across
+  // queriesMutex_ (via processResponse -> completeQuery). The UDP-truncation TCP
+  // fallback (processResponse, mode==UDP, reached only from handleUdpData) holds
+  // queriesMutex_ across sendTcpQuery's sessionsMutex_. handleClose deliberately uses
+  // THREE sequential, NON-co-held critical sections (sessionsMutex_, then
+  // tcpBuffersMutex_, then completeQuery's queriesMutex_) and MUST NOT merge them:
+  // co-holding sessionsMutex_ (acquired first, so outer) with tcpBuffersMutex_ or
+  // queriesMutex_ (inner) would invert this order and can deadlock.
+  // ---------------------------------------------------------------------------
 
   // State management
   std::atomic<bool> running_{false};
@@ -325,9 +366,11 @@ private:
   } stats_;
 
   // Session management
-  std::map<std::string, SessionId> serverSessions_; // server:port -> SessionId
-  std::map<SessionId, std::pair<std::string, std::uint16_t>>
-    sessionToServer_; // SessionId -> (server, port)
+  std::map<std::string, SessionId> serverSessions_; // server:port[:tcp] -> SessionId
+  // (isTcp, SessionId) -> (server, port). Keyed by the protocol bit because the UDP
+  // and TCP engines mint SessionIds from independent counters both starting at 1, so
+  // a bare SessionId aliases a colliding UDP/TCP session pair (tracker 2026-09-11-5).
+  std::map<std::pair<bool, SessionId>, std::pair<std::string, std::uint16_t>> sessionToServer_;
   mutable std::mutex sessionsMutex_;
 
   // Per-session connect-deferral state (CF-H1). The transport now REJECTS a send
@@ -760,6 +803,17 @@ inline std::shared_ptr<Transport> DnsTransport::createTcpTransport()
   return transport;
 }
 
+inline std::string DnsTransport::serverKey(const std::string &server, std::uint16_t port,
+                                           bool isTcp)
+{
+  std::string key = server + ":" + std::to_string(port);
+  if (isTcp)
+  {
+    key += ":tcp";
+  }
+  return key;
+}
+
 inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
 {
   if (!udpTransport_)
@@ -773,13 +827,13 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
                            " retry=" + std::to_string(query->retryCount));
 
   // Get or create session to DNS server
-  std::string serverKey = query->server + ":" + std::to_string(query->port);
+  std::string sk = serverKey(query->server, query->port, false);
   SessionId sessionId = 0;
   bool sendNow = false;
 
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = serverSessions_.find(serverKey);
+    auto it = serverSessions_.find(sk);
     if (it != serverSessions_.end())
     {
       sessionId = it->second;
@@ -798,8 +852,8 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
       sessionId = cr.value();
-      serverSessions_[serverKey] = sessionId;
-      sessionToServer_[sessionId] = {query->server, query->port};
+      serverSessions_[sk] = sessionId;
+      sessionToServer_[std::make_pair(false, sessionId)] = {query->server, query->port};
       sendNow = false;
     }
 
@@ -859,13 +913,13 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   }
 
   // Get or create session to DNS server
-  std::string serverKey = query->server + ":" + std::to_string(query->port) + ":tcp";
+  std::string sk = serverKey(query->server, query->port, true);
   SessionId sessionId = 0;
   bool sendNow = false;
 
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = serverSessions_.find(serverKey);
+    auto it = serverSessions_.find(sk);
     if (it != serverSessions_.end())
     {
       sessionId = it->second;
@@ -884,8 +938,8 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
       sessionId = cr.value();
-      serverSessions_[serverKey] = sessionId;
-      sessionToServer_[sessionId] = {query->server, query->port};
+      serverSessions_[sk] = sessionId;
+      sessionToServer_[std::make_pair(true, sessionId)] = {query->server, query->port};
       sendNow = false;
     }
 
@@ -957,7 +1011,7 @@ inline void DnsTransport::handleUdpData(SessionId sessionId, iora::core::BufferV
   std::uint16_t port;
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = sessionToServer_.find(sessionId);
+    auto it = sessionToServer_.find(std::make_pair(false, sessionId));
     if (it != sessionToServer_.end())
     {
       server = it->second.first;
@@ -1040,7 +1094,7 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
       std::uint16_t port;
       {
         std::lock_guard<std::mutex> slock(sessionsMutex_);
-        auto it = sessionToServer_.find(sessionId);
+        auto it = sessionToServer_.find(std::make_pair(true, sessionId));
         if (it != sessionToServer_.end())
         {
           server = it->second.first;
@@ -1226,21 +1280,25 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
 {
   std::vector<std::shared_ptr<PendingQuery>> orphaned;
 
-  // Remove closed sessions from mappings
+  // Remove closed sessions from mappings. PROTOCOL-AWARE teardown (tracker
+  // 2026-09-11-5): sessionToServer_ is keyed by (isTcp,sid) and serverSessions_ by a
+  // protocol-qualified string key, so a colliding sibling session of the OTHER
+  // protocol (same bare sid) must NOT be torn down. Reconstruct the exact serverKey
+  // from the (isTcp,sid) mapping BEFORE erasing it (erasing first would make the
+  // lookup miss and leak the serverSessions_ entry -> later dead-sid reuse).
   {
     std::lock_guard<std::mutex> lock(sessionsMutex_);
-    for (auto it = serverSessions_.begin(); it != serverSessions_.end();)
+    auto sit = sessionToServer_.find(std::make_pair(isTcp, sessionId));
+    if (sit != sessionToServer_.end())
     {
-      if (it->second == sessionId)
+      auto sk = serverKey(sit->second.first, sit->second.second, isTcp);
+      auto ssit = serverSessions_.find(sk);
+      if (ssit != serverSessions_.end() && ssit->second == sessionId)
       {
-        it = serverSessions_.erase(it);
+        serverSessions_.erase(ssit);
       }
-      else
-      {
-        ++it;
-      }
+      sessionToServer_.erase(sit); // erase LAST, after serverKey reconstruction
     }
-    sessionToServer_.erase(sessionId);
 
     // Drop the per-session connect-deferral state (keyed by protocol+sid). Take
     // ownership of any queries still awaiting connect so they can be failed after
@@ -1254,7 +1312,10 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
     }
   }
 
-  // Clean up TCP buffers
+  // Clean up TCP buffers. tcpBuffers_ is a TCP-only map (populated solely by
+  // handleTcpData with TCP sids), so a UDP close must NOT erase a colliding live TCP
+  // session's partially-reassembled message (tracker 2026-09-11-5).
+  if (isTcp)
   {
     std::lock_guard<std::mutex> lock(tcpBuffersMutex_);
     tcpBuffers_.erase(sessionId);
