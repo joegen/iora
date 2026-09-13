@@ -35,6 +35,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 using iora::network::HttpServer;
 
@@ -373,4 +374,178 @@ TEST_CASE("HttpServer still pipelines well-formed keep-alive requests (regressio
             "GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
   (void)c.readResponse();
   REQUIRE(waitFor([&]() { return aCount.load() >= 1 && bCount.load() >= 1; }, 1000));
+}
+
+namespace
+{
+/// \brief Drive a COMPLETE crafted request through a real HttpServer framer and
+/// return its HTTP status (400 for a poisoned/ambiguous framing; the handler's
+/// status otherwise; 0 if the connection closed without a response). Used by the
+/// cross-layer parity test to observe the FRAMER's verdict for an input.
+int framerStatusFor(const std::string &crafted)
+{
+  HttpServer srv;
+  const int port = static_cast<int>(testnet::getFreePortTCP());
+  srv.setPort(port);
+  auto echo = [](const HttpServer::Request &req, HttpServer::Response &res)
+  { res.set_content(req.body, "text/plain"); };
+  srv.onPost("/p", echo);
+  srv.onGet("/p", echo);
+  srv.start();
+
+  Conn c;
+  REQUIRE(c.open(port));
+  c.sendRaw(crafted);
+  auto [status, body] = c.readResponse();
+  (void)body;
+  return status;
+}
+
+/// \brief One cross-layer parity row: a human-readable name + the crafted request.
+struct FramingCase
+{
+  const char *name;
+  std::string crafted;
+};
+
+/// \brief True iff the strict parser rejects the crafted request (any throw).
+bool parserRejects(const std::string &crafted)
+{
+  try
+  {
+    iora::network::HttpRequest::fromWireFormat(crafted);
+    return false;
+  }
+  catch (...)
+  {
+    return true;
+  }
+}
+
+/// \brief POSITIVE discriminator for the "streaming framer WAITS on an incomplete
+/// body" behavior: send `part1` (an incomplete request), pause so the framer
+/// processes it in isolation (it must BUFFER, not 400 or close), then send `part2`
+/// (the remainder) and return the resulting status. A framer that correctly waited
+/// dispatches once complete (200); one that bare-closed or 400'd the truncated part
+/// yields 0 or 400. This distinguishes "waited" from "bare close" — which a lone
+/// "no response" (status 0) cannot (HR-13/HR-16).
+int framerCompletesAfterRemainder(const std::string &part1, const std::string &part2)
+{
+  HttpServer srv;
+  const int port = static_cast<int>(testnet::getFreePortTCP());
+  srv.setPort(port);
+  auto echo = [](const HttpServer::Request &req, HttpServer::Response &res)
+  { res.set_content(req.body, "text/plain"); };
+  srv.onPost("/p", echo);
+  srv.onGet("/p", echo);
+  srv.start();
+
+  Conn c;
+  REQUIRE(c.open(port));
+  c.sendRaw(part1);
+  // Let the framer see the incomplete request on its own recv: it must buffer and
+  // WAIT (RFC 9112 §6.3/§7.1) — not respond, not close.
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  c.sendRaw(part2);
+  auto [status, body] = c.readResponse();
+  (void)body;
+  return status;
+}
+} // namespace
+
+// tracker 2026-09-12-1: the core invariant the shared-helper refactor establishes —
+// the strict parser (HttpRequest::fromWireFormat) and the transport framer
+// (HttpServer::handleData) reach the IDENTICAL framing verdict on the same COMPLETE
+// input (both reject an ambiguous framing, both accept a well-formed one). This is
+// what "cannot drift" means; before this refactor each layer computed the verdict
+// from its own copy. (Incomplete/need-more inputs legitimately differ — framer waits,
+// parser 400s — and are covered by the tri-state helper unit tests, not here.)
+TEST_CASE("cross-layer framing parity: parser and framer reach the same verdict",
+          "[http_server][framing][parity]")
+{
+  const std::string H = "POST /p HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+
+  SECTION("ambiguous framings are rejected by BOTH layers")
+  {
+    const std::vector<FramingCase> rejects = {
+      {"differing dup-CL", H + "Content-Length: 5\r\nContent-Length: 6\r\n\r\n"},
+      // Leading-zero dup-CL: '5' and '05' are DISTINCT strings (not numerically
+      // collapsed) -> conflict -> 400 on both layers (anti-normalization nuance).
+      {"leading-zero differing dup-CL", H + "Content-Length: 5\r\nContent-Length: 05\r\n\r\n"},
+      {"CL+TE", H + "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"},
+      {"non-final chunked", H + "Transfer-Encoding: gzip\r\n\r\n"},
+      {"invalid CL", H + "Content-Length: abc\r\n\r\n"},
+      {"out-of-range CL", H + "Content-Length: 18446744073709551616\r\n\r\n"},
+      {"invalid-CL + TE", H + "Content-Length: abc\r\nTransfer-Encoding: chunked\r\n\r\n"},
+      {"out-of-range-CL + TE",
+       H + "Content-Length: 18446744073709551616\r\nTransfer-Encoding: chunked\r\n\r\n"},
+      {"obs-fold header", H + "X-Foo: bar\r\n \tfolded\r\n\r\n"},
+      {"whitespace before colon", H + "Content-Length : 5\r\n\r\n"},
+      // Chunked-body ambiguities that BOTH layers reject promptly (complete input):
+      {"obs-fold trailer",
+       H + "Transfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n0\r\n \tX-T: v\r\n\r\n"},
+      // chunk-size = 2^64 (the smallest value that overflows uint64) -> parseChunkSize
+      // rejects -> parser 400 malformed / framer framingError 400.
+      {"chunk-size overflows uint64 (=2^64)",
+       H + "Transfer-Encoding: chunked\r\n\r\n10000000000000000\r\nx\r\n0\r\n\r\n"},
+    };
+    for (const auto &c : rejects)
+    {
+      INFO("case: " << c.name);
+      REQUIRE(parserRejects(c.crafted));
+      REQUIRE(framerStatusFor(c.crafted) == 400);
+    }
+  }
+
+  SECTION("per-layer end-policy divergence on chunked (complete-buffer parser vs "
+          "streaming framer) — the documented, RFC-correct difference")
+  {
+    // Truncated chunk-data: the strict parser (complete buffer) 400s; the streaming
+    // framer WAITS. Assert the wait POSITIVELY: send the incomplete chunk, then the
+    // remainder — the framer must have BUFFERED (not closed / not 400'd) and now
+    // dispatch (200). A bare-close or premature 400 would yield 0 / 400 here.
+    {
+      const std::string part1 = H + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHel";
+      REQUIRE(parserRejects(part1)); // the complete-buffer parser 400s the truncated body
+      REQUIRE(framerCompletesAfterRemainder(part1, "lo\r\n0\r\n\r\n") == 200);
+    }
+    // In-range but unsatisfiable chunk-size (ffffffffffffffff = 2^64-1): the strict
+    // parser 400s (chunk-size exceeds available data); the framer treats it as
+    // need-more (it can never arrive). The framer-waits side is unit-pinned by
+    // chunkDataStep(UINT64_MAX)==NeedMore; here we pin the parser side.
+    {
+      const std::string oversize = H + "Transfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nx";
+      REQUIRE(parserRejects(oversize));
+    }
+    // Trailing bytes after the terminating chunk: the parser (one complete message)
+    // 400s "unexpected data after terminating chunk"; the framer frames request 1 at
+    // the 0\r\n\r\n boundary and dispatches it (200), with Connection: close then
+    // ending the connection. This pins the per-layer boundary computation (parser
+    // rejects the trailing bytes; framer stops at the boundary) — not live pipelining.
+    {
+      const std::string trailing =
+        H + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n"
+            "GET /p HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+      REQUIRE(parserRejects(trailing));
+      REQUIRE(framerStatusFor(trailing) == 200); // request 1 dispatched at the boundary
+    }
+  }
+
+  SECTION("well-formed framings are accepted by BOTH layers")
+  {
+    const std::vector<FramingCase> accepts = {
+      {"single valid CL + matching body", H + "Content-Length: 5\r\nConnection: close\r\n\r\nHELLO"},
+      {"identical dup-CL",
+       H + "Content-Length: 5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO"},
+      {"leading-zero CL", H + "Content-Length: 05\r\nConnection: close\r\n\r\nHELLO"},
+      {"valid chunked",
+       H + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n"},
+    };
+    for (const auto &c : accepts)
+    {
+      INFO("case: " << c.name);
+      REQUIRE_FALSE(parserRejects(c.crafted));
+      REQUIRE(framerStatusFor(c.crafted) == 200);
+    }
+  }
 }

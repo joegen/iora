@@ -237,6 +237,40 @@ TEST_CASE("request Content-Length digit validation edge cases", "[http_message][
     HttpRequest::fromWireFormat("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"));
 }
 
+// tracker 2026-09-12-1 (Q1, human-approved unification): an all-digit Content-Length
+// that overflows uint64 is unframeable (RFC 9112 §6.3 / RFC 9110 §8.6) and is now a
+// 400 on the PARSER too (it previously validated 1*DIGIT but never converted, so it
+// accepted an out-of-range value). The framer already 400'd it; this closes the
+// parser/framer divergence via the shared decideRequestFraming verdict.
+TEST_CASE("request out-of-range (>2^64) Content-Length is rejected 400 (parser)",
+          "[http_message][smuggling]")
+{
+  // 2^64 exactly and a far-larger all-digit value: both overflow uint64.
+  REQUIRE_THROWS_AS(HttpRequest::fromWireFormat(
+                      "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 18446744073709551616\r\n\r\n"),
+                    HttpRequestError);
+  REQUIRE_THROWS_AS(
+    HttpRequest::fromWireFormat(
+      "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 99999999999999999999999999\r\n\r\n"),
+    HttpRequestError);
+  // 2^64-1 is representable and must still parse (boundary — pins the >, not >=).
+  REQUIRE_NOTHROW(HttpRequest::fromWireFormat(
+    "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 18446744073709551615\r\n\r\n"));
+}
+
+// tracker 2026-09-12-1 (web MEDIUM-1 body-integrity invariant): the parser consumes
+// the framing verdict ONLY for the out-of-range 400; it does NOT bound the body by
+// Content-Length. fromWireFormat takes the WHOLE post-header remainder as the body
+// (a pre-delimited single request handed over by the framer) — it must NOT truncate
+// to CL and must NOT apply the framer's MAX_BODY_SIZE 413 cap.
+TEST_CASE("request body is the whole post-header remainder, not truncated to Content-Length",
+          "[http_message][smuggling]")
+{
+  const auto req = HttpRequest::fromWireFormat(
+    "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nHELLOWORLD");
+  REQUIRE(req.body == "HELLOWORLD"); // full 10 bytes, not truncated to "HELL"
+}
+
 // web-L1 request-path: a Transfer-Encoding with a trailing empty element ("chunked,")
 // is accepted (final coding is chunked); a parameterized final coding is accepted.
 TEST_CASE("request Transfer-Encoding trailing-empty and parameterized chunked accepted",

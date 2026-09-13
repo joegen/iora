@@ -1080,126 +1080,114 @@ protected:
           continue;
         }
 
-        // Reject the SAME field-line grammar the strict parser rejects, so the
-        // framer never HONORS a Content-Length / Transfer-Encoding on a line the
-        // parser would 400 (which would make the framer compute a body boundary
-        // the parser never assigns -> request-smuggling desync, RFC 9112 §6.3):
-        //  - obs-fold: a field-line beginning with SP/HTAB (§5.2), and
-        //  - whitespace between the field-name and the colon (§5.1).
-        if (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+        // Reject the SAME field-line grammar the strict parser rejects (obs-fold
+        // §5.2, whitespace-before-colon §5.1), via the shared helper — so the framer
+        // never HONORS a Content-Length / Transfer-Encoding on a line the parser
+        // would 400 (which would make the framer compute a body boundary the parser
+        // never assigns -> request-smuggling desync, RFC 9112 §6.3).
+        const auto scan = detail::checkHeaderLineGrammar(line);
+        if (scan.grammar != detail::HeaderLineGrammar::Ok)
         {
           malformedHeaderLine = true;
           break;
         }
-
-        auto colonPos = line.find(':');
-        if (colonPos != std::string::npos)
+        if (scan.colonPos != std::string::npos)
         {
-          if (colonPos > 0 && (line[colonPos - 1] == ' ' || line[colonPos - 1] == '\t'))
-          {
-            malformedHeaderLine = true;
-            break;
-          }
-          std::string key = line.substr(0, colonPos);
-          std::string value = line.substr(colonPos + 1);
-
-          // Trim OWS
-          key.erase(0, key.find_first_not_of(" \t"));
-          key.erase(key.find_last_not_of(" \t") + 1);
-          value.erase(0, value.find_first_not_of(" \t"));
-          value.erase(value.find_last_not_of(" \t") + 1);
-
-          // Match field names case-insensitively via the SAME comparator the
-          // parser uses (locale-independent ASCII; no hand-rolled ::tolower).
+          // Match field names case-insensitively via the SAME comparator the parser
+          // uses (locale-independent ASCII), and the SAME OWS trim, so the shared
+          // verdict is fed identical inputs on both layers.
+          const std::string key = detail::trimOws(line.substr(0, scan.colonPos));
           if (CaseInsensitiveCompare::equals(key, "Content-Length"))
           {
-            clValues.insert(value);
+            clValues.insert(detail::trimOws(line.substr(scan.colonPos + 1)));
           }
           else if (CaseInsensitiveCompare::equals(key, "Transfer-Encoding"))
           {
             sawTransferEncoding = true;
-            lastTransferEncoding = value; // last field-line wins (parser semantics)
+            // last field-line wins (parser semantics)
+            lastTransferEncoding = detail::trimOws(line.substr(scan.colonPos + 1));
           }
         }
       }
 
-      // Reach the parser's framing verdict. Unrecoverable framing errors
-      // (RFC 9112 §6.3): a conflicting duplicate Content-Length; Content-Length
-      // together with Transfer-Encoding; or a Transfer-Encoding whose final
-      // coding is not chunked (§6.1). Any of these makes the request boundary
-      // ambiguous, so the framer MUST NOT frame or dispatch anything further on
-      // this connection: emit 400 and CLOSE, poisoning it. Framing an empty body
-      // and continuing the pipelining loop would dispatch the trailing bytes as a
-      // SMUGGLED request (CL.TE / dup-CL desync), because framing (this I/O
-      // thread) and handler dispatch (pool) are decoupled — the next request is
-      // enqueued before the parser's 400+close for this one runs.
-      const bool teFinalChunked =
-        sawTransferEncoding && detail::isChunkedFinalCoding(lastTransferEncoding);
-      const bool ambiguousFraming = malformedHeaderLine || (clValues.size() > 1) ||
-                                    (!clValues.empty() && sawTransferEncoding) ||
-                                    (sawTransferEncoding && !teFinalChunked);
-      if (ambiguousFraming)
+      // A malformed header-line grammar (obs-fold / whitespace-before-colon) makes
+      // the request boundary unrecoverable exactly like a §6.3 ambiguity: 400 +
+      // CLOSE (poison), never frame/dispatch trailing bytes. (LOW-E: retained as a
+      // 400+close; the strict parser 400s the same line.)
+      if (malformedHeaderLine)
       {
-        iora::core::Logger::error("HttpServer: Ambiguous request framing (duplicate "
-                                  "Content-Length, Content-Length+Transfer-Encoding, or "
-                                  "non-final chunked coding) for session " +
+        iora::core::Logger::error("HttpServer: Malformed header-line grammar (obs-fold or "
+                                  "whitespace before colon) for session " +
                                   std::to_string(sid) + " - sending 400 and closing");
-        // RFC 9110 §15.5.1. sendErrorResponse guards under _mutex, sends
-        // headers-only, then closes + cleans up the session. Return WITHOUT
-        // framing/dispatching any further buffered bytes on this connection.
         sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
         return;
       }
 
-      if (!clValues.empty())
+      // RFC 9112 §6.3 request body-framing verdict — the SHARED decision the strict
+      // parser (HttpRequest::fromWireFormat) also computes, so the framer picks the
+      // SAME request boundary. Any Ambiguous verdict makes the boundary unrecoverable,
+      // so the framer MUST NOT frame or dispatch anything further: emit 400 and CLOSE.
+      // Framing an empty body and continuing the pipelining loop would dispatch the
+      // trailing bytes as a SMUGGLED request (CL.TE / dup-CL desync), because framing
+      // (this I/O thread) and handler dispatch (pool) are decoupled.
       {
-        // Single Content-Length: it MUST be 1*DIGIT (RFC 9112 §6.3). std::stoull
-        // is lenient (leading sign/whitespace, "-1" -> ULLONG_MAX), so validate
-        // the token strictly before it drives the request boundary.
-        const std::string &cl = *clValues.begin();
-        const bool valid =
-          !cl.empty() && std::all_of(cl.begin(), cl.end(),
-                                     [](char c) { return c >= '0' && c <= '9'; });
-        if (!valid)
+        // (distinctCl, singleCl) count+pointer adapter — the same two lines appear at
+        // the parser's call site; this count+pointer signature keeps
+        // decideRequestFraming decoupled from the container type (here
+        // std::unordered_set, parser std::set) per the DISTINCT-VALUE CL DEDUP invariant.
+        const std::size_t distinctCl = clValues.size();
+        const std::string *singleCl = (distinctCl == 1) ? &*clValues.begin() : nullptr;
+        const auto verdict = detail::decideRequestFraming(distinctCl, singleCl,
+                                                          sawTransferEncoding, lastTransferEncoding);
+        if (verdict.kind == detail::FramingKind::Ambiguous)
         {
-          iora::core::Logger::error("HttpServer: Invalid "
-                                    "content-length header for session " +
-                                    std::to_string(sid) + " - sending 400 and closing");
-          // An invalid Content-Length is a 400 Bad Request (RFC 9112 §6.3 /
-          // RFC 9110 §15.5.1); a bare close is indistinguishable from a crash and
-          // makes clients retry. Emit the 400 like the adjacent ambiguous-framing
-          // path (tracker 2026-07-26-7 covers the DIFFERENT CL+TE case, not this).
+          const char *why = "request framing";
+          switch (verdict.reason)
+          {
+          case detail::FramingReason::DuplicateContentLength:
+            why = "conflicting duplicate Content-Length";
+            break;
+          case detail::FramingReason::InvalidContentLength:
+            why = "invalid Content-Length value";
+            break;
+          case detail::FramingReason::OutOfRangeContentLength:
+            why = "out-of-range Content-Length value";
+            break;
+          case detail::FramingReason::ContentLengthWithTransferEncoding:
+            why = "Content-Length together with Transfer-Encoding";
+            break;
+          case detail::FramingReason::NonFinalChunked:
+            why = "Transfer-Encoding without a final chunked coding";
+            break;
+          case detail::FramingReason::None:
+            break;
+          }
+          iora::core::Logger::error("HttpServer: Ambiguous request framing (" + std::string(why) +
+                                    ") for session " + std::to_string(sid) +
+                                    " - sending 400 and closing");
+          // RFC 9110 §15.5.1. sendErrorResponse guards under _mutex, sends headers-
+          // only, then closes + cleans up the session.
           sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
           return;
         }
-        try
+        if (verdict.kind == detail::FramingKind::ContentLength)
         {
-          contentLength = std::stoull(cl);
+          contentLength = static_cast<std::size_t>(verdict.length);
+          if (contentLength > SessionInfo::MAX_BODY_SIZE)
+          {
+            iora::core::Logger::error("HttpServer: Body size limit exceeded for session " +
+                                      std::to_string(sid) + " - sending 413 and closing");
+            // Declared Content-Length over the body cap -> 413 Content Too Large
+            // (RFC 9110 §15.5.14). This size-policy cap is framer-only (the strict
+            // parser does not bound its body by Content-Length).
+            sendErrorResponse(sid, 413, getStatusText(413), "", /*headersOnly=*/true);
+            return;
+          }
         }
-        catch (...)
-        {
-          // 1*DIGIT but numerically out of range (> 2^64) -> unframeable -> 400.
-          iora::core::Logger::error("HttpServer: Out-of-range "
-                                    "content-length header for session " +
-                                    std::to_string(sid) + " - sending 400 and closing");
-          sendErrorResponse(sid, 400, getStatusText(400), "", /*headersOnly=*/true);
-          return;
-        }
-        if (contentLength > SessionInfo::MAX_BODY_SIZE)
-        {
-          iora::core::Logger::error("HttpServer: Body size limit exceeded for session " +
-                                    std::to_string(sid) + " - sending 413 and closing");
-          // Declared Content-Length over the body cap -> 413 Content Too Large
-          // (RFC 9110 §15.5.14). No lock held; sendErrorResponse guards under
-          // _mutex, sends headers-only, then closes + cleans up the session.
-          sendErrorResponse(sid, 413, getStatusText(413), "", /*headersOnly=*/true);
-          return;
-        }
+        // CL and TE are mutually exclusive here (any combination returned above);
+        // chunked framing applies iff the verdict is Chunked.
+        isChunked = (verdict.kind == detail::FramingKind::Chunked);
       }
-      // Ambiguous CL/TE combinations already returned above; here CL and TE are
-      // mutually exclusive, so chunked framing applies iff TE's final coding is
-      // chunked.
-      isChunked = teFinalChunked;
 
       std::size_t requestEndPos;
 
@@ -1979,37 +1967,13 @@ protected:
         return std::string::npos; // Need more data
       }
 
-      // chunk-size = 1*HEXDIG [ chunk-ext ]; the size ends at the first ';'
-      // (chunk-ext) or the CRLF. std::stoul silently accepts a leading sign or
-      // whitespace and drives a bogus frame length, so strip any chunk-ext, trim
-      // OWS, and validate 1*HEXDIG before parsing.
-      std::string chunkSizeStr = data.substr(pos, chunkSizeLine - pos);
-      const auto semi = chunkSizeStr.find(';');
-      if (semi != std::string::npos)
-      {
-        chunkSizeStr = chunkSizeStr.substr(0, semi);
-      }
-      const auto lastNonWs = chunkSizeStr.find_last_not_of(" \t");
-      chunkSizeStr.erase(lastNonWs == std::string::npos ? 0 : lastNonWs + 1);
-      if (chunkSizeStr.empty() ||
-          !std::all_of(chunkSizeStr.begin(), chunkSizeStr.end(),
-                       [](char c)
-                       {
-                         const unsigned char u = static_cast<unsigned char>(c);
-                         return (u >= '0' && u <= '9') || (u >= 'a' && u <= 'f') ||
-                                (u >= 'A' && u <= 'F');
-                       }))
-      {
-        iora::core::Logger::error("HttpServer: Invalid chunk size in chunked encoding");
-        framingError = true;
-        return std::string::npos;
-      }
-      std::size_t chunkSize;
-      try
-      {
-        chunkSize = std::stoull(chunkSizeStr, nullptr, 16);
-      }
-      catch (...)
+      // Shared chunk-size parse (ext-strip, OWS, 1*HEXDIG, base-16 convert with
+      // overflow rejection) — same source the strict decoder uses, so they cannot
+      // drift. A false result is a DEFINITIVELY malformed chunk-size (the decoder
+      // 400s the same input): poison the connection rather than wait for bytes that
+      // can never make it valid.
+      std::uint64_t chunkSize = 0;
+      if (!detail::parseChunkSize(data, pos, chunkSizeLine, chunkSize))
       {
         iora::core::Logger::error("HttpServer: Invalid chunk size in chunked encoding");
         framingError = true;
@@ -2020,59 +1984,42 @@ protected:
 
       if (chunkSize == 0)
       {
-        // Terminating chunk: consume the trailer-section (zero or more field-lines,
-        // RFC 9112 §7.1 / §7.1.2) up to the closing empty line. Stopping at the
-        // FIRST CRLF after the 0-line under-reads a trailered request and desyncs
-        // from decodeChunkedRequestBody (which DOES consume trailers) — both layers
-        // must consume the trailer-section identically or they disagree on the
-        // request boundary.
-        while (true)
+        // Terminating chunk: consume the trailer-section via the shared walker —
+        // same source decodeChunkedRequestBody uses, so the two layers cannot
+        // disagree on the request boundary. Streaming framer: NeedMore waits;
+        // Malformed (obs-fold trailer the decoder 400s) poisons; Ok returns the
+        // boundary past the closing empty line (framer end-policy keeps the rest
+        // for pipelining, unlike the parser which rejects trailing bytes).
+        std::size_t endPos = 0;
+        const auto tstep = detail::walkTrailerSection(data, pos, endPos);
+        if (tstep == detail::FramingStep::NeedMore)
         {
-          // Reject an obs-fold (SP/HTAB-led) trailer field-line, matching both the
-          // decoder (decodeChunkedRequestBody) and the framer's own header-section
-          // handling (RFC 9112 §5.2 / §7.1.2). Without this the framer would accept
-          // a trailer the decoder 400s, and — because framing and dispatch are
-          // decoupled — dispatch the next pipelined request before that 400 closes.
-          if (pos < data.length() && (data[pos] == ' ' || data[pos] == '\t'))
-          {
-            framingError = true;
-            return std::string::npos;
-          }
-          auto tcrlf = data.find("\r\n", pos);
-          if (tcrlf == std::string::npos)
-          {
-            return std::string::npos; // Need more data (trailer not fully arrived)
-          }
-          const bool emptyLine = (tcrlf == pos);
-          pos = tcrlf + 2;
-          if (emptyLine)
-          {
-            return pos; // past the closing empty line
-          }
+          return std::string::npos; // Need more data (trailer not fully arrived)
         }
+        if (tstep == detail::FramingStep::Malformed)
+        {
+          framingError = true;
+          return std::string::npos;
+        }
+        return endPos; // past the closing empty line
       }
 
-      // Skip chunk data + trailing \r\n. Bound the chunk against the remaining
-      // buffer with SUBTRACTION: `pos += chunkSize + 2` wraps size_t when
-      // chunkSize has its MSB set (e.g. ffffffffffffffff), bypassing the
-      // `pos > length` guard and mis-framing the request (a boundary-confusion /
-      // smuggling primitive). `pos <= data.length()` holds, so `remaining` does
-      // not underflow; `remaining - chunkSize` is guarded by the prior check.
-      const std::size_t remaining = data.length() - pos;
-      if (chunkSize > remaining || (remaining - chunkSize) < 2)
+      // Shared chunk-data step (subtraction bounds + trailing-CRLF check) — same
+      // computation the strict decoder uses. The streaming framer waits on NeedMore
+      // (chunk-data / CRLF not yet arrived) but poisons on Malformed (a bad
+      // terminator the decoder 400s) — per-layer disposition of one shared result.
+      std::size_t nextPos = 0;
+      const auto step = detail::chunkDataStep(data, pos, chunkSize, nextPos);
+      if (step == detail::FramingStep::NeedMore)
       {
         return std::string::npos; // Need more data (chunk data / CRLF not yet arrived)
       }
-      // The 2 bytes after chunk-data MUST be CRLF (RFC 9112 §7.1); they are
-      // present now. If they are not CRLF the framing is definitively malformed
-      // (decodeChunkedRequestBody 400s the same input) — signal a framing error
-      // rather than scan past a bad terminator (a framer/decoder desync).
-      if (data.compare(pos + chunkSize, 2, "\r\n") != 0)
+      if (step == detail::FramingStep::Malformed)
       {
         framingError = true;
         return std::string::npos;
       }
-      pos += chunkSize + 2;
+      pos = nextPos;
     }
 
     return std::string::npos;

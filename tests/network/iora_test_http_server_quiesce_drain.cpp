@@ -20,9 +20,9 @@
 //                   pool-level seam tests + code review, not an HttpServer race
 //                   test that cannot exist (see tracker).
 #define CATCH_CONFIG_MAIN
-#include "iora_test_net_utils.hpp"
-#include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp" // uses Catch2 REQUIRE -> must follow catch.hpp
+#include "test_helpers.hpp"
 
 #include <atomic>
 #include <chrono>

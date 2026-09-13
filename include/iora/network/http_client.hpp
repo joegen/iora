@@ -2507,24 +2507,6 @@ private:
 
   // ── RFC 9112 §6.3/§7.1 response message-body framing ───────────────────────
 
-  static bool isHexDigit(char c)
-  {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-  }
-
-  /// \brief Parse [b,e) as a full-token unsigned integer (DD-8). Rejects any
-  /// trailing junk, leading sign/whitespace, and overflow. No exceptions, no
-  /// locale (std::from_chars). Returns false on any violation.
-  static bool parseFullUInt(const char *b, const char *e, int base, std::uint64_t &out)
-  {
-    if (b == e)
-    {
-      return false;
-    }
-    auto r = std::from_chars(b, e, out, base);
-    return r.ec == std::errc() && r.ptr == e;
-  }
-
   static bool ciEquals(const std::string &a, const std::string &b) { return ciEqualsAscii(a, b); }
 
   /// \brief Parse a Content-Length value, honoring RFC 9112 §6.3 rule 5: a
@@ -2543,7 +2525,7 @@ private:
       std::size_t b = (end == 0) ? std::string::npos : v.find_last_not_of(" \t", end - 1);
       std::uint64_t val = 0;
       if (a == std::string::npos || a >= end || b == std::string::npos || b < a ||
-          !parseFullUInt(v.data() + a, v.data() + b + 1, 10, val))
+          !detail::parseFullUInt(v.data() + a, v.data() + b + 1, 10, val))
       {
         throw HttpFramingError("invalid Content-Length: " + v);
       }
@@ -2622,7 +2604,7 @@ private:
     std::size_t sp2 = statusLine.find(' ', codeStart);
     std::size_t codeEnd = (sp2 == std::string::npos) ? statusLine.size() : sp2;
     std::uint64_t code = 0;
-    if (!parseFullUInt(statusLine.data() + codeStart, statusLine.data() + codeEnd, 10, code) ||
+    if (!detail::parseFullUInt(statusLine.data() + codeStart, statusLine.data() + codeEnd, 10, code) ||
         code > 999)
     {
       throw HttpFramingError("invalid status code in: " + statusLine);
@@ -2795,7 +2777,7 @@ private:
       std::size_t lineEnd = nl - 1; // index of '\r'
       std::size_t p = st.pos;
       std::size_t hexEnd = p;
-      while (hexEnd < lineEnd && isHexDigit(buf[hexEnd]))
+      while (hexEnd < lineEnd && detail::isHexDigit(buf[hexEnd]))
       {
         ++hexEnd;
       }
@@ -2804,7 +2786,7 @@ private:
         return FrameStatus::Malformed; // no chunk-size digits
       }
       std::uint64_t chunkSize = 0;
-      if (!parseFullUInt(buf.data() + p, buf.data() + hexEnd, 16, chunkSize) ||
+      if (!detail::parseFullUInt(buf.data() + p, buf.data() + hexEnd, 16, chunkSize) ||
           chunkSize > effectiveCap)
       {
         return FrameStatus::Malformed; // overflow / too large
