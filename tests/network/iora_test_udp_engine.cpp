@@ -41,7 +41,11 @@ struct UdpFixture
   // a main-thread read. If a future test needs one from the test thread, guard it
   // with a mutex + a locked snapshot accessor (as TcpFixture does), or gate it
   // behind an atomic set AFTER the write. (lastData is the exception: it is
-  // published to the main thread via the clientGotEcho release/acquire edge.)
+  // published to the main thread via the clientGotEcho release/acquire edge.
+  // PRECONDITION: each echo test sends exactly ONE datagram per client, so
+  // lastData has a single I/O-thread writer per publish. A test that echoes
+  // twice — or resets clientGotEcho and re-waits with a prior echo in flight —
+  // would race the write; guard lastData with dataMutex if that ever changes.)
   SessionId serverSid{0};
   SessionId clientSid{0};
   std::string lastErrMsg;
@@ -111,17 +115,43 @@ struct UdpFixture
     tx.setCallbacks(std::move(cbs));
   }
 
+  // Stop (and join) the engine's I/O thread BEFORE any data member the callbacks
+  // touch (connectedSessions/receivedData/atomics) is destroyed. Member reverse-
+  // destruction would otherwise free those members first (tx is declared early,
+  // so ~UdpEngine's stop()+join runs last) — a live I/O thread firing onConnect/
+  // onData into a freed member is heap corruption. This matters whenever a test's
+  // trailing f.tx.stop() is skipped or omitted (a REQUIRE throwing and unwinding,
+  // or a section that never calls stop()). The join is guaranteed here: this
+  // fixture never calls scheduleSelfDestruct, so _running is still true and
+  // stop()'s CAS cannot short-circuit past the join. Wrapped like ~UdpEngine —
+  // a throwing stop()/join() in an (implicitly noexcept) dtor would std::terminate
+  // and mask the original assertion failure.
+  ~UdpFixture() noexcept
+  {
+    try
+    {
+      tx.stop();
+    }
+    catch (...)
+    {
+    }
+  }
+
   bool waitFor(const std::atomic<bool> &flag, int ms = 1000)
   {
     for (int i = 0; i < ms / 5 && !flag.load(); ++i)
+    {
       std::this_thread::sleep_for(5ms);
+    }
     return flag.load();
   }
 
   bool waitForCount(const std::atomic<int> &counter, int expected, int ms = 1000)
   {
     for (int i = 0; i < ms / 5 && counter.load() < expected; ++i)
+    {
       std::this_thread::sleep_for(5ms);
+    }
     return counter.load() >= expected;
   }
 };
@@ -362,18 +392,23 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
   REQUIRE(lr.isOk());
   ListenerId lid = lr.value();
 
-  // Set up a second UDP server to connect to
+  // Set up a second UDP server to connect to. Declare tx2 AFTER the locals its
+  // onData captures by-ref, so tx2 (destroyed first, reverse declaration order)
+  // joins its I/O thread before those locals die — same teardown-UAF guard as
+  // ~UdpFixture, needed because the trailing tx2.stop() is skipped if a REQUIRE
+  // throws.
   TransportConfig cfg2{};
-  UdpEngine tx2{cfg2};
-
   std::atomic<bool> server2Received{false};
+  UdpEngine tx2{cfg2};
   iora::network::detail::EngineBase::Callbacks cbs2{};
   cbs2.onData = [&](SessionId, iora::core::BufferView bv,
                     std::chrono::steady_clock::time_point)
   {
     std::string msg(reinterpret_cast<const char *>(bv.data()), bv.size());
     if (msg == "via_test")
+    {
       server2Received = true;
+    }
   };
   tx2.setCallbacks(std::move(cbs2));
 
@@ -390,7 +425,9 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
 
   // Wait for server2 to receive
   for (int i = 0; i < 200 && !server2Received.load(); ++i)
+  {
     std::this_thread::sleep_for(5ms);
+  }
   REQUIRE(server2Received.load());
 
   REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
@@ -432,7 +469,9 @@ TEST_CASE("UDP error conditions", "[udp][error]")
   {
     SessionId fakeSid = 9999;
     const char *msg = "test";
-    REQUIRE(f.tx.send(fakeSid, msg, std::strlen(msg))); // Returns true but does nothing
+    // CF-H1: send() to an unknown/closed session now returns FALSE (it must not
+    // mask a dead session — SIP RFC 3263 failover depends on the false).
+    REQUIRE_FALSE(f.tx.send(fakeSid, msg, std::strlen(msg)));
   }
 
   SECTION("close non-existent session")
@@ -780,6 +819,12 @@ TEST_CASE("UDP session limits", "[udp][limits]")
   // Now try to create another client - should still work
   SessionId cs3 = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
 
+  // Wait for cs3 to actually connect before sending: CF-H1 send() rejects a sid
+  // not yet registered in _sessions (returns false), and connect() only enqueues
+  // the session creation onto the I/O thread — connectCount==3 means cs3's
+  // onConnect fired AFTER it was inserted into _sessions.
+  REQUIRE(f.waitForCount(f.connectCount, 3));
+
   // But sending from it should not create a new server peer (would exceed limit)
   REQUIRE(f.tx.send(cs3, "test3", 5));
   std::this_thread::sleep_for(100ms);
@@ -866,14 +911,14 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
   auto port1 = testnet::getFreePortUDP();
   auto port2 = testnet::getFreePortUDP();
 
-  // Set up a server
+  // Set up a server. Declare tx2 AFTER the locals its onData captures, so tx2 is
+  // destroyed (and its I/O thread joined) before they die — teardown-UAF guard,
+  // as in ~UdpFixture (the trailing tx2.stop() is skipped if a REQUIRE throws).
   TransportConfig cfg2{};
-  UdpEngine tx2{cfg2};
-
   std::atomic<int> server2DataCount{0};
   std::mutex server2Mutex;
   std::vector<std::string> server2Data;
-
+  UdpEngine tx2{cfg2};
   iora::network::detail::EngineBase::Callbacks cbs2{};
   cbs2.onData = [&](SessionId, iora::core::BufferView bv,
                     std::chrono::steady_clock::time_point)
@@ -915,7 +960,9 @@ TEST_CASE("UDP multiple sessions to same peer", "[udp][loopback][multi]")
 
   // Wait for server to receive all 3 messages
   for (int i = 0; i < 200 && server2DataCount.load() < 3; ++i)
+  {
     std::this_thread::sleep_for(5ms);
+  }
   REQUIRE(server2DataCount.load() == 3);
 
   // Verify all messages received
