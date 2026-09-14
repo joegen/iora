@@ -18,6 +18,13 @@ namespace
 {
 struct UdpFixture
 {
+  // `cfg` is a CONSTRUCTION-TIME SNAPSHOT: UdpEngine copies it BY VALUE at
+  // construction (udp_engine.hpp:58 `_config(config)`), so mutate cfg ONLY before
+  // it reaches the engine. Build a TransportConfig, set fields, and pass it via
+  // `UdpFixture f{cfg}`. A post-construction `f.cfg.X = ...` write is a SILENT
+  // NO-OP — it never reaches the already-copied _config (this is the very defect
+  // tracker 2026-09-13-6 fixed). Declaration order (cfg before tx) guarantees the
+  // `tx{cfg}` member initializer copies a fully-initialized cfg.
   TransportConfig cfg{};
   UdpEngine tx{cfg};
 
@@ -55,7 +62,14 @@ struct UdpFixture
   std::mutex dataMutex;
   std::vector<std::string> receivedData;
 
-  UdpFixture()
+  // Option (b) (tracker 2026-09-13-6): take the TransportConfig by value (defaulted,
+  // so `UdpFixture f;` still works) and move it into `cfg` in the mem-init list
+  // BEFORE the `tx{cfg}` member initializer runs (member init follows declaration
+  // order: cfg then tx), so the engine is constructed with the test's config — not
+  // the default. `tx` stays a plain UdpEngine member, so the ~UdpFixture stop()+join
+  // teardown invariant is preserved verbatim (dtor body joins the I/O thread before
+  // any member destructs).
+  explicit UdpFixture(TransportConfig c = TransportConfig{}) : cfg(std::move(c))
   {
     iora::network::detail::EngineBase::Callbacks cbs{};
     cbs.onAccept = [&](SessionId sid, const TransportAddress &)
@@ -139,20 +153,36 @@ struct UdpFixture
 
   bool waitFor(const std::atomic<bool> &flag, int ms = 1000)
   {
-    for (int i = 0; i < ms / 5 && !flag.load(); ++i)
-    {
-      std::this_thread::sleep_for(5ms);
-    }
-    return flag.load();
+    return pollUntil([&] { return flag.load(); }, ms);
   }
 
   bool waitForCount(const std::atomic<int> &counter, int expected, int ms = 1000)
   {
-    for (int i = 0; i < ms / 5 && counter.load() < expected; ++i)
+    return pollUntil([&] { return counter.load() >= expected; }, ms);
+  }
+
+  // Bounded poll of a getStats()-derived predicate — the observable analogue of
+  // waitForCount for the GC/age/backpressure tests. Prefer this over a fixed sleep +
+  // hard equality: the number of GC cycles completed within a wall-clock window is
+  // nondeterministic under load, so a fixed-sleep `== N` can flake. Main-thread-safe
+  // here: getStats() reads the atomic stats (udp_engine.hpp:354-372). (It also reads
+  // the non-atomic _batchProcessor pointer at :373-376, but batching is never enabled
+  // in these tests, so that is a stable-null read; if a future test enables batching
+  // while polling getStats(), re-verify EventBatchProcessor::getStats() thread-safety.)
+  template <typename Pred> bool waitForStats(Pred pred, int ms = 5000)
+  {
+    return pollUntil([&] { return pred(tx.getStats()); }, ms);
+  }
+
+private:
+  // Single bounded-poll primitive shared by the three wait helpers above (5ms tick).
+  template <typename Pred> bool pollUntil(Pred pred, int ms)
+  {
+    for (int i = 0; i < ms / 5 && !pred(); ++i)
     {
       std::this_thread::sleep_for(5ms);
     }
-    return counter.load() >= expected;
+    return pred();
   }
 };
 } // namespace
@@ -437,9 +467,13 @@ TEST_CASE("UDP connectViaListener", "[udp][via]")
 
 TEST_CASE("UDP basic operation after start", "[udp][config]")
 {
+  // NOTE: this test previously set gcInterval=1s and maxWriteQueue=10, but neither
+  // is exercised here (idleTimeout stays the 600s default so nothing goes idle in
+  // the window; a single small echo never approaches the write queue). Once config
+  // actually reaches the engine those knobs would be inert decoration implying a
+  // check this test does not perform, so they are dropped — this is a plain
+  // post-start echo test (tracker 2026-09-13-6, cpp17-F5).
   UdpFixture f;
-  f.cfg.gcInterval = std::chrono::seconds(1);
-  f.cfg.maxWriteQueue = 10;
   REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
@@ -509,10 +543,14 @@ TEST_CASE("UDP error conditions", "[udp][error]")
 
 TEST_CASE("UDP garbage collection", "[udp][gc]")
 {
-  UdpFixture f;
-  f.cfg.idleTimeout = std::chrono::seconds(1);
-  f.cfg.gcInterval = std::chrono::seconds(1);
-  f.cfg.maxConnAge = std::chrono::seconds(0); // Disabled
+  // Config now reaches the engine (tracker 2026-09-13-6): idleTimeout=1s so idle
+  // sessions are GC-closed. maxConnAge=0 disables age-close (== default) — this
+  // test isolates the idle path.
+  TransportConfig cfg;
+  cfg.idleTimeout = std::chrono::seconds(1);
+  cfg.gcInterval = std::chrono::seconds(1);
+  cfg.maxConnAge = std::chrono::seconds(0);
+  UdpFixture f{cfg};
 
   REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
@@ -526,18 +564,17 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.accepted));
 
-  auto stats1 = f.tx.getStats();
-  REQUIRE(stats1.sessionsCurrent == 2);
+  // Both sessions established. Bound-poll rather than a hard == read so the check is
+  // robust if it ever races the 1s GC timer under extreme load (cpp17-L3).
+  REQUIRE(f.waitForStats([](const auto &s) { return s.sessionsCurrent == 2; }, 2000));
 
-  // Wait for idle timeout + GC interval (need to ensure GC runs)
-  // GC timer might not be properly armed, so we just check that sessions exist
-  std::this_thread::sleep_for(3000ms);
-
-  (void)f.tx.getStats();
-  // Note: GC timer implementation might not be working in tests
-  // Just verify basic functionality
-  // sessionsCurrent is unsigned, so >= 0 check is always true
-  REQUIRE(true); // Sessions might be cleaned up
+  // Both sessions go idle (no further traffic) and are idle-GC'd. Bounded-poll the
+  // atomic sessionsCurrent to 0 rather than a fixed sleep + hard == (the number of
+  // GC cycles within a wall-clock window is nondeterministic; cpp17-L2 / ts M-1).
+  REQUIRE(f.waitForStats([](const auto &s) { return s.sessionsCurrent == 0; }, 6000));
+  auto stats2 = f.tx.getStats();
+  REQUIRE(stats2.gcRuns >= 1);
+  REQUIRE(stats2.gcClosedIdle >= 1);
 
   REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
@@ -545,10 +582,14 @@ TEST_CASE("UDP garbage collection", "[udp][gc]")
 
 TEST_CASE("UDP max connection age", "[udp][gc][age]")
 {
-  UdpFixture f;
-  f.cfg.idleTimeout = std::chrono::seconds(0); // Disabled
-  f.cfg.maxConnAge = std::chrono::seconds(1);
-  f.cfg.gcInterval = std::chrono::seconds(1);
+  // Config now reaches the engine (tracker 2026-09-13-6): maxConnAge=1s ages
+  // sessions out REGARDLESS of activity. idleTimeout=0 disables idle-close (==
+  // default) so this test isolates the age path.
+  TransportConfig cfg;
+  cfg.idleTimeout = std::chrono::seconds(0);
+  cfg.maxConnAge = std::chrono::seconds(1);
+  cfg.gcInterval = std::chrono::seconds(1);
+  UdpFixture f{cfg};
 
   REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
@@ -562,24 +603,19 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
   REQUIRE(f.waitFor(f.accepted));
 
-  auto stats1 = f.tx.getStats();
-  REQUIRE(stats1.sessionsCurrent == 2);
+  // Both sessions established. Bound-poll rather than a hard == read so the check is
+  // robust if it ever races the 1s GC timer under extreme load (cpp17-L3).
+  REQUIRE(f.waitForStats([](const auto &s) { return s.sessionsCurrent == 2; }, 2000));
 
-  // Keep sending to prevent idle timeout
-  for (int i = 0; i < 3; ++i)
-  {
-    std::this_thread::sleep_for(500ms);
-    REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
-  }
-
-  // After max age, sessions might be closed
-  std::this_thread::sleep_for(1000ms);
-
-  (void)f.tx.getStats();
-  // Note: GC timer implementation might not be working in tests
-  // Just verify basic functionality
-  // sessionsCurrent is unsigned, so >= 0 check is always true
-  REQUIRE(true); // Sessions might be cleaned up
+  // The previous keep-alive send loop (send every 500ms "to prevent idle timeout")
+  // is removed: idleTimeout is disabled here so it guarded nothing, and once
+  // maxConnAge actually applies GC ages the session out mid-loop (age-close ignores
+  // activity), after which send() returns false for the GC-closed sid (CF-H1) — the
+  // loop's REQUIRE(send) would fail. Age-out IS the point of the test (tracker
+  // 2026-09-13-6, cpp17-F1). Bounded-poll for the age-close instead of a fixed sleep.
+  REQUIRE(f.waitForStats([](const auto &s) { return s.sessionsCurrent < 2; }, 6000));
+  auto stats2 = f.tx.getStats();
+  REQUIRE(stats2.gcClosedAged >= 1);
 
   REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   f.tx.stop();
@@ -587,49 +623,79 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
 
 TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
 {
-  UdpFixture f;
-  f.cfg.maxWriteQueue = 5;
-  f.cfg.closeOnBackpressure = true;
+  // Config now reaches the engine (tracker 2026-09-13-6). Drive deterministic
+  // backpressure: a non-echoing peer + a shrunk client soSndBuf (4096, host-
+  // independent EAGAIN) + a large-volume burst forces the client ::send to EAGAIN,
+  // growing the write queue past maxWriteQueue -> backpressureCloses++ (udp_engine
+  // .hpp:1930-1935). closeOnBackpressure then decides the ACTION: close the session
+  // (true, :1935) or drop the oldest queued datagram and keep it open (false, :1940).
+  //
+  // NOTE on non-vacuity: backpressureCloses>=1 is VOLUME-driven — it fires under any
+  // config given this burst — so it verifies only that the mechanism ran, NOT that
+  // config reached the engine. The config-DISCRIMINATING observable is the ACTION
+  // (anyClosed): the closeOnBackpressure=false section below asserts the session
+  // SURVIVES, which fails if the value is reverted to the default (true). soSndBuf
+  // and maxWriteQueue are determinism aids, not discriminators (loopback backpressure
+  // is inherently volume-driven; cpp17-F6/L1).
 
-  REQUIRE(f.tx.start().isOk());
-  auto port = testnet::getFreePortUDP();
-
-  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-
-  // Create a server that doesn't echo (to cause backpressure)
-  TransportConfig cfg2{};
-  UdpEngine tx2{cfg2};
-
-  iora::network::detail::EngineBase::Callbacks cbs2{};
-  cbs2.onData = [&](SessionId, iora::core::BufferView,
-                    std::chrono::steady_clock::time_point)
+  // Shared driver: stand up a non-echoing server, connect the fixture's client to it,
+  // burst datagrams, and confirm the backpressure mechanism fired. tx2's callbacks
+  // capture nothing, so its teardown (stop()+join here) is order-independent.
+  auto drive = [](UdpFixture &f)
   {
-    // Don't echo - just receive
+    REQUIRE(f.tx.start().isOk());
+    TransportConfig cfg2{};
+    UdpEngine tx2{cfg2};
+    iora::network::detail::EngineBase::Callbacks cbs2{};
+    cbs2.onData = [](SessionId, iora::core::BufferView,
+                     std::chrono::steady_clock::time_point) { /* receive, don't echo */ };
+    tx2.setCallbacks(std::move(cbs2));
+    REQUIRE(tx2.start().isOk());
+    auto port2 = testnet::getFreePortUDP();
+    (void)tx2.addListener("127.0.0.1", port2, TlsMode::None);
+
+    SessionId cs = f.tx.connect("127.0.0.1", port2, TlsMode::None).value();
+    REQUIRE(f.waitFor(f.connected));
+
+    std::string bigMsg(4000, 'X');
+    for (int i = 0; i < 2000; ++i)
+    {
+      f.tx.send(cs, bigMsg.data(), bigMsg.size());
+    }
+    REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 3000));
+    tx2.stop(); // join tx2's I/O thread before it leaves scope
   };
-  tx2.setCallbacks(std::move(cbs2));
 
-  REQUIRE(tx2.start().isOk());
-  auto port2 = testnet::getFreePortUDP();
-  (void)tx2.addListener("127.0.0.1", port2, TlsMode::None);
-
-  SessionId cs = f.tx.connect("127.0.0.1", port2, TlsMode::None).value();
-  REQUIRE(f.waitFor(f.connected));
-
-  // Spam messages to trigger backpressure
-  std::string bigMsg(10000, 'X');
-  for (int i = 0; i < 100; ++i)
+  SECTION("closeOnBackpressure=true closes the session")
   {
-    f.tx.send(cs, bigMsg.data(), bigMsg.size());
+    // Covers the close action (udp_engine.hpp:1935). NOT config-discriminating on its
+    // own (true == default), but exercises the close path under real backpressure.
+    TransportConfig cfg;
+    cfg.maxWriteQueue = 5;
+    cfg.closeOnBackpressure = true;
+    cfg.soSndBuf = 4096;
+    UdpFixture f{cfg};
+    drive(f);
+    REQUIRE(f.waitFor(f.anyClosed)); // backpressure closed the session
+    f.tx.stop();
   }
 
-  std::this_thread::sleep_for(100ms);
-
-  (void)f.tx.getStats();
-  // Should have some backpressure events if queue filled
-  // Note: UDP might not actually trigger backpressure easily
-
-  f.tx.stop();
-  tx2.stop();
+  SECTION("closeOnBackpressure=false keeps the session (drop-oldest)")
+  {
+    // NON-default value -> drop-oldest path (udp_engine.hpp:1940); the session must
+    // SURVIVE backpressure. This is the CONFIG-DISCRIMINATING assertion: reverting
+    // closeOnBackpressure to the default (true) closes the session -> REQUIRE_FALSE
+    // below fails. Also covers the previously-untested drop-oldest branch (cpp17-L4).
+    TransportConfig cfg;
+    cfg.maxWriteQueue = 5;
+    cfg.closeOnBackpressure = false;
+    cfg.soSndBuf = 4096;
+    UdpFixture f{cfg};
+    drive(f);
+    std::this_thread::sleep_for(100ms); // allow any (erroneous) close to surface
+    REQUIRE_FALSE(f.anyClosed);         // drop-oldest kept the session open
+    f.tx.stop();
+  }
 }
 
 TEST_CASE("UDP IPv6 support", "[udp][ipv6]")
@@ -746,8 +812,13 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
 {
   SECTION("edge triggered (default)")
   {
-    UdpFixture f;
-    f.cfg.useEdgeTriggered = true;
+    // useEdgeTriggered=true == default: this section is a smoke check that
+    // duplicates the default-config echo tests. epoll trigger mode has no getStats
+    // observable, so it is asserted only via functional echo (tracker 2026-09-13-6,
+    // cpp17-F4).
+    TransportConfig cfg;
+    cfg.useEdgeTriggered = true;
+    UdpFixture f{cfg};
     REQUIRE(f.tx.start().isOk());
 
     auto port = testnet::getFreePortUDP();
@@ -767,8 +838,13 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
 
   SECTION("level triggered")
   {
-    UdpFixture f;
-    f.cfg.useEdgeTriggered = false;
+    // Config now reaches the engine (tracker 2026-09-13-6): this genuinely exercises
+    // the LEVEL-triggered epoll path (previously it ran the default edge path, so
+    // the level path was never tested). No stat observable for epoll mode — asserted
+    // via functional echo only (cpp17-F4).
+    TransportConfig cfg;
+    cfg.useEdgeTriggered = false;
+    UdpFixture f{cfg};
     REQUIRE(f.tx.start().isOk());
 
     auto port = testnet::getFreePortUDP();
@@ -789,8 +865,10 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
 
 TEST_CASE("UDP session limits", "[udp][limits]")
 {
-  UdpFixture f;
-  f.cfg.maxSessions = 4; // Set limit to 4 (2 clients + 2 server peers)
+  // Config now reaches the engine (tracker 2026-09-13-6): maxSessions=4.
+  TransportConfig cfg;
+  cfg.maxSessions = 4; // 2 clients + 2 server peers = at cap
+  UdpFixture f{cfg};
   REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
@@ -807,44 +885,56 @@ TEST_CASE("UDP session limits", "[udp][limits]")
 
   REQUIRE(f.waitForCount(f.connectCount, 2));
 
-  // Send from both clients to create server peers (should create 2+2=4 sessions total)
+  // Send from both clients so the server creates 2 server peers (each fires
+  // onAccept, udp_engine.hpp:1345-1350). Gate on acceptCount==2 instead of a fixed
+  // sleep — bumpSess() precedes onAccept, so observing acceptCount==2 guarantees
+  // both server-peer session bumps are visible.
   REQUIRE(f.tx.send(clients[0], "test1", 5));
   REQUIRE(f.tx.send(clients[1], "test2", 5));
+  REQUIRE(f.waitForCount(f.acceptCount, 2));
 
-  std::this_thread::sleep_for(100ms);
+  // STATE PRECONDITION (M1): 2 clients + 2 server peers = 4, exactly at the cap.
+  // This holds under BOTH capped and default config (the cap is not exercised until
+  // a 5th session would be created), so it is a precondition establishing the
+  // at-cap state — exempt from the per-assertion config-discrimination mutation-check.
+  REQUIRE(f.tx.getStats().sessionsCurrent == 4);
 
-  auto stats = f.tx.getStats();
-  REQUIRE(stats.sessionsCurrent <= f.cfg.maxSessions);
-
-  // Now try to create another client - should still work
+  // A 3rd client connect() succeeds: the plain connect() path is NOT capped — only
+  // server-peer creation is (see backlog 2026-09-14-1 for that production asymmetry).
+  // sessionsCurrent -> 5; cs3 is a real session, so send(cs3) returns true.
   SessionId cs3 = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
-
-  // Wait for cs3 to actually connect before sending: CF-H1 send() rejects a sid
-  // not yet registered in _sessions (returns false), and connect() only enqueues
-  // the session creation onto the I/O thread — connectCount==3 means cs3's
-  // onConnect fired AFTER it was inserted into _sessions.
   REQUIRE(f.waitForCount(f.connectCount, 3));
-
-  // But sending from it should not create a new server peer (would exceed limit)
   REQUIRE(f.tx.send(cs3, "test3", 5));
-  std::this_thread::sleep_for(100ms);
 
-  auto stats2 = f.tx.getStats();
-  // Session count should be reasonable (3 clients + up to 2 server peers)
-  // The limit applies to preventing new server peer creation
-  REQUIRE(stats2.sessionsCurrent <= 6); // Maximum possible: 3 clients + 3 peers
+  // CONFIG-DISCRIMINATING assertion (M1): cs3's datagram arrives from a NEW peer
+  // address; with the cap reached (5 >= 4) the server DROPS it (udp_engine.hpp:1326
+  // `continue`) and creates NO 3rd server peer -> no 3rd onAccept. Under reverted
+  // (default maxSessions=0) config the datagram WOULD create a 6th session
+  // (acceptCount -> 3, sessionsCurrent -> 6), so this pair fails-on-revert = it
+  // genuinely exercises the cap. The bounded wait-for-3rd-accept is the deterministic
+  // way to observe the negative (it times out only when the cap held).
+  REQUIRE_FALSE(f.waitForCount(f.acceptCount, 3, 500)); // no 3rd server peer created
+  REQUIRE(f.tx.getStats().sessionsCurrent == 5);        // 3 clients + 2 peers, cap held
 
-  // Accepted sessions echo normally; a session rejected by the limit never
-  // reaches onData, so no echo is attempted for it — sendFailed must stay false.
+  // A datagram rejected by the cap never reaches onData, so no echo is attempted
+  // for it — sendFailed must stay false.
   REQUIRE_FALSE(f.sendFailed);
   f.tx.stop();
 }
 
 TEST_CASE("UDP socket buffer configuration", "[udp][socket]")
 {
-  UdpFixture f;
-  f.cfg.soRcvBuf = 256 * 1024;
-  f.cfg.soSndBuf = 256 * 1024;
+  // Config now reaches the engine (tracker 2026-09-13-6): soRcvBuf/soSndBuf are
+  // applied via setsockopt (udp_engine.hpp:1256-1259,1587-1590), exercising the
+  // soRcvBuf/soSndBuf>0 branches that were dead before (default 0). NOTE: the buffer
+  // sizes have NO test observable — getStats reports no socket-buffer field and this
+  // test has no fd handle to getsockopt — so the effect is UNVERIFIED here; the test
+  // asserts only that the socket functions correctly with non-default buffers
+  // (cpp17-F3; human disposition 2026-09-14: scope honestly, no backlog).
+  TransportConfig cfg;
+  cfg.soRcvBuf = 256 * 1024;
+  cfg.soSndBuf = 256 * 1024;
+  UdpFixture f{cfg};
   REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
