@@ -351,17 +351,17 @@ class DnsResolverException : public std::exception
 public:
   explicit DnsResolverException(const std::string &message,
                                 DnsResponseCode code = DnsResponseCode::SERVFAIL)
-      : message_(message), responseCode_(code)
+      : _message(message), _responseCode(code)
   {
   }
 
-  const char *what() const noexcept override { return message_.c_str(); }
+  const char *what() const noexcept override { return _message.c_str(); }
 
-  DnsResponseCode getResponseCode() const noexcept { return responseCode_; }
+  DnsResponseCode getResponseCode() const noexcept { return _responseCode; }
 
 private:
-  std::string message_;
-  DnsResponseCode responseCode_;
+  std::string _message;
+  DnsResponseCode _responseCode;
 };
 
 class DnsResolutionFailedException : public DnsResolverException
@@ -434,19 +434,19 @@ public:
   explicit DnsResolver(std::shared_ptr<DnsTransport> transport,
                        std::shared_ptr<DnsCache> cache = nullptr,
                        const DnsConfig &config = DnsConfig{})
-      : transport_(transport), cache_(cache), config_(config)
+      : _transport(transport), _cache(cache), _config(config)
   {
     // Initialize RNG with random seed for production use
     std::random_device rd;
-    rng_.seed(rd());
+    _rng.seed(rd());
   }
 
   /// \brief Set RNG seed for deterministic testing
   /// \param seed Seed value for reproducible randomness
   void setRngSeed(std::uint32_t seed)
   {
-    std::lock_guard<std::mutex> lock(rngMutex_);
-    rng_.seed(seed);
+    std::lock_guard<std::mutex> lock(_rngMutex);
+    _rng.seed(seed);
   }
 
   /// \brief Resolve service domain using RFC 3263 NAPTR→SRV→A/AAAA procedure
@@ -465,11 +465,11 @@ public:
     }
 
     // Check cache first
-    if (cache_)
+    if (_cache)
     {
       DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
       DnsResult naptrResult;
-      if (cache_->get(naptrQuestion, naptrResult))
+      if (_cache->get(naptrQuestion, naptrResult))
       {
         iora::core::Logger::debug("DNS service resolution cache hit for domain: " + domain);
         ServiceResolutionResult result(domain);
@@ -517,11 +517,11 @@ public:
                                  const std::vector<ServiceType> &preferredTransports = {})
   {
     // Check cache first
-    if (cache_)
+    if (_cache)
     {
       DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
       DnsResult naptrResult;
-      if (cache_->get(naptrQuestion, naptrResult))
+      if (_cache->get(naptrQuestion, naptrResult))
       {
         iora::core::Logger::debug("DNS async service resolution cache hit for domain: " + domain);
         try
@@ -591,10 +591,10 @@ public:
   DnsResult query(const DnsQuestion &question)
   {
     // Check cache first
-    if (cache_)
+    if (_cache)
     {
       DnsResult result;
-      if (cache_->get(question, result))
+      if (_cache->get(question, result))
       {
         // For negative cache hits, still need to throw the appropriate exception
         if (!result.isSuccess())
@@ -606,7 +606,7 @@ public:
     }
 
     // Perform query via transport
-    DnsResult result = transport_->query(question);
+    DnsResult result = _transport->query(question);
 
     cacheQueryResult(question, result);
 
@@ -624,10 +624,10 @@ public:
   void queryAsync(const DnsQuestion &question, QueryCallback callback)
   {
     // Check cache first
-    if (cache_)
+    if (_cache)
     {
       DnsResult result;
-      if (cache_->get(question, result))
+      if (_cache->get(question, result))
       {
         // For negative cache hits, still need to pass the appropriate exception
         if (!result.isSuccess())
@@ -644,7 +644,7 @@ public:
 
     // Perform async query
     auto self = shared_from_this();
-    transport_->queryAsync(
+    _transport->queryAsync(
       question,
       [self, question, callback](const DnsResult &result, const std::exception_ptr &ex)
       {
@@ -683,7 +683,7 @@ public:
 
     // Determine address resolution policy
     // If prefer_ipv6 is explicitly set, honor it for backward compatibility
-    AddressResolutionPolicy policy = config_.addressResolutionPolicy;
+    AddressResolutionPolicy policy = _config.addressResolutionPolicy;
     if (prefer_ipv6 && policy == AddressResolutionPolicy::IPv4First)
     {
       policy = AddressResolutionPolicy::IPv6First;
@@ -788,10 +788,10 @@ public:
   /// \return Selected target based on priority and weighted randomness
   ServiceTarget getPreferredTarget(const ServiceResolutionResult &result) const
   {
-    // rng_ is mutated (the generator advances) even on this const path; guard it
+    // _rng is mutated (the generator advances) even on this const path; guard it
     // so concurrent getPreferredTarget()/setRngSeed() calls don't race the state.
-    std::lock_guard<std::mutex> lock(rngMutex_);
-    return result.getPreferredTarget(rng_);
+    std::lock_guard<std::mutex> lock(_rngMutex);
+    return result.getPreferredTarget(_rng);
   }
 
   /// \brief Handle direct SRV resolution when no NAPTR records exist (generic version)
@@ -884,7 +884,7 @@ public:
       DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
 
       auto self = shared_from_this();
-      transport_->queryAsync(
+      _transport->queryAsync(
         srvQuestion,
         [self, result, service, remainingQueries, callbackFired, resultMutex, deniedServices,
          callback, domain, preferredTransports](const DnsResult &srvResult,
@@ -931,13 +931,13 @@ public:
   }
 
 private:
-  std::shared_ptr<DnsTransport> transport_; ///< DNS transport layer
-  std::shared_ptr<DnsCache> cache_;         ///< DNS cache (optional)
-  DnsConfig config_;                        ///< DNS configuration
+  std::shared_ptr<DnsTransport> _transport; ///< DNS transport layer
+  std::shared_ptr<DnsCache> _cache;         ///< DNS cache (optional)
+  DnsConfig _config;                        ///< DNS configuration
 
   /// \brief Centralized random number generator for deterministic testing
-  mutable std::mt19937 rng_;    ///< Weighted SRV selection RNG (guarded by rngMutex_)
-  mutable std::mutex rngMutex_; ///< Guards rng_ against concurrent advance/seed
+  mutable std::mt19937 _rng;    ///< Weighted SRV selection RNG (guarded by _rngMutex)
+  mutable std::mutex _rngMutex; ///< Guards _rng against concurrent advance/seed
 
   // =============================================================================
   // Input Validation Functions (RFC Compliance & Security)
@@ -1243,7 +1243,7 @@ private:
     DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
 
     auto self = shared_from_this();
-    transport_->queryAsync(
+    _transport->queryAsync(
       naptrQuestion,
       [self, domain, callback, preferredTransports](const DnsResult &naptrResult,
                                                     const std::exception_ptr &naptrError)
@@ -1310,7 +1310,7 @@ private:
           auto service = srvTarget.service;
           auto naptrPref = srvTarget.naptrPreference;
 
-          self->transport_->queryAsync(
+          self->_transport->queryAsync(
             srvQuestion,
             [self, result, service, naptrPref, remainingQueries, callbackFired, resultMutex,
              callback](const DnsResult &srvResult, const std::exception_ptr &srvError)
@@ -1375,14 +1375,14 @@ private:
     // Step 2: Try to get SRV records from cache for each target
     for (const auto &srvTarget : srvTargets)
     {
-      if (!cache_)
+      if (!_cache)
       {
         continue;
       }
 
       DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
       DnsResult srvResult;
-      if (cache_->get(srvQuestion, srvResult))
+      if (_cache->get(srvQuestion, srvResult))
       {
         processSrvRecords(srvResult.srv_records, srvTarget.service, result, srvTarget.naptrPreference);
       }
@@ -1391,7 +1391,7 @@ private:
     // Step 3: Try to resolve hostnames from cache
     for (auto &target : result.targets)
     {
-      if (!cache_)
+      if (!_cache)
       {
         continue;
       }
@@ -1399,7 +1399,7 @@ private:
       // Try A records first
       DnsQuestion aQuestion(target.hostname, DnsType::A, DnsClass::IN);
       DnsResult aResult;
-      if (cache_->get(aQuestion, aResult))
+      if (_cache->get(aQuestion, aResult))
       {
         for (const auto &record : aResult.a_records)
         {
@@ -1412,7 +1412,7 @@ private:
       {
         DnsQuestion aaaaQuestion(target.hostname, DnsType::AAAA, DnsClass::IN);
         DnsResult aaaaResult;
-        if (cache_->get(aaaaQuestion, aaaaResult))
+        if (_cache->get(aaaaQuestion, aaaaResult))
         {
           for (const auto &record : aaaaResult.aaaa_records)
           {
@@ -1636,14 +1636,14 @@ private:
   /// SHOULD NOT be cached, as there is no authoritative TTL to bound it).
   void cacheQueryResult(const DnsQuestion &question, const DnsResult &result)
   {
-    if (!cache_)
+    if (!_cache)
     {
       return;
     }
 
     if (result.isSuccess())
     {
-      cache_->put(question, result);
+      _cache->put(question, result);
       return;
     }
 
@@ -1655,14 +1655,14 @@ private:
 
     if (result.header.rcode == DnsResponseCode::NXDOMAIN)
     {
-      cache_->putNegative(question, result, "Domain not found (NXDOMAIN)");
+      _cache->putNegative(question, result, "Domain not found (NXDOMAIN)");
     }
     else if (result.header.rcode == DnsResponseCode::NOERROR)
     {
       // NODATA (NOERROR with no answer records) — RFC 2308 §2.2. Caching this
       // stops the common "name exists but no records of this type" case (e.g. a
       // domain publishing SRV but no NAPTR) from re-querying on every lookup.
-      cache_->putNegative(question, result, "No records of requested type (NODATA)");
+      _cache->putNegative(question, result, "No records of requested type (NODATA)");
     }
   }
 
@@ -1816,7 +1816,7 @@ private:
     DnsQuestion aQuestion(domain, DnsType::A, DnsClass::IN);
 
     auto self = shared_from_this();
-    transport_->queryAsync(
+    _transport->queryAsync(
       aQuestion,
       [self, domain, result, callback, transportsToUse](const DnsResult &aResult,
                                                         const std::exception_ptr &aError)
@@ -1836,7 +1836,7 @@ private:
           // Try AAAA if A failed
           DnsQuestion aaaaQuestion(domain, DnsType::AAAA, DnsClass::IN);
 
-          self->transport_->queryAsync(aaaaQuestion,
+          self->_transport->queryAsync(aaaaQuestion,
                                  [self, result, callback, domain, transportsToUse, addresses](
                                    const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
                                  {
@@ -1894,7 +1894,7 @@ private:
       std::string hostname = result->targets[targetIndex].hostname;
       DnsQuestion aQuestion(hostname, DnsType::A, DnsClass::IN);
 
-      transport_->queryAsync(
+      _transport->queryAsync(
         aQuestion,
         [self, targetIndex, initialTargetCount, remainingTargets, result, callback,
          hostname](const DnsResult &aResult, const std::exception_ptr &aError)
@@ -1914,7 +1914,7 @@ private:
           {
             DnsQuestion aaaaQuestion(hostname, DnsType::AAAA, DnsClass::IN);
 
-            self->transport_->queryAsync(
+            self->_transport->queryAsync(
               aaaaQuestion,
               [self, targetIndex, initialTargetCount, remainingTargets, result,
                callback](const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)

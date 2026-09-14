@@ -46,9 +46,9 @@ public:
   /// \return true if successfully cancelled, false if already completed or cancelled
   bool cancel()
   {
-    if (!state_)
+    if (!_state)
       return false;
-    return !state_->cancelled.exchange(true, std::memory_order_acq_rel);
+    return !_state->cancelled.exchange(true, std::memory_order_acq_rel);
   }
 
   /// \brief Check if request was cancelled
@@ -57,23 +57,23 @@ public:
   /// may still have its callback invoked if transport processing had already begun.
   ///
   /// \return true if cancelled
-  bool isCancelled() const { return state_ && state_->cancelled.load(std::memory_order_acquire); }
+  bool isCancelled() const { return _state && _state->cancelled.load(std::memory_order_acquire); }
 
   /// \brief Check if request completed
   /// \return true if completed (successfully or with error)
-  bool isCompleted() const { return state_ && state_->completed.load(std::memory_order_acquire); }
+  bool isCompleted() const { return _state && _state->completed.load(std::memory_order_acquire); }
 
   /// \brief Get hostname being queried
   /// \return hostname string, empty if invalid request
-  std::string getHostname() const { return state_ ? state_->hostname : ""; }
+  std::string getHostname() const { return _state ? _state->hostname : ""; }
 
   /// \brief Mark request as completed (for cancellation)
   /// \internal Used by CancellableFuture to update completion state
   void markCompleted()
   {
-    if (state_)
+    if (_state)
     {
-      state_->completed.store(true, std::memory_order_release);
+      _state->completed.store(true, std::memory_order_release);
     }
   }
 
@@ -93,9 +93,9 @@ private:
   };
 
   /// \brief Constructor for valid request
-  explicit AsyncDnsRequest(std::shared_ptr<RequestState> state) : state_(std::move(state)) {}
+  explicit AsyncDnsRequest(std::shared_ptr<RequestState> state) : _state(std::move(state)) {}
 
-  std::shared_ptr<RequestState> state_;
+  std::shared_ptr<RequestState> _state;
 };
 
 /// \brief Future with cancellation support for DNS operations
@@ -105,8 +105,8 @@ template <typename T> struct CancellableFuture
 {
   std::future<T> future;
   AsyncDnsRequest request;
-  std::shared_ptr<std::promise<T>> promise_;      // Store promise for immediate cancellation
-  std::shared_ptr<std::atomic<bool>> promiseSet_; // Shared atomic guard
+  std::shared_ptr<std::promise<T>> promise;      // Store promise for immediate cancellation
+  std::shared_ptr<std::atomic<bool>> promiseSet; // Shared atomic guard
 
   /// \brief Cancel the underlying DNS request (immediate when safe)
   ///
@@ -119,17 +119,17 @@ template <typename T> struct CancellableFuture
   {
     bool cancelResult = request.cancel();
 
-    if (cancelResult && promise_)
+    if (cancelResult && promise)
     {
       // Use promiseSet atomic guard to prevent race with callback
-      if (promiseSet_)
+      if (promiseSet)
       {
         bool expected = false;
-        if (promiseSet_->compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        if (promiseSet->compare_exchange_strong(expected, true, std::memory_order_acq_rel))
         {
           try
           {
-            promise_->set_exception(
+            promise->set_exception(
               std::make_exception_ptr(dns::DnsResolverException("DNS request cancelled")));
           }
           catch (const std::future_error &)
@@ -209,7 +209,7 @@ public:
 
   /// \brief Constructor with custom configuration
   /// \param config DNS client configuration
-  explicit DnsClient(const dns::DnsConfig &config) : config_(config) { initialize(); }
+  explicit DnsClient(const dns::DnsConfig &config) : _config(config) { initialize(); }
 
   /// \brief Destructor - stops transport before destruction
   ~DnsClient()
@@ -224,9 +224,9 @@ public:
   /// \brief Stop the DNS client and its transport threads
   void stop()
   {
-    if (transport_)
+    if (_transport)
     {
-      transport_->stop();
+      _transport->stop();
     }
   }
 
@@ -289,7 +289,7 @@ public:
   resolveServiceDomain(const std::string &domain,
                        const std::vector<dns::ServiceType> &preferredTransports = {})
   {
-    return resolver_->resolveServiceDomain(domain, preferredTransports);
+    return _resolver->resolveServiceDomain(domain, preferredTransports);
   }
 
   /// \brief Resolve custom service domain with specific SRV record queries
@@ -304,7 +304,7 @@ public:
     const std::vector<std::pair<std::string, dns::ServiceType>> &srvQueries,
     const std::vector<dns::ServiceType> &preferredTransports = {})
   {
-    return resolver_->performDirectSrvResolution(domain, preferredTransports,
+    return _resolver->performDirectSrvResolution(domain, preferredTransports,
                                                  std::make_optional(srvQueries));
   }
 
@@ -316,7 +316,7 @@ public:
                                  dns::DnsResolver::ServiceResolutionCallback callback,
                                  const std::vector<dns::ServiceType> &preferredTransports = {})
   {
-    resolver_->resolveServiceDomainAsync(domain, callback, preferredTransports);
+    _resolver->resolveServiceDomainAsync(domain, callback, preferredTransports);
   }
 
   /// \brief Resolve custom service domain asynchronously
@@ -330,7 +330,7 @@ public:
     dns::DnsResolver::ServiceResolutionCallback callback,
     const std::vector<dns::ServiceType> &preferredTransports = {})
   {
-    resolver_->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
+    _resolver->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
                                                std::make_optional(srvQueries));
   }
 
@@ -410,7 +410,7 @@ public:
   /// \param question DNS question to resolve
   /// \return DNS query result
   /// \throws dns::DnsResolverException on query failure
-  dns::DnsResult query(const dns::DnsQuestion &question) { return resolver_->query(question); }
+  dns::DnsResult query(const dns::DnsQuestion &question) { return _resolver->query(question); }
 
   /// \brief Perform DNS query asynchronously
   /// \param question DNS question to resolve
@@ -418,7 +418,7 @@ public:
   void queryAsync(const dns::DnsQuestion &question,
                   std::function<void(const dns::DnsResult &, const std::exception_ptr &)> callback)
   {
-    resolver_->queryAsync(question, callback);
+    _resolver->queryAsync(question, callback);
   }
 
   /// \brief Resolve A records synchronously (IPv4 addresses)
@@ -528,7 +528,7 @@ public:
   /// \throws dns::DnsResolverException on resolution failure
   std::vector<std::string> resolveHostname(const std::string &hostname, bool prefer_ipv6 = false)
   {
-    return resolver_->resolveHostname(hostname, prefer_ipv6);
+    return _resolver->resolveHostname(hostname, prefer_ipv6);
   }
 
   /// \brief Resolve SRV records
@@ -650,9 +650,9 @@ public:
   /// \return Current cache statistics (empty if caching disabled)
   dns::DnsCacheStats getCacheStats() const
   {
-    if (cache_)
+    if (_cache)
     {
-      return cache_->getStats();
+      return _cache->getStats();
     }
     return dns::DnsCacheStats{};
   }
@@ -660,9 +660,9 @@ public:
   /// \brief Clear DNS cache
   void clearCache()
   {
-    if (cache_)
+    if (_cache)
     {
-      cache_->clear();
+      _cache->clear();
     }
   }
 
@@ -670,9 +670,9 @@ public:
   /// \param question DNS question to remove from cache
   void removeCacheEntry(const dns::DnsQuestion &question)
   {
-    if (cache_)
+    if (_cache)
     {
-      cache_->remove(question);
+      _cache->remove(question);
     }
   }
 
@@ -680,9 +680,9 @@ public:
   /// \return Number of entries removed
   std::size_t cleanupCache()
   {
-    if (cache_)
+    if (_cache)
     {
-      return cache_->cleanupExpired();
+      return _cache->cleanupExpired();
     }
     return 0;
   }
@@ -719,7 +719,7 @@ public:
 
   /// \brief Check if caching is enabled
   /// \return true if caching is enabled
-  bool isCacheEnabled() const { return cache_ != nullptr; }
+  bool isCacheEnabled() const { return _cache != nullptr; }
 
   // =============================================================================
   // Configuration and Status
@@ -727,14 +727,14 @@ public:
 
   /// \brief Get current DNS configuration
   /// \return Current configuration
-  const dns::DnsConfig &getConfig() const { return config_; }
+  const dns::DnsConfig &getConfig() const { return _config; }
 
   /// \brief Update DNS configuration
   /// \param config New configuration
   /// \note This will recreate transport and resolver with new settings
   void updateConfig(const dns::DnsConfig &config)
   {
-    config_ = config;
+    _config = config;
     initialize(); // Reinitialize with new config
   }
 
@@ -743,7 +743,7 @@ public:
   /// \note Servers without explicit port use default port 53. IPv6 addresses supported.
   void setDnsServers(const std::vector<std::string> &servers)
   {
-    config_.setServers(servers);
+    _config.setServers(servers);
     initialize(); // Reinitialize with new servers
   }
 
@@ -755,7 +755,7 @@ public:
     dns::DnsServer dnsServer = dns::DnsServer::fromString(server);
 
     // Check if server already exists
-    auto &servers = config_.servers;
+    auto &servers = _config.servers;
     if (std::find(servers.begin(), servers.end(), dnsServer) == servers.end())
     {
       servers.push_back(dnsServer);
@@ -770,7 +770,7 @@ public:
     // Parse server string to DnsServer structure
     dns::DnsServer dnsServer = dns::DnsServer::fromString(server);
 
-    auto &servers = config_.servers;
+    auto &servers = _config.servers;
     servers.erase(std::remove(servers.begin(), servers.end(), dnsServer), servers.end());
 
     if (servers.empty())
@@ -787,8 +787,8 @@ public:
   std::vector<std::string> getDnsServers() const
   {
     std::vector<std::string> result;
-    result.reserve(config_.servers.size());
-    for (const auto &server : config_.servers)
+    result.reserve(_config.servers.size());
+    for (const auto &server : _config.servers)
     {
       result.push_back(server.toString());
     }
@@ -799,9 +799,9 @@ public:
   /// \param callback Function to call after cache cleanup operations
   void setCacheCleanupCallback(std::function<void(const dns::DnsCacheStats &)> callback)
   {
-    if (cache_)
+    if (_cache)
     {
-      cache_->setCleanupCallback(callback);
+      _cache->setCleanupCallback(callback);
     }
   }
 
@@ -813,9 +813,9 @@ public:
   /// \param ttl New default time-to-live for cache entries
   void setCacheTtl(std::chrono::seconds ttl)
   {
-    if (cache_)
+    if (_cache)
     {
-      cache_->setDefaultTtl(ttl);
+      _cache->setDefaultTtl(ttl);
     }
   }
 
@@ -823,18 +823,18 @@ public:
   /// \return Current default TTL in seconds, or 0 if caching is disabled
   std::chrono::seconds getCacheTtl() const
   {
-    if (cache_)
+    if (_cache)
     {
-      return cache_->getDefaultTtl();
+      return _cache->getDefaultTtl();
     }
     return std::chrono::seconds{0};
   }
 
 private:
-  dns::DnsConfig config_;                                   ///< DNS configuration
-  std::shared_ptr<dns::DnsTransport> transport_;            ///< DNS transport layer
-  std::shared_ptr<dns::DnsCache> cache_;                    ///< DNS cache (optional)
-  std::shared_ptr<dns::DnsResolver> resolver_;              ///< DNS resolver
+  dns::DnsConfig _config;                                   ///< DNS configuration
+  std::shared_ptr<dns::DnsTransport> _transport;            ///< DNS transport layer
+  std::shared_ptr<dns::DnsCache> _cache;                    ///< DNS cache (optional)
+  std::shared_ptr<dns::DnsResolver> _resolver;              ///< DNS resolver
 
   /// \brief Initialize all DNS components based on current configuration
   void initialize()
@@ -843,27 +843,27 @@ private:
     // No additional normalization needed
 
     // Create cache if enabled. The default TTL for records that carry no TTL is
-    // driven by config_.cacheTimeout (maxCacheSize is not an entry cap: the
+    // driven by _config.cacheTimeout (maxCacheSize is not an entry cap: the
     // underlying ExpiringCache is time-based only).
-    if (config_.enableCache)
+    if (_config.enableCache)
     {
-      cache_ = std::make_shared<dns::DnsCache>(config_.cacheTimeout);
+      _cache = std::make_shared<dns::DnsCache>(_config.cacheTimeout);
     }
     else
     {
-      cache_.reset();
+      _cache.reset();
     }
 
     // Create transport layer
-    transport_ = std::make_shared<dns::DnsTransport>(config_);
+    _transport = std::make_shared<dns::DnsTransport>(_config);
 
     // Create resolver
-    resolver_ = std::make_shared<dns::DnsResolver>(transport_, cache_, config_);
+    _resolver = std::make_shared<dns::DnsResolver>(_transport, _cache, _config);
 
     // Start the transport - this is required for dns::DnsTransport::query() to work
     try
     {
-      transport_->start();
+      _transport->start();
     }
     catch (const std::exception &e)
     {
@@ -1003,7 +1003,7 @@ private:
   }
 
   /// \brief Internal implementation of async A record resolution
-  /// \pre transport_ must be valid (checked by caller)
+  /// \pre _transport must be valid (checked by caller)
   /// \pre state must be valid (provided by caller)
   void resolveAInternal(const std::string &hostname,
                         std::function<void(std::vector<std::string>, std::exception_ptr)> callback,
@@ -1011,7 +1011,7 @@ private:
   {
     dns::DnsQuestion question(hostname, dns::DnsType::A, dns::DnsClass::IN);
 
-    transport_->queryAsync(
+    _transport->queryAsync(
       question,
       [callback = std::move(callback), state](const dns::DnsResult &result,
                                               std::exception_ptr error) mutable
@@ -1083,7 +1083,7 @@ DnsClient::resolveA(const std::string &hostname,
   auto state = std::make_shared<AsyncDnsRequest::RequestState>(hostname);
 
   // Check for immediate errors
-  if (!transport_)
+  if (!_transport)
   {
     auto error =
       std::make_exception_ptr(dns::DnsResolverException("DNS transport not initialized"));

@@ -63,23 +63,23 @@ NameResolver (name_resolver.hpp) vs DnsClient (dns_client.hpp). NameResolver is 
 
 ```
 DnsClient  (dns_client.hpp:204)
-  config_       : dns::DnsConfig                       // value; the live configuration
-  cache_        : shared_ptr<dns::DnsCache>            // null when config_.enableCache == false
-  transport_    : shared_ptr<dns::DnsTransport>        // owns the wire layer + timers
-  resolver_     : shared_ptr<dns::DnsResolver>         // RFC 3263 engine; holds transport_ + cache_
+  _config       : dns::DnsConfig                       // value; the live configuration
+  _cache        : shared_ptr<dns::DnsCache>            // null when _config.enableCache == false
+  _transport    : shared_ptr<dns::DnsTransport>        // owns the wire layer + timers
+  _resolver     : shared_ptr<dns::DnsResolver>         // RFC 3263 engine; holds _transport + _cache
 
   dns::DnsResolver (dns_resolver.hpp:420)
-    transport_  : shared_ptr<dns::DnsTransport>        // shared with DnsClient
-    cache_      : shared_ptr<dns::DnsCache>            // shared with DnsClient (may be null)
-    config_     : dns::DnsConfig
-    rng_        : std::mt19937                          // weighted SRV selection (seedable, rngMutex_)
+    _transport  : shared_ptr<dns::DnsTransport>        // shared with DnsClient
+    _cache      : shared_ptr<dns::DnsCache>            // shared with DnsClient (may be null)
+    _config     : dns::DnsConfig
+    _rng        : std::mt19937                          // weighted SRV selection (seedable, _rngMutex)
 
   dns::DnsTransport (dns_transport.hpp:79)
-    udpTransport_ : shared_ptr<Transport>              // Transport::udp(config) — created for mode UDP/Both
-    tcpTransport_ : shared_ptr<Transport>              // Transport::tcp(config) — created for mode TCP/Both
-    pendingQueries_ : map<QueryKey, shared_ptr<PendingQuery>>   // guarded by queriesMutex_
-    timerService_ : shared_ptr<core::TimerService>     // "DnsRetryTimer" — retries + timeouts
-    cleanupThread_ : std::thread                       // 10 s sweep of expired queries
+    _udpTransport : shared_ptr<Transport>              // Transport::udp(config) — created for mode UDP/Both
+    _tcpTransport : shared_ptr<Transport>              // Transport::tcp(config) — created for mode TCP/Both
+    _pendingQueries : map<QueryKey, shared_ptr<PendingQuery>>   // guarded by _queriesMutex
+    _timerService : shared_ptr<core::TimerService>     // "DnsRetryTimer" — retries + timeouts
+    _cleanupThread : std::thread                       // 10 s sweep of expired queries
 
   dns::DnsCache (dns_cache.hpp:70)
     ExpiringCache<DnsCacheKey, CachedDnsResult>        // util/expiring_cache.hpp; time-based TTL
@@ -133,7 +133,7 @@ sequenceDiagram
 | **Caller thread** | Runs the synchronous accessors (`resolveA`/`resolveSRV`/`query`/…); blocks on `std::future::wait_for` inside `DnsTransport::queryMultiple`. Immediate submission errors invoke the async callback here. |
 | **Transport engine I/O thread** | Owned by the two `Transport` engines. Delivers normal DNS responses: `onData` → `DnsMessage::parse` → `processResponse` → `completeQuery` → user callback. |
 | **`DnsRetryTimer` (TimerService) thread** | Fires per-query timeout completions (`scheduleQueryTimeout`) and retry re-sends (`retryQuery`). A timeout's user callback runs here. |
-| **Cleanup thread** (`cleanupThread_`) | A 10-second sweep (`cleanupExpiredQueries`) that retries or times out queries the fast paths missed; those completion callbacks run here. |
+| **Cleanup thread** (`_cleanupThread`) | A 10-second sweep (`cleanupExpiredQueries`) that retries or times out queries the fast paths missed; those completion callbacks run here. |
 
 **Consequence for callers:** an async callback (or `CancellableFuture` continuation) may run on any of three internal threads — the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread — never assume it runs on the caller's thread. Callbacks must be thread-safe. This is documented on `DnsClient::resolveA(host, cb)` (`dns_client.hpp:460-464`).
 
@@ -145,7 +145,7 @@ sequenceDiagram
 
 `DnsClient` is a thin, ownership-holding façade over the resolver. It is **move-only** (`dns_client.hpp:272-277`: copy deleted, move defaulted) because it owns transport threads.
 
-**Construction and lifecycle.** Both constructors (default, and one taking a `dns::DnsConfig`) call `initialize()`, which: creates `cache_` iff `config_.enableCache` — seeding its default TTL from `config_.cacheTimeout` (else resets it); constructs `transport_` from `config_`; constructs `resolver_` from `(transport_, cache_, config_)`; and starts the transport, wrapping any start failure in `dns::DnsResolverException`. `start()` is a no-op that returns `true` (the transport is already started in the constructor); the destructor calls `stop()`, which stops the transport threads.
+**Construction and lifecycle.** Both constructors (default, and one taking a `dns::DnsConfig`) call `initialize()`, which: creates `_cache` iff `_config.enableCache` — seeding its default TTL from `_config.cacheTimeout` (else resets it); constructs `_transport` from `_config`; constructs `_resolver` from `(_transport, _cache, _config)`; and starts the transport, wrapping any start failure in `dns::DnsResolverException`. `start()` is a no-op that returns `true` (the transport is already started in the constructor); the destructor calls `stop()`, which stops the transport threads.
 
 **Synchronous accessors.** Each typed accessor issues one `query()` and unpacks the typed record vector, throwing `dns::DnsNoRecordsException` when the corresponding vector is empty:
 
@@ -176,7 +176,7 @@ These wrap the resolver's callback API in a `std::promise`, guarding against dou
 
 The resolver turns questions into results and orchestrates the service-location chain. It reads exactly one config field itself — `addressResolutionPolicy` — and defers all retry/timeout/server behavior to the transport.
 
-**`query` / `queryAsync`** are the record-level primitives: consult `cache_` (if present), else `transport_->queryMultiple` / `queryAsync`, then apply the cache-write policy via `cacheQueryResult`. That policy caches positive results, and negative results (NXDOMAIN and NODATA — NOERROR with no answers) **only when the response carries an SOA** (RFC 2308 §5: a negative without an SOA has no authoritative TTL to bound it, so it is not cached and is re-queried). `resolveHostname` implements `AddressResolutionPolicy`:
+**`query` / `queryAsync`** are the record-level primitives: consult `_cache` (if present), else `_transport->queryMultiple` / `queryAsync`, then apply the cache-write policy via `cacheQueryResult`. That policy caches positive results, and negative results (NXDOMAIN and NODATA — NOERROR with no answers) **only when the response carries an SOA** (RFC 2308 §5: a negative without an SOA has no authoritative TTL to bound it, so it is not cached and is re-queried). `resolveHostname` implements `AddressResolutionPolicy`:
 
 - Query `A` when policy ∈ {IPv4Only, IPv4First, IPv6First}; query `AAAA` when ∈ {IPv6Only, IPv4First, IPv6First}.
 - Combine: IPv4Only → A only; IPv6Only → AAAA only; IPv4First → A then AAAA; IPv6First → AAAA then A.
@@ -193,7 +193,7 @@ The resolver turns questions into results and orchestrates the service-location 
 
 **`performDirectSrvResolution`** is the no-NAPTR (and no-usable-NAPTR) path: it tries the standard SIP SRV names (`_sips._tcp`, `_sip._tcp`, `_sip._udp`, `_sip._sctp`), reordered by `preferredTransports`. An SRV RRset whose target is the root `.` (RFC 2782 "service decidedly not available") is skipped and marks that **service** denied. If no targets result, it calls `performFallbackResolution`, which does a plain A/AAAA lookup of the bare domain and builds one target per preferred transport (defaulting to `SIP_UDP`) — **excluding any service a `.` explicitly denied** (per-service suppression, not domain-wide: a `_sips._tcp` `.` does not strand plain SIP reachable via a bare A record).
 
-**RFC 2782 weighted selection.** `ServiceResolutionResult::getPreferredTarget` finds the lowest-`naptrPreference` tier, then the lowest `priority` within it, then performs a cumulative-weight walk over `uniform_int_distribution<uint32_t>(0, total_weight-1)`. Three flavors exist: a deterministic-seed const overload, a `thread_local`-RNG production overload `getPreferredTargetWithDefaultRng`, and a caller-RNG template. The resolver-level `getPreferredTarget(result)` uses the resolver's own seedable `rng_` (`setRngSeed`) — guarded by `rngMutex_` — so tests can make selection reproducible without a data race.
+**RFC 2782 weighted selection.** `ServiceResolutionResult::getPreferredTarget` finds the lowest-`naptrPreference` tier, then the lowest `priority` within it, then performs a cumulative-weight walk over `uniform_int_distribution<uint32_t>(0, total_weight-1)`. Three flavors exist: a deterministic-seed const overload, a `thread_local`-RNG production overload `getPreferredTargetWithDefaultRng`, and a caller-RNG template. The resolver-level `getPreferredTarget(result)` uses the resolver's own seedable `_rng` (`setRngSeed`) — guarded by `_rngMutex` — so tests can make selection reproducible without a data race.
 
 **Async service resolution** (`performServiceResolutionAsync`) mirrors the sync chain but fans SRV queries out in parallel, coordinating completion with a shared `std::atomic<size_t> remainingQueries` (`fetch_sub(acq_rel)`), an `std::atomic<bool> callbackFired`, a `std::mutex resultMutex`, and a shared `deniedServices` vector; the last query to finish triggers async address resolution and fires the callback exactly once.
 
@@ -201,19 +201,19 @@ The resolver turns questions into results and orchestrates the service-location 
 
 `DnsTransport` must be owned by a `shared_ptr` — `start()` calls `shared_from_this()`, so a stack instance throws `std::bad_weak_ptr` (`dns_transport.hpp:87-90`). It instantiates the engine(s) the configured `transportMode` needs — `Transport::udp(config)` for `UDP`/`Both`, `Transport::tcp(config)` for `TCP`/`Both` — and wires their `onData`/`onConnect`/`onClose` callbacks, each captured as a `weak_ptr<DnsTransport>` promoted per-use to avoid a reference cycle.
 
-**Query lifecycle.** `queryMultiple` (sync, `:578`) and `queryAsync` (`:675`) mint a unique 16-bit query ID (`generateUniqueQueryId`, `:1446`), build a `QueryKey{id, server, port}` (`:167`), register a `PendingQuery` under `queriesMutex_`, encode the request with `DnsMessage::buildQuery`, and send over UDP (or TCP per `transportMode`). The sync path then blocks on `future.wait_for(calculateMaxSyncWaitTime())` (`:645`).
+**Query lifecycle.** `queryMultiple` (sync, `:578`) and `queryAsync` (`:675`) mint a unique 16-bit query ID (`generateUniqueQueryId`, `:1446`), build a `QueryKey{id, server, port}` (`:167`), register a `PendingQuery` under `_queriesMutex`, encode the request with `DnsMessage::buildQuery`, and send over UDP (or TCP per `transportMode`). The sync path then blocks on `future.wait_for(calculateMaxSyncWaitTime())` (`:645`).
 
-**Query-to-response matching** is by `QueryKey` — the `(queryId, server, port)` triple. Because the UDP and TCP engines mint colliding `SessionId`s, the response path maps a session back to its server via `sessionToServer_`, keyed by `(bool isTcp, SessionId)` (`:373`), preventing cross-engine confusion.
+**Query-to-response matching** is by `QueryKey` — the `(queryId, server, port)` triple. Because the UDP and TCP engines mint colliding `SessionId`s, the response path maps a session back to its server via `_sessionToServer`, keyed by `(bool isTcp, SessionId)` (`:373`), preventing cross-engine confusion.
 
-**UDP→TCP fallback** is truncation-driven, not size-driven: in `processResponse` (`:1129`) a UDP response with the `TC` flag set, when `transportMode == Both` and the query has not already fallen back, sets `tcpFallback = true` and re-sends over TCP. (`config_.maxUdpSize` is **not** consulted — see Known Limitations.)
+**UDP→TCP fallback** is truncation-driven, not size-driven: in `processResponse` (`:1129`) a UDP response with the `TC` flag set, when `transportMode == Both` and the query has not already fallen back, sets `tcpFallback = true` and re-sends over TCP. (`_config.maxUdpSize` is **not** consulted — see Known Limitations.)
 
-**Retry / backoff / jitter.** `retryQuery` (`:1852`) computes `baseDelay = min(initialRetryDelay * retryMultiplier^retryCount, maxRetryDelay)`, then applies multiplicative jitter `× U(1 - jitterFactor, 1 + jitterFactor)` when `jitterFactor > 0`, and schedules the re-send on `timerService_`. Once `retryCount >= config_.retryCount`, the query completes with `dns::DnsTimeoutException`.
+**Retry / backoff / jitter.** `retryQuery` (`:1852`) computes `baseDelay = min(initialRetryDelay * retryMultiplier^retryCount, maxRetryDelay)`, then applies multiplicative jitter `× U(1 - jitterFactor, 1 + jitterFactor)` when `jitterFactor > 0`, and schedules the re-send on `_timerService`. Once `retryCount >= _config.retryCount`, the query completes with `dns::DnsTimeoutException`.
 
-**Timeouts.** Each query arms a `TimerService` timeout of `config_.timeout` via `scheduleQueryTimeout` (`:1696`); the 10-second cleanup sweep (`cleanupExpiredQueries`, `:1774`) is a backstop that retries or times out anything the timer missed.
+**Timeouts.** Each query arms a `TimerService` timeout of `_config.timeout` via `scheduleQueryTimeout` (`:1696`); the 10-second cleanup sweep (`cleanupExpiredQueries`, `:1774`) is a backstop that retries or times out anything the timer missed.
 
-**DoS resistance.** TCP DNS is 2-byte length-prefixed. In `handleTcpData` (`:1031`, under `tcpBuffersMutex_`) the per-session accumulation buffer is capped at `config_.maxTcpBufferSize` (default 65536): exceeding it, or a length prefix that is zero / `> 65535` / `> maxTcpBufferSize`, clears the buffer and **closes the session**. `Transport::close` is enqueue-only, so calling it from inside the I/O-thread `onData` callback is safe.
+**DoS resistance.** TCP DNS is 2-byte length-prefixed. In `handleTcpData` (`:1031`, under `_tcpBuffersMutex`) the per-session accumulation buffer is capped at `_config.maxTcpBufferSize` (default 65536): exceeding it, or a length prefix that is zero / `> 65535` / `> maxTcpBufferSize`, clears the buffer and **closes the session**. `Transport::close` is enqueue-only, so calling it from inside the I/O-thread `onData` callback is safe.
 
-**Server selection.** `getNextServer` (`:1339`) is round-robin over `config_.servers` via an atomic cursor, chosen per query only when the caller passes an empty `server`. There is **no per-query failover**: a retry re-sends to the same server; only a *new* query advances the cursor.
+**Server selection.** `getNextServer` (`:1339`) is round-robin over `_config.servers` via an atomic cursor, chosen per query only when the caller passes an empty `server`. There is **no per-query failover**: a retry re-sends to the same server; only a *new* query advances the cursor.
 
 ### 3.5 `dns::DnsMessage` (wire codec)
 
@@ -227,11 +227,11 @@ The resolver turns questions into results and orchestrates the service-location 
 
 ### 3.6 `dns::DnsCache`
 
-`DnsCache` (`dns_cache.hpp`) wraps a `util::ExpiringCache<DnsCacheKey, CachedDnsResult>` (time-based expiration only — there is no entry-count cap). Its default TTL (for records that carry none) is seeded from `config_.cacheTimeout` and adjustable at runtime via `setCacheTtl`. The cache key (`DnsCacheKey`, `dns_types.hpp`) lowercases the query name for RFC 1035 case-insensitive matching.
+`DnsCache` (`dns_cache.hpp`) wraps a `util::ExpiringCache<DnsCacheKey, CachedDnsResult>` (time-based expiration only — there is no entry-count cap). Its default TTL (for records that carry none) is seeded from `_config.cacheTimeout` and adjustable at runtime via `setCacheTtl`. The cache key (`DnsCacheKey`, `dns_types.hpp`) lowercases the query name for RFC 1035 case-insensitive matching.
 
 **TTL derivation.** Positive entries use `calculateResultTtl` — the **minimum TTL** across every record in all sections (RFC 1035 conservative minimum), falling back to the default TTL only when no record carries one. Negative entries use `calculateNegativeTtl` — the SOA `min(minimum, ttl)` per RFC 2308, then the authority-section SOA TTL, then the default.
 
-**Thread safety.** A `std::shared_mutex cacheMutex_` guards the backing `ExpiringCache` pointer: `get`/`put`/`putNegative`/`remove` take it shared, `clear()` takes it exclusively (it destroys and replaces the instance). A separate `std::mutex statsMutex_` (inner; ordering `cacheMutex_ → statsMutex_`) serializes the read-decide-count sequence in `put`/`putNegative` so concurrent same-key writes cannot double-count. Statistics are nine `std::atomic<uint64_t>` counters (`AtomicStats`); `defaultTtlSeconds_` is an `atomic<int64_t>`. `cleanupExpired()` is a no-op returning 0 (ExpiringCache sweeps on its own), and `setCleanupCallback` stores a callback that is never invoked (compatibility no-op).
+**Thread safety.** A `std::shared_mutex _cacheMutex` guards the backing `ExpiringCache` pointer: `get`/`put`/`putNegative`/`remove` take it shared, `clear()` takes it exclusively (it destroys and replaces the instance). A separate `std::mutex _statsMutex` (inner; ordering `_cacheMutex → _statsMutex`) serializes the read-decide-count sequence in `put`/`putNegative` so concurrent same-key writes cannot double-count. Statistics are nine `std::atomic<uint64_t>` counters (`AtomicStats`); `_defaultTtlSeconds` is an `atomic<int64_t>`. `cleanupExpired()` is a no-op returning 0 (ExpiringCache sweeps on its own), and `setCleanupCallback` stores a callback that is never invoked (compatibility no-op).
 
 ---
 
@@ -375,12 +375,12 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 | Step | Component | Action |
 |---|---|---|
 | 1 | `DnsClient::resolveA` | Build `DnsQuestion{host, A, IN}`; call `query()`. |
-| 2 | `DnsResolver::query` | Look up `cache_->get()`. On hit, return cached `DnsResult`. |
-| 3 | `DnsTransport::queryMultiple` | `generateUniqueQueryId`; register `PendingQuery` under `queriesMutex_`; arm timeout on `timerService_`. |
+| 2 | `DnsResolver::query` | Look up `_cache->get()`. On hit, return cached `DnsResult`. |
+| 3 | `DnsTransport::queryMultiple` | `generateUniqueQueryId`; register `PendingQuery` under `_queriesMutex`; arm timeout on `_timerService`. |
 | 4 | `DnsTransport::sendUdpQuery` | `DnsMessage::buildQuery`; send via the UDP engine. |
 | 5 | Caller thread | Block on `future.wait_for(calculateMaxSyncWaitTime())`. |
 | 6 | Engine I/O thread | `onData` → `DnsMessage::parse` → `processResponse` → `completeQuery` sets the promise. |
-| 7 | `DnsResolver::query` | Populate `cache_->put()`; return `DnsResult`. |
+| 7 | `DnsResolver::query` | Populate `_cache->put()`; return `DnsResult`. |
 | 8 | `DnsClient::resolveA` | Extract `a_records`; throw `DnsNoRecordsException` if empty, else return addresses. |
 
 ### Truncation → TCP fallback
@@ -388,9 +388,9 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 | Step | Component | Action |
 |---|---|---|
 | 1 | Engine I/O thread | UDP `processResponse` observes `result.isTruncated()` (TC flag). |
-| 2 | `DnsTransport` | Increment `truncatedResponses`. If `transportMode == Both` and `!tcpFallback` (under `queriesMutex_`): set `tcpFallback = true`. |
-| 3 | `DnsTransport::sendTcpQuery` | Re-send the same query over the TCP engine (inner co-hold of `sessionsMutex_`); `return` without completing. |
-| 4 | Engine I/O thread | TCP `handleTcpData` accumulates length-prefixed bytes under `tcpBuffersMutex_`; over `maxTcpBufferSize` → clear + `close(session)`. |
+| 2 | `DnsTransport` | Increment `truncatedResponses`. If `transportMode == Both` and `!tcpFallback` (under `_queriesMutex`): set `tcpFallback = true`. |
+| 3 | `DnsTransport::sendTcpQuery` | Re-send the same query over the TCP engine (inner co-hold of `_sessionsMutex`); `return` without completing. |
+| 4 | Engine I/O thread | TCP `handleTcpData` accumulates length-prefixed bytes under `_tcpBuffersMutex`; over `maxTcpBufferSize` → clear + `close(session)`. |
 | 5 | `DnsTransport` | On a complete TCP message → `processResponse` → `completeQuery`. |
 
 ### Async cancellation (future path)
@@ -405,8 +405,8 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 
 | Step | Component | Action |
 |---|---|---|
-| 1 | `DnsRetryTimer` thread | Per-query timeout lambda fires (`scheduleQueryTimeout`) or `retryQuery` sees `retryCount >= config_.retryCount`. |
-| 2 | `DnsTransport::completeQuery` | Remove the `PendingQuery` under `queriesMutex_`, release the lock, then invoke callback / set promise with `DnsTimeoutException`. |
+| 1 | `DnsRetryTimer` thread | Per-query timeout lambda fires (`scheduleQueryTimeout`) or `retryQuery` sees `retryCount >= _config.retryCount`. |
+| 2 | `DnsTransport::completeQuery` | Remove the `PendingQuery` under `_queriesMutex`, release the lock, then invoke callback / set promise with `DnsTimeoutException`. |
 
 ---
 
@@ -416,17 +416,17 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 
 | Component / operation | Synchronization | Notes |
 |---|---|---|
-| `DnsTransport` pending-query map | `queriesMutex_` | Guards `pendingQueries_`. `completeQuery` and the timeout lambda are **copy-then-invoke** (release before callback). |
-| `DnsTransport::stop()` | `queriesMutex_` held during callback | The single callback-under-lock site: `stop()` invokes each pending query's error callback while holding `queriesMutex_` (`dns_transport.hpp:523-527`). A callback that re-enters the transport can deadlock. |
-| `DnsTransport` sessions | `sessionsMutex_` | Guards `serverSessions_`, `sessionToServer_`, `connectedSessions_`, `pendingOnConnect_`. |
-| `DnsTransport` TCP buffers | `tcpBuffersMutex_` | Guards per-session accumulation; the DoS cap + `close()` run here. |
-| `DnsTransport` cleanup thread | `cleanupMutex_` + `cleanupCv_` | 10-second wait loop; `cleanupRunning_`/`running_` are atomics. |
+| `DnsTransport` pending-query map | `_queriesMutex` | Guards `_pendingQueries`. `completeQuery` and the timeout lambda are **copy-then-invoke** (release before callback). |
+| `DnsTransport::stop()` | `_queriesMutex` held during callback | The single callback-under-lock site: `stop()` invokes each pending query's error callback while holding `_queriesMutex` (`dns_transport.hpp:523-527`). A callback that re-enters the transport can deadlock. |
+| `DnsTransport` sessions | `_sessionsMutex` | Guards `_serverSessions`, `_sessionToServer`, `_connectedSessions`, `_pendingOnConnect`. |
+| `DnsTransport` TCP buffers | `_tcpBuffersMutex` | Guards per-session accumulation; the DoS cap + `close()` run here. |
+| `DnsTransport` cleanup thread | `_cleanupMutex` + `_cleanupCv` | 10-second wait loop; `_cleanupRunning`/`_running` are atomics. |
 | `DnsTransport` statistics | `std::atomic` counters | `InternalStatistics` (8 atomics); snapshot via `getStatistics()`. |
-| `DnsTransport` lock ordering | Documented | `stateMutex_ / cleanupMutex_ > tcpBuffersMutex_ > queriesMutex_ > sessionsMutex_` (`dns_transport.hpp:320-342`). The truncation path holds `queriesMutex_` while `sendTcpQuery` takes `sessionsMutex_` (an intentional inner co-hold). |
+| `DnsTransport` lock ordering | Documented | `_stateMutex / _cleanupMutex > _tcpBuffersMutex > _queriesMutex > _sessionsMutex` (`dns_transport.hpp:320-342`). The truncation path holds `_queriesMutex` while `sendTcpQuery` takes `_sessionsMutex` (an intentional inner co-hold). |
 | `DnsResolver` async coordination | per-op `std::mutex` + atomics | `resultMutex` + `remainingQueries` (`fetch_sub(acq_rel)`) + `callbackFired` + `deniedServices` are local to each async call, not members. Async continuations capture `self = shared_from_this()` to stay alive across the callback chain. |
-| `DnsResolver::rng_` | `rngMutex_` | Guards the weighted-selection generator against concurrent `getPreferredTarget(result)` / `setRngSeed`; a leaf lock. |
-| `DnsCache` container | `std::shared_mutex cacheMutex_` | Shared for `get`/`put`/`putNegative`/`remove`, exclusive for `clear()` (which replaces the `ExpiringCache`). Guards the pointer; the store is itself internally synchronized. |
-| `DnsCache` stats | `statsMutex_` (inner) + `std::atomic` counters | Ordering `cacheMutex_ → statsMutex_`; the eviction callback takes neither (atomic `fetch_sub` only). |
+| `DnsResolver::_rng` | `_rngMutex` | Guards the weighted-selection generator against concurrent `getPreferredTarget(result)` / `setRngSeed`; a leaf lock. |
+| `DnsCache` container | `std::shared_mutex _cacheMutex` | Shared for `get`/`put`/`putNegative`/`remove`, exclusive for `clear()` (which replaces the `ExpiringCache`). Guards the pointer; the store is itself internally synchronized. |
+| `DnsCache` stats | `_statsMutex` (inner) + `std::atomic` counters | Ordering `_cacheMutex → _statsMutex`; the eviction callback takes neither (atomic `fetch_sub` only). |
 | Async callback delivery | `RequestState::deliveryAttempted` + `promiseSet` CAS | Exactly-once delivery even when response and timeout race across threads. |
 
 ---
@@ -446,7 +446,7 @@ All fields are on `dns::DnsConfig` (`dns_types.hpp:542`). Timeouts use `std::chr
 | `retryMultiplier` | `double` | `2.0` | Exponential backoff multiplier. |
 | `maxRetryDelay` | `std::chrono::milliseconds` | `10000` | Backoff cap. |
 | `jitterFactor` | `double` | `0.1` | Multiplicative jitter `× U(1−f, 1+f)` when `> 0`. |
-| `enableCache` | `bool` | `true` | Create a `DnsCache`; when false, `cache_` is null. |
+| `enableCache` | `bool` | `true` | Create a `DnsCache`; when false, `_cache` is null. |
 | `maxCacheSize` | `std::size_t` | `10000` | **Not an entry cap** — the cache is time-based (`ExpiringCache`), so this is not enforced; entries live for their TTL, not a count. |
 | `transportMode` | `DnsTransportMode` | `Both` | `UDP` / `TCP` / `Both` (UDP with TCP fallback on truncation). |
 | `recursionDesired` | `bool` | `true` | Sets the `RD` flag in outbound queries. |
@@ -478,8 +478,8 @@ template <typename T> struct CancellableFuture
 {
   std::future<T> future;
   AsyncDnsRequest request;
-  std::shared_ptr<std::promise<T>> promise_;
-  std::shared_ptr<std::atomic<bool>> promiseSet_;
+  std::shared_ptr<std::promise<T>> promise;
+  std::shared_ptr<std::atomic<bool>> promiseSet;
   bool cancel();
   bool isCancelled() const;
   bool isCompleted() const;
@@ -638,12 +638,12 @@ class DnsNoRecordsException : public DnsResolverException {}; // rcode NXDOMAIN
 | Limitation | Impact |
 |---|---|
 | **`maxUdpSize` is declared but unused.** | `DnsConfig::maxUdpSize` (default 512) is never consulted by `DnsTransport`; outbound UDP size is not checked and TCP fallback is purely TC-flag-driven. Setting it has no effect. |
-| **`tcpTimeout` is declared but unused.** | `DnsConfig::tcpTimeout` (default 10000 ms) is never referenced; TCP queries use `config_.timeout` (5000 ms) like UDP. Do not rely on a distinct TCP timeout. |
+| **`tcpTimeout` is declared but unused.** | `DnsConfig::tcpTimeout` (default 10000 ms) is never referenced; TCP queries use `_config.timeout` (5000 ms) like UDP. Do not rely on a distinct TCP timeout. |
 | **`maxCacheSize` is not enforced.** | The cache has no entry-count bound; it is expiration-based only. A flood of distinct short-TTL names is bounded only by their TTLs, not by a size cap. |
 | **NAPTR tier-descent does not re-descend on SRV-resolution failure.** | `processNaptrRecords` commits to the first `ORDER` tier that produces a selectable `S`/`A` record; if that tier's SRV RRset later resolves to nothing, a usable higher-`ORDER` tier is not retried. RFC 3263 §4.1 permits this ("first selectable tier wins"), but a peer that publishes fallback tiers expecting SRV-failure re-descent will not get it. |
-| **Cache statistics are approximate under concurrent same-key writes.** | The insertion/replacement counters can drift by ±1 when a key expires in the window between a `put`'s existence check and its count update (the eviction callback decrements without `statsMutex_`). Cached data is unaffected; only the monitoring counters are approximate (tracked backlog). |
+| **Cache statistics are approximate under concurrent same-key writes.** | The insertion/replacement counters can drift by ±1 when a key expires in the window between a `put`'s existence check and its count update (the eviction callback decrements without `_statsMutex`). Cached data is unaffected; only the monitoring counters are approximate (tracked backlog). |
 | **No per-query server failover.** | A failing query retries against the *same* server; only a new query advances the round-robin cursor. A single dead server is not skipped mid-query. |
-| **`stop()` invokes callbacks under `queriesMutex_`.** | `DnsTransport::stop()` is the one callback-under-lock site (`dns_transport.hpp:523-527`); a callback that re-enters the transport during shutdown can deadlock. Keep shutdown-time callbacks non-re-entrant. |
+| **`stop()` invokes callbacks under `_queriesMutex`.** | `DnsTransport::stop()` is the one callback-under-lock site (`dns_transport.hpp:523-527`); a callback that re-enters the transport during shutdown can deadlock. Keep shutdown-time callbacks non-re-entrant. |
 | **`cleanupCache()` / `setCacheCleanupCallback` are no-ops.** | `cleanupExpired()` always returns 0 (ExpiringCache sweeps itself every ~5 s) and the stored cleanup callback is never invoked. Do not use them for monitoring. |
 | **`resolveHost` swallows per-family errors.** | It returns `success = false` only when *both* A and AAAA fail; individual family errors are discarded, so a partial failure is invisible to the caller. Use `resolveA`/`resolveAAAA` when you need per-family error detail. |
 | **Async callbacks run on internal threads.** | Callbacks fire on the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread — never the caller's. Non-thread-safe callback bodies are a data race. |

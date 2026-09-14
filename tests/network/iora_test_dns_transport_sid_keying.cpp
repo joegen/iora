@@ -10,8 +10,8 @@
 ///
 /// The UDP and TCP transport engines mint SessionIds from independent counters that
 /// both start at 1, so the first UDP session and the first TCP session both get
-/// sid == 1. Before the fix, sessionToServer_ was keyed by a bare SessionId and
-/// handleClose erased serverSessions_/tcpBuffers_ ignoring the protocol, so a
+/// sid == 1. Before the fix, _sessionToServer was keyed by a bare SessionId and
+/// handleClose erased _serverSessions/_tcpBuffers ignoring the protocol, so a
 /// colliding UDP/TCP sid pair aliased each other's server mapping (wrong-server
 /// attribution) and one protocol's close tore down the other's still-live state.
 ///
@@ -21,7 +21,7 @@
 /// is reproduced without flakiness. They cover the tracker test_plan assertions:
 ///   (A) routing / no-misattribution across a colliding (UDP sid=1, TCP sid=1) pair;
 ///   (B) teardown isolation -- a TCP close must not tear down the UDP sibling;
-///   (C) tcpBuffers_ cross-erase -- a UDP close must not erase the TCP sibling's
+///   (C) _tcpBuffers cross-erase -- a UDP close must not erase the TCP sibling's
 ///       partially-reassembled buffer, while a TCP close still erases its own.
 /// Non-vacuity (RED-against-unfixed) is demonstrated separately by targeted mutation
 /// of each fixed site (see the tracker); the assertions below pin the fixed behavior.
@@ -67,41 +67,41 @@ struct DnsTransportSidKeyingTestAccess
   static void putSession(T &t, bool isTcp, SessionId sid, const std::string &server,
                          std::uint16_t port)
   {
-    std::lock_guard<std::mutex> l(t.sessionsMutex_);
-    t.sessionToServer_[std::make_pair(isTcp, sid)] = {server, port};
-    t.serverSessions_[T::serverKey(server, port, isTcp)] = sid;
+    std::lock_guard<std::mutex> l(t._sessionsMutex);
+    t._sessionToServer[std::make_pair(isTcp, sid)] = {server, port};
+    t._serverSessions[T::serverKey(server, port, isTcp)] = sid;
   }
 
   static bool hasSession(T &t, bool isTcp, SessionId sid)
   {
-    std::lock_guard<std::mutex> l(t.sessionsMutex_);
-    return t.sessionToServer_.count(std::make_pair(isTcp, sid)) != 0;
+    std::lock_guard<std::mutex> l(t._sessionsMutex);
+    return t._sessionToServer.count(std::make_pair(isTcp, sid)) != 0;
   }
 
   static bool hasServerSession(T &t, const std::string &server, std::uint16_t port, bool isTcp)
   {
-    std::lock_guard<std::mutex> l(t.sessionsMutex_);
-    return t.serverSessions_.count(T::serverKey(server, port, isTcp)) != 0;
+    std::lock_guard<std::mutex> l(t._sessionsMutex);
+    return t._serverSessions.count(T::serverKey(server, port, isTcp)) != 0;
   }
 
   static void putTcpBuffer(T &t, SessionId sid, const std::vector<std::uint8_t> &bytes)
   {
-    std::lock_guard<std::mutex> l(t.tcpBuffersMutex_);
-    auto &buf = t.tcpBuffers_[sid];
+    std::lock_guard<std::mutex> l(t._tcpBuffersMutex);
+    auto &buf = t._tcpBuffers[sid];
     buf.insert(buf.end(), bytes.begin(), bytes.end());
   }
 
   static bool hasTcpBuffer(T &t, SessionId sid)
   {
-    std::lock_guard<std::mutex> l(t.tcpBuffersMutex_);
-    return t.tcpBuffers_.count(sid) != 0;
+    std::lock_guard<std::mutex> l(t._tcpBuffersMutex);
+    return t._tcpBuffers.count(sid) != 0;
   }
 
   static std::size_t tcpBufferSize(T &t, SessionId sid)
   {
-    std::lock_guard<std::mutex> l(t.tcpBuffersMutex_);
-    auto it = t.tcpBuffers_.find(sid);
-    return it == t.tcpBuffers_.end() ? 0 : it->second.size();
+    std::lock_guard<std::mutex> l(t._tcpBuffersMutex);
+    auto it = t._tcpBuffers.find(sid);
+    return it == t._tcpBuffers.end() ? 0 : it->second.size();
   }
 
   static void registerPending(T &t, std::uint16_t id, const std::string &server,
@@ -109,14 +109,14 @@ struct DnsTransportSidKeyingTestAccess
   {
     auto q = std::make_shared<T::PendingQuery>(id, std::chrono::milliseconds(5000), server, port,
                                                std::vector<std::uint8_t>{});
-    std::lock_guard<std::mutex> l(t.queriesMutex_);
-    t.pendingQueries_.emplace(T::QueryKey(id, server, port), q);
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    t._pendingQueries.emplace(T::QueryKey(id, server, port), q);
   }
 
   static bool hasPending(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
   {
-    std::lock_guard<std::mutex> l(t.queriesMutex_);
-    return t.pendingQueries_.count(T::QueryKey(id, server, port)) != 0;
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    return t._pendingQueries.count(T::QueryKey(id, server, port)) != 0;
   }
 
   static void feedUdp(T &t, SessionId sid, const std::vector<std::uint8_t> &bytes)
@@ -225,7 +225,7 @@ TEST_CASE("dns sid-keying: TCP close preserves the colliding UDP sibling", "[dns
   CHECK(Access::hasServerSession(*t, SERVER_A, PORT_A, /*isTcp=*/false));
 }
 
-// (C) tcpBuffers_ cross-erase: a UDP close of the colliding sid must not erase the
+// (C) _tcpBuffers cross-erase: a UDP close of the colliding sid must not erase the
 // live TCP session's partially-reassembled buffer; a TCP close still erases its own.
 TEST_CASE("dns sid-keying: UDP close preserves the colliding TCP reassembly buffer",
           "[dns][sid-keying]")

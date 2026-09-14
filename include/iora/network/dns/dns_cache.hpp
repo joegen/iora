@@ -71,11 +71,11 @@ class DnsCache
 {
 public:
   /// \brief Constructor with default configuration
-  DnsCache() : defaultTtlSeconds_(300) { initializeCache(); } // 5 minute default TTL
+  DnsCache() : _defaultTtlSeconds(300) { initializeCache(); } // 5 minute default TTL
 
   /// \brief Constructor with configurable TTL
   /// \param ttl Time-to-live for cache entries
-  explicit DnsCache(std::chrono::seconds ttl) : defaultTtlSeconds_(ttl.count()) { initializeCache(); }
+  explicit DnsCache(std::chrono::seconds ttl) : _defaultTtlSeconds(ttl.count()) { initializeCache(); }
 
   /// \brief Store DNS query result in cache with minimum TTL
   ///
@@ -96,14 +96,14 @@ public:
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
 
-    // cacheMutex_ (shared) guards cache_ against clear()'s reassignment; statsMutex_
+    // _cacheMutex (shared) guards _cache against clear()'s reassignment; _statsMutex
     // (inner) serializes the read-decide-count sequence so concurrent same-key puts
-    // cannot both count an insertion. Ordering is always cacheMutex_ -> statsMutex_.
-    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    // cannot both count an insertion. Ordering is always _cacheMutex -> _statsMutex.
+    std::shared_lock<std::shared_mutex> clock(_cacheMutex);
+    std::lock_guard<std::mutex> lock(_statsMutex);
 
     // Check what type of entry exists to handle counter correctly
-    auto existingEntry = cache_->get(key);
+    auto existingEntry = _cache->get(key);
     bool hadEntry = existingEntry.has_value();
     bool hadNegativeEntry = hadEntry && existingEntry->isNegative;
 
@@ -112,26 +112,26 @@ public:
 
     // Store positive result
     CachedDnsResult cachedResult(result);
-    cache_->set(key, cachedResult, std::chrono::seconds(ttl));
+    _cache->set(key, cachedResult, std::chrono::seconds(ttl));
 
     // Update statistics - distinguish insertions from replacements
     if (!hadEntry)
     {
       // New entry
-      stats_.insertions.fetch_add(1);
-      stats_.current_entries.fetch_add(1);
+      _stats.insertions.fetch_add(1);
+      _stats.current_entries.fetch_add(1);
     }
     else if (hadNegativeEntry)
     {
       // Replacing negative entry with positive entry
-      stats_.replacements.fetch_add(1);
-      stats_.current_negative_entries.fetch_sub(1);
-      stats_.current_entries.fetch_add(1);
+      _stats.replacements.fetch_add(1);
+      _stats.current_negative_entries.fetch_sub(1);
+      _stats.current_entries.fetch_add(1);
     }
     else
     {
       // Replacing positive with positive
-      stats_.replacements.fetch_add(1);
+      _stats.replacements.fetch_add(1);
       // No current_entries change needed
     }
   }
@@ -146,37 +146,37 @@ public:
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
 
-    // cacheMutex_ (shared) -> statsMutex_ (inner); see put().
-    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
-    std::lock_guard<std::mutex> lock(statsMutex_);
+    // _cacheMutex (shared) -> _statsMutex (inner); see put().
+    std::shared_lock<std::shared_mutex> clock(_cacheMutex);
+    std::lock_guard<std::mutex> lock(_statsMutex);
 
     // Check what type of entry exists to handle counter correctly
-    auto existingEntry = cache_->get(key);
+    auto existingEntry = _cache->get(key);
     bool hadEntry = existingEntry.has_value();
     bool hadNegativeEntry = hadEntry && existingEntry->isNegative;
 
     // Store negative result
     CachedDnsResult cachedResult(result, errorMessage);
-    cache_->set(key, cachedResult, std::chrono::seconds(negativeTtl));
+    _cache->set(key, cachedResult, std::chrono::seconds(negativeTtl));
 
     // Update statistics - distinguish insertions from replacements
     if (!hadEntry)
     {
       // New entry
-      stats_.negative_insertions.fetch_add(1);
-      stats_.current_negative_entries.fetch_add(1);
+      _stats.negative_insertions.fetch_add(1);
+      _stats.current_negative_entries.fetch_add(1);
     }
     else if (!hadNegativeEntry)
     {
       // Replacing positive entry with negative entry
-      stats_.negative_replacements.fetch_add(1);
-      stats_.current_entries.fetch_sub(1);
-      stats_.current_negative_entries.fetch_add(1);
+      _stats.negative_replacements.fetch_add(1);
+      _stats.current_entries.fetch_sub(1);
+      _stats.current_negative_entries.fetch_add(1);
     }
     else
     {
       // Replacing negative with negative
-      stats_.negative_replacements.fetch_add(1);
+      _stats.negative_replacements.fetch_add(1);
       // No current counter change needed
     }
   }
@@ -201,13 +201,13 @@ public:
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
 
     // Shared lock: concurrent readers/writers are fine; only clear() (which
-    // reassigns cache_) needs exclusivity. See cacheMutex_.
-    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
+    // reassigns _cache) needs exclusivity. See _cacheMutex.
+    std::shared_lock<std::shared_mutex> clock(_cacheMutex);
 
-    auto cachedResult = cache_->get(key);
+    auto cachedResult = _cache->get(key);
     if (!cachedResult.has_value())
     {
-      stats_.misses.fetch_add(1);
+      _stats.misses.fetch_add(1);
       return false;
     }
 
@@ -216,11 +216,11 @@ public:
 
     if (cachedResult->isNegative)
     {
-      stats_.negative_hits.fetch_add(1);
+      _stats.negative_hits.fetch_add(1);
     }
     else
     {
-      stats_.hits.fetch_add(1);
+      _stats.hits.fetch_add(1);
     }
 
     return true;
@@ -231,8 +231,8 @@ public:
   void remove(const DnsQuestion &question)
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
-    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
-    cache_->remove(key);
+    std::shared_lock<std::shared_mutex> clock(_cacheMutex);
+    _cache->remove(key);
   }
 
   /// \brief Clear entire cache (preserves historical statistics)
@@ -257,32 +257,32 @@ public:
   ///                            If false, preserve hits/misses/insertions for monitoring
   void clear(bool resetHistoricalStats)
   {
-    // Exclusive lock: clear() replaces cache_, so no reader/writer (get/put/
-    // putNegative/remove, all shared-locked) may be inside cache_ concurrently.
-    std::unique_lock<std::shared_mutex> clock(cacheMutex_);
+    // Exclusive lock: clear() replaces _cache, so no reader/writer (get/put/
+    // putNegative/remove, all shared-locked) may be inside _cache concurrently.
+    std::unique_lock<std::shared_mutex> clock(_cacheMutex);
 
     // Reset historical statistics if requested
     if (resetHistoricalStats)
     {
-      stats_.hits.store(0);
-      stats_.misses.store(0);
-      stats_.negative_hits.store(0);
-      stats_.insertions.store(0);
-      stats_.replacements.store(0);
-      stats_.negative_insertions.store(0);
-      stats_.negative_replacements.store(0);
+      _stats.hits.store(0);
+      _stats.misses.store(0);
+      _stats.negative_hits.store(0);
+      _stats.insertions.store(0);
+      _stats.replacements.store(0);
+      _stats.negative_insertions.store(0);
+      _stats.negative_replacements.store(0);
     }
 
     // ExpiringCache has no clear(); replace the instance. Destroying the old one
     // joins its purge thread, so any IN-FLIGHT eviction callbacks complete before
     // we store(0) below; resident entries are dropped without a per-entry
     // decrement, which the unconditional store(0) reconciles (no underflow).
-    // The cleanupCallback_ and defaultTtlSeconds_ are preserved.
+    // The _cleanupCallback and _defaultTtlSeconds are preserved.
     initializeCache();
 
     // Reset current entry counters after the old cache is fully torn down.
-    stats_.current_entries.store(0);
-    stats_.current_negative_entries.store(0);
+    _stats.current_entries.store(0);
+    _stats.current_negative_entries.store(0);
   }
 
   /// \brief Get current cache statistics
@@ -290,17 +290,17 @@ public:
   DnsCacheStats getStats() const
   {
     DnsCacheStats currentStats;
-    currentStats.hits = stats_.hits.load();
-    currentStats.misses = stats_.misses.load();
-    currentStats.negative_hits = stats_.negative_hits.load();
-    currentStats.insertions = stats_.insertions.load();
-    currentStats.replacements = stats_.replacements.load();
-    currentStats.negative_insertions = stats_.negative_insertions.load();
-    currentStats.negative_replacements = stats_.negative_replacements.load();
+    currentStats.hits = _stats.hits.load();
+    currentStats.misses = _stats.misses.load();
+    currentStats.negative_hits = _stats.negative_hits.load();
+    currentStats.insertions = _stats.insertions.load();
+    currentStats.replacements = _stats.replacements.load();
+    currentStats.negative_insertions = _stats.negative_insertions.load();
+    currentStats.negative_replacements = _stats.negative_replacements.load();
 
     // Use accurate counters maintained via eviction callbacks
-    currentStats.current_entries = stats_.current_entries.load();
-    currentStats.current_negative_entries = stats_.current_negative_entries.load();
+    currentStats.current_entries = _stats.current_entries.load();
+    currentStats.current_negative_entries = _stats.current_negative_entries.load();
 
     currentStats.last_cleanup = std::chrono::steady_clock::now();
     return currentStats;
@@ -319,7 +319,7 @@ public:
   void setCleanupCallback(std::function<void(const DnsCacheStats &)> callback)
   {
     // Store callback for potential future use
-    cleanupCallback_ = callback;
+    _cleanupCallback = callback;
   }
 
   /// \brief Set default TTL for cache entries at runtime
@@ -331,7 +331,7 @@ public:
   /// \param ttl New default time-to-live for cache entries
   void setDefaultTtl(std::chrono::seconds ttl)
   {
-    defaultTtlSeconds_.store(ttl.count(), std::memory_order_relaxed);
+    _defaultTtlSeconds.store(ttl.count(), std::memory_order_relaxed);
   }
 
   /// \brief Get current default TTL for cache entries
@@ -339,12 +339,12 @@ public:
   /// \return Current default TTL in seconds
   std::chrono::seconds getDefaultTtl() const
   {
-    return std::chrono::seconds{defaultTtlSeconds_.load(std::memory_order_relaxed)};
+    return std::chrono::seconds{_defaultTtlSeconds.load(std::memory_order_relaxed)};
   }
 
 private:
   /// \brief Default TTL for cache entries (atomic for thread safety)
-  std::atomic<int64_t> defaultTtlSeconds_;
+  std::atomic<int64_t> _defaultTtlSeconds;
 
   /// \brief Atomic statistics counters
   struct AtomicStats
@@ -358,7 +358,7 @@ private:
     std::atomic<std::uint64_t> negative_replacements{0};
     std::atomic<std::uint64_t> current_entries{0};          ///< Accurate current positive entries
     std::atomic<std::uint64_t> current_negative_entries{0}; ///< Accurate current negative entries
-  } stats_;
+  } _stats;
 
   /// \brief Serializes the get -> decide -> set -> count sequence in put/putNegative
   ///
@@ -369,26 +369,26 @@ private:
   /// makes that read-decide-count sequence atomic. It is NOT taken by the eviction
   /// callback (which only does atomic fetch_sub), so there is no lock-ordering
   /// hazard with the ExpiringCache's internal mutex.
-  mutable std::mutex statsMutex_;
+  mutable std::mutex _statsMutex;
 
-  /// \brief Guards the cache_ pointer against clear()'s reassignment.
+  /// \brief Guards the _cache pointer against clear()'s reassignment.
   ///
-  /// Shared-locked by get/put/putNegative/remove (they only need cache_ to stay
+  /// Shared-locked by get/put/putNegative/remove (they only need _cache to stay
   /// alive while they dereference it; ExpiringCache is itself internally
-  /// synchronized), unique-locked by clear() which destroys and replaces cache_.
-  /// Lock ordering is cacheMutex_ -> statsMutex_; the eviction callback takes
+  /// synchronized), unique-locked by clear() which destroys and replaces _cache.
+  /// Lock ordering is _cacheMutex -> _statsMutex; the eviction callback takes
   /// neither, so there is no inversion with ExpiringCache's internal mutex.
-  mutable std::shared_mutex cacheMutex_;
+  mutable std::shared_mutex _cacheMutex;
 
   /// \brief Optional cleanup callback
-  std::function<void(const DnsCacheStats &)> cleanupCallback_;
+  std::function<void(const DnsCacheStats &)> _cleanupCallback;
 
   /// \brief Underlying expiring cache.
   ///
   /// Declared LAST so it is destroyed FIRST: ~ExpiringCache joins its purge
-  /// thread before stats_/statsMutex_/cacheMutex_ (which the eviction callback
+  /// thread before _stats/_statsMutex/_cacheMutex (which the eviction callback
   /// touches) are destroyed, closing the teardown UAF window.
-  std::unique_ptr<util::ExpiringCache<DnsCacheKey, CachedDnsResult>> cache_;
+  std::unique_ptr<util::ExpiringCache<DnsCacheKey, CachedDnsResult>> _cache;
 
   /// \brief Initialize cache with eviction callback
   void initializeCache()
@@ -398,15 +398,15 @@ private:
       // Decrement appropriate counter when entries are evicted
       if (result.isNegative)
       {
-        stats_.current_negative_entries.fetch_sub(1);
+        _stats.current_negative_entries.fetch_sub(1);
       }
       else
       {
-        stats_.current_entries.fetch_sub(1);
+        _stats.current_entries.fetch_sub(1);
       }
     };
 
-    cache_ = std::make_unique<util::ExpiringCache<DnsCacheKey, CachedDnsResult>>(getDefaultTtl(),
+    _cache = std::make_unique<util::ExpiringCache<DnsCacheKey, CachedDnsResult>>(getDefaultTtl(),
                                                                                  evictionCallback);
   }
 
@@ -424,7 +424,7 @@ private:
   ///    - This handles cases where SOA parsing might have been missed
   ///    - Note: This is less accurate as it doesn't extract MINIMUM from RDATA
   ///
-  /// 3. **Default**: Uses configured defaultTtl_ when no SOA found
+  /// 3. **Default**: Uses configured _defaultTtlSeconds when no SOA found
   ///    - Standard fallback per RFC 2308 recommendations
   ///
   /// The authority section fallback exists because SOA records in NXDOMAIN responses
@@ -432,7 +432,7 @@ private:
   /// them to soa_records. If this fallback is frequently used, it may indicate a parsing issue.
   ///
   /// \param result DNS query result containing potential SOA records
-  /// \param defaultNegativeTtl Fallback TTL if no SOA found (0 = use defaultTtl_)
+  /// \param defaultNegativeTtl Fallback TTL if no SOA found (0 = use _defaultTtlSeconds)
   /// \return Negative TTL in seconds (from SOA minimum or default)
   std::uint32_t calculateNegativeTtl(const DnsResult &result,
                                      std::uint32_t defaultNegativeTtl = 0) const
@@ -459,7 +459,7 @@ private:
 
     // RFC 2308 fallback: use default negative TTL when no SOA found
     return defaultNegativeTtl > 0 ? defaultNegativeTtl
-                                  : static_cast<std::uint32_t>(defaultTtlSeconds_.load(std::memory_order_relaxed));
+                                  : static_cast<std::uint32_t>(_defaultTtlSeconds.load(std::memory_order_relaxed));
   }
 
   /// \brief Calculate appropriate TTL from DNS result using conservative minimum approach
@@ -544,7 +544,7 @@ private:
     // Default TTL if no records found (RFC 1035 suggests reasonable defaults)
     if (min_ttl == std::numeric_limits<std::uint32_t>::max())
     {
-      min_ttl = static_cast<std::uint32_t>(defaultTtlSeconds_.load(std::memory_order_relaxed));
+      min_ttl = static_cast<std::uint32_t>(_defaultTtlSeconds.load(std::memory_order_relaxed));
     }
 
     return min_ttl;

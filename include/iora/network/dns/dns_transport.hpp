@@ -132,7 +132,7 @@ public:
   void updateConfig(const DnsConfig &config);
 
   /// \brief Get current configuration
-  const DnsConfig &getConfig() const { return config_; }
+  const DnsConfig &getConfig() const { return _config; }
 
   /// \brief Get transport statistics (thread-safe atomic counters)
   struct Statistics
@@ -304,53 +304,53 @@ private:
   /// \brief Create TCP transport
   std::shared_ptr<Transport> createTcpTransport();
 
-  /// \brief Build the serverSessions_ string key for a (server, port, protocol).
+  /// \brief Build the _serverSessions string key for a (server, port, protocol).
   ///        UDP => "server:port"; TCP => "server:port:tcp". Single source of the
   ///        ":tcp" suffix convention, reused by sendUdpQuery/sendTcpQuery/handleClose
   ///        so the protocol-qualified key is constructed identically everywhere.
   static std::string serverKey(const std::string &server, std::uint16_t port, bool isTcp);
 
   // Configuration
-  DnsConfig config_;
+  DnsConfig _config;
 
   // Transport instances
-  std::shared_ptr<Transport> udpTransport_;
-  std::shared_ptr<Transport> tcpTransport_;
+  std::shared_ptr<Transport> _udpTransport;
+  std::shared_ptr<Transport> _tcpTransport;
 
   // ---------------------------------------------------------------------------
   // LOCK ORDERING (HR-2) — acquire outer -> inner; never acquire an outer lock
   // while holding an inner one:
-  //   stateMutex_ / cleanupMutex_  >  tcpBuffersMutex_  >  queriesMutex_  >  sessionsMutex_
+  //   _stateMutex / _cleanupMutex  >  _tcpBuffersMutex  >  _queriesMutex  >  _sessionsMutex
   //
-  // OUTERMOST: stateMutex_ (start/stop/updateConfig) and cleanupMutex_ (the cleanup
-  // thread's CV mutex) are each held ACROSS inner locks — stop() holds stateMutex_
-  // across (sequentially) queriesMutex_, then sessionsMutex_, then tcpBuffersMutex_;
-  // the cleanup thread holds cleanupMutex_ across cleanupExpiredQueries() ->
-  // queriesMutex_. So NEVER acquire stateMutex_ or cleanupMutex_ from inside any
+  // OUTERMOST: _stateMutex (start/stop/updateConfig) and _cleanupMutex (the cleanup
+  // thread's CV mutex) are each held ACROSS inner locks — stop() holds _stateMutex
+  // across (sequentially) _queriesMutex, then _sessionsMutex, then _tcpBuffersMutex;
+  // the cleanup thread holds _cleanupMutex across cleanupExpiredQueries() ->
+  // _queriesMutex. So NEVER acquire _stateMutex or _cleanupMutex from inside any
   // inner critical section (e.g. a query/session path) — that would deadlock against
   // stop()/the cleanup thread. (No current path does.)
   //
   // INNER co-holds (at most two inner locks held at once): handleTcpData holds
-  // tcpBuffersMutex_ across sessionsMutex_ (the sessionToServer_ read) and across
-  // queriesMutex_ (via processResponse -> completeQuery). The UDP-truncation TCP
+  // _tcpBuffersMutex across _sessionsMutex (the _sessionToServer read) and across
+  // _queriesMutex (via processResponse -> completeQuery). The UDP-truncation TCP
   // fallback (processResponse, mode==UDP, reached only from handleUdpData) holds
-  // queriesMutex_ across sendTcpQuery's sessionsMutex_. handleClose deliberately uses
-  // THREE sequential, NON-co-held critical sections (sessionsMutex_, then
-  // tcpBuffersMutex_, then completeQuery's queriesMutex_) and MUST NOT merge them:
-  // co-holding sessionsMutex_ (acquired first, so outer) with tcpBuffersMutex_ or
-  // queriesMutex_ (inner) would invert this order and can deadlock.
+  // _queriesMutex across sendTcpQuery's _sessionsMutex. handleClose deliberately uses
+  // THREE sequential, NON-co-held critical sections (_sessionsMutex, then
+  // _tcpBuffersMutex, then completeQuery's _queriesMutex) and MUST NOT merge them:
+  // co-holding _sessionsMutex (acquired first, so outer) with _tcpBuffersMutex or
+  // _queriesMutex (inner) would invert this order and can deadlock.
   // ---------------------------------------------------------------------------
 
   // State management
-  std::atomic<bool> running_{false};
-  mutable std::mutex stateMutex_;
+  std::atomic<bool> _running{false};
+  mutable std::mutex _stateMutex;
 
   // Query management
-  std::map<QueryKey, std::shared_ptr<PendingQuery>> pendingQueries_;
-  mutable std::mutex queriesMutex_;
+  std::map<QueryKey, std::shared_ptr<PendingQuery>> _pendingQueries;
+  mutable std::mutex _queriesMutex;
 
   // Server selection
-  std::atomic<std::size_t> serverIndex_{0};
+  std::atomic<std::size_t> _serverIndex{0};
 
   // Statistics (thread-safe atomic counters)
   struct InternalStatistics
@@ -363,15 +363,15 @@ private:
     std::atomic<std::uint64_t> retries{0};
     std::atomic<std::uint64_t> errors{0};
     std::atomic<std::uint64_t> truncatedResponses{0};
-  } stats_;
+  } _stats;
 
   // Session management
-  std::map<std::string, SessionId> serverSessions_; // server:port[:tcp] -> SessionId
+  std::map<std::string, SessionId> _serverSessions; // server:port[:tcp] -> SessionId
   // (isTcp, SessionId) -> (server, port). Keyed by the protocol bit because the UDP
   // and TCP engines mint SessionIds from independent counters both starting at 1, so
   // a bare SessionId aliases a colliding UDP/TCP session pair (tracker 2026-09-11-5).
-  std::map<std::pair<bool, SessionId>, std::pair<std::string, std::uint16_t>> sessionToServer_;
-  mutable std::mutex sessionsMutex_;
+  std::map<std::pair<bool, SessionId>, std::pair<std::string, std::uint16_t>> _sessionToServer;
+  mutable std::mutex _sessionsMutex;
 
   // Per-session connect-deferral state (CF-H1). The transport now REJECTS a send
   // to a session that is not yet registered/connected (sessionSendable == present
@@ -379,8 +379,8 @@ private:
   // it is inserted asynchronously on the I/O thread, and onConnect fires AFTER the
   // insert. So a query issued for a NEW or still-connecting session is buffered
   // here and (re)sent from handleConnect once the session is registered. Both
-  // containers are guarded by sessionsMutex_ (the same mutex guarding
-  // serverSessions_/sessionToServer_); no lock is held across a transport->send().
+  // containers are guarded by _sessionsMutex (the same mutex guarding
+  // _serverSessions/_sessionToServer); no lock is held across a transport->send().
   //
   // Keyed by (isTcp, SessionId): the UDP and TCP engines mint SessionIds from
   // independent counters (both start at 1 — see udp_engine.hpp/tcp_engine.hpp
@@ -389,32 +389,32 @@ private:
   // let a UDP connect event drain a colliding TCP session's buffer (wrong framing,
   // session not yet connected) and vice versa. The protocol bit in the key makes
   // these structures collision-safe.
-  std::set<std::pair<bool, SessionId>> connectedSessions_;
+  std::set<std::pair<bool, SessionId>> _connectedSessions;
   std::map<std::pair<bool, SessionId>, std::vector<std::shared_ptr<PendingQuery>>>
-    pendingOnConnect_;
+    _pendingOnConnect;
 
   // TCP message framing (TCP DNS messages are length-prefixed)
-  std::map<SessionId, std::deque<std::uint8_t>> tcpBuffers_;
-  mutable std::mutex tcpBuffersMutex_;
+  std::map<SessionId, std::deque<std::uint8_t>> _tcpBuffers;
+  mutable std::mutex _tcpBuffersMutex;
 
   // Cleanup timer
-  std::atomic<bool> cleanupRunning_{false};
-  std::thread cleanupThread_;
-  std::condition_variable cleanupCv_;
-  std::mutex cleanupMutex_;
+  std::atomic<bool> _cleanupRunning{false};
+  std::thread _cleanupThread;
+  std::condition_variable _cleanupCv;
+  std::mutex _cleanupMutex;
 
   // Centralized RNG for retry jitter
-  mutable std::mt19937 rng_;
+  mutable std::mt19937 _rng;
 
   // Timer service for efficient retry scheduling (avoids sleeping in thread pool workers)
-  std::shared_ptr<core::TimerService> timerService_;
+  std::shared_ptr<core::TimerService> _timerService;
 };
 
 // ==================== Implementation ====================
 
-inline DnsTransport::DnsTransport(const DnsConfig &config) : config_(config)
+inline DnsTransport::DnsTransport(const DnsConfig &config) : _config(config)
 {
-  if (config_.servers.empty())
+  if (_config.servers.empty())
   {
     throw DnsTransportException("No DNS servers configured");
   }
@@ -424,22 +424,22 @@ inline DnsTransport::DnsTransport(const DnsConfig &config) : config_(config)
 
   // Initialize RNG for jitter
   std::random_device rd;
-  rng_.seed(rd());
+  _rng.seed(rd());
 
   // Initialize timer service for efficient retry scheduling
   core::TimerServiceConfig timerConfig;
   timerConfig.threadName = "DnsRetryTimer";
   timerConfig.enableStatistics = false; // Keep it lightweight
-  timerService_ = std::make_shared<core::TimerService>(timerConfig);
+  _timerService = std::make_shared<core::TimerService>(timerConfig);
 }
 
 inline DnsTransport::~DnsTransport() { stop(); }
 
 inline void DnsTransport::start()
 {
-  std::lock_guard<std::mutex> lock(stateMutex_);
+  std::lock_guard<std::mutex> lock(_stateMutex);
 
-  if (running_.load())
+  if (_running.load())
   {
     return; // Already running
   }
@@ -447,22 +447,22 @@ inline void DnsTransport::start()
   try
   {
     // Create transports based on configuration
-    if (config_.transportMode == DnsTransportMode::UDP ||
-        config_.transportMode == DnsTransportMode::Both)
+    if (_config.transportMode == DnsTransportMode::UDP ||
+        _config.transportMode == DnsTransportMode::Both)
     {
-      udpTransport_ = createUdpTransport();
-      auto sr = udpTransport_->start();
+      _udpTransport = createUdpTransport();
+      auto sr = _udpTransport->start();
       if (sr.isErr())
       {
         throw DnsTransportException("Failed to start UDP transport: " + sr.error().message);
       }
     }
 
-    if (config_.transportMode == DnsTransportMode::TCP ||
-        config_.transportMode == DnsTransportMode::Both)
+    if (_config.transportMode == DnsTransportMode::TCP ||
+        _config.transportMode == DnsTransportMode::Both)
     {
-      tcpTransport_ = createTcpTransport();
-      auto sr = tcpTransport_->start();
+      _tcpTransport = createTcpTransport();
+      auto sr = _tcpTransport->start();
       if (sr.isErr())
       {
         throw DnsTransportException("Failed to start TCP transport: " + sr.error().message);
@@ -471,54 +471,54 @@ inline void DnsTransport::start()
 
     // Timer service is already started by its constructor
 
-    running_.store(true);
+    _running.store(true);
     startCleanupTimer();
   }
   catch (const std::exception &e)
   {
-    running_.store(false);
+    _running.store(false);
     throw DnsTransportException("Failed to start DNS transport: " + std::string(e.what()));
   }
 }
 
 inline void DnsTransport::stop()
 {
-  std::lock_guard<std::mutex> lock(stateMutex_);
+  std::lock_guard<std::mutex> lock(_stateMutex);
 
-  if (!running_.load())
+  if (!_running.load())
   {
     return; // Already stopped
   }
 
-  running_.store(false);
+  _running.store(false);
 
   // Stop cleanup timer
-  cleanupRunning_.store(false);
-  cleanupCv_.notify_all();
-  if (cleanupThread_.joinable())
+  _cleanupRunning.store(false);
+  _cleanupCv.notify_all();
+  if (_cleanupThread.joinable())
   {
-    cleanupThread_.join();
+    _cleanupThread.join();
   }
 
   // Stop transports
-  if (udpTransport_)
+  if (_udpTransport)
   {
-    udpTransport_->stop();
-    udpTransport_.reset();
+    _udpTransport->stop();
+    _udpTransport.reset();
   }
 
-  if (tcpTransport_)
+  if (_tcpTransport)
   {
-    tcpTransport_->stop();
-    tcpTransport_.reset();
+    _tcpTransport->stop();
+    _tcpTransport.reset();
   }
 
   // Complete all pending queries with error
   {
-    std::lock_guard<std::mutex> qlock(queriesMutex_);
+    std::lock_guard<std::mutex> qlock(_queriesMutex);
     auto error = std::make_exception_ptr(DnsTransportException("Transport stopped"));
 
-    for (auto &[key, query] : pendingQueries_)
+    for (auto &[key, query] : _pendingQueries)
     {
       if (query->callback)
       {
@@ -538,36 +538,36 @@ inline void DnsTransport::stop()
       {
       }
     }
-    pendingQueries_.clear();
+    _pendingQueries.clear();
   }
 
-  // Clear session mappings. The buffered queries in pendingOnConnect_ are also
-  // registered in pendingQueries_ (cleared/failed above), so dropping the buffer
+  // Clear session mappings. The buffered queries in _pendingOnConnect are also
+  // registered in _pendingQueries (cleared/failed above), so dropping the buffer
   // here does not lose them — it just discards the now-defunct connect state.
   {
-    std::lock_guard<std::mutex> slock(sessionsMutex_);
-    serverSessions_.clear();
-    sessionToServer_.clear();
-    connectedSessions_.clear();
-    pendingOnConnect_.clear();
+    std::lock_guard<std::mutex> slock(_sessionsMutex);
+    _serverSessions.clear();
+    _sessionToServer.clear();
+    _connectedSessions.clear();
+    _pendingOnConnect.clear();
   }
 
   // Clear TCP buffers
   {
-    std::lock_guard<std::mutex> tlock(tcpBuffersMutex_);
-    tcpBuffers_.clear();
+    std::lock_guard<std::mutex> tlock(_tcpBuffersMutex);
+    _tcpBuffers.clear();
   }
 
   // Stop timer service and ensure all scheduled retries are cancelled
-  if (timerService_)
+  if (_timerService)
   {
-    timerService_->stop();
+    _timerService->stop();
     // Reset the shared pointer to ensure clean shutdown
-    timerService_.reset();
+    _timerService.reset();
   }
 }
 
-inline bool DnsTransport::isRunning() const { return running_.load(); }
+inline bool DnsTransport::isRunning() const { return _running.load(); }
 
 inline DnsResult DnsTransport::query(const DnsQuestion &question, const std::string &server,
                                      std::uint16_t port)
@@ -578,7 +578,7 @@ inline DnsResult DnsTransport::query(const DnsQuestion &question, const std::str
 inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &questions,
                                              const std::string &server, std::uint16_t port)
 {
-  if (!running_.load())
+  if (!_running.load())
   {
     throw DnsTransportException("Transport not running");
   }
@@ -612,21 +612,21 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
   auto queryData = prepareQuery(questions, queryId);
 
   // Create pending query with immutable fields (thread-safe constructor)
-  auto query = std::make_shared<PendingQuery>(queryId, config_.timeout, targetServer, targetPort,
+  auto query = std::make_shared<PendingQuery>(queryId, _config.timeout, targetServer, targetPort,
                                               std::move(queryData));
-  query->transportMode = config_.transportMode;
+  query->transportMode = _config.transportMode;
 
   // Create composite key and register pending query
   QueryKey key(queryId, targetServer, targetPort);
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
-    pendingQueries_[key] = query;
+    std::lock_guard<std::mutex> lock(_queriesMutex);
+    _pendingQueries[key] = query;
   }
 
   try
   {
     // Send initial query (UDP first if Both mode)
-    if (config_.transportMode == DnsTransportMode::TCP)
+    if (_config.transportMode == DnsTransportMode::TCP)
     {
       sendTcpQuery(query);
     }
@@ -640,22 +640,22 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
     auto maxWaitTime = calculateMaxSyncWaitTime();
     iora::core::Logger::debug(
       "DNS sync query max wait time: " + std::to_string(maxWaitTime.count()) + "ms " +
-      "(timeout=" + std::to_string(config_.timeout.count()) + "ms, " +
-      "retries=" + std::to_string(config_.retryCount) + ")");
+      "(timeout=" + std::to_string(_config.timeout.count()) + "ms, " +
+      "retries=" + std::to_string(_config.retryCount) + ")");
     auto status = future.wait_for(maxWaitTime);
 
     if (status == std::future_status::timeout)
     {
       // Remove from pending and count timeout for sync queries
       {
-        std::lock_guard<std::mutex> lock(queriesMutex_);
-        pendingQueries_.erase(key);
+        std::lock_guard<std::mutex> lock(_queriesMutex);
+        _pendingQueries.erase(key);
       }
 
       // Atomic increment - no mutex needed
-      stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+      _stats.timeouts.fetch_add(1, std::memory_order_relaxed);
 
-      throw DnsTimeoutException("Query timeout after " + std::to_string(config_.timeout.count()) +
+      throw DnsTimeoutException("Query timeout after " + std::to_string(_config.timeout.count()) +
                                 "ms");
     }
 
@@ -665,8 +665,8 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
   {
     // Remove from pending queries on any exception
     {
-      std::lock_guard<std::mutex> lock(queriesMutex_);
-      pendingQueries_.erase(key);
+      std::lock_guard<std::mutex> lock(_queriesMutex);
+      _pendingQueries.erase(key);
     }
     throw;
   }
@@ -675,7 +675,7 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
 inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback callback,
                                      const std::string &server, std::uint16_t port)
 {
-  if (!running_.load())
+  if (!_running.load())
   {
     auto error = std::make_exception_ptr(DnsTransportException("Transport not running"));
     callback({}, error);
@@ -706,22 +706,22 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
   auto queryData = prepareQuery({question}, queryId);
 
   // Create pending query with immutable fields (thread-safe constructor)
-  auto query = std::make_shared<PendingQuery>(queryId, config_.timeout, targetServer, targetPort,
+  auto query = std::make_shared<PendingQuery>(queryId, _config.timeout, targetServer, targetPort,
                                               std::move(queryData));
-  query->transportMode = config_.transportMode;
+  query->transportMode = _config.transportMode;
   query->callback = std::move(callback);
 
   // Create composite key and register pending query
   QueryKey key(queryId, targetServer, targetPort);
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
-    pendingQueries_[key] = query;
+    std::lock_guard<std::mutex> lock(_queriesMutex);
+    _pendingQueries[key] = query;
   }
 
   try
   {
     // Send query
-    if (config_.transportMode == DnsTransportMode::TCP)
+    if (_config.transportMode == DnsTransportMode::TCP)
     {
       sendTcpQuery(query);
     }
@@ -734,8 +734,8 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
   {
     // Remove from pending and call callback with error
     {
-      std::lock_guard<std::mutex> lock(queriesMutex_);
-      pendingQueries_.erase(key);
+      std::lock_guard<std::mutex> lock(_queriesMutex);
+      _pendingQueries.erase(key);
     }
 
     auto error = std::make_exception_ptr(DnsTransportException(e.what()));
@@ -750,7 +750,7 @@ inline std::shared_ptr<Transport> DnsTransport::createUdpTransport()
   auto transport = Transport::udp(config); // S-3: shared_ptr factory (sets protocol internally)
 
   // Capture a WEAK ref (not an owning shared_from_this()) and promote per-use. The
-  // Transport is OWNED by this DnsTransport (udpTransport_/tcpTransport_), so an owning
+  // Transport is OWNED by this DnsTransport (_udpTransport/_tcpTransport), so an owning
   // capture here would form a DnsTransport<->Transport reference cycle that never
   // collects (~DnsTransport — which resets the transports — could never run). The arch
   // reference-cycle designPrinciple requires a weak_ptr promoted per-use. lock() also
@@ -816,7 +816,7 @@ inline std::string DnsTransport::serverKey(const std::string &server, std::uint1
 
 inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
 {
-  if (!udpTransport_)
+  if (!_udpTransport)
   {
     throw DnsTransportException("UDP transport not available");
   }
@@ -832,39 +832,39 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
   bool sendNow = false;
 
   {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = serverSessions_.find(sk);
-    if (it != serverSessions_.end())
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    auto it = _serverSessions.find(sk);
+    if (it != _serverSessions.end())
     {
       sessionId = it->second;
       // Cached session: send immediately only if it has already fired onConnect.
       // If it is still connecting, CF-H1 would reject an immediate send, so defer.
-      sendNow = connectedSessions_.count(std::make_pair(false, sessionId)) != 0;
+      sendNow = _connectedSessions.count(std::make_pair(false, sessionId)) != 0;
     }
     else
     {
       // Create new session. connect() only enqueues the session; it is registered
       // asynchronously on the I/O thread, so an immediate send would be rejected by
       // CF-H1 (sessionSendable == false). Defer the send to handleConnect.
-      auto cr = udpTransport_->connect(query->server, query->port, TlsMode::None);
+      auto cr = _udpTransport->connect(query->server, query->port, TlsMode::None);
       if (cr.isErr())
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
       sessionId = cr.value();
-      serverSessions_[sk] = sessionId;
-      sessionToServer_[std::make_pair(false, sessionId)] = {query->server, query->port};
+      _serverSessions[sk] = sessionId;
+      _sessionToServer[std::make_pair(false, sessionId)] = {query->server, query->port};
       sendNow = false;
     }
 
     if (!sendNow)
     {
-      // Buffer while awaiting connect. Populated under sessionsMutex_ BEFORE it is
-      // released, so handleConnect (which also takes sessionsMutex_) cannot drain
+      // Buffer while awaiting connect. Populated under _sessionsMutex BEFORE it is
+      // released, so handleConnect (which also takes _sessionsMutex) cannot drain
       // an empty buffer and lose this query. Dedup (L-2): a retry timer can re-issue
       // this query while the session is still connecting; buffering it twice would
       // double-send on connect.
-      auto &bucket = pendingOnConnect_[std::make_pair(false, sessionId)];
+      auto &bucket = _pendingOnConnect[std::make_pair(false, sessionId)];
       if (std::find(bucket.begin(), bucket.end(), query) == bucket.end())
       {
         bucket.push_back(query);
@@ -872,10 +872,10 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
     }
   }
 
-  // copy-then-send: sessionsMutex_ is released above; never send under the lock.
+  // copy-then-send: _sessionsMutex is released above; never send under the lock.
   if (sendNow)
   {
-    bool sent = udpTransport_->send(sessionId, query->queryData.data(), query->queryData.size());
+    bool sent = _udpTransport->send(sessionId, query->queryData.data(), query->queryData.size());
     if (!sent)
     {
       iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
@@ -901,13 +901,13 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
   scheduleQueryTimeout(query);
 
   // Atomic increments - no mutex needed
-  stats_.totalQueries.fetch_add(1, std::memory_order_relaxed);
-  stats_.udpQueries.fetch_add(1, std::memory_order_relaxed);
+  _stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
+  _stats.udpQueries.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
 {
-  if (!tcpTransport_)
+  if (!_tcpTransport)
   {
     throw DnsTransportException("TCP transport not available");
   }
@@ -918,28 +918,28 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   bool sendNow = false;
 
   {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = serverSessions_.find(sk);
-    if (it != serverSessions_.end())
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    auto it = _serverSessions.find(sk);
+    if (it != _serverSessions.end())
     {
       sessionId = it->second;
       // Cached session: send immediately only if it has already fired onConnect.
       // If it is still connecting, CF-H1 would reject an immediate send, so defer.
-      sendNow = connectedSessions_.count(std::make_pair(true, sessionId)) != 0;
+      sendNow = _connectedSessions.count(std::make_pair(true, sessionId)) != 0;
     }
     else
     {
       // Create new session. connect() only enqueues the session; TCP additionally
       // needs the 3-way handshake before onConnect fires, so an immediate send would
       // be rejected by CF-H1 (sessionSendable == false). Defer to handleConnect.
-      auto cr = tcpTransport_->connect(query->server, query->port, TlsMode::None);
+      auto cr = _tcpTransport->connect(query->server, query->port, TlsMode::None);
       if (cr.isErr())
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
       sessionId = cr.value();
-      serverSessions_[sk] = sessionId;
-      sessionToServer_[std::make_pair(true, sessionId)] = {query->server, query->port};
+      _serverSessions[sk] = sessionId;
+      _sessionToServer[std::make_pair(true, sessionId)] = {query->server, query->port};
       sendNow = false;
     }
 
@@ -948,7 +948,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
       // Buffer while awaiting connect (populated under the lock before release, so
       // handleConnect cannot drain an empty buffer). handleConnect re-frames with
       // the 2-byte length prefix, exactly as the immediate-send path below does.
-      auto &bucket = pendingOnConnect_[std::make_pair(true, sessionId)];
+      auto &bucket = _pendingOnConnect[std::make_pair(true, sessionId)];
       if (std::find(bucket.begin(), bucket.end(), query) == bucket.end()) // dedup (L-2)
       {
         bucket.push_back(query);
@@ -959,7 +959,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   // TCP DNS messages are length-prefixed
   std::uint16_t length = static_cast<std::uint16_t>(query->queryData.size());
 
-  // copy-then-send: sessionsMutex_ is released above; never send under the lock.
+  // copy-then-send: _sessionsMutex is released above; never send under the lock.
   if (sendNow)
   {
     std::vector<std::uint8_t> tcpMessage;
@@ -967,7 +967,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
     tcpMessage.push_back(length & 0xFF);
     tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
 
-    bool sent = tcpTransport_->send(sessionId, tcpMessage.data(), tcpMessage.size());
+    bool sent = _tcpTransport->send(sessionId, tcpMessage.data(), tcpMessage.size());
     if (!sent)
     {
       iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
@@ -992,11 +992,11 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   scheduleQueryTimeout(query);
 
   // Atomic increments - no mutex needed
-  stats_.totalQueries.fetch_add(1, std::memory_order_relaxed);
-  stats_.tcpQueries.fetch_add(1, std::memory_order_relaxed);
+  _stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
+  _stats.tcpQueries.fetch_add(1, std::memory_order_relaxed);
   if (query->tcpFallback)
   {
-    stats_.tcpFallbacks.fetch_add(1, std::memory_order_relaxed);
+    _stats.tcpFallbacks.fetch_add(1, std::memory_order_relaxed);
     iora::core::Logger::debug(
       "DNS TCP fallback completed for query ID=" + std::to_string(query->queryId) +
       " server=" + query->server + ":" + std::to_string(query->port));
@@ -1010,9 +1010,9 @@ inline void DnsTransport::handleUdpData(SessionId sessionId, iora::core::BufferV
   std::string server;
   std::uint16_t port;
   {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto it = sessionToServer_.find(std::make_pair(false, sessionId));
-    if (it != sessionToServer_.end())
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    auto it = _sessionToServer.find(std::make_pair(false, sessionId));
+    if (it != _sessionToServer.end())
     {
       server = it->second.first;
       port = it->second.second;
@@ -1031,7 +1031,7 @@ inline void DnsTransport::handleUdpData(SessionId sessionId, iora::core::BufferV
 inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferView data,
                                         std::chrono::steady_clock::time_point)
 {
-  // F-2 (RESOLVED-SAFE): the tcpTransport_->close(sessionId) calls below run from
+  // F-2 (RESOLVED-SAFE): the _tcpTransport->close(sessionId) calls below run from
   // inside this onData callback (the I/O thread). This is SAFE because
   // Transport::close(sid) is ENQUEUE-ONLY — TcpEngine::close() is
   // `return enqueue(Command::close(sid));` (detail/tcp_engine.hpp), taking no
@@ -1040,15 +1040,15 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
   // synchronous, revisit these in-onData close sites.
   // TCP DNS messages are length-prefixed, may arrive in fragments
   {
-    std::lock_guard<std::mutex> lock(tcpBuffersMutex_);
-    auto &buffer = tcpBuffers_[sessionId];
+    std::lock_guard<std::mutex> lock(_tcpBuffersMutex);
+    auto &buffer = _tcpBuffers[sessionId];
 
     // Prevent unbounded buffer growth using configured limit
-    if (buffer.size() + data.size() > config_.maxTcpBufferSize)
+    if (buffer.size() + data.size() > _config.maxTcpBufferSize)
     {
       // Clear buffer and close session on excessive buffer growth
       buffer.clear();
-      tcpTransport_->close(sessionId);
+      _tcpTransport->close(sessionId);
       return;
     }
 
@@ -1065,21 +1065,21 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
       {
         // Invalid message length, clear buffer and close session
         buffer.clear();
-        tcpTransport_->close(sessionId);
+        _tcpTransport->close(sessionId);
         return;
       }
 
       // Check for integer overflow and bounds safety
       // Ensure messageLength is reasonable and won't cause overflow
       const std::size_t maxSafeSize = SIZE_MAX - 2;
-      if (messageLength > maxSafeSize || messageLength > config_.maxTcpBufferSize)
+      if (messageLength > maxSafeSize || messageLength > _config.maxTcpBufferSize)
       {
         // Message too large, clear buffer and close session
         iora::core::Logger::error(
           "DNS TCP message too large: " + std::to_string(messageLength) +
-          " bytes, max=" + std::to_string(std::min(maxSafeSize, config_.maxTcpBufferSize)));
+          " bytes, max=" + std::to_string(std::min(maxSafeSize, _config.maxTcpBufferSize)));
         buffer.clear();
-        tcpTransport_->close(sessionId);
+        _tcpTransport->close(sessionId);
         return;
       }
 
@@ -1093,9 +1093,9 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
       std::string server;
       std::uint16_t port;
       {
-        std::lock_guard<std::mutex> slock(sessionsMutex_);
-        auto it = sessionToServer_.find(std::make_pair(true, sessionId));
-        if (it != sessionToServer_.end())
+        std::lock_guard<std::mutex> slock(_sessionsMutex);
+        auto it = _sessionToServer.find(std::make_pair(true, sessionId));
+        if (it != _sessionToServer.end())
         {
           server = it->second.first;
           port = it->second.second;
@@ -1139,18 +1139,18 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
     if (mode == DnsTransportMode::UDP && result.isTruncated())
     {
       // Atomic increment - no mutex needed
-      stats_.truncatedResponses.fetch_add(1, std::memory_order_relaxed);
+      _stats.truncatedResponses.fetch_add(1, std::memory_order_relaxed);
 
       iora::core::Logger::debug(
         "DNS response truncated (TC=1) for query ID=" + std::to_string(result.header.id) +
         " from " + sourceServer + ":" + std::to_string(sourcePort));
 
       // Find and retry with TCP if configured
-      if (config_.transportMode == DnsTransportMode::Both)
+      if (_config.transportMode == DnsTransportMode::Both)
       {
-        std::lock_guard<std::mutex> lock(queriesMutex_);
-        auto it = pendingQueries_.find(key);
-        if (it != pendingQueries_.end() && !it->second->tcpFallback)
+        std::lock_guard<std::mutex> lock(_queriesMutex);
+        auto it = _pendingQueries.find(key);
+        if (it != _pendingQueries.end() && !it->second->tcpFallback)
         {
           iora::core::Logger::debug("Initiating TCP fallback for truncated response, query ID=" +
                                     std::to_string(result.header.id));
@@ -1205,13 +1205,13 @@ inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddr
   // connected and drain any queries buffered while it was connecting.
   std::vector<std::shared_ptr<PendingQuery>> toSend;
   {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    connectedSessions_.insert(std::make_pair(isTcp, sessionId));
-    auto it = pendingOnConnect_.find(std::make_pair(isTcp, sessionId));
-    if (it != pendingOnConnect_.end())
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    _connectedSessions.insert(std::make_pair(isTcp, sessionId));
+    auto it = _pendingOnConnect.find(std::make_pair(isTcp, sessionId));
+    if (it != _pendingOnConnect.end())
     {
       toSend = std::move(it->second);
-      pendingOnConnect_.erase(it);
+      _pendingOnConnect.erase(it);
     }
   }
 
@@ -1220,12 +1220,12 @@ inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddr
     return;
   }
 
-  // copy-then-send: sessionsMutex_ released above; never send under the lock.
+  // copy-then-send: _sessionsMutex released above; never send under the lock.
   // Select the transport + framing from the protocol bit (sids can collide across
   // the two engines, so we must not send a UDP datagram on the TCP transport or
   // vice versa). Timeout/stats were already handled when the query was buffered,
   // so a send failure here is left to the already-scheduled timeout/retry path.
-  std::shared_ptr<Transport> transport = isTcp ? tcpTransport_ : udpTransport_;
+  std::shared_ptr<Transport> transport = isTcp ? _tcpTransport : _udpTransport;
   if (!transport)
   {
     return; // Transport torn down; buffered queries will time out.
@@ -1236,9 +1236,9 @@ inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddr
     // Skip a query that already completed/timed-out while buffered (L-1): sending it
     // would be a wasted DNS query (its late response is dropped as "unknown query").
     {
-      std::lock_guard<std::mutex> qlock(queriesMutex_);
-      if (pendingQueries_.find(QueryKey(query->queryId, query->server, query->port)) ==
-          pendingQueries_.end())
+      std::lock_guard<std::mutex> qlock(_queriesMutex);
+      if (_pendingQueries.find(QueryKey(query->queryId, query->server, query->port)) ==
+          _pendingQueries.end())
       {
         continue;
       }
@@ -1281,48 +1281,48 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
   std::vector<std::shared_ptr<PendingQuery>> orphaned;
 
   // Remove closed sessions from mappings. PROTOCOL-AWARE teardown (tracker
-  // 2026-09-11-5): sessionToServer_ is keyed by (isTcp,sid) and serverSessions_ by a
+  // 2026-09-11-5): _sessionToServer is keyed by (isTcp,sid) and _serverSessions by a
   // protocol-qualified string key, so a colliding sibling session of the OTHER
   // protocol (same bare sid) must NOT be torn down. Reconstruct the exact serverKey
   // from the (isTcp,sid) mapping BEFORE erasing it (erasing first would make the
-  // lookup miss and leak the serverSessions_ entry -> later dead-sid reuse).
+  // lookup miss and leak the _serverSessions entry -> later dead-sid reuse).
   {
-    std::lock_guard<std::mutex> lock(sessionsMutex_);
-    auto sit = sessionToServer_.find(std::make_pair(isTcp, sessionId));
-    if (sit != sessionToServer_.end())
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    auto sit = _sessionToServer.find(std::make_pair(isTcp, sessionId));
+    if (sit != _sessionToServer.end())
     {
       auto sk = serverKey(sit->second.first, sit->second.second, isTcp);
-      auto ssit = serverSessions_.find(sk);
-      if (ssit != serverSessions_.end() && ssit->second == sessionId)
+      auto ssit = _serverSessions.find(sk);
+      if (ssit != _serverSessions.end() && ssit->second == sessionId)
       {
-        serverSessions_.erase(ssit);
+        _serverSessions.erase(ssit);
       }
-      sessionToServer_.erase(sit); // erase LAST, after serverKey reconstruction
+      _sessionToServer.erase(sit); // erase LAST, after serverKey reconstruction
     }
 
     // Drop the per-session connect-deferral state (keyed by protocol+sid). Take
     // ownership of any queries still awaiting connect so they can be failed after
     // the lock is released (copy-then-invoke).
-    connectedSessions_.erase(std::make_pair(isTcp, sessionId));
-    auto pit = pendingOnConnect_.find(std::make_pair(isTcp, sessionId));
-    if (pit != pendingOnConnect_.end())
+    _connectedSessions.erase(std::make_pair(isTcp, sessionId));
+    auto pit = _pendingOnConnect.find(std::make_pair(isTcp, sessionId));
+    if (pit != _pendingOnConnect.end())
     {
       orphaned = std::move(pit->second);
-      pendingOnConnect_.erase(pit);
+      _pendingOnConnect.erase(pit);
     }
   }
 
-  // Clean up TCP buffers. tcpBuffers_ is a TCP-only map (populated solely by
+  // Clean up TCP buffers. _tcpBuffers is a TCP-only map (populated solely by
   // handleTcpData with TCP sids), so a UDP close must NOT erase a colliding live TCP
   // session's partially-reassembled message (tracker 2026-09-11-5).
   if (isTcp)
   {
-    std::lock_guard<std::mutex> lock(tcpBuffersMutex_);
-    tcpBuffers_.erase(sessionId);
+    std::lock_guard<std::mutex> lock(_tcpBuffersMutex);
+    _tcpBuffers.erase(sessionId);
   }
 
   // Fail (do not silently drop) any query buffered on a session that closed before
-  // connecting. completeQuery takes queriesMutex_ (never held with sessionsMutex_)
+  // connecting. completeQuery takes _queriesMutex (never held with _sessionsMutex)
   // and is a no-op for a query already completed/timed-out, so a stale buffered
   // entry is harmless. This mirrors the existing "failed to send" error handling.
   if (!orphaned.empty())
@@ -1338,17 +1338,17 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
 
 inline DnsServer DnsTransport::getNextServer()
 {
-  if (config_.servers.empty())
+  if (_config.servers.empty())
   {
     throw DnsTransportException("No DNS servers configured");
   }
 
-  std::size_t index = serverIndex_.fetch_add(1) % config_.servers.size();
-  DnsServer selectedServer = config_.servers[index];
+  std::size_t index = _serverIndex.fetch_add(1) % _config.servers.size();
+  DnsServer selectedServer = _config.servers[index];
 
   iora::core::Logger::info("DNS getNextServer: selected server=" + selectedServer.toString() +
                            " (index=" + std::to_string(index) + " of " +
-                           std::to_string(config_.servers.size()) + " servers)");
+                           std::to_string(_config.servers.size()) + " servers)");
 
   return selectedServer;
 }
@@ -1356,43 +1356,43 @@ inline DnsServer DnsTransport::getNextServer()
 inline std::vector<std::uint8_t>
 DnsTransport::prepareQuery(const std::vector<DnsQuestion> &questions, std::uint16_t queryId)
 {
-  return DnsMessage::buildQuery(questions, config_.recursionDesired, queryId);
+  return DnsMessage::buildQuery(questions, _config.recursionDesired, queryId);
 }
 
 inline DnsTransport::Statistics DnsTransport::getStatistics() const
 {
   // No mutex needed - atomic loads are thread-safe
   Statistics result;
-  result.totalQueries = stats_.totalQueries.load(std::memory_order_relaxed);
-  result.udpQueries = stats_.udpQueries.load(std::memory_order_relaxed);
-  result.tcpQueries = stats_.tcpQueries.load(std::memory_order_relaxed);
-  result.tcpFallbacks = stats_.tcpFallbacks.load(std::memory_order_relaxed);
-  result.timeouts = stats_.timeouts.load(std::memory_order_relaxed);
-  result.retries = stats_.retries.load(std::memory_order_relaxed);
-  result.errors = stats_.errors.load(std::memory_order_relaxed);
-  result.truncatedResponses = stats_.truncatedResponses.load(std::memory_order_relaxed);
+  result.totalQueries = _stats.totalQueries.load(std::memory_order_relaxed);
+  result.udpQueries = _stats.udpQueries.load(std::memory_order_relaxed);
+  result.tcpQueries = _stats.tcpQueries.load(std::memory_order_relaxed);
+  result.tcpFallbacks = _stats.tcpFallbacks.load(std::memory_order_relaxed);
+  result.timeouts = _stats.timeouts.load(std::memory_order_relaxed);
+  result.retries = _stats.retries.load(std::memory_order_relaxed);
+  result.errors = _stats.errors.load(std::memory_order_relaxed);
+  result.truncatedResponses = _stats.truncatedResponses.load(std::memory_order_relaxed);
   return result;
 }
 
 inline void DnsTransport::resetStatistics()
 {
   // No mutex needed - atomic stores are thread-safe
-  stats_.totalQueries.store(0, std::memory_order_relaxed);
-  stats_.udpQueries.store(0, std::memory_order_relaxed);
-  stats_.tcpQueries.store(0, std::memory_order_relaxed);
-  stats_.tcpFallbacks.store(0, std::memory_order_relaxed);
-  stats_.timeouts.store(0, std::memory_order_relaxed);
-  stats_.retries.store(0, std::memory_order_relaxed);
-  stats_.errors.store(0, std::memory_order_relaxed);
-  stats_.truncatedResponses.store(0, std::memory_order_relaxed);
+  _stats.totalQueries.store(0, std::memory_order_relaxed);
+  _stats.udpQueries.store(0, std::memory_order_relaxed);
+  _stats.tcpQueries.store(0, std::memory_order_relaxed);
+  _stats.tcpFallbacks.store(0, std::memory_order_relaxed);
+  _stats.timeouts.store(0, std::memory_order_relaxed);
+  _stats.retries.store(0, std::memory_order_relaxed);
+  _stats.errors.store(0, std::memory_order_relaxed);
+  _stats.truncatedResponses.store(0, std::memory_order_relaxed);
 }
 
 inline void DnsTransport::updateConfig(const DnsConfig &config)
 {
-  std::lock_guard<std::mutex> lock(stateMutex_);
-  config_ = config;
+  std::lock_guard<std::mutex> lock(_stateMutex);
+  _config = config;
 
-  if (config_.servers.empty())
+  if (_config.servers.empty())
   {
     throw DnsTransportException("No DNS servers configured");
   }
@@ -1405,32 +1405,32 @@ inline std::chrono::milliseconds DnsTransport::calculateMaxSyncWaitTime() const
 {
   // Calculate maximum total wait time for synchronous queries
   // Base timeout for initial attempt
-  auto totalWait = config_.timeout;
+  auto totalWait = _config.timeout;
 
   // Calculate retry delays with exponential backoff and accurate per-retry jitter
-  auto delay = config_.initialRetryDelay;
+  auto delay = _config.initialRetryDelay;
   std::chrono::milliseconds totalJitter{0};
 
-  for (int retry = 0; retry < config_.retryCount; ++retry)
+  for (int retry = 0; retry < _config.retryCount; ++retry)
   {
     totalWait += delay;
 
     // Calculate jitter for this specific retry delay (more accurate than using maxRetryDelay)
-    if (config_.jitterFactor > 0.0)
+    if (_config.jitterFactor > 0.0)
     {
       // Worst case: this retry gets maximum positive jitter based on actual delay
       auto jitterForThisRetry =
-        std::chrono::milliseconds(static_cast<long>(delay.count() * config_.jitterFactor));
+        std::chrono::milliseconds(static_cast<long>(delay.count() * _config.jitterFactor));
       totalJitter += jitterForThisRetry;
     }
 
     // Apply exponential backoff multiplier
-    delay = std::chrono::milliseconds(static_cast<long>(delay.count() * config_.retryMultiplier));
+    delay = std::chrono::milliseconds(static_cast<long>(delay.count() * _config.retryMultiplier));
 
     // Cap at maximum delay
-    if (delay > config_.maxRetryDelay)
+    if (delay > _config.maxRetryDelay)
     {
-      delay = config_.maxRetryDelay;
+      delay = _config.maxRetryDelay;
     }
   }
 
@@ -1461,11 +1461,11 @@ inline std::uint16_t DnsTransport::generateUniqueQueryId(const std::string &serv
 
     // Check candidates in a short critical section
     {
-      std::lock_guard<std::mutex> lock(queriesMutex_);
+      std::lock_guard<std::mutex> lock(_queriesMutex);
       for (std::uint16_t queryId : candidates)
       {
         QueryKey testKey(queryId, server, port);
-        if (pendingQueries_.find(testKey) == pendingQueries_.end())
+        if (_pendingQueries.find(testKey) == _pendingQueries.end())
         {
           return queryId; // Found unique ID
         }
@@ -1478,14 +1478,14 @@ inline std::uint16_t DnsTransport::generateUniqueQueryId(const std::string &serv
     "DNS query ID collision after 1000 random attempts, falling back to sequential search");
 
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
+    std::lock_guard<std::mutex> lock(_queriesMutex);
 
     // Sequential search through the entire 16-bit space
     for (std::uint32_t id = 1; id <= 65535; ++id)
     {
       std::uint16_t queryId = static_cast<std::uint16_t>(id);
       QueryKey testKey(queryId, server, port);
-      if (pendingQueries_.find(testKey) == pendingQueries_.end())
+      if (_pendingQueries.find(testKey) == _pendingQueries.end())
       {
         iora::core::Logger::debug("Found free query ID " + std::to_string(queryId) +
                                   " via sequential search");
@@ -1504,10 +1504,10 @@ inline std::shared_ptr<DnsTransport::PendingQuery>
 DnsTransport::findPendingQuery(std::uint16_t queryId, const std::string &sourceServer,
                                std::uint16_t sourcePort)
 {
-  std::lock_guard<std::mutex> lock(queriesMutex_);
+  std::lock_guard<std::mutex> lock(_queriesMutex);
   QueryKey key(queryId, sourceServer, sourcePort);
-  auto it = pendingQueries_.find(key);
-  if (it != pendingQueries_.end())
+  auto it = _pendingQueries.find(key);
+  if (it != _pendingQueries.end())
   {
     return it->second;
   }
@@ -1519,12 +1519,12 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const DnsResult &re
   std::shared_ptr<PendingQuery> query;
 
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
-    auto it = pendingQueries_.find(key);
-    if (it != pendingQueries_.end())
+    std::lock_guard<std::mutex> lock(_queriesMutex);
+    auto it = _pendingQueries.find(key);
+    if (it != _pendingQueries.end())
     {
       query = it->second;
-      pendingQueries_.erase(it);
+      _pendingQueries.erase(it);
     }
   }
 
@@ -1534,7 +1534,7 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const DnsResult &re
     std::uint64_t activeTimer = query->activeTimerId.load(std::memory_order_relaxed);
     if (activeTimer != 0)
     {
-      timerService_->cancel(activeTimer);
+      _timerService->cancel(activeTimer);
       query->activeTimerId.store(0, std::memory_order_relaxed);
     }
 
@@ -1605,12 +1605,12 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const std::exceptio
   std::shared_ptr<PendingQuery> query;
 
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
-    auto it = pendingQueries_.find(key);
-    if (it != pendingQueries_.end())
+    std::lock_guard<std::mutex> lock(_queriesMutex);
+    auto it = _pendingQueries.find(key);
+    if (it != _pendingQueries.end())
     {
       query = it->second;
-      pendingQueries_.erase(it);
+      _pendingQueries.erase(it);
     }
   }
 
@@ -1620,7 +1620,7 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const std::exceptio
     std::uint64_t activeTimer = query->activeTimerId.load(std::memory_order_relaxed);
     if (activeTimer != 0)
     {
-      timerService_->cancel(activeTimer);
+      _timerService->cancel(activeTimer);
       query->activeTimerId.store(0, std::memory_order_relaxed);
     }
 
@@ -1650,7 +1650,7 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const std::exceptio
       " retries=" + std::to_string(query->retryCount.load()) + " error=" + errorMessage);
 
     // Atomic increment - no mutex needed
-    stats_.errors.fetch_add(1, std::memory_order_relaxed);
+    _stats.errors.fetch_add(1, std::memory_order_relaxed);
 
     if (query->callback)
     {
@@ -1674,16 +1674,16 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const std::exceptio
 
 inline void DnsTransport::startCleanupTimer()
 {
-  cleanupRunning_.store(true);
+  _cleanupRunning.store(true);
   auto self = shared_from_this(); // Ensure transport remains alive during cleanup thread
-  cleanupThread_ = std::thread(
+  _cleanupThread = std::thread(
     [self]()
     {
-      while (self->cleanupRunning_.load())
+      while (self->_cleanupRunning.load())
       {
-        std::unique_lock<std::mutex> lock(self->cleanupMutex_);
-        if (self->cleanupCv_.wait_for(lock, std::chrono::seconds(10),
-                                      [self] { return !self->cleanupRunning_.load(); }))
+        std::unique_lock<std::mutex> lock(self->_cleanupMutex);
+        if (self->_cleanupCv.wait_for(lock, std::chrono::seconds(10),
+                                      [self] { return !self->_cleanupRunning.load(); }))
         {
           break; // Shutdown requested
         }
@@ -1701,23 +1701,23 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
   std::uint64_t existingTimerId = query->activeTimerId.load(std::memory_order_relaxed);
   if (existingTimerId != 0)
   {
-    timerService_->cancel(existingTimerId);
+    _timerService->cancel(existingTimerId);
     query->activeTimerId.store(0, std::memory_order_relaxed);
   }
 
   // Schedule a timeout timer for the configured query timeout
-  std::uint64_t timerId = timerService_->scheduleAfter(
+  std::uint64_t timerId = _timerService->scheduleAfter(
     query->timeout,
     [self, query]()
     {
       // Check if transport is still running before accessing any members
-      if (!self->running_.load())
+      if (!self->_running.load())
       {
         return; // Transport has been stopped/destroyed
       }
 
       // Also check if timer service is still valid (defensive programming)
-      if (!self->timerService_)
+      if (!self->_timerService)
       {
         return; // Timer service has been destroyed
       }
@@ -1727,16 +1727,16 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
 
       std::shared_ptr<PendingQuery> pendingQuery;
       {
-        std::lock_guard<std::mutex> lock(self->queriesMutex_);
-        auto it = self->pendingQueries_.find(key);
-        if (it == self->pendingQueries_.end())
+        std::lock_guard<std::mutex> lock(self->_queriesMutex);
+        auto it = self->_pendingQueries.find(key);
+        if (it == self->_pendingQueries.end())
         {
           return; // Query already completed or cancelled
         }
         pendingQuery = it->second;
 
         // Remove from pending queries
-        self->pendingQueries_.erase(it);
+        self->_pendingQueries.erase(it);
       }
 
       // Clear the timer ID since timeout fired
@@ -1764,7 +1764,7 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
       }
 
       // Update timeout statistics
-      self->stats_.timeouts.fetch_add(1, std::memory_order_relaxed);
+      self->_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
     });
 
   // Store timer ID for potential cancellation
@@ -1778,8 +1778,8 @@ inline void DnsTransport::cleanupExpiredQueries()
 
   // Phase 1: Collect expired queries with minimal lock time
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
-    for (const auto &[key, query] : pendingQueries_)
+    std::lock_guard<std::mutex> lock(_queriesMutex);
+    for (const auto &[key, query] : _pendingQueries)
     {
       if (now - query->startTime.load() > query->timeout)
       {
@@ -1795,7 +1795,7 @@ inline void DnsTransport::cleanupExpiredQueries()
 
   for (const auto &[key, query] : expiredQueries)
   {
-    if (query->retryCount.load() < config_.retryCount)
+    if (query->retryCount.load() < _config.retryCount)
     {
       // Try retry instead of timing out (retryQuery doesn't need the main lock)
       retryQuery(query, "timeout");
@@ -1812,10 +1812,10 @@ inline void DnsTransport::cleanupExpiredQueries()
   // Phase 3: Remove timed-out queries with short lock duration
   if (!toRemove.empty())
   {
-    std::lock_guard<std::mutex> lock(queriesMutex_);
+    std::lock_guard<std::mutex> lock(_queriesMutex);
     for (const auto &key : toRemove)
     {
-      pendingQueries_.erase(key);
+      _pendingQueries.erase(key);
     }
   }
 
@@ -1845,13 +1845,13 @@ inline void DnsTransport::cleanupExpiredQueries()
   if (actualTimeouts > 0)
   {
     // Atomic increment - no mutex needed
-    stats_.timeouts.fetch_add(actualTimeouts, std::memory_order_relaxed);
+    _stats.timeouts.fetch_add(actualTimeouts, std::memory_order_relaxed);
   }
 }
 
 inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const std::string &reason)
 {
-  if (query->retryCount.load() >= config_.retryCount)
+  if (query->retryCount.load() >= _config.retryCount)
   {
     // Maximum retries exceeded, complete with error
     // Log total attempts made (retryCount + 1 = initial attempt + retries)
@@ -1866,26 +1866,26 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
   }
 
   // Calculate exponential backoff delay with jitter
-  auto baseDelay = config_.initialRetryDelay;
+  auto baseDelay = _config.initialRetryDelay;
   for (int i = 0; i < query->retryCount.load(); ++i)
   {
     baseDelay =
-      std::chrono::milliseconds(static_cast<long>(baseDelay.count() * config_.retryMultiplier));
+      std::chrono::milliseconds(static_cast<long>(baseDelay.count() * _config.retryMultiplier));
   }
 
   // Cap at maximum delay
-  if (baseDelay > config_.maxRetryDelay)
+  if (baseDelay > _config.maxRetryDelay)
   {
-    baseDelay = config_.maxRetryDelay;
+    baseDelay = _config.maxRetryDelay;
   }
 
   // Add jitter to prevent thundering herd
-  if (config_.jitterFactor > 0.0)
+  if (_config.jitterFactor > 0.0)
   {
-    std::uniform_real_distribution<double> dis(1.0 - config_.jitterFactor,
-                                               1.0 + config_.jitterFactor);
+    std::uniform_real_distribution<double> dis(1.0 - _config.jitterFactor,
+                                               1.0 + _config.jitterFactor);
 
-    auto jitter = dis(rng_);
+    auto jitter = dis(_rng);
     baseDelay = std::chrono::milliseconds(static_cast<long>(baseDelay.count() * jitter));
   }
 
@@ -1901,12 +1901,12 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
 
   // Schedule retry after delay using timer service (avoids sleeping in worker threads)
   auto self = shared_from_this();
-  std::uint64_t timerId = timerService_->scheduleAfter(
+  std::uint64_t timerId = _timerService->scheduleAfter(
     baseDelay,
     [self, query]()
     {
       // Check if transport is still running before accessing any members
-      if (!self->running_.load())
+      if (!self->_running.load())
       {
         return; // Transport has been stopped/destroyed
       }
@@ -1914,10 +1914,10 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
       // Check if query is still valid (not completed/cancelled)
       // SAFE: queryId, server, port are const fields, so QueryKey is always consistent
       {
-        std::lock_guard<std::mutex> lock(self->queriesMutex_);
+        std::lock_guard<std::mutex> lock(self->_queriesMutex);
         QueryKey key(query->queryId, query->server, query->port);
-        auto it = self->pendingQueries_.find(key);
-        if (it == self->pendingQueries_.end())
+        auto it = self->_pendingQueries.find(key);
+        if (it == self->_pendingQueries.end())
         {
           return; // Query already completed or cancelled
         }
@@ -1939,7 +1939,7 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
         }
 
         // Atomic increment - no mutex needed
-        self->stats_.retries.fetch_add(1, std::memory_order_relaxed);
+        self->_stats.retries.fetch_add(1, std::memory_order_relaxed);
       }
       catch (const std::exception &e)
       {
