@@ -191,7 +191,9 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **WebSocket** — the RFC 6455 frame codec, server, and client: tri-state frame parse with length/masking/RSV/control-frame conformance, fragmentation, and the abrupt-disconnect close hook — [`docs/network/websocket.md`](docs/network/websocket.md)
 - **Network Resiliency: CircuitBreaker & ConnectionHealth** — standalone circuit-breaking and per-connection health primitives (not auto-wired by the transport): the Closed/Open/HalfOpen breaker and its `std::string`-name-keyed manager, plus the five-level connection-health tracker and its `SessionId`-keyed monitor — [`docs/network/resiliency.md`](docs/network/resiliency.md)
 - **DnsClient** — the standalone DNS-protocol client with RFC 3263 SIP service discovery (NAPTR→SRV→A/AAAA, `S`/`A`-flag subset), UDP-with-TCP-fallback transport, retry/backoff, hardened wire parsing, TTL caching, and best-effort cancellable async — distinct from the transport-internal `NameResolver`/`getaddrinfo` path — [`docs/network/dns_client.md`](docs/network/dns_client.md)
-- **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
+- **Server-Sent Events + Channel pub/sub** — the `SessionId`-retention SSE model (`upgradeToSse`, `SseStream`, the injected-`TimerService` `SseManager` heartbeat) plus the `SseChannel` / `WsChannel` snapshot-then-write fan-out — [`docs/network/sse_and_channels.md`](docs/network/sse_and_channels.md)
+- **EventBatchProcessor** — the optional epoll batch-drain helper with adaptive sizing and the eventfd/timerfd special-fd fast-path (opt-in via `TransportConfig::batching`) — [`docs/network/event_batch_processor.md`](docs/network/event_batch_processor.md)
+- **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
 
 ### parsers
 - **JSON** — value model, parser & serializer (`\uXXXX`/surrogate decoding, RFC 8259) — [`docs/parsers/json.md`](docs/parsers/json.md)
@@ -207,7 +209,8 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **Gzip**, **TtlMap** / **ExpiringCache**, **Base64**, **Crc32**, **Filesystem** — `docs/util/` _(planned)_
 
 ### web
-- **Application**, **Htmx**, **Assets** (asset pipeline), **Channel** (SSE/WS), **Middleware interfaces** — `docs/web/` _(planned)_
+- **Channel** (SSE/WS pub-sub) — documented alongside the SSE stream in [`docs/network/sse_and_channels.md`](docs/network/sse_and_channels.md)
+- **Application**, **Htmx**, **Assets** (asset pipeline), **Middleware interfaces** — `docs/web/` _(planned)_
 
 ### storage
 - **KVStore**, **JsonFileStore**, **ConcreteStateStore** — `docs/storage/` _(planned)_

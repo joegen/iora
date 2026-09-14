@@ -247,6 +247,19 @@
         "network/dns/dns_types.hpp",
         "network/dns/dns_utils.hpp"
       ]
+    },
+    "network/sse_and_channels.md": {
+      "area": "network",
+      "headers": [
+        "network/sse_stream.hpp",
+        "web/channel.hpp"
+      ]
+    },
+    "network/event_batch_processor.md": {
+      "area": "network",
+      "headers": [
+        "network/event_batch_processor.hpp"
+      ]
     }
   }
 }

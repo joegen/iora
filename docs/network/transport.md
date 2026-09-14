@@ -493,6 +493,8 @@ if (stats.batchingStats)
 
 Batching adds up to `maxBatchDelay` of latency (with a 1 ms floor from `epoll_wait`'s millisecond granularity), so it is a throughput/latency trade-off -- enable it for bulk relays, disable it for SIP signaling and RTP media. The engine internals are owned by the engine layer, not this facade.
 
+> **Deep dive: [event_batch_processor.md](event_batch_processor.md)** -- the `EventBatchProcessor` itself: the adaptive batch-size controller, the special-fd fast-path, the `statsMutex_` thread-safety model (`getStats()` is the one cross-thread-safe method), and the full API.
+
 ### 3.13 Internal state (`Transport::Impl`)
 
 All internal state lives behind a pimpl (`struct Impl`, defined in `transport_impl.hpp`):
