@@ -235,6 +235,18 @@
         "network/circuit_breaker.hpp",
         "network/connection_health.hpp"
       ]
+    },
+    "network/dns_client.md": {
+      "area": "network",
+      "headers": [
+        "network/dns_client.hpp",
+        "network/dns/dns_resolver.hpp",
+        "network/dns/dns_transport.hpp",
+        "network/dns/dns_cache.hpp",
+        "network/dns/dns_message.hpp",
+        "network/dns/dns_types.hpp",
+        "network/dns/dns_utils.hpp"
+      ]
     }
   }
 }
