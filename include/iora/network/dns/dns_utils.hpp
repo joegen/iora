@@ -60,13 +60,15 @@ inline std::string normalizeServerString(const std::string &server)
       std::string zone_part = ipv6_part.substr(zone_pos + 1);
 
       // Convert address part to lowercase, keep zone case-sensitive (may be interface name)
-      std::transform(addr_part.begin(), addr_part.end(), addr_part.begin(), ::tolower);
+      std::transform(addr_part.begin(), addr_part.end(), addr_part.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
       return "[" + addr_part + "%" + zone_part + "]";
     }
     else
     {
       // No zone ID, just normalize IPv6 address to lowercase
-      std::transform(ipv6_part.begin(), ipv6_part.end(), ipv6_part.begin(), ::tolower);
+      std::transform(ipv6_part.begin(), ipv6_part.end(), ipv6_part.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
       return "[" + ipv6_part + "]";
     }
   }
@@ -81,13 +83,15 @@ inline std::string normalizeServerString(const std::string &server)
       std::string zone_part = normalized.substr(zone_pos + 1);
 
       // Convert address part to lowercase, keep zone case-sensitive
-      std::transform(addr_part.begin(), addr_part.end(), addr_part.begin(), ::tolower);
+      std::transform(addr_part.begin(), addr_part.end(), addr_part.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
       return addr_part + "%" + zone_part;
     }
     else
     {
       // No zone ID, normalize to lowercase
-      std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
+      std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
       return normalized;
     }
   }
@@ -97,7 +101,7 @@ inline std::string normalizeServerString(const std::string &server)
     bool hasLetters = false;
     for (char c : normalized)
     {
-      if (std::isalpha(c))
+      if (std::isalpha(static_cast<unsigned char>(c)))
       {
         hasLetters = true;
         break;
@@ -107,7 +111,8 @@ inline std::string normalizeServerString(const std::string &server)
     if (hasLetters)
     {
       // Hostname - convert to lowercase for DNS case-insensitivity
-      std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
+      std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     }
     // IPv4 addresses are kept as-is (case doesn't matter for digits/dots)
   }

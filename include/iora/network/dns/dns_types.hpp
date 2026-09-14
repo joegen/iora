@@ -145,7 +145,8 @@ struct DnsCacheKey
     DnsCacheKey key;
     // Convert to lowercase for case-insensitive comparison
     key.qname = question.qname;
-    std::transform(key.qname.begin(), key.qname.end(), key.qname.begin(), ::tolower);
+    std::transform(key.qname.begin(), key.qname.end(), key.qname.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     key.qtype = question.qtype;
     key.qclass = question.qclass;
     return key;
@@ -626,7 +627,7 @@ struct DnsConfig
 
   /// \brief Transport mode preference
   /// Default: Both (UDP with TCP fallback on truncation)
-  /// Options: UDP_Only, TCP_Only, Both
+  /// Options: UDP / TCP / Both
   DnsTransportMode transportMode{DnsTransportMode::Both};
 
   /// \brief Request recursion from DNS server (RD flag)

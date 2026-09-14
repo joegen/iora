@@ -884,6 +884,15 @@ inline SrvRecord DnsMessage::parseSrvRecord(const DnsResourceRecord &rr,
     {
       decodeNameFromRdata(messageData, messageSize, rdataOffset, nameOffset, rr.rdata.data(),
                           rr.rdata.size(), record.target);
+      // A target field that is present but decodes to empty is the root label
+      // (single 0x00) — RFC 2782's "." meaning "the service is decidedly not
+      // available at this domain". Represent it as "." so it is distinguishable
+      // from a malformed record whose target field is absent entirely (rdata is
+      // exactly 6 bytes), which leaves target empty.
+      if (record.target.empty())
+      {
+        record.target = ".";
+      }
     }
   }
 

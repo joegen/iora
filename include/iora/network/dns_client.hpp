@@ -12,6 +12,7 @@
 #include "dns/dns_transport.hpp"
 #include "dns/dns_types.hpp"
 #include "dns/dns_utils.hpp"
+#include "iora/core/string_utils.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -209,16 +210,6 @@ public:
   /// \brief Constructor with custom configuration
   /// \param config DNS client configuration
   explicit DnsClient(const dns::DnsConfig &config) : config_(config) { initialize(); }
-
-  /// \brief Constructor with custom transport (for testing)
-  /// \param transport Custom transport implementation
-  /// \param config DNS client configuration
-  explicit DnsClient(std::shared_ptr<Transport> transport,
-                     const dns::DnsConfig &config = dns::DnsConfig{})
-      : config_(config), customTransport_(transport)
-  {
-    initialize();
-  }
 
   /// \brief Destructor - stops transport before destruction
   ~DnsClient()
@@ -841,7 +832,6 @@ public:
 
 private:
   dns::DnsConfig config_;                                   ///< DNS configuration
-  std::shared_ptr<Transport> customTransport_; ///< Custom transport (optional)
   std::shared_ptr<dns::DnsTransport> transport_;            ///< DNS transport layer
   std::shared_ptr<dns::DnsCache> cache_;                    ///< DNS cache (optional)
   std::shared_ptr<dns::DnsResolver> resolver_;              ///< DNS resolver
@@ -852,10 +842,12 @@ private:
     // DnsServer structure already handles normalization via fromString()
     // No additional normalization needed
 
-    // Create cache if enabled
+    // Create cache if enabled. The default TTL for records that carry no TTL is
+    // driven by config_.cacheTimeout (maxCacheSize is not an entry cap: the
+    // underlying ExpiringCache is time-based only).
     if (config_.enableCache)
     {
-      cache_ = std::make_shared<dns::DnsCache>(config_.maxCacheSize);
+      cache_ = std::make_shared<dns::DnsCache>(config_.cacheTimeout);
     }
     else
     {
@@ -964,8 +956,8 @@ private:
       {
         group = "0" + group;
       }
-      // Convert to lowercase
-      std::transform(group.begin(), group.end(), group.begin(), ::tolower);
+      // Convert to lowercase (locale-independent ASCII)
+      group = iora::core::StringUtils::toLower(group);
       result += group;
     }
 

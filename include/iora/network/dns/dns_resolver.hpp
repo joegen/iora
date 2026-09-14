@@ -9,6 +9,7 @@
 #include "dns_cache.hpp"
 #include "dns_transport.hpp"
 #include "dns_types.hpp"
+#include "iora/core/string_utils.hpp"
 #include <algorithm>
 #include <cctype>
 #include <functional>
@@ -50,7 +51,7 @@ struct ServiceTarget
   ServiceType transport;              ///< Transport protocol
   std::uint16_t priority;             ///< SRV priority (lower = higher priority)
   std::uint16_t weight;               ///< SRV weight for load balancing
-  std::uint16_t naptrPreference{0};   ///< NAPTR preference (RFC 3403 §2.1) — lower = preferred.
+  std::uint16_t naptrPreference{0};   ///< NAPTR preference (RFC 3403 §4.1) — lower = preferred.
                                       ///< 0 = no NAPTR tier (direct SRV/A fallback path).
   std::vector<std::string> addresses; ///< Resolved IP addresses (A/AAAA)
 
@@ -100,7 +101,7 @@ struct NaptrSrvTarget
 };
 
 /// \brief NAPTR 'A' flag target — hostname for direct A/AAAA resolution (no SRV)
-/// Carries NAPTR order/preference for correct priority ordering (RFC 3403 §2.1)
+/// Carries NAPTR order/preference for correct priority ordering (RFC 3403 §4.1)
 struct NaptrDirectTarget
 {
   ServiceType service{ServiceType::Unknown};
@@ -442,7 +443,11 @@ public:
 
   /// \brief Set RNG seed for deterministic testing
   /// \param seed Seed value for reproducible randomness
-  void setRngSeed(std::uint32_t seed) { rng_.seed(seed); }
+  void setRngSeed(std::uint32_t seed)
+  {
+    std::lock_guard<std::mutex> lock(rngMutex_);
+    rng_.seed(seed);
+  }
 
   /// \brief Resolve service domain using RFC 3263 NAPTR→SRV→A/AAAA procedure
   /// \param domain Service domain to resolve (e.g., "example.com", "sip.example.com")
@@ -603,19 +608,7 @@ public:
     // Perform query via transport
     DnsResult result = transport_->query(question);
 
-    // Cache results (positive and negative)
-    if (cache_)
-    {
-      if (result.isSuccess())
-      {
-        cache_->put(question, result);
-      }
-      else if (result.header.rcode == DnsResponseCode::NXDOMAIN)
-      {
-        // Negative caching for NXDOMAIN responses per RFC 2308
-        cache_->putNegative(question, result, "Domain not found (NXDOMAIN)");
-      }
-    }
+    cacheQueryResult(question, result);
 
     if (!result.isSuccess())
     {
@@ -661,19 +654,7 @@ public:
           return;
         }
 
-        // Cache results (positive and negative)
-        if (self->cache_)
-        {
-          if (result.isSuccess())
-          {
-            self->cache_->put(question, result);
-          }
-          else if (result.header.rcode == DnsResponseCode::NXDOMAIN)
-          {
-            // Negative caching for NXDOMAIN responses per RFC 2308
-            self->cache_->putNegative(question, result, "Domain not found (NXDOMAIN)");
-          }
-        }
+        self->cacheQueryResult(question, result);
 
         if (!result.isSuccess())
         {
@@ -807,6 +788,9 @@ public:
   /// \return Selected target based on priority and weighted randomness
   ServiceTarget getPreferredTarget(const ServiceResolutionResult &result) const
   {
+    // rng_ is mutated (the generator advances) even on this const path; guard it
+    // so concurrent getPreferredTarget()/setRngSeed() calls don't race the state.
+    std::lock_guard<std::mutex> lock(rngMutex_);
     return result.getPreferredTarget(rng_);
   }
 
@@ -823,55 +807,20 @@ public:
   {
     ServiceResolutionResult result(domain);
 
-    // Use provided SRV queries or default to common SIP services for backward compatibility
-    std::vector<std::pair<std::string, ServiceType>> actualSrvQueries;
-    if (srvQueries.has_value())
-    {
-      actualSrvQueries = srvQueries.value();
-    }
-    else
-    {
-      actualSrvQueries = {{"_sips._tcp." + domain, ServiceType::SIPS_TLS},
-                          {"_sip._tcp." + domain, ServiceType::SIP_TCP},
-                          {"_sip._udp." + domain, ServiceType::SIP_UDP},
-                          {"_sip._sctp." + domain, ServiceType::SIP_SCTP}};
-    }
+    auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports);
 
-    // Reorder based on preferences
-    if (!preferredTransports.empty())
-    {
-      std::sort(actualSrvQueries.begin(), actualSrvQueries.end(),
-                [&preferredTransports](const auto &a, const auto &b)
-                {
-                  auto pos_a =
-                    std::find(preferredTransports.begin(), preferredTransports.end(), a.second);
-                  auto pos_b =
-                    std::find(preferredTransports.begin(), preferredTransports.end(), b.second);
-
-                  if (pos_a == preferredTransports.end() && pos_b == preferredTransports.end())
-                  {
-                    return false; // Both not preferred, keep original order
-                  }
-                  if (pos_a == preferredTransports.end())
-                  {
-                    return false; // a not preferred, b preferred
-                  }
-                  if (pos_b == preferredTransports.end())
-                  {
-                    return true; // a preferred, b not preferred
-                  }
-
-                  return pos_a < pos_b; // Both preferred, order by preference
-                });
-    }
-
-    // Query SRV records
+    // Query SRV records. Track which services returned an RFC 2782 "." abort so the
+    // A/AAAA fallback is suppressed per-service (not domain-wide).
+    std::vector<ServiceType> deniedServices;
     for (const auto &[srvName, service] : actualSrvQueries)
     {
       try
       {
         DnsResult srvResult = query(DnsQuestion(srvName, DnsType::SRV, DnsClass::IN));
-        processSrvRecords(srvResult.srv_records, service, result);
+        if (processSrvRecords(srvResult.srv_records, service, result))
+        {
+          deniedServices.push_back(service);
+        }
       }
       catch (const DnsResolverException &)
       {
@@ -880,15 +829,16 @@ public:
       }
     }
 
-    // If no SRV records found, fall back to A/AAAA records
-    if (result.targets.empty())
-    {
-      performFallbackResolution(domain, result, preferredTransports);
-    }
-    else
+    if (!result.targets.empty())
     {
       resolveTargetAddresses(result);
       sortTargetsByPriority(result);
+    }
+    else
+    {
+      // No SRV targets: fall back to A/AAAA on the domain for the transports that
+      // were NOT explicitly declared unavailable by an SRV "." (RFC 2782).
+      performFallbackResolution(domain, result, preferredTransports, deniedServices);
     }
 
     return result;
@@ -906,55 +856,28 @@ public:
     const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries =
       std::nullopt)
   {
-    // Use provided SRV queries or default to common SIP services for backward compatibility
-    std::vector<std::pair<std::string, ServiceType>> actualSrvQueries;
-    if (srvQueries.has_value())
-    {
-      actualSrvQueries = srvQueries.value();
-    }
-    else
-    {
-      actualSrvQueries = {{"_sips._tcp." + domain, ServiceType::SIPS_TLS},
-                          {"_sip._tcp." + domain, ServiceType::SIP_TCP},
-                          {"_sip._udp." + domain, ServiceType::SIP_UDP},
-                          {"_sip._sctp." + domain, ServiceType::SIP_SCTP}};
-    }
+    auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports);
 
-    // Reorder based on preferences
-    if (!preferredTransports.empty())
-    {
-      std::sort(actualSrvQueries.begin(), actualSrvQueries.end(),
-                [&preferredTransports](const auto &a, const auto &b)
-                {
-                  auto pos_a =
-                    std::find(preferredTransports.begin(), preferredTransports.end(), a.second);
-                  auto pos_b =
-                    std::find(preferredTransports.begin(), preferredTransports.end(), b.second);
-
-                  if (pos_a == preferredTransports.end() && pos_b == preferredTransports.end())
-                  {
-                    return false; // Both not preferred, keep original order
-                  }
-                  if (pos_a == preferredTransports.end())
-                  {
-                    return false; // a not preferred, b preferred
-                  }
-                  if (pos_b == preferredTransports.end())
-                  {
-                    return true; // a preferred, b not preferred
-                  }
-
-                  return pos_a < pos_b; // Both preferred, order by preference
-                });
-    }
-
-    // Chain SRV queries asynchronously
     auto result = std::make_shared<ServiceResolutionResult>(domain);
+
+    // Zero-work guard: with no SRV queries to issue, the per-query completion block
+    // below never runs, so the user callback would never fire (caller hangs). Mirror
+    // the sync path and fall back directly.
+    if (actualSrvQueries.empty())
+    {
+      performFallbackResolutionAsync(domain, result, callback, preferredTransports, {});
+      return;
+    }
+
     auto remainingQueries = std::make_shared<std::atomic<size_t>>(actualSrvQueries.size());
     // callbackFired ensures the completion callback is invoked exactly once
     auto callbackFired = std::make_shared<std::atomic<bool>>(false);
-    // Mutex protects concurrent writes to result->targets from parallel SRV callbacks
+    // Mutex protects concurrent writes to result->targets AND deniedServices from
+    // parallel SRV callbacks.
     auto resultMutex = std::make_shared<std::mutex>();
+    // Services whose SRV query returned an RFC 2782 "." abort; the A/AAAA fallback
+    // is suppressed per-service (not domain-wide), mirroring the sync path.
+    auto deniedServices = std::make_shared<std::vector<ServiceType>>();
 
     for (const auto &[srvName, service] : actualSrvQueries)
     {
@@ -963,15 +886,19 @@ public:
       auto self = shared_from_this();
       transport_->queryAsync(
         srvQuestion,
-        [self, result, service, remainingQueries, callbackFired, resultMutex, callback, domain,
-         preferredTransports](const DnsResult &srvResult, const std::exception_ptr &srvError)
+        [self, result, service, remainingQueries, callbackFired, resultMutex, deniedServices,
+         callback, domain, preferredTransports](const DnsResult &srvResult,
+                                                 const std::exception_ptr &srvError)
         {
           if (!srvError)
           {
             try
             {
               std::lock_guard<std::mutex> lock(*resultMutex);
-              self->processSrvRecords(srvResult.srv_records, service, *result);
+              if (self->processSrvRecords(srvResult.srv_records, service, *result))
+              {
+                deniedServices->push_back(service);
+              }
             }
             catch (...)
             {
@@ -979,17 +906,24 @@ public:
             }
           }
 
-          // Check if all SRV queries are complete
-          if (--(*remainingQueries) == 0 && !callbackFired->exchange(true))
+          // Completion: the last query to decrement to zero runs the join. acq_rel
+          // publishes every prior callback's locked writes (targets/deniedServices)
+          // to this thread (concurrency.md HR-1: minimal sufficient ordering).
+          if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+              !callbackFired->exchange(true))
           {
-            // If no SRV records found, fall back to A/AAAA
-            if (result->targets.empty())
+            if (!result->targets.empty())
             {
-              self->performFallbackResolutionAsync(domain, result, callback, preferredTransports);
+              self->resolveTargetAddressesAsync(result, callback);
             }
             else
             {
-              self->resolveTargetAddressesAsync(result, callback);
+              // No SRV targets: fall back to A/AAAA for the transports NOT declared
+              // unavailable by an SRV "." (RFC 2782). If every fallback transport is
+              // denied, performFallbackResolutionAsync yields an empty result and
+              // still fires the callback exactly once.
+              self->performFallbackResolutionAsync(domain, result, callback, preferredTransports,
+                                                   *deniedServices);
             }
           }
         });
@@ -1002,7 +936,8 @@ private:
   DnsConfig config_;                        ///< DNS configuration
 
   /// \brief Centralized random number generator for deterministic testing
-  mutable std::mt19937 rng_; ///< Thread-local not needed since resolver is stateful
+  mutable std::mt19937 rng_;    ///< Weighted SRV selection RNG (guarded by rngMutex_)
+  mutable std::mutex rngMutex_; ///< Guards rng_ against concurrent advance/seed
 
   // =============================================================================
   // Input Validation Functions (RFC Compliance & Security)
@@ -1011,7 +946,7 @@ private:
   /// \brief Validate hostname according to RFC 1035
   /// \param hostname Hostname to validate
   /// \return true if valid, false otherwise
-  bool validateHostname(const std::string &hostname) const
+  bool validateHostname(const std::string &hostname, bool allowUnderscore = false) const
   {
     if (hostname.empty() || hostname.length() > 255)
     {
@@ -1052,9 +987,12 @@ private:
         for (std::size_t j = labelStart; j < i; ++j)
         {
           char c = normalizedHostname[j];
-          if (!std::isalnum(c) && c != '-')
+          // Alphanumeric and hyphen always; underscore only when allowed (SRV
+          // owner names, RFC 2782 _service._proto, used as NAPTR 'S' replacements).
+          if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' &&
+              !(allowUnderscore && c == '_'))
           {
-            return false; // Only alphanumeric and hyphen allowed
+            return false;
           }
           if ((j == labelStart || j == i - 1) && c == '-')
           {
@@ -1079,10 +1017,9 @@ private:
       return false; // Reasonable length limit
     }
 
-    // Check for valid SIP/WebSocket service patterns (case-insensitive)
-    std::string upper = service;
-    std::transform(upper.begin(), upper.end(), upper.begin(),
-                   [](unsigned char c) { return std::toupper(c); });
+    // Check for valid SIP/WebSocket service patterns (case-insensitive,
+    // locale-independent ASCII)
+    std::string upper = iora::core::StringUtils::toUpper(service);
     if (upper == "SIPS+D2T" || upper == "SIPS+D2S" || upper == "SIPS+D2W" ||
         upper == "SIP+D2T" || upper == "SIP+D2U" || upper == "SIP+D2S" ||
         upper == "SIP+D2W")
@@ -1093,7 +1030,7 @@ private:
     // Basic format validation: should be alphanumeric with +, -, _
     for (char c : service)
     {
-      if (!std::isalnum(c) && c != '+' && c != '-' && c != '_')
+      if (!std::isalnum(static_cast<unsigned char>(c)) && c != '+' && c != '-' && c != '_')
       {
         return false; // Invalid character
       }
@@ -1112,7 +1049,9 @@ private:
       return true; // Terminal replacement
     }
 
-    return validateHostname(replacement);
+    // A NAPTR 'S'-flag replacement is an SRV owner name (RFC 2782 _service._proto)
+    // whose labels legitimately begin with '_'; allow underscores here.
+    return validateHostname(replacement, /*allowUnderscore=*/true);
   }
 
   /// \brief Sanitize and validate input string
@@ -1137,7 +1076,7 @@ private:
         sanitized.push_back(c);
       }
       // Convert to space for safety
-      else if (std::isspace(c))
+      else if (std::isspace(static_cast<unsigned char>(c)))
       {
         sanitized.push_back(' ');
       }
@@ -1161,10 +1100,9 @@ private:
       return ServiceType::Unknown;
     }
 
-    // Normalize to uppercase for case-insensitive matching (RFC 3403)
-    std::string upper = service;
-    std::transform(upper.begin(), upper.end(), upper.begin(),
-                   [](unsigned char c) { return std::toupper(c); });
+    // Normalize to uppercase for case-insensitive matching (RFC 3403,
+    // locale-independent ASCII)
+    std::string upper = iora::core::StringUtils::toUpper(service);
 
     // SIP service mappings
     if (upper == "SIPS+D2T")
@@ -1248,6 +1186,14 @@ private:
     std::vector<NaptrSrvTarget> srvTargets;
     std::vector<NaptrDirectTarget> aTargets;
     processNaptrRecords(naptrRecords, srvTargets, aTargets, preferredTransports);
+
+    // NAPTR present but no usable target (all records unknown-service, filtered
+    // by preferredTransports, or invalid replacement across every ORDER tier):
+    // fall back to direct SRV resolution, mirroring performServiceResolutionAsync.
+    if (srvTargets.empty() && aTargets.empty())
+    {
+      return performDirectSrvResolution(domain, preferredTransports, std::nullopt);
+    }
 
     // Step 3: Query SRV records for 'S' flag targets
     for (const auto &srvTarget : srvTargets)
@@ -1382,8 +1328,10 @@ private:
                 }
               }
 
-              // Check if all SRV queries are complete
-              if (--(*remainingQueries) == 0 && !callbackFired->exchange(true))
+              // Check if all SRV queries are complete (acq_rel publishes each
+              // callback's locked target writes to the joining thread).
+              if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+                  !callbackFired->exchange(true))
               {
                 // All SRV queries done, now resolve hostnames asynchronously
                 self->resolveTargetAddressesAsync(result, callback);
@@ -1511,16 +1459,25 @@ private:
                 return a.preference < b.preference;
               });
 
-    // RFC 3403 §2.4.4: only process records at the lowest order value
-    const auto lowestOrder = sortedRecords.front().order;
+    // RFC 3403 §4.1 (records are processed lowest ORDER first) and §8 (a NAPTR
+    // processor advances to the next ORDER value only when the current one
+    // yields no usable target). Records are already sorted by (order,
+    // preference); walk them tier by tier and stop as soon as a completed ORDER
+    // tier has produced at least one target.
+    std::uint16_t currentOrder = sortedRecords.front().order;
 
     // Process records to extract targets
     for (const auto &record : sortedRecords)
     {
-      // Break-at-first-order: stop when we exceed the lowest order
-      if (record.order != lowestOrder)
+      if (record.order != currentOrder)
       {
-        break;
+        // Finished the current ORDER tier: if it produced any usable target,
+        // stop (do not descend to higher orders); otherwise advance to this one.
+        if (!srvTargets.empty() || !aTargets.empty())
+        {
+          break;
+        }
+        currentOrder = record.order;
       }
 
       ServiceType service = parseServiceType(record.service);
@@ -1551,10 +1508,8 @@ private:
         continue;
       }
 
-      // Case-insensitive flag check (RFC 3403)
-      std::string flags = record.flags;
-      std::transform(flags.begin(), flags.end(), flags.begin(),
-                     [](unsigned char c) { return std::toupper(c); });
+      // Case-insensitive flag check (RFC 3403, locale-independent ASCII)
+      std::string flags = iora::core::StringUtils::toUpper(record.flags);
 
       if (flags.find('S') != std::string::npos)
       {
@@ -1578,12 +1533,185 @@ private:
   /// \param srvRecords SRV records to process
   /// \param service Service type for these records
   /// \param result Result to populate
+  /// \brief Build the SRV query list (custom, or the default SIP service set) and
+  /// order it by the caller's preferred transports. Shared by the sync and async
+  /// direct-SRV paths so the query set and ordering are defined once.
+  std::vector<std::pair<std::string, ServiceType>> buildOrderedSrvQueries(
+    const std::string &domain,
+    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries,
+    const std::vector<ServiceType> &preferredTransports) const
+  {
+    std::vector<std::pair<std::string, ServiceType>> actualSrvQueries;
+    if (srvQueries.has_value())
+    {
+      actualSrvQueries = srvQueries.value();
+    }
+    else
+    {
+      actualSrvQueries = {{"_sips._tcp." + domain, ServiceType::SIPS_TLS},
+                          {"_sip._tcp." + domain, ServiceType::SIP_TCP},
+                          {"_sip._udp." + domain, ServiceType::SIP_UDP},
+                          {"_sip._sctp." + domain, ServiceType::SIP_SCTP}};
+    }
+
+    if (!preferredTransports.empty())
+    {
+      std::sort(actualSrvQueries.begin(), actualSrvQueries.end(),
+                [&preferredTransports](const auto &a, const auto &b)
+                {
+                  auto pos_a =
+                    std::find(preferredTransports.begin(), preferredTransports.end(), a.second);
+                  auto pos_b =
+                    std::find(preferredTransports.begin(), preferredTransports.end(), b.second);
+
+                  if (pos_a == preferredTransports.end() && pos_b == preferredTransports.end())
+                  {
+                    return false; // Both not preferred, keep original order
+                  }
+                  if (pos_a == preferredTransports.end())
+                  {
+                    return false; // a not preferred, b preferred
+                  }
+                  if (pos_b == preferredTransports.end())
+                  {
+                    return true; // a preferred, b not preferred
+                  }
+
+                  return pos_a < pos_b; // Both preferred, order by preference
+                });
+    }
+
+    return actualSrvQueries;
+  }
+
+  /// \brief Compute the A/AAAA-fallback transport list: the preferred transports
+  /// (or default UDP when none are given), minus any service an SRV "." declared
+  /// unavailable (RFC 2782). An empty result means every candidate transport was
+  /// denied, so no fallback target is produced.
+  std::vector<ServiceType> fallbackTransports(const std::vector<ServiceType> &preferredTransports,
+                                              const std::vector<ServiceType> &deniedServices) const
+  {
+    std::vector<ServiceType> transports = preferredTransports;
+    if (transports.empty())
+    {
+      transports.push_back(ServiceType::SIP_UDP);
+    }
+    transports.erase(std::remove_if(transports.begin(), transports.end(),
+                                    [&deniedServices](ServiceType t)
+                                    {
+                                      return std::find(deniedServices.begin(),
+                                                       deniedServices.end(),
+                                                       t) != deniedServices.end();
+                                    }),
+                     transports.end());
+    return transports;
+  }
+
+  /// \brief Append one fallback ServiceTarget per transport (same domain host and
+  /// resolved addresses, no SRV priority/weight). Shared by the sync and async
+  /// A/AAAA-fallback paths so the target-construction loop lives in one place.
+  void appendFallbackTargets(ServiceResolutionResult &result, const std::string &domain,
+                             const std::vector<ServiceType> &transports,
+                             const std::vector<std::string> &addresses) const
+  {
+    for (ServiceType transport : transports)
+    {
+      ServiceTarget target;
+      target.hostname = domain;
+      target.port = getDefaultServicePort(transport);
+      target.transport = transport;
+      target.priority = 0;
+      target.weight = 0;
+      target.addresses = addresses;
+
+      result.targets.push_back(target);
+    }
+  }
+
+  /// \brief Apply the cache-write policy for a completed query result.
+  ///
+  /// Positive results are cached; NXDOMAIN and NODATA (NOERROR with no answer
+  /// records) are negatively cached per RFC 2308 — but ONLY when the response
+  /// carries an SOA record (RFC 2308 §5: a negative response without an SOA
+  /// SHOULD NOT be cached, as there is no authoritative TTL to bound it).
+  void cacheQueryResult(const DnsQuestion &question, const DnsResult &result)
+  {
+    if (!cache_)
+    {
+      return;
+    }
+
+    if (result.isSuccess())
+    {
+      cache_->put(question, result);
+      return;
+    }
+
+    // Negative response: only cache it if it carries an SOA (RFC 2308 §5).
+    if (!negativeResponseHasSoa(result))
+    {
+      return;
+    }
+
+    if (result.header.rcode == DnsResponseCode::NXDOMAIN)
+    {
+      cache_->putNegative(question, result, "Domain not found (NXDOMAIN)");
+    }
+    else if (result.header.rcode == DnsResponseCode::NOERROR)
+    {
+      // NODATA (NOERROR with no answer records) — RFC 2308 §2.2. Caching this
+      // stops the common "name exists but no records of this type" case (e.g. a
+      // domain publishing SRV but no NAPTR) from re-querying on every lookup.
+      cache_->putNegative(question, result, "No records of requested type (NODATA)");
+    }
+  }
+
+  /// \brief True if a negative response carries an SOA (in the parsed SOA set or
+  /// the authority section) — the prerequisite for RFC 2308 negative caching.
+  static bool negativeResponseHasSoa(const DnsResult &result)
+  {
+    if (!result.soa_records.empty())
+    {
+      return true;
+    }
+    for (const auto &rr : result.authority)
+    {
+      if (rr.type == DnsType::SOA)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /// \param naptrPref NAPTR preference for this SRV group (0 if not from NAPTR)
-  void processSrvRecords(const std::vector<SrvRecord> &srvRecords, ServiceType service,
+  /// \return true if any SRV record carried the RFC 2782 "." target — meaning the
+  ///         service is decidedly NOT available at this domain; such records are
+  ///         skipped and the caller should suppress any A/AAAA fallback.
+  bool processSrvRecords(const std::vector<SrvRecord> &srvRecords, ServiceType service,
                          ServiceResolutionResult &result, std::uint16_t naptrPref = 0)
   {
+    bool serviceUnavailable = false;
     for (const auto &record : srvRecords)
     {
+      // RFC 2782: a Target of "." means the service is decidedly not available at
+      // this domain. The parser represents a present root target as "." (distinct
+      // from a malformed record with no target field). Skip it and flag the caller
+      // so it suppresses the A/AAAA fallback for THIS service.
+      if (record.target == ".")
+      {
+        serviceUnavailable = true;
+        continue;
+      }
+
+      // A malformed SRV whose target field is absent decodes to an empty string.
+      // It is not a connectable target, but it is not a deliberate "." abort
+      // either: skip it WITHOUT signalling service-unavailable.
+      if (record.target.empty())
+      {
+        continue;
+      }
+
       ServiceTarget target;
       target.hostname = record.target;
       target.port = record.port;
@@ -1594,6 +1722,7 @@ private:
 
       result.targets.push_back(target);
     }
+    return serviceUnavailable;
   }
 
   /// \brief Resolve IP addresses for all targets
@@ -1621,7 +1750,7 @@ private:
   }
 
   /// \brief Sort targets by NAPTR preference then SRV priority
-  /// NAPTR preference (RFC 3403 §2.1) is the primary key — lower = preferred transport.
+  /// NAPTR preference (RFC 3403 §4.1) is the primary key — lower = preferred transport.
   /// SRV priority (RFC 2782) is the secondary key — lower = higher precedence within
   /// the same NAPTR preference tier.
   void sortTargetsByPriority(ServiceResolutionResult &result)
@@ -1642,31 +1771,21 @@ private:
   /// \param result Result to populate
   /// \param preferredTransports Preferred transport types
   void performFallbackResolution(const std::string &domain, ServiceResolutionResult &result,
-                                 const std::vector<ServiceType> &preferredTransports)
+                                 const std::vector<ServiceType> &preferredTransports,
+                                 const std::vector<ServiceType> &deniedServices = {})
   {
     try
     {
-      auto addresses = resolveHostname(domain, false);
-
-      // Create targets for preferred transports (or default UDP if none specified)
-      std::vector<ServiceType> transports = preferredTransports;
+      // Transports to build fallback targets for, minus any SRV-"." denied service.
+      std::vector<ServiceType> transports = fallbackTransports(preferredTransports, deniedServices);
       if (transports.empty())
       {
-        transports.push_back(ServiceType::SIP_UDP);
+        return; // Every candidate transport was declared unavailable (RFC 2782).
       }
 
-      for (ServiceType transport : transports)
-      {
-        ServiceTarget target;
-        target.hostname = domain;
-        target.port = getDefaultServicePort(transport);
-        target.transport = transport;
-        target.priority = 0;
-        target.weight = 0;
-        target.addresses = addresses;
+      auto addresses = resolveHostname(domain, false);
 
-        result.targets.push_back(target);
-      }
+      appendFallbackTargets(result, domain, transports, addresses);
     }
     catch (const DnsResolverException &)
     {
@@ -1682,15 +1801,25 @@ private:
   void performFallbackResolutionAsync(const std::string &domain,
                                       std::shared_ptr<ServiceResolutionResult> result,
                                       ServiceResolutionCallback callback,
-                                      const std::vector<ServiceType> &preferredTransports)
+                                      const std::vector<ServiceType> &preferredTransports,
+                                      const std::vector<ServiceType> &deniedServices = {})
   {
+    // Transports to build fallback targets for, minus any SRV-"." denied service.
+    // If none remain, there is nothing to resolve — fire the callback immediately.
+    auto transportsToUse = fallbackTransports(preferredTransports, deniedServices);
+    if (transportsToUse.empty())
+    {
+      callback(*result, nullptr);
+      return;
+    }
+
     DnsQuestion aQuestion(domain, DnsType::A, DnsClass::IN);
 
     auto self = shared_from_this();
     transport_->queryAsync(
       aQuestion,
-      [self, domain, result, callback, preferredTransports](const DnsResult &aResult,
-                                                            const std::exception_ptr &aError)
+      [self, domain, result, callback, transportsToUse](const DnsResult &aResult,
+                                                        const std::exception_ptr &aError)
       {
         std::vector<std::string> addresses;
 
@@ -1708,7 +1837,7 @@ private:
           DnsQuestion aaaaQuestion(domain, DnsType::AAAA, DnsClass::IN);
 
           self->transport_->queryAsync(aaaaQuestion,
-                                 [self, result, callback, domain, preferredTransports, addresses](
+                                 [self, result, callback, domain, transportsToUse, addresses](
                                    const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
                                  {
                                    std::vector<std::string> finalAddresses = addresses;
@@ -1722,24 +1851,8 @@ private:
                                    }
 
                                    // Create fallback targets
-                                   std::vector<ServiceType> transports = preferredTransports;
-                                   if (transports.empty())
-                                   {
-                                     transports.push_back(ServiceType::SIP_UDP);
-                                   }
-
-                                   for (ServiceType transport : transports)
-                                   {
-                                     ServiceTarget target;
-                                     target.hostname = domain;
-                                     target.port = self->getDefaultServicePort(transport);
-                                     target.transport = transport;
-                                     target.priority = 0;
-                                     target.weight = 0;
-                                     target.addresses = finalAddresses;
-
-                                     result->targets.push_back(target);
-                                   }
+                                   self->appendFallbackTargets(*result, domain, transportsToUse,
+                                                               finalAddresses);
 
                                    callback(*result, nullptr);
                                  });
@@ -1747,24 +1860,7 @@ private:
         else
         {
           // Create fallback targets with A records
-          std::vector<ServiceType> transports = preferredTransports;
-          if (transports.empty())
-          {
-            transports.push_back(ServiceType::SIP_UDP);
-          }
-
-          for (ServiceType transport : transports)
-          {
-            ServiceTarget target;
-            target.hostname = domain;
-            target.port = self->getDefaultServicePort(transport);
-            target.transport = transport;
-            target.priority = 0;
-            target.weight = 0;
-            target.addresses = addresses;
-
-            result->targets.push_back(target);
-          }
+          self->appendFallbackTargets(*result, domain, transportsToUse, addresses);
 
           callback(*result, nullptr);
         }
@@ -1787,6 +1883,11 @@ private:
     const std::size_t initialTargetCount = result->targets.size();
     auto remainingTargets = std::make_shared<std::atomic<size_t>>(initialTargetCount);
 
+    // Keep the resolver alive across the async A/AAAA callbacks: the caller's
+    // strong reference is released when its own callback returns, so the callbacks
+    // this method queues must own a strong ref (fire-and-forget resolution).
+    auto self = shared_from_this();
+
     // Process targets by index with bounds safety
     for (size_t targetIndex = 0; targetIndex < initialTargetCount; ++targetIndex)
     {
@@ -1795,7 +1896,7 @@ private:
 
       transport_->queryAsync(
         aQuestion,
-        [this, targetIndex, initialTargetCount, remainingTargets, result, callback,
+        [self, targetIndex, initialTargetCount, remainingTargets, result, callback,
          hostname](const DnsResult &aResult, const std::exception_ptr &aError)
         {
           // Safe bounds check using initial count (targets vector won't be modified until all
@@ -1813,9 +1914,9 @@ private:
           {
             DnsQuestion aaaaQuestion(hostname, DnsType::AAAA, DnsClass::IN);
 
-            transport_->queryAsync(
+            self->transport_->queryAsync(
               aaaaQuestion,
-              [this, targetIndex, initialTargetCount, remainingTargets, result,
+              [self, targetIndex, initialTargetCount, remainingTargets, result,
                callback](const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
               {
                 if (!aaaaError && targetIndex < initialTargetCount)
@@ -1826,8 +1927,9 @@ private:
                   }
                 }
 
-                // Check if all targets are resolved
-                if (--(*remainingTargets) == 0)
+                // Check if all targets are resolved (acq_rel publishes each
+                // target's writes to the joining thread; see the SRV completer).
+                if (remainingTargets->fetch_sub(1, std::memory_order_acq_rel) == 1)
                 {
                   // Remove targets with no addresses and sort
                   result->targets.erase(
@@ -1835,7 +1937,7 @@ private:
                                    [](const ServiceTarget &t) { return t.addresses.empty(); }),
                     result->targets.end());
 
-                  sortTargetsByPriority(*result);
+                  self->sortTargetsByPriority(*result);
 
                   callback(*result, nullptr);
                 }
@@ -1844,7 +1946,7 @@ private:
           else
           {
             // Check if all targets are resolved
-            if (--(*remainingTargets) == 0)
+            if (remainingTargets->fetch_sub(1, std::memory_order_acq_rel) == 1)
             {
               // Remove targets with no addresses and sort
               result->targets.erase(std::remove_if(result->targets.begin(), result->targets.end(),
@@ -1852,7 +1954,7 @@ private:
                                                    { return t.addresses.empty(); }),
                                     result->targets.end());
 
-              sortTargetsByPriority(*result);
+              self->sortTargetsByPriority(*result);
 
               callback(*result, nullptr);
             }

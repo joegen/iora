@@ -21,10 +21,13 @@
 #include "iora/network/dns/dns_types.hpp"
 #include "iora/network/dns_client.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <random>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace iora::network::dns;
 using iora::network::DnsClient;
@@ -426,11 +429,12 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Caching and TTL Handling", "[dns][cache][t
     auto stats2 = server().getStats();
     CHECK(stats2.udpQueries == udpQueries1); // No additional queries due to negative cache
 
-    // Verify cache contains negative entry with SOA.minimum TTL
+    // Verify a negative entry was inserted and subsequently hit from cache.
     if (client().isCacheEnabled())
     {
       auto cacheStats = client().getCacheStats();
-      CHECK(cacheStats.negative_hits == cacheStats.negative_hits); // Just check field exists
+      CHECK(cacheStats.negative_insertions >= 1);
+      CHECK(cacheStats.negative_hits >= 1);
     }
   }
 }
@@ -703,11 +707,24 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Full Service Discovery Chain",
 
   SECTION("Complete NAPTR -> SRV -> A resolution chain")
   {
-    // Setup complete service discovery chain
-    server().addRecord({"service.example.com", "NAPTR",
-                        "100 10 \"s\" \"SIP+D2U\" \"\" _sip._udp.service.example.com", 3600});
+    // Setup complete service discovery chain with a real NAPTR record (S flag ->
+    // SRV -> A), exercising processNaptrRecords rather than the direct-SRV fallback.
+    // Use a NON-default SRV name so this test genuinely exercises the NAPTR 'S'
+    // path: if it were broken, the direct-SRV fallback (which queries the default
+    // _sip._udp/_tcp/... names) could not reach this SRV, and there is no bare-domain
+    // A record for it to fall back to either.
+    MockDnsServer::DnsRecord naptr;
+    naptr.name = "service.example.com";
+    naptr.type = "NAPTR";
+    naptr.ttl = 3600;
+    naptr.naptrOrder = 100;
+    naptr.naptrPreference = 10;
+    naptr.naptrFlags = "s";
+    naptr.naptrService = "SIP+D2U";
+    naptr.naptrReplacement = "_sipchain._udp.service.example.com";
+    server().addRecord(naptr);
     server().addRecord(
-      {"_sip._udp.service.example.com", "SRV", "sip.service.example.com", 3600, 10, 5, 5060});
+      {"_sipchain._udp.service.example.com", "SRV", "sip.service.example.com", 3600, 10, 5, 5060});
     server().addRecord({"sip.service.example.com", "A", "192.168.1.100", 3600});
 
     auto result = client().resolveServiceDomain("service.example.com");
@@ -720,5 +737,286 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Full Service Discovery Chain",
     // Test preferred target selection
     auto preferred = result.getPreferredTarget();
     CHECK(preferred.hostname == "sip.service.example.com");
+  }
+}
+
+// =============================================================================
+// REGRESSION TESTS FOR THE 2026-09-14 DNS RESILIENCY/CORRECTNESS FIXES
+// =============================================================================
+
+TEST_CASE("DNS cacheTimeout drives the default cache TTL", "[dns][cache][config]")
+{
+  // Regression: DnsConfig::cacheTimeout was previously never applied — the cache
+  // was built via the size_t DnsCache ctor, which hardcodes a 300s TTL. It must
+  // now seed the cache default TTL. (No network: only the cache is exercised.)
+  DnsConfig cfg;
+  cfg.enableCache = true;
+  cfg.cacheTimeout = std::chrono::seconds(123);
+  DnsClient client(cfg);
+
+  REQUIRE(client.isCacheEnabled());
+  CHECK(client.getCacheTtl() == std::chrono::seconds(123));
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS SRV target '.' suppresses A/AAAA fallback (RFC 2782)",
+                 "[dns][service-discovery][rfc2782]")
+{
+  startServer();
+
+  SECTION("A single SRV '.' target means service unavailable — no A/AAAA fallback")
+  {
+    // _sip._udp.denied.example.com publishes one SRV with target "." — RFC 2782
+    // "the service is decidedly not available at this domain". An A record for
+    // the bare domain also exists; the resolver must NOT fall back to it.
+    server().addRecord({"_sip._udp.denied.example.com", "SRV", ".", 3600, 0, 0, 5060});
+    server().addRecord({"denied.example.com", "A", "192.168.1.77", 3600});
+
+    auto result = client().resolveServiceDomain("denied.example.com", {ServiceType::SIP_UDP});
+
+    // The "." target is skipped and the A/AAAA fallback is suppressed: no target.
+    CHECK(result.targets.empty());
+    CHECK_FALSE(result.isSuccess());
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture, "DNS NODATA (NOERROR/0-answers) is negative-cached (RFC 2308)",
+                 "[dns][cache][rfc2308][nodata]")
+{
+  startServer();
+
+  SECTION("A NODATA response is cached and re-thrown without a second network query")
+  {
+    // NOERROR with no answers + an SOA in authority = RFC 2308 NODATA.
+    MockDnsServer::QueryConfig nodata;
+    nodata.shouldReturnNodata = true;
+    server().configureQuery("nodata.example.com", nodata);
+
+    // First query: NODATA -> negatively cached (SOA present) + throws.
+    REQUIRE_THROWS_AS(client().resolveA("nodata.example.com"), DnsResolverException);
+    auto udpAfterFirst = server().getStats().udpQueries;
+
+    // Second query: served from the negative cache, no additional network query.
+    REQUIRE_THROWS_AS(client().resolveA("nodata.example.com"), DnsResolverException);
+    CHECK(server().getStats().udpQueries == udpAfterFirst);
+
+    if (client().isCacheEnabled())
+    {
+      auto stats = client().getCacheStats();
+      CHECK(stats.negative_insertions >= 1);
+      CHECK(stats.negative_hits >= 1);
+    }
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS NAPTR ascending-ORDER descent skips an unusable lower tier (RFC 3403)",
+                 "[dns][service-discovery][rfc3403][naptr]")
+{
+  startServer();
+
+  SECTION("Lowest ORDER is all-unsupported; the next ORDER's usable target is used")
+  {
+    // ORDER 10: an unsupported service (skipped). ORDER 20: a usable SIP+D2U 's'
+    // record pointing at a NON-default SRV name, so only real ascending-order NAPTR
+    // processing (not the direct-SRV fallback, which queries default names) reaches it.
+    MockDnsServer::DnsRecord low;
+    low.name = "multi.example.com";
+    low.type = "NAPTR";
+    low.naptrOrder = 10;
+    low.naptrPreference = 10;
+    low.naptrFlags = "s";
+    low.naptrService = "FOO+BAR"; // unsupported -> Unknown -> skipped
+    low.naptrReplacement = "_foo._udp.multi.example.com";
+    server().addRecord(low);
+
+    MockDnsServer::DnsRecord high;
+    high.name = "multi.example.com";
+    high.type = "NAPTR";
+    high.naptrOrder = 20;
+    high.naptrPreference = 10;
+    high.naptrFlags = "s";
+    high.naptrService = "SIP+D2U";
+    high.naptrReplacement = "_sipcustom._udp.multi.example.com"; // non-default SRV name
+    server().addRecord(high);
+
+    server().addRecord(
+      {"_sipcustom._udp.multi.example.com", "SRV", "sipcustom.multi.example.com", 3600, 5, 0, 5060});
+    server().addRecord({"sipcustom.multi.example.com", "A", "192.168.1.99", 3600});
+    // Deliberately NO A record for multi.example.com: the direct-SRV fallback would
+    // find nothing, so a pass proves the ORDER-20 tier was actually processed.
+
+    auto result = client().resolveServiceDomain("multi.example.com");
+
+    REQUIRE_FALSE(result.targets.empty());
+    CHECK(result.targets[0].hostname == "sipcustom.multi.example.com");
+    CHECK(result.targets[0].transport == ServiceType::SIP_UDP);
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS sync service resolution falls back to direct SRV when NAPTR is unusable",
+                 "[dns][service-discovery][rfc3263]")
+{
+  startServer();
+
+  SECTION("NAPTR present but all-unusable -> sync direct-SRV fallback (parity with async)")
+  {
+    MockDnsServer::DnsRecord naptr;
+    naptr.name = "unusable.example.com";
+    naptr.type = "NAPTR";
+    naptr.naptrOrder = 10;
+    naptr.naptrPreference = 10;
+    naptr.naptrFlags = "s";
+    naptr.naptrService = "FOO+BAR"; // unsupported -> no usable target
+    naptr.naptrReplacement = "_foo._udp.unusable.example.com";
+    server().addRecord(naptr);
+
+    server().addRecord(
+      {"_sip._udp.unusable.example.com", "SRV", "sip.unusable.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"sip.unusable.example.com", "A", "192.168.1.55", 3600});
+
+    auto result = client().resolveServiceDomain("unusable.example.com");
+
+    REQUIRE_FALSE(result.targets.empty());
+    CHECK(result.targets[0].hostname == "sip.unusable.example.com");
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture, "DNS async SRV '.' suppresses the A/AAAA fallback (RFC 2782)",
+                 "[dns][service-discovery][rfc2782][async]")
+{
+  startServer();
+
+  SECTION("Async path honors the '.' abort like the sync path")
+  {
+    server().addRecord({"_sip._udp.adenied.example.com", "SRV", ".", 3600, 0, 0, 5060});
+    server().addRecord({"adenied.example.com", "A", "192.168.1.66", 3600});
+
+    std::promise<ServiceResolutionResult> prom;
+    auto fut = prom.get_future();
+    client().resolveServiceDomainAsync(
+      "adenied.example.com",
+      [&prom](const ServiceResolutionResult &r, const std::exception_ptr &)
+      { prom.set_value(r); },
+      {ServiceType::SIP_UDP});
+
+    REQUIRE(fut.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    auto result = fut.get();
+    CHECK(result.targets.empty());
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS SRV '.' suppression is per-service, not domain-wide (RFC 2782)",
+                 "[dns][service-discovery][rfc2782]")
+{
+  startServer();
+
+  SECTION("SIPS disabled via '.' must not strand plain SIP reachable via a bare A record")
+  {
+    // _sips._tcp declares SIPS unavailable ("."); no other SRV exists; the domain
+    // has a bare A record. Plain SIP (UDP) must still resolve via A/AAAA fallback.
+    server().addRecord({"_sips._tcp.persvc.example.com", "SRV", ".", 3600, 0, 0, 5060});
+    server().addRecord({"persvc.example.com", "A", "192.168.1.88", 3600});
+
+    auto result = client().resolveServiceDomain(
+      "persvc.example.com", {ServiceType::SIP_UDP, ServiceType::SIPS_TLS});
+
+    REQUIRE_FALSE(result.targets.empty());
+    // Only the non-denied transport (UDP) is present; SIPS is suppressed.
+    for (const auto &t : result.targets)
+    {
+      CHECK(t.transport != ServiceType::SIPS_TLS);
+    }
+    bool hasUdp = false;
+    for (const auto &t : result.targets)
+    {
+      if (t.transport == ServiceType::SIP_UDP)
+      {
+        hasUdp = true;
+        CHECK(std::find(t.addresses.begin(), t.addresses.end(), "192.168.1.88") !=
+              t.addresses.end());
+      }
+    }
+    CHECK(hasUdp);
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS resolveCustomServiceDomainAsync with an empty SRV set still fires the callback",
+                 "[dns][service-discovery][async]")
+{
+  startServer();
+
+  SECTION("Empty srvQueries must not lose the completion (no caller hang)")
+  {
+    server().addRecord({"h1.example.com", "A", "192.168.1.11", 3600});
+
+    std::promise<bool> prom;
+    auto fut = prom.get_future();
+    std::vector<std::pair<std::string, ServiceType>> emptyQueries;
+    client().resolveCustomServiceDomainAsync(
+      "h1.example.com", emptyQueries,
+      [&prom](const ServiceResolutionResult &, const std::exception_ptr &)
+      { prom.set_value(true); });
+
+    // Without the zero-work guard the callback never fires and this times out.
+    REQUIRE(fut.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    CHECK(fut.get());
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS NODATA without an SOA is NOT negative-cached (RFC 2308 section 5)",
+                 "[dns][cache][rfc2308][nodata]")
+{
+  startServer();
+
+  SECTION("A no-SOA negative re-queries the network (negative-control for the SOA gate)")
+  {
+    MockDnsServer::QueryConfig nodataNoSoa;
+    nodataNoSoa.shouldReturnNodataNoSoa = true;
+    server().configureQuery("nosoa.example.com", nodataNoSoa);
+
+    REQUIRE_THROWS_AS(client().resolveA("nosoa.example.com"), DnsResolverException);
+    auto udpAfterFirst = server().getStats().udpQueries;
+
+    // Second query MUST re-hit the network: a negative without an SOA is not cached.
+    REQUIRE_THROWS_AS(client().resolveA("nosoa.example.com"), DnsResolverException);
+    CHECK(server().getStats().udpQueries > udpAfterFirst);
+
+    if (client().isCacheEnabled())
+    {
+      CHECK(client().getCacheStats().negative_insertions == 0);
+    }
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS async SRV '.' suppression is per-service, not domain-wide (RFC 2782)",
+                 "[dns][service-discovery][rfc2782][async]")
+{
+  startServer();
+
+  SECTION("Async: SIPS denied via '.' still leaves plain SIP reachable via bare A")
+  {
+    server().addRecord({"_sips._tcp.apersvc.example.com", "SRV", ".", 3600, 0, 0, 5060});
+    server().addRecord({"apersvc.example.com", "A", "192.168.1.90", 3600});
+
+    std::promise<ServiceResolutionResult> prom;
+    auto fut = prom.get_future();
+    client().resolveServiceDomainAsync(
+      "apersvc.example.com",
+      [&prom](const ServiceResolutionResult &r, const std::exception_ptr &) { prom.set_value(r); },
+      {ServiceType::SIP_UDP, ServiceType::SIPS_TLS});
+
+    REQUIRE(fut.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    auto result = fut.get();
+    REQUIRE_FALSE(result.targets.empty());
+    for (const auto &t : result.targets)
+    {
+      CHECK(t.transport != ServiceType::SIPS_TLS);
+    }
   }
 }

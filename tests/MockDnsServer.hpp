@@ -76,6 +76,14 @@ public:
     std::uint32_t retry{1800};    // SOA retry
     std::uint32_t expire{604800}; // SOA expire
     std::uint32_t minimum{86400}; // SOA minimum (negative cache TTL)
+
+    // NAPTR-specific fields (RFC 3403) for service-discovery tests
+    std::uint16_t naptrOrder{0};      // NAPTR ORDER
+    std::uint16_t naptrPreference{0}; // NAPTR PREFERENCE
+    std::string naptrFlags;           // NAPTR FLAGS (e.g. "S", "A")
+    std::string naptrService;         // NAPTR SERVICES (e.g. "SIP+D2U")
+    std::string naptrRegexp;          // NAPTR REGEXP (usually empty for SIP)
+    std::string naptrReplacement;     // NAPTR REPLACEMENT (SRV name or host)
   };
 
   /// \brief Query behavior configuration
@@ -89,6 +97,8 @@ public:
     bool useWireFormat{false};           // Use raw wire response
     bool enableCompression{true};        // Enable name compression
     bool injectMaliciousPointers{false}; // Test pointer loop handling
+    bool shouldReturnNodata{false};      // RFC 2308 NODATA (NOERROR, 0 answers, SOA authority)
+    bool shouldReturnNodataNoSoa{false}; // NODATA WITHOUT an SOA (must NOT be negative-cached)
     std::string errorMessage;            // Custom error message
   };
 
@@ -688,6 +698,18 @@ private:
           return generateServfailResponse(queryId, questionName, queryType);
         }
 
+        // Handle RFC 2308 NODATA (NOERROR, no answers, SOA in authority)
+        if (queryConfig.shouldReturnNodata)
+        {
+          return generateNodataResponse(queryId, questionName, queryType);
+        }
+
+        // NODATA WITHOUT an SOA (RFC 2308 §5 negative-control: must NOT be cached)
+        if (queryConfig.shouldReturnNodataNoSoa)
+        {
+          return generateNodataResponse(queryId, questionName, queryType, /*includeSoa=*/false);
+        }
+
         // Apply delay only for successful responses
         if (queryConfig.delay.count() > 0)
         {
@@ -757,6 +779,9 @@ private:
     case 33:
       typeStr = "SRV";
       break;
+    case 35:
+      typeStr = "NAPTR";
+      break;
     case 5:
       typeStr = "CNAME";
       break;
@@ -785,93 +810,102 @@ private:
     return generateWireResponse(questionName, queryType, filteredRecords, true, false, queryId);
   }
 
+  /// \brief Shared builder for NXDOMAIN / NODATA negative responses.
+  /// \param rcodeByte flags byte 3: 0x83 = NXDOMAIN (RA + rcode 3), 0x80 = NOERROR
+  ///        (RA, rcode 0 -> NODATA when ANCOUNT=0).
+  /// \param includeSoa when true, appends an authority SOA (NSCOUNT=1) so the
+  ///        response is negatively cacheable (RFC 2308 §5); when false, NSCOUNT=0
+  ///        (a negative response WITHOUT an SOA — must NOT be negatively cached).
+  std::vector<std::uint8_t> generateNegativeResponse(std::uint16_t queryId,
+                                                     const std::string &questionName,
+                                                     std::uint16_t queryType, std::uint8_t rcodeByte,
+                                                     bool includeSoa)
+  {
+    std::vector<std::uint8_t> response;
+    response.resize(12);
+    response[0] = static_cast<std::uint8_t>(queryId >> 8);
+    response[1] = static_cast<std::uint8_t>(queryId & 0xFF);
+    response[2] = 0x81; // QR=1, RD=1
+    response[3] = rcodeByte;
+
+    // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0-or-1, ARCOUNT=0
+    response[4] = 0;
+    response[5] = 1;
+    response[6] = 0;
+    response[7] = 0;
+    response[8] = 0;
+    response[9] = includeSoa ? 1 : 0;
+    response[10] = 0;
+    response[11] = 0;
+
+    // Question section - echo the query
+    encodeQuestionName(response, questionName);
+    response.push_back((queryType >> 8) & 0xFF);
+    response.push_back(queryType & 0xFF);
+    response.push_back(0);
+    response.push_back(1); // CLASS IN
+
+    if (includeSoa)
+    {
+      // Authority SOA (drives the RFC 2308 negative-cache TTL)
+      DnsRecord soaRecord;
+      soaRecord.type = "SOA";
+      soaRecord.name = questionName;
+      soaRecord.mname = "ns1.example.com";
+      soaRecord.rname = "admin.example.com";
+      soaRecord.minimum = 300;
+
+      auto soaData = generateSoaResponse(questionName, soaRecord);
+      response.insert(response.end(), soaData.begin() + 12, soaData.end()); // Skip header
+    }
+
+    return response;
+  }
+
   std::vector<std::uint8_t> generateNxdomainResponse(std::uint16_t queryId,
                                                      const std::string &questionName,
                                                      std::uint16_t queryType = 1)
   {
-    // Generate NXDOMAIN response with SOA record
-    std::vector<std::uint8_t> response;
+    return generateNegativeResponse(queryId, questionName, queryType, 0x83, /*includeSoa=*/true);
+  }
 
-    // DNS header (12 bytes)
-    response.resize(12);
-    response[0] = static_cast<std::uint8_t>(queryId >> 8);
-    response[1] = static_cast<std::uint8_t>(queryId & 0xFF);
-    response[2] = 0x81; // Response, recursion desired
-    response[3] = 0x83; // NXDOMAIN
-
-    // Question count = 1, Answer count = 0, Authority count = 1, Additional = 0
-    response[4] = 0;
-    response[5] = 1; // QDCOUNT
-    response[6] = 0;
-    response[7] = 0; // ANCOUNT
-    response[8] = 0;
-    response[9] = 1; // NSCOUNT
-    response[10] = 0;
-    response[11] = 0; // ARCOUNT
-
-    // Question section - echo back the exact query
-    encodeQuestionName(response, questionName);
-    response.push_back((queryType >> 8) & 0xFF); // QTYPE high byte
-    response.push_back(queryType & 0xFF);        // QTYPE low byte
-    response.push_back(0);
-    response.push_back(1); // CLASS IN
-
-    // Authority section with SOA
-    DnsRecord soaRecord;
-    soaRecord.type = "SOA";
-    soaRecord.name = "example.com";
-    soaRecord.mname = "ns1.example.com";
-    soaRecord.rname = "admin.example.com";
-    soaRecord.minimum = 3600;
-
-    auto soaData = generateSoaResponse(questionName, soaRecord);
-    response.insert(response.end(), soaData.begin() + 12, soaData.end()); // Skip header
-
-    return response;
+  std::vector<std::uint8_t> generateNodataResponse(std::uint16_t queryId,
+                                                   const std::string &questionName,
+                                                   std::uint16_t queryType = 1,
+                                                   bool includeSoa = true)
+  {
+    return generateNegativeResponse(queryId, questionName, queryType, 0x80, includeSoa);
   }
 
   std::vector<std::uint8_t> generateServfailResponse(std::uint16_t queryId,
                                                      const std::string &questionName,
                                                      std::uint16_t queryType = 1)
   {
-    // Generate SERVFAIL response (similar to NXDOMAIN but with different error code)
-    std::vector<std::uint8_t> response;
-
-    // DNS header (12 bytes)
-    response.resize(12);
-    response[0] = static_cast<std::uint8_t>(queryId >> 8);
-    response[1] = static_cast<std::uint8_t>(queryId & 0xFF);
-    response[2] = 0x81; // Response, recursion desired
-    response[3] = 0x82; // SERVFAIL (0x80 | 0x02)
-
-    // Question count = 1, Answer count = 0, Authority count = 0, Additional = 0
-    response[4] = 0;
-    response[5] = 1; // QDCOUNT
-    response[6] = 0;
-    response[7] = 0; // ANCOUNT
-    response[8] = 0;
-    response[9] = 0; // NSCOUNT (no authority section for SERVFAIL)
-    response[10] = 0;
-    response[11] = 0; // ARCOUNT
-
-    // Add question section
-    encodeQuestionName(response, questionName);
-    response.push_back(static_cast<std::uint8_t>(queryType >> 8));
-    response.push_back(static_cast<std::uint8_t>(queryType & 0xFF));
-    response.push_back(0x00);
-    response.push_back(0x01); // Class IN
-
-    return response;
+    // SERVFAIL: 0x82 = RA | rcode 2, no authority section (RFC 1035 §4.1.1).
+    return generateNegativeResponse(queryId, questionName, queryType, 0x82, /*includeSoa=*/false);
   }
 
   void encodeQuestionName(std::vector<std::uint8_t> &buffer, const std::string &name)
   {
-    // Simple DNS name encoding
+    // Root ("." or "") encodes to a single 0x00 label (the canonical wire form a
+    // real server emits), NOT an empty-label byte followed by a terminator.
+    if (name.empty() || name == ".")
+    {
+      buffer.push_back(0);
+      return;
+    }
+
+    // Simple DNS name encoding. Skip empty labels (e.g. a trailing dot in an FQDN)
+    // so they don't emit a stray zero-length label.
     std::istringstream iss(name);
     std::string label;
 
     while (std::getline(iss, label, '.'))
     {
+      if (label.empty())
+      {
+        continue;
+      }
       buffer.push_back(static_cast<std::uint8_t>(label.length()));
       buffer.insert(buffer.end(), label.begin(), label.end());
     }
@@ -955,6 +989,8 @@ private:
         recordType = 15;
       else if (record.type == "SRV")
         recordType = 33;
+      else if (record.type == "NAPTR")
+        recordType = 35;
 
       response.push_back((recordType >> 8) & 0xFF);
       response.push_back(recordType & 0xFF);
@@ -1038,6 +1074,45 @@ private:
         encodeQuestionName(response, record.value);
 
         // Update RDLENGTH
+        std::size_t rdataLength = response.size() - rdataStart;
+        response[rdlengthPos] = (rdataLength >> 8) & 0xFF;
+        response[rdlengthPos + 1] = rdataLength & 0xFF;
+      }
+      else if (record.type == "NAPTR")
+      {
+        // NAPTR RDATA (RFC 3403): ORDER(2) PREFERENCE(2) FLAGS(char-str)
+        // SERVICES(char-str) REGEXP(char-str) REPLACEMENT(domain-name)
+        std::size_t rdlengthPos = response.size();
+        response.push_back(0x00); // RDLENGTH placeholder
+        response.push_back(0x00);
+
+        std::size_t rdataStart = response.size();
+
+        response.push_back((record.naptrOrder >> 8) & 0xFF);
+        response.push_back(record.naptrOrder & 0xFF);
+        response.push_back((record.naptrPreference >> 8) & 0xFF);
+        response.push_back(record.naptrPreference & 0xFF);
+
+        // Character-strings: single length byte then bytes
+        auto pushCharString = [&response](const std::string &s)
+        {
+          response.push_back(static_cast<std::uint8_t>(s.size()));
+          response.insert(response.end(), s.begin(), s.end());
+        };
+        pushCharString(record.naptrFlags);
+        pushCharString(record.naptrService);
+        pushCharString(record.naptrRegexp);
+
+        // REPLACEMENT is a domain-name (root "." if empty)
+        if (record.naptrReplacement.empty() || record.naptrReplacement == ".")
+        {
+          response.push_back(0x00); // root label
+        }
+        else
+        {
+          encodeQuestionName(response, record.naptrReplacement);
+        }
+
         std::size_t rdataLength = response.size() - rdataStart;
         response[rdlengthPos] = (rdataLength >> 8) & 0xFF;
         response[rdlengthPos + 1] = rdataLength & 0xFF;

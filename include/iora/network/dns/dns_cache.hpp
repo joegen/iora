@@ -12,6 +12,8 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 
 namespace iora
 {
@@ -75,14 +77,6 @@ public:
   /// \param ttl Time-to-live for cache entries
   explicit DnsCache(std::chrono::seconds ttl) : defaultTtlSeconds_(ttl.count()) { initializeCache(); }
 
-  /// \brief Constructor with maximum cache size (ignored - ExpiringCache uses TTL only)
-  /// \param maxSize Ignored for compatibility with old API
-  explicit DnsCache(std::size_t maxSize) : defaultTtlSeconds_(300)
-  {
-    // maxSize is ignored - ExpiringCache uses time-based expiration only
-    initializeCache();
-  }
-
   /// \brief Store DNS query result in cache with minimum TTL
   ///
   /// This implementation uses a single TTL for the entire DNS result, calculated as the
@@ -101,6 +95,12 @@ public:
   void put(const DnsQuestion &question, const DnsResult &result)
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
+
+    // cacheMutex_ (shared) guards cache_ against clear()'s reassignment; statsMutex_
+    // (inner) serializes the read-decide-count sequence so concurrent same-key puts
+    // cannot both count an insertion. Ordering is always cacheMutex_ -> statsMutex_.
+    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
+    std::lock_guard<std::mutex> lock(statsMutex_);
 
     // Check what type of entry exists to handle counter correctly
     auto existingEntry = cache_->get(key);
@@ -145,6 +145,10 @@ public:
                    const std::string &errorMessage)
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
+
+    // cacheMutex_ (shared) -> statsMutex_ (inner); see put().
+    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
+    std::lock_guard<std::mutex> lock(statsMutex_);
 
     // Check what type of entry exists to handle counter correctly
     auto existingEntry = cache_->get(key);
@@ -196,6 +200,10 @@ public:
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
 
+    // Shared lock: concurrent readers/writers are fine; only clear() (which
+    // reassigns cache_) needs exclusivity. See cacheMutex_.
+    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
+
     auto cachedResult = cache_->get(key);
     if (!cachedResult.has_value())
     {
@@ -223,6 +231,7 @@ public:
   void remove(const DnsQuestion &question)
   {
     DnsCacheKey key = DnsCacheKey::fromQuestion(question);
+    std::shared_lock<std::shared_mutex> clock(cacheMutex_);
     cache_->remove(key);
   }
 
@@ -248,9 +257,9 @@ public:
   ///                            If false, preserve hits/misses/insertions for monitoring
   void clear(bool resetHistoricalStats)
   {
-    // Reset current entry counters (always)
-    stats_.current_entries.store(0);
-    stats_.current_negative_entries.store(0);
+    // Exclusive lock: clear() replaces cache_, so no reader/writer (get/put/
+    // putNegative/remove, all shared-locked) may be inside cache_ concurrently.
+    std::unique_lock<std::shared_mutex> clock(cacheMutex_);
 
     // Reset historical statistics if requested
     if (resetHistoricalStats)
@@ -264,10 +273,16 @@ public:
       stats_.negative_replacements.store(0);
     }
 
-    // ExpiringCache doesn't have a clear method, so we create a new instance
-    // The cleanupCallback_ is preserved and passed to initializeCache()
-    // The defaultTtlSeconds_ is also preserved from construction time
+    // ExpiringCache has no clear(); replace the instance. Destroying the old one
+    // joins its purge thread, so any IN-FLIGHT eviction callbacks complete before
+    // we store(0) below; resident entries are dropped without a per-entry
+    // decrement, which the unconditional store(0) reconciles (no underflow).
+    // The cleanupCallback_ and defaultTtlSeconds_ are preserved.
     initializeCache();
+
+    // Reset current entry counters after the old cache is fully torn down.
+    stats_.current_entries.store(0);
+    stats_.current_negative_entries.store(0);
   }
 
   /// \brief Get current cache statistics
@@ -328,9 +343,6 @@ public:
   }
 
 private:
-  /// \brief Underlying expiring cache
-  std::unique_ptr<util::ExpiringCache<DnsCacheKey, CachedDnsResult>> cache_;
-
   /// \brief Default TTL for cache entries (atomic for thread safety)
   std::atomic<int64_t> defaultTtlSeconds_;
 
@@ -348,8 +360,35 @@ private:
     std::atomic<std::uint64_t> current_negative_entries{0}; ///< Accurate current negative entries
   } stats_;
 
+  /// \brief Serializes the get -> decide -> set -> count sequence in put/putNegative
+  ///
+  /// The stats counters are individually atomic, but the "check existing entry,
+  /// then adjust insertion/replacement counts" sequence is a compound operation:
+  /// two threads inserting the SAME key concurrently could both observe no prior
+  /// entry and both increment, drifting the accurate-count invariant. This mutex
+  /// makes that read-decide-count sequence atomic. It is NOT taken by the eviction
+  /// callback (which only does atomic fetch_sub), so there is no lock-ordering
+  /// hazard with the ExpiringCache's internal mutex.
+  mutable std::mutex statsMutex_;
+
+  /// \brief Guards the cache_ pointer against clear()'s reassignment.
+  ///
+  /// Shared-locked by get/put/putNegative/remove (they only need cache_ to stay
+  /// alive while they dereference it; ExpiringCache is itself internally
+  /// synchronized), unique-locked by clear() which destroys and replaces cache_.
+  /// Lock ordering is cacheMutex_ -> statsMutex_; the eviction callback takes
+  /// neither, so there is no inversion with ExpiringCache's internal mutex.
+  mutable std::shared_mutex cacheMutex_;
+
   /// \brief Optional cleanup callback
   std::function<void(const DnsCacheStats &)> cleanupCallback_;
+
+  /// \brief Underlying expiring cache.
+  ///
+  /// Declared LAST so it is destroyed FIRST: ~ExpiringCache joins its purge
+  /// thread before stats_/statsMutex_/cacheMutex_ (which the eviction callback
+  /// touches) are destroyed, closing the teardown UAF window.
+  std::unique_ptr<util::ExpiringCache<DnsCacheKey, CachedDnsResult>> cache_;
 
   /// \brief Initialize cache with eviction callback
   void initializeCache()
