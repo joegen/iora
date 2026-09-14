@@ -189,7 +189,8 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **HttpServer / WebhookServer** — the routing HTTP server and its JSON specialization: request framing and chunked de-chunking, RFC 9112 connection persistence, repeated Set-Cookie, and the WebSocket-upgrade subclass seam — [`docs/network/http_server.md`](docs/network/http_server.md)
 - **HTTP Basic Auth** — the `requireBasicAuth` route decorator: realm sanitization, constant-time verification, and credential scrubbing — [`docs/network/http_basic_auth.md`](docs/network/http_basic_auth.md)
 - **WebSocket** — the RFC 6455 frame codec, server, and client: tri-state frame parse with length/masking/RSV/control-frame conformance, fragmentation, and the abrupt-disconnect close hook — [`docs/network/websocket.md`](docs/network/websocket.md)
-- **DnsClient**, **CircuitBreaker**, **ConnectionHealth**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
+- **Network Resiliency: CircuitBreaker & ConnectionHealth** — standalone circuit-breaking and per-connection health primitives (not auto-wired by the transport): the Closed/Open/HalfOpen breaker and its `std::string`-name-keyed manager, plus the five-level connection-health tracker and its `SessionId`-keyed monitor — [`docs/network/resiliency.md`](docs/network/resiliency.md)
+- **DnsClient**, **SseStream**, **EventBatchProcessor**, **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
 
 ### parsers
 - **JSON** — value model, parser & serializer (`\uXXXX`/surrogate decoding, RFC 8259) — [`docs/parsers/json.md`](docs/parsers/json.md)

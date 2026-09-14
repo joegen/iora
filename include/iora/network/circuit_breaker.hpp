@@ -8,9 +8,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace iora
 {
@@ -38,8 +43,8 @@ class CircuitBreaker
 {
 public:
   explicit CircuitBreaker(const CircuitBreakerConfig &config = {})
-      : config_(config), state_(CircuitBreakerState::Closed), failureCount_(0), successCount_(0),
-        lastFailureTime_(std::chrono::steady_clock::time_point{}), requestCount_(0)
+      : _config(config), _state(CircuitBreakerState::Closed), _failureCount(0), _successCount(0),
+        _lastFailureTime(std::chrono::steady_clock::time_point{}), _requestCount(0)
   {
   }
 
@@ -48,22 +53,22 @@ public:
   {
     auto now = std::chrono::steady_clock::now();
 
-    switch (state_.load(std::memory_order_relaxed))
+    switch (_state.load(std::memory_order_relaxed))
     {
     case CircuitBreakerState::Closed:
       return true;
 
     case CircuitBreakerState::Open:
     {
-      auto lastFailure = lastFailureTime_.load(std::memory_order_relaxed);
-      if (now - lastFailure >= config_.timeout)
+      auto lastFailure = _lastFailureTime.load(std::memory_order_relaxed);
+      if (now - lastFailure >= _config.timeout)
       {
         // Transition to half-open
         auto expected = CircuitBreakerState::Open;
-        if (state_.compare_exchange_strong(expected, CircuitBreakerState::HalfOpen,
+        if (_state.compare_exchange_strong(expected, CircuitBreakerState::HalfOpen,
                                            std::memory_order_relaxed))
         {
-          successCount_.store(0, std::memory_order_relaxed);
+          _successCount.store(0, std::memory_order_relaxed);
         }
         return true;
       }
@@ -81,56 +86,56 @@ public:
 
   void recordSuccess()
   {
-    requestCount_.fetch_add(1, std::memory_order_relaxed);
+    _requestCount.fetch_add(1, std::memory_order_relaxed);
 
-    auto currentState = state_.load(std::memory_order_relaxed);
+    auto currentState = _state.load(std::memory_order_relaxed);
 
     if (currentState == CircuitBreakerState::HalfOpen)
     {
-      int successes = successCount_.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (successes >= config_.successThreshold)
+      int successes = _successCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (successes >= _config.successThreshold)
       {
         // Circuit recovered, close it
-        state_.store(CircuitBreakerState::Closed, std::memory_order_relaxed);
-        failureCount_.store(0, std::memory_order_relaxed);
-        successCount_.store(0, std::memory_order_relaxed);
+        _state.store(CircuitBreakerState::Closed, std::memory_order_relaxed);
+        _failureCount.store(0, std::memory_order_relaxed);
+        _successCount.store(0, std::memory_order_relaxed);
       }
     }
     else if (currentState == CircuitBreakerState::Closed)
     {
       // Reset failure count on success
-      failureCount_.store(0, std::memory_order_relaxed);
+      _failureCount.store(0, std::memory_order_relaxed);
     }
   }
 
   void recordFailure()
   {
-    requestCount_.fetch_add(1, std::memory_order_relaxed);
+    _requestCount.fetch_add(1, std::memory_order_relaxed);
 
     auto now = std::chrono::steady_clock::now();
-    lastFailureTime_.store(now, std::memory_order_relaxed);
+    _lastFailureTime.store(now, std::memory_order_relaxed);
 
-    int failures = failureCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+    int failures = _failureCount.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    auto currentState = state_.load(std::memory_order_relaxed);
+    auto currentState = _state.load(std::memory_order_relaxed);
 
     if (currentState == CircuitBreakerState::HalfOpen)
     {
       // Failed during testing, go back to open
-      state_.store(CircuitBreakerState::Open, std::memory_order_relaxed);
-      successCount_.store(0, std::memory_order_relaxed);
+      _state.store(CircuitBreakerState::Open, std::memory_order_relaxed);
+      _successCount.store(0, std::memory_order_relaxed);
     }
     else if (currentState == CircuitBreakerState::Closed)
     {
       // Check if we should open the circuit
       if (shouldOpenCircuit(failures))
       {
-        state_.store(CircuitBreakerState::Open, std::memory_order_relaxed);
+        _state.store(CircuitBreakerState::Open, std::memory_order_relaxed);
       }
     }
   }
 
-  CircuitBreakerState getState() const { return state_.load(std::memory_order_relaxed); }
+  CircuitBreakerState getState() const { return _state.load(std::memory_order_relaxed); }
 
   struct Stats
   {
@@ -145,56 +150,56 @@ public:
   Stats getStats() const
   {
     auto now = std::chrono::steady_clock::now();
-    auto lastFailure = lastFailureTime_.load(std::memory_order_relaxed);
-    auto failures = failureCount_.load(std::memory_order_relaxed);
-    auto requests = requestCount_.load(std::memory_order_relaxed);
+    auto lastFailure = _lastFailureTime.load(std::memory_order_relaxed);
+    auto failures = _failureCount.load(std::memory_order_relaxed);
+    auto requests = _requestCount.load(std::memory_order_relaxed);
 
-    return {state_.load(std::memory_order_relaxed),
+    return {_state.load(std::memory_order_relaxed),
             failures,
-            successCount_.load(std::memory_order_relaxed),
+            _successCount.load(std::memory_order_relaxed),
             requests,
             std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFailure),
             requests > 0 ? static_cast<double>(failures) / requests : 0.0};
   }
 
-  void updateConfig(const CircuitBreakerConfig &config) { config_ = config; }
+  void updateConfig(const CircuitBreakerConfig &config) { _config = config; }
 
   void reset()
   {
-    state_.store(CircuitBreakerState::Closed, std::memory_order_relaxed);
-    failureCount_.store(0, std::memory_order_relaxed);
-    successCount_.store(0, std::memory_order_relaxed);
-    requestCount_.store(0, std::memory_order_relaxed);
-    lastFailureTime_.store(std::chrono::steady_clock::time_point{}, std::memory_order_relaxed);
+    _state.store(CircuitBreakerState::Closed, std::memory_order_relaxed);
+    _failureCount.store(0, std::memory_order_relaxed);
+    _successCount.store(0, std::memory_order_relaxed);
+    _requestCount.store(0, std::memory_order_relaxed);
+    _lastFailureTime.store(std::chrono::steady_clock::time_point{}, std::memory_order_relaxed);
   }
 
 private:
   bool shouldOpenCircuit(int failures) const
   {
     // Simple threshold-based check
-    if (failures >= config_.failureThreshold)
+    if (failures >= _config.failureThreshold)
     {
       return true;
     }
 
     // Failure rate based check
-    auto requests = requestCount_.load(std::memory_order_relaxed);
-    if (static_cast<int>(requests) >= config_.minimumRequests)
+    auto requests = _requestCount.load(std::memory_order_relaxed);
+    if (static_cast<int>(requests) >= _config.minimumRequests)
     {
       double failureRate = static_cast<double>(failures) / requests;
-      return failureRate >= config_.failureRateThreshold;
+      return failureRate >= _config.failureRateThreshold;
     }
 
     return false;
   }
 
 private:
-  CircuitBreakerConfig config_;
-  std::atomic<CircuitBreakerState> state_;
-  std::atomic<int> failureCount_;
-  std::atomic<int> successCount_;
-  std::atomic<std::chrono::steady_clock::time_point> lastFailureTime_;
-  std::atomic<std::uint64_t> requestCount_;
+  CircuitBreakerConfig _config;
+  std::atomic<CircuitBreakerState> _state;
+  std::atomic<int> _failureCount;
+  std::atomic<int> _successCount;
+  std::atomic<std::chrono::steady_clock::time_point> _lastFailureTime;
+  std::atomic<std::uint64_t> _requestCount;
 };
 
 // Circuit breaker manager for different operations/endpoints
@@ -204,18 +209,18 @@ public:
   using BreakerFactory = std::function<std::unique_ptr<CircuitBreaker>()>;
 
   explicit CircuitBreakerManager(BreakerFactory factory = nullptr)
-      : factory_(factory ? std::move(factory) : []() { return std::make_unique<CircuitBreaker>(); })
+      : _factory(factory ? std::move(factory) : []() { return std::make_unique<CircuitBreaker>(); })
   {
   }
 
   CircuitBreaker &getBreaker(const std::string &name)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(_mutex);
 
-    auto it = breakers_.find(name);
-    if (it == breakers_.end())
+    auto it = _breakers.find(name);
+    if (it == _breakers.end())
     {
-      auto [inserted, success] = breakers_.emplace(name, factory_());
+      auto [inserted, success] = _breakers.emplace(name, _factory());
       return *inserted->second;
     }
 
@@ -237,8 +242,8 @@ public:
 
   void updateAllConfigs(const CircuitBreakerConfig &config)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto &[name, breaker] : breakers_)
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto &[name, breaker] : _breakers)
     {
       breaker->updateConfig(config);
     }
@@ -247,9 +252,9 @@ public:
   std::vector<std::string> getBreakerNames() const
   {
     std::vector<std::string> names;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(_mutex);
 
-    for (const auto &[name, breaker] : breakers_)
+    for (const auto &[name, breaker] : _breakers)
     {
       names.push_back(name);
     }
@@ -261,17 +266,17 @@ public:
 
   void resetAll()
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto &[name, breaker] : breakers_)
+    std::lock_guard<std::mutex> lock(_mutex);
+    for (auto &[name, breaker] : _breakers)
     {
       breaker->reset();
     }
   }
 
 private:
-  mutable std::mutex mutex_;
-  std::unordered_map<std::string, std::unique_ptr<CircuitBreaker>> breakers_;
-  BreakerFactory factory_;
+  mutable std::mutex _mutex;
+  std::unordered_map<std::string, std::unique_ptr<CircuitBreaker>> _breakers;
+  BreakerFactory _factory;
 };
 
 } // namespace network

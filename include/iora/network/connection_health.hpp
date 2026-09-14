@@ -7,11 +7,18 @@
 
 #pragma once
 
-#include "transport_types.hpp"
+#include "iora/network/transport_types.hpp"
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace iora
 {
@@ -39,38 +46,38 @@ class ConnectionHealth
 {
 public:
   explicit ConnectionHealth(const HealthConfig &config = {})
-      : config_(config), lastActivity_(std::chrono::steady_clock::now()), consecutiveFailures_(0),
-        state_(ConnectionState::Healthy)
+      : _config(config), _lastActivity(std::chrono::steady_clock::now()), _consecutiveFailures(0),
+        _state(ConnectionState::Healthy)
   {
   }
 
   void recordActivity()
   {
-    lastActivity_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    _lastActivity.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
 
     // Reset failure count on successful activity
-    if (consecutiveFailures_.load(std::memory_order_relaxed) > 0)
+    if (_consecutiveFailures.load(std::memory_order_relaxed) > 0)
     {
-      consecutiveFailures_.store(0, std::memory_order_relaxed);
+      _consecutiveFailures.store(0, std::memory_order_relaxed);
       updateState();
     }
   }
 
   void recordFailure()
   {
-    consecutiveFailures_.fetch_add(1, std::memory_order_relaxed);
-    totalFailures_.fetch_add(1, std::memory_order_relaxed);
+    _consecutiveFailures.fetch_add(1, std::memory_order_relaxed);
+    _totalFailures.fetch_add(1, std::memory_order_relaxed);
     updateState();
   }
 
   void recordSuccess()
   {
-    totalSuccesses_.fetch_add(1, std::memory_order_relaxed);
+    _totalSuccesses.fetch_add(1, std::memory_order_relaxed);
     // Decrease consecutive failures on success
-    int current = consecutiveFailures_.load(std::memory_order_relaxed);
+    int current = _consecutiveFailures.load(std::memory_order_relaxed);
     if (current > 0)
     {
-      consecutiveFailures_.compare_exchange_weak(current, std::max(0, current - 1),
+      _consecutiveFailures.compare_exchange_weak(current, std::max(0, current - 1),
                                                  std::memory_order_relaxed);
       updateState();
     }
@@ -78,28 +85,28 @@ public:
 
   bool isHealthy() const
   {
-    return state_.load(std::memory_order_relaxed) <= ConnectionState::Warning;
+    return _state.load(std::memory_order_relaxed) <= ConnectionState::Warning;
   }
 
-  ConnectionState getState() const { return state_.load(std::memory_order_relaxed); }
+  ConnectionState getState() const { return _state.load(std::memory_order_relaxed); }
 
   bool needsHeartbeat() const
   {
-    if (!config_.enableHeartbeat)
+    if (!_config.enableHeartbeat)
       return false;
 
     auto now = std::chrono::steady_clock::now();
-    auto lastActivity = lastActivity_.load(std::memory_order_relaxed);
+    auto lastActivity = _lastActivity.load(std::memory_order_relaxed);
 
-    return (now - lastActivity) >= config_.heartbeatInterval;
+    return (now - lastActivity) >= _config.heartbeatInterval;
   }
 
   bool isTimedOut() const
   {
     auto now = std::chrono::steady_clock::now();
-    auto lastActivity = lastActivity_.load(std::memory_order_relaxed);
+    auto lastActivity = _lastActivity.load(std::memory_order_relaxed);
 
-    return (now - lastActivity) >= config_.timeoutThreshold;
+    return (now - lastActivity) >= _config.timeoutThreshold;
   }
 
   struct Stats
@@ -115,25 +122,25 @@ public:
   Stats getStats() const
   {
     auto now = std::chrono::steady_clock::now();
-    auto lastActivity = lastActivity_.load(std::memory_order_relaxed);
-    auto successes = totalSuccesses_.load(std::memory_order_relaxed);
-    auto failures = totalFailures_.load(std::memory_order_relaxed);
+    auto lastActivity = _lastActivity.load(std::memory_order_relaxed);
+    auto successes = _totalSuccesses.load(std::memory_order_relaxed);
+    auto failures = _totalFailures.load(std::memory_order_relaxed);
     auto total = successes + failures;
 
-    return {state_.load(std::memory_order_relaxed),
-            consecutiveFailures_.load(std::memory_order_relaxed),
+    return {_state.load(std::memory_order_relaxed),
+            _consecutiveFailures.load(std::memory_order_relaxed),
             successes,
             failures,
             std::chrono::duration_cast<std::chrono::milliseconds>(now - lastActivity),
             total > 0 ? static_cast<double>(successes) / total : 1.0};
   }
 
-  void updateConfig(const HealthConfig &config) { config_ = config; }
+  void updateConfig(const HealthConfig &config) { _config = config; }
 
 private:
   void updateState()
   {
-    int failures = consecutiveFailures_.load(std::memory_order_relaxed);
+    int failures = _consecutiveFailures.load(std::memory_order_relaxed);
     ConnectionState newState;
 
     if (failures == 0)
@@ -144,11 +151,11 @@ private:
     {
       newState = ConnectionState::Warning;
     }
-    else if (failures < config_.maxConsecutiveFailures)
+    else if (failures < _config.maxConsecutiveFailures)
     {
       newState = ConnectionState::Degraded;
     }
-    else if (failures == config_.maxConsecutiveFailures)
+    else if (failures == _config.maxConsecutiveFailures)
     {
       newState = ConnectionState::Critical;
     }
@@ -157,41 +164,41 @@ private:
       newState = ConnectionState::Unhealthy;
     }
 
-    state_.store(newState, std::memory_order_relaxed);
+    _state.store(newState, std::memory_order_relaxed);
   }
 
 private:
-  HealthConfig config_;
-  std::atomic<std::chrono::steady_clock::time_point> lastActivity_;
-  std::atomic<int> consecutiveFailures_;
-  std::atomic<std::uint64_t> totalSuccesses_{0};
-  std::atomic<std::uint64_t> totalFailures_{0};
-  std::atomic<ConnectionState> state_;
+  HealthConfig _config;
+  std::atomic<std::chrono::steady_clock::time_point> _lastActivity;
+  std::atomic<int> _consecutiveFailures;
+  std::atomic<std::uint64_t> _totalSuccesses{0};
+  std::atomic<std::uint64_t> _totalFailures{0};
+  std::atomic<ConnectionState> _state;
 };
 
 // Health monitor for managing multiple connections
 class HealthMonitor
 {
 public:
-  explicit HealthMonitor(const HealthConfig &config = {}) : config_(config) {}
+  explicit HealthMonitor(const HealthConfig &config = {}) : _config(config) {}
 
   void addConnection(SessionId id)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    connections_[id] = std::make_unique<ConnectionHealth>(config_);
+    std::lock_guard<std::mutex> lock(_mutex);
+    _connections[id] = std::make_unique<ConnectionHealth>(_config);
   }
 
   void removeConnection(SessionId id)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    connections_.erase(id);
+    std::lock_guard<std::mutex> lock(_mutex);
+    _connections.erase(id);
   }
 
   void recordActivity(SessionId id)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = connections_.find(id);
-    if (it != connections_.end())
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _connections.find(id);
+    if (it != _connections.end())
     {
       it->second->recordActivity();
     }
@@ -199,9 +206,9 @@ public:
 
   void recordFailure(SessionId id)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = connections_.find(id);
-    if (it != connections_.end())
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _connections.find(id);
+    if (it != _connections.end())
     {
       it->second->recordFailure();
     }
@@ -209,9 +216,9 @@ public:
 
   void recordSuccess(SessionId id)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = connections_.find(id);
-    if (it != connections_.end())
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto it = _connections.find(id);
+    if (it != _connections.end())
     {
       it->second->recordSuccess();
     }
@@ -220,9 +227,9 @@ public:
   std::vector<SessionId> getUnhealthyConnections() const
   {
     std::vector<SessionId> unhealthy;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(_mutex);
 
-    for (const auto &[id, health] : connections_)
+    for (const auto &[id, health] : _connections)
     {
       if (!health->isHealthy())
       {
@@ -236,9 +243,9 @@ public:
   std::vector<SessionId> getConnectionsNeedingHeartbeat() const
   {
     std::vector<SessionId> needHeartbeat;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(_mutex);
 
-    for (const auto &[id, health] : connections_)
+    for (const auto &[id, health] : _connections)
     {
       if (health->needsHeartbeat())
       {
@@ -262,15 +269,15 @@ public:
 
   OverallStats getOverallStats() const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(_mutex);
 
     OverallStats stats{};
-    stats.totalConnections = connections_.size();
+    stats.totalConnections = _connections.size();
 
     std::uint64_t totalSuccesses = 0;
     std::uint64_t totalFailures = 0;
 
-    for (const auto &[id, health] : connections_)
+    for (const auto &[id, health] : _connections)
     {
       auto connStats = health->getStats();
       totalSuccesses += connStats.totalSuccesses;
@@ -304,18 +311,18 @@ public:
 
   void updateConfig(const HealthConfig &config)
   {
-    config_ = config;
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto &[id, health] : connections_)
+    std::lock_guard<std::mutex> lock(_mutex);
+    _config = config;
+    for (auto &[id, health] : _connections)
     {
       health->updateConfig(config);
     }
   }
 
 private:
-  HealthConfig config_;
-  mutable std::mutex mutex_;
-  std::unordered_map<SessionId, std::unique_ptr<ConnectionHealth>> connections_;
+  HealthConfig _config;
+  mutable std::mutex _mutex;
+  std::unordered_map<SessionId, std::unique_ptr<ConnectionHealth>> _connections;
 };
 
 } // namespace network

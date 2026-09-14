@@ -228,6 +228,13 @@
         "network/websocket_server.hpp",
         "network/websocket_client.hpp"
       ]
+    },
+    "network/resiliency.md": {
+      "area": "network",
+      "headers": [
+        "network/circuit_breaker.hpp",
+        "network/connection_health.hpp"
+      ]
     }
   }
 }
