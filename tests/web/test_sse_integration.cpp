@@ -544,3 +544,68 @@ TEST_CASE("integration: WsChannel publish skips a closed real WS session (web-M7
   client->disconnect();
   server.stop();
 }
+
+// Tracker 2026-09-11-19 (T3): heartbeat-ON is the production SSE config. A client
+// disconnect must still fire onClose EXACTLY ONCE and prune. Exercised with TWO
+// close triggers on the same stream — the RDHUP-driven markClosed() and a later
+// manager.shutdown() close() — the exactly-once latch must count only one.
+// MUTATION: removing the latch makes shutdown's close() fire a second onClose.
+TEST_CASE("integration: heartbeat-ON disconnect fires onClose exactly once",
+          "[sse][integration][disconnect][heartbeat]")
+{
+  SseFixture fx(/*heartbeatMs=*/50); // heartbeat ON: the manager holds the stream
+  {
+    SseConn c;
+    REQUIRE(c.open(fx.port));
+    c.sendGet("/sse");
+    c.readUntil("\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120)); // >= 1 heartbeat tick
+    REQUIRE(fx.channel.subscriberCount() == 1);
+    REQUIRE(fx.manager.streamCount() == 1);
+    c.closeNow(); // client drops -> EPOLLRDHUP -> markClosed -> onClose #1
+  }
+  REQUIRE(waitFor([&] { return fx.onCloseCount.load() == 1; }, 2500));
+  // Second close trigger on the same stream; the exactly-once latch must hold.
+  fx.manager.shutdown(); // writes ':shutting down' + close() each live stream
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  REQUIRE(fx.onCloseCount.load() == 1); // exactly once across RDHUP-close + shutdown-close
+  fx.channel.publish("e", "x");
+  REQUIRE(fx.channel.subscriberCount() == 0); // pruned
+}
+
+// Tracker 2026-09-11-19 (T4): a disconnect while the SSE session has a BACKED-UP
+// write queue (wantWrite -> EPOLLOUT armed). The client FIN co-delivers
+// EPOLLRDHUP|EPOLLOUT; the RDHUP branch must close + return before the
+// EPOLLOUT/writePending path touches the freed session (the H2 use-after-free
+// guard). This EXERCISES the co-delivery path (a functional assertion cannot by
+// itself prove absence of a UAF — run under ASan for that); it asserts the
+// disconnect is detected exactly once and the subscriber is pruned with no hang.
+TEST_CASE("integration: disconnect with a backed-up write queue (RDHUP+EPOLLOUT)",
+          "[sse][integration][disconnect][pendingwrite]")
+{
+  SseFixture fx(/*heartbeatMs=*/0);
+  {
+    SseConn c;
+    REQUIRE(c.open(fx.port));
+    c.sendGet("/sse");
+    c.readUntil("\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    REQUIRE(fx.channel.subscriberCount() == 1);
+    // Back up the server write queue: publish more than the socket buffers can
+    // hold while the client never reads, so the session has pending writes
+    // (~1.2 MB, well under the default maxWriteQueue so no backpressure close).
+    const std::string big(4096, 'x');
+    for (int i = 0; i < 300; ++i)
+    {
+      fx.channel.publish("e", big);
+    }
+    // The session must still be subscribed here: a premature backpressure/write-
+    // error close before the FIN would drop the subscriber and make the assertion
+    // below pass for the WRONG reason (cpp17-#2/#3). Fail loudly if that happens.
+    REQUIRE(fx.channel.subscriberCount() == 1);
+    c.closeNow(); // FIN while writes are pending -> RDHUP (+EPOLLOUT) co-delivery
+  }
+  REQUIRE(waitFor([&] { return fx.onCloseCount.load() == 1; }, 3000));
+  fx.channel.publish("e", "x");
+  REQUIRE(fx.channel.subscriberCount() == 0); // pruned, no crash/hang
+}

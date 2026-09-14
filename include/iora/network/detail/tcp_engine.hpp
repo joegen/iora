@@ -1705,7 +1705,10 @@ private:
       }
       bumpSess();
 
-      std::uint32_t ev = EPOLLIN;
+      // EPOLLRDHUP armed at accept time for uniform peer-half-close detection
+      // (defense-in-depth; updateInterest is the load-bearing site since modEpoll
+      // replaces the full mask — tracker 2026-09-11-19).
+      std::uint32_t ev = EPOLLIN | EPOLLRDHUP;
       if (_config.useEdgeTriggered)
       {
         ev |= EPOLLET;
@@ -2099,7 +2102,10 @@ private:
     }
     bumpSess();
 
-    std::uint32_t ev = EPOLLIN | EPOLLOUT;
+    // EPOLLRDHUP armed for uniform peer-half-close detection (defense-in-depth;
+    // updateInterest is the load-bearing site since modEpoll replaces the full
+    // mask — tracker 2026-09-11-19).
+    std::uint32_t ev = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
     if (_config.useEdgeTriggered)
     {
       ev |= EPOLLET;
@@ -2192,7 +2198,13 @@ private:
                    << ", connectPending=" << s->connectPending
                    << ", tlsMode=" << static_cast<int>(s->tlsMode));
 
-    if (events & EPOLLOUT)
+    // Connect-completion SO_ERROR probe (tracker 2026-09-11-19 steps-4-8 cpp17-#1):
+    // gate on connectPending so an ESTABLISHED session's async socket error (e.g.
+    // a peer RST while a write is pending) is NOT mislabeled as a connect failure.
+    // An established session's error surfaces via EPOLLHUP|EPOLLERR (-> PeerClosed)
+    // or the write/read paths (-> Socket/PeerClosed); only a still-connecting
+    // session's SO_ERROR is a genuine TransportError::Connect.
+    if ((events & EPOLLOUT) && s->connectPending)
     {
       IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT detected for sid=" << s->id
                      << ", checking for connection errors");
@@ -2329,6 +2341,21 @@ private:
         return;
       }
       s = it->second.get();
+    }
+    // Peer half-close (FIN) — the sole disconnect signal for a read-DISABLED
+    // (write-only, e.g. SSE) session, whose EPOLLIN is withheld so the EOF-read
+    // path above never runs for it (tracker 2026-09-11-19). This branch MUST come
+    // AFTER the EPOLLIN drain + re-lookup: a read-ENABLED peer FIN co-delivers
+    // EPOLLIN, so readAvail fully drains the inbound bytes and closes on recv()==0
+    // (freeing s -> the re-lookup returns above) BEFORE this branch is reached —
+    // so no inbound data is truncated, and this branch is effectively
+    // read-disabled-only. It MUST return immediately after closeNow: closeNow
+    // erases + frees the Session, so falling through to the EPOLLOUT/writePending
+    // block below would dereference freed memory (use-after-free).
+    if (events & EPOLLRDHUP)
+    {
+      closeNow(s, TransportError::PeerClosed, "Connection closed by peer (EPOLLRDHUP)", 0);
+      return;
     }
     if (events & EPOLLOUT)
     {
@@ -2636,6 +2663,14 @@ private:
     // ReadMode::Disabled session from re-arming read events. EPOLLOUT (needWrite)
     // and the edge-triggered flag below are unaffected.
     std::uint32_t ev = 0;
+    // Peer half-close (FIN) detection is a connection-lifecycle event, armed
+    // INDEPENDENTLY of the C5 application-data read-gate below (tracker
+    // 2026-09-11-19). A read-disabled (write-only, e.g. SSE) session withholds
+    // EPOLLIN, so EPOLLRDHUP is its ONLY peer-FIN signal; without it a graceful
+    // client close is invisible to epoll and the disconnect observer never fires.
+    // Harmless for read-enabled sessions: their FIN co-delivers EPOLLIN and is
+    // drained+closed via readAvail's EOF path before the RDHUP branch is reached.
+    ev |= EPOLLRDHUP;
     // C5 read-gate (braced per R-FMT-5, CF-L4). CF-M2: during the TLS handshake
     // force EPOLLIN regardless of readEnabled — handshake reads
     // (SSL_ERROR_WANT_READ) are protocol-level, not application data, so

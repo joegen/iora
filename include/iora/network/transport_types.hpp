@@ -178,6 +178,16 @@ enum class ReadMode
 {
   Async,
   Sync,
+  /// \brief Write-only: suppress inbound-data delivery on this session.
+  /// CONTRACT (DR-1, tracker 2026-09-11-19, human sign-off 2026-09-14): the
+  /// application expects no further inbound data on this session; a peer close
+  /// (a graceful FIN half-close) while reads are disabled TERMINATES the session
+  /// (onClose PeerClosed) and DISCARDS any unread buffered inbound bytes rather
+  /// than preserving them for a later re-enable. Peer-disconnect detection for a
+  /// read-disabled session therefore rides EPOLLRDHUP (the TCP engine arms it
+  /// independently of EPOLLIN, which is withheld here), not the EPOLLIN/EOF read
+  /// path. The SSE write-only stream (sse_stream.hpp upgradeToSse) is the sole
+  /// user. See Transport::setReadMode.
   Disabled
 };
 

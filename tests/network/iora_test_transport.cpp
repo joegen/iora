@@ -40,6 +40,20 @@ static bool waitFor(std::function<bool()> pred, std::chrono::milliseconds timeou
   return true;
 }
 
+// Helper: true iff the TLS test cert exists; WARNs and returns false otherwise so
+// a TLS test can skip gracefully when certs are unavailable.
+static bool tlsCertsAvailable(const std::string &certFile)
+{
+  FILE *f = std::fopen(certFile.c_str(), "r");
+  if (!f)
+  {
+    WARN("TLS certs not available at " << certFile << " — skipping TLS test");
+    return false;
+  }
+  std::fclose(f);
+  return true;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // task-6.1: Construction and lifecycle
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1649,16 +1663,7 @@ TEST_CASE("TLS connection via Transport API", "[transport][tls]")
   std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
 
-  // Check if TLS certs are available
-  {
-    FILE *f = std::fopen(certFile.c_str(), "r");
-    if (!f)
-    {
-      WARN("TLS certs not available at " << certFile << " — skipping TLS test");
-      return;
-    }
-    std::fclose(f);
-  }
+  if (!tlsCertsAvailable(certFile)) { return; }
 
   auto port = testnet::getFreePortTCP();
 
@@ -1734,11 +1739,7 @@ TEST_CASE("TLS client enforces a TLS 1.2 floor (rejects a TLS 1.1-only server)",
 {
   std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
-  {
-    FILE *f = std::fopen(certFile.c_str(), "r");
-    if (!f) { WARN("TLS certs not available — skipping client-floor test"); return; }
-    std::fclose(f);
-  }
+  if (!tlsCertsAvailable(certFile)) { return; }
 
   auto port = testnet::getFreePortTCP();
 
@@ -2079,4 +2080,233 @@ TEST_CASE("forHighThroughput preset values are correct", "[transport][batching][
   REQUIRE(t->start().isOk());
   REQUIRE(t->getProtocol() == Protocol::TCP);
   t->stop();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Tracker 2026-09-11-19: peer half-close (FIN) detection on a read-DISABLED
+// session (SSE disconnect-detection regression / EPOLLRDHUP gap).
+//
+// A read-disabled (write-only, e.g. SSE) session withholds EPOLLIN, so a graceful
+// client FIN is detectable ONLY via EPOLLRDHUP. MUTATION-VERIFIED: without the fix
+// (updateInterest arming EPOLLRDHUP + the RDHUP-close branch), onClose never fires
+// and the waitFor below times out. DR-1 contract (transport_types.hpp ReadMode::
+// Disabled): a peer close while reads are disabled terminates the session with
+// TransportError::PeerClosed.
+// ══════════════════════════════════════════════════════════════════════════════
+static void readDisabledPeerCloseFiresOnClose(bool edgeTriggered)
+{
+  auto port = testnet::getFreePortTCP();
+  TransportConfig serverCfg;
+  serverCfg.useEdgeTriggered = edgeTriggered;
+  auto server = Transport::tcp(std::move(serverCfg));
+  auto client = Transport::tcp();
+
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> clientConnected{false};
+  std::atomic<int> closeCount{0};
+  std::atomic<int> closeCode{-1};
+
+  server->onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  server->onClose([&](SessionId, const TransportErrorInfo &info)
+  {
+    closeCode = static_cast<int>(info.code);
+    closeCount++;
+  });
+  client->onConnect([&](SessionId, const TransportAddress &) { clientConnected = true; });
+
+  REQUIRE(server->start().isOk());
+  REQUIRE(server->addListener("127.0.0.1", port).isOk());
+  REQUIRE(client->start().isOk());
+  auto conn = client->connect("127.0.0.1", port);
+  REQUIRE(conn.isOk());
+  REQUIRE(waitFor([&] { return serverSid.load() != 0 && clientConnected.load(); }));
+
+  // Make the server session write-only (SSE-style): EPOLLIN is now withheld.
+  REQUIRE(server->setReadMode(serverSid.load(), ReadMode::Disabled));
+  std::this_thread::sleep_for(100ms);
+
+  // Client closes gracefully (FIN half-close). With reads disabled, EPOLLRDHUP is
+  // the server's ONLY disconnect signal.
+  client->close(conn.value());
+
+  REQUIRE(waitFor([&] { return closeCount.load() > 0; }, 3000ms));
+  REQUIRE(closeCode.load() == static_cast<int>(TransportError::PeerClosed));
+
+  client->stop();
+  server->stop();
+}
+
+TEST_CASE("read-disabled session detects peer FIN via EPOLLRDHUP (edge-triggered)",
+          "[transport][readmode][rdhup]")
+{
+  readDisabledPeerCloseFiresOnClose(/*edgeTriggered=*/true);
+}
+
+TEST_CASE("read-disabled session detects peer FIN via EPOLLRDHUP (level-triggered)",
+          "[transport][readmode][rdhup]")
+{
+  readDisabledPeerCloseFiresOnClose(/*edgeTriggered=*/false);
+}
+
+// TLS variant: the RDHUP mechanism is a TCP-layer event and fires regardless of
+// TLS. A read-disabled TLS session (client sends close_notify + TCP FIN) is
+// detected via EPOLLRDHUP just like plain TCP. (Covers the TLS-SSE mechanism at
+// the transport layer, tracker 2026-09-11-19 test T1-TLS.)
+TEST_CASE("read-disabled TLS session detects peer FIN via EPOLLRDHUP",
+          "[transport][readmode][rdhup][tls]")
+{
+  std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
+  std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
+  if (!tlsCertsAvailable(certFile)) { return; }
+
+  auto port = testnet::getFreePortTCP();
+  TransportConfig serverCfg;
+  serverCfg.serverTls.enabled = true;
+  serverCfg.serverTls.defaultMode = TlsMode::Server;
+  serverCfg.serverTls.certFile = certFile;
+  serverCfg.serverTls.keyFile = keyFile;
+  auto server = Transport::tcp(std::move(serverCfg));
+
+  TransportConfig clientCfg;
+  clientCfg.clientTls.enabled = true;
+  clientCfg.clientTls.defaultMode = TlsMode::Client;
+  clientCfg.clientTls.verifyPeer = false; // self-signed
+  auto client = Transport::tcp(std::move(clientCfg));
+
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<bool> connected{false};
+  std::atomic<int> closeCount{0};
+  std::atomic<int> closeCode{-1};
+
+  server->onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  server->onClose([&](SessionId, const TransportErrorInfo &info)
+  {
+    closeCode = static_cast<int>(info.code);
+    closeCount++;
+  });
+  client->onConnect([&](SessionId, const TransportAddress &) { connected = true; });
+
+  REQUIRE(server->start().isOk());
+  REQUIRE(server->addListener("127.0.0.1", port, TlsMode::Server).isOk());
+  REQUIRE(client->start().isOk());
+  auto conn = client->connect("127.0.0.1", port, TlsMode::Client);
+  REQUIRE(conn.isOk());
+  // Wait for the client-side handshake to complete before disabling reads, so the
+  // read-gate's TLS-handshake EPOLLIN exemption no longer applies.
+  REQUIRE(waitFor([&] { return serverSid.load() != 0 && connected.load(); }, 5000ms));
+
+  REQUIRE(server->setReadMode(serverSid.load(), ReadMode::Disabled));
+  std::this_thread::sleep_for(100ms);
+
+  client->close(conn.value()); // close_notify + TCP FIN
+
+  REQUIRE(waitFor([&] { return closeCount.load() > 0; }, 3000ms));
+  REQUIRE(closeCode.load() == static_cast<int>(TransportError::PeerClosed));
+
+  client->stop();
+  server->stop();
+}
+
+// Forward-regression guard (tracker 2026-09-11-19 T2): arming EPOLLRDHUP for
+// read-ENABLED sessions too must NOT truncate inbound data when a payload and the
+// peer FIN co-arrive in one epoll cycle. readAvail drains to recv()==0 EOF and
+// closes BEFORE the RDHUP branch is reachable, so the payload survives. NOTE: this
+// passes on BOTH patched and unpatched code (it exercises the pre-existing EOF
+// path, not the new RDHUP branch); it guards a FUTURE reordering, and is not part
+// of the mutation-verified fix gate.
+TEST_CASE("read-enabled session drains inbound data before closing on peer FIN",
+          "[transport][readmode][rdhup][drain]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+
+  std::atomic<int> closeCount{0};
+  std::string serverReceived;
+  std::mutex mtx;
+  server->onData([&](SessionId, iora::core::BufferView data, std::chrono::steady_clock::time_point)
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    serverReceived.append(reinterpret_cast<const char *>(data.data()), data.size());
+  });
+  server->onClose([&](SessionId, const TransportErrorInfo &) { closeCount++; });
+
+  REQUIRE(server->start().isOk());
+  REQUIRE(server->addListener("127.0.0.1", port).isOk());
+
+  // Raw client: connect, write, then close IMMEDIATELY with no intervening server
+  // read, so the payload and the FIN co-arrive in one epoll cycle.
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(fd >= 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  REQUIRE(::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  const std::string payload = "the-full-payload-must-survive-the-coincident-FIN";
+  REQUIRE(::send(fd, payload.data(), payload.size(), 0) == static_cast<ssize_t>(payload.size()));
+  ::close(fd); // graceful FIN immediately after the write
+
+  REQUIRE(waitFor([&] { return closeCount.load() > 0; }, 3000ms));
+  {
+    std::lock_guard<std::mutex> lk(mtx);
+    REQUIRE(serverReceived == payload); // not truncated by the co-delivered FIN
+  }
+  server->stop();
+}
+
+// Tracker 2026-09-11-19 steps-4-8 cpp17-#1: an ESTABLISHED session's async socket
+// error (peer RST) must NOT be mislabeled TransportError::Connect. The top-of-
+// handler EPOLLOUT SO_ERROR probe is now gated on connectPending; an established
+// session with a pending write (EPOLLOUT armed) that receives an RST is reported
+// as a peer/socket close, not a connect failure. MUTATION-VERIFIED: without the
+// connectPending gate the close code is TransportError::Connect.
+TEST_CASE("established session peer RST is not mislabeled as a connect error",
+          "[transport][rst][closecode]")
+{
+  auto port = testnet::getFreePortTCP();
+  auto server = Transport::tcp();
+  std::atomic<SessionId> serverSid{0};
+  std::atomic<int> closeCount{0};
+  std::atomic<int> closeCode{-1};
+  server->onAccept([&](SessionId s, const TransportAddress &) { serverSid = s; });
+  server->onClose([&](SessionId, const TransportErrorInfo &info)
+  {
+    closeCode = static_cast<int>(info.code);
+    closeCount++;
+  });
+
+  REQUIRE(server->start().isOk());
+  REQUIRE(server->addListener("127.0.0.1", port).isOk());
+
+  // Raw client so we can force an RST via SO_LINGER{1,0} (abortive close).
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  REQUIRE(fd >= 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  REQUIRE(::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  REQUIRE(waitFor([&] { return serverSid.load() != 0; }));
+
+  // Arm EPOLLOUT on the ESTABLISHED server session: fill its write queue by
+  // sending far more than the socket buffers hold while the client never reads.
+  const std::string big(65536, 'x');
+  for (int i = 0; i < 64; ++i)
+  {
+    server->send(serverSid.load(), big.data(), big.size());
+  }
+  std::this_thread::sleep_for(150ms);
+
+  // Force an RST from the client.
+  struct linger lg
+  {
+    1, 0
+  };
+  ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+  ::close(fd);
+
+  REQUIRE(waitFor([&] { return closeCount.load() > 0; }, 3000ms));
+  // The established session's error must be a peer/socket close, never Connect.
+  REQUIRE(closeCode.load() != static_cast<int>(TransportError::Connect));
+  server->stop();
 }

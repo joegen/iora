@@ -142,6 +142,8 @@ public:
                                                  kFallbackSyncTimeout);
 
   // ===== Read Modes =====
+  // ReadMode::Disabled carries a write-only disconnect-detection contract
+  // (DR-1) documented at its enumerator in transport_types.hpp.
   virtual bool setReadMode(SessionId sid, ReadMode mode) = 0;
   virtual bool getReadMode(SessionId sid, ReadMode &mode) const = 0;
 
