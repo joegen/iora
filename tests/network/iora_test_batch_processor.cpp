@@ -552,3 +552,169 @@ TEST_CASE("EventBatchProcessor concurrency stress test", "[batch][stress][concur
     }
   }
 }
+
+TEST_CASE("EventBatchProcessor setFixedBatchSize caps the epoll batch", "[batch][fixed]")
+{
+  // Regression for the setFixedBatchSize dead-effect: getCurrentBatchSize() must
+  // honor the pinned size so it reaches epoll_wait. Pre-fix, getCurrentBatchSize()
+  // returned config_.maxBatchSize whenever adaptive sizing was off, so the pin was
+  // inert and a single drain returned all 4 ready fds instead of the pinned 2.
+  EpollHelper epoll;
+  std::vector<std::unique_ptr<EventFdHelper>> fds;
+  constexpr int numFds = 4;
+  for (int i = 0; i < numFds; ++i)
+  {
+    auto fd = std::make_unique<EventFdHelper>();
+    epoll.addFd(fd->fd());
+    fds.push_back(std::move(fd));
+  }
+
+  BatchProcessingConfig config;
+  config.maxBatchSize = 8;      // buffer sized for 8
+  config.maxBatchDelay = 50ms;
+  EventBatchProcessor processor(config);
+  processor.setFixedBatchSize(2); // pin BELOW both maxBatchSize and the ready count
+
+  // Signal all 4 eventfds (level-triggered → all ready at once).
+  for (auto &fd : fds)
+  {
+    fd->signal();
+  }
+
+  std::vector<int> received;
+  auto generalHandler = [&received](int fd, uint32_t) { received.push_back(fd); };
+  auto specialHandler = [](int, uint32_t) { return false; };
+
+  // Single drain: with the pin honored, epoll_wait returns AT MOST the fixed 2,
+  // even though 4 fds are ready and maxBatchSize is 8.
+  processor.processBatch(epoll.fd(), generalHandler, specialHandler);
+
+  INFO("received " << received.size() << " events (fixed batch size = 2, 4 fds ready)");
+  REQUIRE_FALSE(received.empty()); // fds are ready — not a timeout
+  REQUIRE(received.size() <= 2);   // the pin is honored (pre-fix: 4)
+}
+
+TEST_CASE("EventBatchProcessor getStats is race-free under concurrent processBatch",
+          "[batch][concurrent][stats]")
+{
+  // Regression for the getStats() data race: the transport engines' public
+  // getStats() overrides forward to EventBatchProcessor::getStats() from arbitrary
+  // threads while the I/O thread mutates stats_ in processBatch. statsMutex_ makes
+  // that read/write race-free. This test drives the same access pattern (owner
+  // thread runs processBatch; a reader thread hammers getStats) so TSAN flags the
+  // race pre-fix and passes post-fix; without TSAN it asserts forward progress and
+  // no crash.
+  EpollHelper epoll;
+  EventFdHelper eventFd;
+  epoll.addFd(eventFd.fd());
+
+  BatchProcessingConfig config;
+  config.maxBatchSize = 8;
+  config.maxBatchDelay = 5ms;
+  config.enableAdaptiveSizing = true; // exercises adjustBatchSize's stats_ writes too
+  EventBatchProcessor processor(config);
+
+  std::atomic<bool> stop{false};
+  auto generalHandler = [](int, uint32_t) {};
+  auto specialHandler = [](int, uint32_t) { return false; };
+
+  std::thread owner(
+    [&]()
+    {
+      while (!stop.load(std::memory_order_relaxed))
+      {
+        eventFd.signal();
+        try
+        {
+          processor.processBatch(epoll.fd(), generalHandler, specialHandler);
+        }
+        catch (...)
+        {
+        }
+      }
+    });
+
+  std::atomic<std::uint64_t> reads{0};
+  std::thread reader(
+    [&]()
+    {
+      while (!stop.load(std::memory_order_relaxed))
+      {
+        auto s = processor.getStats();
+        (void)s.totalBatches;
+        (void)s.throughputEventsPerSec;
+        reads.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+
+  std::this_thread::sleep_for(200ms);
+  stop.store(true, std::memory_order_relaxed);
+  owner.join();
+  reader.join();
+
+  REQUIRE(reads.load() > 0);                    // reader made progress
+  REQUIRE(processor.getStats().totalBatches > 0); // owner made progress
+}
+
+TEST_CASE("EventBatchProcessor degenerate batch sizes are safe", "[batch][degenerate]")
+{
+  // Regressions for the getCurrentBatchSize() simplification:
+  //  - maxBatchSize==0 sizes events_ to 0 but currentBatchSize_ is force-bumped to
+  //    1; without the maxEvents clamp, epoll_wait would write past the empty buffer
+  //    (OOB / heap overflow — caught by ASAN pre-fix).
+  //  - updateConfig() to a tiny maxBatchSize must not leave currentBatchSize_ at 0
+  //    (which would wedge the drain to a permanent no-op).
+  EpollHelper epoll;
+  EventFdHelper eventFd;
+  epoll.addFd(eventFd.fd());
+  auto generalHandler = [](int, uint32_t) {};
+  auto specialHandler = [](int, uint32_t) { return false; };
+
+  SECTION("maxBatchSize == 0 does not overflow the empty event buffer")
+  {
+    BatchProcessingConfig config;
+    config.maxBatchSize = 0; // events_ sized to 0; currentBatchSize_ bumped to 1
+    config.maxBatchDelay = 5ms;
+    config.enableAdaptiveSizing = false;
+    EventBatchProcessor processor(config);
+    eventFd.signal();
+    // Must be a safe no-op (early return on empty buffer), never an OOB epoll_wait
+    // write and never an EINVAL throw.
+    REQUIRE_NOTHROW(processor.processBatch(epoll.fd(), generalHandler, specialHandler));
+  }
+
+  SECTION("updateConfig to maxBatchSize == 1 still drains (no wedge)")
+  {
+    BatchProcessingConfig config;
+    config.maxBatchSize = 8;
+    config.enableAdaptiveSizing = true;
+    EventBatchProcessor processor(config);
+
+    BatchProcessingConfig tiny;
+    tiny.maxBatchSize = 1;       // adaptive on → maxBatchSize/2 == 0 without the floor
+    tiny.maxBatchDelay = 50ms;
+    tiny.enableAdaptiveSizing = true;
+    processor.updateConfig(tiny);
+
+    std::vector<int> received;
+    auto rec = [&received](int fd, uint32_t) { received.push_back(fd); };
+    eventFd.signal();
+    processor.processBatch(epoll.fd(), rec, specialHandler);
+    REQUIRE(received.size() == 1); // drains one; 0 (wedged) without the ==0->1 floor
+  }
+
+  SECTION("setFixedBatchSize(0) is floored to 1, not wedged")
+  {
+    BatchProcessingConfig config;
+    config.maxBatchSize = 8;
+    config.maxBatchDelay = 50ms;
+    EventBatchProcessor processor(config);
+    processor.setFixedBatchSize(0); // floored to 1
+
+    std::vector<int> received;
+    auto rec = [&received](int fd, uint32_t) { received.push_back(fd); };
+    eventFd.signal();
+    processor.processBatch(epoll.fd(), rec, specialHandler);
+    REQUIRE(received.size() == 1); // drains one; 0 (wedged) without the floor
+  }
+}

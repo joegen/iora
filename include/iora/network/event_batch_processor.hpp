@@ -6,13 +6,15 @@
 
 #pragma once
 
-#include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <system_error>
+#include <utility>
 #include <sys/epoll.h>
 #include <vector>
 
@@ -71,12 +73,21 @@ public:
   {
     auto batchStart = std::chrono::high_resolution_clock::now();
 
-    // Determine batch size (adaptive or fixed)
-    std::size_t currentBatchSize = getCurrentBatchSize();
+    // Determine batch size (adaptive or fixed), clamped to the actual buffer
+    // capacity. currentBatchSize_ can exceed events_.size() on a degenerate
+    // config: maxBatchSize==0 sizes events_ to 0 yet the ctor force-bumps
+    // currentBatchSize_ to 1. Passing a maxevents larger than the buffer would let
+    // epoll_wait write past it (heap overflow / EFAULT); a maxevents of 0 is EINVAL.
+    // Clamp, and skip the drain entirely when the buffer is empty (safe no-op).
+    const int maxEvents = static_cast<int>(std::min(getCurrentBatchSize(), events_.size()));
+    if (maxEvents <= 0)
+    {
+      return;
+    }
 
     // Wait for events with timeout (round up to at least 1ms to avoid busy-spin)
     int timeout = std::max(1, static_cast<int>((config_.maxBatchDelay.count() + 999) / 1000));
-    int n = ::epoll_wait(epollFd, events_.data(), static_cast<int>(currentBatchSize), timeout);
+    int n = ::epoll_wait(epollFd, events_.data(), maxEvents, timeout);
 
     if (n < 0)
     {
@@ -160,9 +171,18 @@ public:
     processBatch(epollFd, generalHandler, specialHandler, onBatchComplete);
   }
 
+  // Thread-safe snapshot: stats_ is mutated by the owning I/O thread inside
+  // processBatch (updateStats/adjustBatchSize), but getStats() is reachable from
+  // arbitrary caller threads (the transport engines' public getStats() overrides
+  // forward here for off-thread monitoring). Copy stats_ under statsMutex_, then
+  // compute the derived fields on the local copy outside the lock.
   BatchProcessingStats getStats() const
   {
-    auto stats = stats_;
+    BatchProcessingStats stats;
+    {
+      std::lock_guard<std::mutex> lock(statsMutex_);
+      stats = stats_;
+    }
 
     if (stats.totalBatches > 0)
     {
@@ -179,12 +199,18 @@ public:
     return stats;
   }
 
+  // Owner-thread-only (writes the unguarded lastAdjustment_). The stats_ reset is
+  // locked so it cannot race a concurrent getStats() reader.
   void resetStats()
   {
-    stats_ = {};
+    {
+      std::lock_guard<std::mutex> lock(statsMutex_);
+      stats_ = {};
+    }
     lastAdjustment_ = std::chrono::steady_clock::now();
   }
 
+  // Owner-thread-only (rewrites config_/currentBatchSize_/events_). NOT cross-thread-safe.
   void updateConfig(const BatchProcessingConfig &config)
   {
     config_ = config;
@@ -199,30 +225,45 @@ public:
     {
       currentBatchSize_ = config_.maxBatchSize;
     }
+    // Mirror the ctor's floor: never leave currentBatchSize_ at 0 (maxBatchSize==0,
+    // or ==1 with adaptive on), which would wedge the drain to a permanent no-op.
+    if (currentBatchSize_ == 0)
+    {
+      currentBatchSize_ = 1;
+    }
   }
 
+  // Owner-thread-only (reads config_). Unlike getStats() this is NOT cross-thread-safe:
+  // do not poll it from a monitoring thread while updateConfig()/setFixedBatchSize() may run.
   BatchProcessingConfig getConfig() const { return config_; }
 
-  // Force a specific batch size for testing
+  // Force a specific batch size for testing. Owner-thread-only. Floors to 1 so a
+  // setFixedBatchSize(0) — or any size with maxBatchSize==0 — never wedges the drain.
   void setFixedBatchSize(std::size_t size)
   {
     config_.enableAdaptiveSizing = false;
     currentBatchSize_ = std::min(size, config_.maxBatchSize);
+    if (currentBatchSize_ == 0)
+    {
+      currentBatchSize_ = 1;
+    }
   }
 
 private:
   std::size_t getCurrentBatchSize() const
   {
-    if (!config_.enableAdaptiveSizing)
-    {
-      return config_.maxBatchSize;
-    }
-
+    // currentBatchSize_ tracks the effective bound in ALL modes: the adaptive
+    // controller updates it when enableAdaptiveSizing is on; the constructor and
+    // updateConfig() seed it to maxBatchSize when adaptive is off; and
+    // setFixedBatchSize() pins it. Returning it unconditionally is what makes the
+    // setFixedBatchSize() pin actually reach epoll_wait (this previously returned
+    // config_.maxBatchSize whenever adaptive sizing was off, so the pin was inert).
     return currentBatchSize_;
   }
 
   void updateStats(int eventCount, std::chrono::microseconds processingTime)
   {
+    std::lock_guard<std::mutex> lock(statsMutex_);
     stats_.totalBatches++;
     stats_.totalEvents += eventCount;
     stats_.totalBatchTime += processingTime;
@@ -273,18 +314,23 @@ private:
       shouldDecrease = true;
     }
 
+    // 25% step, at least 1 (shared by the grow and shrink branches).
+    const std::size_t step = std::max<std::size_t>(1, currentBatchSize_ / 4);
+    bool adjusted = false;
     if (shouldIncrease && currentBatchSize_ < config_.maxBatchSize)
     {
-      // Increase by 25% or at least 1
-      std::size_t increase = std::max(1UL, currentBatchSize_ / 4);
-      currentBatchSize_ = std::min(config_.maxBatchSize, currentBatchSize_ + increase);
-      stats_.adaptiveAdjustments++;
+      currentBatchSize_ = std::min(config_.maxBatchSize, currentBatchSize_ + step);
+      adjusted = true;
     }
     else if (shouldDecrease && currentBatchSize_ > 1)
     {
-      // Decrease by 25% but at least keep 1
-      std::size_t decrease = std::max(1UL, currentBatchSize_ / 4);
-      currentBatchSize_ = std::max(1UL, currentBatchSize_ - decrease);
+      // Floor at 1 on the shrink side.
+      currentBatchSize_ = std::max<std::size_t>(1, currentBatchSize_ - step);
+      adjusted = true;
+    }
+    if (adjusted)
+    {
+      std::lock_guard<std::mutex> lock(statsMutex_);
       stats_.adaptiveAdjustments++;
     }
   }
@@ -293,6 +339,16 @@ private:
   BatchProcessingConfig config_;
   std::vector<epoll_event> events_;
   BatchProcessingStats stats_;
+  // Guards stats_ ONLY. stats_ is written by the owning I/O thread (updateStats /
+  // adjustBatchSize) and read by getStats(), which the transport engines forward
+  // from arbitrary monitoring threads — so getStats() is the ONE cross-thread-safe
+  // method. Every OTHER method is OWNER-THREAD-ONLY, including resetStats() (it also
+  // writes the unguarded lastAdjustment_) and updateConfig()/setFixedBatchSize()
+  // (they mutate config_/currentBatchSize_/events_). Those members — config_,
+  // currentBatchSize_, events_, lastAdjustment_ — are owner-thread-only and MUST NOT
+  // be touched from another thread while the I/O loop runs. resetStats() still locks
+  // statsMutex_ for its stats_ reset so that reset cannot race a concurrent getStats().
+  mutable std::mutex statsMutex_;
 
   // Adaptive sizing state
   std::size_t currentBatchSize_{0};

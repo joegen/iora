@@ -537,6 +537,8 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_tcp_engine_teardown_race
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race
+    iora_test_batch_processor
+
     iora_test_name_resolver
     iora_test_tcp_engine_resolve
     iora_test_udp_engine_resolve
