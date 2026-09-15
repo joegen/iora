@@ -200,6 +200,21 @@ private:
     }
   };
 
+  /// \brief Pack (isTcp, sid) into one 64-bit value for PendingQuery::sentSession.
+  ///
+  /// Stored in a std::atomic<uint64_t> (lock-free -- no libatomic) so the (sid,isTcp)
+  /// pair is never read torn during a UDP->TCP fallback: a torn pair could false-match a
+  /// session close and spuriously fail a live query. SessionIds are minted from a
+  /// monotonic counter starting at 1 (udp/tcp _nextSessionId) and never approach 2^63, so
+  /// the top bit safely carries the protocol flag. Packed value 0 == never sent (a real
+  /// session sid is always >= 1, so a never-sent query never matches a real close).
+  static constexpr std::uint64_t SENT_TCP_BIT = 1ULL << 63;
+  static std::uint64_t packSentSession(SessionId sid, bool isTcp)
+  {
+    assert(sid < SENT_TCP_BIT && "SessionId must not use bit 63 (packed protocol flag)");
+    return (isTcp ? SENT_TCP_BIT : 0ULL) | static_cast<std::uint64_t>(sid);
+  }
+
   /// \brief Pending query information
   ///
   /// THREAD SAFETY: This structure is accessed from multiple threads:
@@ -216,16 +231,24 @@ private:
     const std::uint16_t port;
     const std::vector<std::uint8_t> queryData;
 
-    // Mutable but single-writer fields (only modified by creating thread)
+    // Mutable, single-writer fields (set once by the creating thread before
+    // registration; not modified afterward).
     std::promise<DnsResult> promise;
     QueryCallback callback;
     DnsTransportMode transportMode;
+    // tcpFallback: set true from the I/O thread (processResponse) under
+    // _queriesMutex when a truncated UDP answer is retried over TCP; read under
+    // _queriesMutex. NOT single-writer despite the group heading above.
     bool tcpFallback;
 
     // Thread-safe concurrent fields - accessed from multiple threads
     std::atomic<std::chrono::steady_clock::time_point> startTime;
     std::atomic<int> retryCount;
     std::atomic<std::uint64_t> activeTimerId{0}; // Currently scheduled retry timer (0 = none)
+    // The session this query is currently bound to; written at each (re)send,
+    // read by handleClose M-1. Packed atomic uint64 (see packSentSession) so the
+    // (sid,isTcp) pair is never read torn; lock-free (no libatomic). 0 == never sent.
+    std::atomic<std::uint64_t> sentSession{0};
 
     PendingQuery(std::uint16_t id, std::chrono::milliseconds to, const std::string &srv,
                  std::uint16_t prt, std::vector<std::uint8_t> data)
@@ -241,6 +264,36 @@ private:
 
   /// \brief Send query using TCP transport
   void sendTcpQuery(std::shared_ptr<PendingQuery> query);
+
+  /// \brief L-3 (tracker 2026-09-11-7): a cached session's send() failed because the
+  /// engine reaped it without an onClose reaching handleClose. Evict the stale
+  /// (isTcp,failedSid) mapping and reconnect, buffering \p query for handleConnect
+  /// (rebinding its sentSession), instead of throwing. Runs on the caller/timer thread.
+  /// Takes only _sessionsMutex (never _queriesMutex -- a caller may already hold it).
+  /// \return true if the query was (re)buffered on a live/new session; false if the
+  ///         transport is stopping or the reconnect failed (caller degrades to throw).
+  bool reconnectStaleSession(const std::shared_ptr<PendingQuery> &query, bool isTcp,
+                             SessionId failedSid);
+
+  /// \brief Connect a new session to \p server : \p port and register it in
+  /// _serverSessions/_sessionToServer. REQUIRES _sessionsMutex held. Re-checks
+  /// _state==Running (tracker 2026-09-11-7 item 7) so a send racing stop() cannot
+  /// resurrect the session maps after stop()'s clear. \return the new SessionId, or 0 if
+  /// the transport is stopping/unavailable or connect() failed.
+  SessionId connectAndRegisterSession(bool isTcp, const std::string &server, std::uint16_t port,
+                                      const std::string &sk);
+
+  /// \brief Idempotently buffer \p query for handleConnect on session \p sid (dedup L-2).
+  /// REQUIRES _sessionsMutex held.
+  void bufferOnConnect(bool isTcp, SessionId sid, const std::shared_ptr<PendingQuery> &query);
+
+  /// \brief Frame \p query per protocol (TCP is length-prefixed) and send it on
+  /// \p sessionId. Never called under a lock (copy-then-send). \return the transport
+  /// send() result; the caller logs and relies on the already-scheduled timeout/retry on
+  /// failure. Shared by handleConnect (drain) and reconnectStaleSession (send-now).
+  bool sendQueryOnSession(const std::shared_ptr<Transport> &transport,
+                          const std::shared_ptr<PendingQuery> &query, SessionId sessionId,
+                          bool isTcp);
 
   /// \brief Handle incoming UDP data
   void handleUdpData(SessionId sessionId, iora::core::BufferView data,
@@ -1168,49 +1221,56 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
     }
     else
     {
-      // Create new session. connect() only enqueues the session; it is registered
-      // asynchronously on the I/O thread, so an immediate send would be rejected by
-      // CF-H1 (sessionSendable == false). Defer the send to handleConnect.
-      auto cr = udp->connect(query->server, query->port, TlsMode::None);
-      if (cr.isErr())
+      // New session. connectAndRegisterSession re-checks _state==Running under
+      // _sessionsMutex (tracker 2026-09-11-7 item 7), so a cache-miss send racing stop()
+      // cannot resurrect the session maps after stop()'s clear. connect() only enqueues
+      // the session (registered async on the I/O thread); the send is deferred to
+      // handleConnect (an immediate send would be rejected by CF-H1).
+      sessionId = connectAndRegisterSession(false, query->server, query->port, sk);
+      if (sessionId == 0)
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
-      sessionId = cr.value();
-      _serverSessions[sk] = sessionId;
-      _sessionToServer[std::make_pair(false, sessionId)] = {query->server, query->port};
       sendNow = false;
     }
 
     if (!sendNow)
     {
-      // Buffer while awaiting connect. Populated under _sessionsMutex BEFORE it is
-      // released, so handleConnect (which also takes _sessionsMutex) cannot drain
-      // an empty buffer and lose this query. Dedup (L-2): a retry timer can re-issue
-      // this query while the session is still connecting; buffering it twice would
-      // double-send on connect.
-      auto &bucket = _pendingOnConnect[std::make_pair(false, sessionId)];
-      if (std::find(bucket.begin(), bucket.end(), query) == bucket.end())
-      {
-        bucket.push_back(query);
-      }
+      // Buffer while awaiting connect, populated under _sessionsMutex BEFORE release so
+      // handleConnect cannot drain an empty buffer and lose this query.
+      bufferOnConnect(false, sessionId, query);
     }
   }
+
+  // Record the session this query is now bound to (sent-now OR buffered for
+  // handleConnect), for handleClose M-1 fast-fail (tracker 2026-09-11-7).
+  query->sentSession.store(packSentSession(sessionId, false), std::memory_order_relaxed);
 
   // copy-then-send: _sessionsMutex is released above; never send under the lock.
   if (sendNow)
   {
-    bool sent = udp->send(sessionId, query->queryData.data(), query->queryData.size());
-    if (!sent)
+    bool sent = sendQueryOnSession(udp, query, sessionId, /*isTcp=*/false);
+    if (sent)
     {
-      iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
-                                std::to_string(query->port));
-      throw DnsTransportException("Failed to send UDP query to " + query->server);
+      iora::core::Logger::debug("DNS UDP query sent: ID=" + std::to_string(query->queryId) +
+                                " to " + query->server + ":" + std::to_string(query->port) +
+                                " size=" + std::to_string(query->queryData.size()) + "bytes");
     }
-
-    iora::core::Logger::debug("DNS UDP query sent: ID=" + std::to_string(query->queryId) + " to " +
-                              query->server + ":" + std::to_string(query->port) +
-                              " size=" + std::to_string(query->queryData.size()) + "bytes");
+    else
+    {
+      // L-3 (tracker 2026-09-11-7): the cached session was reaped by the engine
+      // without an onClose reaching handleClose. Reconnect + buffer for handleConnect
+      // instead of throwing, then fall through to the shared scheduleQueryTimeout+stats
+      // tail so the query is armed exactly once. Only throw if the transport is stopping.
+      iora::core::Logger::debug("DNS UDP cached session " + std::to_string(sessionId) +
+                                " send failed; reconnecting to " + query->server);
+      if (!reconnectStaleSession(query, false, sessionId))
+      {
+        iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
+                                  std::to_string(query->port));
+        throw DnsTransportException("Failed to send UDP query to " + query->server);
+      }
+    }
   }
   else
   {
@@ -1255,32 +1315,31 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
     }
     else
     {
-      // Create new session. connect() only enqueues the session; TCP additionally
-      // needs the 3-way handshake before onConnect fires, so an immediate send would
-      // be rejected by CF-H1 (sessionSendable == false). Defer to handleConnect.
-      auto cr = tcp->connect(query->server, query->port, TlsMode::None);
-      if (cr.isErr())
+      // New session. connectAndRegisterSession re-checks _state==Running under
+      // _sessionsMutex (tracker 2026-09-11-7 item 7), so a cache-miss send racing stop()
+      // cannot resurrect the session maps after stop()'s clear. connect() only enqueues
+      // the session; TCP needs the 3-way handshake before onConnect fires, so the send
+      // is deferred to handleConnect (an immediate send would be rejected by CF-H1).
+      sessionId = connectAndRegisterSession(true, query->server, query->port, sk);
+      if (sessionId == 0)
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
       }
-      sessionId = cr.value();
-      _serverSessions[sk] = sessionId;
-      _sessionToServer[std::make_pair(true, sessionId)] = {query->server, query->port};
       sendNow = false;
     }
 
     if (!sendNow)
     {
       // Buffer while awaiting connect (populated under the lock before release, so
-      // handleConnect cannot drain an empty buffer). handleConnect re-frames with
-      // the 2-byte length prefix, exactly as the immediate-send path below does.
-      auto &bucket = _pendingOnConnect[std::make_pair(true, sessionId)];
-      if (std::find(bucket.begin(), bucket.end(), query) == bucket.end()) // dedup (L-2)
-      {
-        bucket.push_back(query);
-      }
+      // handleConnect cannot drain an empty buffer). handleConnect re-frames with the
+      // 2-byte length prefix, exactly as the immediate-send path below does.
+      bufferOnConnect(true, sessionId, query);
     }
   }
+
+  // Record the session this query is now bound to (sent-now OR buffered for
+  // handleConnect), for handleClose M-1 fast-fail (tracker 2026-09-11-7).
+  query->sentSession.store(packSentSession(sessionId, true), std::memory_order_relaxed);
 
   // TCP DNS messages are length-prefixed
   std::uint16_t length = static_cast<std::uint16_t>(query->queryData.size());
@@ -1288,23 +1347,27 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   // copy-then-send: _sessionsMutex is released above; never send under the lock.
   if (sendNow)
   {
-    std::vector<std::uint8_t> tcpMessage;
-    tcpMessage.push_back((length >> 8) & 0xFF);
-    tcpMessage.push_back(length & 0xFF);
-    tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
-
-    bool sent = tcp->send(sessionId, tcpMessage.data(), tcpMessage.size());
-    if (!sent)
+    bool sent = sendQueryOnSession(tcp, query, sessionId, /*isTcp=*/true);
+    if (sent)
     {
-      iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
-                                std::to_string(query->port));
-      throw DnsTransportException("Failed to send TCP query to " + query->server);
+      iora::core::Logger::debug("DNS TCP query sent: ID=" + std::to_string(query->queryId) +
+                                " to " + query->server + ":" + std::to_string(query->port) +
+                                " size=" + std::to_string(length) + "bytes (+2 length prefix)");
     }
-
-    iora::core::Logger::debug("DNS TCP query sent: ID=" + std::to_string(query->queryId) + " to " +
-                              query->server + ":" + std::to_string(query->port) +
-                              " size=" + std::to_string(length) + "bytes (+" +
-                              std::to_string(tcpMessage.size() - length) + " length prefix)");
+    else
+    {
+      // L-3 (tracker 2026-09-11-7): reconnect a reaped cached session + buffer for
+      // handleConnect instead of throwing; fall through to the shared timeout+stats
+      // tail. Only throw if the transport is stopping (degrade).
+      iora::core::Logger::debug("DNS TCP cached session " + std::to_string(sessionId) +
+                                " send failed; reconnecting to " + query->server);
+      if (!reconnectStaleSession(query, true, sessionId))
+      {
+        iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
+                                  std::to_string(query->port));
+        throw DnsTransportException("Failed to send TCP query to " + query->server);
+      }
+    }
   }
   else
   {
@@ -1327,6 +1390,125 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
       "DNS TCP fallback completed for query ID=" + std::to_string(query->queryId) +
       " server=" + query->server + ":" + std::to_string(query->port));
   }
+}
+
+inline SessionId DnsTransport::connectAndRegisterSession(bool isTcp, const std::string &server,
+                                                         std::uint16_t port, const std::string &sk)
+{
+  // REQUIRES _sessionsMutex held by the caller.
+  // State gate (tracker 2026-09-11-7 item 7): re-check under _sessionsMutex so a send
+  // racing stop() cannot resurrect the session maps after stop()'s step-6 clear. stop()
+  // stores a non-Running lifecycle (release) before clearing the maps under the same
+  // mutex, so an insert here either precedes the clear (and is wiped) or observes
+  // non-Running (and is rejected).
+  if (_state.load(std::memory_order_acquire) != Lifecycle::Running)
+  {
+    return 0;
+  }
+  auto transport = isTcp ? loadTcp() : loadUdp();
+  if (!transport)
+  {
+    return 0;
+  }
+  auto cr = transport->connect(server, port, TlsMode::None);
+  if (cr.isErr())
+  {
+    return 0;
+  }
+  const SessionId sid = cr.value();
+  _serverSessions[sk] = sid;
+  _sessionToServer[std::make_pair(isTcp, sid)] = {server, port};
+  return sid;
+}
+
+inline void DnsTransport::bufferOnConnect(bool isTcp, SessionId sid,
+                                          const std::shared_ptr<PendingQuery> &query)
+{
+  // REQUIRES _sessionsMutex held. Dedup (L-2): a retry timer can re-issue a query while
+  // the session is still connecting; buffering twice would double-send on connect.
+  auto &bucket = _pendingOnConnect[std::make_pair(isTcp, sid)];
+  if (std::find(bucket.begin(), bucket.end(), query) == bucket.end())
+  {
+    bucket.push_back(query);
+  }
+}
+
+inline bool DnsTransport::reconnectStaleSession(const std::shared_ptr<PendingQuery> &query,
+                                                bool isTcp, SessionId failedSid)
+{
+  const std::string sk = serverKey(query->server, query->port, isTcp);
+  SessionId targetSid = 0;
+  bool sendNowOnTarget = false;
+  {
+    std::lock_guard<std::mutex> lock(_sessionsMutex);
+    // State gate (tracker 2026-09-11-7 H-2): never resurrect per-session state after
+    // stop() has begun. stop() stores a non-Running lifecycle BEFORE it clears the
+    // session maps under _sessionsMutex, so reading _state inside this same critical
+    // section serializes against that clear -- an insert here either precedes the clear
+    // (and is wiped) or observes non-Running (and degrades). connectAndRegisterSession
+    // re-checks it too; this top gate additionally guards the peer-recreated buffer path.
+    if (_state.load(std::memory_order_acquire) != Lifecycle::Running)
+    {
+      return false;
+    }
+    auto it = _serverSessions.find(sk);
+    if (it != _serverSessions.end() && it->second != failedSid)
+    {
+      // Peer-recreated: a concurrent path already evicted+recreated the session between
+      // our unlocked send()==false and here. Do NOT connect() again. If the current
+      // session is ALREADY connected, send immediately below (copy-then-send), mirroring
+      // the normal cached path -- buffering onto an already-connected session is a
+      // dead-end until timeout, since handleConnect only drains on the onConnect that
+      // already fired (tracker 2026-09-11-7 L-3 peer-recreated edge, Fix B).
+      targetSid = it->second;
+      sendNowOnTarget = _connectedSessions.count(std::make_pair(isTcp, targetSid)) != 0;
+    }
+    else
+    {
+      // The stale session is still mapped (or already gone): evict the three per-session
+      // maps keyed on (isTcp,failedSid), then reconnect. A fresh session is never yet
+      // connected, so it is always buffered for handleConnect.
+      if (it != _serverSessions.end())
+      {
+        _serverSessions.erase(it);
+      }
+      _connectedSessions.erase(std::make_pair(isTcp, failedSid));
+      _sessionToServer.erase(std::make_pair(isTcp, failedSid));
+
+      targetSid = connectAndRegisterSession(isTcp, query->server, query->port, sk);
+      if (targetSid == 0)
+      {
+        return false; // transport gone / connect failed -- caller reports the send failure
+      }
+    }
+
+    // Buffer for handleConnect (dedup) unless we will send immediately below.
+    if (!sendNowOnTarget)
+    {
+      bufferOnConnect(isTcp, targetSid, query);
+    }
+  }
+  // Rebind the query to the (re)connected session so a later handleClose selects it by
+  // exact sender session (M-1).
+  query->sentSession.store(packSentSession(targetSid, isTcp), std::memory_order_relaxed);
+
+  // copy-then-send: send immediately on an already-connected peer-recreated session. A
+  // send failure is left to the already-scheduled timeout/retry (as handleConnect does).
+  if (sendNowOnTarget)
+  {
+    auto transport = isTcp ? loadTcp() : loadUdp();
+    if (!transport)
+    {
+      return false; // transport stopping -- degrade (the query is covered by stop()'s drain)
+    }
+    if (!sendQueryOnSession(transport, query, targetSid, isTcp))
+    {
+      iora::core::Logger::error("DNS reconnect send-now failed on peer-recreated session: ID=" +
+                                std::to_string(query->queryId) + " to " + query->server + ":" +
+                                std::to_string(query->port) + (isTcp ? " (TCP)" : " (UDP)"));
+    }
+  }
+  return true;
 }
 
 inline void DnsTransport::handleUdpData(SessionId sessionId, iora::core::BufferView data,
@@ -1492,9 +1674,11 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
                                           DnsTransportMode mode, const std::string &sourceServer,
                                           std::uint16_t sourcePort)
 {
+  bool parsed = false;
   try
   {
     DnsResult result = DnsMessage::parse(data, size);
+    parsed = true; // the parse stage succeeded -- a later throw is NOT a parse error
     QueryKey key(result.header.id, sourceServer, sourcePort);
 
     // Check for truncation (UDP only)
@@ -1534,6 +1718,20 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
                               " answers=" + std::to_string(result.header.ancount));
     completeQuery(key, result);
   }
+  catch (const DnsTransportException &e)
+  {
+    // A send failure surfaced from the truncation TCP-fallback path (sendTcpQuery ->
+    // L-3 reconnect failed, tracker 2026-09-11-7) unwinds here. The parse SUCCEEDED (we
+    // have a valid response header), so this is NOT a parse error -- complete the query
+    // with the ORIGINAL transport error rather than mislabeling it as DnsParseException.
+    iora::core::Logger::warning("DNS TCP-fallback send failed for response from " + sourceServer +
+                                ":" + std::to_string(sourcePort) + ": " + e.what());
+    if (size >= 2)
+    {
+      std::uint16_t queryId = (data[0] << 8) | data[1];
+      completeQuery(QueryKey(queryId, sourceServer, sourcePort), std::current_exception());
+    }
+  }
   catch (const std::exception &e)
   {
     iora::core::Logger::warning("DNS response parse failed from " + sourceServer + ":" +
@@ -1545,7 +1743,11 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
     {
       std::uint16_t queryId = (data[0] << 8) | data[1];
       QueryKey key(queryId, sourceServer, sourcePort);
-      auto error = std::make_exception_ptr(DnsParseException(e.what()));
+      // A post-parse throw that reaches here (parsed==true; a DnsTransportException is
+      // already handled by the catch above) is NOT a parse error -- surface the raw
+      // exception rather than mislabeling it DnsParseException (tracker 2026-09-11-7 L-2).
+      auto error = parsed ? std::current_exception()
+                          : std::make_exception_ptr(DnsParseException(e.what()));
       completeQuery(key, error);
     }
     else
@@ -1559,6 +1761,25 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
 // handleTransportError removed — new Transport API delivers errors via onClose/onError
 // callbacks, not via data callback IoResult. The onClose handler (handleClose) cleans up
 // sessions; the onError handler can be enhanced to retry pending queries if needed.
+
+inline bool DnsTransport::sendQueryOnSession(const std::shared_ptr<Transport> &transport,
+                                             const std::shared_ptr<PendingQuery> &query,
+                                             SessionId sessionId, bool isTcp)
+{
+  // copy-then-send: never called under a lock. Frame per protocol (sids can collide
+  // across the two engines, so the protocol bit selects the framing + transport).
+  if (isTcp)
+  {
+    // TCP DNS messages are length-prefixed (same framing as sendTcpQuery).
+    std::vector<std::uint8_t> tcpMessage;
+    const std::uint16_t length = static_cast<std::uint16_t>(query->queryData.size());
+    tcpMessage.push_back((length >> 8) & 0xFF);
+    tcpMessage.push_back(length & 0xFF);
+    tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
+    return transport->send(sessionId, tcpMessage.data(), tcpMessage.size());
+  }
+  return transport->send(sessionId, query->queryData.data(), query->queryData.size());
+}
 
 inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddress &, bool isTcp)
 {
@@ -1605,21 +1826,7 @@ inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddr
         continue;
       }
     }
-    bool sent = false;
-    if (isTcp)
-    {
-      // TCP DNS messages are length-prefixed (same framing as sendTcpQuery).
-      std::vector<std::uint8_t> tcpMessage;
-      std::uint16_t length = static_cast<std::uint16_t>(query->queryData.size());
-      tcpMessage.push_back((length >> 8) & 0xFF);
-      tcpMessage.push_back(length & 0xFF);
-      tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
-      sent = transport->send(sessionId, tcpMessage.data(), tcpMessage.size());
-    }
-    else
-    {
-      sent = transport->send(sessionId, query->queryData.data(), query->queryData.size());
-    }
+    const bool sent = sendQueryOnSession(transport, query, sessionId, isTcp);
 
     if (!sent)
     {
@@ -1694,6 +1901,37 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
     for (auto &query : orphaned)
     {
       completeQuery(QueryKey(query->queryId, query->server, query->port), error);
+    }
+  }
+
+  // M-1 (tracker 2026-09-11-7): fast-fail already-SENT in-flight queries bound to the
+  // closed session, instead of letting them linger until their per-query timeout. A
+  // query is selected by EXACT sender session (sentSession == (isTcp,sessionId)), which
+  // avoids failing a sibling query on the OTHER protocol or a DIFFERENT live session to
+  // the same server:port (QueryKey carries no session discriminator). Lock discipline:
+  // collect keys under _queriesMutex as a SEPARATE, non-co-held critical section (the
+  // _sessionsMutex section above is already released), then fire completeQuery OUTSIDE
+  // the lock -- it re-takes _queriesMutex via takePending (exactly-once erase + timer
+  // cancel) and no-ops for a query a concurrent path already completed.
+  std::vector<QueryKey> inFlightKeys;
+  {
+    std::lock_guard<std::mutex> lock(_queriesMutex);
+    const std::uint64_t closedPacked = packSentSession(sessionId, isTcp);
+    for (const auto &kv : _pendingQueries)
+    {
+      if (kv.second->sentSession.load(std::memory_order_relaxed) == closedPacked)
+      {
+        inFlightKeys.push_back(kv.first);
+      }
+    }
+  }
+  if (!inFlightKeys.empty())
+  {
+    auto error = std::make_exception_ptr(DnsTransportException(
+      "DNS session closed (" + std::string(isTcp ? "TCP" : "UDP") + ") with in-flight query"));
+    for (const auto &key : inFlightKeys)
+    {
+      completeQuery(key, error);
     }
   }
 }

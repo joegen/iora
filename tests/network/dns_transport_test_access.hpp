@@ -176,6 +176,16 @@ struct DnsTransportTestAccess
     std::lock_guard<std::mutex> l(t._queriesMutex);
     return t._pendingQueries.count(T::QueryKey(id, server, port)) != 0;
   }
+  /// Register a pending query carrying a non-empty payload (so a driven send() is not
+  /// short-circuited by the engine's n==0 fast path -- needed to exercise send()==false).
+  static void registerPendingWithData(T &t, std::uint16_t id, const std::string &server,
+                                      std::uint16_t port, std::vector<std::uint8_t> data)
+  {
+    auto q = std::make_shared<typename T::PendingQuery>(id, std::chrono::milliseconds(5000),
+                                                        server, port, std::move(data));
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    t._pendingQueries.emplace(T::QueryKey(id, server, port), q);
+  }
   static std::uint64_t activeTimerIdOf(T &t, std::uint16_t id, const std::string &server,
                                        std::uint16_t port)
   {
@@ -188,6 +198,99 @@ struct DnsTransportTestAccess
     std::lock_guard<std::mutex> l(t._queriesMutex);
     auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
     return it == t._pendingQueries.end() ? -1 : it->second->retryCount.load();
+  }
+  /// Bind a registered query to a sender session (tracker 2026-09-11-7 M-1): sets the
+  /// query's sentSession so handleClose(sid,isTcp) fast-fails it by EXACT session match.
+  static void setSentSession(T &t, std::uint16_t id, const std::string &server,
+                             std::uint16_t port, SessionId sid, bool isTcp)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    if (it != t._pendingQueries.end())
+    {
+      it->second->sentSession.store(T::packSentSession(sid, isTcp));
+    }
+  }
+
+  // ---- L-3 reconnect (tracker 2026-09-11-7) ----
+  /// Invoke reconnectStaleSession for a registered query (drives the L-3 path without a
+  /// real send()==false). The evict+connect() branch requires a STARTED transport; the
+  /// state-gate and peer-recreated branches do not.
+  static bool reconnectStale(T &t, std::uint16_t id, const std::string &server,
+                             std::uint16_t port, SessionId failedSid, bool isTcp)
+  {
+    std::shared_ptr<typename T::PendingQuery> q;
+    {
+      std::lock_guard<std::mutex> l(t._queriesMutex);
+      auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+      if (it != t._pendingQueries.end())
+      {
+        q = it->second;
+      }
+    }
+    return q ? t.reconnectStaleSession(q, isTcp, failedSid) : false;
+  }
+  static SessionId serverSessionSid(T &t, const std::string &server, std::uint16_t port,
+                                    bool isTcp)
+  {
+    std::lock_guard<std::mutex> l(t._sessionsMutex);
+    auto it = t._serverSessions.find(T::serverKey(server, port, isTcp));
+    return it == t._serverSessions.end() ? 0 : it->second;
+  }
+  static bool hasPendingOnConnect(T &t, bool isTcp, SessionId sid)
+  {
+    std::lock_guard<std::mutex> l(t._sessionsMutex);
+    return t._pendingOnConnect.count(std::make_pair(isTcp, sid)) != 0;
+  }
+  /// Mark a session already-connected (as handleConnect would), so the L-3 peer-recreated
+  /// branch takes its send-now path (Fix B) instead of buffering.
+  static void markConnected(T &t, bool isTcp, SessionId sid)
+  {
+    std::lock_guard<std::mutex> l(t._sessionsMutex);
+    t._connectedSessions.insert(std::make_pair(isTcp, sid));
+  }
+  /// True iff the registered query's sentSession == packSentSession(sid,isTcp).
+  static bool sentSessionMatches(T &t, std::uint16_t id, const std::string &server,
+                                 std::uint16_t port, SessionId sid, bool isTcp)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    return it != t._pendingQueries.end() &&
+           it->second->sentSession.load() == T::packSentSession(sid, isTcp);
+  }
+  /// Invoke reconnectStaleSession WHILE holding _queriesMutex, reproducing the
+  /// truncation-fallback condition (which calls sendTcpQuery->reconnectStaleSession under
+  /// _queriesMutex). reconnectStaleSession must take only _sessionsMutex (order
+  /// _queriesMutex > _sessionsMutex), never re-enter _queriesMutex -> no self-deadlock.
+  static bool reconnectStaleHoldingQueriesLock(T &t, std::uint16_t id, const std::string &server,
+                                               std::uint16_t port, SessionId failedSid, bool isTcp)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    if (it == t._pendingQueries.end())
+    {
+      return false;
+    }
+    return t.reconnectStaleSession(it->second, isTcp, failedSid);
+  }
+  /// Drive sendUdpQuery for a registered query (exercises the full cached-send ->
+  /// send()==false -> L-3 reconnect -> shared scheduleQueryTimeout tail path). Requires a
+  /// STARTED transport (sendUdpQuery loads the UDP handle). May throw (propagates).
+  static void driveSendUdp(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
+  {
+    std::shared_ptr<typename T::PendingQuery> q;
+    {
+      std::lock_guard<std::mutex> l(t._queriesMutex);
+      auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+      if (it != t._pendingQueries.end())
+      {
+        q = it->second;
+      }
+    }
+    if (q)
+    {
+      t.sendUdpQuery(q);
+    }
   }
 
   // ---- drive private handlers directly ----

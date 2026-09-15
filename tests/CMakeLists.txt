@@ -72,6 +72,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_transport_sid_keying
     network/iora_test_dns_transport_callback_deadlock
     network/iora_test_dns_transport_lifecycle_restructure
+    network/iora_test_dns_transport_close_robustness
     network/iora_test_http
     network/iora_test_http_request_framing
     network/iora_test_http_framing_detail
@@ -550,6 +551,11 @@ set(IORA_SANITIZED_TEST_TARGETS
     # config/handle reads racing stop()/updateConfig() are a cross-thread data-race property
     # only TSan can prove clean -- this target carries the C-race probe.
     iora_test_dns_transport_lifecycle_restructure
+
+    # DnsTransport session-close robustness (tracker 2026-09-11-7): M-1 fast-fail collects
+    # in-flight queries under _queriesMutex as a separate, non-co-held critical section from
+    # _sessionsMutex -- the lock-order (no-co-hold) property is a cross-thread invariant TSan checks.
+    iora_test_dns_transport_close_robustness
 
     iora_test_name_resolver
     iora_test_tcp_engine_resolve
