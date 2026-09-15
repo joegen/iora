@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include <iora/common/i_lifecycle_managed.hpp>
+#include <iora/core/atomic_thread_id.hpp>
 #include <iora/core/errno_utils.hpp>
 
 namespace iora
@@ -355,6 +356,18 @@ public:
 
   TimerService(const TimerService &) = delete;
   TimerService &operator=(const TimerService &) = delete;
+
+  /// \brief Race-free "am I on the timer service's run-loop thread?" check.
+  ///
+  /// Reads an atomic thread-id stamped at run-loop entry and cleared at loop exit
+  /// (see runLoop()). Safe to call from ANY thread concurrently with start()/stop()
+  /// (reading the raw std::thread would be a data race). Mirrors
+  /// detail::EngineBase::isOnIoThread(); relaxed ordering suffices — the atomic is
+  /// only ever equality-compared to this_thread::get_id() and publishes no
+  /// companion data. Used by DnsTransport's teardown-latch exemption (tracker
+  /// 2026-09-13-11): a stop() re-entered from a fired timer callback (on this
+  /// thread) must not park on the state CV waiting for a join of itself.
+  bool isOnTimerThread() const noexcept { return _timerThreadId.isCurrentThread(); }
 
   /// \brief Schedule handler at absolute time with perfect forwarding.
   template <typename Handler> std::uint64_t scheduleAt(TimePoint tp, Handler &&handler)
@@ -1489,6 +1502,10 @@ private:
       TimerService *self;
       ~ExitGuard()
       {
+        // Clear the run-loop-thread stamp FIRST (before publishing _runLoopExited),
+        // so isOnTimerThread() reports false as soon as the loop is exiting and never
+        // yields a recycled-thread-id false positive after the thread ends.
+        self->_timerThreadId.clear();
         {
           std::lock_guard<std::mutex> lock(self->_mutex);
           self->_runLoopExited.store(true, std::memory_order_release);
@@ -1496,6 +1513,10 @@ private:
         self->_drainCV.notify_all();
       }
     } exitGuard{this};
+
+    // Stamp this thread as the run-loop thread FIRST, so isOnTimerThread() is valid for
+    // the whole loop lifetime (before any callback can re-enter a caller that queries it).
+    _timerThreadId.stamp();
 
     loggerSnapshot()->info("Timer service loop started");
 
@@ -1675,6 +1696,11 @@ private:
   // _running still true). Reset to false when the run-loop thread is (re)started.
   std::atomic<bool> _runLoopExited{false};
   std::thread _thread;
+  // Published run-loop-thread identity for isOnTimerThread() (tracker 2026-09-13-11).
+  // iora::core::AtomicThreadId is the shared home of this stamp/clear/compare idiom
+  // (also used by EngineBase::_ioThreadId and DnsTransport's cleanup-thread id).
+  // Default (== no run-loop thread) until stamped at runLoop() entry; cleared at exit.
+  AtomicThreadId _timerThreadId;
   int _epollFd{-1};              // only accessed from init/runLoop/cleanup (single thread)
   int _timerFd{-1};              // only accessed from init/runLoop/cleanup (single thread)
   std::atomic<int> _eventFd{-1}; // accessed cross-thread by poke()

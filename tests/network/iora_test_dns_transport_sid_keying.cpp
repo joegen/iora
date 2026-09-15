@@ -17,7 +17,7 @@
 ///
 /// These tests are WHITE-BOX and deterministic (no real sockets, no timing): they
 /// drive the private I/O-thread handlers directly and inspect the private per-session
-/// maps via the DnsTransportSidKeyingTestAccess friend seam, so the exact collision
+/// maps via the DnsTransportTestAccess friend seam, so the exact collision
 /// is reproduced without flakiness. They cover the tracker test_plan assertions:
 ///   (A) routing / no-misattribution across a colliding (UDP sid=1, TCP sid=1) pair;
 ///   (B) teardown isolation -- a TCP close must not tear down the UDP sibling;
@@ -29,11 +29,10 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 
-#include "iora/core/buffer_view.hpp"
+#include "dns_transport_test_access.hpp" // shared white-box seam (SM-M1)
+
 #include "iora/network/dns/dns_message.hpp"
-#include "iora/network/dns/dns_transport.hpp"
 #include "iora/network/dns/dns_types.hpp"
-#include "iora/network/transport_types.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -43,109 +42,9 @@
 #include <string>
 #include <vector>
 
-namespace iora
-{
-namespace network
-{
-namespace dns
-{
-
-/// \brief Friend test seam granting deterministic access to DnsTransport internals.
-///
-/// USAGE CONTRACT: these accessors are for an UN-STARTED DnsTransport instance only
-/// (no start() called, so no I/O thread is running). The feed*/close drivers invoke
-/// the private I/O-thread handlers directly; running them concurrently with a live
-/// I/O thread would produce nondeterministic interleavings against the same guarded
-/// maps (each map op is locked, but a manually-invoked handler is not atomic w.r.t.
-/// a concurrent real handler). The driver accessors assert(!isRunning()) to enforce
-/// this. The reproduction here targets a key-aliasing LOGICAL race, not a data race,
-/// so single-threaded white-box driving is the correct, deterministic verification.
-struct DnsTransportSidKeyingTestAccess
-{
-  using T = DnsTransport;
-
-  static void putSession(T &t, bool isTcp, SessionId sid, const std::string &server,
-                         std::uint16_t port)
-  {
-    std::lock_guard<std::mutex> l(t._sessionsMutex);
-    t._sessionToServer[std::make_pair(isTcp, sid)] = {server, port};
-    t._serverSessions[T::serverKey(server, port, isTcp)] = sid;
-  }
-
-  static bool hasSession(T &t, bool isTcp, SessionId sid)
-  {
-    std::lock_guard<std::mutex> l(t._sessionsMutex);
-    return t._sessionToServer.count(std::make_pair(isTcp, sid)) != 0;
-  }
-
-  static bool hasServerSession(T &t, const std::string &server, std::uint16_t port, bool isTcp)
-  {
-    std::lock_guard<std::mutex> l(t._sessionsMutex);
-    return t._serverSessions.count(T::serverKey(server, port, isTcp)) != 0;
-  }
-
-  static void putTcpBuffer(T &t, SessionId sid, const std::vector<std::uint8_t> &bytes)
-  {
-    std::lock_guard<std::mutex> l(t._tcpBuffersMutex);
-    auto &buf = t._tcpBuffers[sid];
-    buf.insert(buf.end(), bytes.begin(), bytes.end());
-  }
-
-  static bool hasTcpBuffer(T &t, SessionId sid)
-  {
-    std::lock_guard<std::mutex> l(t._tcpBuffersMutex);
-    return t._tcpBuffers.count(sid) != 0;
-  }
-
-  static std::size_t tcpBufferSize(T &t, SessionId sid)
-  {
-    std::lock_guard<std::mutex> l(t._tcpBuffersMutex);
-    auto it = t._tcpBuffers.find(sid);
-    return it == t._tcpBuffers.end() ? 0 : it->second.size();
-  }
-
-  static void registerPending(T &t, std::uint16_t id, const std::string &server,
-                              std::uint16_t port)
-  {
-    auto q = std::make_shared<T::PendingQuery>(id, std::chrono::milliseconds(5000), server, port,
-                                               std::vector<std::uint8_t>{});
-    std::lock_guard<std::mutex> l(t._queriesMutex);
-    t._pendingQueries.emplace(T::QueryKey(id, server, port), q);
-  }
-
-  static bool hasPending(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
-  {
-    std::lock_guard<std::mutex> l(t._queriesMutex);
-    return t._pendingQueries.count(T::QueryKey(id, server, port)) != 0;
-  }
-
-  static void feedUdp(T &t, SessionId sid, const std::vector<std::uint8_t> &bytes)
-  {
-    assert(!t.isRunning()); // un-started instances only (see USAGE CONTRACT above)
-    t.handleUdpData(sid, iora::core::BufferView(bytes.data(), bytes.size()),
-                    std::chrono::steady_clock::now());
-  }
-
-  static void feedTcp(T &t, SessionId sid, const std::vector<std::uint8_t> &bytes)
-  {
-    assert(!t.isRunning());
-    t.handleTcpData(sid, iora::core::BufferView(bytes.data(), bytes.size()),
-                    std::chrono::steady_clock::now());
-  }
-
-  static void close(T &t, SessionId sid, bool isTcp)
-  {
-    assert(!t.isRunning());
-    t.handleClose(sid, TransportErrorInfo{}, isTcp);
-  }
-};
-
-} // namespace dns
-} // namespace network
-} // namespace iora
 
 using namespace iora::network::dns;
-using Access = iora::network::dns::DnsTransportSidKeyingTestAccess;
+using Access = iora::network::dns::DnsTransportTestAccess;
 
 namespace
 {

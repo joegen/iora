@@ -8,7 +8,7 @@
 /// \brief Callback-under-lock / fire-outside-locks / exactly-once regression tests for
 ///        DnsTransport (tracker 2026-09-11-6).
 ///
-/// WHITE-BOX + deterministic. Via the DnsTransportCallbackTestAccess friend seam these
+/// WHITE-BOX + deterministic. Via the DnsTransportTestAccess friend seam these
 /// drive the private handlers/maps directly and pin the tracker test_plan behavior:
 ///   - F-2 (handleTcpData collect-then-fire): a mid-stream framing error must NOT drop
 ///     already-collected complete messages (break-not-return, no-drop); multiple
@@ -40,12 +40,10 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "dns_transport_test_access.hpp" // shared white-box seam (SM-M1)
 
-#include "iora/core/buffer_view.hpp"
 #include "iora/network/dns/dns_message.hpp"
-#include "iora/network/dns/dns_transport.hpp"
 #include "iora/network/dns/dns_types.hpp"
-#include "iora/network/transport_types.hpp"
 
 #include <atomic>
 #include <cassert>
@@ -57,124 +55,9 @@
 #include <thread>
 #include <vector>
 
-namespace iora
-{
-namespace network
-{
-namespace dns
-{
-
-/// \brief Friend seam for the callback-under-lock / exactly-once probes.
-struct DnsTransportCallbackTestAccess
-{
-  using T = DnsTransport;
-
-  static void setRunning(T &t, bool v) { t._running.store(v); }
-
-  /// Install an UNSTARTED tcp Transport so handleTcpData's framing-error close(sid) --
-  /// which is enqueue-only -- does not deref a null _tcpTransport in white-box driving.
-  /// (In production handleTcpData only runs via a live _tcpTransport, so it is never null.)
-  static void installTcpTransport(T &t) { t._tcpTransport = Transport::tcp(TransportConfig{}); }
-
-  static int configRetryCount(T &t) { return t._config.retryCount; }
-
-  static void putSession(T &t, bool isTcp, SessionId sid, const std::string &server,
-                         std::uint16_t port)
-  {
-    std::lock_guard<std::mutex> l(t._sessionsMutex);
-    t._sessionToServer[std::make_pair(isTcp, sid)] = {server, port};
-    t._serverSessions[T::serverKey(server, port, isTcp)] = sid;
-  }
-
-  /// Register a pending query with a callback. startTimeOffset shifts startTime into the
-  /// past so the query is already expired for cleanup probes.
-  static void registerPending(T &t, std::uint16_t id, const std::string &server,
-                              std::uint16_t port, T::QueryCallback cb, int retryCount = 0,
-                              std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
-                              std::chrono::milliseconds startTimeOffset = std::chrono::milliseconds(0))
-  {
-    auto q = std::make_shared<T::PendingQuery>(id, timeout, server, port,
-                                               std::vector<std::uint8_t>{});
-    q->callback = std::move(cb);
-    q->retryCount.store(retryCount);
-    if (startTimeOffset.count() != 0)
-    {
-      q->startTime.store(std::chrono::steady_clock::now() - startTimeOffset);
-    }
-    std::lock_guard<std::mutex> l(t._queriesMutex);
-    t._pendingQueries.emplace(T::QueryKey(id, server, port), q);
-  }
-
-  static bool hasPending(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
-  {
-    std::lock_guard<std::mutex> l(t._queriesMutex);
-    return t._pendingQueries.count(T::QueryKey(id, server, port)) != 0;
-  }
-
-  static std::uint64_t activeTimerIdOf(T &t, std::uint16_t id, const std::string &server,
-                                       std::uint16_t port)
-  {
-    std::lock_guard<std::mutex> l(t._queriesMutex);
-    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
-    return it == t._pendingQueries.end() ? 0 : it->second->activeTimerId.load();
-  }
-
-  static int retryCountOf(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
-  {
-    std::lock_guard<std::mutex> l(t._queriesMutex);
-    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
-    return it == t._pendingQueries.end() ? -1 : it->second->retryCount.load();
-  }
-
-  static void feedTcp(T &t, SessionId sid, const std::vector<std::uint8_t> &bytes)
-  {
-    t.handleTcpData(sid, iora::core::BufferView(bytes.data(), bytes.size()),
-                    std::chrono::steady_clock::now());
-  }
-
-  static void callCleanup(T &t) { t.cleanupExpiredQueries(); }
-
-  static void callCompleteResult(T &t, std::uint16_t id, const std::string &server,
-                                 std::uint16_t port)
-  {
-    t.completeQuery(T::QueryKey(id, server, port), DnsResult{});
-  }
-
-  /// Start ONLY the real cleanup thread (_running=true + the production startCleanupTimer),
-  /// WITHOUT creating any transports. Exercises the genuine _cleanupThread + weak_ptr
-  /// capture (item 10) so the cleanup-arm self-join guard (item 5) and the
-  /// cleanup-thread-last-owner cycle (F-R3-4) run on the real thread with no sockets.
-  static void startCleanupOnly(T &t)
-  {
-    t._running.store(true);
-    t.startCleanupTimer();
-  }
-
-  /// True iff the UDP transport exists and the caller runs on its I/O thread. Used INSIDE
-  /// a query callback to prove the IO-arm probe is non-vacuous (the callback really fired
-  /// on the transport I/O thread, so stop()'s item-6 branch is genuinely taken).
-  static bool udpCallerOnIoThread(T &t)
-  {
-    return t._udpTransport && t._udpTransport->isOnIoThread();
-  }
-
-  /// Shorten the cleanup-sweep interval (item F seam). MUST be called BEFORE the cleanup
-  /// thread starts (startCleanupOnly / start()); read only by that thread. The assert
-  /// enforces the set-before-start precondition (L-1/L2): writing it post-start would be a
-  /// data race against the cleanup thread's read.
-  static void setCleanupInterval(T &t, std::chrono::milliseconds interval)
-  {
-    assert(!t._running.load() && "setCleanupInterval must be called before start()");
-    t._cleanupInterval = interval;
-  }
-};
-
-} // namespace dns
-} // namespace network
-} // namespace iora
 
 using namespace iora::network::dns;
-using Access = iora::network::dns::DnsTransportCallbackTestAccess;
+using Access = iora::network::dns::DnsTransportTestAccess;
 
 namespace
 {
@@ -498,7 +381,7 @@ TEST_CASE("dns callback-deadlock: item6 stop() from the transport I/O thread tea
                   callbackRan.store(true);
                   // Non-vacuous: prove the callback truly fired on the transport I/O thread, so
                   // stop()'s item-6 branch is genuinely taken. Read BEFORE stop() nulls it.
-                  onIoThread.store(Access::udpCallerOnIoThread(*t));
+                  onIoThread.store(Access::udpOnIoThread(*t));
                   try
                   {
                     t->stop(); // on the I/O thread: must skip the throwing wrapper stop()

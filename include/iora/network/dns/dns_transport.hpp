@@ -9,6 +9,8 @@
 #include "dns_message.hpp"
 #include "dns_types.hpp"
 #include "dns_utils.hpp"
+#include "iora/core/atomic_shared_ptr.hpp"
+#include "iora/core/atomic_thread_id.hpp"
 #include "iora/core/logger.hpp"
 #include "iora/core/thread_pool.hpp"
 #include "iora/core/timer.hpp"
@@ -70,13 +72,12 @@ public:
   }
 };
 
-// Test seam (tracker 2026-09-11-5): forward-declared so DnsTransport can befriend it
-// (see the friend declaration in the private section). Defined only by the sid-keying
-// regression test; no production code depends on it.
-struct DnsTransportSidKeyingTestAccess;
-// Test seam (tracker 2026-09-11-6): callback-under-lock / exactly-once probes;
-// forward-declared here, befriended below, defined only by that probe test.
-struct DnsTransportCallbackTestAccess;
+// Shared white-box test seam (SM-M1, tracker 2026-09-13-11): ONE friend struct reused by
+// every DnsTransport test file (sid-keying, callback-deadlock, lifecycle-restructure),
+// forward-declared here, befriended below, defined only by tests/network/
+// dns_transport_test_access.hpp. Consolidates the accessors those files previously
+// duplicated across three separate friend structs. No production code depends on it.
+struct DnsTransportTestAccess;
 
 /// \brief DNS transport implementation using Iora's Transport
 class DnsTransport : public std::enable_shared_from_this<DnsTransport>
@@ -134,8 +135,13 @@ public:
   /// \brief Update configuration
   void updateConfig(const DnsConfig &config);
 
-  /// \brief Get current configuration
-  const DnsConfig &getConfig() const { return _config; }
+  /// \brief Get current configuration snapshot.
+  ///
+  /// Returns a std::shared_ptr<const DnsConfig> (NOT a reference into a member): the
+  /// config is atomic-published (INV-2, tracker 2026-09-13-11), so a `const DnsConfig&`
+  /// accessor would dangle the instant a concurrent updateConfig() swaps the snapshot.
+  /// The returned snapshot is immutable and pins its config for the caller's use.
+  std::shared_ptr<const DnsConfig> getConfig() const { return loadConfig(); }
 
   /// \brief Get transport statistics (thread-safe atomic counters)
   struct Statistics
@@ -154,12 +160,12 @@ public:
   void resetStatistics();
 
 private:
-  // Test seam (tracker 2026-09-11-5): the sid-keying regression test drives the
-  // private I/O-thread handlers and inspects the per-session maps directly, so the
-  // cross-engine SessionId collision is reproduced deterministically without real
-  // sockets or timing. Test-only; no production code path depends on it.
-  friend struct DnsTransportSidKeyingTestAccess;
-  friend struct DnsTransportCallbackTestAccess;
+  // Shared white-box test seam: the DnsTransport regression tests drive the private
+  // I/O-thread handlers and inspect the per-session / lifecycle state directly, so
+  // sid-collision, callback-under-lock, and teardown-lifecycle scenarios reproduce
+  // deterministically without real sockets or timing. Defined in tests/network/
+  // dns_transport_test_access.hpp. Test-only; no production code path depends on it.
+  friend struct DnsTransportTestAccess;
 
   /// \brief Composite key for pending queries to avoid ID collisions
   ///
@@ -265,6 +271,13 @@ private:
   /// \brief Atomically find+erase a pending query by key (returns nullptr if absent)
   std::shared_ptr<PendingQuery> takePending(const QueryKey &key);
 
+  /// \brief Registration gate (NEW-6): insert \p query into _pendingQueries iff the
+  /// transport is still Running, atomically under _queriesMutex. Returns false (no insert)
+  /// when a concurrent stop() has left Running, so the caller fails the query fast. The
+  /// _queriesMutex release/acquire carries stop()'s step-1 Stopping store, so a registration
+  /// serialized after the drain observes non-Running and is refused — never orphaned.
+  bool registerPendingIfRunning(const QueryKey &key, const std::shared_ptr<PendingQuery> &query);
+
   /// \brief Atomically claim and cancel a query's active retry timer, if any
   void cancelActiveTimer(const std::shared_ptr<PendingQuery> &query);
 
@@ -334,28 +347,128 @@ private:
   ///        so the protocol-qualified key is constructed identically everywhere.
   static std::string serverKey(const std::string &server, std::uint16_t port, bool isTcp);
 
-  // Configuration
-  DnsConfig _config;
+  // ---------------------------------------------------------------------------
+  // Lifecycle + atomic-published shared state (tracker 2026-09-13-11).
+  //
+  // INV-1 (single lifecycle atomic): _state subsumes the old _running flag.
+  // INV-2 (atomic-published shared state): _config, _udpTransport, _tcpTransport and
+  //   _timerService are held in iora::core::AtomicSharedPtr slots, published via the
+  //   C++17 std::atomic_load/store/exchange free functions it wraps (std::atomic<shared_ptr>
+  //   is C++20 — NOT used). The wrapper has NO raw accessor, so a read/write that bypasses
+  //   the atomic idiom is a COMPILE error, not a silent data race — the grep gate is
+  //   mechanical. Every reader snapshots ONCE into a local via the load* helpers below.
+  //   _stateMutex does NOT guard these four members.
+  // ---------------------------------------------------------------------------
+  // Lifecycle states. PascalCase enumerators intentionally follow the established
+  // lifecycle/mode-enum precedent (iora::common::LifecycleState, DnsTransportMode) rather
+  // than the ALL_UPPERCASE R-NS-5 default — consistency with the sibling enums wins here
+  // (human style call, 2026-09-15).
+  enum class Lifecycle
+  {
+    Stopped,
+    Starting,
+    Running,
+    Stopping
+  };
 
-  // Transport instances
-  std::shared_ptr<Transport> _udpTransport;
-  std::shared_ptr<Transport> _tcpTransport;
+  /// \brief Snapshot the atomic-published config (INV-2). Read ONCE per operation.
+  std::shared_ptr<const DnsConfig> loadConfig() const { return _config.load(); }
+  /// \brief Snapshot the atomic-published UDP transport handle (INV-2).
+  std::shared_ptr<Transport> loadUdp() const { return _udpTransport.load(); }
+  /// \brief Snapshot the atomic-published TCP transport handle (INV-2).
+  std::shared_ptr<Transport> loadTcp() const { return _tcpTransport.load(); }
+  /// \brief Snapshot the atomic-published timer-service handle (INV-2).
+  std::shared_ptr<core::TimerService> loadTimer() const { return _timerService.load(); }
+
+  /// \brief Is the calling thread one the in-progress teardown JOINS, or the teardown
+  ///        driver itself? MUST be called with _stateMutex held (INV-3a, R3-C1 fix).
+  ///
+  /// The identities come from STABLE, member-INDEPENDENT sources so the exemption still
+  /// fires after stop() has moved the cleanup thread out and is mid-join:
+  ///   - driver: _stoppingThreadId, recorded under _stateMutex at CAS-to-Stopping;
+  ///   - cleanup: _cleanupThreadId, a stamped AtomicThreadId set by the cleanup lambda at
+  ///     entry (NOT _cleanupThread.get_id(), which stop() step 2 moves out before releasing);
+  ///   - I/O: the LIVE transport handles (route B keeps them live until stop() step 8);
+  ///   - timer: the LIVE timer handle's isOnTimerThread().
+  /// Returns true => the caller must NEVER park on _stateCv (that would be the reborn
+  /// callback-under-lock deadlock, now on the CV instead of the mutex).
+  ///
+  /// The stamped-id reads (_cleanupThreadId, and isOnIoThread/isOnTimerThread) are relaxed
+  /// and need no happens-before of their own: each id is only ever equality-compared against
+  /// its own stamping thread, so the comparison is self-consistent via that thread's program
+  /// order (a false positive is impossible — no other thread's id can equal the stamper's).
+  bool isTeardownExemptLocked(std::thread::id me) const
+  {
+    if (_stoppingThreadId != std::thread::id{} && me == _stoppingThreadId)
+    {
+      return true;
+    }
+    if (_cleanupThreadId.matches(me))
+    {
+      return true;
+    }
+    if (auto u = loadUdp())
+    {
+      if (u->isOnIoThread())
+      {
+        return true;
+      }
+    }
+    if (auto t = loadTcp())
+    {
+      if (t->isOnIoThread())
+      {
+        return true;
+      }
+    }
+    if (auto tm = loadTimer())
+    {
+      if (tm->isOnTimerThread())
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// \brief Settle a failed start() to Stopped + notify. MUST be called with _stateMutex
+  /// held (H-1): both start() catch clauses use it so a bring-up throw never strands
+  /// Starting (which would hang every settled-predicate waiter forever).
+  void settleStartFailureLocked()
+  {
+    _state.store(Lifecycle::Stopped, std::memory_order_release);
+    _stateCv.notify_all();
+  }
+
+  // Configuration (atomic-published — INV-2). Access via loadConfig() / _config.store()
+  // on updateConfig()/start(). The AtomicSharedPtr wrapper makes a raw access a compile
+  // error (mechanical grep gate).
+  iora::core::AtomicSharedPtr<const DnsConfig> _config;
+
+  // Transport instances (atomic-published — INV-2). Access via loadUdp()/loadTcp() /
+  // .store()/.exchange(); the wrapper forbids raw access at compile time.
+  iora::core::AtomicSharedPtr<Transport> _udpTransport;
+  iora::core::AtomicSharedPtr<Transport> _tcpTransport;
 
   // ---------------------------------------------------------------------------
   // LOCK ORDERING (HR-2) — acquire outer -> inner; never acquire an outer lock
   // while holding an inner one:
   //   _stateMutex  >  _cleanupMutex  >  _tcpBuffersMutex  >  _queriesMutex  >  _sessionsMutex
   //
-  // OUTERMOST: _stateMutex (start/stop/updateConfig). stop() holds _stateMutex across
-  // (sequentially) _cleanupMutex (the flag store only), then _queriesMutex (collect),
-  // then _sessionsMutex, then _tcpBuffersMutex — establishing _stateMutex > _cleanupMutex
-  // (tracker 2026-09-11-6 item 7). NEVER acquire _stateMutex from inside any inner
-  // critical section — that would deadlock against stop(). The cleanup thread takes
-  // _cleanupMutex ONLY for the CV wait (nothing inner held under it, and it never takes
-  // _stateMutex), so the _stateMutex > _cleanupMutex edge is acyclic. stop() must NOT
-  // hold _cleanupMutex across _cleanupThread.join() (the thread needs it to exit
-  // wait_for): the flag store is a tiny separate critical section, and notify+join run
-  // outside it.
+  // OUTERMOST: _stateMutex (start/stop/updateConfig transitions). RESTRUCTURED (tracker
+  // 2026-09-13-11): stop() no longer holds _stateMutex across the worker joins — that was
+  // the callback-under-lock teardown deadlock. It now CASes to Stopping, snapshots the
+  // handles, RELEASES _stateMutex, and joins the workers with NO lock held; a completion
+  // latch on _stateCv (with a thread-identity exemption) restores the join-before-return
+  // property the mutex used to give. So _stateMutex is co-held ONLY with _cleanupMutex (the
+  // tiny flag store in stop() step 2) — establishing _stateMutex > _cleanupMutex — and with
+  // nothing else. updateConfig is DE-LATCHED: it takes NO lifecycle lock at all (atomic
+  // publish). NEVER acquire _stateMutex from inside any inner critical section — the query
+  // hot paths read _state lock-free (acquire) and never take _stateMutex. The cleanup thread
+  // takes _cleanupMutex ONLY for the CV wait (nothing inner held under it, and it never takes
+  // _stateMutex), so the _stateMutex > _cleanupMutex edge is acyclic. stop() must NOT hold
+  // _cleanupMutex across the cleanup-thread join (the thread needs it to exit wait_for): the
+  // flag store is a tiny separate critical section, and notify + the join run outside it.
   //
   // INNER co-holds (at most two inner locks held at once): handleTcpData holds
   // _tcpBuffersMutex across _sessionsMutex (the _sessionToServer read) ONLY — it now
@@ -371,9 +484,18 @@ private:
   // _tcpBuffersMutex or _queriesMutex (inner) would invert this order and can deadlock.
   // ---------------------------------------------------------------------------
 
-  // State management
-  std::atomic<bool> _running{false};
+  // State management (INV-1/INV-3, tracker 2026-09-13-11).
+  // _state is the single lifecycle atomic (subsumes the old _running). _stateMutex +
+  // _stateCv serialize lifecycle TRANSITIONS and provide the join-before-return
+  // completion latch: a concurrent stop()/start()/dtor that observes a transient state
+  // waits on _stateCv for a SETTLED state (Running||Stopped), UNLESS it is exempt
+  // (isTeardownExemptLocked). _stoppingThreadId (guarded by _stateMutex) records the
+  // teardown driver for the exemption. Query fast paths read _state lock-free (acquire);
+  // they never take _stateMutex (no lock-order inversion against the hot path).
+  std::atomic<Lifecycle> _state{Lifecycle::Stopped};
   mutable std::mutex _stateMutex;
+  std::condition_variable _stateCv;
+  std::thread::id _stoppingThreadId; // guarded by _stateMutex
 
   // Query management
   std::map<QueryKey, std::shared_ptr<PendingQuery>> _pendingQueries;
@@ -432,23 +554,46 @@ private:
   std::thread _cleanupThread;
   std::condition_variable _cleanupCv;
   std::mutex _cleanupMutex;
+  // Resurrect-guard generation (H, INV / tracker 2026-09-13-11). startCleanupTimer()
+  // bumps this and the new thread captures the fresh value; a stale detached cleanup
+  // thread (self-stop path) observes a generation mismatch and exits even if a restart
+  // has re-set _cleanupRunning=true, so at most one live sweeper survives a restart.
+  std::atomic<std::uint64_t> _cleanupGeneration{0};
+  // Live cleanup-thread count (incremented at each sweeper's loop entry, decremented at its
+  // exit). Bounds how many sweepers are simultaneously alive — the observable the resurrect
+  // guard exists to keep at 1. Read by the lifecycle test seam to assert a stale detached
+  // sweeper has exited after a restart.
+  std::atomic<int> _cleanupThreadCount{0};
+  // Stamped, member-INDEPENDENT cleanup-thread identity for the teardown-latch exemption
+  // (R3-C1). Stamped by the cleanup lambda at entry / clearIfCurrent() at exit; read by
+  // isTeardownExemptLocked(). NOT _cleanupThread.get_id() (stop() moves that out before
+  // releasing _stateMutex, so a re-entrant worker would read an emptied slot).
+  iora::core::AtomicThreadId _cleanupThreadId;
   // Cleanup-sweep interval (item F / cpp17-LOW-1): production default 10s; the test seam
-  // (DnsTransportCallbackTestAccess) shortens it so the running-instance probes finish in
+  // (DnsTransportTestAccess) shortens it so the running-instance probes finish in
   // sub-second bounds instead of ~15s. Set BEFORE start(); read only by the cleanup thread.
   std::chrono::milliseconds _cleanupInterval{std::chrono::seconds(10)};
 
-  // Centralized RNG for retry jitter
+  // Centralized RNG for retry jitter. Guarded by _rngMutex (TS-HIGH-1): although in steady
+  // state only the single cleanup thread draws from it (via retryQuery), the resurrect
+  // window can transiently overlap a stale detached sweeper with a fresh one — the
+  // generation token bounds thread COUNT but does not preempt an in-flight sweep, so two
+  // threads could draw concurrently. mt19937 is non-atomic, so an unguarded concurrent draw
+  // is a data race (UB). _rngMutex is an INNERMOST leaf (nothing is acquired under it), so
+  // it does not participate in the documented lock order.
+  mutable std::mutex _rngMutex;
   mutable std::mt19937 _rng;
 
-  // Timer service for efficient retry scheduling (avoids sleeping in thread pool workers)
-  std::shared_ptr<core::TimerService> _timerService;
+  // Timer service for efficient retry scheduling (atomic-published — INV-2). Access via
+  // loadTimer() / _timerService.store()/.exchange(); the wrapper forbids raw access.
+  iora::core::AtomicSharedPtr<core::TimerService> _timerService;
 };
 
 // ==================== Implementation ====================
 
-inline DnsTransport::DnsTransport(const DnsConfig &config) : _config(config)
+inline DnsTransport::DnsTransport(const DnsConfig &config)
 {
-  if (_config.servers.empty())
+  if (config.servers.empty())
   {
     throw DnsTransportException("No DNS servers configured");
   }
@@ -456,185 +601,291 @@ inline DnsTransport::DnsTransport(const DnsConfig &config) : _config(config)
   // DnsServer structures are already normalized via fromString()
   // No additional normalization needed
 
+  // Publish the immutable config snapshot (INV-2). No other thread can observe this
+  // object during construction, so the store is uniform-style rather than a
+  // synchronization requirement here.
+  _config.store(std::make_shared<const DnsConfig>(config));
+
   // Initialize RNG for jitter
   std::random_device rd;
   _rng.seed(rd());
 
-  // Initialize timer service for efficient retry scheduling
+  // Initialize (publish) the timer service for efficient retry scheduling. start()
+  // re-creates it if a prior stop() cleared the handle (restart), and stop() joins it.
   core::TimerServiceConfig timerConfig;
   timerConfig.threadName = "DnsRetryTimer";
   timerConfig.enableStatistics = false; // Keep it lightweight
-  _timerService = std::make_shared<core::TimerService>(timerConfig);
+  _timerService.store(std::make_shared<core::TimerService>(timerConfig));
 }
 
 inline DnsTransport::~DnsTransport() { stop(); }
 
 inline void DnsTransport::start()
 {
-  std::lock_guard<std::mutex> lock(_stateMutex);
+  std::unique_lock<std::mutex> lock(_stateMutex);
+  const std::thread::id me = std::this_thread::get_id();
 
-  if (_running.load())
+  // Reach a decision: return (already running / exempt re-entry), or claim Starting.
+  for (;;)
   {
-    return; // Already running
+    Lifecycle s = _state.load(std::memory_order_acquire);
+    if (s == Lifecycle::Running)
+    {
+      return; // Already running
+    }
+    if (s == Lifecycle::Stopped)
+    {
+      _state.store(Lifecycle::Starting, std::memory_order_release);
+      break;
+    }
+    // Starting || Stopping.
+    if (isTeardownExemptLocked(me))
+    {
+      // A driver/worker re-entrant restart WHILE a teardown (or another start) is in
+      // flight is a documented no-op (R3-L2): the caller runs on a thread the in-flight
+      // transition joins, so it must never park on _stateCv (that is the reborn
+      // callback-under-lock deadlock). The in-flight transition owns the outcome.
+      return;
+    }
+    // A genuinely independent caller waits for a SETTLED state, then re-evaluates
+    // (never a single transient target — a bare "until Stopped" hangs when this same
+    // start() is what drives Starting->Running).
+    _stateCv.wait(lock,
+                  [this]
+                  {
+                    Lifecycle x = _state.load(std::memory_order_acquire);
+                    return x == Lifecycle::Running || x == Lifecycle::Stopped;
+                  });
   }
 
+  // state == Starting, _stateMutex held. Bring-up on locals; publish only on full success.
   try
   {
-    // Create transports based on configuration
-    if (_config.transportMode == DnsTransportMode::UDP ||
-        _config.transportMode == DnsTransportMode::Both)
+    auto cfg = loadConfig();
+
+    std::shared_ptr<Transport> udp;
+    std::shared_ptr<Transport> tcp;
+    if (cfg->transportMode == DnsTransportMode::UDP ||
+        cfg->transportMode == DnsTransportMode::Both)
     {
-      _udpTransport = createUdpTransport();
-      auto sr = _udpTransport->start();
+      udp = createUdpTransport();
+      auto sr = udp->start();
       if (sr.isErr())
       {
         throw DnsTransportException("Failed to start UDP transport: " + sr.error().message);
       }
     }
 
-    if (_config.transportMode == DnsTransportMode::TCP ||
-        _config.transportMode == DnsTransportMode::Both)
+    if (cfg->transportMode == DnsTransportMode::TCP ||
+        cfg->transportMode == DnsTransportMode::Both)
     {
-      _tcpTransport = createTcpTransport();
-      auto sr = _tcpTransport->start();
+      tcp = createTcpTransport();
+      auto sr = tcp->start();
       if (sr.isErr())
       {
         throw DnsTransportException("Failed to start TCP transport: " + sr.error().message);
       }
     }
 
-    // Timer service is already started by its constructor
+    // (Re)create the timer service if a prior stop() cleared the handle (restart). On a
+    // first start the constructor's live service is kept.
+    auto timer = loadTimer();
+    if (!timer)
+    {
+      core::TimerServiceConfig timerConfig;
+      timerConfig.threadName = "DnsRetryTimer";
+      timerConfig.enableStatistics = false;
+      timer = std::make_shared<core::TimerService>(timerConfig);
+    }
 
-    _running.store(true);
+    // Publish the handles (release), then flip to Running + notify + start the cleanup
+    // sweeper — ALL in this one _stateMutex critical section (M-1: a woken stop() waiter
+    // must not observe Running before startCleanupTimer has run / race it).
+    _udpTransport.store(udp);
+    _tcpTransport.store(tcp);
+    _timerService.store(timer);
+    _state.store(Lifecycle::Running, std::memory_order_release);
+    _stateCv.notify_all();
     startCleanupTimer();
   }
   catch (const std::exception &e)
   {
-    _running.store(false);
+    // H-1: NEVER strand Starting — a stranded Starting hangs every settled-predicate
+    // waiter. Settle to Stopped + notify UNDER the lock, then rethrow. The partially
+    // created transport locals are destroyed on unwind (never published to the members).
+    settleStartFailureLocked();
     throw DnsTransportException("Failed to start DNS transport: " + std::string(e.what()));
+  }
+  catch (...)
+  {
+    // H-1 (ANY throw): a non-std exception must ALSO settle to Stopped + notify, never
+    // strand Starting. Re-raise the original (no .what() to wrap).
+    settleStartFailureLocked();
+    throw;
   }
 }
 
 inline void DnsTransport::stop()
 {
-  // Pending queries are COLLECTED under _queriesMutex but FIRED only after every
-  // DnsTransport lock (including _stateMutex) is released (F-3 / tracker 2026-09-11-6
-  // item 2). Firing from this local -- not from the map -- guarantees the drained
-  // completions are delivered even if the timer teardown below throws.
+  // Release-before-join teardown with a completion latch (INV-3, tracker 2026-09-13-11).
+  // The old design held _stateMutex across every worker join, so a worker whose fired
+  // callback re-entered stop()/updateConfig() (which took _stateMutex) deadlocked. This
+  // rewrite CASes to Stopping, snapshots the handles, RELEASES _stateMutex, THEN joins;
+  // a re-entrant stop()/start() on a joined worker (or the driver itself) is EXEMPTED and
+  // returns immediately instead of parking on _stateCv. Steps:
+  //   (1) become the teardown driver (CAS Running->Stopping) or return/wait;
+  //   (2) stop the cleanup sweeper (flag + notify) and MOVE its thread to a local;
+  //   (3) snapshot the handles to locals, LEAVING the members live (route B / R3-C1) so
+  //       the exemption's isOnIoThread/isOnTimerThread reach live objects during the join;
+  //   (4) RELEASE _stateMutex;
+  //   (5) join/detach the workers with NO lock held;
+  //   (6) collect pending queries + clear session/buffer state;
+  //   (7) FIRE the collected failures with NO lock held, BEFORE publishing Stopped (H-2);
+  //   (8) re-lock: publish Stopped + null the handle members + notify, all under _stateMutex.
   std::vector<std::shared_ptr<PendingQuery>> toFail;
+  std::shared_ptr<Transport> udp;
+  std::shared_ptr<Transport> tcp;
+  std::shared_ptr<core::TimerService> timer;
+  std::thread cleanupLocal;
+  bool timerStopped = false;
 
   {
-    std::lock_guard<std::mutex> lock(_stateMutex);
+    std::unique_lock<std::mutex> lock(_stateMutex);
+    const std::thread::id me = std::this_thread::get_id();
 
-    if (!_running.load())
+    // Step 1 — reach a decision.
+    for (;;)
     {
-      return; // Already stopped
+      Lifecycle s = _state.load(std::memory_order_acquire);
+      if (s == Lifecycle::Stopped)
+      {
+        return; // Already stopped.
+      }
+      if (s == Lifecycle::Running)
+      {
+        _state.store(Lifecycle::Stopping, std::memory_order_release);
+        _stoppingThreadId = me;
+        break; // We are the teardown driver.
+      }
+      // Starting || Stopping.
+      if (isTeardownExemptLocked(me))
+      {
+        // A joined worker (or the driver) re-entering stop() must NEVER park on _stateCv:
+        // the join it would wait on can only complete after its own return (R3-C1).
+        return;
+      }
+      _stateCv.wait(lock,
+                    [this]
+                    {
+                      Lifecycle x = _state.load(std::memory_order_acquire);
+                      return x == Lifecycle::Running || x == Lifecycle::Stopped;
+                    });
+      // Re-evaluate: a start() may have driven Starting->Running (we then tear that down).
     }
 
-    _running.store(false);
-
-    // Stop cleanup timer. Flip the flag UNDER _cleanupMutex so the wakeup cannot be
-    // lost against the cleanup thread's predicate re-check (item 7), but notify + join
-    // OUTSIDE the lock -- holding _cleanupMutex across join() would deadlock (the
-    // cleanup thread must re-acquire it to exit wait_for).
+    // Step 2 — stop the cleanup sweeper. Flip the flag UNDER _cleanupMutex so the wakeup
+    // cannot be lost against the cleanup thread's predicate re-check, notify, then MOVE the
+    // thread to a local (joined lock-free at step 5). Do NOT hold _cleanupMutex across the
+    // join. _cleanupThreadId (the stamped exemption id) is member-independent and survives
+    // this move, so a re-entrant stop() from the cleanup thread is still exempt at step 1.
     {
       std::lock_guard<std::mutex> clk(_cleanupMutex);
       _cleanupRunning.store(false);
     }
     _cleanupCv.notify_all();
-    if (_cleanupThread.joinable())
+    cleanupLocal = std::move(_cleanupThread);
+
+    // Step 3 — snapshot the handles into locals; LEAVE the members live (route B / R3-C1).
+    udp = loadUdp();
+    tcp = loadTcp();
+    timer = loadTimer();
+  } // Step 4 — _stateMutex RELEASED here.
+
+  // Step 5 — join/detach the workers with NO DnsTransport lock held. A worker whose
+  // callback re-enters stop()/updateConfig() now takes _stateMutex freely and is exempted.
+  if (cleanupLocal.joinable())
+  {
+    // Self-join guard: stop() may run ON the cleanup thread (a fired sweep callback). A
+    // thread cannot join itself; detach instead (it already observed _cleanupRunning==false).
+    if (cleanupLocal.get_id() == std::this_thread::get_id())
     {
-      // Self-join guard (item 5): stop() may be reached from a callback fired ON the
-      // cleanup thread; a thread cannot join itself (resource_deadlock_would_occur).
-      // Detach instead -- the thread observes _cleanupRunning==false and exits.
-      if (std::this_thread::get_id() == _cleanupThread.get_id())
-      {
-        _cleanupThread.detach();
-      }
-      else
-      {
-        _cleanupThread.join();
-      }
+      cleanupLocal.detach();
     }
-
-    // Teardown ordering (item 2 / M-A + fix B, corrected round 2 for C1/H-1): STOP (join)
-    // every internal thread that reads an owned handle BEFORE RESETTING any handle. Two join
-    // domains read distinct handles:
-    //   - the TimerService thread runs retry lambdas that deref _udpTransport / _tcpTransport;
-    //   - the transport I/O threads run completeQuery -> cancelActiveTimer that derefs
-    //     _timerService.
-    // Resetting either handle before BOTH domains are joined is a use-after-free (fix B closed
-    // the retry-vs-transport arm; resetting _timerService before the I/O join opened the
-    // completeQuery-vs-timer arm -- C1/H-1). So PHASE 1 stops (joins) timer + transports, then
-    // PHASE 2 resets every handle once all joinable readers are quiesced. All UNDER _stateMutex
-    // (start/stop/updateConfig serialized).
-    // Self-join residuals (tracked, not regressed here): the timer arm (stop() on the
-    // TimerService thread joins self -> throws; swallow + do NOT reset, tracker 2026-09-13-5)
-    // and the IO arm (wrapper stop() throws on its own I/O thread -> skip stop(), still reset
-    // -> deferred ~Transport self-destruct, item 6). The broader caller-thread lock-free reads
-    // of these handles racing stop()/updateConfig() are the restructure tracked in
-    // 2026-09-13-11 / 2026-09-13-4, out of scope here.
-
-    // PHASE 1 -- STOP (join every internal thread that reads an owned handle).
-    bool timerStopped = false;
-    if (_timerService)
+    else
     {
-      try
-      {
-        _timerService->stop();
-        timerStopped = true;
-      }
-      catch (...)
-      {
-        // Timer-arm self-join (2026-09-13-5). Leave _timerService intact (skip reset below).
-      }
+      cleanupLocal.join();
     }
-    stopTransportGuarded(_udpTransport);
-    stopTransportGuarded(_tcpTransport);
-
-    // PHASE 2 -- RESET (all joinable readers are now quiesced; no live deref can race these).
-    if (timerStopped)
+  }
+  if (timer)
+  {
+    try
     {
-      _timerService.reset();
+      timer->stop();
+      timerStopped = true;
     }
-    _udpTransport.reset();
-    _tcpTransport.reset();
-
-    // Collect (do NOT fire yet) all pending queries under _queriesMutex.
+    catch (...)
     {
-      std::lock_guard<std::mutex> qlock(_queriesMutex);
-      toFail.reserve(_pendingQueries.size());
-      for (auto &[key, query] : _pendingQueries)
-      {
-        toFail.push_back(query);
-      }
-      _pendingQueries.clear();
+      // Timer-arm self-join (tracker 2026-09-13-5): stop() reached from a fired timer
+      // callback joins its own thread -> throws. Swallow and leave the timer member intact
+      // (skip its null at step 8) — the deeper fix is -5's, out of scope here (INV-5).
     }
+  }
+  stopTransportGuarded(udp);
+  stopTransportGuarded(tcp);
 
-    // Clear session mappings. The buffered queries in _pendingOnConnect are also
-    // registered in _pendingQueries (collected/failed below), so dropping the buffer
-    // here does not lose them — it just discards the now-defunct connect state.
+  // Step 6 — collect pending queries (do NOT fire) and clear session/buffer state.
+  {
+    std::lock_guard<std::mutex> qlock(_queriesMutex);
+    toFail.reserve(_pendingQueries.size());
+    for (auto &[key, query] : _pendingQueries)
     {
-      std::lock_guard<std::mutex> slock(_sessionsMutex);
-      _serverSessions.clear();
-      _sessionToServer.clear();
-      _connectedSessions.clear();
-      _pendingOnConnect.clear();
+      toFail.push_back(query);
     }
+    _pendingQueries.clear();
+  }
+  {
+    // The buffered queries in _pendingOnConnect are also registered in _pendingQueries
+    // (collected/failed above), so dropping the buffer here loses nothing.
+    std::lock_guard<std::mutex> slock(_sessionsMutex);
+    _serverSessions.clear();
+    _sessionToServer.clear();
+    _connectedSessions.clear();
+    _pendingOnConnect.clear();
+  }
+  {
+    std::lock_guard<std::mutex> tlock(_tcpBuffersMutex);
+    _tcpBuffers.clear();
+  }
 
-    // Clear TCP buffers
-    {
-      std::lock_guard<std::mutex> tlock(_tcpBuffersMutex);
-      _tcpBuffers.clear();
-    }
-  } // _stateMutex released here
-
-  // Fire the collected failures with NO DnsTransport lock held (F-3 / item 2).
+  // Step 7 — FIRE the collected failures with NO lock held, BEFORE publishing Stopped
+  // (H-2 ordering): a dtor/stop() waiter released by Stopped must not be able to destroy
+  // _stateCv while a callback here is still running.
   auto error = std::make_exception_ptr(DnsTransportException("Transport stopped"));
   failCollected(toFail, error);
+
+  // Step 8 — publish the terminal state + null the handle members + notify, all under
+  // _stateMutex (notify-under-lock). Only now (after every join + callback) do the members
+  // go null, so a genuinely external waiter released here observes a fully torn-down object.
+  {
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    _udpTransport.store(std::shared_ptr<Transport>{});
+    _tcpTransport.store(std::shared_ptr<Transport>{});
+    if (timerStopped)
+    {
+      // Timer-arm self-join leaves the member intact (INV-5): a stop() on the timer thread
+      // did not actually join it, so nulling it would drop a still-live service.
+      _timerService.store(std::shared_ptr<core::TimerService>{});
+    }
+    _stoppingThreadId = std::thread::id{};
+    _state.store(Lifecycle::Stopped, std::memory_order_release);
+    _stateCv.notify_all();
+  }
 }
 
-inline bool DnsTransport::isRunning() const { return _running.load(); }
+inline bool DnsTransport::isRunning() const
+{
+  return _state.load(std::memory_order_acquire) == Lifecycle::Running;
+}
 
 inline DnsResult DnsTransport::query(const DnsQuestion &question, const std::string &server,
                                      std::uint16_t port)
@@ -645,7 +896,7 @@ inline DnsResult DnsTransport::query(const DnsQuestion &question, const std::str
 inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &questions,
                                              const std::string &server, std::uint16_t port)
 {
-  if (!_running.load())
+  if (!isRunning())
   {
     throw DnsTransportException("Transport not running");
   }
@@ -654,6 +905,8 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
   {
     throw DnsTransportException("No questions provided");
   }
+
+  auto cfg = loadConfig(); // INV-2: one config snapshot for this operation.
 
   // Determine target server and port
   DnsServer targetDnsServer;
@@ -679,21 +932,23 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
   auto queryData = prepareQuery(questions, queryId);
 
   // Create pending query with immutable fields (thread-safe constructor)
-  auto query = std::make_shared<PendingQuery>(queryId, _config.timeout, targetServer, targetPort,
+  auto query = std::make_shared<PendingQuery>(queryId, cfg->timeout, targetServer, targetPort,
                                               std::move(queryData));
-  query->transportMode = _config.transportMode;
+  query->transportMode = cfg->transportMode;
 
-  // Create composite key and register pending query
+  // Register pending query via the NEW-6 registration gate (closes -7's orphan-on-stop):
+  // a query racing stop()'s drain either registers (and is drained/failed) or is refused
+  // here — never orphaned past the drain.
   QueryKey key(queryId, targetServer, targetPort);
+  if (!registerPendingIfRunning(key, query))
   {
-    std::lock_guard<std::mutex> lock(_queriesMutex);
-    _pendingQueries[key] = query;
+    throw DnsTransportException("Transport stopped");
   }
 
   try
   {
     // Send initial query (UDP first if Both mode)
-    if (_config.transportMode == DnsTransportMode::TCP)
+    if (cfg->transportMode == DnsTransportMode::TCP)
     {
       sendTcpQuery(query);
     }
@@ -707,8 +962,8 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
     auto maxWaitTime = calculateMaxSyncWaitTime();
     iora::core::Logger::debug(
       "DNS sync query max wait time: " + std::to_string(maxWaitTime.count()) + "ms " +
-      "(timeout=" + std::to_string(_config.timeout.count()) + "ms, " +
-      "retries=" + std::to_string(_config.retryCount) + ")");
+      "(timeout=" + std::to_string(cfg->timeout.count()) + "ms, " +
+      "retries=" + std::to_string(cfg->retryCount) + ")");
     auto status = future.wait_for(maxWaitTime);
 
     if (status == std::future_status::timeout)
@@ -716,7 +971,7 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
       // Count the timeout, then throw -- the single catch(...) below owns removal + timer
       // cancellation (simplification L1/L2: no separate erase here, no double-erase).
       _stats.timeouts.fetch_add(1, std::memory_order_relaxed);
-      throw DnsTimeoutException("Query timeout after " + std::to_string(_config.timeout.count()) +
+      throw DnsTimeoutException("Query timeout after " + std::to_string(cfg->timeout.count()) +
                                 "ms");
     }
 
@@ -739,12 +994,14 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
 inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback callback,
                                      const std::string &server, std::uint16_t port)
 {
-  if (!_running.load())
+  if (!isRunning())
   {
     auto error = std::make_exception_ptr(DnsTransportException("Transport not running"));
     failCallback(callback, error);
     return;
   }
+
+  auto cfg = loadConfig(); // INV-2: one config snapshot for this operation.
 
   // Determine target server and port
   DnsServer targetDnsServer;
@@ -770,22 +1027,25 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
   auto queryData = prepareQuery({question}, queryId);
 
   // Create pending query with immutable fields (thread-safe constructor)
-  auto query = std::make_shared<PendingQuery>(queryId, _config.timeout, targetServer, targetPort,
+  auto query = std::make_shared<PendingQuery>(queryId, cfg->timeout, targetServer, targetPort,
                                               std::move(queryData));
-  query->transportMode = _config.transportMode;
+  query->transportMode = cfg->transportMode;
   query->callback = std::move(callback);
 
-  // Create composite key and register pending query
+  // Register pending query via the NEW-6 registration gate (see queryMultiple). On refusal
+  // fire the callback OUTSIDE _queriesMutex (copy-then-invoke / HR-3).
   QueryKey key(queryId, targetServer, targetPort);
+  if (!registerPendingIfRunning(key, query))
   {
-    std::lock_guard<std::mutex> lock(_queriesMutex);
-    _pendingQueries[key] = query;
+    auto error = std::make_exception_ptr(DnsTransportException("Transport stopped"));
+    failOne(query, error);
+    return;
   }
 
   try
   {
     // Send query
-    if (_config.transportMode == DnsTransportMode::TCP)
+    if (cfg->transportMode == DnsTransportMode::TCP)
     {
       sendTcpQuery(query);
     }
@@ -880,7 +1140,8 @@ inline std::string DnsTransport::serverKey(const std::string &server, std::uint1
 
 inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
 {
-  if (!_udpTransport)
+  auto udp = loadUdp(); // INV-2: one handle snapshot; a mid/post-stop send fails cleanly.
+  if (!udp)
   {
     throw DnsTransportException("UDP transport not available");
   }
@@ -910,7 +1171,7 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
       // Create new session. connect() only enqueues the session; it is registered
       // asynchronously on the I/O thread, so an immediate send would be rejected by
       // CF-H1 (sessionSendable == false). Defer the send to handleConnect.
-      auto cr = _udpTransport->connect(query->server, query->port, TlsMode::None);
+      auto cr = udp->connect(query->server, query->port, TlsMode::None);
       if (cr.isErr())
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
@@ -939,7 +1200,7 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
   // copy-then-send: _sessionsMutex is released above; never send under the lock.
   if (sendNow)
   {
-    bool sent = _udpTransport->send(sessionId, query->queryData.data(), query->queryData.size());
+    bool sent = udp->send(sessionId, query->queryData.data(), query->queryData.size());
     if (!sent)
     {
       iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
@@ -971,7 +1232,8 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
 
 inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
 {
-  if (!_tcpTransport)
+  auto tcp = loadTcp(); // INV-2: one handle snapshot; a mid/post-stop send fails cleanly.
+  if (!tcp)
   {
     throw DnsTransportException("TCP transport not available");
   }
@@ -996,7 +1258,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
       // Create new session. connect() only enqueues the session; TCP additionally
       // needs the 3-way handshake before onConnect fires, so an immediate send would
       // be rejected by CF-H1 (sessionSendable == false). Defer to handleConnect.
-      auto cr = _tcpTransport->connect(query->server, query->port, TlsMode::None);
+      auto cr = tcp->connect(query->server, query->port, TlsMode::None);
       if (cr.isErr())
       {
         throw DnsTransportException("Failed to connect to DNS server " + query->server);
@@ -1031,7 +1293,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
     tcpMessage.push_back(length & 0xFF);
     tcpMessage.insert(tcpMessage.end(), query->queryData.begin(), query->queryData.end());
 
-    bool sent = _tcpTransport->send(sessionId, tcpMessage.data(), tcpMessage.size());
+    bool sent = tcp->send(sessionId, tcpMessage.data(), tcpMessage.size());
     if (!sent)
     {
       iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
@@ -1115,17 +1377,25 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
   };
   std::vector<ReadyMessage> ready;
 
+  // INV-2 snapshots: one config + one TCP-handle snapshot for this call. A null handle
+  // (transport torn down by a concurrent stop()) makes the close sites clean no-ops.
+  auto cfg = loadConfig();
+  auto tcp = loadTcp();
+
   {
     std::lock_guard<std::mutex> lock(_tcpBuffersMutex);
     auto &buffer = _tcpBuffers[sessionId];
 
     // Prevent unbounded buffer growth using configured limit
-    if (buffer.size() + data.size() > _config.maxTcpBufferSize)
+    if (buffer.size() + data.size() > cfg->maxTcpBufferSize)
     {
       // Clear buffer and close session on excessive buffer growth. Nothing has been
       // collected yet, so an early return here drops no completions.
       buffer.clear();
-      _tcpTransport->close(sessionId);
+      if (tcp)
+      {
+        tcp->close(sessionId);
+      }
       return;
     }
 
@@ -1137,7 +1407,10 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
     auto abortFraming = [&]()
     {
       buffer.clear();
-      _tcpTransport->close(sessionId);
+      if (tcp)
+      {
+        tcp->close(sessionId);
+      }
     };
 
     // Process complete messages
@@ -1155,11 +1428,11 @@ inline void DnsTransport::handleTcpData(SessionId sessionId, iora::core::BufferV
       }
 
       // Reject a frame larger than the configured TCP buffer cap.
-      if (messageLength > _config.maxTcpBufferSize)
+      if (messageLength > cfg->maxTcpBufferSize)
       {
         iora::core::Logger::error(
           "DNS TCP message too large: " + std::to_string(messageLength) +
-          " bytes, max=" + std::to_string(_config.maxTcpBufferSize));
+          " bytes, max=" + std::to_string(cfg->maxTcpBufferSize));
         abortFraming();
         break;
       }
@@ -1235,7 +1508,7 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
         " from " + sourceServer + ":" + std::to_string(sourcePort));
 
       // Find and retry with TCP if configured
-      if (_config.transportMode == DnsTransportMode::Both)
+      if (loadConfig()->transportMode == DnsTransportMode::Both)
       {
         std::lock_guard<std::mutex> lock(_queriesMutex);
         auto it = _pendingQueries.find(key);
@@ -1314,7 +1587,7 @@ inline void DnsTransport::handleConnect(SessionId sessionId, const TransportAddr
   // the two engines, so we must not send a UDP datagram on the TCP transport or
   // vice versa). Timeout/stats were already handled when the query was buffered,
   // so a send failure here is left to the already-scheduled timeout/retry path.
-  std::shared_ptr<Transport> transport = isTcp ? _tcpTransport : _udpTransport;
+  std::shared_ptr<Transport> transport = isTcp ? loadTcp() : loadUdp(); // INV-2 snapshot
   if (!transport)
   {
     return; // Transport torn down; buffered queries will time out.
@@ -1427,17 +1700,20 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
 
 inline DnsServer DnsTransport::getNextServer()
 {
-  if (_config.servers.empty())
+  // INV-2 (L-1): pin ONE config snapshot so the size, the index, and the element are read
+  // from the same immutable servers vector — a concurrent updateConfig() cannot tear it.
+  auto cfg = loadConfig();
+  if (cfg->servers.empty())
   {
     throw DnsTransportException("No DNS servers configured");
   }
 
-  std::size_t index = _serverIndex.fetch_add(1) % _config.servers.size();
-  DnsServer selectedServer = _config.servers[index];
+  std::size_t index = _serverIndex.fetch_add(1) % cfg->servers.size();
+  DnsServer selectedServer = cfg->servers[index];
 
   iora::core::Logger::info("DNS getNextServer: selected server=" + selectedServer.toString() +
                            " (index=" + std::to_string(index) + " of " +
-                           std::to_string(_config.servers.size()) + " servers)");
+                           std::to_string(cfg->servers.size()) + " servers)");
 
   return selectedServer;
 }
@@ -1445,7 +1721,7 @@ inline DnsServer DnsTransport::getNextServer()
 inline std::vector<std::uint8_t>
 DnsTransport::prepareQuery(const std::vector<DnsQuestion> &questions, std::uint16_t queryId)
 {
-  return DnsMessage::buildQuery(questions, _config.recursionDesired, queryId);
+  return DnsMessage::buildQuery(questions, loadConfig()->recursionDesired, queryId);
 }
 
 inline DnsTransport::Statistics DnsTransport::getStatistics() const
@@ -1478,48 +1754,55 @@ inline void DnsTransport::resetStatistics()
 
 inline void DnsTransport::updateConfig(const DnsConfig &config)
 {
-  std::lock_guard<std::mutex> lock(_stateMutex);
-  _config = config;
-
-  if (_config.servers.empty())
+  // DE-LATCHED (M-2): updateConfig changes no lifecycle state, so it takes NEITHER
+  // _stateMutex NOR _stateCv (folding tracker 2026-09-13-4). It validates first, then
+  // atomically publishes an immutable snapshot (INV-2) that every reader picks up via
+  // loadConfig(). Validate-before-publish (the old code assigned then threw, leaving an
+  // empty config live).
+  if (config.servers.empty())
   {
     throw DnsTransportException("No DNS servers configured");
   }
 
   // DnsServer structures are already normalized via fromString()
   // No additional normalization needed
+  _config.store(std::make_shared<const DnsConfig>(config));
 }
 
 inline std::chrono::milliseconds DnsTransport::calculateMaxSyncWaitTime() const
 {
+  // INV-2 (L-1): pin ONE config snapshot — this reads six config fields, which must all
+  // come from the same immutable config a concurrent updateConfig() cannot tear.
+  auto cfg = loadConfig();
+
   // Calculate maximum total wait time for synchronous queries
   // Base timeout for initial attempt
-  auto totalWait = _config.timeout;
+  auto totalWait = cfg->timeout;
 
   // Calculate retry delays with exponential backoff and accurate per-retry jitter
-  auto delay = _config.initialRetryDelay;
+  auto delay = cfg->initialRetryDelay;
   std::chrono::milliseconds totalJitter{0};
 
-  for (int retry = 0; retry < _config.retryCount; ++retry)
+  for (int retry = 0; retry < cfg->retryCount; ++retry)
   {
     totalWait += delay;
 
     // Calculate jitter for this specific retry delay (more accurate than using maxRetryDelay)
-    if (_config.jitterFactor > 0.0)
+    if (cfg->jitterFactor > 0.0)
     {
       // Worst case: this retry gets maximum positive jitter based on actual delay
       auto jitterForThisRetry =
-        std::chrono::milliseconds(static_cast<long>(delay.count() * _config.jitterFactor));
+        std::chrono::milliseconds(static_cast<long>(delay.count() * cfg->jitterFactor));
       totalJitter += jitterForThisRetry;
     }
 
     // Apply exponential backoff multiplier
-    delay = std::chrono::milliseconds(static_cast<long>(delay.count() * _config.retryMultiplier));
+    delay = std::chrono::milliseconds(static_cast<long>(delay.count() * cfg->retryMultiplier));
 
     // Cap at maximum delay
-    if (delay > _config.maxRetryDelay)
+    if (delay > cfg->maxRetryDelay)
     {
-      delay = _config.maxRetryDelay;
+      delay = cfg->maxRetryDelay;
     }
   }
 
@@ -1617,15 +1900,30 @@ DnsTransport::takePending(const QueryKey &key)
   return query;
 }
 
+inline bool DnsTransport::registerPendingIfRunning(const QueryKey &key,
+                                                   const std::shared_ptr<PendingQuery> &query)
+{
+  std::lock_guard<std::mutex> lock(_queriesMutex);
+  if (_state.load(std::memory_order_acquire) != Lifecycle::Running)
+  {
+    return false;
+  }
+  _pendingQueries[key] = query;
+  return true;
+}
+
 inline void DnsTransport::cancelActiveTimer(const std::shared_ptr<PendingQuery> &query)
 {
   // Atomically CLAIM the timer id (item I / TSA-LOW-2: exchange, not load-then-store, so a
   // concurrent completeQuery cannot read the same non-zero id and double-cancel it). Guard
   // _timerService -- a concurrent stop() may have reset it (M-D).
   std::uint64_t activeTimer = query->activeTimerId.exchange(0, std::memory_order_relaxed);
-  if (activeTimer != 0 && _timerService)
+  if (activeTimer != 0)
   {
-    _timerService->cancel(activeTimer);
+    if (auto timer = loadTimer()) // INV-2: a concurrent stop() may have nulled the handle.
+    {
+      timer->cancel(activeTimer);
+    }
   }
 }
 
@@ -1805,6 +2103,12 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const std::exceptio
 inline void DnsTransport::startCleanupTimer()
 {
   _cleanupRunning.store(true);
+  // Resurrect-guard generation (H / phase 4): bump and capture the fresh value. A stale
+  // detached cleanup thread from a prior self-stop captured an OLDER generation, so it
+  // exits at its next check even if this restart re-set _cleanupRunning=true — at most one
+  // live sweeper survives a restart (LOW-4: bumped HERE by the next start(), not at detach).
+  const std::uint64_t myGeneration =
+    _cleanupGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
   // Capture a weak_ptr, NOT an owning shared_from_this() (tracker 2026-09-11-6 item 10):
   // an owning capture forms a DnsTransport -> _cleanupThread -> self reference cycle, so a
   // DnsTransport dropped without an explicit stop() would never be destroyed. Promote to
@@ -1813,12 +2117,40 @@ inline void DnsTransport::startCleanupTimer()
   // is gone, so the detached thread exits without touching freed state.
   std::weak_ptr<DnsTransport> weakSelf = weak_from_this();
   _cleanupThread = std::thread(
-    [weakSelf]()
+    [weakSelf, myGeneration]()
     {
+      // Stamp this thread's id for the teardown-latch exemption (R3-C1). Uses the
+      // member-INDEPENDENT _cleanupThreadId (NOT _cleanupThread.get_id(), which stop() step 2
+      // moves out before releasing _stateMutex). clearIfCurrent() on exit so a resurrected
+      // sibling that already re-stamped its own id is not clobbered.
+      {
+        auto self = weakSelf.lock();
+        if (!self)
+        {
+          return;
+        }
+        self->_cleanupThreadId.stamp();
+        self->_cleanupThreadCount.fetch_add(1, std::memory_order_relaxed);
+      }
+      struct StampGuard
+      {
+        std::weak_ptr<DnsTransport> w;
+        ~StampGuard()
+        {
+          if (auto s = w.lock())
+          {
+            s->_cleanupThreadId.clearIfCurrent();
+            s->_cleanupThreadCount.fetch_sub(1, std::memory_order_relaxed);
+          }
+        }
+      } stampGuard{weakSelf};
+
       for (;;)
       {
         auto self = weakSelf.lock();
-        if (!self || !self->_cleanupRunning.load())
+        // Exit on shutdown OR on a generation mismatch (a restart minted a newer sweeper).
+        if (!self || !self->_cleanupRunning.load() ||
+            self->_cleanupGeneration.load(std::memory_order_acquire) != myGeneration)
         {
           break;
         }
@@ -1845,8 +2177,9 @@ inline void DnsTransport::startCleanupTimer()
 inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> query)
 {
   // Defensive: if the timer service is already gone (stop() in progress), do not
-  // schedule -- the pending query will be drained by stop() (M-D null-guard).
-  if (!_timerService)
+  // schedule -- the pending query will be drained by stop() (M-D null-guard). INV-2 snapshot.
+  auto timer = loadTimer();
+  if (!timer)
   {
     return;
   }
@@ -1859,19 +2192,19 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
   cancelActiveTimer(query);
 
   // Schedule a timeout timer for the configured query timeout
-  std::uint64_t timerId = _timerService->scheduleAfter(
+  std::uint64_t timerId = timer->scheduleAfter(
     query->timeout,
     [weakSelf, query]()
     {
       auto self = weakSelf.lock();
       // Check if transport is still alive/running before accessing any members
-      if (!self || !self->_running.load())
+      if (!self || !self->isRunning())
       {
         return; // Transport has been stopped/destroyed
       }
 
-      // Also check if timer service is still valid (defensive programming)
-      if (!self->_timerService)
+      // Also check if timer service is still valid (defensive programming) — INV-2 snapshot.
+      if (!self->loadTimer())
       {
         return; // Timer service has been destroyed
       }
@@ -1909,6 +2242,7 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
 inline void DnsTransport::cleanupExpiredQueries()
 {
   auto now = std::chrono::steady_clock::now();
+  auto cfg = loadConfig(); // INV-2: one config snapshot for this sweep.
   std::vector<std::shared_ptr<PendingQuery>> retryList;
   std::vector<std::shared_ptr<PendingQuery>> failList;
 
@@ -1925,7 +2259,7 @@ inline void DnsTransport::cleanupExpiredQueries()
       auto &query = it->second;
       if (now - query->startTime.load() > query->timeout)
       {
-        if (query->retryCount.load() < _config.retryCount)
+        if (query->retryCount.load() < cfg->retryCount)
         {
           retryList.push_back(query);
           ++it;
@@ -1969,12 +2303,15 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
   // Defensive (M-D): if the timer service is gone (stop() in progress / a prior fail
   // callback called stop()), do not touch it -- leave the query in the map for stop()'s
   // drain to fail. This makes the cleanup retryList-before-failList ordering robust.
-  if (!_timerService)
+  // INV-2 snapshots: one timer handle + one config for this retry.
+  auto timer = loadTimer();
+  if (!timer)
   {
     return;
   }
+  auto cfg = loadConfig();
 
-  if (query->retryCount.load() >= _config.retryCount)
+  if (query->retryCount.load() >= cfg->retryCount)
   {
     // Maximum retries exceeded, complete with error
     // Log total attempts made (retryCount + 1 = initial attempt + retries)
@@ -1989,26 +2326,32 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
   }
 
   // Calculate exponential backoff delay with jitter
-  auto baseDelay = _config.initialRetryDelay;
+  auto baseDelay = cfg->initialRetryDelay;
   for (int i = 0; i < query->retryCount.load(); ++i)
   {
     baseDelay =
-      std::chrono::milliseconds(static_cast<long>(baseDelay.count() * _config.retryMultiplier));
+      std::chrono::milliseconds(static_cast<long>(baseDelay.count() * cfg->retryMultiplier));
   }
 
   // Cap at maximum delay
-  if (baseDelay > _config.maxRetryDelay)
+  if (baseDelay > cfg->maxRetryDelay)
   {
-    baseDelay = _config.maxRetryDelay;
+    baseDelay = cfg->maxRetryDelay;
   }
 
-  // Add jitter to prevent thundering herd
-  if (_config.jitterFactor > 0.0)
+  // Add jitter to prevent thundering herd. Draw under _rngMutex (TS-HIGH-1): the resurrect
+  // window can transiently overlap two cleanup sweepers, and a concurrent draw from the
+  // non-atomic mt19937 would be a data race. The lock scopes ONLY the draw (an innermost
+  // leaf), not the schedule below.
+  if (cfg->jitterFactor > 0.0)
   {
-    std::uniform_real_distribution<double> dis(1.0 - _config.jitterFactor,
-                                               1.0 + _config.jitterFactor);
+    std::uniform_real_distribution<double> dis(1.0 - cfg->jitterFactor, 1.0 + cfg->jitterFactor);
 
-    auto jitter = dis(_rng);
+    double jitter;
+    {
+      std::lock_guard<std::mutex> rngLock(_rngMutex);
+      jitter = dis(_rng);
+    }
     baseDelay = std::chrono::milliseconds(static_cast<long>(baseDelay.count() * jitter));
   }
 
@@ -2032,13 +2375,13 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
   // Schedule retry after delay using timer service (avoids sleeping in worker threads).
   // Weak capture (item 10) to avoid the DnsTransport -> _timerService -> lambda -> self cycle.
   std::weak_ptr<DnsTransport> weakSelf = weak_from_this();
-  std::uint64_t timerId = _timerService->scheduleAfter(
+  std::uint64_t timerId = timer->scheduleAfter(
     baseDelay,
     [weakSelf, query]()
     {
       auto self = weakSelf.lock();
       // Check if transport is still alive/running before accessing any members
-      if (!self || !self->_running.load())
+      if (!self || !self->isRunning())
       {
         return; // Transport has been stopped/destroyed
       }

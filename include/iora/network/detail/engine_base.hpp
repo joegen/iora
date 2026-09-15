@@ -3,6 +3,7 @@
 #error "Linux-only (epoll/eventfd/timerfd)"
 #endif
 
+#include "iora/core/atomic_thread_id.hpp"
 #include "iora/core/buffer_view.hpp"
 #include "iora/network/transport_types.hpp"
 
@@ -165,10 +166,7 @@ public:
   ///    transport-lifecycle refusal) to detect I/O-thread re-entry.
   /// Relaxed ordering suffices: the atomic is only ever equality-compared to
   /// this_thread::get_id() and publishes no companion data.
-  bool isOnIoThread() const noexcept
-  {
-    return _ioThreadId.load(std::memory_order_relaxed) == std::this_thread::get_id();
-  }
+  bool isOnIoThread() const noexcept { return _ioThreadId.isCurrentThread(); }
 
   // Emergency detach for destruction from I/O thread.
   // Sets _running=false and detaches the I/O thread so that the engine's
@@ -205,20 +203,14 @@ protected:
   /// \brief Stamp the current thread as the I/O thread. Call FIRST-THING in the
   /// concrete engine's loop thread, before any dispatch, so isOnIoThread() is
   /// valid for the whole loop lifetime.
-  void stampIoThread() noexcept
-  {
-    _ioThreadId.store(std::this_thread::get_id(), std::memory_order_relaxed);
-  }
+  void stampIoThread() noexcept { _ioThreadId.stamp(); }
 
   /// \brief Clear the I/O-thread stamp. Call at loop exit, AFTER loop()/drain
   /// has unwound and BEFORE the self-destruct deleter runs (the deleter may free
   /// the owning object, after which touching _ioThreadId would be a UAF). Reset
   /// to the default id so isOnIoThread() correctly returns false post-detach and
   /// never yields a recycled-thread-id false positive.
-  void clearIoThread() noexcept
-  {
-    _ioThreadId.store(std::thread::id{}, std::memory_order_relaxed);
-  }
+  void clearIoThread() noexcept { _ioThreadId.clear(); }
 
   /// \brief Shared post gate captured by resolver continuations. Re-created in
   /// each derived engine's start() before the loop; closed (closed=true,
@@ -227,10 +219,10 @@ protected:
   std::shared_ptr<EnginePostGate> _postGuard;
 
 private:
-  // Published I/O-thread identity for isOnIoThread(). std::thread::id is
-  // trivially copyable, so std::atomic<std::thread::id> is lock-free on Linux
-  // (id wraps pthread_t). Default-constructed (== no I/O thread) until stamped.
-  std::atomic<std::thread::id> _ioThreadId{};
+  // Published I/O-thread identity for isOnIoThread() (iora::core::AtomicThreadId
+  // is the shared home of this stamp/clear/compare idiom). Default (== no I/O
+  // thread) until stampIoThread().
+  iora::core::AtomicThreadId _ioThreadId;
 };
 
 } // namespace detail

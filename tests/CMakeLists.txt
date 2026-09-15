@@ -71,6 +71,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_comprehensive
     network/iora_test_dns_transport_sid_keying
     network/iora_test_dns_transport_callback_deadlock
+    network/iora_test_dns_transport_lifecycle_restructure
     network/iora_test_http
     network/iora_test_http_request_framing
     network/iora_test_http_framing_detail
@@ -544,6 +545,11 @@ set(IORA_SANITIZED_TEST_TARGETS
     # phase-split stop() UAF fix is a cross-thread teardown-ordering property a non-TSan
     # soak cannot observe -- this target carries the cross-thread external-stop() probe.
     iora_test_dns_transport_callback_deadlock
+
+    # DnsTransport stop()/lifecycle RESTRUCTURE (tracker 2026-09-13-11): the atomic-published
+    # config/handle reads racing stop()/updateConfig() are a cross-thread data-race property
+    # only TSan can prove clean -- this target carries the C-race probe.
+    iora_test_dns_transport_lifecycle_restructure
 
     iora_test_name_resolver
     iora_test_tcp_engine_resolve
