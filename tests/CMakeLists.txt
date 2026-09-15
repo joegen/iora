@@ -70,6 +70,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_async
     network/iora_test_dns_comprehensive
     network/iora_test_dns_transport_sid_keying
+    network/iora_test_dns_transport_callback_deadlock
     network/iora_test_http
     network/iora_test_http_request_framing
     network/iora_test_http_framing_detail
@@ -538,6 +539,11 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race
     iora_test_batch_processor
+
+    # DnsTransport callback-under-lock / teardown cluster (tracker 2026-09-11-6): the
+    # phase-split stop() UAF fix is a cross-thread teardown-ordering property a non-TSan
+    # soak cannot observe -- this target carries the cross-thread external-stop() probe.
+    iora_test_dns_transport_callback_deadlock
 
     iora_test_name_resolver
     iora_test_tcp_engine_resolve
