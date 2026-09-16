@@ -1842,8 +1842,31 @@ protected:
                                 {
                                   if (!result.isOk())
                                   {
-                                    iora::core::Logger::error("Failed to send HTTP response: " +
-                                                              result.error().message);
+                                    // A pre-response send failure. The leading (but
+                                    // not only) cause is a client request half-close:
+                                    // the peer sent shutdown(SHUT_WR) after its
+                                    // request, the transport saw read-half EOF and
+                                    // closed the session (recv()==0 => close; iora does
+                                    // NOT support request half-close, RFC 9112 §9.6),
+                                    // and this response was dropped. Also fires on peer
+                                    // RST / backpressure close / shutdown — a
+                                    // hypothesis over any pre-response drop, not a
+                                    // positive half-close detector, so the prefix states
+                                    // only the observed fact and result.error().message
+                                    // carries the authoritative cause. Covers only the
+                                    // deterministic (session-gone-at-send) case; racy
+                                    // enqueue-then-close drops stay silent here (see
+                                    // tracker 2026-09-14-4 / backlog 2026-09-16-1).
+                                    // Logged at warning, not error: a request half-close
+                                    // is a legitimate (if unsupported) client action, so
+                                    // it must not read as a server error at scale.
+                                    iora::core::Logger::warning(
+                                      "Failed to send HTTP response (session " +
+                                      std::to_string(session) +
+                                      "): connection closed before the response was "
+                                      "written (possible request half-close, RFC 9112 "
+                                      "§9.6): " +
+                                      result.error().message);
                                     // relaxed: the atomic carries no dependent data
                                     // and completion is synchronous on this thread.
                                     sendOutcome->store(SendOutcome::Failed,

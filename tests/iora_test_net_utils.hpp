@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <netinet/in.h>
@@ -19,11 +20,14 @@
 namespace testnet
 {
 
-/// \brief Get a free TCP port. If minPort/maxPort are 0, the OS assigns one.
-/// Sets SO_REUSEADDR to reduce TOCTOU race with parallel tests.
-inline std::uint16_t getFreePortTCP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
+/// \brief Get a free port for `sockType` (SOCK_STREAM or SOCK_DGRAM). If minPort/maxPort
+/// are 0, the OS assigns one; otherwise the first bindable port in [minPort,maxPort] is
+/// returned. Sets SO_REUSEADDR to reduce the TOCTOU race with parallel tests. Shared
+/// core for getFreePortTCP/getFreePortUDP (simplification review, tracker 2026-09-14-4).
+inline std::uint16_t getFreePort(int sockType, std::uint16_t minPort = 0,
+                                 std::uint16_t maxPort = 0)
 {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  int fd = ::socket(AF_INET, sockType, 0);
   REQUIRE(fd >= 0);
 
   int reuse = 1;
@@ -59,44 +63,16 @@ inline std::uint16_t getFreePortTCP(std::uint16_t minPort = 0, std::uint16_t max
   return port;
 }
 
+/// \brief Get a free TCP port. If minPort/maxPort are 0, the OS assigns one.
+inline std::uint16_t getFreePortTCP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
+{
+  return getFreePort(SOCK_STREAM, minPort, maxPort);
+}
+
 /// \brief Get a free UDP port. If minPort/maxPort are 0, the OS assigns one.
-/// Sets SO_REUSEADDR to reduce TOCTOU race with parallel tests.
 inline std::uint16_t getFreePortUDP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
 {
-  int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-  REQUIRE(fd >= 0);
-
-  int reuse = 1;
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-  if (minPort > 0 && maxPort >= minPort)
-  {
-    for (std::uint16_t p = minPort; p <= maxPort; ++p)
-    {
-      addr.sin_port = htons(p);
-      if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
-      {
-        ::close(fd);
-        return p;
-      }
-    }
-    ::close(fd);
-    REQUIRE(false); // No free port in range
-    return 0;
-  }
-
-  addr.sin_port = 0;
-  REQUIRE(::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
-
-  socklen_t len = sizeof(addr);
-  REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) == 0);
-  std::uint16_t port = ntohs(addr.sin_port);
-  ::close(fd);
-  return port;
+  return getFreePort(SOCK_DGRAM, minPort, maxPort);
 }
 
 /// \brief A TCP endpoint that is BOUND but NOT listening: a connect() to it gets
@@ -151,6 +127,34 @@ private:
   std::uint16_t _port{0};
 };
 
+/// \brief Open a blocking loopback TCP socket to 127.0.0.1:`port`, apply an
+/// `SO_RCVTIMEO` receive timeout, and connect. Returns the connected fd, or -1 on any
+/// socket/connect failure (the fd is closed before -1 is returned). The shared prologue
+/// for the raw-socket test helpers below (de-duplicated per the simplification review,
+/// tracker 2026-09-14-4). The receive-timeout bound turns a close-handling regression
+/// into a diagnosable failure instead of a CI hang for the recv-until-EOF callers.
+inline int connectLoopbackTcp(int port, int rcvTimeoutSec = 15)
+{
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0)
+  {
+    return -1;
+  }
+  struct timeval rcvTimeout{};
+  rcvTimeout.tv_sec = rcvTimeoutSec;
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
+  {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 /// \brief Send raw request bytes to a loopback TCP port and return the full raw
 /// HTTP response (or "" on any socket error). Used where HttpClient's map API
 /// cannot express the wire form — an OPTIONS preflight, or duplicate header
@@ -159,26 +163,15 @@ private:
 /// jsonrpc gzip request/response tests, which each had a byte-identical copy.)
 inline std::string rawHttpRequest(int port, const std::string &requestBytes)
 {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  // Reads until EOF, relying on the server honoring "Connection: close".
+  int fd = connectLoopbackTcp(port);
   if (fd < 0)
   {
     return "";
   }
-  // Bound the blocking recv loop: this helper reads until EOF, relying on the
-  // server honoring "Connection: close". A close-handling regression would
-  // otherwise hang the caller forever (no default socket timeout) — a generous
-  // receive timeout turns that into a diagnosable failure instead of a CI hang.
-  struct timeval rcvTimeout{};
-  rcvTimeout.tv_sec = 15;
-  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, sizeof(rcvTimeout));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<std::uint16_t>(port));
-  addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
   std::string out;
-  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
-      ::send(fd, requestBytes.data(), requestBytes.size(), 0) ==
-        static_cast<ssize_t>(requestBytes.size()))
+  if (::send(fd, requestBytes.data(), requestBytes.size(), 0) ==
+      static_cast<ssize_t>(requestBytes.size()))
   {
     char buf[4096];
     ssize_t n;
@@ -189,6 +182,75 @@ inline std::string rawHttpRequest(int port, const std::string &requestBytes)
   }
   ::close(fd);
   return out;
+}
+
+/// \brief Connect to a loopback TCP port, send `payload`, then (if `halfClose`)
+/// immediately `shutdown(SHUT_WR)` with NO intervening delay, and read the server's
+/// reply. Returns the received bytes ("" if none).
+///
+/// Purpose (tracker 2026-09-14-4): pin iora's read-half-EOF => close contract. With
+/// halfClose=true and no delay, the client FIN batches with the request into a single
+/// server-side readAvail drain, so the server hits recv()==0 and closeNow() BEFORE the
+/// (asynchronously enqueued) response drains — the response is dropped. A determinism
+/// caveat the reviewers flagged: the shutdown MUST be back-to-back with the send (no
+/// sleep), or the eventfd wakeup can flush the response before the FIN arrives and mask
+/// the drop.
+///
+/// `halfClose=false` is the executable POSITIVE CONTROL: a normal full-duplex client
+/// (no SHUT_WR) that reads the echo — proves the echo path works, so a drop under
+/// halfClose is specifically the half-close, not a broken fixture. In that mode the
+/// echo server keeps the session open, so the read STOPS once `payload.size()` bytes are
+/// in hand rather than blocking on the 15s SO_RCVTIMEO waiting for an EOF that never
+/// comes (per the cpp17 review); halfClose=true reads to EOF (the server closes).
+inline std::string rawTcpHalfCloseExchange(int port, const std::string &payload,
+                                           bool halfClose)
+{
+  int fd = connectLoopbackTcp(port);
+  if (fd < 0)
+  {
+    return "";
+  }
+  std::string out;
+  if (::send(fd, payload.data(), payload.size(), 0) ==
+      static_cast<ssize_t>(payload.size()))
+  {
+    if (halfClose)
+    {
+      // Back-to-back with the send, NO delay (determinism — see doc above).
+      ::shutdown(fd, SHUT_WR);
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0)
+    {
+      out.append(buf, static_cast<std::size_t>(n));
+      // Positive-control path (no half-close): the echo server never closes on its
+      // own, so stop once the full echo is in hand instead of stalling to timeout.
+      if (!halfClose && out.size() >= payload.size())
+      {
+        break;
+      }
+    }
+  }
+  ::close(fd);
+  return out;
+}
+
+/// \brief Confirm a TLS test cert file is present/readable; WARN and return false if
+/// not (so a TLS test can skip cleanly). The canonical fopen-probe for the raw-TLS test
+/// helpers — the caller builds the path from IORA_TEST_RESOURCE_DIR and passes it in, so
+/// this header need not reference that per-target macro. (Simplification review: shared
+/// with the copy in iora_test_transport.cpp's tlsCertsAvailable.)
+inline bool tlsCertFileReadable(const std::string &certFile)
+{
+  FILE *cf = std::fopen(certFile.c_str(), "r");
+  if (cf == nullptr)
+  {
+    WARN("TLS certs not available at " << certFile << " — skipping TLS test");
+    return false;
+  }
+  std::fclose(cf);
+  return true;
 }
 
 } // namespace testnet

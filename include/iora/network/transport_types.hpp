@@ -207,6 +207,40 @@ enum class ReadMode
   Disabled
 };
 
+/// \brief READ-HALF-CLOSE CONTRACT (tracker 2026-09-14-4, human sign-off 2026-09-16).
+/// For a read-ENABLED session (the normal request/response case), the TCP engine
+/// treats read-half EOF as terminal: recv()==0 (plaintext) and the TLS analogues
+/// (SSL_ERROR_ZERO_RETURN from a peer close_notify; a bare FIN without close_notify
+/// surfacing via the TLSIO error branch) all close the session immediately. A client
+/// that finishes its request and then shutdown(SHUT_WR) — a legitimate TCP half-close
+/// ("done sending; still reading the response") — therefore has its session torn down
+/// before a pending/in-flight response is written, and that response is DROPPED. In
+/// other words: iora does NOT support HTTP request half-close. This is a DELIBERATE,
+/// documented non-conformance with RFC 9112 §9.6 (Tear-down) — which states a client
+/// half-close "does not imply that the client is no longer interested in a response" —
+/// accepted because (a) no first-party or deployed consumer relies on request
+/// half-close, and (b) deferring the close would add a leak/grace-timer state machine
+/// to the transport's teardown-race-sensitive core. The http_server layer logs the
+/// resulting pre-response send failure (with an RFC 9112 §9.6 hint) so the otherwise
+/// silent truncation is diagnosable. Deferred-close support (the §9.6-conformant
+/// behavior) is a CONDITIONAL follow-on: coding_trackers tasks/iora/backlog/2026-09-16-1.
+///
+/// CONTRAST with ReadMode::Disabled above: same wire signal (peer FIN), OPPOSITE
+/// correctness. A read-DISABLED (SSE/write-only) session owes no response, so its peer
+/// FIN (detected via EPOLLRDHUP) CORRECTLY closes; a read-ENABLED session DOES owe a
+/// response, so closing on its peer FIN drops that response — the defect this contract
+/// documents. The two paths are handled separately and must stay separate.
+///
+/// SECOND §9.6 ASPECT (staged close, distinct latent non-conformance). RFC 9112 §9.6
+/// also directs a server to close "in stages" — half-close its write side, then keep
+/// reading — so an immediate full close cannot make the peer's TCP stack RST-discard a
+/// still-unread final response from the client's receive buffer (the RST is triggered
+/// when the fully-closed socket then receives further client data, e.g. a pipelined
+/// request). iora closeNow()s in a
+/// single step rather than staging. This is a SEPARATE §9.6 gap from the request
+/// half-close above; the §9.6-conformant staged/deferred close is tracked with the
+/// deferred-close follow-on: coding_trackers tasks/iora/backlog/2026-09-16-1.
+
 struct TransportAddress
 {
   std::string host;

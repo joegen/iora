@@ -8,9 +8,13 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cstdio>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <vector>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 using namespace std::chrono_literals;
 using TcpEngine = iora::network::TcpEngine;
@@ -36,6 +40,13 @@ struct TcpFixture
   std::atomic<size_t> closeCount{0};
   std::atomic<size_t> errorCount{0};
   std::atomic<size_t> totalBytesReceived{0};
+  // Optional server-side echo delay (ms). Default 0 = echo immediately (existing
+  // tests). The half-close drop test sets it >0 so onData holds the I/O thread long
+  // enough for the client's FIN to arrive and closeNow to run BEFORE the echo is
+  // flushed by the command loop — making the drop deterministic instead of relying on
+  // the client's send()/shutdown() FIN batching (tracker 2026-09-14-4 round-3 M-1).
+  // Set it BEFORE start() so the write happens-before the I/O thread reads it.
+  std::atomic<int> echoDelayMs{0};
 
   std::vector<SessionId> acceptedSessions;
   std::vector<SessionId> connectedSessions;
@@ -85,7 +96,19 @@ struct TcpFixture
       // BufferView stays valid for the callback duration.
       if (echo)
       {
-        tx.send(sid, data.data(), data.size());
+        // Optional delay (default 0): holds the I/O thread so a subsequent client
+        // FIN is seen (recv()==0 -> closeNow) before this echo is flushed. See
+        // echoDelayMs. Copy the bytes first since the delay outlives the BufferView.
+        if (int d = echoDelayMs.load(std::memory_order_relaxed))
+        {
+          std::string owned(reinterpret_cast<const char *>(data.data()), data.size());
+          std::this_thread::sleep_for(std::chrono::milliseconds(d));
+          tx.send(sid, owned.data(), owned.size());
+        }
+        else
+        {
+          tx.send(sid, data.data(), data.size());
+        }
       }
     };
     cbs.onClose = [&](SessionId sid, const TransportErrorInfo &err)
@@ -104,6 +127,25 @@ struct TcpFixture
     tx.setCallbacks(cbs);
   }
 
+  // Join the engine I/O thread while the callback-touched members are still alive.
+  // tx is declared BEFORE those members, so member reverse-destruction would otherwise
+  // free them before ~TcpEngine (which stop()s+joins the I/O thread) runs — a live
+  // callback then touches freed callbackMutex/sessionData. The trailing f.tx.stop() in
+  // each test hides it on the happy path, but a REQUIRE that throws (e.g. a load-induced
+  // waitForCondition timeout) unwinds past that stop() and detonates the UAF. noexcept +
+  // guarded so a stop() during unwinding cannot std::terminate. (tracker 2026-09-13-7;
+  // same fix as ~UdpFixture / ~TlsEchoServer.)
+  ~TcpFixture() noexcept
+  {
+    try
+    {
+      tx.stop();
+    }
+    catch (...)
+    {
+    }
+  }
+
   void reset()
   {
     std::lock_guard<std::mutex> lock(callbackMutex);
@@ -118,14 +160,11 @@ struct TcpFixture
     lastErrMsg.clear();
   }
 
+  // Delegates to the shared iora::test::waitFor poll helper (same predicate-poll-until-
+  // timeout loop); keeps the fixture's own 1000ms default. (simplification review.)
   bool waitForCondition(std::function<bool()> condition, std::chrono::milliseconds timeout = 1000ms)
   {
-    auto start = std::chrono::steady_clock::now();
-    while (!condition() && (std::chrono::steady_clock::now() - start) < timeout)
-    {
-      std::this_thread::sleep_for(5ms);
-    }
-    return condition();
+    return iora::test::waitFor(std::move(condition), timeout);
   }
 
   // Thread-safe snapshot of a session's accumulated bytes: the onData callback
@@ -752,14 +791,30 @@ struct CappedTcpEngine
     tx->setCallbacks(cbs);
   }
 
+  // Delegates to the shared iora::test::waitFor poll helper (keeps the 3000ms default);
+  // same as TcpFixture::waitForCondition. (simplification review.)
   bool waitFor(std::function<bool()> pred, std::chrono::milliseconds cap = 3000ms)
   {
-    auto start = std::chrono::steady_clock::now();
-    while (!pred() && (std::chrono::steady_clock::now() - start) < cap)
+    return iora::test::waitFor(std::move(pred), cap);
+  }
+
+  // Same member-ordering teardown hazard as TcpFixture: tx is declared before the
+  // callback-touched acceptCount/errorCount/mu/lastErrMsg, so join the I/O thread here
+  // (dtor body, members still alive) rather than during ~TcpEngine at member teardown.
+  // A REQUIRE that throws before the test's trailing e.tx->stop() would otherwise unwind
+  // into the UAF. (tracker 2026-09-13-7 secondary-instance sweep; same fix as ~TcpFixture.)
+  ~CappedTcpEngine() noexcept
+  {
+    try
     {
-      std::this_thread::sleep_for(5ms);
+      if (tx)
+      {
+        tx->stop();
+      }
     }
-    return pred();
+    catch (...)
+    {
+    }
   }
 };
 } // namespace
@@ -863,4 +918,296 @@ TEST_CASE("maxSessions of 0 means unlimited on TCP", "[tcp][limits]")
     ::close(fd);
   }
   e.tx->stop();
+}
+
+TEST_CASE("TCP full exchange echoes (positive control for the half-close pin)",
+          "[tcp][halfclose]")
+{
+  // POSITIVE CONTROL for the drop test below: a full-duplex client that does NOT
+  // half-close DOES receive the echo, proving the echo path works. It runs on its OWN
+  // fixture — sharing one fixture with the drop test would latch TcpFixture::serverSid to
+  // whichever client connected first, leaving the other client's session unserviced and
+  // making the drop assertion vacuous (round-2 review HIGH). Same design as the TLS pair.
+  TcpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  std::string echoed = testnet::rawTcpHalfCloseExchange(port, "PING", /*halfClose=*/false);
+  CHECK(echoed.find("PING") != std::string::npos);
+
+  f.tx.stop();
+}
+
+TEST_CASE("TCP read-half-close drops the pending response (recv()==0 close contract)",
+          "[tcp][halfclose]")
+{
+  // tracker 2026-09-14-4: iora tears a session down on read-half EOF (recv()==0). A
+  // client that finishes its request then shutdown(SHUT_WR) (a legitimate TCP
+  // half-close: "done sending, still reading your response") delivers FIN on the
+  // server read half while the response is still being produced (send is async), so
+  // readAvail hits recv()==0 -> closeNow() drops the queued/in-flight response. This
+  // test PINS that deliberate, documented non-conformance with RFC 9112 §9.6
+  // (Tear-down): request half-close is NOT supported. Deferred-close support (fork b)
+  // is the conditional backlog tasks/iora/backlog/2026-09-16-1.
+  //
+  // OWN fixture, ONLY the half-close client connects: it is accepted as the FIRST session
+  // so TcpFixture::serverSid latches to it and the server DOES try to echo to it — the
+  // drop is therefore observable (non-vacuous). Non-vacuity is also demonstrated by the
+  // positive-control test above (same server shape, full-duplex client, echo arrives).
+  TcpFixture f;
+  // Deterministic drop (round-3 M-1): delay the server echo so the client's FIN is
+  // always seen (recv()==0 -> closeNow) BEFORE the echo is flushed. Without this, a
+  // client-thread preemption between send() and shutdown() could let the server drain
+  // data-only, flush the echo, and only then see the FIN — delivering the echo and
+  // false-failing the drop CHECK. Set before start() (happens-before the I/O thread).
+  f.echoDelayMs.store(100);
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+
+  // Send then shutdown(SHUT_WR): the server reads the request, and the echoDelayMs delay
+  // holds the I/O thread until the FIN arrives, so recv()==0 -> closeNow fires and drops
+  // the not-yet-flushed echo. Deterministic regardless of send()/FIN batching.
+  std::string got = testnet::rawTcpHalfCloseExchange(port, "PING", /*halfClose=*/true);
+
+  // The request DID arrive at the server (onData) and the session WAS closed on the
+  // read-half EOF...
+  REQUIRE(f.waitForCondition([&] { return f.dataCount.load() >= 1; }));
+  REQUIRE(f.waitForCondition([&] { return f.closeCount.load() >= 1; }, 3000ms));
+  // ...but the half-closing client received no echo: the echo the server DID attempt for
+  // this (serverSid) session was dropped by the close on read-half EOF.
+  CHECK(got.find("PING") == std::string::npos);
+
+  f.tx.stop();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS read-half-close parity (tracker 2026-09-14-4 phase-1 TLS variants)
+// ─────────────────────────────────────────────────────────────────────────────
+namespace
+{
+/// How a raw TLS client ends its write half after the request.
+enum class TlsClientClose
+{
+  CLEAN_CLOSE_NOTIFY, ///< SSL_shutdown => TLS close_notify => server SSL_ERROR_ZERO_RETURN
+  DIRTY_BARE_FIN,     ///< ::shutdown(SHUT_WR) => bare TCP FIN => server TLSIO branch
+  NO_HALF_CLOSE       ///< full-duplex: no half-close (positive control — echo arrives)
+};
+
+/// A minimal TLS-server TcpEngine (the code under test) with an echo onData handler
+/// and data/close counters. serverTls MUST be configured before the engine is
+/// constructed — TcpEngine copies TransportConfig by value at construction (tracker
+/// 2026-09-13-6), so post-construction cfg mutation would be ignored. All shared state
+/// is atomic (callbacks run on the engine I/O thread; the test thread polls), so no
+/// mutex is needed; the echo uses the sid the callback is handed.
+struct TlsEchoServer
+{
+  TransportConfig cfg{};
+  std::unique_ptr<TcpEngine> tx;
+  std::atomic<size_t> dataCount{0};
+  std::atomic<size_t> closeCount{0};
+  std::atomic<int> lastCloseCode{-1};
+  // See TcpFixture::echoDelayMs — the half-close drop test sets this >0 so the FIN is
+  // seen and closeNow runs before the echo is flushed (deterministic drop, round-3 M-1).
+  // Set before start(). Default 0 keeps the positive control fast.
+  std::atomic<int> echoDelayMs{0};
+
+  TlsEchoServer(const std::string &certFile, const std::string &keyFile)
+  {
+    cfg.serverTls.enabled = true;
+    cfg.serverTls.defaultMode = TlsMode::Server;
+    cfg.serverTls.certFile = certFile;
+    cfg.serverTls.keyFile = keyFile;
+    tx = std::make_unique<TcpEngine>(cfg);
+
+    iora::network::detail::EngineBase::Callbacks cbs{};
+    cbs.onData = [this](SessionId sid, iora::core::BufferView data,
+                        std::chrono::steady_clock::time_point)
+    {
+      dataCount.fetch_add(1);
+      // Echo back: send() only enqueues. On the half-close the session is torn down
+      // (readAvail ZERO_RETURN / TLSIO -> closeNow) before this drains, so the echo is
+      // dropped — the behavior this test pins. The optional echoDelayMs holds the I/O
+      // thread so the FIN-triggered closeNow always precedes the echo flush (copy the
+      // bytes first, since the delay outlives the BufferView).
+      if (int d = echoDelayMs.load(std::memory_order_relaxed))
+      {
+        std::string owned(reinterpret_cast<const char *>(data.data()), data.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(d));
+        tx->send(sid, owned.data(), owned.size());
+      }
+      else
+      {
+        tx->send(sid, data.data(), data.size());
+      }
+    };
+    cbs.onClose = [this](SessionId, const TransportErrorInfo &err)
+    {
+      // Store the code BEFORE bumping the counter: the test reads lastCloseCode only
+      // after observing closeCount>=1, so this publishes the code before that flag.
+      lastCloseCode.store(static_cast<int>(err.code));
+      closeCount.fetch_add(1);
+    };
+    tx->setCallbacks(cbs);
+  }
+
+  // Join the I/O thread while this object is still alive (see ~TcpFixture rationale).
+  ~TlsEchoServer() noexcept
+  {
+    try
+    {
+      if (tx)
+      {
+        tx->stop();
+      }
+    }
+    catch (...)
+    {
+    }
+  }
+};
+
+/// Raw OpenSSL client: TLS handshake, SSL_write(payload), then end the write half per
+/// `mode`, then read the server's reply. Clean/Dirty read to EOF (the server closes);
+/// NO_HALF_CLOSE (positive control) stops once `payload.size()` bytes are in hand, since
+/// the echo server keeps the session open. Leak-free (null-checked SSL/SSL_CTX free;
+/// SSL_set_fd uses BIO_NOCLOSE so the explicit ::close(fd) is the sole fd close).
+inline std::string rawTlsHalfCloseExchange(int port, const std::string &payload,
+                                           TlsClientClose mode)
+{
+  int fd = testnet::connectLoopbackTcp(port);
+  if (fd < 0)
+  {
+    return "";
+  }
+  std::string out;
+  SSL_CTX *ctx = ::SSL_CTX_new(::TLS_client_method());
+  SSL *ssl = nullptr;
+  if (ctx != nullptr)
+  {
+    ssl = ::SSL_new(ctx);
+  }
+  if (ssl != nullptr)
+  {
+    ::SSL_set_fd(ssl, fd);
+    if (::SSL_connect(ssl) == 1 &&
+        ::SSL_write(ssl, payload.data(), static_cast<int>(payload.size())) ==
+          static_cast<int>(payload.size()))
+    {
+      if (mode == TlsClientClose::CLEAN_CLOSE_NOTIFY)
+      {
+        ::SSL_shutdown(ssl); // close_notify -> server SSL_ERROR_ZERO_RETURN
+      }
+      else if (mode == TlsClientClose::DIRTY_BARE_FIN)
+      {
+        ::shutdown(fd, SHUT_WR); // bare FIN, no close_notify -> server TLSIO branch
+      }
+      char buf[4096];
+      int n;
+      while ((n = ::SSL_read(ssl, buf, sizeof(buf))) > 0)
+      {
+        out.append(buf, static_cast<std::size_t>(n));
+        if (mode == TlsClientClose::NO_HALF_CLOSE && out.size() >= payload.size())
+        {
+          break; // positive control: full echo in hand, don't stall to timeout
+        }
+      }
+    }
+  }
+  if (ssl != nullptr)
+  {
+    ::SSL_free(ssl);
+  }
+  if (ctx != nullptr)
+  {
+    ::SSL_CTX_free(ctx);
+  }
+  ::close(fd);
+  return out;
+}
+
+/// Resolve the static test cert/key paths (from the per-target IORA_TEST_RESOURCE_DIR),
+/// delegating the fopen-probe/WARN to the shared testnet::tlsCertFileReadable. Returns
+/// false (and WARNs) if absent.
+inline bool tlsHalfCloseCerts(std::string &certFile, std::string &keyFile)
+{
+  certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
+  keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
+  return testnet::tlsCertFileReadable(certFile);
+}
+} // namespace
+
+TEST_CASE("TLS full exchange echoes (positive control for the half-close pin)",
+          "[tcp][halfclose][tls]")
+{
+  // POSITIVE CONTROL for the drop test below: a full-duplex TLS client that does NOT
+  // half-close DOES receive the echo, proving the TLS echo server genuinely works — so a
+  // drop under half-close is specifically the half-close, not a broken TLS fixture.
+  std::string certFile, keyFile;
+  if (!tlsHalfCloseCerts(certFile, keyFile))
+  {
+    return;
+  }
+
+  TlsEchoServer server(certFile, keyFile);
+  REQUIRE(server.tx->start().isOk());
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(server.tx->addListener("127.0.0.1", port, TlsMode::Server).isOk());
+
+  std::string echoed = rawTlsHalfCloseExchange(port, "PING", TlsClientClose::NO_HALF_CLOSE);
+  CHECK(echoed.find("PING") != std::string::npos);
+}
+
+TEST_CASE("TLS read-half-close drops the pending response (close_notify + bare-FIN)",
+          "[tcp][halfclose][tls]")
+{
+  // tracker 2026-09-14-4 phase-1 TLS parity: the read-half EOF that drops a plaintext
+  // response drops a TLS one too, via BOTH TLS EOF shapes:
+  //   * CLEAN close_notify -> SSL_read SSL_ERROR_ZERO_RETURN -> closeNow(PeerClosed)
+  //   * DIRTY bare TCP FIN -> SSL_read != ZERO_RETURN        -> closeNow(TLSIO)
+  // Both tear the read-ENABLED session down before the async echo drains, dropping an
+  // owed response — the deliberate RFC 9112 §9.6 non-conformance the read-half-close
+  // contract (transport_types.hpp) documents. Pins both the drop and the distinct error
+  // classification of each EOF shape. Non-vacuity is proven by the positive-control test
+  // above (same server, full-duplex client, echo arrives).
+  std::string certFile, keyFile;
+  if (!tlsHalfCloseCerts(certFile, keyFile))
+  {
+    return;
+  }
+
+  const TlsClientClose mode =
+    GENERATE(TlsClientClose::CLEAN_CLOSE_NOTIFY, TlsClientClose::DIRTY_BARE_FIN);
+  const bool cleanClose = (mode == TlsClientClose::CLEAN_CLOSE_NOTIFY);
+  const char *modeName = cleanClose ? "clean-close_notify" : "dirty-bare-FIN";
+  CAPTURE(modeName);
+
+  TlsEchoServer server(certFile, keyFile);
+  // Deterministic drop (round-3 M-1): delay the echo so the client's EOF (close_notify
+  // or bare FIN) is seen and closeNow runs before the echo is flushed. Set before start().
+  server.echoDelayMs.store(100);
+  REQUIRE(server.tx->start().isOk());
+  auto port = testnet::getFreePortTCP();
+  REQUIRE(server.tx->addListener("127.0.0.1", port, TlsMode::Server).isOk());
+
+  std::string got = rawTlsHalfCloseExchange(port, "PING", mode);
+
+  // The request reached the server (onData) and the session was torn down on the
+  // read-half EOF (only the half-close client connects, so lastCloseCode is that
+  // session's close, unambiguously)...
+  REQUIRE(iora::test::waitFor([&] { return server.dataCount.load() >= 1; }));
+  REQUIRE(iora::test::waitFor([&] { return server.closeCount.load() >= 1; }, 3000ms));
+  // ...classified by EOF shape: close_notify => PeerClosed, bare FIN => TLSIO. This
+  // mapping is OpenSSL-version-ROBUST, not version-fragile: only a real close_notify
+  // yields SSL_ERROR_ZERO_RETURN => PeerClosed; a bare FIN yields SSL_ERROR_SYSCALL
+  // (OpenSSL 1.1.1) or SSL_ERROR_SSL/UNEXPECTED_EOF_WHILE_READING (3.0+), and the engine
+  // maps BOTH of those (any non-ZERO_RETURN SSL_read error) to TLSIO via the same
+  // ERR_get_error else-branch (tcp_engine.hpp readAvail). So bare FIN can never surface
+  // as PeerClosed regardless of OpenSSL version — the exact-code assertion is sound.
+  const int expectedCode = cleanClose ? static_cast<int>(TransportError::PeerClosed)
+                                      : static_cast<int>(TransportError::TLSIO);
+  CHECK(server.lastCloseCode.load() == expectedCode);
+  // ...and no echo came back: the response was dropped by the close.
+  CHECK(got.find("PING") == std::string::npos);
 }

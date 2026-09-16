@@ -40,19 +40,6 @@ static bool waitFor(std::function<bool()> pred, std::chrono::milliseconds timeou
   return true;
 }
 
-// Helper: true iff the TLS test cert exists; WARNs and returns false otherwise so
-// a TLS test can skip gracefully when certs are unavailable.
-static bool tlsCertsAvailable(const std::string &certFile)
-{
-  FILE *f = std::fopen(certFile.c_str(), "r");
-  if (!f)
-  {
-    WARN("TLS certs not available at " << certFile << " — skipping TLS test");
-    return false;
-  }
-  std::fclose(f);
-  return true;
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // task-6.1: Construction and lifecycle
@@ -1663,7 +1650,7 @@ TEST_CASE("TLS connection via Transport API", "[transport][tls]")
   std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
 
-  if (!tlsCertsAvailable(certFile)) { return; }
+  if (!testnet::tlsCertFileReadable(certFile)) { return; }
 
   auto port = testnet::getFreePortTCP();
 
@@ -1739,7 +1726,7 @@ TEST_CASE("TLS client enforces a TLS 1.2 floor (rejects a TLS 1.1-only server)",
 {
   std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
-  if (!tlsCertsAvailable(certFile)) { return; }
+  if (!testnet::tlsCertFileReadable(certFile)) { return; }
 
   auto port = testnet::getFreePortTCP();
 
@@ -2157,7 +2144,7 @@ TEST_CASE("read-disabled TLS session detects peer FIN via EPOLLRDHUP",
 {
   std::string certFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
   std::string keyFile = std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
-  if (!tlsCertsAvailable(certFile)) { return; }
+  if (!testnet::tlsCertFileReadable(certFile)) { return; }
 
   auto port = testnet::getFreePortTCP();
   TransportConfig serverCfg;

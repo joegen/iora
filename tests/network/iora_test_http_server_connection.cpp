@@ -25,6 +25,7 @@
 #include <catch2/catch.hpp>
 #include "iora/network/http_server.hpp"
 #include "iora_test_net_utils.hpp" // uses Catch2 REQUIRE -> must follow catch.hpp
+#include "test_helpers.hpp"        // iora::test::waitFor
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -587,4 +588,64 @@ TEST_CASE("HttpServer emits Set-Cookie on a bodyless 204 response (SRV-M5)",
   REQUIRE(r.head.find("sid=abc") != std::string::npos);
   // ...and no body-framing header leaks onto the 204.
   REQUIRE(Conn::headerValue(r.head, "Content-Length").empty());
+}
+
+// tracker 2026-09-14-4 phase-3: a client request half-close (shutdown(SHUT_WR) after
+// its request) makes the transport close the read-ENABLED session before the pooled
+// handler's async response is sent, so HttpServer's sendAsync completion fails and logs
+// the enriched pre-response send-failure diagnostic (half-close hypothesis + RFC 9112
+// §9.6 + session id), at WARNING (a half-close is legitimate-but-unsupported, not a
+// server error). This pins that the enriched log fires — the detection the fork-a
+// decision added so the otherwise-silent truncation is diagnosable — without weakening
+// the drop contract.
+TEST_CASE("HttpServer logs the enriched half-close diagnostic when a request half-close "
+          "drops the response",
+          "[http_server][halfclose]")
+{
+  HttpServer srv;
+  const int port = static_cast<int>(testnet::getFreePortTCP());
+  srv.setPort(port);
+  srv.onGet("/x",
+            [](const HttpServer::Request &, HttpServer::Response &res)
+            {
+              // Small delay so the I/O thread reliably processes the batched FIN and
+              // closes the session BEFORE this pooled handler's response is sent —
+              // making the pre-response drop (and thus the enriched log) deterministic.
+              // This does not mask the bug; it deterministically triggers the very
+              // scenario the contract documents.
+              std::this_thread::sleep_for(std::chrono::milliseconds(60));
+              res.set_content("x", "text/plain");
+            });
+  srv.start();
+
+  // Capture the enriched WARNING via the logger external handler.
+  std::atomic<bool> sawHalfCloseWarn{false};
+  iora::core::Logger::setExternalHandler(
+    [&](iora::core::Logger::Level lvl, const std::string &, const std::string &raw)
+    {
+      if (lvl == iora::core::Logger::Level::Warning &&
+          raw.find("request half-close") != std::string::npos &&
+          raw.find("9.6") != std::string::npos)
+      {
+        sawHalfCloseWarn.store(true);
+      }
+    });
+  // RAII: clear the PROCESS-GLOBAL handler on any exit path — including a throwing
+  // assertion below — before sawHalfCloseWarn (captured by reference) is destroyed, so a
+  // later test in this binary can never invoke a handler holding a dangling reference.
+  struct HandlerGuard
+  {
+    ~HandlerGuard() { iora::core::Logger::clearExternalHandler(); }
+  } handlerGuard;
+
+  // Full request then immediate shutdown(SHUT_WR): the FIN batches with the request, the
+  // session closes on recv()==0, and the delayed handler's response is dropped.
+  const std::string got = testnet::rawTcpHalfCloseExchange(
+    port, "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", /*halfClose=*/true);
+
+  const bool warned =
+    iora::test::waitFor([&] { return sawHalfCloseWarn.load(); }, std::chrono::seconds(5));
+
+  CHECK(warned);                                   // the enriched diagnostic was emitted
+  CHECK(got.find("200") == std::string::npos);     // the response was dropped (not sent)
 }
