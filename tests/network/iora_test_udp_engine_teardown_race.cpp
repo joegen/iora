@@ -31,12 +31,18 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 #include "iora/network/detail/udp_engine.hpp"
+#include "iora_test_fd_reuse_probe.hpp"
 #include "iora_test_net_utils.hpp"
 #include "test_helpers.hpp"
 
+#include <arpa/inet.h>
 #include <atomic>
+#include <cstring>
 #include <future>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -48,13 +54,7 @@ using ListenerId = iora::network::ListenerId;
 
 namespace
 {
-inline void spinUntil(const std::atomic<bool> &go)
-{
-  while (!go.load(std::memory_order_acquire))
-  {
-    std::this_thread::yield();
-  }
-}
+using fdreuse::spinUntil; // shared release-barrier spin (see iora_test_fd_reuse_probe.hpp)
 } // namespace
 
 // Hazard A: enqueue()'s _eventFd wakeup-write must be serialized with
@@ -202,4 +202,309 @@ TEST_CASE("UdpEngine value-returning ops surface error after stop", "[udp][teard
                });
   REQUIRE(cbFired.load());
   REQUIRE_FALSE(cbOk.load());
+}
+
+// ===========================================================================
+// Deterministic fd-reuse ordering tests (tracker 2026-09-15-3, WIDEN).
+//
+// The engine defers every getter-reachable teardown ::close until AFTER the
+// session/listener is out of its map, so a cross-thread getter can never syscall
+// on a closed/reused fd. Each case dup2()s a sentinel onto the fd at the pre-close
+// seam and asserts the under-lock getter NEVER observes the sentinel. See
+// iora_test_fd_reuse_probe.hpp for the mechanism + mutation-verify recipe.
+// ===========================================================================
+
+namespace
+{
+using Callbacks = iora::network::detail::EngineBase::Callbacks;
+using TransportAddress = iora::network::TransportAddress;
+using iora::test::waitFor; // canonical bounded-poll helper (test_helpers.hpp)
+
+// Send one datagram to a UDP listener from a throwaway socket, to force the
+// engine to create a ServerPeer session (onAccept) sharing the listener fd.
+inline void sendDatagramTo(std::uint16_t port, const char *msg)
+{
+  int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  REQUIRE(fd >= 0);
+  sockaddr_in dst{};
+  dst.sin_family = AF_INET;
+  dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  dst.sin_port = htons(port);
+  (void)::sendto(fd, msg, std::strlen(msg), 0, reinterpret_cast<sockaddr *>(&dst),
+                 sizeof(dst));
+  ::close(fd);
+}
+} // namespace
+
+// Session closeNow: getLocalAddress + setDscp must never resolve a session whose
+// fd has just been ::close()d. The seam dup2()s a sentinel onto the fd right
+// before ::close; the fix erases the session first, so both getters miss it.
+// MUTATION: move fdToClose's ::close (+ seam) ABOVE the _sessions.erase() write
+// lock in closeNow -> sawSentinel/dscpApplied become true and this FAILS.
+TEST_CASE("UdpEngine closeNow defers ::close until after erase (fd-reuse)",
+          "[udp][teardown][fdreuse]")
+{
+  // Declare all seam/callback-captured state BEFORE the engine, so the engine (which
+  // stores the hook + callbacks capturing this state) is destroyed FIRST.
+  fdreuse::Sentinel sentinel;
+  fdreuse::Probe probe;
+  std::atomic<SessionId> targetSid{0};
+  std::atomic<bool> connected{false};
+  std::atomic<SessionId> connSid{0};
+  UdpEngine tx{TransportConfig{}};
+
+  tx.testSetPreCloseHook(fdreuse::makeCloseHook(
+    probe, sentinel, [&] { return tx.getLocalAddress(targetSid.load()); },
+    [&] { return tx.setDscp(targetSid.load(), 0x28); }));
+
+  Callbacks cbs{};
+  cbs.onConnect = [&](SessionId sid, const TransportAddress &)
+  {
+    connSid.store(sid);
+    connected.store(true);
+  };
+  tx.setCallbacks(std::move(cbs));
+
+  REQUIRE(tx.start().isOk());
+  const auto port = testnet::getFreePortUDP();
+  REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return connected.load(); }));
+  const SessionId sid = connSid.load();
+  const int fd = tx.testGetSessionFd(sid);
+  REQUIRE(fd >= 0);
+
+  targetSid.store(sid);
+  probe.targetFd.store(fd);
+  REQUIRE(tx.close(sid));
+  REQUIRE(waitFor([&] { return probe.targetFires.load() >= 1; }));
+  tx.stop(); // join -> publishes the seam's recorded outcomes
+
+  REQUIRE(probe.targetFires.load() == 1); // the close path ran (non-vacuous)
+  REQUIRE(probe.dup2Ok.load());           // the sentinel trap was installed
+  REQUIRE_FALSE(probe.sawSentinel.load()); // getLocalAddress never saw the sentinel
+  REQUIRE(probe.getterEmpty.load());       // fixed ordering: session already erased
+  REQUIRE_FALSE(probe.dscpApplied.load()); // setDscp found no session -> no foreign TOS
+  REQUIRE(sentinel.ipTos() == 0);          // the sentinel socket was never mutated
+}
+
+// Session shutdownDrain (engine stop): getLocalAddress must never resolve a
+// drained session whose fd is being ::close()d. MUTATION: in shutdownDrain, close
+// the session fd inside the drain loop (before _sessions.clear()) -> FAILS.
+TEST_CASE("UdpEngine shutdownDrain defers session ::close until after clear (fd-reuse)",
+          "[udp][teardown][fdreuse]")
+{
+  // Declare all seam/callback-captured state BEFORE the engine (destroyed first).
+  fdreuse::Sentinel sentinel;
+  fdreuse::Probe probe;
+  std::atomic<SessionId> targetSid{0};
+  std::atomic<bool> connected{false};
+  std::atomic<SessionId> connSid{0};
+  UdpEngine tx{TransportConfig{}};
+
+  tx.testSetPreCloseHook(fdreuse::makeCloseHook(
+    probe, sentinel, [&] { return tx.getLocalAddress(targetSid.load()); }));
+
+  Callbacks cbs{};
+  cbs.onConnect = [&](SessionId sid, const TransportAddress &)
+  {
+    connSid.store(sid);
+    connected.store(true);
+  };
+  tx.setCallbacks(std::move(cbs));
+
+  REQUIRE(tx.start().isOk());
+  const auto port = testnet::getFreePortUDP();
+  REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return connected.load(); }));
+  const SessionId sid = connSid.load();
+  const int fd = tx.testGetSessionFd(sid);
+  REQUIRE(fd >= 0);
+
+  targetSid.store(sid);
+  probe.targetFd.store(fd);
+  tx.stop(); // shutdownDrain runs on the I/O thread; join publishes the outcomes
+
+  REQUIRE(probe.targetFires.load() == 1);
+  REQUIRE(probe.dup2Ok.load());
+  REQUIRE_FALSE(probe.sawSentinel.load());
+  REQUIRE(probe.getterEmpty.load());
+  REQUIRE(sentinel.ipTos() == 0);
+}
+
+// Listener shutdownDrain (engine stop): getListenerAddress must never resolve a
+// listener whose fd is being ::close()d. Listener-only engine, so the seam fires
+// exactly once. MUTATION: close the listener fd inside the listener drain loop
+// (before _listeners.clear()) -> FAILS.
+TEST_CASE("UdpEngine shutdownDrain defers listener ::close until after clear (fd-reuse)",
+          "[udp][teardown][fdreuse]")
+{
+  // Declare all seam-captured state BEFORE the engine (destroyed first).
+  fdreuse::Sentinel sentinel;
+  fdreuse::Probe probe;
+  std::atomic<ListenerId> targetLid{0};
+  UdpEngine tx{TransportConfig{}};
+
+  tx.testSetPreCloseHook(fdreuse::makeCloseHook(
+    probe, sentinel, [&] { return tx.getListenerAddress(targetLid.load()); }));
+
+  REQUIRE(tx.start().isOk());
+  const auto port = testnet::getFreePortUDP();
+  auto lr = tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  targetLid.store(lr.value());
+
+  tx.stop();
+
+  REQUIRE(probe.fireCount.load() == 1); // only the listener fd was closed
+  REQUIRE(probe.dup2Ok.load());
+  REQUIRE_FALSE(probe.sawSentinel.load());
+  REQUIRE(probe.getterEmpty.load());
+  REQUIRE(sentinel.ipTos() == 0);
+}
+
+// ServerPeer-present drain: a ServerPeer session aliases the shared listener fd
+// (s->fd == listener fd), so it must NOT be ::close()d as a session — the listener
+// fd is closed exactly ONCE via the listener drain, and stays valid for a
+// concurrent getListenerAddress until _listeners is cleared. MUTATION: collect a
+// ServerPeer's fd in the session drain (drop the role==ClientConnected guard) ->
+// fireCount becomes 2 (double close of the shared fd) and this FAILS.
+TEST_CASE("UdpEngine shutdownDrain closes the shared listener fd exactly once with a ServerPeer",
+          "[udp][teardown][fdreuse]")
+{
+  // Declare all seam/callback-captured state BEFORE the engine (destroyed first).
+  fdreuse::Sentinel sentinel;
+  fdreuse::Probe probe;
+  std::atomic<ListenerId> targetLid{0};
+  std::atomic<bool> accepted{false};
+  UdpEngine tx{TransportConfig{}};
+
+  tx.testSetPreCloseHook(fdreuse::makeCloseHook(
+    probe, sentinel, [&] { return tx.getListenerAddress(targetLid.load()); }));
+
+  Callbacks cbs{};
+  cbs.onAccept = [&](SessionId, const TransportAddress &) { accepted.store(true); };
+  tx.setCallbacks(std::move(cbs));
+
+  REQUIRE(tx.start().isOk());
+  const auto port = testnet::getFreePortUDP();
+  auto lr = tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  targetLid.store(lr.value());
+
+  sendDatagramTo(port, "make-a-serverpeer");
+  REQUIRE(waitFor([&] { return accepted.load(); }));
+
+  tx.stop();
+
+  // The shared listener fd is closed exactly once; the ServerPeer session (which
+  // aliases it) is NOT independently closed.
+  REQUIRE(probe.fireCount.load() == 1);
+  REQUIRE(probe.dup2Ok.load());
+  REQUIRE_FALSE(probe.sawSentinel.load());
+  REQUIRE(probe.getterEmpty.load());
+  REQUIRE(sentinel.ipTos() == 0);
+}
+
+// PRIMARY closed race (tracker 2026-09-15-3): Session::closed is read LOCK-FREE on
+// the caller thread in sessionSendable() (send()/sendAsync()) while the I/O thread
+// WRITES it in closeNow() without holding _sessionRwMutex — a data race on the old
+// plain bool. std::atomic<bool> makes that read/write well-defined. Drive N caller
+// threads send()ing a LIVE session while the I/O thread closeNow()s it (via close()),
+// across many iterations. This file is on IORA_SANITIZED_TEST_TARGETS, so under TSan
+// the run exercises the closed field's cross-thread access. NEGATIVE CONTROL: with
+// closed reverted to a plain bool, TSan reports the data race here (mutation-verified).
+TEST_CASE("UdpEngine send() racing closeNow() on a live session (closed atomic)",
+          "[udp][teardown][race]")
+{
+  constexpr int kIters = 30;
+  constexpr int kSenders = 3;
+  for (int iter = 0; iter < kIters; ++iter)
+  {
+    UdpEngine tx{TransportConfig{}};
+    std::atomic<bool> connected{false};
+    std::atomic<SessionId> connSid{0};
+    Callbacks cbs{};
+    cbs.onConnect = [&](SessionId sid, const TransportAddress &)
+    {
+      connSid.store(sid);
+      connected.store(true);
+    };
+    tx.setCallbacks(std::move(cbs));
+
+    REQUIRE(tx.start().isOk());
+    const auto port = testnet::getFreePortUDP();
+    REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+    auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
+    REQUIRE(cr.isOk());
+    REQUIRE(waitFor([&] { return connected.load(); }));
+    const SessionId sid = connSid.load();
+
+    std::atomic<bool> go{false};
+    std::vector<std::thread> senders;
+    senders.reserve(kSenders);
+    for (int s = 0; s < kSenders; ++s)
+    {
+      senders.emplace_back(
+        [&]
+        {
+          spinUntil(go);
+          const char buf[4] = {'p', 'i', 'n', 'g'};
+          for (int j = 0; j < 400; ++j)
+          {
+            (void)tx.send(sid, buf, sizeof(buf)); // sessionSendable() reads closed
+          }
+        });
+    }
+    go.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(1ms); // let the senders read closed first
+    (void)tx.close(sid);              // closeNow() on the I/O thread writes closed
+    for (auto &t : senders)
+    {
+      t.join();
+    }
+    tx.stop();
+  }
+  SUCCEED("send() vs closeNow() closed-race storm completed without crash");
+}
+
+// Regression (tracker 2026-09-15-3, round-3 cpp17 MEDIUM): symmetric to the TCP
+// _fdTags guard. UdpEngine's shutdownDrain must erase a session's/listener's _tags entry,
+// else _sessions.clear()/_listeners.clear() frees the owner while its Tag survives in
+// _tags with a dangling Tag::sess/Tag::lst; _tags is never bulk-cleared and start() does
+// not reset it, so a reused fd number on restart resurrects the stale tag (emplace does
+// not overwrite) -> handleFdEvent UAF. After a clean addListener + connect + stop, no
+// fd->Tag entry may survive. MUTATION: drop a _tags.erase in the drain -> testTagCount()
+// is nonzero after stop and this FAILS.
+TEST_CASE("UdpEngine shutdownDrain erases session/listener fd-tags (no stale Tag)",
+          "[udp][teardown][race]")
+{
+  std::atomic<bool> connected{false};
+  std::atomic<SessionId> connSid{0};
+  UdpEngine tx{TransportConfig{}};
+
+  Callbacks cbs{};
+  cbs.onConnect = [&](SessionId sid, const TransportAddress &)
+  {
+    connSid.store(sid);
+    connected.store(true);
+  };
+  tx.setCallbacks(std::move(cbs));
+
+  REQUIRE(tx.start().isOk());
+  const auto port = testnet::getFreePortUDP();
+  REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return connected.load(); }));
+  // Non-vacuity: the live session owns a _tags entry (running-safe check via the shared
+  // lock). Do NOT read testTagCount() while running (its contract is post-stop only).
+  REQUIRE(tx.testGetSessionFd(connSid.load()) >= 0);
+
+  tx.stop(); // shutdownDrain must erase both the session and listener fd-tags
+
+  REQUIRE(tx.testTagCount() == 0); // no stale Tag survives the drain
 }

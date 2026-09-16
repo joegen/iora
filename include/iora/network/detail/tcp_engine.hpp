@@ -58,6 +58,7 @@
 #include "iora/core/string_utils.hpp" // StringUtils::toLower (locale-independent ASCII, SNI norm)
 #include "iora/core/timer.hpp"
 #include "iora/network/detail/engine_base.hpp"
+#include "iora/network/detail/fd_closer.hpp"
 #include "iora/network/event_batch_processor.hpp"
 #include "iora/network/name_resolver.hpp"
 #include "iora/network/sockaddr_utils.hpp"
@@ -430,22 +431,22 @@ public:
   TransportStats getStats() const override
   {
     TransportStats ts;
-    ts.accepted = _atomicStats.accepted.load();
-    ts.connected = _atomicStats.connected.load();
-    ts.closed = _atomicStats.closed.load();
-    ts.errors = _atomicStats.errors.load();
-    ts.tlsHandshakes = _atomicStats.tlsHandshakes.load();
-    ts.tlsFailures = _atomicStats.tlsFailures.load();
-    ts.bytesIn = _atomicStats.bytesIn.load();
-    ts.bytesOut = _atomicStats.bytesOut.load();
-    ts.epollWakeups = _atomicStats.epollWakeups.load();
-    ts.commands = _atomicStats.commands.load();
-    ts.gcRuns = _atomicStats.gcRuns.load();
-    ts.gcClosedIdle = _atomicStats.gcClosedIdle.load();
-    ts.gcClosedAged = _atomicStats.gcClosedAged.load();
-    ts.backpressureCloses = _atomicStats.backpressureCloses.load();
-    ts.sessionsCurrent = _atomicStats.sessionsCurrent.load();
-    ts.sessionsPeak = _atomicStats.sessionsPeak.load();
+    ts.accepted = _atomicStats.accepted.load(std::memory_order_relaxed);
+    ts.connected = _atomicStats.connected.load(std::memory_order_relaxed);
+    ts.closed = _atomicStats.closed.load(std::memory_order_relaxed);
+    ts.errors = _atomicStats.errors.load(std::memory_order_relaxed);
+    ts.tlsHandshakes = _atomicStats.tlsHandshakes.load(std::memory_order_relaxed);
+    ts.tlsFailures = _atomicStats.tlsFailures.load(std::memory_order_relaxed);
+    ts.bytesIn = _atomicStats.bytesIn.load(std::memory_order_relaxed);
+    ts.bytesOut = _atomicStats.bytesOut.load(std::memory_order_relaxed);
+    ts.epollWakeups = _atomicStats.epollWakeups.load(std::memory_order_relaxed);
+    ts.commands = _atomicStats.commands.load(std::memory_order_relaxed);
+    ts.gcRuns = _atomicStats.gcRuns.load(std::memory_order_relaxed);
+    ts.gcClosedIdle = _atomicStats.gcClosedIdle.load(std::memory_order_relaxed);
+    ts.gcClosedAged = _atomicStats.gcClosedAged.load(std::memory_order_relaxed);
+    ts.backpressureCloses = _atomicStats.backpressureCloses.load(std::memory_order_relaxed);
+    ts.sessionsCurrent = _atomicStats.sessionsCurrent.load(std::memory_order_relaxed);
+    ts.sessionsPeak = _atomicStats.sessionsPeak.load(std::memory_order_relaxed);
     if (_batchProcessor)
     {
       ts.batchingStats = _batchProcessor->getStats();
@@ -601,6 +602,26 @@ public:
     return it->second->fd;
   }
 
+  /// \brief TEST-ONLY (tracker 2026-09-15-3): number of fd->Tag entries. Used to assert
+  /// that shutdownDrain erases a drained session's fd-tag (no stale Tag::sess survives).
+  /// Call only when the I/O thread is stopped (no lock taken). NOT production API.
+  std::size_t testFdTagCount() const { return _fdTags.size(); }
+
+  /// \brief TEST-ONLY (tracker 2026-09-15-3): install a hook invoked with the fd number
+  /// immediately before each getter-reachable teardown ::close (session closeNow /
+  /// shutdownDrain, listener drain), so a deterministic fd-reuse test can dup2() a
+  /// sentinel onto the fd and confirm the session/listener is already out of its map.
+  /// MUST be installed before start() -- the hook is read lock-free on the I/O thread.
+  /// The hook MUST be noexcept: it runs in detail::FdCloser's noexcept destructor during
+  /// shutdownDrain, so a throwing hook would std::terminate.
+  /// Empty in production (one null-function check per teardown close). NOT production API.
+  void testSetPreCloseHook(std::function<void(int)> hook)
+  {
+    assert(!_running.load(std::memory_order_acquire) &&
+           "testSetPreCloseHook must be called before start()");
+    _preCloseHook = std::move(hook);
+  }
+
 protected:
   // ===== Virtual hooks for fault injection (B6 TLS testing) =====
   // These hooks allow subclasses to intercept SSL operations for testing.
@@ -740,7 +761,7 @@ private:
   {
     std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
     auto it = _sessions.find(sid);
-    return it != _sessions.end() && !it->second->closed;
+    return it != _sessions.end() && !it->second->closed.load(std::memory_order_relaxed);
   }
 
   static std::string keyFromSockaddr(const sockaddr_storage &ss)
@@ -800,7 +821,7 @@ private:
 
   void err(TransportError te, const std::string &m)
   {
-    _atomicStats.errors++;
+    _atomicStats.errors.fetch_add(1, std::memory_order_relaxed);
     decltype(_cbs.onError) cb;
     { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
     if (cb) cb(te, m);
@@ -961,7 +982,7 @@ private:
         return false;
       }
       _cmds.push_back(Command::runOnIo(std::move(fn)));
-      _atomicStats.commands++;
+      _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
       if (_eventFd >= 0)
       {
         std::uint64_t one = 1;
@@ -986,7 +1007,7 @@ private:
           return false;
         }
         _cmds.push_back(cmd);
-        _atomicStats.commands++;
+        _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
         if (_eventFd >= 0)
         {
           std::uint64_t one = 1;
@@ -1017,7 +1038,7 @@ private:
           return false;
         }
         _cmds.push_back(std::move(cmd));
-        _atomicStats.commands++;
+        _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
         if (_eventFd >= 0)
         {
           std::uint64_t one = 1;
@@ -1078,7 +1099,14 @@ private:
 
     std::deque<ByteBuffer> wq;
     bool wantWrite{false};
-    bool closed{false};
+    // Cross-thread liveness flag (tracker 2026-09-15-3): read lock-free on the CALLER
+    // thread in sessionSendable() while the I/O thread writes it in closeNow()/
+    // shutdownDrain(). Atomic (relaxed) makes that read/write well-defined -- an advisory
+    // liveness gate publishing no companion state (the I/O thread re-validates under the
+    // map at doSend). The check-then-set in closeNow/shutdownDrain is a plain relaxed
+    // store (not a CAS), safe ONLY because BOTH are I/O-thread-confined and never run
+    // concurrently; a future caller-thread close path must use a CAS.
+    std::atomic<bool> closed{false};
     // C5: when false, EPOLLIN is withheld from this session's epoll interest so
     // the read/re-arm path (updateInterest) does not deliver read events for a
     // ReadMode::Disabled session. I/O thread only. Defaults enabled.
@@ -1233,23 +1261,37 @@ private:
     for (auto &kv : _sessions)
       toClose.push_back(kv.second.get());
 
+    // fd-reuse fix (tracker 2026-09-15-3): detach sessions/listeners and COLLECT their
+    // fds; ::close them only AFTER both maps are cleared under the write lock (fdsToClose
+    // destructs at scope end), so a cross-thread getter holding the shared lock cannot
+    // syscall on a closed/reused fd. (TCP: every Session owns its own fd -- no ServerPeer
+    // aliasing, so no role guard.)
+    std::vector<detail::FdCloser> fdsToClose;
+    fdsToClose.reserve(toClose.size() + _listeners.size());
+
     // Close all sessions safely (but don't erase from _sessions yet)
     for (auto *s : toClose)
     {
-      if (!s || s->closed)
+      if (!s || s->closed.load(std::memory_order_relaxed))
         continue;
-      s->closed = true;
+      s->closed.store(true, std::memory_order_relaxed);
       delEpoll(s->fd);
-      // SSL_shutdown before close(fd) — same ordering as closeNow
+      // Erase the fd->Tag entry too (mirrors closeNow and the listener loop below):
+      // _sessions.clear() destroys the Session, so a surviving _fdTags entry would
+      // dangle its Tag::sess. _fdTags is never bulk-cleared and start() does not reset
+      // it, so on restart a reused fd number would keep the stale tag (emplace does not
+      // overwrite) and handleFdEvent would dereference the freed Session (UAF).
+      _fdTags.erase(s->fd); // erase-by-key: no-op if absent (matches the UDP _tags.erase idiom)
+      // SSL_shutdown before close(fd) — same ordering as closeNow (still on the live fd)
       if (s->ssl)
       {
         ::SSL_shutdown(s->ssl);
         ::SSL_free(s->ssl);
         s->ssl = nullptr;
       }
-      ::close(s->fd);
-      _atomicStats.closed++;
-      _atomicStats.sessionsCurrent--;
+      fdsToClose.emplace_back(s->fd, &_preCloseHook); // ::close after _sessions.clear()
+      _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
+      _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
       decltype(_cbs.onClose) closeCb;
       { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
       if (closeCb)
@@ -1262,18 +1304,21 @@ private:
       _sessions.clear();
     }
 
-    // Close listeners
-    std::vector<Listener *> listenersToClose;
-    listenersToClose.reserve(_listeners.size());
+    // Detach listeners (delEpoll + _fdTags erase + collect fd), then clear _listeners
+    // under the write lock, then close (fdsToClose destructor). Do NOT deref lst->fd
+    // after the clear -- _listeners.clear() destroys the Listener.
     for (auto &kv : _listeners)
-      listenersToClose.push_back(kv.second.get());
-
-    for (auto *lst : listenersToClose)
-      closeListenerNow(lst);
+    {
+      Listener *lst = kv.second.get();
+      delEpoll(lst->fd);
+      _fdTags.erase(lst->fd);
+      fdsToClose.emplace_back(lst->fd, &_preCloseHook);
+    }
     {
       std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
       _listeners.clear();
     }
+    // fdsToClose destructs at scope end (after both maps cleared) -> all fds ::close()d.
     if (_timerFd >= 0)
     {
       delEpoll(_timerFd);
@@ -1376,7 +1421,7 @@ private:
         err(TransportError::Unknown, "epoll_wait: " + lastErr());
         continue;
       }
-      _atomicStats.epollWakeups++;
+      _atomicStats.epollWakeups.fetch_add(1, std::memory_order_relaxed);
 
       for (int i = 0; i < n; ++i)
       {
@@ -1428,7 +1473,7 @@ private:
             runGc();
           }
         );
-        _atomicStats.epollWakeups++;
+        _atomicStats.epollWakeups.fetch_add(1, std::memory_order_relaxed);
       }
       catch (const std::system_error &)
       {
@@ -1660,7 +1705,7 @@ private:
       // peer controls the size of, so an unbounded session count makes every
       // per-session memory cap meaningless in aggregate — the real ceiling would
       // be the process fd limit. Mirrors the UDP engine's cap; 0 means unlimited.
-      if (_config.maxSessions && _atomicStats.sessionsCurrent.load() >= _config.maxSessions)
+      if (_config.maxSessions && _atomicStats.sessionsCurrent.load(std::memory_order_relaxed) >= _config.maxSessions)
       {
         ::close(cfd);
         err(TransportError::Accept, "maxSessions reached; connection rejected");
@@ -1720,7 +1765,7 @@ private:
       tg->sess = sPtr;
       _fdTags.emplace(cfd, std::move(tg));
 
-      _atomicStats.accepted++;
+      _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
       decltype(_cbs.onAccept) acceptCb;
       { std::lock_guard<std::mutex> g(_cbMutex); acceptCb = _cbs.onAccept; }
       if (acceptCb) acceptCb(sid, addressFromSockaddr(peer));
@@ -2013,7 +2058,7 @@ private:
           closeCb(cr.sid, TransportErrorInfo{TransportError::TLSHandshake, why});
         }
         err(TransportError::TLSHandshake, why);
-        _atomicStats.tlsFailures++;
+        _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
         cancelConnectTimeout(s.get()); // release the timer scheduled at connect start
         if (s->ssl) { ::SSL_free(s->ssl); s->ssl = nullptr; }
         ::close(cfd);
@@ -2149,7 +2194,7 @@ private:
           { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
           if (connectCb)
           {
-            _atomicStats.connected++;
+            _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
             connectCb(cr.sid, addressFromSockaddr(sPtr->peer));
           }
           sPtr->connectPending = false;
@@ -2188,7 +2233,7 @@ private:
 
   void onSession(Session *s, std::uint32_t events)
   {
-    if (!s || s->closed)
+    if (!s || s->closed.load(std::memory_order_relaxed))
     {
       return;
     }
@@ -2275,7 +2320,7 @@ private:
               { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
               if (connectCb)
               {
-                _atomicStats.connected++;
+                _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
                 connectCb(s->id, addressFromSockaddr(s->peer));
               }
               s->connectPending = false;
@@ -2377,7 +2422,7 @@ private:
     if (!beforeSslHandshake(s->id, s->peerKey))
     {
       closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
-      _atomicStats.tlsFailures++;
+      _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
 
@@ -2388,7 +2433,7 @@ private:
       if (!afterSslHandshake(s->id, true, 0))
       {
         closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
-        _atomicStats.tlsFailures++;
+        _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
 
@@ -2419,7 +2464,7 @@ private:
         if (!pc)
         {
           closeNow(s, TransportError::TLSHandshake, "no peer certificate", 0);
-          _atomicStats.tlsFailures++;
+          _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
           return false;
         }
         long vr = ::SSL_get_verify_result(s->ssl);
@@ -2428,7 +2473,7 @@ private:
           ::X509_free(pc);
           closeNow(s, TransportError::TLSHandshake, ::X509_verify_cert_error_string(vr),
                    static_cast<int>(vr));
-          _atomicStats.tlsFailures++;
+          _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
           return false;
         }
         ::X509_free(pc);
@@ -2436,14 +2481,14 @@ private:
 
       s->tlsState = TlsState::Open;
       s->tlsWantWrite = false; // Reset handshake tracking
-      _atomicStats.tlsHandshakes++;
+      _atomicStats.tlsHandshakes.fetch_add(1, std::memory_order_relaxed);
       cancelHandshakeTimeout(s);
 
       decltype(_cbs.onConnect) connectCb;
       { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
       if (connectCb)
       {
-        _atomicStats.connected++;
+        _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
         connectCb(s->id, addressFromSockaddr(s->peer));
       }
       s->connectPending = false;
@@ -2465,7 +2510,7 @@ private:
     if (!afterSslHandshake(s->id, false, errc))
     {
       closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
-      _atomicStats.tlsFailures++;
+      _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
 
@@ -2483,7 +2528,7 @@ private:
     char msg[256];
     ::ERR_error_string_n(e, msg, sizeof(msg));
     closeNow(s, TransportError::TLSHandshake, msg, (int)e);
-    _atomicStats.tlsFailures++;
+    _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
 
@@ -2552,7 +2597,7 @@ private:
 
       if (n > 0)
       {
-        _atomicStats.bytesIn += n;
+        _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
         s->lastActivity = MonoClock::now();
         decltype(_cbs.onData) dataCb;
         { std::lock_guard<std::mutex> g(_cbMutex); dataCb = _cbs.onData; }
@@ -2625,7 +2670,7 @@ private:
 
       if (n >= 0)
       {
-        _atomicStats.bytesOut += n;
+        _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
         s->lastWriteProgress = MonoClock::now();
 
         // Handle partial writes - only remove sent bytes from buffer
@@ -2724,7 +2769,7 @@ private:
       return;
     }
     Session *s = it->second.get();
-    if (s->closed)
+    if (s->closed.load(std::memory_order_relaxed))
     {
       return;
     }
@@ -2743,7 +2788,7 @@ private:
       return;
     }
     Session *s = it->second.get();
-    if (s->closed)
+    if (s->closed.load(std::memory_order_relaxed))
     {
       IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " is closed");
       return;
@@ -2782,7 +2827,7 @@ private:
         IORA_LOG_DEBUG("[IO-THREAD] SSL_write returned " << n << " for sid=" << sr.sid);
         if (n > 0)
         {
-          _atomicStats.bytesOut += n;
+          _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
           s->lastActivity = MonoClock::now();
           s->lastWriteProgress = MonoClock::now();
 
@@ -2819,7 +2864,7 @@ private:
                       << " (requested " << sr.payload.size() << " bytes)");
         if (n >= 0)
         {
-          _atomicStats.bytesOut += n;
+          _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
           s->lastActivity = MonoClock::now();
           s->lastWriteProgress = MonoClock::now();
 
@@ -2856,7 +2901,7 @@ private:
     }
     if (s->wq.size() > _config.maxWriteQueue)
     {
-      _atomicStats.backpressureCloses++;
+      _atomicStats.backpressureCloses.fetch_add(1, std::memory_order_relaxed);
       if (_config.closeOnBackpressure)
       {
         IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", closing connection");
@@ -2876,12 +2921,12 @@ private:
 
   void closeNow(Session *s, TransportError why, const std::string &msg, int tlsErr)
   {
-    if (!s || s->closed)
+    if (!s || s->closed.load(std::memory_order_relaxed))
     {
       return;
     }
     IORA_LOG_DEBUG("[IO-THREAD] closeNow called for session " << s->id << ", reason: " << msg);
-    s->closed = true;
+    s->closed.store(true, std::memory_order_relaxed);
     cancelAllTimers(s);
 
     // Save caller's errno before system calls that overwrite it
@@ -2894,12 +2939,7 @@ private:
     s->ssl = nullptr; // Take ownership to prevent double-free
 
     delEpoll(fd);
-
-    auto tagIt = _fdTags.find(fd);
-    if (tagIt != _fdTags.end())
-    {
-      _fdTags.erase(tagIt);
-    }
+    _fdTags.erase(fd); // erase-by-key: no-op if absent
 
     // Remove from session map under write lock (before closing fd)
     {
@@ -2916,10 +2956,14 @@ private:
       ::SSL_free(ssl);
     }
 
-    ::close(fd);
+    // A scoped detail::FdCloser runs the pre-close seam + ::close here (fd-reuse fix,
+    // tracker 2026-09-15-3) — the single close primitive shared with shutdownDrain.
+    {
+      detail::FdCloser closer(fd, &_preCloseHook);
+    }
 
-    _atomicStats.closed++;
-    _atomicStats.sessionsCurrent--;
+    _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
+    _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
 
     decltype(_cbs.onClose) closeCb;
     { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
@@ -2930,20 +2974,9 @@ private:
     }
   }
 
-  void closeListenerNow(Listener *lst)
-  {
-    delEpoll(lst->fd);
-    ::close(lst->fd);
-    auto it = _fdTags.find(lst->fd);
-    if (it != _fdTags.end())
-    {
-      _fdTags.erase(it);
-    }
-  }
-
   void runGc()
   {
-    _atomicStats.gcRuns++;
+    _atomicStats.gcRuns.fetch_add(1, std::memory_order_relaxed);
     const auto now = MonoClock::now();
     const bool age = _config.maxConnAge.count() > 0;
 
@@ -2953,7 +2986,7 @@ private:
     for (auto &kv : _sessions)
     {
       Session *s = kv.second.get();
-      if (s->closed)
+      if (s->closed.load(std::memory_order_relaxed))
       {
         continue;
       }
@@ -2961,14 +2994,14 @@ private:
       if (_config.idleTimeout.count() > 0 && (now - s->lastActivity) > _config.idleTimeout)
       {
         toClose.push_back(s->id);
-        _atomicStats.gcClosedIdle++;
+        _atomicStats.gcClosedIdle.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
       if (age && (now - s->created) > _config.maxConnAge)
       {
         toClose.push_back(s->id);
-        _atomicStats.gcClosedAged++;
+        _atomicStats.gcClosedAged.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
@@ -3014,8 +3047,8 @@ private:
   void bumpSess()
   {
     auto cur = _atomicStats.sessionsCurrent.fetch_add(1) + 1;
-    auto pk = _atomicStats.sessionsPeak.load();
-    while (cur > pk && !_atomicStats.sessionsPeak.compare_exchange_weak(pk, cur))
+    auto pk = _atomicStats.sessionsPeak.load(std::memory_order_relaxed);
+    while (cur > pk && !_atomicStats.sessionsPeak.compare_exchange_weak(pk, cur, std::memory_order_relaxed))
     {
     }
   }
@@ -3382,6 +3415,9 @@ private:
   std::unordered_map<ListenerId, std::unique_ptr<Listener>> _listeners;
   std::unordered_map<SessionId, std::unique_ptr<Session>> _sessions;
   std::unordered_map<int, std::unique_ptr<Tag>> _fdTags;
+  // TEST-ONLY seam (tracker 2026-09-15-3): see testSetPreCloseHook. Empty in production;
+  // installed before start(), then read-only on the I/O thread (no locking needed).
+  std::function<void(int)> _preCloseHook;
 
   std::atomic<SessionId> _nextSessionId{1};
   std::atomic<ListenerId> _nextListenerId{1};
