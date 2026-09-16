@@ -325,7 +325,7 @@ TEST_CASE("UDP named-host via-listener AF mismatch fires onClose(Config)",
   f.tx->stop();
 }
 
-TEST_CASE("UDP named-host via-listener session cap fires onClose(Config: session cap reached)",
+TEST_CASE("UDP named-host via-listener session cap fires onClose(ResourceLimit: session cap reached)",
           "[udp][via][resolve][isolated]")
 {
   ResolveFixture f{5000ms, std::chrono::seconds(5), /*maxSessions=*/1};
@@ -350,7 +350,11 @@ TEST_CASE("UDP named-host via-listener session cap fires onClose(Config: session
   {
     std::lock_guard<std::mutex> lock(f.m);
     CHECK(f.closeCount == 1);
-    CHECK(f.lastCloseCode == TransportError::Config);
+    // tracker 2026-09-14-1 phase-0: the session-cap rejection now emits the distinct
+    // TransportError::ResourceLimit (was overloaded Config) so SIP consumers can map
+    // it to 503 + Retry-After without RFC 3263 failover. Mutation-check: reverting the
+    // :1796 emission to Config fails this CHECK.
+    CHECK(f.lastCloseCode == TransportError::ResourceLimit);
     CHECK(f.lastCloseMsg.find("session cap reached") != std::string::npos);
   }
 

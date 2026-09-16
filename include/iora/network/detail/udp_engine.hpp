@@ -1331,8 +1331,10 @@ private:
         auto it = _peerIndex.find(k);
         if (it == _peerIndex.end())
         {
-          if (_config.maxSessions && _atomicStats.sessionsCurrent.load(std::memory_order_relaxed) >= _config.maxSessions)
-            continue;
+          if (sessionCapReached())
+          {
+            continue; // no SessionId yet -> silent drop (peer retransmits)
+          }
           sid = _nextSessionId++;
           auto s = std::make_unique<Session>();
           s->id = sid;
@@ -1586,6 +1588,15 @@ private:
   /// double-free (#6). Runs on the I/O thread.
   bool connectFromAddrs(const ConnectReq &cr, addrinfo *res)
   {
+    // Admission cap (tracker 2026-09-14-1): reject a new client connect() at the
+    // aggregate session cap BEFORE materializing any fd/epoll/session — placing this
+    // before the ::socket loop avoids leaking an fd / orphaning an uncounted session
+    // on rejection (mirrors the earliest-check inbound and connectViaListener sites).
+    // See sessionCapReached() for the shared-aggregate + I/O-thread-serialization notes.
+    if (rejectAtSessionCap(cr.sid))
+    {
+      return false;
+    }
     int sfd = -1;
     for (addrinfo *ai = res; ai; ai = ai->ai_next)
     {
@@ -1793,12 +1804,8 @@ private:
     // This enables self-loopback (same address as listener) and multiple logical
     // connections to the same remote peer. The _peerIndex maps peer address to
     // ONE SessionId for incoming data dispatch; applications must demultiplex.
-    if (_config.maxSessions && _atomicStats.sessionsCurrent.load(std::memory_order_relaxed) >= _config.maxSessions)
+    if (rejectAtSessionCap(sid))
     {
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-        closeCb(sid, TransportErrorInfo{TransportError::Config, "session cap reached"});
       return false;
     }
     auto s = std::make_unique<Session>();
@@ -2129,9 +2136,44 @@ private:
     error(TransportError::Resolve, "resolve timeout");
   }
 
+  /// \brief True when the aggregate session cap is reached. Shared by all three
+  /// session-creation paths (readFromListener inbound, connectFromAddrs client
+  /// connect, viaFromAddrs connectViaListener). Race-free: sessionsCurrent is
+  /// mutated ONLY on the I/O thread (bumpSess / the two fetch_sub decrements), and
+  /// every caller of this predicate runs on the I/O thread — so the check-then-bump
+  /// is serialized, not a TOCTOU. `relaxed` is the weakest correct order given the
+  /// single-writer-thread confinement. The cap is a SHARED aggregate across all
+  /// three paths, so sizing maxSessions must account for every path.
+  bool sessionCapReached() const
+  {
+    return _config.maxSessions &&
+           _atomicStats.sessionsCurrent.load(std::memory_order_relaxed) >= _config.maxSessions;
+  }
+
+  /// \brief Reject a pending session creation at the cap via a copy-then-invoke
+  /// onClose(ResourceLimit). Returns true iff rejected (caller returns false).
+  /// NOT used by readFromListener, which has no SessionId yet at rejection time and
+  /// silently drops (`continue`) — it calls sessionCapReached() directly.
+  bool rejectAtSessionCap(SessionId sid)
+  {
+    if (!sessionCapReached())
+    {
+      return false;
+    }
+    decltype(_cbs.onClose) closeCb;
+    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+    if (closeCb)
+    {
+      closeCb(sid, TransportErrorInfo{TransportError::ResourceLimit, "session cap reached"});
+    }
+    return true;
+  }
+
   void bumpSess()
   {
-    auto cur = _atomicStats.sessionsCurrent.fetch_add(1) + 1;
+    // relaxed: single-I/O-thread mutation (see sessionCapReached); matches the
+    // fetch_sub decrement sites and the cap-check loads (thread-safety L-2).
+    auto cur = _atomicStats.sessionsCurrent.fetch_add(1, std::memory_order_relaxed) + 1;
     auto pk = _atomicStats.sessionsPeak.load(std::memory_order_relaxed);
     while (cur > pk && !_atomicStats.sessionsPeak.compare_exchange_weak(pk, cur, std::memory_order_relaxed))
     {

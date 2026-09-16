@@ -70,6 +70,22 @@ enum class TransportError
   BufferOverflow, // Sync receive buffer exceeded maxSyncReceiveBuffer (data dropped)
   ShuttingDown,   // Transport is being torn down; sync op released without completing
   TooManyPendingSyncOps, // Concurrent parked sync ops reached maxPendingSyncOps
+  // Local CONNECTION-ADMISSION exhaustion: a new session was refused because a
+  // local admission limit (maxSessions now; fd/memory later) was reached. This is
+  // NOT a per-target transport failure (Connect/Resolve) and NOT a misconfiguration
+  // (Config). It is distinct from the resource-flavored siblings above
+  // (WriteBackpressure / BufferOverflow / TooManyPendingSyncOps), which concern an
+  // ESTABLISHED session's data plane, not session admission. SIP consumers map this
+  // to 503 Service Unavailable + a bounded Retry-After WITHOUT RFC 3263 failover
+  // (a local, sheddable condition; see iora_sip transport session-cap handling).
+  // EMISSION SCOPE (2026-09-16): currently emitted by the UDP engine's cap sites
+  // (client connect() and connectViaListener). The TCP/TLS engine also enforces
+  // maxSessions but still reports its accept-time rejection via TransportError::Accept;
+  // migrating the TCP/TLS cap sites to this discriminator is a tracked follow-on
+  // (coding_trackers tasks/iora/backlog/2026-09-16-2).
+  // Appended before Unknown to preserve existing enum ordinals (some operator-facing
+  // logs stringify static_cast<int>(code)).
+  ResourceLimit,
   Unknown
 };
 

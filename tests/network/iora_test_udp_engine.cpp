@@ -62,6 +62,20 @@ struct UdpFixture
   std::mutex dataMutex;
   std::vector<std::string> receivedData;
 
+  // Close-terminal capture (tracker 2026-09-14-1, cpp17-M3). onClose runs on the
+  // engine I/O thread; the test thread reads these via lastClose(). Guarded by the
+  // existing dataMutex (one mutex per fixture, matching TcpFixture/ResolveFixture)
+  // + a locked snapshot accessor, per this fixture's own I/O-thread-only publication
+  // rule above. Written BEFORE closeCount++ so a test that waits on closeCount then
+  // calls lastClose() observes the matching terminal.
+  TransportError lastCloseError{TransportError::None};
+  std::string lastCloseMsg;
+  std::pair<TransportError, std::string> lastClose()
+  {
+    std::lock_guard<std::mutex> g(dataMutex);
+    return {lastCloseError, lastCloseMsg};
+  }
+
   // Option (b) (tracker 2026-09-13-6): take the TransportConfig by value (defaulted,
   // so `UdpFixture f;` still works) and move it into `cfg` in the mem-init list
   // BEFORE the `tx{cfg}` member initializer runs (member init follows declaration
@@ -116,8 +130,13 @@ struct UdpFixture
         receivedData.push_back(std::string(reinterpret_cast<const char *>(data), n));
       }
     };
-    cbs.onClose = [&](SessionId, const TransportErrorInfo &)
+    cbs.onClose = [&](SessionId, const TransportErrorInfo &info)
     {
+      {
+        std::lock_guard<std::mutex> g(dataMutex);
+        lastCloseError = info.code;
+        lastCloseMsg = info.message;
+      }
       anyClosed = true;
       closeCount++;
     };
@@ -863,62 +882,86 @@ TEST_CASE("UDP edge vs level triggered", "[udp][epoll]")
   }
 }
 
-TEST_CASE("UDP session limits", "[udp][limits]")
+TEST_CASE("UDP connect() session cap rejection", "[udp][limits]")
 {
-  // Config now reaches the engine (tracker 2026-09-13-6): maxSessions=4.
+  // tracker 2026-09-14-1: the plain client connect() path now enforces maxSessions.
+  // Previously only inbound server-peer creation and connectViaListener were capped;
+  // plain connect() bumped the session count with no check (the production asymmetry).
   TransportConfig cfg;
-  cfg.maxSessions = 4; // 2 clients + 2 server peers = at cap
+  cfg.maxSessions = 2;
   UdpFixture f{cfg};
   REQUIRE(f.tx.start().isOk());
 
   auto port = testnet::getFreePortUDP();
   (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
 
-  // Create 2 connections
-  std::vector<SessionId> clients;
+  // Fill to the cap with 2 client connects (no sends -> no server peers created).
   for (int i = 0; i < 2; ++i)
   {
-    auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
-    REQUIRE(cr.isOk());
-    clients.push_back(cr.value());
+    REQUIRE(f.tx.connect("127.0.0.1", port, TlsMode::None).isOk());
   }
-
   REQUIRE(f.waitForCount(f.connectCount, 2));
+  REQUIRE(f.tx.getStats().sessionsCurrent == 2); // at cap
 
-  // Send from both clients so the server creates 2 server peers (each fires
-  // onAccept, udp_engine.hpp:1345-1350). Gate on acceptCount==2 instead of a fixed
-  // sleep — bumpSess() precedes onAccept, so observing acceptCount==2 guarantees
-  // both server-peer session bumps are visible.
-  REQUIRE(f.tx.send(clients[0], "test1", 5));
-  REQUIRE(f.tx.send(clients[1], "test2", 5));
-  REQUIRE(f.waitForCount(f.acceptCount, 2));
+  // A 3rd connect() is admission-rejected. connect() returns ok(sid) SYNCHRONOUSLY
+  // (the sid is allocated + the request enqueued before the async cap check runs on
+  // the I/O thread), so the rejection is observed via onClose, NOT the ConnectResult.
+  auto third = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(third.isOk()); // sid allocated synchronously; admission decided async
 
-  // STATE PRECONDITION (M1): 2 clients + 2 server peers = 4, exactly at the cap.
-  // This holds under BOTH capped and default config (the cap is not exercised until
-  // a 5th session would be created), so it is a precondition establishing the
-  // at-cap state — exempt from the per-assertion config-discrimination mutation-check.
-  REQUIRE(f.tx.getStats().sessionsCurrent == 4);
+  // The async cap check (connectFromAddrs guard) fires onClose(ResourceLimit).
+  REQUIRE(f.waitForCount(f.closeCount, 1));
+  auto lastClose = f.lastClose();
+  CHECK(lastClose.first == TransportError::ResourceLimit);
+  CHECK(lastClose.second.find("session cap reached") != std::string::npos);
 
-  // A 3rd client connect() succeeds: the plain connect() path is NOT capped — only
-  // server-peer creation is (see backlog 2026-09-14-1 for that production asymmetry).
-  // sessionsCurrent -> 5; cs3 is a real session, so send(cs3) returns true.
-  SessionId cs3 = f.tx.connect("127.0.0.1", port, TlsMode::None).value();
-  REQUIRE(f.waitForCount(f.connectCount, 3));
-  REQUIRE(f.tx.send(cs3, "test3", 5));
+  // No 3rd session materialized: onConnect never fired for it and the aggregate stays
+  // at the cap. CONFIG-DISCRIMINATING mutation-check: reverting the connectFromAddrs
+  // guard makes the 3rd connect succeed (connectCount -> 3, sessionsCurrent -> 3), so
+  // both assertions below fail on revert -> they genuinely exercise the cap.
+  CHECK_FALSE(f.waitForCount(f.connectCount, 3, 500));
+  CHECK(f.tx.getStats().sessionsCurrent == 2);
 
-  // CONFIG-DISCRIMINATING assertion (M1): cs3's datagram arrives from a NEW peer
-  // address; with the cap reached (5 >= 4) the server DROPS it (udp_engine.hpp:1326
-  // `continue`) and creates NO 3rd server peer -> no 3rd onAccept. Under reverted
-  // (default maxSessions=0) config the datagram WOULD create a 6th session
-  // (acceptCount -> 3, sessionsCurrent -> 6), so this pair fails-on-revert = it
-  // genuinely exercises the cap. The bounded wait-for-3rd-accept is the deterministic
-  // way to observe the negative (it times out only when the cap held).
-  REQUIRE_FALSE(f.waitForCount(f.acceptCount, 3, 500)); // no 3rd server peer created
-  REQUIRE(f.tx.getStats().sessionsCurrent == 5);        // 3 clients + 2 peers, cap held
+  f.tx.stop();
+}
 
-  // A datagram rejected by the cap never reaches onData, so no echo is attempted
-  // for it — sendFailed must stay false.
-  REQUIRE_FALSE(f.sendFailed);
+TEST_CASE("UDP inbound server-peer drop at session cap", "[udp][limits]")
+{
+  // Retains coverage of the inbound listener-read server-peer cap drop
+  // (udp_engine.hpp ~:1334 `continue`), which the old 'UDP session limits' test
+  // exercised via a 3rd client's datagram — no longer possible now that a 3rd
+  // connect() is rejected. tracker 2026-09-14-1 cpp17-R2 N1.
+  TransportConfig cfg;
+  cfg.maxSessions = 3;
+  UdpFixture f{cfg};
+  REQUIRE(f.tx.start().isOk());
+
+  auto port = testnet::getFreePortUDP();
+  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
+
+  // Client 1 connects and sends -> the server creates exactly 1 server peer.
+  auto c1 = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(c1.isOk());
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  REQUIRE(f.tx.send(c1.value(), "one", 3));
+  REQUIRE(f.waitForCount(f.acceptCount, 1));     // 1 server peer created
+  REQUIRE(f.tx.getStats().sessionsCurrent == 2); // 1 client + 1 server peer
+
+  // Client 2 connects (sessionsCurrent -> 3, at cap), then sends. Its inbound
+  // datagram is from a NEW peer address, so the server tries to create a 2nd server
+  // peer -> at cap (3 >= 3) it hits the :1334 drop (`continue`): NO 2nd onAccept.
+  auto c2 = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(c2.isOk());
+  REQUIRE(f.waitForCount(f.connectCount, 2));
+  REQUIRE(f.tx.getStats().sessionsCurrent == 3); // at cap
+  REQUIRE(f.tx.send(c2.value(), "two", 3));
+
+  // CONFIG-DISCRIMINATING: the 2nd server peer is dropped by the cap. Under reverted
+  // (default maxSessions=0) config the datagram WOULD create a 2nd server peer
+  // (acceptCount -> 2, sessionsCurrent -> 4), so this pair fails-on-revert.
+  CHECK_FALSE(f.waitForCount(f.acceptCount, 2, 500)); // no 2nd server peer
+  CHECK(f.tx.getStats().sessionsCurrent == 3);        // cap held
+
   f.tx.stop();
 }
 
