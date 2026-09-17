@@ -17,6 +17,26 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 
+# Compiler cache
+option(IORA_USE_CCACHE "Use ccache as the compiler launcher when available" ON)
+if(IORA_USE_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    endif()
+endif()
+
+# Split DWARF debug info (smaller objects, lower link-time memory; no-op without -g)
+option(IORA_USE_SPLIT_DWARF "Use -gsplit-dwarf to reduce debug-info size and link memory" ON)
+if(IORA_USE_SPLIT_DWARF)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-gsplit-dwarf" IORA_HAVE_SPLIT_DWARF)
+    if(IORA_HAVE_SPLIT_DWARF)
+        add_compile_options(-gsplit-dwarf)
+    endif()
+endif()
+
 # Install directories (must be before any add_subdirectory that references them)
 include(GNUInstallDirs)
 
