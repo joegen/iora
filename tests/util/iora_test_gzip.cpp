@@ -360,6 +360,25 @@ TEST_CASE("gzip streaming output is byte-identical across runs (determinism)",
   REQUIRE(streamOnce(plain) == streamOnce(plain));
 }
 
+TEST_CASE("gzip Encoder::finish() with no prior update() yields a valid empty member",
+          "[gzip][streaming]")
+{
+  // The streaming empty-input path (finish() called with zero update() calls)
+  // must produce a well-formed gzip member decode-equivalent to the one-shot
+  // compress("") path. Previously only the one-shot empty path was asserted.
+  Gzip::Encoder enc(Level::DEFAULT);
+  const std::string streamed = enc.finish();
+
+  REQUIRE_FALSE(streamed.empty()); // a gzip member has header + trailer even for 0 bytes
+
+  auto r = Gzip::decompress(streamed, 1u << 20);
+  REQUIRE(r.isOk());
+  REQUIRE(r.value().empty()); // round-trips to empty
+
+  // Decode-equivalent to the one-shot path (both are deterministic empty members).
+  REQUIRE(streamed == Gzip::compress("", Level::DEFAULT));
+}
+
 TEST_CASE("gzip Encoder is move-only (L2)", "[gzip][streaming]")
 {
   STATIC_REQUIRE_FALSE(std::is_copy_constructible<Gzip::Encoder>::value);

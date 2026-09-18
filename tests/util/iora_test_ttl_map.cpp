@@ -806,6 +806,23 @@ TEST_CASE("TtlMap concurrency soak with self-validating values")
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// 2.8b get() is callable through a const reference (pins the get() const contract
+//      — every other call site uses a non-const unique_ptr, so without this a
+//      regression dropping const from get() would compile and pass unnoticed).
+// ───────────────────────────────────────────────────────────────────────────
+TEST_CASE("TtlMap::get is callable through a const reference")
+{
+  TimerFixture fx;
+  auto cache = std::make_unique<StrIntCache>(strCfg(60s, 16, 60s), fx.timers);
+  cache->put("a", 1);
+  const StrIntCache &constRef = *cache;
+  REQUIRE(constRef.get("a").value() == 1);
+  REQUIRE_FALSE(constRef.get("absent").has_value());
+  cache.reset();
+  fx.stopTimers();
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // 2.9 constructor throws when schedulePeriodic returns 0
 // ───────────────────────────────────────────────────────────────────────────
 TEST_CASE("TtlMap constructor throws when the sweeper cannot be scheduled")
@@ -819,4 +836,58 @@ TEST_CASE("TtlMap constructor throws when the sweeper cannot be scheduled")
   // so no cleanup needed" — arch constructor contract).
   REQUIRE(timers.getStats().periodicTimersActive.load() == 0);
   REQUIRE(timers.getInFlightCount() == 0);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 2.10 sweeper reaps a map LARGER than one scan chunk (kScanBudget=4096) across
+//      multiple bounded chunks — exercises the resume-by-key cursor. Regression
+//      for the sweepState() fix: the sweep must (a) reap ALL expired entries
+//      even when the map exceeds the per-acquisition scan budget, and (b) leave
+//      live entries untouched (the resume cursor must neither skip nor over-reap).
+// ───────────────────────────────────────────────────────────────────────────
+TEST_CASE("TtlMap sweeper reaps across scan-budget chunks without skipping live")
+{
+  TimerFixture fx;
+  // maxEntries far above the working set so capacity eviction never fires — the
+  // periodic SWEEPER alone must reap. sweepInterval 1s so a tick fires quickly.
+  IntCache::Config cfg{};
+  cfg.defaultTtl = 60s;
+  cfg.maxEntries = 100000;
+  cfg.sweepInterval = 1s;
+  auto cache = std::make_unique<IntCache>(cfg, fx.timers);
+
+  // > kScanBudget (4096) entries so one sweep pass spans multiple chunks.
+  constexpr int kN = 6000;
+  // Even keys: short 1s TTL (will expire); odd keys: long 600s TTL (stay live).
+  for (int i = 0; i < kN; ++i)
+  {
+    cache->put(i, i, (i % 2 == 0) ? 1s : 600s);
+  }
+  REQUIRE(cache->stats().size == static_cast<std::size_t>(kN));
+
+  // Wait for the short-TTL half to expire AND for the periodic sweeper to run
+  // enough passes to physically reap them. Do NOT call get() on the expired keys
+  // (that would lazily count them as misses but never reap — we are testing the
+  // SWEEPER path in isolation). Poll size() (lock-free) until it settles at kN/2.
+  const std::size_t kExpectedLive = kN / 2;
+  bool settled = false;
+  for (int i = 0; i < kSweepWaitIters; ++i)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (cache->stats().size == kExpectedLive)
+    {
+      settled = true;
+      break;
+    }
+  }
+  REQUIRE(settled); // all 3000 expired entries reaped by the sweeper
+
+  // Live (odd) keys untouched by the sweep; expired (even) keys gone.
+  REQUIRE(cache->get(1).has_value());
+  REQUIRE(cache->get(kN - 1).has_value()); // last odd key survived (past chunk 1)
+  REQUIRE_FALSE(cache->get(0).has_value());
+  REQUIRE_FALSE(cache->get(kN - 2).has_value()); // last even key was reaped
+
+  cache.reset();
+  fx.stopTimers();
 }

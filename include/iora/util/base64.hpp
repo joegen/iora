@@ -19,6 +19,66 @@ namespace iora
 namespace util
 {
 
+namespace base64_detail
+{
+/// \brief Shared 3-byte-group Base64 encode core. \p table is the 64-entry
+/// alphabet (index 0..63); \p pad appends '=' padding on a partial final group
+/// (standard Base64) or not (Base64URL). encode() indexes \p table directly; the
+/// two public encoders differ ONLY in the alphabet and the pad flag, so a single
+/// implementation keeps them from silently drifting (mirroring the encode/decode
+/// shared-alphabet discipline already applied on the decode side).
+inline std::string encodeImpl(const std::uint8_t *data, std::size_t len,
+                              const char (&table)[65], bool pad)
+{
+  if (len == 0)
+  {
+    return {};
+  }
+
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+
+  std::size_t i = 0;
+  while (i + 3 <= len)
+  {
+    std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
+                      (static_cast<std::uint32_t>(data[i + 1]) << 8) |
+                      (static_cast<std::uint32_t>(data[i + 2]));
+    out.push_back(table[(v >> 18) & 0x3F]);
+    out.push_back(table[(v >> 12) & 0x3F]);
+    out.push_back(table[(v >> 6) & 0x3F]);
+    out.push_back(table[v & 0x3F]);
+    i += 3;
+  }
+
+  const std::size_t rem = len - i;
+  if (rem == 1)
+  {
+    std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
+    out.push_back(table[(v >> 18) & 0x3F]);
+    out.push_back(table[(v >> 12) & 0x3F]);
+    if (pad)
+    {
+      out.push_back('=');
+      out.push_back('=');
+    }
+  }
+  else if (rem == 2)
+  {
+    std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
+                      (static_cast<std::uint32_t>(data[i + 1]) << 8);
+    out.push_back(table[(v >> 18) & 0x3F]);
+    out.push_back(table[(v >> 12) & 0x3F]);
+    out.push_back(table[(v >> 6) & 0x3F]);
+    if (pad)
+    {
+      out.push_back('=');
+    }
+  }
+  return out;
+}
+} // namespace base64_detail
+
 /// \brief Base64URL encoder (RFC 4648) without padding.
 ///
 /// Base64URL encoding uses URL-safe characters and omits padding,
@@ -35,46 +95,8 @@ public:
   {
     static constexpr char kTable[65] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    if (len == 0)
-    {
-      return {};
-    }
-
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-
-    std::size_t i = 0;
-    while (i + 3 <= len)
-    {
-      std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
-                        (static_cast<std::uint32_t>(data[i + 1]) << 8) |
-                        (static_cast<std::uint32_t>(data[i + 2]));
-      out.push_back(kTable[(v >> 18) & 0x3F]);
-      out.push_back(kTable[(v >> 12) & 0x3F]);
-      out.push_back(kTable[(v >> 6) & 0x3F]);
-      out.push_back(kTable[v & 0x3F]);
-      i += 3;
-    }
-
-    // Handle remaining bytes (1 or 2)
-    std::size_t rem = len - i;
-    if (rem == 1)
-    {
-      std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
-      out.push_back(kTable[(v >> 18) & 0x3F]);
-      out.push_back(kTable[(v >> 12) & 0x3F]);
-      // No padding in Base64URL
-    }
-    else if (rem == 2)
-    {
-      std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
-                        (static_cast<std::uint32_t>(data[i + 1]) << 8);
-      out.push_back(kTable[(v >> 18) & 0x3F]);
-      out.push_back(kTable[(v >> 12) & 0x3F]);
-      out.push_back(kTable[(v >> 6) & 0x3F]);
-      // No padding in Base64URL
-    }
-    return out;
+    // Base64URL: URL-safe alphabet, no padding.
+    return base64_detail::encodeImpl(data, len, kTable, /*pad=*/false);
   }
 
   /// \brief Encode a vector of bytes to Base64URL string.
@@ -121,46 +143,8 @@ public:
   /// \brief Encode binary data to standard Base64 string with padding.
   static std::string encode(const std::uint8_t *data, std::size_t len)
   {
-    if (len == 0)
-    {
-      return {};
-    }
-
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-
-    std::size_t i = 0;
-    while (i + 3 <= len)
-    {
-      std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
-                        (static_cast<std::uint32_t>(data[i + 1]) << 8) |
-                        (static_cast<std::uint32_t>(data[i + 2]));
-      out.push_back(kStdAlphabet[(v >> 18) & 0x3F]);
-      out.push_back(kStdAlphabet[(v >> 12) & 0x3F]);
-      out.push_back(kStdAlphabet[(v >> 6) & 0x3F]);
-      out.push_back(kStdAlphabet[v & 0x3F]);
-      i += 3;
-    }
-
-    std::size_t rem = len - i;
-    if (rem == 1)
-    {
-      std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
-      out.push_back(kStdAlphabet[(v >> 18) & 0x3F]);
-      out.push_back(kStdAlphabet[(v >> 12) & 0x3F]);
-      out.push_back('=');
-      out.push_back('=');
-    }
-    else if (rem == 2)
-    {
-      std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
-                        (static_cast<std::uint32_t>(data[i + 1]) << 8);
-      out.push_back(kStdAlphabet[(v >> 18) & 0x3F]);
-      out.push_back(kStdAlphabet[(v >> 12) & 0x3F]);
-      out.push_back(kStdAlphabet[(v >> 6) & 0x3F]);
-      out.push_back('=');
-    }
-    return out;
+    // Standard Base64: '+'/'/' alphabet with '=' padding.
+    return base64_detail::encodeImpl(data, len, kStdAlphabet, /*pad=*/true);
   }
 
   /// \brief Encode a vector of bytes to standard Base64 string.

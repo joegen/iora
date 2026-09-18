@@ -278,6 +278,43 @@
       "headers": [
         "network/sockaddr_utils.hpp"
       ]
+    },
+    "util/gzip.md": {
+      "area": "util",
+      "headers": [
+        "util/gzip.hpp"
+      ]
+    },
+    "util/caching.md": {
+      "area": "util",
+      "headers": [
+        "util/ttl_map.hpp",
+        "util/expiring_cache.hpp"
+      ]
+    },
+    "util/base64.md": {
+      "area": "util",
+      "headers": [
+        "util/base64.hpp"
+      ]
+    },
+    "util/crc32.md": {
+      "area": "util",
+      "headers": [
+        "util/crc32.hpp"
+      ]
+    },
+    "util/filesystem.md": {
+      "area": "util",
+      "headers": [
+        "util/filesystem.hpp"
+      ]
+    },
+    "util/unicode.md": {
+      "area": "util",
+      "headers": [
+        "util/unicode.hpp"
+      ]
     }
   }
 }

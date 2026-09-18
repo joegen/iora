@@ -61,8 +61,12 @@ class TtlMap
   static_assert(std::is_copy_constructible_v<V>,
                 "iora::util::TtlMap requires V to be copy-constructible: get() "
                 "returns a copy of V under the lock and the periodic sweep "
-                "handler stored by the TimerService must be CopyConstructible. "
-                "A whole Node/State is never copied or assigned.");
+                "handler stored by the TimerService must be CopyConstructible.");
+  static_assert(std::is_move_assignable_v<V> || std::is_copy_assignable_v<V>,
+                "iora::util::TtlMap requires V to be move- or copy-assignable: "
+                "put() on an existing key refreshes the stored value in place via "
+                "`node->value = std::move(value)`. A whole Node/State is never "
+                "copied or assigned, but the stored V is move-assigned on refresh.");
 
 public:
   /// \brief Cache configuration. \c maxEntries==0 disables the cache (put() is
@@ -199,8 +203,10 @@ public:
 
   /// \brief Look up an entry (SHARED lock). Returns nullopt on miss OR expired
   /// (deferred reap — no erase/splice under the shared lock). Updates the
-  /// relaxed recency stamp and the hit/miss counters.
-  std::optional<V> get(const K &key)
+  /// relaxed recency stamp and the hit/miss counters. `const`: it mutates only
+  /// atomics inside State (reached through `*_state`, whose constness does not
+  /// propagate to the pointee), so it is consistent with `stats() const`.
+  std::optional<V> get(const K &key) const
   {
     State &s = *_state;
     std::shared_lock<std::shared_mutex> lock(s.mutex);
@@ -297,6 +303,14 @@ private:
     std::atomic<std::uint64_t> evictions{0};
     std::atomic<std::size_t> size{0};
     std::atomic<bool> stopping{false};
+    // Sweep resume cursor: the KEY of the next node sweepState should examine.
+    // Read/written ONLY by sweepState, always under the exclusive `mutex`, so it
+    // needs no separate synchronization. std::nullopt = start from the LRU front.
+    // A key (not a std::list iterator) is stored deliberately: an iterator saved
+    // across a lock release could dangle if a concurrent writer erased its node,
+    // whereas a key re-found via `index` cannot — if the key is gone, the sweep
+    // safely restarts from the front.
+    std::optional<K> sweepResume;
   };
 
   /// \brief Erase one node from both the index and the LRU list and decrement
@@ -346,39 +360,92 @@ private:
     s.evictions.fetch_add(1, std::memory_order_relaxed);
   }
 
-  /// \brief Periodic sweep: physically reap expired entries in bounded batches
-  /// (<=kBatch erases per exclusive-lock acquisition), releasing the lock
-  /// between batches so readers progress. Re-checks \c stopping at the top of
-  /// each batch and bails early (liveness — a teardown-in-progress sweep must
-  /// stop promptly so drain() is not delayed). STATIC by contract: it operates
-  /// ONLY on the State reached via the handler's locked shared_ptr and must
-  /// never touch a TtlMap member, because *this may be destroyed concurrently
-  /// (see the REENTRANCY CONTRACT at the handler in the constructor).
+  /// \brief Periodic sweep: physically reap expired entries in bounded chunks,
+  /// releasing the exclusive lock between chunks so readers progress.
+  ///
+  /// LOCK-HOLD BOUND (the load-bearing property): each exclusive-lock
+  /// acquisition visits at most \c kScanBudget nodes AND erases at most
+  /// \c kReapBatch of them, then releases the lock. This bounds the worst-case
+  /// reader/writer stall per acquisition to O(kScanBudget) regardless of map
+  /// size or expiry distribution. A previous version bounded only ERASURES
+  /// (kBatch), so a sparse-expiry or high-hit-rate map — the stated target
+  /// workload — would walk the entire LRU list under one continuous exclusive
+  /// lock, stalling every hot-path get(); scanning also always restarted at the
+  /// MRU front, re-walking the live prefix. Both are fixed here.
+  ///
+  /// SAFE RESUME: the loop carries its position across lock releases as a KEY
+  /// (\c State::sweepResume), never a std::list iterator — an iterator could
+  /// dangle if a concurrent put()/invalidate()/evictOne()/clear() erased its
+  /// node during the released window, whereas a key re-found via \c index cannot.
+  /// If the resume key is gone on re-lock (its node was erased meanwhile), the
+  /// sweep safely restarts from the front; the list only shrinks, so overall
+  /// forward progress is preserved.
+  ///
+  /// Re-checks \c stopping at the top of each chunk and bails early (liveness —
+  /// a teardown-in-progress sweep must stop promptly so drain() is not delayed).
+  /// STATIC by contract: it operates ONLY on the State reached via the handler's
+  /// locked shared_ptr and must never touch a TtlMap member, because *this may be
+  /// destroyed concurrently (see the REENTRANCY CONTRACT at the handler in the
+  /// constructor).
   static void sweepState(State &s)
   {
-    constexpr std::size_t kBatch = 512;
+    constexpr std::size_t kReapBatch = 512;   // max erasures per lock acquisition
+    constexpr std::size_t kScanBudget = 4096; // max nodes VISITED per acquisition
+    static_assert(kReapBatch <= kScanBudget,
+                  "kReapBatch must not exceed kScanBudget: erasures are a subset "
+                  "of the nodes visited per lock acquisition");
+
+    // PER-INVOCATION visit ceiling — the termination guard, independent of the
+    // resume cursor surviving. One tick visits at most ~one full pass worth of
+    // nodes (size-at-entry + one chunk); anything left is reaped by the next
+    // periodic tick. Without this, an adversary erasing the exact resume key
+    // during every released window (while the live front stays > kScanBudget)
+    // would make the restart-from-front path re-scan the prefix forever and
+    // monopolize the TimerService thread. Forward progress does NOT rest on the
+    // list only shrinking (put() grows it at the front): it rests on the cursor
+    // advancing when the resume key survives, and on this ceiling when it does not.
+    const std::size_t visitCeiling =
+        s.size.load(std::memory_order_relaxed) + kScanBudget;
+    std::size_t totalScanned = 0;
+
     for (;;)
     {
       if (s.stopping.load(std::memory_order_acquire))
       {
-        return; // per-batch stopping re-check (liveness)
+        return; // per-chunk stopping re-check (liveness)
       }
-      // Re-sample now per batch: the lock is released between batches, so a
-      // multi-batch sweep of a large map still reaps entries that cross their
+      // Re-sample now per chunk: the lock is released between chunks, so a
+      // multi-chunk sweep of a large map still reaps entries that cross their
       // expiry mid-sweep (no one-tick deferral).
       const auto now = std::chrono::steady_clock::now();
       std::size_t reaped = 0;
+      std::size_t scanned = 0;
+      bool reachedEnd = false;
       {
         std::unique_lock<std::shared_mutex> lock(s.mutex);
-        auto it = s.lru.begin();
-        while (it != s.lru.end() && reaped < kBatch)
+        // Resume at the saved cursor key if it still exists; else from the front
+        // (a redundant re-scan, never a skip). A KEY is carried across the
+        // released lock, not a std::list iterator: a saved iterator could dangle
+        // if a concurrent erase removed its node, whereas a key re-found via
+        // index cannot.
+        NodeIter it;
+        if (s.sweepResume)
         {
+          auto ri = s.index.find(*s.sweepResume);
+          it = (ri != s.index.end()) ? ri->second : s.lru.begin();
+        }
+        else
+        {
+          it = s.lru.begin();
+        }
+        while (it != s.lru.end() && reaped < kReapBatch && scanned < kScanBudget)
+        {
+          ++scanned;
           if (it->expiresAt <= now)
           {
-            auto next = std::next(it);
-            s.index.erase(it->key);
-            s.lru.erase(it);
-            s.size.fetch_sub(1, std::memory_order_relaxed);
+            NodeIter next = std::next(it);
+            removeNode(s, it); // erase from index+lru, decrement size (reads
+                               // it->key before erasing lru — same order as before)
             it = next;
             ++reaped;
           }
@@ -387,12 +454,24 @@ private:
             ++it;
           }
         }
+        if (it == s.lru.end())
+        {
+          reachedEnd = true;
+          s.sweepResume.reset(); // full pass complete; next tick starts fresh
+        }
+        else
+        {
+          // Budget/erasure cap hit before end: remember where to resume so the
+          // next chunk does not re-walk the prefix we already scanned.
+          s.sweepResume = it->key;
+        }
       }
-      if (reaped < kBatch)
+      totalScanned += scanned;
+      if (reachedEnd || totalScanned >= visitCeiling)
       {
-        return; // a non-full batch means no expired entries remain this pass
+        return; // swept the whole list, or hit the per-tick visit ceiling
       }
-      // Full batch: lock released above so readers progress; loop for the next.
+      // Chunk cap hit: lock released above so readers progress; loop for the next.
     }
   }
 

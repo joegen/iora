@@ -208,7 +208,12 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **ContentCoding** — Content-Encoding list-splitting and log scrubbing — [`docs/parsers/content_coding.md`](docs/parsers/content_coding.md)
 
 ### util
-- **Gzip**, **TtlMap** / **ExpiringCache**, **Base64**, **Crc32**, **Filesystem** — `docs/util/` _(planned)_
+- **Gzip** — the dependency-free RFC 1951/1952 DEFLATE+gzip codec: one-shot `compress`, the streaming `Gzip::Encoder`, and bounded-output `decompress` of untrusted input (zip-bomb cap, `core::Result` errors) — [`docs/util/gzip.md`](docs/util/gzip.md)
+- **Caching (TtlMap / ExpiringCache)** — two TTL caches: the read-optimized `TtlMap` (injected `TimerService`, `shared_mutex`, bounded approximate-LRU, chunked non-stalling sweeper) and the simpler thread-owning `ExpiringCache` with eviction callbacks — [`docs/util/caching.md`](docs/util/caching.md)
+- **Base64** — RFC 4648 standard (`Base64`, padded, strict canonical decode) and URL-safe unpadded (`Base64Url`) encoders/decoder — [`docs/util/base64.md`](docs/util/base64.md)
+- **Crc32** — table-driven reflected CRC-32 (`compute` + the streaming `Incremental` accumulator) used by the gzip trailer — [`docs/util/crc32.md`](docs/util/crc32.md)
+- **Filesystem** — small executable-path and current-directory file-cleanup helpers (`getExecutablePath`/`getExecutableDir`, anchored-prefix / fragment file removal) — [`docs/util/filesystem.md`](docs/util/filesystem.md)
+- **Unicode** — the shared UTF-8 code-point encoder (`appendUtf8`) and ASCII hex-digit decoder (`hexDigitValue`) used by the JSON/XML parsers — [`docs/util/unicode.md`](docs/util/unicode.md)
 
 ### web
 - **Channel** (SSE/WS pub-sub) — documented alongside the SSE stream in [`docs/network/sse_and_channels.md`](docs/network/sse_and_channels.md)

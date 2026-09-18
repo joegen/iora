@@ -177,6 +177,9 @@ set(UTIL_TESTS
     util/iora_test_expiring_cache
     util/iora_test_shell_runner
     util/iora_test_ttl_map
+    util/iora_test_base64
+    util/iora_test_filesystem
+    util/iora_test_unicode
 )
 
 # Storage namespace tests

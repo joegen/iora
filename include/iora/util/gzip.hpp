@@ -1039,11 +1039,13 @@ inline InflateStatus parseGzipHeader(std::string_view input, std::size_t &dataOf
 /// (fixed-Huffman blocks + hash-chain LZ77 over a <=32KB window) wrapped in the
 /// RFC 1952 container with a deterministic header (MTIME=0, OS=0xFF) and a
 /// CRC-32 + ISIZE trailer. Output is byte-reproducible for a given input+level
-/// and decodes under any standard inflater (gunzip, zlib). Decodes any standard
-/// gzip stream (stored / fixed / dynamic-Huffman blocks — including streams
-/// produced by gunzip / zlib), enforcing a mandatory decoded-size cap and
-/// rejecting malformed input cleanly. The raw DEFLATE core is private (namespace
-/// detail); only the gzip container is exposed.
+/// and decodes under any standard inflater (gunzip, zlib). Decodes a SINGLE
+/// standard RFC 1952 gzip member (stored / fixed / dynamic-Huffman blocks —
+/// including members produced by gunzip / zlib), enforcing a mandatory
+/// decoded-size cap and rejecting malformed input cleanly. NOTE: a concatenated
+/// multi-member stream (RFC 1952 §2.2) is NOT accepted — trailing bytes after the
+/// first member are rejected as MALFORMED_INPUT (see decompress()). The raw
+/// DEFLATE core is private (namespace detail); only the gzip container is exposed.
 ///
 /// Entry points:
 ///   - compress(view, level): one-shot encode, materializes the whole input.
