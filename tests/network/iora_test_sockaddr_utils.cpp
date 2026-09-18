@@ -23,8 +23,12 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 using iora::network::addressFromSockaddr;
+using iora::network::applyDscpToFd;
 using iora::network::toSockaddr;
 using iora::network::TransportAddress;
 
@@ -159,5 +163,38 @@ TEST_CASE("toSockaddr and addressFromSockaddr ROUND-TRIP", "[network][sockaddr]"
     const auto out = addressFromSockaddr(ss);
     CHECK(out.host == in.host);
     CHECK(out.port == in.port);
+  }
+}
+
+TEST_CASE("applyDscpToFd marks INET/INET6 sockets and rejects other families",
+          "[network][sockaddr][dscp]")
+{
+  SECTION("AF_INET socket accepts the mark")
+  {
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    REQUIRE(fd >= 0);
+    CHECK(applyDscpToFd(fd, 46)); // EF
+    ::close(fd);
+  }
+
+  SECTION("AF_INET6 socket accepts the mark (primary IPV6_TCLASS)")
+  {
+    int fd = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    REQUIRE(fd >= 0);
+    CHECK(applyDscpToFd(fd, 46));
+    ::close(fd);
+  }
+
+  SECTION("Unsupported family (AF_UNIX) is rejected, not passed to IP_TOS")
+  {
+    int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    REQUIRE(fd >= 0);
+    CHECK_FALSE(applyDscpToFd(fd, 46));
+    ::close(fd);
+  }
+
+  SECTION("A negative fd is rejected")
+  {
+    CHECK_FALSE(applyDscpToFd(-1, 46));
   }
 }

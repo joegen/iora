@@ -193,7 +193,9 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **DnsClient** — the standalone DNS-protocol client with RFC 3263 SIP service discovery (NAPTR→SRV→A/AAAA, `S`/`A`-flag subset), UDP-with-TCP-fallback transport, retry/backoff, hardened wire parsing, TTL caching, and best-effort cancellable async — distinct from the transport-internal `NameResolver`/`getaddrinfo` path — [`docs/network/dns_client.md`](docs/network/dns_client.md)
 - **Server-Sent Events + Channel pub/sub** — the `SessionId`-retention SSE model (`upgradeToSse`, `SseStream`, the injected-`TimerService` `SseManager` heartbeat) plus the `SseChannel` / `WsChannel` snapshot-then-write fan-out — [`docs/network/sse_and_channels.md`](docs/network/sse_and_channels.md)
 - **EventBatchProcessor** — the optional epoll batch-drain helper with adaptive sizing and the eventfd/timerfd special-fd fast-path (opt-in via `TransportConfig::batching`) — [`docs/network/event_batch_processor.md`](docs/network/event_batch_processor.md)
-- **IpUtils**, **ObjectPool**, **SockaddrUtils** — `docs/network/` _(planned)_
+- **IP utilities** — IPv4/IPv6 parsing, validation, classification, CIDR containment, and the `shared_mutex`-guarded trusted-network allow-list (leading-zero rejection, RFC 5952 rendering) — [`docs/network/ip_utils.md`](docs/network/ip_utils.md)
+- **ObjectPool** — the generic mutex-guarded free-list pool with capped growth and the `PooledObject` RAII return-to-pool handle — [`docs/network/object_pool.md`](docs/network/object_pool.md)
+- **SockaddrUtils** — the shared `sockaddr_storage` ↔ `TransportAddress` conversions and DSCP fd-marking with dual-stack mirroring — [`docs/network/sockaddr_utils.md`](docs/network/sockaddr_utils.md)
 
 ### parsers
 - **JSON** — value model, parser & serializer (`\uXXXX`/surrogate decoding, RFC 8259) — [`docs/parsers/json.md`](docs/parsers/json.md)

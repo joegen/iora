@@ -152,7 +152,13 @@ inline bool applyDscpToFd(int fd, std::uint8_t dscp)
     (void)::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val));
     return true;
   }
-  return ::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) == 0;
+  if (ss.ss_family == AF_INET)
+  {
+    return ::setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) == 0;
+  }
+  // Any other family (e.g. AF_UNIX) has no DSCP/TOS notion: fail explicitly
+  // rather than relying on the kernel to reject an IP_TOS setsockopt.
+  return false;
 }
 
 } // namespace network

@@ -260,6 +260,24 @@
       "headers": [
         "network/event_batch_processor.hpp"
       ]
+    },
+    "network/ip_utils.md": {
+      "area": "network",
+      "headers": [
+        "network/ip_utils.hpp"
+      ]
+    },
+    "network/object_pool.md": {
+      "area": "network",
+      "headers": [
+        "network/object_pool.hpp"
+      ]
+    },
+    "network/sockaddr_utils.md": {
+      "area": "network",
+      "headers": [
+        "network/sockaddr_utils.hpp"
+      ]
     }
   }
 }

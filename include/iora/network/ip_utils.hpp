@@ -323,14 +323,29 @@ public:
       {
         group = ip.substr(pos, colonPos - pos);
         pos = colonPos + 1;
-      }
-
-      if (!group.empty())
-      {
-        if (!parseGroup(group, groups))
+        // A single (non-doubled) separator colon with nothing after it is a
+        // stray trailing colon ("1:2:...:8:", "1::2:"): the group before it is
+        // well-formed, so the empty-group check below cannot catch it. A
+        // legitimate trailing "::" is consumed by the double-colon branch above
+        // (via `continue`) and never reaches here.
+        if (pos == ip.length())
         {
           return false;
         }
+      }
+
+      // An empty group here is a stray, non-doubled leading colon (":1:2:...").
+      // A legitimate "::" is consumed by the double-colon branch above via
+      // `continue` and never reaches this point, so an empty token is always
+      // malformed. Reject it rather than silently skipping, mirroring
+      // IPv4::parse's trailing-character rejection.
+      if (group.empty())
+      {
+        return false;
+      }
+      if (!parseGroup(group, groups))
+      {
+        return false;
       }
     }
 
@@ -767,19 +782,26 @@ struct CidrNetwork
     else
     {
       addrPart = cidr.substr(0, slashPos);
+      // The prefix must be a run of decimal digits and nothing else. std::stoul
+      // stops at the first non-digit WITHOUT reporting the trailing remainder,
+      // so "10.0.0.0/24garbage" would otherwise parse as a well-formed /24;
+      // pre-validate every character (mirrors IPv6::parseGroup's hex pre-check)
+      // and reject a sign, whitespace, or trailing garbage.
+      const std::string prefixStr = cidr.substr(slashPos + 1);
+      if (prefixStr.empty() ||
+          !std::all_of(prefixStr.begin(), prefixStr.end(),
+                       [](unsigned char c) { return std::isdigit(c) != 0; }))
+      {
+        return false;
+      }
       try
       {
-        // Use stoul to avoid negative value issues
-        unsigned long prefix = std::stoul(cidr.substr(slashPos + 1));
+        unsigned long prefix = std::stoul(prefixStr);
         if (prefix > 128)  // Max valid prefix for either family
         {
           return false;
         }
         prefixLength = static_cast<std::uint32_t>(prefix);
-      }
-      catch (const std::invalid_argument&)
-      {
-        return false;
       }
       catch (const std::out_of_range&)
       {
@@ -952,11 +974,10 @@ public:
   {
     std::unique_lock lock(_mutex);
 
-    // Check for duplicate
+    // Check for duplicate (canonical so two spellings of one address collide)
     for (const auto& e : _entries)
     {
-      if (e.network.address == entry.network.address &&
-          e.network.prefixLength == entry.network.prefixLength)
+      if (sameNetwork(e.network, entry.network))
       {
         return false;
       }
@@ -988,11 +1009,10 @@ public:
 
     std::unique_lock lock(_mutex);
 
-    // Check for duplicate
+    // Check for duplicate (canonical so two spellings of one address collide)
     for (const auto& e : _entries)
     {
-      if (e.network.address == entry.network.address &&
-          e.network.prefixLength == entry.network.prefixLength)
+      if (sameNetwork(e.network, entry.network))
       {
         return "";
       }
@@ -1035,10 +1055,7 @@ public:
     std::unique_lock lock(_mutex);
 
     auto it = std::remove_if(_entries.begin(), _entries.end(),
-      [&net](const TrustedNetworkEntry& e) {
-        return e.network.address == net.address &&
-               e.network.prefixLength == net.prefixLength;
-      });
+      [&net](const TrustedNetworkEntry& e) { return sameNetwork(e.network, net); });
 
     if (it != _entries.end())
     {
@@ -1056,8 +1073,16 @@ public:
   {
     std::shared_lock lock(_mutex);
 
-    // Fast path: exact match for single IPs
+    // Fast path: canonical match for single IPs. The stored keys are canonical,
+    // so probe the raw query first — an already-canonical input (the common
+    // case) hits directly and skips the parse + allocation in canonicalAddress.
+    // Only on a miss do we canonicalize, so a non-canonical spelling still hits.
     if (_singleIpSet.count(ip) > 0)
+    {
+      return true;
+    }
+    const std::string canonical = canonicalAddress(ip);
+    if (canonical != ip && _singleIpSet.count(canonical) > 0)
     {
       return true;
     }
@@ -1172,8 +1197,10 @@ private:
 
       if (entry.network.isSingleHost())
       {
-        // Single IPs go to hash set for O(1) lookup (works for both IPv4 and IPv6)
-        _singleIpSet.insert(entry.network.address);
+        // Single IPs go to hash set for O(1) lookup (works for both IPv4 and
+        // IPv6). Key on the canonical form so a differently-spelled query still
+        // hits (e.g. "::1" added, "0:0:0:0:0:0:0:1" queried).
+        _singleIpSet.insert(canonicalAddress(entry.network.address));
       }
       else
       {
@@ -1194,6 +1221,33 @@ private:
   {
     // Use atomic fetch_add for thread-safe ID generation
     return "net_" + std::to_string(_idCounter.fetch_add(1, std::memory_order_relaxed) + 1);
+  }
+
+  /// \brief Canonical textual form of an address for identity comparison.
+  ///
+  /// A single IP has many textual spellings ("::1" vs "0:0:0:0:0:0:0:1",
+  /// "2001:DB8::1" vs "2001:db8::1"). Keying the single-host set and the
+  /// duplicate/remove checks on the raw input string would make matching and
+  /// de-duplication spelling-dependent. Reduce to the RFC 5952 canonical form.
+  /// IPv4 needs no work: IPv4::parse rejects leading zeros, so a valid IPv4
+  /// literal already has exactly one spelling — skip the parse+reformat round
+  /// trip for it. Falls back to the original string if it is not a valid IP
+  /// literal.
+  static std::string canonicalAddress(const std::string& addr)
+  {
+    if (!isIPv6Address(addr))
+    {
+      return addr; // valid IPv4 is already canonical; invalid falls through unchanged
+    }
+    IPv6::Address ipv6{};
+    return IPv6::parse(addr, ipv6) ? IPv6::toString(ipv6) : addr;
+  }
+
+  /// \brief True if two networks denote the same address (canonical) + prefix.
+  static bool sameNetwork(const CidrNetwork& a, const CidrNetwork& b)
+  {
+    return a.prefixLength == b.prefixLength &&
+           canonicalAddress(a.address) == canonicalAddress(b.address);
   }
 
   mutable std::shared_mutex _mutex;

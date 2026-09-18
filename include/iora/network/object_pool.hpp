@@ -25,15 +25,15 @@ public:
   using Resetter = std::function<void(T *)>;
 
   explicit ObjectPool(Factory factory, Resetter resetter = nullptr, std::size_t initialSize = 0)
-      : factory_(std::move(factory)), resetter_(std::move(resetter))
+      : _factory(std::move(factory)), _resetter(std::move(resetter))
   {
     // Pre-populate pool
     for (std::size_t i = 0; i < initialSize; ++i)
     {
-      if (auto obj = factory_())
+      if (auto obj = _factory())
       {
-        available_.push_back(std::move(obj));
-        created_.fetch_add(1, std::memory_order_relaxed);
+        _available.push_back(std::move(obj));
+        _created.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
@@ -41,45 +41,56 @@ public:
   // Acquire an object from the pool
   std::unique_ptr<T> acquire()
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (!available_.empty())
     {
-      auto obj = std::move(available_.back());
-      available_.pop_back();
-      acquired_.fetch_add(1, std::memory_order_relaxed);
-      return obj;
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (!_available.empty())
+      {
+        auto obj = std::move(_available.back());
+        _available.pop_back();
+        _acquired.fetch_add(1, std::memory_order_relaxed);
+        return obj;
+      }
     }
 
-    // Pool empty, create new object
-    created_.fetch_add(1, std::memory_order_relaxed);
-    return factory_();
+    // Pool empty: manufacture OUTSIDE the lock so a slow or re-entrant factory
+    // neither serializes other pool users nor self-deadlocks (contrast the
+    // resetter in release(), which also runs off the lock). A factory that
+    // returns null is handled gracefully and counts toward nothing.
+    auto obj = _factory ? _factory() : nullptr;
+    if (obj)
+    {
+      _created.fetch_add(1, std::memory_order_relaxed);
+      _acquired.fetch_add(1, std::memory_order_relaxed);
+    }
+    return obj;
   }
 
   // Return an object to the pool
   void release(std::unique_ptr<T> obj)
   {
     if (!obj)
-      return;
-
-    // Reset object state if resetter provided
-    if (resetter_)
     {
-      resetter_(obj.get());
+      return;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    // Reset object state if resetter provided (runs BEFORE the lock)
+    if (_resetter)
+    {
+      _resetter(obj.get());
+    }
+
+    std::lock_guard<std::mutex> lock(_mutex);
 
     // Limit pool size to prevent unbounded growth
-    if (available_.size() < maxPoolSize_)
+    if (_available.size() < _maxPoolSize)
     {
-      available_.push_back(std::move(obj));
-      released_.fetch_add(1, std::memory_order_relaxed);
+      _available.push_back(std::move(obj));
+      _released.fetch_add(1, std::memory_order_relaxed);
     }
     else
     {
       // Let object be destroyed
-      destroyed_.fetch_add(1, std::memory_order_relaxed);
+      _destroyed.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -95,56 +106,77 @@ public:
 
   Stats getStats() const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return {available_.size(), created_.load(std::memory_order_relaxed),
-            acquired_.load(std::memory_order_relaxed), released_.load(std::memory_order_relaxed),
-            destroyed_.load(std::memory_order_relaxed)};
+    std::lock_guard<std::mutex> lock(_mutex);
+    return {_available.size(), _created.load(std::memory_order_relaxed),
+            _acquired.load(std::memory_order_relaxed), _released.load(std::memory_order_relaxed),
+            _destroyed.load(std::memory_order_relaxed)};
   }
 
   void setMaxPoolSize(std::size_t size)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    maxPoolSize_ = size;
-
-    // Trim existing pool if it exceeds the new max size
-    while (available_.size() > maxPoolSize_)
+    std::vector<std::unique_ptr<T>> dead;
     {
-      available_.pop_back();
-      destroyed_.fetch_add(1, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lock(_mutex);
+      _maxPoolSize = size;
+      collectSurplusLocked(_maxPoolSize, dead); // trim to the new cap
     }
+    // `dead` destructs here, AFTER the lock is released.
   }
 
   void clear()
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    available_.clear();
+    std::vector<std::unique_ptr<T>> dead;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      collectSurplusLocked(0, dead);
+    }
+    // `dead` destructs here, AFTER the lock is released.
   }
 
 private:
-  Factory factory_;
-  Resetter resetter_;
-  mutable std::mutex mutex_;
-  std::vector<std::unique_ptr<T>> available_;
-  std::size_t maxPoolSize_{100}; // Prevent unbounded growth
+  // Move every idle object beyond `keep` out of _available into `out`, counting
+  // each as destroyed. The caller holds _mutex, but the actual ~T() runs when
+  // `out` is destroyed AFTER the lock is released — mirroring release()'s
+  // over-cap path — so a re-entrant object destructor cannot deadlock on the
+  // non-recursive _mutex. Shared by clear() and setMaxPoolSize().
+  void collectSurplusLocked(std::size_t keep, std::vector<std::unique_ptr<T>> &out)
+  {
+    if (_available.size() <= keep)
+    {
+      return;
+    }
+    _destroyed.fetch_add(_available.size() - keep, std::memory_order_relaxed);
+    for (std::size_t i = keep; i < _available.size(); ++i)
+    {
+      out.push_back(std::move(_available[i]));
+    }
+    _available.resize(keep); // the moved-from tail holds null unique_ptrs
+  }
+
+  Factory _factory;
+  Resetter _resetter;
+  mutable std::mutex _mutex;
+  std::vector<std::unique_ptr<T>> _available;
+  std::size_t _maxPoolSize{100}; // Prevent unbounded growth
 
   // Statistics
-  std::atomic<std::size_t> created_{0};
-  std::atomic<std::size_t> acquired_{0};
-  std::atomic<std::size_t> released_{0};
-  std::atomic<std::size_t> destroyed_{0};
+  std::atomic<std::size_t> _created{0};
+  std::atomic<std::size_t> _acquired{0};
+  std::atomic<std::size_t> _released{0};
+  std::atomic<std::size_t> _destroyed{0};
 };
 
 // RAII wrapper for automatic return to pool
 template <typename T> class PooledObject
 {
 public:
-  PooledObject(std::unique_ptr<T> obj, ObjectPool<T> *pool) : obj_(std::move(obj)), pool_(pool) {}
+  PooledObject(std::unique_ptr<T> obj, ObjectPool<T> *pool) : _obj(std::move(obj)), _pool(pool) {}
 
   ~PooledObject()
   {
-    if (obj_ && pool_)
+    if (_obj && _pool)
     {
-      pool_->release(std::move(obj_));
+      _pool->release(std::move(_obj));
     }
   }
 
@@ -152,9 +184,9 @@ public:
   PooledObject(const PooledObject &) = delete;
   PooledObject &operator=(const PooledObject &) = delete;
 
-  PooledObject(PooledObject &&other) noexcept : obj_(std::move(other.obj_)), pool_(other.pool_)
+  PooledObject(PooledObject &&other) noexcept : _obj(std::move(other._obj)), _pool(other._pool)
   {
-    other.pool_ = nullptr;
+    other._pool = nullptr;
   }
 
   PooledObject &operator=(PooledObject &&other) noexcept
@@ -162,33 +194,33 @@ public:
     if (this != &other)
     {
       // Return current object to pool
-      if (obj_ && pool_)
+      if (_obj && _pool)
       {
-        pool_->release(std::move(obj_));
+        _pool->release(std::move(_obj));
       }
 
-      obj_ = std::move(other.obj_);
-      pool_ = other.pool_;
-      other.pool_ = nullptr;
+      _obj = std::move(other._obj);
+      _pool = other._pool;
+      other._pool = nullptr;
     }
     return *this;
   }
 
-  T *get() const { return obj_.get(); }
-  T &operator*() const { return *obj_; }
-  T *operator->() const { return obj_.get(); }
-  explicit operator bool() const { return static_cast<bool>(obj_); }
+  T *get() const { return _obj.get(); }
+  T &operator*() const { return *_obj; }
+  T *operator->() const { return _obj.get(); }
+  explicit operator bool() const { return static_cast<bool>(_obj); }
 
   // Release ownership without returning to pool
   std::unique_ptr<T> release()
   {
-    pool_ = nullptr;
-    return std::move(obj_);
+    _pool = nullptr;
+    return std::move(_obj);
   }
 
 private:
-  std::unique_ptr<T> obj_;
-  ObjectPool<T> *pool_;
+  std::unique_ptr<T> _obj;
+  ObjectPool<T> *_pool;
 };
 
 template <typename T> PooledObject<T> makePooled(ObjectPool<T> &pool)
