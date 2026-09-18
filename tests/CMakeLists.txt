@@ -180,6 +180,7 @@ set(UTIL_TESTS
     util/iora_test_base64
     util/iora_test_filesystem
     util/iora_test_unicode
+    util/iora_test_external_clock_idle_map
 )
 
 # Storage namespace tests
@@ -539,6 +540,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_gzip_decode
     iora_test_ttl_map
     iora_test_expiring_cache
+    iora_test_external_clock_idle_map
     iora_test_transport
     iora_test_transport_improvements
     iora_test_tcp_engine
