@@ -167,6 +167,7 @@ set(PARSERS_TESTS
     parsers/iora_test_http_message_hardening
     parsers/iora_test_accept_encoding
     parsers/iora_test_content_coding
+    parsers/iora_test_hep3_parser
 )
 
 # Util namespace tests
