@@ -511,20 +511,64 @@ TEST_CASE("Embedded getStatic + reload() concurrently is lock-free safe (M-7)", 
   REQUIRE_FALSE(bad.load());
 }
 
-TEST_CASE("getTemplate copy-before-reload contract (H-5)", "[assets][filesystem][template]")
+TEST_CASE("getTemplate returns an owning value that survives reload (H-5)",
+          "[assets][filesystem][template]")
 {
   TempTree tree("tplreload");
   tree.writeTemplate("p.html", "<b>original</b>");
   Assets a = Assets::fromDirectory(tree.root);
-  auto v = a.getTemplate("p.html");
+  std::optional<std::string> v = a.getTemplate("p.html");
   REQUIRE(v.has_value());
-  std::string copy(*v); // caller copies BEFORE any reload (the documented contract)
+  // The returned value OWNS its bytes: a subsequent reload cannot invalidate it.
   tree.writeTemplate("p.html", "<b>changed</b>");
   a.reload();
-  REQUIRE(copy == "<b>original</b>");
+  REQUIRE(*v == "<b>original</b>");
   auto v2 = a.getTemplate("p.html");
   REQUIRE(v2.has_value());
   REQUIRE(*v2 == "<b>changed</b>");
+}
+
+TEST_CASE("getTemplate is reload-safe under concurrent reload (H-5, TSAN)",
+          "[assets][filesystem][template][concurrency]")
+{
+  TempTree tree("tplreloadrace");
+  tree.writeTemplate("p.html", "<b>original</b>");
+  Assets a = Assets::fromDirectory(tree.root);
+  std::atomic<bool> stop{false};
+  std::atomic<bool> bad{false};  // Catch2 macros are main-thread-only
+  std::atomic<int> reads{0};     // liveness: prove the reader actually ran
+  std::thread reader(
+    [&]()
+    {
+      while (!stop.load())
+      {
+        std::optional<std::string> v = a.getTemplate("p.html");
+        // Owning result: reading it can never race a concurrent reload()'s cache
+        // clear (the old bare-string_view return UAF'd exactly here).
+        if (v)
+        {
+          if (v->find("<b>") == std::string::npos)
+          {
+            bad.store(true);
+          }
+          reads.fetch_add(1);
+        }
+      }
+    });
+  for (int i = 0; i < 500; ++i)
+  {
+    a.reload(); // clears the template cache; must not race the concurrent reader
+  }
+  // Do not stop until the reader has observed at least one template, so the test
+  // cannot pass vacuously without ever exercising the reader/reload interleaving.
+  for (int g = 0; reads.load() == 0 && g < 2000000; ++g)
+  {
+    std::this_thread::yield();
+  }
+  stop.store(true);
+  reader.join();
+  REQUIRE_FALSE(bad.load());
+  REQUIRE(reads.load() > 0);
 }
 
 TEST_CASE("Filesystem-mode traversal rejection (OQ-9/M-d/M-e, exercises isContained)",

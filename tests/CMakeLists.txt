@@ -550,6 +550,14 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_udp_engine_teardown_race
     iora_test_batch_processor
 
+    # Web asset-pipeline getTemplate reload-safety (H1, web slice 2026-09-22): the
+    # filesystem template return was a bare string_view into the cache whose only
+    # strong ref is the cache itself; a concurrent reload() clear() freed it under a
+    # reader. The fix returns an owning copy taken under the cache mutex; the
+    # reader-vs-reload race is a cross-thread UAF a plain build cannot reliably
+    # detect. Guarded by if(TARGET ...) since web tests are opt-in (IORA_BUILD_WEB_TESTS).
+    test_assets
+
     # JsonFileStore background-flush drain-handshake (storage slice 2026-09-22): the
     # erase-then-drain lifetime barrier (flushThreadFunc snapshots under registryMutex
     # then flushes off it, holding flushCycleMutex across the cycle; unregisterStore

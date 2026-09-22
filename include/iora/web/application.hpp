@@ -97,28 +97,19 @@ public:
   /// page/fragment/postFragment are the catch points (RD-14/APP-9).
   std::string render(std::string_view templateName, const parsers::Json &data) const
   {
-    std::optional<std::string_view> tmplView = _assets.getTemplate(templateName);
-    if (!tmplView)
+    std::optional<std::string> tmpl = _assets.getTemplate(templateName);
+    if (!tmpl)
     {
       core::Logger::error("Application::render: template not found: " +
                           std::string(templateName));
       throw parsers::MustacheError("template not found: " + std::string(templateName));
     }
-    // N-1: the filesystem-mode getTemplate view is NOT reload-safe — copy the
-    // top-level template into an owning std::string BEFORE the render (reload
-    // boundary). Only getStatic's StaticBlob is reload-safe (RD-20).
-    std::string tmpl(*tmplView);
+    // getTemplate returns an OWNING std::string that is reload-safe (the
+    // filesystem-mode copy is taken under the cache mutex), so the top-level
+    // template and each resolved partial survive a concurrent reload().
     parsers::PartialResolver resolver =
-      [this](std::string_view name) -> std::optional<std::string>
-    {
-      std::optional<std::string_view> t = _assets.getTemplate(name);
-      if (!t)
-      {
-        return std::nullopt;
-      }
-      return std::string(*t); // owning copy per partial (no reload-boundary view)
-    };
-    return parsers::Mustache::render(tmpl, data, resolver);
+      [this](std::string_view name) { return _assets.getTemplate(name); };
+    return parsers::Mustache::render(*tmpl, data, resolver);
   }
 
   // ── page / fragment / postFragment ────────────────────────────────────────

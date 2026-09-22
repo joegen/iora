@@ -217,7 +217,10 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 
 ### web
 - **Channel** (SSE/WS pub-sub) — documented alongside the SSE stream in [`docs/network/sse_and_channels.md`](docs/network/sse_and_channels.md)
-- **Application**, **Htmx**, **Assets** (asset pipeline), **Middleware interfaces** — `docs/web/` _(planned)_
+- **Application** — the consumer-facing facade wiring routing, Mustache, assets, SSE/WS channels, and metrics into a server-rendered HTMX app — [`docs/web/application.md`](docs/web/application.md)
+- **Asset pipeline** (`Assets`) — static-asset + template serving with build-time embedding, gzip variants, per-representation ETags, and a path-traversal chokepoint — [`docs/web/asset_pipeline.md`](docs/web/asset_pipeline.md)
+- **Htmx** — `HX-*` request inspectors and response setters with CR/LF + dangerous-scheme injection guards — [`docs/web/htmx.md`](docs/web/htmx.md)
+- **Middleware interfaces** — the pluggable auth/session/CSRF/login contracts (`IAuthGuard`/`ISessionStore`/`ICsrfProtector`/`ILoginUiProvider`) and their conformance suites — [`docs/web/middleware_interfaces.md`](docs/web/middleware_interfaces.md)
 
 ### storage
 - **KVStore** — durable binary key-value store with per-key TTL, background compaction, and an in-memory mode — [`docs/storage/kvstore.md`](docs/storage/kvstore.md)

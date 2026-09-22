@@ -37,12 +37,13 @@
 // less-trusted principals); intermediate-component swaps would need openat()
 // chains (out of v1 scope).
 //
-// getTemplate cross-thread (H-5/N-5): getTemplate's filesystem-mode return is a
-// bare std::string_view into the template cache and is NOT ownership-protected
-// against a CONCURRENT reload() on another thread — callers MUST copy it into an
-// owning std::string before any reload boundary (the PartialResolver bridge
-// copies immediately; rendering is synchronous on the handler thread). Only
-// getStatic's StaticBlob is reload-safe via _entry.
+// getTemplate cross-thread (H-5/N-5): getTemplate returns an OWNING
+// std::optional<std::string>. For filesystem mode the copy is taken under the
+// cache mutex, so the returned value is reload-safe — a concurrent reload() that
+// clears the template cache cannot invalidate an already-returned template. This
+// mirrors getStatic's StaticBlob reload-safety (there via the _entry shared_ptr;
+// here via an owning copy, since every caller renders from an owned string
+// anyway, making the owning return net-zero cost).
 
 #pragma once
 
@@ -221,13 +222,14 @@ public:
 
   /// \brief Return the raw template source for `name`, or nullopt if absent.
   ///
-  /// H-5/N-5: the filesystem-mode view is valid only until the next reload()
-  /// and is NOT protected against a concurrent reload() on another thread —
-  /// callers MUST copy it into an owning std::string before any reload boundary
-  /// (the PartialResolver bridge copies immediately; rendering is synchronous).
+  /// H-5/N-5: returns an OWNING std::optional<std::string>. For filesystem mode
+  /// the copy is taken under the cache mutex, so the result is reload-safe — a
+  /// concurrent reload() that clears the cache cannot invalidate it (mirrors
+  /// getStatic's StaticBlob reload-safety). Every caller renders from an owned
+  /// string anyway, so this owning return is net-zero cost.
   /// M-g: a traversal name returns nullopt (template names are server-controlled,
   /// never request-derived).
-  std::optional<std::string_view> getTemplate(std::string_view name) const
+  std::optional<std::string> getTemplate(std::string_view name) const
   {
     if (lexicallyRejected(name))
     {
@@ -236,7 +238,11 @@ public:
     if (_mode == Mode::Embedded)
     {
       const EmbeddedTemplate *t = findTemplate(name);
-      return t ? std::optional<std::string_view>(t->bytes) : std::nullopt;
+      if (!t)
+      {
+        return std::nullopt;
+      }
+      return std::string(t->bytes);
     }
     return getTemplateFilesystem(name);
   }
@@ -729,7 +735,7 @@ private:
     return {GetStaticResult::Status::Found, blobFromEntry(chosen, path)};
   }
 
-  std::optional<std::string_view> getTemplateFilesystem(std::string_view name) const
+  std::optional<std::string> getTemplateFilesystem(std::string_view name) const
   {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -747,30 +753,41 @@ private:
     }
 
     const std::string key(name);
+    // Copy the cache's owning shared_ptr out UNDER the lock (H-5); the std::string
+    // is materialized once, after the lock releases, from a locally-owned handle
+    // that a concurrent reload()'s clear() can no longer invalidate. Same
+    // double-checked-locking shape as getStaticFilesystem (one `chosen` handle,
+    // one exit).
+    std::shared_ptr<const std::string> chosen;
     {
       std::lock_guard<std::mutex> lock(_fs->mutex);
       auto it = _fs->templateCache.find(key);
       if (it != _fs->templateCache.end())
       {
-        return std::string_view(*it->second);
+        chosen = it->second;
       }
     }
-    auto data = readFile(resolved);
-    if (!data)
+    if (!chosen)
     {
-      return std::nullopt;
-    }
-    auto source = std::make_shared<std::string>(std::move(*data));
-    {
+      auto data = readFile(resolved);
+      if (!data)
+      {
+        return std::nullopt;
+      }
+      auto built = std::make_shared<const std::string>(std::move(*data));
       std::lock_guard<std::mutex> lock(_fs->mutex);
       auto it = _fs->templateCache.find(key);
       if (it != _fs->templateCache.end())
       {
-        return std::string_view(*it->second);
+        chosen = it->second; // a peer populated it first; adopt the winner
       }
-      _fs->templateCache.emplace(key, source);
+      else
+      {
+        _fs->templateCache.emplace(key, built);
+        chosen = built;
+      }
     }
-    return std::string_view(*source);
+    return std::string(*chosen);
   }
 };
 

@@ -333,6 +333,30 @@
       "headers": [
         "storage/json_file_store.hpp"
       ]
+    },
+    "web/application.md": {
+      "area": "web",
+      "headers": [
+        "web/application.hpp"
+      ]
+    },
+    "web/asset_pipeline.md": {
+      "area": "web",
+      "headers": [
+        "web/assets.hpp"
+      ]
+    },
+    "web/htmx.md": {
+      "area": "web",
+      "headers": [
+        "web/htmx.hpp"
+      ]
+    },
+    "web/middleware_interfaces.md": {
+      "area": "web",
+      "headers": [
+        "web/middleware_interfaces.hpp"
+      ]
     }
   }
 }
