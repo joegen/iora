@@ -220,7 +220,9 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 - **Application**, **Htmx**, **Assets** (asset pipeline), **Middleware interfaces** — `docs/web/` _(planned)_
 
 ### storage
-- **KVStore**, **JsonFileStore**, **ConcreteStateStore** — `docs/storage/` _(planned)_
+- **KVStore** — durable binary key-value store with per-key TTL, background compaction, and an in-memory mode — [`docs/storage/kvstore.md`](docs/storage/kvstore.md)
+- **JsonFileStore** — JSON-file-backed store with typed values and a shared background flush thread — [`docs/storage/json_file_store.md`](docs/storage/json_file_store.md)
+- **ConcreteStateStore** — lightweight in-memory, case-insensitive string state map — [`docs/storage/concrete_state_store.md`](docs/storage/concrete_state_store.md)
 
 ### crypto / ids / system / common
 - **SecureRng**, **Uuid**, **ShellRunner**, **ILifecycleManaged** — `docs/{crypto,ids,system,common}/` _(planned)_

@@ -550,6 +550,14 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_udp_engine_teardown_race
     iora_test_batch_processor
 
+    # JsonFileStore background-flush drain-handshake (storage slice 2026-09-22): the
+    # erase-then-drain lifetime barrier (flushThreadFunc snapshots under registryMutex
+    # then flushes off it, holding flushCycleMutex across the cycle; unregisterStore
+    # drains it) is a cross-thread UAF property a plain build cannot reliably detect --
+    # the churn / multi-instance-destroy-under-live-thread probes are only meaningful
+    # under ASan/TSan.
+    iora_test_state
+
     # DnsTransport callback-under-lock / teardown cluster (tracker 2026-09-11-6): the
     # phase-split stop() UAF fix is a cross-thread teardown-ordering property a non-TSan
     # soak cannot observe -- this target carries the cross-thread external-stop() probe.

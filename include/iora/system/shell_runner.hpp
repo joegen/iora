@@ -815,6 +815,44 @@ private:
   }
 };
 
+/// \brief Deleter for popen()'d FILE* streams. A stateless functor -- NOT
+/// decltype(&pclose) -- so the deleter type carries none of glibc's function
+/// attributes on pclose. Those attributes, when captured via decltype and used
+/// as a std::unique_ptr deleter template argument, trip -Wignored-attributes,
+/// which is a hard error under -Werror on newer GCC (14+).
+struct PcloseDeleter
+{
+  void operator()(FILE *stream) const noexcept
+  {
+    if (stream != nullptr)
+    {
+      pclose(stream);
+    }
+  }
+};
+
+/// \brief Canonicalize a pclose() return value into an exit code.
+/// pclose() returns -1 on failure (e.g. ECHILD / interrupted wait); otherwise it
+/// returns a wait(2)-style status. A normally-exited child yields its exit
+/// status; a signal-terminated child is reported as 128 + signal (shell
+/// convention) rather than a garbage WEXITSTATUS of an un-WIFEXITED status.
+inline int pcloseExitCode(int rc)
+{
+  if (rc == -1)
+  {
+    return -1;
+  }
+  if (WIFEXITED(rc))
+  {
+    return WEXITSTATUS(rc);
+  }
+  if (WIFSIGNALED(rc))
+  {
+    return 128 + WTERMSIG(rc);
+  }
+  return rc;
+}
+
 /// \brief Executes shell commands and manages process lifecycles.
 class ShellRunner
 {
@@ -827,7 +865,7 @@ public:
     std::array<char, 128> buffer;
     std::string result;
 
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command.c_str(), "r"), pclose);
+    std::unique_ptr<FILE, PcloseDeleter> pipe(popen(command.c_str(), "r"));
 
     if (!pipe)
     {
@@ -839,12 +877,12 @@ public:
       result += buffer.data();
     }
 
-    int exit_code = pclose(pipe.release());
+    int exit_code = pcloseExitCode(pclose(pipe.release()));
 
     if (exit_code != 0)
     {
       throw std::runtime_error("ShellRunner error: Command failed with exit code " +
-                               std::to_string(WEXITSTATUS(exit_code)));
+                               std::to_string(exit_code));
     }
 
     return result;
@@ -858,7 +896,7 @@ public:
   {
     std::array<char, 128> buffer;
 
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command.c_str(), "r"), pclose);
+    std::unique_ptr<FILE, PcloseDeleter> pipe(popen(command.c_str(), "r"));
 
     if (!pipe)
     {
@@ -871,8 +909,7 @@ public:
       output.flush(); // Ensure real-time streaming
     }
 
-    int exit_code = pclose(pipe.release());
-    return WEXITSTATUS(exit_code);
+    return pcloseExitCode(pclose(pipe.release()));
   }
 
   /// \brief Executes a shell command with advanced options.
@@ -890,7 +927,7 @@ public:
 
     // Execute command
     std::array<char, 128> buffer;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(full_command.c_str(), "r"), pclose);
+    std::unique_ptr<FILE, PcloseDeleter> pipe(popen(full_command.c_str(), "r"));
 
     if (!pipe)
     {
@@ -915,8 +952,7 @@ public:
       }
     }
 
-    int exit_code = pclose(pipe.release());
-    result.exitCode = WEXITSTATUS(exit_code);
+    result.exitCode = pcloseExitCode(pclose(pipe.release()));
 
     auto end_time = std::chrono::steady_clock::now();
     result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);

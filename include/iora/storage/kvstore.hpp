@@ -1669,12 +1669,15 @@ private:
   // Threading and synchronization.
   //
   // Lock ordering (outer -> inner; acquire only in this order, never reversed):
-  //   _mutex -> _cacheMutex   (data mutation updates the warm cache under _mutex)
-  //   _mutex -> _evictionMutex (a TTL arm under _mutex synchronously enqueues via
-  //                             armTimerLocked -> wheel schedule -> enqueueEviction)
-  // _compactionMutex and _evictionMutex (worker side) are LEAVES: the compaction
-  // and eviction workers take their own mutex alone and release it before taking
-  // _mutex, so there is no _evictionMutex/_compactionMutex -> _mutex inversion.
+  //   _mutex -> _cacheMutex          (data mutation updates the warm cache under _mutex)
+  //   _mutex -> wheel-internal mutex (a TTL arm under _mutex calls _wheel->schedule()/cancel())
+  // _evictionMutex is a PURE LEAF: TimingWheel::schedule() never fires a callback
+  // synchronously (a due/zero-delay timer fires on the next tick, and callbacks
+  // fire outside the wheel mutex), so an arm never enqueues. _evictionMutex is
+  // taken only by the tick thread when it dispatches a fired closure
+  // (enqueueEviction), by the eviction worker on pop, and by shutdown() -- always
+  // alone, released before _mutex, never nested under _mutex. _compactionMutex is
+  // likewise a leaf. So there is no _evictionMutex/_compactionMutex -> _mutex inversion.
   mutable std::shared_mutex _mutex;
   mutable std::shared_mutex _cacheMutex;
   std::mutex _compactionMutex;

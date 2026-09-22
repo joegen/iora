@@ -17,3 +17,12 @@ configure_iora_target(transport_example ENABLE_OPENSSL)
 
 add_executable(http_server_example http_server_example.cpp)
 configure_iora_target(http_server_example ENABLE_OPENSSL)
+
+# kvstore.hpp pulls only core/timing_wheel + the standard library (no cpp-httplib
+# TLS), so kvstore_example does NOT need ENABLE_OPENSSL (configure_iora_target
+# still links OpenSSL unconditionally; the keyword only sets the httplib define).
+add_executable(kvstore_example kvstore_example.cpp)
+configure_iora_target(kvstore_example)
+# Wire it into ctest so its always-active checks actually gate a regression
+# (the example returns non-zero and prints to stderr on failure).
+add_test(NAME storage::kvstore_example COMMAND kvstore_example)

@@ -7,7 +7,7 @@
 
 #pragma once
 #include "iora/core/logger.hpp"
-#include <algorithm>
+#include "iora/core/string_utils.hpp"
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -20,27 +20,13 @@ namespace iora
 namespace storage
 {
 
-/// \brief In-memory key-value store for string data with basic get/set
-/// operations.
-struct CaseInsensitiveHash
-{
-  std::size_t operator()(const std::string &key) const
-  {
-    std::string lowered = key;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), ::tolower);
-    return std::hash<std::string>{}(lowered);
-  }
-};
-
-struct CaseInsensitiveEqual
-{
-  bool operator()(const std::string &lhs, const std::string &rhs) const
-  {
-    return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
-                      [](char a, char b) { return std::tolower(a) == std::tolower(b); });
-  }
-};
-
+/// \brief In-memory, case-insensitive key-value store for string data with
+/// basic get/set operations plus a few query helpers.
+///
+/// Keys are compared case-insensitively via the shared, ASCII-only,
+/// locale-independent core::StringUtils traits (which cast to unsigned char, so
+/// no bytes >= 0x80 hit tolower undefined behavior). The original key casing is
+/// preserved for keys()/logging.
 class ConcreteStateStore
 {
 public:
@@ -122,7 +108,7 @@ public:
     return _store.empty();
   }
 
-  /// \brief Finds all keys with the given prefix.
+  /// \brief Finds all keys with the given prefix (case-sensitive prefix match).
   std::vector<std::string> findKeysWithPrefix(const std::string &prefix) const
   {
     std::lock_guard<std::mutex> lock(_mutex);
@@ -158,11 +144,27 @@ public:
   }
 
   /// \brief Finds all keys satisfying a custom matcher.
+  ///
+  /// The matcher runs OUTSIDE the store lock (copy-then-iterate): keys are
+  /// snapshotted under the lock, the lock is released, then the matcher is
+  /// applied. So a matcher may safely re-enter this store, and a slow matcher
+  /// does not block other operations. The snapshot is point-in-time (consistent
+  /// with keys()): a key removed concurrently may still be presented to the
+  /// matcher.
   std::vector<std::string> findKeysMatching(std::function<bool(const std::string &)> matcher) const
   {
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::vector<std::string> candidates;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      candidates.reserve(_store.size());
+      for (const auto &[key, _] : _store)
+      {
+        candidates.push_back(key);
+      }
+    }
+
     std::vector<std::string> result;
-    for (const auto &[key, _] : _store)
+    for (const auto &key : candidates)
     {
       try
       {
@@ -184,7 +186,9 @@ public:
 
 private:
   mutable std::mutex _mutex;
-  std::unordered_map<std::string, std::string, CaseInsensitiveHash, CaseInsensitiveEqual> _store;
+  std::unordered_map<std::string, std::string, iora::core::StringUtils::CaseInsensitiveHash,
+                     iora::core::StringUtils::CaseInsensitiveEqual>
+    _store;
 };
 
 } // namespace storage

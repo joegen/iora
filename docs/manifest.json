@@ -315,6 +315,24 @@
       "headers": [
         "util/unicode.hpp"
       ]
+    },
+    "storage/kvstore.md": {
+      "area": "storage",
+      "headers": [
+        "storage/kvstore.hpp"
+      ]
+    },
+    "storage/concrete_state_store.md": {
+      "area": "storage",
+      "headers": [
+        "storage/concrete_state_store.hpp"
+      ]
+    },
+    "storage/json_file_store.md": {
+      "area": "storage",
+      "headers": [
+        "storage/json_file_store.hpp"
+      ]
     }
   }
 }

@@ -210,6 +210,18 @@ std::mutex &JsonFileStore::registryMutex()
   return m;
 }
 
+std::mutex &JsonFileStore::lifecycleMutex()
+{
+  static std::mutex m;
+  return m;
+}
+
+std::mutex &JsonFileStore::flushCycleMutex()
+{
+  static std::mutex m;
+  return m;
+}
+
 std::thread &JsonFileStore::flushThread()
 {
   static std::thread t;
