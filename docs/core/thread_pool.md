@@ -364,7 +364,7 @@ void example()
 
 ---
 
-## 5. `iora::core::async` and `PooledFuture\<R\>` -- the `std::async` drop-in
+## 5. `iora::core::async` and `PooledFuture<R>` -- the `std::async` drop-in
 
 This section documents the async layer built on top of `ThreadPool`. It is the second reason the header exists and is the primary interface most callers use for one-off asynchronous work.
 
@@ -398,7 +398,7 @@ Immortality (raw `new`, never `delete`d) mirrors the `LoggerData` precedent: an 
 
 > The `idleTimeout` of 30 s passed to `generalAsyncPool()` is inert **for the idle-shrink path only**: with `initialSize == maxSize` the idle-exit CAS never fires (the idle-shrink floor keeps the live count at `_initialSize`), so no worker is ever reaped for idleness. The value is not otherwise dead, however -- it is still the `_condition.wait_for` wake interval, so each idle worker wakes every 30 s to re-check the predicate and (finding nothing) loops back to wait again. It affects only that idle re-check cadence, not the pool's steady-state size.
 
-### 5.2 `PooledFuture\<R\>`
+### 5.2 `PooledFuture<R>`
 
 ```cpp
 template <typename R> class PooledFuture
@@ -445,7 +445,7 @@ private:
 
 **Consume path costs nothing.** After `get()` (or a move-from), `_future.valid()` is `false`, so both the destructor and move-assign are no-ops. The join cost is paid only by genuinely abandoned futures.
 
-**No `share()`, no implicit `operator std::future\<R\>()`.** Both are intentionally omitted -- either would hand out a bare, non-blocking future and silently defeat the guarantee. Move-only with `noexcept` moves (load-bearing for the strong exception guarantee when relocating a `std::vector<PooledFuture>`).
+**No `share()`, no implicit `operator std::future<R>()`.** Both are intentionally omitted -- either would hand out a bare, non-blocking future and silently defeat the guarantee. Move-only with `noexcept` moves (load-bearing for the strong exception guarantee when relocating a `std::vector<PooledFuture>`).
 
 ### 5.3 `detail::submitTo` and `async(...)`
 

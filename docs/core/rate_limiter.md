@@ -9,7 +9,7 @@
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/rate_limiter.hpp` |
 | **Namespace** | `iora::core` |
-| **Public classes** | `TokenBucket`, `SlidingWindowCounter`, `RateLimiterMap\<K\>` |
+| **Public classes** | `TokenBucket`, `SlidingWindowCounter`, `RateLimiterMap<K>` |
 | **Dependencies** | Two intra-Iora headers -- `iora/core/concurrent_hash_map.hpp` (`ConcurrentHashMap`, the sharded per-key store) and `iora/core/timing_wheel.hpp` (`TimingWheel`, optional auto-cleanup scheduling). Standard library: `<algorithm>`, `<chrono>`, `<cmath>`, `<deque>`, `<mutex>`, `<vector>` (and, transitively via `ConcurrentHashMap`, `<atomic>`/`<shared_mutex>`). No external/third-party dependencies. |
 
 ---
@@ -36,7 +36,7 @@ Three composable primitives in `iora::core`:
 
 - **`TokenBucket`** -- allows a burst up to a capacity, then enforces a steady refill rate. Lazy (on-demand) replenishment, no background timer, plain `double` arithmetic, no internal locking. Best for API-style limits where a short burst is acceptable.
 - **`SlidingWindowCounter`** -- strict "no more than N requests in any T-second window", with **no** burst allowance. Self-contained and internally `std::mutex`-guarded. Best for flood protection where burst is unacceptable.
-- **`RateLimiterMap\<K\>`** -- per-key rate limiting backed by `ConcurrentHashMap\<K, TokenBucket\>`. Each key (IP, user, trunk) gets its own `TokenBucket`, created on demand at the default rate. Optional idle-bucket eviction driven by a `TimingWheel`.
+- **`RateLimiterMap<K>`** -- per-key rate limiting backed by `ConcurrentHashMap<K, TokenBucket>`. Each key (IP, user, trunk) gets its own `TokenBucket`, created on demand at the default rate. Optional idle-bucket eviction driven by a `TimingWheel`.
 
 ### Technical Impact
 
@@ -191,15 +191,15 @@ bool tryAcquire()
 - **`remaining() const`** counts entries with `now - ts < _window` and returns `_maxRequests - active` (floored at 0).
 - **`timeUntilAvailable() const`** returns `0ms` when `_timestamps.size() < _maxRequests` (raw size, *including* expired entries); otherwise it scans for the oldest still-active entry and returns its time-to-expiry plus 1ms (round-up). If every entry is expired it falls through to `0ms`.
 
-### 3.3 `RateLimiterMap\<K\>` -- per-key buckets
+### 3.3 `RateLimiterMap<K>` -- per-key buckets
 
-Template over the key type plus the usual `Hash`/`KeyEqual` (defaulting to `std::hash\<K\>` / `std::equal_to\<K\>`). It composes a `ConcurrentHashMap\<K, TokenBucket\>` with atomic default parameters. `RateLimiterMap` is itself non-copyable and non-movable -- it holds the non-movable `ConcurrentHashMap` plus `std::atomic` members.
+Template over the key type plus the usual `Hash`/`KeyEqual` (defaulting to `std::hash<K>` / `std::equal_to<K>`). It composes a `ConcurrentHashMap<K, TokenBucket>` with atomic default parameters. `RateLimiterMap` is itself non-copyable and non-movable -- it holds the non-movable `ConcurrentHashMap` plus `std::atomic` members.
 
 **`tryConsume` (fast path).** Call `findAndModify(key, modifier)` first. `findAndModify` takes the shard `unique_lock`, and if the key exists runs `modifier` (which calls `bucket.tryConsume(tokens)`) in place, then returns `true`. On an existing key this is a single lock acquisition and no `TokenBucket` is constructed.
 
 **`tryConsume` (slow path).** If `findAndModify` returns `false`, the key is absent: construct a `TokenBucket(defaultRate, defaultBurst)`, `insert` it (a no-op if a peer inserted first), then call `findAndModify` **again** to consume. This path acquires three shard locks and is **not** atomic across them (sections 5.2, 11).
 
-**`setDefaultRate(rate, burst)`.** Stores both into `std::atomic\<double\>` members with `memory_order_relaxed`. Affects only **future** bucket creation, never existing buckets. Because the two stores and the two slow-path loads are independent relaxed operations, a concurrent creator can observe a torn `(rate, burst)` pair (section 11).
+**`setDefaultRate(rate, burst)`.** Stores both into `std::atomic<double>` members with `memory_order_relaxed`. Affects only **future** bucket creation, never existing buckets. Because the two stores and the two slow-path loads are independent relaxed operations, a concurrent creator can observe a torn `(rate, burst)` pair (section 11).
 
 **`setKeyRate(key, rate, burst)`.** `insertOrAssign(key, TokenBucket(rate, burst))` -- a single shard `unique_lock`, atomic replace. This **resets** the key's bucket to a full burst at the new parameters (any accumulated balance/deficit is discarded). Using `insertOrAssign` avoids the TOCTOU window an `erase`-then-`insert` pair would open.
 
@@ -439,7 +439,7 @@ limiter.setDefaultRate(20.0, 20.0);                  // future NEW keys: 20/sec,
 | `maxRequests` | `std::size_t` | (required) | count | Max acquires per window. |
 | `window` | `std::chrono::seconds` | (required) | seconds | Trailing window length. Second granularity only. |
 
-### 8.3 `RateLimiterMap\<K\>`
+### 8.3 `RateLimiterMap<K>`
 
 | Parameter | Type | Default | Units | Notes |
 |---|---|---|---|---|

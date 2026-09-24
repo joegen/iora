@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.7 |
-| **Date** | 2026-09-11 |
+| **Version** | 1.10 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/network/transport.hpp` |
 | **Namespace** | `iora::network` |
@@ -24,8 +24,10 @@
 | 1.4 | 2026-06-14 | `TcpEngine _eventFd` teardown-race fix: enqueue eventfd wakeup-`write` serialized with the `shutdownDrain` eventfd `close` under `_cmdMutex`; command-queue teardown flag added. |
 | 1.5 | 2026-06-14 | `UdpEngine _eventFd` teardown-race fix (sibling of 1.4), plus the UDP `connectViaListener()` closed-queue reject. |
 | 1.6 | 2026-09-11 | **Migrated to `docs/network/` and re-verified against the current source.** Restructured toward the 12-section guide template (added a dedicated Call Flow / Sequence Reference section). Corrected stale claims: removed the deleted `autoHealthMonitoring` config field; removed `setDscp()` from the public facade (it is engine-internal -- DSCP is set at construction via `config.dscpValue`); moved `maxSessions` and `listenBacklog` to their real config sections with correct defaults; added the `resolveTimeout` and `syncBufferGcThreshold` config fields, the `BufferOverflow`/`ShuttingDown` `TransportError` values, the per-connection TLS-identity overloads and the `kHttpsHostFlags` constant, and the `isOnIoThread()` accessor. |
-| 1.8 | 2026-09-14 | **`EPOLLRDHUP` peer-half-close detection + connect-error scoping.** (1) The TCP engine now arms `EPOLLRDHUP` on every session (in `updateInterest` and the accept/connect masks), so a `ReadMode::Disabled` (write-only/SSE) session detects a graceful peer FIN and fires `onClose(PeerClosed)` — previously the read-gate withheld `EPOLLIN` and left such a session's disconnect undetected. Documented the `ReadMode::Disabled` DR-1 contract (a peer close discards unread buffered inbound). (2) The `SO_ERROR` connect-completion probe is now gated on `connectPending`, so an **established** session's socket error (e.g. peer `RST`) is no longer mislabeled `Connect` (it surfaces as `PeerClosed`/`Socket`). |
 | 1.7 | 2026-09-11 | **Re-synced to landed source.** (1) Collapsed the duplicate System-Architecture and Component-Deep-Dive headers into the clean canonical 12-section order. (2) `sendSync` now **blocks** until send completion (was fire-and-forget), is gated by the concurrent-sync-op cap, and can return the new `TransportError::TooManyPendingSyncOps`; the teardown gate now counts `activeSends` as a fourth counter. (3) Documented the `kUseConfigSyncTimeout`/`kFallbackSyncTimeout` sync-timeout sentinels and `resolveSyncTimeout()`. (4) `ReadMode::Disabled` now suppresses reads at the fd level (`engine->setReadEnabled`, EPOLLIN removed) on TCP; UDP remains drop-at-callback. (5) Send validation (CF-H1): engines reject a `send` to a session not present-and-open (`sessionSendable`); connect-then-send must await `onConnect`. (6) UDP `connectSync` now parks like TCP (short-circuit removed). (7) Documented `dscpValue` at-creation application via the shared `applyDscpToFd` helper (IPV6_TCLASS primary + best-effort IP_TOS on dual-stack). |
+| 1.8 | 2026-09-14 | **`EPOLLRDHUP` peer-half-close detection + connect-error scoping.** (1) The TCP engine now arms `EPOLLRDHUP` on every session (in `updateInterest` and the accept/connect masks), so a `ReadMode::Disabled` (write-only/SSE) session detects a graceful peer FIN and fires `onClose(PeerClosed)` — previously the read-gate withheld `EPOLLIN` and left such a session's disconnect undetected. Documented the `ReadMode::Disabled` DR-1 contract (a peer close discards unread buffered inbound). (2) The `SO_ERROR` connect-completion probe is now gated on `connectPending`, so an **established** session's socket error (e.g. peer `RST`) is no longer mislabeled `Connect` (it surfaces as `PeerClosed`/`Socket`). |
+| 1.9 | 2026-09-24 | DOC-4: rehomed README-unique content (legacy-name navigation note in §9: `UnifiedSharedTransport` and `SyncAsyncTransport` were consolidated into `Transport`; `SharedTransport`/`SharedUdpTransport` became the internal `TcpEngine`/`UdpEngine`). Restored chronological order of the 1.7/1.8 rows. |
+| 1.10 | 2026-09-24 | DOC-4 doc-review fixes: the §9 legacy-names row now cites `coding_trackers:` tracker -21 for the stale `SyncAsyncTransport` comments (`detail/tcp_engine.hpp:470` plus a test comment). §4's "exactly one TU" pitfall is marked disputed: all `transport_impl.hpp` definitions are `inline` and a two-TU link succeeds. Verification is tracked in -21. |
 
 ---
 
@@ -106,6 +108,11 @@ detail/engine_base.hpp (internal -- not public API)
 |     scheduleSelfDestruct/detachForTermination
 |-- detail::TcpEngine : EngineBase     (TCP/TLS engine)
 `-- detail::UdpEngine : EngineBase     (UDP engine)
+
+detail/fd_closer.hpp (internal -- not public API)
+`-- detail::FdCloser: move-only RAII fd closer shared by both engines; teardown
+      collects fds and ::close()s them only after the session/listener is removed
+      from its map under the write lock, so a getter never syscalls on a reused fd
 ```
 
 ### 2.2 Split-header pattern
@@ -662,7 +669,7 @@ transport->unobserve(oid);
 ### 4.7 Anti-patterns
 
 - **Do NOT block in a callback.** Callbacks run on the single I/O thread; blocking (disk I/O, a contended mutex, a network round-trip) stalls all I/O for the transport. Copy the data and post the work to a thread pool (e.g. `iora::core::async`).
-- **Do NOT forget `transport_impl.hpp` in exactly one TU.** Including only `transport.hpp` yields linker errors for every `Transport` method; including `transport_impl.hpp` in two TUs yields ODR/duplicate-symbol errors.
+- **Do NOT forget `transport_impl.hpp` in exactly one TU.** Including only `transport.hpp` yields linker errors for every `Transport` method; including `transport_impl.hpp` in two TUs yields ODR/duplicate-symbol errors. (**Disputed:** every `Transport` member definition in `transport_impl.hpp` is `inline`, and a two-TU program that includes `http_client.hpp`, and through it `transport_impl.hpp`, in both TUs compiles and links cleanly. Whether the one-TU rule is still needed, here and in the metadata and §2, is **Open -- P2**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-21_stale-transport-comments-syncasynctransport-and-one-tu_P2.json`.)
 - **Do NOT call `stop()`, `addListener()`, or any sync op (`connectSync`/`sendSync`/`receiveSync`) or `setReadMode()` from a callback.** Each throws `std::logic_error` on the I/O thread (deadlock or UB). Use `isOnIoThread()` if you need to branch.
 - **Do NOT `send()` before the connection is open.** An async `connect()` followed immediately by `send()` will have the `send` rejected (`sessionSendable` / CF-H1) -- wait for `onConnect`, or use `connectSync`.
 - **Do NOT assume a `BufferView` outlives the callback.** The engine reuses its read buffer after `onData` returns -- copy anything you retain.
@@ -1047,6 +1054,7 @@ static constexpr unsigned kSipHostFlags   = 0x2u | 0x20u;   // RFC 5922: NO_WILD
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Single interface | `ITransport` implemented by `Transport`; engine behind `unique_ptr<EngineBase>` | One class, one interface, one config type. Engine selection is internal. |
+| Legacy names retired | `UnifiedSharedTransport` (facade) and `SyncAsyncTransport` (sync wrapper) consolidated into `Transport`; `SharedTransport`/`SharedUdpTransport` renamed to the internal engines `TcpEngine`/`UdpEngine` (`network/detail/tcp_engine.hpp`, `udp_engine.hpp`) | None of the four names exists in `include/` any more (one stale doc comment at `detail/tcp_engine.hpp:470`, and a comment in `tests/network/iora_test_tcp_rapid_send.cpp`, still mention `SyncAsyncTransport`; **Open -- P2**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-21_stale-transport-comments-syncasynctransport-and-one-tu_P2.json`); code or notes using them map onto `Transport`. |
 | Shared-ownership only (S-3) | `shared_ptr<Transport>` factories; move+copy deleted; `enable_shared_from_this` | Closes the C-1 concurrent-teardown UAF structurally -- a caller co-owns the transport for the call's duration. |
 | Passkey ctors | Private `PrivateTag` gate | `make_shared` (single alloc, `enable_shared_from_this`-compatible) without a public constructor. |
 | Zero-copy read path | `DataCallback` takes `BufferView` + `receiveTime` | Downstream parsing without a copy; `receiveTime` captured at the `recv()` site (RTP jitter). |

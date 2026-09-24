@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.2 |
-| **Date** | 2026-09-13 |
+| **Version** | 1.5 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Headers** | `include/iora/network/http_server.hpp` (HttpServer + routing), `include/iora/network/webhook_server.hpp` (WebhookServer) |
 | **Namespace** | `iora::network` |
@@ -17,6 +17,8 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.5 | 2026-09-24 | DOC-4 doc-review fixes: corrected the oversize-JSON claim. With the default 10 MB `maxPayloadSize`, `HttpServer`'s 1 MiB per-session buffer (`MAX_BUFFER_SIZE`) answers a headers-only 413 and closes before the wrapper runs, so the wrapper's 500 size path fires only when `maxPayloadSize` < ~1 MiB (§5.5 step 1, §9.4, Known Limitations). §6.3 example `maxPayloadSize` reduced to 256 KB. Corrected the Known Limitations remedy: a `JsonHandler` has no `Response`, so only the raw `Handler` API controls the status. Made the `ex.what()` leak precise: parser errors are fixed strings, while the size-limit and handler text do leak, with no `nosniff`, and a non-`std` exception falls to the generic 500. Added a Known Limitations entry and §5.5 note on the missing `Content-Type` check (cross-origin simple POST). Added the GET-body interop note (RFC 9110 §9.3.1). Trimmed §9.1 to what the rest of the guide does not already say, and added the unvalidated `int` port narrowing, the port-0 `getPort()` gap and the unguarded double `start()`. Known Limitations rows now cite `coding_trackers:` trackers -14 / -15. |
+| 1.4 | 2026-09-24 | DOC-4: rehomed README-unique content (§9.1: `setPort`/`setBindAddress` only store the value, applied at the next `start()`); recorded in Known Limitations that the `WebhookServer` JSON wrappers answer oversize/malformed JSON with 500 (not 413/400) and echo `ex.what()`, including arbitrary handler exception text, to the client. |
 | 1.3 | 2026-09-13 | **Framing verdict single-sourced (iora `2026-09-12-1`).** `HttpServer::handleIncomingData` and `findChunkedRequestEnd` now compute their RFC 9112 §6.3/§7.1 framing decision from the SAME `iora::network::detail` helpers the strict parser uses (`decideRequestFraming`, `parseChunkSize`, `chunkDataStep`, `walkTrailerSection`, `checkHeaderLineGrammar`, `trimOws`, `parseFullUInt`, `isHexDigit`) rather than a hand-maintained copy — the "framer and parser reach the same verdict" anti-smuggling property is now structural. Behavior-preserving; the chunk-data / trailer helpers (`chunkDataStep` / `walkTrailerSection`) return a tri-state `{Ok|NeedMore|Malformed}` the framer maps to poison-vs-wait. (See `docs/parsers/http_message.md` for the out-of-range-`Content-Length` parser-side unification that accompanies this.) |
 | 1.2 | 2026-09-13 | **`quiesceTransport()` drain hardening (iora `2026-09-11-22`).** The pool drain (step 5) no longer caps at 2 s and abandons: it is now **unbounded to `getInFlightCount() == 0`** (the pool's single-critical-section in-flight count, replacing the two-sample `getPendingTaskCount()`/`getActiveThreadCount()` read that admitted the pop->`++_activeThreads` TOCTOU), closing the residual use-after-free where a worker past the 2 s cap dereferenced a destroyed derived member (e.g. `WebhookServer::_jsonConfig`). A `protected virtual drainDeadline()` (default 30 s) backs it with a **fatal-abort circuit breaker** -- past the deadline it writes to stderr and `std::abort()`s (a core dump instead of a silent hang or a UAF; every timed-path diagnostic is a direct stderr write, never the async Logger). Applies uniformly to public `stop()` and every subclass dtor. Doc: `stop()`/`quiesceTransport()`/`quiesceTransportNoexcept()` may abort; `noexcept` stops an exception escaping, not `abort()`; a `stop()`/destroy call from within a handler self-deadlocks. Known-limitation 2 s-drain-cap entry moved to RESOLVED with the generalized LT-8 rule. |
 | 1.1 | 2026-09-12 | **Re-sync to landed fixes (iora `e00906e` / `475ffb2` / `c2b332e`).** Request framing hardened: chunked request bodies are now **de-chunked** before delivery (`HttpRequest::fromWireFormat` -> `decodeChunkedRequestBody`), so handlers and `WebhookServer::onJsonPost` see the decoded payload; the framer (`findChunkedRequestEnd`) now reaches the SAME framing verdict as the strict parser (conflicting (differing-value) duplicate `Content-Length`, `CL`+`TE`, non-final chunked coding, and invalid/out-of-range `Content-Length` all poison the connection with 400 + close), parses chunk-size as `1*HEXDIG` with subtraction bounds (no `size_t` wrap), uses the token-aware `detail::isChunkedFinalCoding` for chunked detection, and enforces the 10 MB body cap on the decoded chunked length (413). Connection management: the `Connection` header is parsed as a comma-separated token list (`connectionListHasToken`, RFC 9110 §7.6.1) and repeated `Connection` field-lines combine; RFC 9112 §9.3 version-aware persistence is computed on the per-request **worker-stack local** (HTTP/1.0 defaults to close) -- the shared `SessionInfo.connectionKeepAlive` / `SessionInfo.httpVersion` fields were **removed** (a pipelined-sibling race). Response: repeated `Set-Cookie` via `Response::add_cookie` / `HttpResponse::setCookies` (separate field-lines, RFC 6265 §3, CR/LF/NUL-guarded); a bare query key with no `=` now stores an empty value. Teardown: the subclass-quiesce invariant (`quiesceTransport` / `quiesceTransportNoexcept` + `onUpgradedClose`) is documented. Corrected the fabricated `explicit` on the `HttpServer`/`WebhookServer` constructors and the `WebhookServer` "defaulted destructor" claim; added 413/414/505 to the parse-error status set; documented the `Date` synthesis in `toWireFormat`. Still-open items retagged with tracker refs. |
@@ -458,12 +460,39 @@ with no public `transport()` leak.
 register an ordinary `Handler` on the inherited `onGet`/`onPost`:
 
 1. Enforce `req.body.size() <= _jsonConfig.maxPayloadSize` (default `DEFAULT_MAX_JSON_SIZE` = 10 MB).
+   This check only ever sees a body that already got past `HttpServer`'s own limits. The I/O thread
+   caps each session's parse buffer at `SessionInfo::MAX_BUFFER_SIZE` = 1 MiB, and that buffer holds
+   the whole request, header block plus body. Once the header terminator has arrived, an overflow is
+   answered with a headers-only **413** and the connection is closed (`handleIncomingData`), before
+   any worker or wrapper runs. The effective JSON body ceiling is therefore
+   `min(maxPayloadSize, ~1 MiB minus the header bytes)`. The wrapper's own size check (and its 500)
+   can only fire when `maxPayloadSize` is set below roughly 1 MiB. With the 10 MB default an
+   oversize body gets 413, not 500.
 2. Parse the body with `parsers::Json::parse(body, _jsonConfig.parseLimits)`; a parse failure throws.
-   For `onJsonGet`, an empty body yields `parsers::Json::object()` instead of a parse.
-3. Invoke the user's `JsonHandler` (`parsers::Json(const parsers::Json&)`).
+   For `onJsonGet`, an empty body yields `parsers::Json::object()` instead of a parse. `onJsonGet`
+   parses a non-empty GET body, but RFC 9110 §9.3.1 gives content in a GET request no defined
+   semantics, and intermediaries and clients may drop or reject it. Pass GET inputs as query
+   parameters (`req.params`, via the raw `onGet` API) rather than relying on a GET body.
+3. Invoke the user's `JsonHandler` (`parsers::Json(const parsers::Json&)`). It receives only the
+   parsed body and returns only a JSON value. It never sees the `Request` (headers, params, peer)
+   or the `Response`, so it cannot set a status code or headers.
 4. Serialize the returned JSON with `res.set_content(json.dump(), "application/json")`.
 5. On **any** `std::exception` (payload too large, parse error, handler throw), set status **500**,
-   put `ex.what()` into a `text/plain` body, and log via `Logger::error`.
+   put `ex.what()` into a `text/plain` body, and log via `Logger::error`. The parser's messages are
+   fixed strings (for example `"JSON parse error: Unexpected character"`) that contain no request
+   bytes. What does leak to the client is the size-limit text (which reveals the configured
+   `maxPayloadSize`) and the text of any `std::exception` the user's `JsonHandler` throws, sent
+   verbatim. The response is `text/plain` and carries no `X-Content-Type-Options: nosniff`. A
+   non-`std::exception` thrown by the handler is not caught here. It propagates to
+   `invokeWithSafetyNet` (Section 5.4), which answers with the generic `500 Internal Server Error`.
+
+Neither wrapper checks the request's `Content-Type`. `onJsonPost` parses any body as JSON, so a
+browser cross-origin "simple" POST (for example `Content-Type: text/plain`, which triggers no CORS
+preflight) reaches a JSON handler, and the handler's side effects happen even though the page
+cannot read the response. Authenticate state-changing JSON endpoints, and require
+`application/json` with the raw `Handler` API if that matters (tracker
+`coding_trackers:tasks/iora/backlog/2026-09-24-14_webhook-json-wrapper-status-codes-and-exception-leak_P1.json`
+proposes a 415 for a wrong type).
 
 `setJsonConfig`/`getJsonConfig` set and read the config (no synchronization -- call before `start()`).
 The destructor is **not** defaulted: `~WebhookServer()` calls `quiesceTransportNoexcept("~WebhookServer")`
@@ -545,27 +574,31 @@ server.setDefaultHandler([](const HttpServer::Request &, HttpServer::Response &r
 using namespace iora::network;
 using namespace iora;   // parsers::Json lives in the sibling iora::parsers namespace
 
-WebhookServer server("0.0.0.0", 8080);
-
-WebhookServer::JsonConfig cfg;
-cfg.maxPayloadSize = 5 * 1024 * 1024;   // 5 MB
-server.setJsonConfig(cfg);              // before start()
-
-server.onJsonPost("/api/submit", [](const parsers::Json &body) -> parsers::Json
+int main()
 {
-  auto result = parsers::Json::object();
-  result["status"] = "ok";
-  result["keys"]   = body.size();
-  return result;                        // auto-serialized as application/json
-});
+  WebhookServer server("0.0.0.0", 8080);
 
-// JSON and plain endpoints coexist.
-server.onGet("/health", [](const HttpServer::Request &, HttpServer::Response &res)
-{
-  res.set_content("OK", "text/plain");
-});
+  WebhookServer::JsonConfig cfg;
+  cfg.maxPayloadSize = 256 * 1024;       // 256 KB; keep below HttpServer's ~1 MiB request cap (Section 5.5)
+  server.setJsonConfig(cfg);              // before start()
 
-server.start();
+  server.onJsonPost("/api/submit", [](const parsers::Json &body) -> parsers::Json
+  {
+    auto result = parsers::Json::object();
+    result["status"] = "ok";
+    result["keys"]   = body.size();
+    return result;                        // auto-serialized as application/json
+  });
+
+  // JSON and plain endpoints coexist.
+  server.onGet("/health", [](const HttpServer::Request &, HttpServer::Response &res)
+  {
+    res.set_content("OK", "text/plain");
+  });
+
+  server.start();
+  return 0;
+}
 ```
 
 ### 6.4 TLS listener
@@ -810,6 +843,17 @@ completion is shaped to that rule, but they differ in how (and whether) they rec
 `maxPendingSyncOps = 32`, `defaultSyncTimeout = 30000 ms`, `enableTcpNoDelay = true`,
 `tcpKeepalive.enable = true`, `maxWriteQueue = 1024`. See `transport.md` for the meaning of each.
 
+Calling `setPort` or `setBindAddress` on a running server does not move the listener, and
+`getPort()` / `getBindAddress()` immediately report the stored, not-yet-applied value, not the
+address actually being listened on. Other points about these values:
+
+- `port` is an `int`. `start()` narrows it with `static_cast<std::uint16_t>(_port)` and does no
+  range check, so `70000` binds port 4464 and `-1` binds port 65535.
+- `port` 0 binds an ephemeral port, but `getPort()` keeps returning 0. The server exposes no way
+  to learn the port the kernel chose.
+- `start()` does not check whether the server is already running. A second `start()` without an
+  intervening `stop()` builds a new engine and overwrites `_transport`.
+
 ### 9.2 Per-session size limits (`SessionInfo`, compile-time constants)
 
 | Constant | Value | Effect on overflow |
@@ -833,7 +877,7 @@ completion is shaped to that rule, but they differ in how (and whether) they rec
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `maxPayloadSize` | `std::size_t` | `DEFAULT_MAX_JSON_SIZE` = 10 MB | Max JSON request body; over -> 500 with a size-limit message. |
+| `maxPayloadSize` | `std::size_t` | `DEFAULT_MAX_JSON_SIZE` = 10 MB | Max JSON request body the wrapper accepts; over -> 500 with a size-limit message. `HttpServer`'s 1 MiB per-session buffer (`MAX_BUFFER_SIZE`, Section 9.2) applies first, so with the default a body that pushes the request past ~1 MiB gets a headers-only **413** plus close before the wrapper runs. The 500 path is reachable only when this is set below ~1 MiB. |
 | `parseLimits` | `parsers::ParseLimits` | default | JSON depth / array-size / etc. limits passed to `Json::parse`. |
 
 ---
@@ -1046,6 +1090,9 @@ defect dressed up as "by design". The genuinely by-design entries are API-shape 
 | **Single trailing wildcard only** | Patterns support exact, named-segment, and one trailing `*` -- no mid-path wildcards, multiple wildcards, or regex. Per-method lookup is O(routes). | By design -- API shape. |
 | **Re-registering an identical NAMED/WILDCARD pattern appends a dead entry** | Only EXACT re-registration overwrites; a duplicate NAMED/WILDCARD registration leaves an unreachable second entry (first-registered wins, the documented tie-break). | By design -- documented registration contract. |
 | **JSON wrappers only for GET and POST** | `WebhookServer` has no `onJsonPut`/`onJsonPatch`/`onJsonDelete`; use the raw `Handler` API for those methods. | By design -- API shape. |
+| **`WebhookServer` JSON wrappers answer every failure with 500 and echo `ex.what()`** | `onJsonGet`/`onJsonPost` catch every `std::exception` in one handler and answer **500** with `ex.what()` as the `text/plain` body (no `X-Content-Type-Options: nosniff`). Malformed JSON (including an empty `onJsonPost` body) gets **500**, not 400. An oversize body gets **500**, not 413, but only when `maxPayloadSize` is below ~1 MiB. With the 10 MB default, `HttpServer`'s 1 MiB per-session buffer answers a headers-only 413 and closes first (Section 5.5 step 1). Parser messages are fixed strings with no request bytes. What leaks is the size-limit text (which reveals `maxPayloadSize`) and the text of any `std::exception` the user's `JsonHandler` throws. A `JsonHandler` has the signature `parsers::Json(const parsers::Json&)` and has no `Response`, so it cannot set a status. Catching inside the handler only stops the exception text leaking, and the client then gets **200** with whatever JSON the handler returned. Size and parse failures happen before the handler runs, so the handler cannot intercept them. Only the raw `Handler` API (`onPost`/`onGet` with a `Response&`) controls the status code. | **Open -- P1**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-14_webhook-json-wrapper-status-codes-and-exception-leak_P1.json`. |
+| **JSON wrappers do not check `Content-Type` (cross-origin simple POST)** | `onJsonPost` parses any body as JSON whatever its `Content-Type`. A browser cross-origin "simple" POST (for example `text/plain`, a CORS-safelisted type, so no preflight is sent) therefore reaches a JSON handler, whose side effects run even though the attacking page cannot read the response. Authenticate requests to state-changing JSON endpoints, and require `application/json` (raw `Handler` API) where that is a concern. | **Open -- P1**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-14_webhook-json-wrapper-status-codes-and-exception-leak_P1.json` (proposes 415 for a non-JSON type). |
+| **`setPort`/`setBindAddress`/`start()` lifecycle gaps** | `port` is an unvalidated `int` narrowed with `static_cast<std::uint16_t>` (`70000` -> 4464, `-1` -> 65535). Port 0 binds an ephemeral port but `getPort()` stays 0, so the bound port cannot be discovered. `getPort()`/`getBindAddress()` report the stored value, not the one in use. `start()` does not check whether the server is already running and overwrites `_transport` (Section 9.1). | **Open -- P1**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-15_httpclientpool-close-stats-freeze-and-httpserver-lifecycle_P1.json`. |
 | **`setJsonConfig` is not synchronized** | Call before `start()` or provide external synchronization; `_jsonConfig` has no lock. | By design -- lifecycle contract. |
 | **No HTTP/2 or HTTP/3** | Only HTTP/1.0 and HTTP/1.1. Chunked transfer coding is framed and decoded (Section 5.3). | By design -- scope. |
 | **`enableTls` validates at call time; no hot-reload** | Certificate rotation requires a server restart. | By design -- scope. |

@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-09 |
+| **Version** | 1.1 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/parsers/json.hpp` |
 | **Namespace** | `iora::parsers` |
@@ -16,6 +16,7 @@
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-09-09 | Initial guide for the implemented single-header JSON value, parser, and serializer. |
+| 1.1 | 2026-09-24 | DOC-4: section 3.4 and Known Limitations no longer refer to the removed README section; the `SmallVec` entries now state the behavior directly. |
 
 ---
 
@@ -217,7 +218,7 @@ bool feed(std::string_view chunk)
 
 ### 3.4 `SmallVec` -- present but not wired into `Json`
 
-The header defines `template<class T, std::size_t InlineN> class SmallVec`, a small-buffer-optimized vector with inline storage, move/copy semantics, and `push_back`/`emplace_back`. Despite the README's "small-vector optimization" language, **`Json::Array` is `std::vector<Json>`, not `SmallVec`** -- `SmallVec` is not used by the `Json` value type anywhere in this header. It is documented here for completeness and flagged in Section 12.
+The header defines `template<class T, std::size_t InlineN> class SmallVec`, a small-buffer-optimized vector with inline storage, move/copy semantics, and `push_back`/`emplace_back`. **`Json::Array` is `std::vector<Json>`, not `SmallVec`** -- `SmallVec` is not used by the `Json` value type anywhere in this header. It is documented here for completeness and flagged in Section 12.
 
 ### 3.5 Serialization
 
@@ -442,7 +443,7 @@ There are no locks, atomics, or shared mutable global state in this header. Safe
 | Mutating a single shared `Json` (`operator[]`, `push_back`, `erase`, ...) | Caller-provided mutex | Not internally synchronized. The test suite's "Concurrent object manipulation" case guards a shared object with an external `std::mutex`. |
 | `JsonParser` instance | Not shared | Single-use, single-threaded; owns cursor `_pos` and `_error`. |
 | `JsonStreamParser` instance | Not shared | Holds mutable `_buffer`/`_value`/`_complete`/`_error`; use one instance per thread/stream. |
-| The `const Json&` returned for missing keys/indices | Shared static | `operator[]` const overloads return a reference to a function-local `static Json null_json`. It is only ever read (never mutated) and default-constructs to null; safe as a read-only sentinel. |
+| The `const Json&` returned for missing keys/indices | Function-local static | each `operator[]` const overload returns a reference to its own function-local `static Json` null sentinel (one in the `std::size_t` overload, one in the `std::string` overload). Each is only ever read (never mutated) and default-constructs to null; safe as a read-only sentinel. |
 
 ---
 
@@ -749,7 +750,7 @@ The source is ground truth. Some behaviors the header's doc comment described we
 | **`dump(..., ensure_ascii, ...)` ignores `ensure_ascii`** | The parameter is accepted for API familiarity but never consulted; non-ASCII bytes are always emitted verbatim. There is no ASCII-only serialization mode. (Tracked: backlog 2026-09-09-5.) |
 | **`parse(text, callback, allow_exceptions)` ignores the callback** | The `std::function<bool(int, const ParseResult&)>` parameter is accepted but never invoked; the overload delegates to the `nullptr` form. There is no SAX/event callback facility. (Tracked: backlog 2026-09-09-6.) |
 | **`JsonStreamParser` is not a true streaming parser** | Each `feed()` re-parses the entire accumulated buffer, so cost is O(n * chunks) for a document delivered in many chunks, and partial input simply reports a (recoverable) parse error until the buffer holds a complete value. (Tracked: backlog 2026-09-09-4.) |
-| **`SmallVec` is defined but unused by `Json`** | `Json::Array` is `std::vector<Json>`. Despite the README's "small-vector optimization" claim, the small-buffer optimization is not applied to JSON arrays. |
+| **`SmallVec` is defined but unused by `Json`** | `Json::Array` is `std::vector<Json>`, so JSON arrays do not get the small-buffer optimization `SmallVec` implements; each non-empty array heap-allocates its element storage. |
 | **Bare `parse(...)` overload set is ambiguous for string literals** | `parse(std::string_view, ParseLimits)` and `parse(const std::string&)` are both viable for `const char*`. Use `parseString`, `parseOrThrow`, or `safe_parse` instead. |
 | **Serialized doubles use `std::to_string`** | Doubles are formatted with a fixed fractional precision (e.g. `3.140000`), which can lose precision and does not produce the shortest round-trippable representation. Integer-valued doubles still print with a fractional part. |
 | **`_skipWhitespace` / `isdigit` pass raw `char` to `<cctype>`** | `std::isspace`/`std::isdigit` are called on a possibly-signed `char`; for bytes with the high bit set this is technically undefined behavior (though it works in practice on common platforms). |

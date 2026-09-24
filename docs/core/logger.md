@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-10 |
+| **Version** | 1.2 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/logger.hpp` |
 | **Compiled unit** | `src/core/iora_core.cpp` (defines `Logger::getData()` and `Logger::handlerReentryDepth()` once into `libiora_core.so` when `IORA_CORE_SHARED`/`IORA_CORE_BUILDING` is set; otherwise a header-only fallback compiles one copy per image) |
@@ -18,8 +18,9 @@
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.0 | 2026-09-10 | Consolidated the two frozen source guides -- `coding_trackers/docs/iora/logger_external_handlers.md` (v3.8) and `coding_trackers/docs/iora/logger_gzip_compression.md` (v1.0) -- plus the README "Thread-Safe Logger" seed into one doc-wiki guide at `docs/core/logger.md`, restructured to the 12-section template. Every signature, default, mutex name, and threading claim was re-verified against the current `include/iora/core/logger.hpp` (3220 lines) and `src/core/iora_core.cpp`. Corrected stale claims: `init()` now takes a sixth `compressAfterDays` argument (the prior external-handlers guide's API reference showed the 5-argument form); there is no `setRetentionDays()` method (README stale) -- retention is an `init()` argument. |
+| 1.0 | 2026-09-10 | Consolidated the two frozen source guides -- `coding_trackers/docs/iora/logger_external_handlers.md` (v3.8) and `coding_trackers/docs/iora/logger_gzip_compression.md` (v1.0) -- into one doc-wiki guide at `docs/core/logger.md`, restructured to the 12-section template. Every signature, default, mutex name, and threading claim was re-verified against the current `include/iora/core/logger.hpp` (3220 lines) and `src/core/iora_core.cpp`. Corrected stale claims: `init()` now takes a sixth `compressAfterDays` argument (the prior external-handlers guide's API reference showed the 5-argument form); there is no `setRetentionDays()` method -- retention is an `init()` argument. |
 | 1.1 | 2026-09-12 | **Mechanism B (deferred tear-out), tracker 2026-07-23-1.** The frozen-inflight accounting (`FrozenScope`/`FrozenReleaser`/`externalHandlerFrozen`/park-notify) was RETIRED. A depth>0 self-clear/set now DEFERS (`nullGateAndDeferLocked`): it nulls the gate, records `pendingTearOut`/`pendingInstall` (last-writer-wins), and returns non-waiting; the last in-flight invocation applies it (`applyDeferredTearOutLocked`). The drain predicate is reduced to `inflight == handlerReentryDepth()`; `init()` at depth>0 is non-waiting; a DEBUG `DepthGtTeardownParkerGuard` guards the `≤ 1 depth>0 teardown parker` invariant. Sections 3.6/3.7/3.10, the class map, the lock-timeline, notify-sites, design records D-2/D-3, and Known Limitations updated. |
+| 1.2 | 2026-09-24 | DOC-4: new section 3.11 (console colors: the per-level ANSI codes, the `NO_COLOR` set-and-non-empty rule, the TTY check, console-only scope); section 8's color row states the `NO_COLOR` rule exactly. Corrected section 5.6: the configuration file is TOML under `[iora.log]`, it is read only by the `iora` executable (`src/iora.cpp`), its retention key is `retentionDays`, and `compressAfterDays` is not read from the file or the command line -- it can only be set in code through `IoraService::Config::log`. |
 
 Historical milestones carried from the frozen sources (behaviour, not tracking):
 
@@ -273,6 +274,31 @@ The tear-out drain branches on `handlerReentryDepth()`, so correctness requires 
 
 `waitWithStallDiagnosticLocked` wraps every drain and worker-exit wait in a `wait_for(kStallReportInterval)` with `kStallReportInterval = std::chrono::seconds(5)`, printing `inflight` and `workerRunning` each time it fires and repeating for as long as the wait lasts. **It never gives up and proceeds** -- proceeding early would be a use-after-free, strictly worse than a hang. No correctness property may depend on this constant; every satisfying state change notifies (with the two documented exceptions in the notify-sites table of section 6).
 
+### 3.11 Console colors
+
+`setConsoleColors(bool enable)` (default off) takes `data.mutex` and re-evaluates two conditions on every call:
+
+1. **`NO_COLOR`** -- if the environment variable is set **and non-empty**, colors are forced off (and the cached TTY flag is cleared), whatever `enable` says. An empty `NO_COLOR` (`NO_COLOR=`) counts as unset.
+2. **TTY** -- otherwise colors are on only if `enable` is `true` **and** `isatty(fileno(stdout))` is true, so output piped to a file or another process stays plain.
+
+The environment and the terminal are sampled only inside this call; changing either afterwards has no effect until `setConsoleColors` is called again.
+
+Colors apply only in console-only mode (no log file configured, `logBasePath` empty). The async enqueue and the synchronous write both key on that stable predicate rather than on whether the file stream is currently open, so a configured log file never receives escape codes even while it is momentarily unopenable and output falls back to `std::cout` in plain text.
+
+When active, `colorizeOutput` wraps the level text inside the rendered line (for example `\033[32mINFO\033[0m`) using these SGR codes:
+
+| Level | Rendered text | ANSI code | Color |
+|---|---|---|---|
+| `Trace` | `TRACE` | `\033[90m` | grey (bright black) |
+| `Debug` | `DEBUG` | `\033[36m` | cyan |
+| `Info` | `INFO` | `\033[32m` | green |
+| `Warning` | `WARN` | `\033[33m` | yellow |
+| `Error` | `ERROR` | `\033[31m` | red |
+| `Fatal` | `FATAL` | `\033[91m` | bright red |
+| (after the level text) | -- | `\033[0m` | reset |
+
+Only the level text is colored, and only its **first** occurrence in the line (see Known Limitations).
+
 ---
 
 ## 4. The Aged-File Gzip Compressor
@@ -442,21 +468,37 @@ private:
 };
 ```
 
-### 5.6 Config-file form (via `IoraService`)
+### 5.6 Configuring through `IoraService`
 
-```jsonc
+The logger reads no configuration file itself. `IoraService::applyConfig` calls `Logger::init` with the fields of `IoraService::Config::log` (defaults: level `"info"`, file `""` = console, async `false`, `retentionDays` 7, time format `"%Y-%m-%d %H:%M:%S"`, `compressAfterDays` 0). Set them in code:
+
+```cpp
+#include <iora/iora.hpp>
+
+void startService()
 {
-  "log": {
-    "level": "info",
-    "file": "/var/log/myservice/app",
-    "async": true,
-    "retentionDays": 30,
-    "compressAfterDays": 3
-  }
+  iora::IoraService::Config config;
+  config.log.level = "info";
+  config.log.file = "/var/log/myservice/app";
+  config.log.async = true;
+  config.log.retentionDays = 30;
+  config.log.compressAfterDays = 3; // no TOML key or CLI flag sets this; code only
+  iora::IoraService::init(config);
 }
 ```
 
-`IoraService::applyConfig` reads these (defaults: `retentionDays` 7, `compressAfterDays` 0) and passes them to `Logger::init`.
+The shipped `iora` executable (`src/iora.cpp`) fills the same fields from its command line and, for fields still unset, from a TOML file (`-c <path>`, default `/etc/iora.conf.d/iora.cfg`). It reads these `[iora.log]` keys -- the names are case-sensitive and must be spelled exactly:
+
+```toml
+[iora.log]
+level = "info"
+file = "/var/log/myservice/app"
+async = true
+retentionDays = 30
+timeFormat = "%Y-%m-%d %H:%M:%S"
+```
+
+`compressAfterDays` is **not** read from the file or from the command line; a `compressAfterDays` key in `[iora.log]` is ignored. The template installed as `iora.cfg` (`src/config/iora.cfg.in`) spells the retention and time-format keys `retention_days` and `time_format`, which the executable does not read, so those two settings in the stock file have no effect (see [`../iora_service.md`](../iora_service.md), Known Limitations).
 
 ### 5.7 Anti-patterns
 
@@ -597,7 +639,7 @@ The concurrency logger suites that exercise the reused teardown path are TSan-cl
 | timeFormat | `init` | `const std::string&` | `"%Y-%m-%d %H:%M:%S"` | strftime | The `%T` timestamp format; `.mmm` is appended only if it contains `%S`. |
 | compressAfterDays | `init` | `int` | `0` | days; `<= 0` = OFF | Compress `<base>.<date>.log` once older than N days, off the hot path. |
 | format string | `setLogFormat` | `const std::string&` | `"[%T] [%L] %m"` | placeholders `%T %t %L %m %F %l %f %%` | Pre-compiled once per call; empty strings are ignored. Contains no `%F/%l/%f` by default. |
-| console colors | `setConsoleColors` | `bool` | `false` | -- | Applies only in console-only mode; honors `NO_COLOR` and requires stdout to be a TTY (both re-checked on the call). |
+| console colors | `setConsoleColors` | `bool` | `false` | -- | Applies only in console-only mode; forced off when `NO_COLOR` is set and non-empty; otherwise requires stdout to be a TTY. Both are re-checked on each call (section 3.11). |
 | `COMPRESSOR_QUEUE_MAX` | compile-time | `static constexpr std::size_t` | `256` | entries | Bounded compressor queue; over-limit pushes drop (retried next sweep). |
 | Gzip level | compile-time | `iora::util::Gzip::Level` | `Level::DEFAULT` | FAST/DEFAULT/BEST | Compression effort in `compressOneFile`. |
 | Read buffer | compile-time | `std::vector<char>` | `64 * 1024` | bytes | Streaming chunk feeding the encoder. |

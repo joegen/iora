@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.1 |
-| **Date** | 2026-09-10 |
+| **Version** | 1.3 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/blocking_queue.hpp` |
 | **Namespace** | `iora::core` |
@@ -19,6 +19,8 @@
 |---|---|---|
 | 1.0 | 2026-09-10 | Initial Architecture & Programmer's Guide. Authored directly against `include/iora/core/blocking_queue.hpp` (386 lines) and cross-checked against `tests/core/iora_test_blocking_queue.cpp` (22 `TEST_CASE`s). The README "Thread-Safe Blocking Queue" section describes the same API but omits the shutdown/wakeup hazard documented here; this guide documents the **actual** shipped behavior, including a lost-wakeup defect in `close()` (see Known Limitations, section 12). |
 | 1.1 | 2026-09-10 | Synced with commit `eec6356`: the `close()` lost-wakeup hang is **fixed** (`_closed` is now mutated under `_mutex` before notifying) -- section 8.4 and Known Limitations flipped from defect to resolved. Reordered Thread Safety Model (now section 7) before Configuration Reference (now section 8) per the doc-writer template; sections renumbered contiguously. Escaped the template angle brackets in the section 3 heading. |
+| 1.2 | 2026-09-24 | DOC-4: removed references to the deleted README section. Corrected the allocation claims in sections 1, 9 and 12: `std::deque::pop_front` does free emptied element blocks (libstdc++), so the queue allocates and frees blocks in steady state rather than settling at a high-water mark. |
+| 1.3 | 2026-09-24 | DOC-4 doc-review fixes: removed the backslash escape from the section 3 heading (now plain `BlockingQueue<T, IdType>` inside a code span, which renders correctly without escaping; the 1.1 row records when it was escaped). Restored the 1.0 row's original wording; the README "Thread-Safe Blocking Queue" section it mentions has since been removed from the README. |
 
 ---
 
@@ -40,7 +42,7 @@ A threaded C++17 framework repeatedly needs to hand work from one set of threads
 
 ### Technical Impact
 
-- **O(1) enqueue / dequeue** -- `std::deque::push_back` / `pop_front`, amortized constant time; no allocation after the deque's block growth stabilizes.
+- **O(1) enqueue / dequeue** -- `std::deque::push_back` / `pop_front`, amortized constant time; the deque allocates and frees fixed-size element blocks as items flow through (section 9).
 - **Back-pressure for free** -- a full queue blocks producers (`queue`), sheds load (`tryQueue`), or applies a deadline (`tryQueue(item, timeout)`); the choice is the caller's per call.
 - **Move-through** -- both the enqueue (`T&&` overload) and the dequeue (`out = std::move(_queue.front())`) sides move, so large payloads are not copied through the queue.
 - **No locks held across a copy/move of `T`** -- the item copy/move happens under `_mutex`, but the CV `notify_one` is issued after `lock.unlock()`, so a woken thread does not immediately contend on a still-held lock.
@@ -128,7 +130,7 @@ There is no owned/background thread: `BlockingQueue` is a passive data structure
 
 ---
 
-## 3. Component Deep Dive -- `BlockingQueue\<T, IdType\>`
+## 3. Component Deep Dive -- `BlockingQueue<T, IdType>`
 
 ### 3.1 Construction and capacity
 
@@ -571,12 +573,12 @@ The timeout arguments to `tryQueue`/`dequeue` are per-call `std::chrono::millise
 
 | Operation | Complexity | Allocation |
 |---|---|---|
-| `queue` / `tryQueue` | O(1) amortized (`std::deque::push_back`). | Amortized none once the deque's internal block map has grown; a `push_back` may allocate a new block. |
-| `dequeue` / `tryDequeue` | O(1) (`front` + `pop_front`). | None (`std::deque` does not shrink on `pop_front`). |
+| `queue` / `tryQueue` | O(1) amortized (`std::deque::push_back`). | A `push_back` that crosses a block boundary allocates a new element block (and occasionally regrows or recentres the block map). |
+| `dequeue` / `tryDequeue` | O(1) (`front` + `pop_front`). | No allocation; with libstdc++ a `pop_front` that empties the front block frees that block. |
 | `size` / `empty` / `full` | O(1) plus one lock acquisition. | None. |
 | `capacity` / `isClosed` | O(1), lock-free. | None. |
 
-The README's "Zero Allocation -- No dynamic allocation after construction" claim is **approximately** true but not literal: `std::deque` allocates fixed-size element blocks on demand as it grows and does not release them on `pop_front`, so once the queue has reached its high-water mark no further allocation occurs, but reaching that mark does allocate. There is no pre-reservation of capacity blocks at construction. Contention is a single mutex; under heavy multi-producer/multi-consumer load that mutex is the throughput ceiling (there is no lock striping or lock-free fast path).
+The queue is **not** allocation-free after construction. It stores items in a `std::deque<T>`, which holds elements in fixed-size blocks. With libstdc++ (GCC), `push_back` allocates a new block each time the tail crosses a block boundary and `pop_front` frees the front block once it is emptied (`_M_pop_front_aux` in `bits/deque.tcc`), so a steady stream of `queue`/`dequeue` keeps allocating and freeing roughly one block per block-worth of items even when the queue never grows; only the block map (the array of block pointers) is kept. Other standard libraries may cache spare blocks, but nothing in `BlockingQueue` relies on that. There is no pre-reservation of blocks at construction, and `T`'s own copy/move may allocate as well. Contention is a single mutex; under heavy multi-producer/multi-consumer load that mutex is the throughput ceiling (there is no lock striping or lock-free fast path).
 
 ---
 
@@ -669,6 +671,6 @@ Return-value contract, at a glance:
 - **`IdType` template parameter is dead.** `template <typename T, typename IdType = std::size_t>` -- the header comment states `IdType` is "unused in current implementation." No member references it; it exists only in the class signature. Supplying a non-default `IdType` changes the type but nothing observable. Candidate for removal or for the intended item-identification feature to be implemented (tracked: iora backlog 2026-09-10-18).
 - **Fixed capacity, no resize.** `maxSize` is `const`; there is no way to grow or shrink a live queue. A workload whose desired bound changes must construct a new queue.
 - **Single mutex, no lock striping.** All producers and consumers serialize on one `_mutex`; under high concurrency the mutex is the throughput ceiling. There is no lock-free or sharded fast path.
-- **`std::deque` does not shrink.** `pop_front` never releases the deque's internal blocks, so peak memory is retained for the object's lifetime; the README's "Zero Allocation" wording is only approximately true (see section 9).
+- **Steady-state allocation.** Enqueue/dequeue traffic allocates and frees `std::deque` element blocks as items cross block boundaries, even at a constant queue depth (see section 9); there is no pre-allocated storage.
 - **Snapshots are advisory.** `size()`/`empty()`/`full()` are stale the instant they return; using them to gate a subsequent operation is a TOCTOU race. Use the atomic `tryQueue`/`tryDequeue` for check-and-act.
 - **No batch or peek API.** Items move one at a time; there is no `dequeueAll`, no `peek`/`front`, and no bulk enqueue. High-fan-in workloads pay one lock round-trip per item.

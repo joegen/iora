@@ -10,7 +10,7 @@
 | **Header** | `include/iora/util/gzip.hpp` |
 | **Namespace** | `iora::util` (internal DEFLATE core in `iora::util::detail`, not part of the public surface) |
 | **Public classes** | `Gzip` (facade), `Gzip::Encoder` (streaming), `Gzip::Level` (enum), `Gzip::DecompressError` (enum) |
-| **Dependencies** | Two intra-Iora headers -- `iora/core/result.hpp` (`core::Result\<T, E\>`, the decode outcome type) and `iora/util/crc32.hpp` (`Crc32`, `Crc32::Incremental`, RFC 1952's integrity trailer). Standard library: `<algorithm>`, `<array>`, `<cassert>`, `<cstddef>`, `<cstdint>`, `<string>`, `<string_view>`, `<vector>`. No external/third-party dependencies -- no zlib, no miniz, nothing linked. |
+| **Dependencies** | Two intra-Iora headers -- `iora/core/result.hpp` (`core::Result<T, E>`, the decode outcome type) and `iora/util/crc32.hpp` (`Crc32`, `Crc32::Incremental`, RFC 1952's integrity trailer). Standard library: `<algorithm>`, `<array>`, `<cassert>`, `<cstddef>`, `<cstdint>`, `<string>`, `<string_view>`, `<vector>`. No external/third-party dependencies -- no zlib, no miniz, nothing linked. |
 
 ---
 

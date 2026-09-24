@@ -186,7 +186,8 @@
         "network/transport_types.hpp",
         "network/detail/engine_base.hpp",
         "network/detail/tcp_engine.hpp",
-        "network/detail/udp_engine.hpp"
+        "network/detail/udp_engine.hpp",
+        "network/detail/fd_closer.hpp"
       ]
     },
     "network/transport_sync_lifecycle.md": {
@@ -380,6 +381,25 @@
       "area": "common",
       "headers": [
         "common/i_lifecycle_managed.hpp"
+      ]
+    },
+    "core/atomic_primitives.md": {
+      "area": "core",
+      "headers": [
+        "core/atomic_shared_ptr.hpp",
+        "core/atomic_thread_id.hpp"
+      ]
+    },
+    "util/external_clock_idle_map.md": {
+      "area": "util",
+      "headers": [
+        "util/external_clock_idle_map.hpp"
+      ]
+    },
+    "parsers/hep3.md": {
+      "area": "parsers",
+      "headers": [
+        "parsers/hep3.hpp"
       ]
     }
   }

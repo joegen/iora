@@ -5,8 +5,8 @@
 | | |
 |---|---|
 | **Component** | `iora::network::HttpClient`, `iora::network::HttpClientPool` (+ `PooledHttpClient`) |
-| **Version** | 2.1 |
-| **Date** | 2026-09-12 |
+| **Version** | 2.3 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/network/http_client.hpp` (client, RFC-9112 framing, exception taxonomy) and `include/iora/network/http_client_pool.hpp` (pool + `PooledHttpClient`) |
 | **Namespace** | `iora::network` |
@@ -28,6 +28,8 @@
 | 1.6 | 2026-09-03 | `HttpConnectTimeoutError` (subclass of `HttpRequestNotSentError`, keyed on `TransportError::Timeout`). |
 | 2.0 | 2026-09-11 | **Migrated to `docs/network/` and re-verified against current source.** Documents the additions the prior draft omitted: `Config::totalRequestTimeout` + `HttpExchangeDeadlineError` (whole-exchange slowloris bound), `HttpInvalidUrlError` (userinfo/bad-port rejection, replacing the stale "parseUrl uses `std::stoi`" claim), `HttpInvalidHeaderError` (caller-header validation + framing-controlled-header rejection), `methodAnticipatesContent` (`Content-Length: 0` for empty POST/PUT/PATCH), `formatHostHeaderField` (non-default port in `Host`, replacing the stale "missing port" limitation), the **`virtual` destructor** (factory-owned polymorphic destruction), the async methods now returning **`core::PooledFuture<Response>`** on the shared bounded pool with a **finite-timeout rejection gate** (`rejectUnboundedPooledRequest`), scheme-qualified connection keys (`getHostPort`), and per-connection TLS identity (`verifyName` + `kHttpsHostFlags`). Corrected `followRedirects` default to `false`. Added full `HttpClientPool` / `PooledHttpClient` coverage. |
 | 2.1 | 2026-09-12 | **Re-synced to the landed Group-5 fixes (iora 1af4b25).** `HttpClientPool::createClient()` now copies `leaseAcquireTimeout` (plus the previously-copied set) so a pooled client's async API works purely from the pool `Config` (CLI-F1). `PooledHttpClient` now forwards the full surface -- `head`/`postStream`/`getAsync`/`postJsonAsync` added (CLI-F3) -- and its `setTlsConfig` forwarder was removed (CLI-F5); the "footgun" and "does-not-forward" Known-Limitations rows are retired. `Config::enableCompression` is now explicitly RESERVED AND INERT rather than an undocumented dead flag (CLI-F2). `parseUrl` now lowercases the scheme (case-insensitive `HTTP://`/`HTTPS://`, RFC 3986 §3.1, CLI-NEW1) and parses bracketed IPv6-literal authorities (`http://[::1]:8080/`, re-bracketed in `Host`, CLI-NEW2) -- both removed from anti-patterns/limitations. Documented the `_connections` lazy idle sweep (CLI-CACHE) and the `setTlsConfig`-before-DNS-setters ordering constraint. |
+| 2.2 | 2026-09-24 | DOC-4: rehomed README-unique content (§6.5 pairing `HttpClientPool` with `core::ThreadPool`); corrected §5.3 statistics (mutex-guarded `BlockingQueue` calls, not atomic reads) and the `close()` description (a client returned after `close()` is destroyed); recorded in Known Limitations that the pool statistics stop tracking checkouts after `close()` and there is no supported way to wait for checkouts to drain. |
+| 2.3 | 2026-09-24 | DOC-4 doc-review fixes: corrected the §5.3 / §7.4 claim that no acquisition succeeds after `close()`. An acquisition that starts after `close()` fails, but one already past its `_closed` check can still dequeue an idle client, because a closed `BlockingQueue` still hands out items it holds (`tryDequeue` ignores the closed flag). Idle clients keep their keep-alive connections until `~HttpClientPool`. Widened the lifetime invariant (§8, Known Limitations): the pool must outlive every call into it, including a blocked `get()`, because the destructor wakes the waiter and then destroys `_queue`. Qualified the §6.5 `ThreadPool` declaration-order advice: it holds only for `ShutdownMode::IMMEDIATE` with no timed-out `stop()` (a detached worker may touch a destroyed pool). Noted that teardown is unbounded because every queued task runs, and recommended `pool.get(timeout)`. Added the missing `leaseAcquireTimeout` field to the §10.3 `HttpClientPool::Config` listing. The Known Limitations drain-wait row now cites `coding_trackers:` tracker -15. Replaced the "not include-safe in multiple TUs" constraint with the evidence (all `transport_impl.hpp` definitions are `inline`, and a two-TU link succeeds), tracked in -21. |
 
 ---
 
@@ -223,9 +225,9 @@ A thread-safe pool of independent clients. Its constructor validates `poolSize >
 
 **Return** is `returnClient(std::shared_ptr<HttpClient>)`, called only from `PooledHttpClient::returnToPool()`. It uses `_queue.tryQueue` (non-blocking) so a return can never deadlock; if the queue is closed or full the client is simply destroyed.
 
-**Close** is one-way: `close()` `exchange`s `_closed` to `true` (idempotent) and closes the queue -- outstanding checkouts may still return, but no new acquisition succeeds.
+**Close** is one-way: `close()` `exchange`s `_closed` to `true` (idempotent) and closes the queue. An acquisition that **starts** after `close()` returns fails: `get()` throws, and `get(timeout)`/`tryGet()` return `std::nullopt`. It is not true that no acquisition can succeed after `close()`. Each acquisition checks `_closed` first and dequeues in a separate step. `BlockingQueue::close()` leaves queued items dequeuable (`dequeue` fails only when the queue is closed *and* empty, and `tryDequeue` ignores the closed flag). So a `get()`/`get(timeout)`/`tryGet()` that passed the `_closed` check before `close()` ran can still dequeue an idle client after `close()` returns, and `inUse()` rises accordingly. Only callers parked on an *empty* queue are woken with a failure. Idle clients stay in the queue and keep their keep-alive connections open until `~HttpClientPool` destroys the queue. An outstanding checkout returned after `close()` is **not** re-queued: `returnClient`'s `tryQueue` fails on the closed queue and the client is destroyed (the `close()` doc comment's "existing clients can be returned" means only that the return is safe, not that the client rejoins the pool). As a result `available()` no longer rises when checkouts come back, so `inUse()`/`utilization()` stay frozen at the number checked out when `close()` ran. There is no supported way to wait for checkouts to drain after `close()` -- a `while (pool.inUse() > 0)` loop never terminates if anything was checked out. Track outstanding checkouts yourself (for example, join the worker threads that hold them) before destroying the pool.
 
-**Statistics** are queue-derived snapshots: `capacity()` (= `poolSize`), `available()` (= `_queue.size()`), `inUse()` (= `capacity() - available()`), `empty()`, `full()`, `utilization()` (0-100), and `config()`. These are approximate under concurrency (each is a separate atomic read).
+**Statistics** are queue-derived snapshots: `capacity()` (= `poolSize`), `available()` (= `_queue.size()`), `inUse()` (= `capacity() - available()`), `empty()`, `full()`, `utilization()` (0-100), and `config()`. `available()`, `empty()`, and `full()` each take the `BlockingQueue` mutex (`size()`/`empty()`/`full()`), `inUse()` and `utilization()` are derived from one `size()` call, and `capacity()` reads the config. Each call is individually consistent, but separate calls take the mutex separately, so a combination (for example `available()` then `inUse()`) is approximate under concurrency. After `close()` these values stop tracking checkouts (see **Close** above).
 
 ### 5.4 `PooledHttpClient`
 
@@ -334,6 +336,40 @@ if (auto c = pool.tryGet())            { c->get("https://api.example.com/x"); }
 if (auto c = pool.get(std::chrono::milliseconds(250))) { c->post("https://api.example.com/y", "z"); }
 ```
 
+**Pairing with `core::ThreadPool`.** A worker pool larger than the client pool is fine. Each task calls `pool.get()`, which blocks until a client is free and returns it on scope exit, so `poolSize` caps the number of concurrent HTTP exchanges while the thread pool caps concurrent tasks. Declare the `ThreadPool` *after* the `HttpClientPool` so it is destroyed first. Its destructor then joins the workers, so every checkout is returned, and every blocked `get()` has returned, before the HTTP pool goes away (see "Pool must outlive its checkouts" in §12).
+
+This ordering is only sufficient under two conditions:
+
+- The `ThreadPool` uses the default `ShutdownMode::IMMEDIATE`.
+- No earlier `stop()` on it timed out.
+
+In `ShutdownMode::DETACHED`, or after a timed-out `stop()` (which force-detaches the workers), the destructor or stop *detaches* the worker threads instead of joining them. A detached worker still running a task can later return its client to, or block in `get()` on, an `HttpClientPool` that has already been destroyed, which is undefined behavior.
+
+Also note that `ThreadPool` teardown is unbounded. In `IMMEDIATE` mode the destructor's join waits for workers that exit only when the task queue is empty, so every queued task runs, including every queued `pool.get()` wait and HTTP exchange. Prefer `pool.get(timeout)` in pooled tasks, and bound each exchange (`totalRequestTimeout`), so that teardown time is bounded as well.
+
+```cpp
+#include <iora/core/thread_pool.hpp>
+#include <iora/network/http_client_pool.hpp>
+
+iora::network::HttpClientPool::Config pcfg;
+pcfg.poolSize = 4;                                // at most 4 concurrent HTTP exchanges
+iora::network::HttpClientPool pool(pcfg);
+
+iora::core::ThreadPool workers(8, 16);            // initial 8 threads, max 16
+
+std::vector<std::string> urls = {"https://api.example.com/a", "https://api.example.com/b"};
+for (const auto &url : urls)
+{
+  workers.enqueue(
+    [&pool, url]()
+    {
+      auto client = pool.get();                   // blocks until a client is free
+      auto resp = client.get(url);
+      std::cout << url << " -> " << resp.statusCode << "\n";
+    });                                           // client returned to the pool here
+}
+```
+
 ### 6.6 Async requests (bounded pool)
 
 ```cpp
@@ -410,7 +446,7 @@ Best-effort only: peer close is observed asynchronously, so a missed FIN lets th
 | 1 | `pool.get()` | If `_closed` -> throw. `_queue.dequeue(client)` (blocks under the queue's own lock). Wrap in `PooledHttpClient(this, client)`. |
 | 2 | caller | Issues requests through the borrowed client (which serializes its own same-host work internally). |
 | 3 | `~PooledHttpClient` | `returnToPool()` -> `_pool->returnClient(client)` -> `_queue.tryQueue(client)` (non-blocking; dropped if closed/full); `_client = nullptr`. |
-| 4 | `pool.close()` | `_closed.exchange(true)`; `_queue.close()` -- parked `get()` callers wake and throw/`nullopt`. |
+| 4 | `pool.close()` | `_closed.exchange(true)`; `_queue.close()`. Callers parked on the empty queue wake and throw (or get `nullopt`). An acquisition that starts after this fails at the `_closed` check. One that passed the check before `close()` can still dequeue an idle client, because the closed queue still hands out items it already holds (§5.3). |
 
 ---
 
@@ -444,10 +480,13 @@ Best-effort only: peer close is observed asynchronously, so a missed FIN lets th
 | `get()` / `get(timeout)` / `tryGet()` | `core::BlockingQueue` internal lock + `_closed` atomic | Blocking / bounded / non-blocking dequeue |
 | `returnClient` (private) | `_queue.tryQueue` (non-blocking) | Called from `PooledHttpClient::returnToPool`; drops the client if closed/full |
 | `close` / `isClosed` | `_closed` atomic (`exchange`/`load`) + `_queue.close()` | Idempotent, one-way |
-| `capacity`/`available`/`inUse`/`empty`/`full`/`utilization` | queue `size()`/`empty()`/`full()` reads | Approximate under concurrency (separate atomic reads) |
+| `capacity`/`available`/`inUse`/`empty`/`full`/`utilization` | queue `size()`/`empty()`/`full()` reads | Each queue-derived call takes the queue mutex (`capacity` reads the config); combinations of calls are approximate under concurrency, and all stop tracking checkouts after `close()` |
 | `PooledHttpClient` forwarders (`get`/`postJson`/`post`/`deleteRequest`/`postFile`/`head`/`postStream`/`getAsync`/`postJsonAsync`) + `client()`/`isValid` | none of its own (delegates to the borrowed `HttpClient`) | Not thread-safe to share one handle across threads; the handle is single-owner |
 
-**Lifetime invariant.** The `HttpClientPool` MUST outlive every `PooledHttpClient` it hands out: `~PooledHttpClient` -> `returnToPool()` dereferences the raw `_pool` back-pointer (AP-19), so destroying the pool while any checkout is still live is undefined behavior.
+**Lifetime invariant.** The `HttpClientPool` MUST outlive every call into it and every `PooledHttpClient` it hands out:
+
+- **Handles.** `~PooledHttpClient` -> `returnToPool()` dereferences the raw `_pool` back-pointer (AP-19), so destroying the pool while any checkout is still live is undefined behavior.
+- **Calls, including a blocked `get()`.** `~HttpClientPool` calls `close()`, which wakes a `get()`/`get(timeout)` parked in `_queue.dequeue`, and then destroys `_queue`. The woken waiter must re-acquire the queue's mutex to return, and that mutex may already have been destroyed. So a `get()` still blocked when the destructor runs is also undefined behavior. `close()` does not make destruction safe while another thread is inside the pool.
 
 ---
 
@@ -661,6 +700,7 @@ public:
     bool enableKeepAlive = true;
     bool enableCompression = false;                  // inert
     std::chrono::milliseconds totalRequestTimeout{0};
+    std::chrono::milliseconds leaseAcquireTimeout{0};
     bool followRedirects = false;                    // inert
     int  maxRedirects = 5;                           // inert
     std::string userAgent = "Iora-HttpClientPool/1.0";
@@ -732,6 +772,7 @@ public:
 | **`cleanup()`/destruction during in-flight requests is unsupported** | Join request threads first. `cancelInFlight()` unblocks from another thread but is terminal (retires the client), not a pause. A request parked in DNS/`connectSync`/`sendSync` unwinds only on its own timeout. | By design (documented precondition). |
 | **No content compression** | `HttpClientPool::Config::enableCompression` is now explicitly RESERVED AND INERT in the source (CLI-F2): `HttpClient` has no gzip/deflate path, `createClient()` does not copy the flag, and `HttpClient::Config` has no matching field. Adding compression is a design pass, not a flag flip. | By design (documented inert). |
 | **Pool cannot configure `connectionIdleTimeout`/`maxResponseBytes`/`jsonConfig`** | `createClient()` copies `requestTimeout`, `connectTimeout`, `totalRequestTimeout`, `leaseAcquireTimeout` (CLI-F1), `followRedirects`, `maxRedirects`, `userAgent`, and `reuseConnections`; `connectionIdleTimeout`, `maxResponseBytes`, and `jsonConfig` keep client defaults. Use `clientConfigurer`/`clientFactory` for those. (Async **is** now reachable from the pool `Config` by setting `totalRequestTimeout > 0` and `leaseAcquireTimeout > 0`.) | Gap (workaround via hooks). |
-| **`http_client.hpp` is not include-safe in multiple TUs** | It transitively includes `transport_impl.hpp` (single-TU definitions), so including it in two TUs risks ODR/duplicate-symbol errors despite the "header-only" framing. | Constraint (include in one TU). |
+| **Multi-TU inclusion of `http_client.hpp` (via `transport_impl.hpp`)** | `http_client.hpp` transitively includes `transport_impl.hpp`, which `transport.hpp` documents as "include in exactly one TU". However, every `Transport` member definition there is `inline`, and a two-TU program that includes `http_client.hpp` in both TUs compiles and links cleanly (DOC-4 check, 2026-09-24). The one-TU claim is therefore unverified, and it may be stale. Until that is settled, prefer to include it in one TU. | **Open -- P2**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-21_stale-transport-comments-syncasynctransport-and-one-tu_P2.json` (verify ODR status; correct the claim or the code). |
 | **`connectTimeout` not observable against loopback** | Clamped to `min(connectTimeout, 200ms)` for `127.0.0.1`/`::1`/`localhost`. Use `192.0.2.1` to exercise a real timeout. | By design (defect_9). |
-| **Pool must outlive its checkouts** | `~PooledHttpClient` -> `returnToPool()` dereferences a raw `_pool` back-pointer (AP-19); destroying the `HttpClientPool` while any `PooledHttpClient` handle is still live is undefined behavior. Keep the pool alive until every checkout has been returned/destroyed. | Constraint (caller-enforced lifetime). |
+| **No drain-wait after `HttpClientPool::close()`** | A client returned after `close()` fails the closed queue's `tryQueue` in `returnClient` and is destroyed, not re-queued. `available()` therefore stops rising, `inUse()`/`utilization()` stay frozen at the count checked out when `close()` ran, and a `while (inUse() > 0)` loop never terminates. The pool offers no other way to wait for outstanding checkouts. There is also a race: an acquisition already past its `_closed` check can still dequeue an idle client after `close()` (§5.3). | **Open -- P1**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-15_httpclientpool-close-stats-freeze-and-httpserver-lifecycle_P1.json` (workaround: track checkouts yourself, e.g. join the threads that hold them). |
+| **Pool must outlive its checkouts and every call into it** | `~PooledHttpClient` -> `returnToPool()` dereferences a raw `_pool` back-pointer (AP-19), so destroying the `HttpClientPool` while any `PooledHttpClient` handle is still live is undefined behavior. The same is true for a thread still blocked in `get()`/`get(timeout)`: the destructor's `close()` wakes it and then destroys `_queue`, whose mutex the waiter must re-acquire (§8). Keep the pool alive until every checkout has been returned or destroyed and every acquisition call has returned. With `core::ThreadPool`, that holds only for `IMMEDIATE` shutdown with no forced detach (§6.5). | Constraint (caller-enforced lifetime). |

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
+| **Version** | 1.1 |
 | **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/system/shell_runner.hpp` |
@@ -17,6 +17,7 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-24 | Initial guide, authored against source; it is the new home of the README "Process Lifecycle Management - ShellRunner" section, which the README index-transform step (DOC-4) removes. Documents the `PcloseDeleter` / `pcloseExitCode` exit-code handling (iora `45cdb88`) and fixes made with this guide: the destructor now signals the process group only when the child leads its own group (it previously SIGKILLed the **caller's** group when `createProcessGroup` was false), `wait()` re-checks the cached result on every locked iteration (a concurrent reap by another thread no longer overwrites a valid exit status with `Unknown`), the kill step is shared by both termination strategies (`killForCleanup()`), `terminate()` now delegates to `kill()`; `killProcessGroup()` refuses group 1 (`kill(-1)` is a broadcast); a redirect is kept when `open()` reuses the target fd (the caller had fd 1/2 closed); and the header comments for `ProcessHandle`, `TerminationStrategy::Graceful`, `terminate()`, `killProcessGroup`, `closeStdin`, `waitUntilReady()`, `waitForCommandReady()`, `killForCleanup()` and the child's `setsid()` now describe what the code does. The remaining behavioral defects are tracked in coding_trackers `tasks/iora/backlog/2026-09-24-4_shell-runner-behavioral-hardening_P0.json` and listed in Known Limitations. |
+| 1.1 | 2026-09-24 | DOC-4: new Usage example 10 (fallback sweep of leftover processes by pattern with `killProcesses` / `findProcesses`); the test-coverage entry in Known Limitations now gives the configure/build/run commands for `iora_test_shell_runner`; SR-1 and the Linux-only entry no longer refer to the removed README section. |
 
 ---
 
@@ -370,6 +371,37 @@ bool stopHelper(iora::system::ProcessHandle &helper,
 
 Afterwards, destroy or reset the handle rather than keeping it: it has reaped its child, and a long-lived reaped handle is exposed to SR-11(b). The one remaining assumption is that nothing else (another thread, a `SIGCHLD` handler, `SIGCHLD = SIG_IGN`) reaps the leader in the meantime.
 
+**10. Fallback sweep of leftovers by pattern.** When a helper's handle is gone -- a previous test run crashed, or the helper daemonized out of its group -- the handle-based cleanup of examples 8 and 9 has nothing to act on, and the only remaining handle is the helper's command line. `findProcesses(pattern)` runs `std::regex_search` over every `/proc/<pid>/cmdline`, with the arguments joined by single spaces. `killProcesses(pattern, sig, waitFor)` sends **one** `sig` to each current match, then sleeps `waitFor` (default 200 ms) whether or not anything matched; it never escalates. Escalation is therefore the caller's job: `SIGTERM` with a grace period, re-check, then `SIGKILL`.
+
+```cpp
+#include <iora/system/shell_runner.hpp>
+
+#include <chrono>
+#include <csignal>
+#include <string>
+
+// SIGTERM every process whose command line matches `pattern`, wait `grace`,
+// then SIGKILL whatever still matches. Returns the number sent SIGKILL.
+int sweepLeftovers(const std::string &pattern,
+                   std::chrono::milliseconds grace = std::chrono::seconds(3))
+{
+  using iora::system::ShellRunner;
+  ShellRunner::killProcesses(pattern, SIGTERM, grace); // one SIGTERM each, then sleeps `grace`
+  if (ShellRunner::findProcesses(pattern).empty())
+  {
+    return 0;
+  }
+  return ShellRunner::killProcesses(pattern, SIGKILL);
+}
+
+// The helper was started with a run-unique token in its own arguments, e.g.
+//   spawn("exec sipp -nostdin -sf uas.xml -trace_err -error_file /tmp/uas-" + runId + ".err ...")
+// so the pattern cannot match this process or another run's helpers:
+//   sweepLeftovers("/tmp/uas-" + runId + "\\.err");
+```
+
+Make the pattern **run-unique** and put the token in the helper's *own* arguments (a per-run port, temp-file path, or ID), not only in a shell comment: with `sh -c`, a forked command does not inherit the wrapper's command line, so a token that only the wrapper carries leaves the real helper unmatched. Nothing excludes the caller: a pattern that also appears in this process's command line -- or in the command line of the shell that launched it -- signals that process too (SR-17), so build the pattern at run time rather than passing it as a literal on your own command line. PIDs can be reused between the scan and the signal (see Known Limitations, "PID reuse").
+
 **Anti-patterns.**
 - Do NOT pass untrusted input in a command, `workingDirectory`, or environment value -- everything is interpreted by `/bin/sh` and nothing is quoted.
 - Do NOT rely on `ExecutionOptions::timeout` to stop a hung command; it stops reading, then waits for the command to exit on its own.
@@ -559,7 +591,7 @@ The public constructor accepts any PID, but a handle is only useful for a child 
 
 The bracketed items are defects tracked in `tasks/iora/backlog/2026-09-24-4_shell-runner-behavioral-hardening_P0.json`; this guide will be re-synced when that work lands.
 
-- **[SR-1] No graceful termination.** `Graceful` sends `SIGKILL` immediately and only waits longer to reap; `terminate()` sends `SIGKILL` to the PID only, ignoring `killProcessGroup`. (The README section this guide replaces still says "SIGTERM first"; that was never true of this code.)
+- **[SR-1] No graceful termination.** `Graceful` sends `SIGKILL` immediately and only waits longer to reap; `terminate()` sends `SIGKILL` to the PID only, ignoring `killProcessGroup`. Neither termination strategy, `terminate()`, nor `kill()` sends `SIGTERM`; only an explicit `signal(SIGTERM)` or `killProcessGroup(pgid, SIGTERM)` does.
 - **[SR-2] `ExecutionOptions::environment` / `workingDirectory` are unquoted and mis-scoped.** The `K=V` assignments reach only the first simple command, which is `cd` when a working directory is set; values with spaces or metacharacters break or inject.
 - **[SR-3] `ExecutionOptions::timeout` does not stop the command.** `pclose` waits for the child after the read deadline; a hung command hangs the caller.
 - **[SR-4] Ignored options.** `ExecutionOptions::input`, `ExecutionOptions::captureStderr`, and `SpawnOptions::closeStdin` have no effect; `ExecutionResult::stderr` is always empty.
@@ -586,12 +618,18 @@ The bracketed items are defects tracked in `tasks/iora/backlog/2026-09-24-4_shel
 - **[SR-26] Exceptions after `fork`.** An allocation failure while the child builds its environment unwinds through `spawn()` inside the child (a duplicate of the caller keeps running), and one while the parent builds the handle leaves the child unowned.
 - **[SR-25] Relative redirect paths ignore `workingDirectory`** (§3.2).
 - **Reach.** The `iora/iora.hpp` umbrella header includes `shell_runner.hpp`, so SR-9 (the `stdout` / `stderr` member names) and the `iora::system` namespace affect every consumer of the umbrella.
-- **Linux only.** `/proc` scanning and `/bin/sh` are hardcoded; there is no macOS or Windows support (the README section this guide replaces still claims macOS support).
+- **Linux only.** `/proc` scanning and `/bin/sh` are hardcoded; there is no macOS or Windows support.
 - **Output is text.** `fgets` + C-string append truncates at a `NUL` byte in the output.
 - **Exit code 127 is ambiguous for `spawn`.** A failed redirect, `chdir`, or `exec` in the child exits `127`, the same code the shell uses for "command not found".
 - **PID reuse.** For a PID that is not an unreaped child of the caller (the static helpers, `killProcesses`), a PID can be recycled between the check and the signal; this is inherent to PID-based POSIX process control. For a handle's own child it is avoidable, and is tracked as SR-13.
 - **Destructor can block.** If a `Graceful` handle's process cannot be reaped promptly after `SIGKILL` (for example, it is stuck in uninterruptible sleep, or SR-11 applies), the destructor blocks for about 6 s before giving up.
-- **Test coverage.** `tests/util/iora_test_shell_runner.cpp` (31 test cases) covers `spawn`, `wait` (including a negative timeout) and timeouts, every termination strategy (including `None` via `setTerminationStrategy`), move and `detach` (including move assignment killing the previous process), stdout/stderr redirection (including a caller with fd 1 closed), working directory (including the `_exit(127)` of a failed `chdir`), environment, process groups (the child leads its own group), the `createProcessGroup = false` destruction path for both strategies (in a forked, single-thread-checked harness in its own session, asserting the harness survives and the child was killed), grandchild cleanup through the group kill for both strategies, `killProcessGroup = false` leaving grandchildren alive, `signal()`, the moved-from `terminate` / `kill` / `signal` / `waitUntilReady` refusals, `waitUntilReady` on a live child, `findProcesses` / `killProcesses` with a per-run unique pattern (which also assert the success path of `waitForCommandReady`) and an invalid pattern, `isProcessRunning` / `getProcessState` (`Running`, `Signaled`, `Unknown` for a non-child) / `waitForProcess` (including a timeout) / `sendSignal` / `killProcessGroup` (including the refusal of groups 0 and 1), a static helper stealing a handle's exit status (`Unknown`, cached), exit codes, the cached state, three threads racing `isRunning` / `getState` across the reap, two concurrent `wait()` calls, every branch of `pcloseExitCode`, and the exit-code behavior of `execute` / `execute(ostream)` / `executeWithOptions` (both `throwOnError` settings) / `executeWithInput`. Not tested: the `executeWithOptions` timeout path, `waitForCommandReady`'s timeout path, `waitUntilReady`'s timeout path, the `ExecutionOptions` environment/working-directory composition, the `Graceful` 5 s escalation, Usage example 9, and the SR-11/SR-19/SR-22/SR-26 cases (tracked).
+- **Test coverage.** `tests/util/iora_test_shell_runner.cpp` (31 test cases) covers `spawn`, `wait` (including a negative timeout) and timeouts, every termination strategy (including `None` via `setTerminationStrategy`), move and `detach` (including move assignment killing the previous process), stdout/stderr redirection (including a caller with fd 1 closed), working directory (including the `_exit(127)` of a failed `chdir`), environment, process groups (the child leads its own group), the `createProcessGroup = false` destruction path for both strategies (in a forked, single-thread-checked harness in its own session, asserting the harness survives and the child was killed), grandchild cleanup through the group kill for both strategies, `killProcessGroup = false` leaving grandchildren alive, `signal()`, the moved-from `terminate` / `kill` / `signal` / `waitUntilReady` refusals, `waitUntilReady` on a live child, `findProcesses` / `killProcesses` with a per-run unique pattern (which also assert the success path of `waitForCommandReady`) and an invalid pattern, `isProcessRunning` / `getProcessState` (`Running`, `Signaled`, `Unknown` for a non-child) / `waitForProcess` (including a timeout) / `sendSignal` / `killProcessGroup` (including the refusal of groups 0 and 1), a static helper stealing a handle's exit status (`Unknown`, cached), exit codes, the cached state, three threads racing `isRunning` / `getState` across the reap, two concurrent `wait()` calls, every branch of `pcloseExitCode`, and the exit-code behavior of `execute` / `execute(ostream)` / `executeWithOptions` (both `throwOnError` settings) / `executeWithInput`. Not tested: the `executeWithOptions` timeout path, `waitForCommandReady`'s timeout path, `waitUntilReady`'s timeout path, the `ExecutionOptions` environment/working-directory composition, the `Graceful` 5 s escalation, Usage examples 9 and 10, and the SR-11/SR-19/SR-22/SR-26 cases (tracked). The file is one executable, `iora_test_shell_runner`, in the `UTIL` test group (`tests/CMakeLists.txt`); tests are off by default, so enable the group (and `BUILD_TESTS`, in case the build tree was configured with it off), build the one target, and run it through CTest, where it is registered as `util::iora_test_shell_runner`:
+
+  ```bash
+  cmake -S . -B build -DBUILD_TESTS=ON -DIORA_BUILD_UTIL_TESTS=ON
+  cmake --build build --target iora_test_shell_runner
+  cd build && ctest -R iora_test_shell_runner --output-on-failure
+  ```
 
 ---
 

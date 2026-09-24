@@ -75,9 +75,9 @@ All five are total and **non-throwing**.
 |---|---|---|---|
 | `isHtmx` | `HX-Request` | `bool` | `true` iff present and value is the literal lowercase `"true"` (HTMX always sends lowercase). Missing → `""` ≠ `"true"` → `false`. |
 | `isBoost` | `HX-Boosted` | `bool` | Same exact-`"true"` rule; set by HTMX for `hx-boost`'ed requests. |
-| `trigger` | `HX-Trigger` | `std::optional\<std::string\>` | The triggering element **id**. Absent → `nullopt`; present-but-empty → `optional("")` (distinguished via `has_header`). |
-| `triggerName` | `HX-Trigger-Name` | `std::optional\<std::string\>` | The triggering element **name**. Same present/absent semantics. |
-| `target` | `HX-Target` | `std::optional\<std::string\>` | The target element id. Same present/absent semantics. |
+| `trigger` | `HX-Trigger` | `std::optional<std::string>` | The triggering element **id**. Absent → `nullopt`; present-but-empty → `optional("")` (distinguished via `has_header`). |
+| `triggerName` | `HX-Trigger-Name` | `std::optional<std::string>` | The triggering element **name**. Same present/absent semantics. |
+| `target` | `HX-Target` | `std::optional<std::string>` | The target element id. Same present/absent semantics. |
 
 **The id-vs-name caveat (critical, AH-9).** HTMX sends `HX-Trigger` **iff the triggering element has an `id`**, and `HX-Trigger-Name` **iff it has a `name`** — the two are **independent**, not alternatives: an element with both attributes sends **both** headers. Therefore `trigger() == nullopt` does **not** mean "no element triggered the request" — the element may simply have no `id` (it may still expose a `name`). A handler that must identify the triggering element should prefer `trigger()` (id) and **fall back to** `triggerName()` (name). This caveat is documented on both functions.
 
@@ -121,7 +121,7 @@ Rejects a value whose URL scheme case-insensitively equals one of `{javascript, 
 - `https://...`, `/admin/x`, `#section`, `false`, `data-driven/path` (no `:`-terminated scheme), `javascript-foo:` (folds to `javascript-foo` ≠ `javascript`), bare `javascript` (no `:`), `mailto:...`, `tel:...` → **accepted**.
 - `java\x01script:`, `java\x00script:` (interior NUL / other C0) → **accepted** — the run terminates with no `:`, exactly as a browser would refuse to parse them as the `javascript` scheme.
 
-**Byte-classification discipline.** Every byte test operates on `static_cast\<unsigned char\>` with explicit ASCII ranges (never locale `std::isalpha`/`std::tolower`; the value may contain bytes ≥ `0x80` and `char` is signed). The `string_view` is **not** NUL-terminated and may contain `0x00`; every index is bounds-checked against `size()`.
+**Byte-classification discipline.** Every byte test operates on `static_cast<unsigned char>` with explicit ASCII ranges (never locale `std::isalpha`/`std::tolower`; the value may contain bytes ≥ `0x80` and `char` is signed). The `string_view` is **not** NUL-terminated and may contain `0x00`; every index is bounds-checked against `size()`.
 
 **Ordering contract.** `rejectDangerousScheme` **must** be called *after* `rejectCrlf`. On its own it does not reject CR/LF — an interior CR/LF would merely terminate the scheme run (no `:` → accepted), yet a browser strips tab/CR/LF across the whole URL before parsing, so `java\nscript:` would execute. Both current callers (`setRedirect`, `setPushUrl`) call `rejectCrlf` first, so no CR/LF ever reaches the scheme guard in practice; any future caller on a navigable-URL sink must preserve that ordering and never use `rejectDangerousScheme` as the sole guard.
 

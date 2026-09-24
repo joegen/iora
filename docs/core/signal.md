@@ -157,7 +157,7 @@ sequenceDiagram
 
 ## 3. Component Deep Dive
 
-### 3.1 The COW slot list (`shared_ptr\<vector\<Slot\>\>` + `atomic_load`/`atomic_store`)
+### 3.1 The COW slot list (`shared_ptr<vector<Slot>>` + `atomic_load`/`atomic_store`)
 
 The slot list is a single `std::shared_ptr<SlotList>` member, `_slots`. The core invariant is: **the `shared_ptr` is only ever swapped atomically; the `vector` it points at is never mutated in place.**
 

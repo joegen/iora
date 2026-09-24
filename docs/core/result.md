@@ -138,7 +138,7 @@ sequenceDiagram
 
 ## 3. Component Deep Dive
 
-### 3.1 `detail::OkWrapper\<T\>` / `detail::ErrWrapper\<E\>` -- variant disambiguation
+### 3.1 `detail::OkWrapper<T>` / `detail::ErrWrapper<E>` -- variant disambiguation
 
 ```cpp
 namespace detail {
@@ -276,11 +276,11 @@ Result& inspect(F&& fn) &;
 
 On success, calls `fn(value())` for its side effect (e.g. logging) and returns `*this` unchanged; on error it does nothing and still returns `*this`. There is deliberately **no `&&` overload** -- an rvalue-qualified `inspect` returning `Result&` would hand back a reference into a temporary, a dangling-reference hazard. The `inspect calls fn on ok, returns self` test (`iora_test_result.cpp:158`) asserts both the side effect and `&ref == &r`.
 
-### 3.6 The `Result\<void, E\>` specialization
+### 3.6 The `Result<void, E>` specialization
 
 For operations that succeed with no value. Storage is `std::variant<std::monostate, E>`.
 
-| Feature | Primary `Result\<T, E\>` | `Result\<void, E\>` |
+| Feature | Primary `Result<T, E>` | `Result<void, E>` |
 |---|---|---|
 | `ok()` factory | `ok(T value)` | `ok()` -- no argument |
 | `value()` | present (4 overloads) | **absent** -- void has no value |
@@ -527,7 +527,7 @@ Result<Data, std::string> getData(int id) // high level: string errors
 | 2 | `std::get<0>(_storage)` is called while the active index is 1. |
 | 3 | `std::get` throws `std::bad_variant_access`; no value is returned (see §8). |
 
-### 5.6 `Result\<void, E\>::andThen` on a success
+### 5.6 `Result<void, E>::andThen` on a success
 
 | Step | Action |
 |---|---|

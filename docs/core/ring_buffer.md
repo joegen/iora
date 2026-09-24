@@ -140,7 +140,7 @@ The entire design rests on one invariant: **exactly one thread ever writes `_hea
 
 The contract is **not enforced at runtime** -- there is no owner-thread check, no assertion. Two producers, two consumers, or a single thread doing both without external ordering is undefined behavior with silent data corruption (lost items, duplicated items, torn reads). The type is non-copyable and non-movable precisely because it is a shared synchronization point that must not be relocated while the two threads reference it.
 
-### 3.2 `RingBuffer\<T, Capacity\>` -- the fixed variant
+### 3.2 `RingBuffer<T, Capacity>` -- the fixed variant
 
 **Compile-time capacity constraints.** Two `static_assert`s fire at instantiation:
 
@@ -177,7 +177,7 @@ The move overload is identical except for `std::move(item)` and a `is_nothrow_mo
 
 **`noexcept` propagation.** `tryPush`/`tryPop`/`peek`/`tryPushBatch`/`tryPopBatch` are conditionally `noexcept` on the relevant `is_nothrow_*_assignable_v<T>` trait; `size`/`empty`/`full`/`capacity`/`clear` are unconditionally `noexcept`. `capacity()` is additionally `constexpr` in this variant. The test suite `static_assert`s `noexcept(rb.size())`, `noexcept(rb.peek(val))` for `T = int`, and friends.
 
-### 3.3 `DynamicRingBuffer\<T\>` -- the runtime variant
+### 3.3 `DynamicRingBuffer<T>` -- the runtime variant
 
 Identical SPSC push/pop/peek/batch semantics, but capacity is chosen at construction and may change:
 
@@ -481,14 +481,14 @@ This is acceptable for monitoring/dashboards but disqualifies these methods from
 
 There is no runtime or environment configuration; sizing is fixed at instantiation/construction.
 
-### 9.1 `RingBuffer\<T, Capacity\>` template parameters
+### 9.1 `RingBuffer<T, Capacity>` template parameters
 
 | Parameter | Kind | Constraints | Meaning |
 |---|---|---|---|
 | `T` | type | Copy- or move-assignable | Element type. Move-only types are supported via the `T&&` push overload and move-out pop. |
 | `Capacity` | `std::size_t` (non-type) | `> 0` **and** a power of two (both `static_assert`ed) | Fixed slot count. `kMask = Capacity - 1` is the public compile-time mask. |
 
-### 9.2 `DynamicRingBuffer\<T\>` construction
+### 9.2 `DynamicRingBuffer<T>` construction
 
 | Parameter | Type | Constraints | Meaning |
 |---|---|---|---|

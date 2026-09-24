@@ -9,7 +9,7 @@
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/util/ttl_map.hpp`, `include/iora/util/expiring_cache.hpp` |
 | **Namespace** | `iora::util` |
-| **Public classes** | `TtlMap\<K, V, Hash, KeyEqual\>`, `ExpiringCache\<K, V\>` |
+| **Public classes** | `TtlMap<K, V, Hash, KeyEqual>`, `ExpiringCache<K, V>` |
 | **Dependencies** | `ttl_map.hpp`: `iora/core/timer.hpp` (`iora::core::TimerService`, injected) plus `<atomic>`, `<chrono>`, `<cstdint>`, `<functional>`, `<list>`, `<memory>`, `<optional>`, `<shared_mutex>`, `<stdexcept>`, `<type_traits>`, `<unordered_map>`, `<utility>`. `expiring_cache.hpp`: `iora/core/logger.hpp` (`iora::core::Logger`, static) plus `<chrono>`, `<condition_variable>`, `<functional>`, `<mutex>`, `<optional>`, `<thread>`, `<unordered_map>`, `<utility>`, `<vector>`. No external/third-party dependencies. |
 
 ---
@@ -27,7 +27,7 @@
 
 ### Problem
 
-`iora::util` has shipped a thread-safe expiring cache, `ExpiringCache\<K, V\>`, since before this guide existed. It solves "expire an entry after N seconds" correctly, but it has three structural limits that matter for a hot read path: `get()` takes an **exclusive** `std::mutex` even though a lookup never mutates the map's shape (only which entry it returns), there is **no capacity bound** (a misbehaving producer can grow the map without limit), and reclamation runs on a **self-owned background thread with a fixed, hardcoded 5-second poll** -- there is no way to tune the sweep cadence or to share a scheduler with the rest of an application.
+`iora::util` has shipped a thread-safe expiring cache, `ExpiringCache<K, V>`, since before this guide existed. It solves "expire an entry after N seconds" correctly, but it has three structural limits that matter for a hot read path: `get()` takes an **exclusive** `std::mutex` even though a lookup never mutates the map's shape (only which entry it returns), there is **no capacity bound** (a misbehaving producer can grow the map without limit), and reclamation runs on a **self-owned background thread with a fixed, hardcoded 5-second poll** -- there is no way to tune the sweep cadence or to share a scheduler with the rest of an application.
 
 `tmc_edge_proxy`'s route cache and AI-registration caches -- and, by extension, any future Iora consumer with a similar shape -- need a **bounded**, **read-heavy**, per-entry-TTL cache: ~100k entries, ~600s TTL, sub-10ms `get()` under concurrent readers, and a way to bound memory when a source floods it with distinct keys. `ExpiringCache`'s exclusive-lock `get()` serializes every reader against every other reader, and its unbounded map has no answer for a key-cardinality flood.
 
@@ -35,8 +35,8 @@
 
 Two distinct, coexisting caching primitives in `iora::util`:
 
-- **`ExpiringCache\<K, V\>`** (`expiring_cache.hpp`) -- the older, simpler cache. TTL-only, no capacity bound, no LRU. Owns a dedicated purge `std::thread` that wakes every 5 seconds (or immediately on shutdown via a condition variable) and sweeps the whole map under one `std::mutex`. An optional `EvictionCallback` fires for both TTL-driven and explicit removals, always **outside** the lock. Remains in place for its existing consumers; nothing about it changed to make room for `TtlMap`.
-- **`TtlMap\<K, V, Hash, KeyEqual\>`** (`ttl_map.hpp`) -- the newer, read-optimized cache. Bounded by `Config::maxEntries` with approximate-LRU eviction, backed by a `std::shared_mutex` so concurrent `get()` calls run under a **shared** lock and never contend with each other. It owns no thread: its periodic sweeper is scheduled on an **injected** `iora::core::TimerService`, with a `std::weak_ptr`-guarded handler that keeps the cache lifetime-safe even if the map is destroyed while a sweep is in flight. Lock-free `stats()`.
+- **`ExpiringCache<K, V>`** (`expiring_cache.hpp`) -- the older, simpler cache. TTL-only, no capacity bound, no LRU. Owns a dedicated purge `std::thread` that wakes every 5 seconds (or immediately on shutdown via a condition variable) and sweeps the whole map under one `std::mutex`. An optional `EvictionCallback` fires for both TTL-driven and explicit removals, always **outside** the lock. Remains in place for its existing consumers; nothing about it changed to make room for `TtlMap`.
+- **`TtlMap<K, V, Hash, KeyEqual>`** (`ttl_map.hpp`) -- the newer, read-optimized cache. Bounded by `Config::maxEntries` with approximate-LRU eviction, backed by a `std::shared_mutex` so concurrent `get()` calls run under a **shared** lock and never contend with each other. It owns no thread: its periodic sweeper is scheduled on an **injected** `iora::core::TimerService`, with a `std::weak_ptr`-guarded handler that keeps the cache lifetime-safe even if the map is destroyed while a sweep is in flight. Lock-free `stats()`.
 
 They are **additive siblings, not a replacement relationship** -- `TtlMap` did not retire `ExpiringCache`; consolidating the two remains an open, separate follow-up (see Section 10).
 
@@ -170,14 +170,14 @@ sequenceDiagram
 | Thread | `TtlMap` responsibility | `ExpiringCache` responsibility |
 |---|---|---|
 | **Any caller thread** | `put`/`get`/`invalidate`/`clear`/`stats` -- all safe to call concurrently with each other (subject to the constructor/destructor ordering contract in Section 6). | `set`/`get`/`remove`/`size` -- all safe to call concurrently with each other and with the purge thread. |
-| **Injected `iora::core::TimerService`'s timer thread** (not owned by `TtlMap`) | Fires the periodic sweep handler (`schedulePeriodic`); the handler locks a `std::weak_ptr\<State\>` and, if still alive, runs `sweepState` under `State::mutex` in bounded batches. | N/A |
+| **Injected `iora::core::TimerService`'s timer thread** (not owned by `TtlMap`) | Fires the periodic sweep handler (`schedulePeriodic`); the handler locks a `std::weak_ptr<State>` and, if still alive, runs `sweepState` under `State::mutex` in bounded batches. | N/A |
 | **`ExpiringCache`'s own `_purgeThread`** (owned, one per instance) | N/A | Wakes every 5 seconds (or immediately when `_stopCondition` is notified at shutdown), sweeps `_cache` for expired entries under `_mutex`, then fires `EvictionCallback` for each evicted entry outside the lock. |
 
 ---
 
 ## 3. Component Deep Dive
 
-### 3.1 `TtlMap\<K, V, Hash, KeyEqual\>`
+### 3.1 `TtlMap<K, V, Hash, KeyEqual>`
 
 #### 3.1.1 `Config`, `Stats`, and the `V` requirement
 
@@ -218,7 +218,7 @@ The first documents that `get()` returns a copy of `V` under the lock, and that 
 
 #### 3.1.2 `State` -- the heap-allocated shared anchor
 
-All mutable cache state lives in a private `State` struct, allocated once via `std::make_shared\<State\>()` in the constructor and held by `TtlMap::_state`:
+All mutable cache state lives in a private `State` struct, allocated once via `std::make_shared<State>()` in the constructor and held by `TtlMap::_state`:
 
 ```cpp
 struct State
@@ -237,9 +237,9 @@ struct State
 
 `sweepResume` is the periodic sweep's resume cursor -- the key of the next node `sweepState` should examine on its next lock acquisition. It is read and written only by `sweepState`, always under the exclusive `mutex`, so it needs no separate synchronization. It stores a **key**, not a `std::list` iterator, deliberately: an iterator saved across a released lock could dangle if a concurrent `put`/`invalidate`/`evictOne`/`clear` erased its node in the meantime, whereas a key re-found via `index` cannot -- if the key is gone, the sweep safely restarts from the LRU front. See Section 3.1.7.
 
-`Node` (the `std::list\<Node\>` element type) holds `K key; V value; std::chrono::steady_clock::time_point expiresAt; std::atomic\<std::int64_t\> lastAccess;`. The `std::atomic` member makes `Node` non-copyable and non-movable -- this is deliberate and harmless: `State` lives on the heap behind a `shared_ptr`, and `std::list` never relocates its nodes (`splice` only relinks pointers), so the map's stored `NodeIter` values and every `Node`'s atomics stay valid across the object's entire life.
+`Node` (the `std::list<Node>` element type) holds `K key; V value; std::chrono::steady_clock::time_point expiresAt; std::atomic<std::int64_t> lastAccess;`. The `std::atomic` member makes `Node` non-copyable and non-movable -- this is deliberate and harmless: `State` lives on the heap behind a `shared_ptr`, and `std::list` never relocates its nodes (`splice` only relinks pointers), so the map's stored `NodeIter` values and every `Node`'s atomics stay valid across the object's entire life.
 
-Indirecting all state through `shared_ptr\<State\>` (rather than storing it directly as `TtlMap` members) is the mechanism that makes the periodic sweeper lifetime-safe -- see Section 3.1.6 and Section 6.
+Indirecting all state through `shared_ptr<State>` (rather than storing it directly as `TtlMap` members) is the mechanism that makes the periodic sweeper lifetime-safe -- see Section 3.1.6 and Section 6.
 
 #### 3.1.3 Construction -- mandatory ordering, and why the constructor can throw
 
@@ -266,7 +266,7 @@ TtlMap(Config cfg, iora::core::TimerService &timers)
 The ordering is load-bearing, not stylistic:
 
 1. `State` is allocated and **fully** default-initialized (`make_shared` default-inits every member; `stopping` starts `false`) as part of the member-initializer list, **before** the constructor body runs.
-2. The sweep handler captures only a `std::weak_ptr\<State\>` -- never a `TtlMap*`, never `this` -- and dispatches to the **static** `sweepState(State&)`.
+2. The sweep handler captures only a `std::weak_ptr<State>` -- never a `TtlMap*`, never `this` -- and dispatches to the **static** `sweepState(State&)`.
 3. `schedulePeriodic` is called **last**. A periodic tick can fire on the `TimerService`'s own thread before this constructor returns (the timer thread is independent and may already be running), so `State` must be complete before the handler is registered.
 4. If `schedulePeriodic` returns `0` (the service is draining, or `TimerLimits::maxPeriodicTimers` is reached -- see [`docs/core/timer.md`](../core/timer.md) Section 9.2), the constructor **throws `std::runtime_error`**. There is no silent "sweeper-less" fallback mode: a `TtlMap` that could never expire cold entries would be a slow-motion memory leak.
 
@@ -428,11 +428,11 @@ static void sweepState(State &s)
 }
 ```
 
-`sweepState` is `static` **by contract**: it is reached only through the sweep handler's locked `shared_ptr\<State\>`, and it must never touch a `TtlMap` member, because the owning `TtlMap` may be concurrently destroyed while this handler frame is live (see Section 6).
+`sweepState` is `static` **by contract**: it is reached only through the sweep handler's locked `shared_ptr<State>`, and it must never touch a `TtlMap` member, because the owning `TtlMap` may be concurrently destroyed while this handler frame is live (see Section 6).
 
 **Two independent bounds per lock acquisition, not one.** Each `std::unique_lock` acquisition inside the loop visits (scans) at most `kScanBudget = 4096` nodes **and** erases at most `kReapBatch = 512` of them, whichever limit is hit first, then releases the lock -- this bounds the worst-case reader/writer stall per acquisition to O(`kScanBudget`) regardless of map size or expiry distribution. `kReapBatch` alone (the erasure-only bound) is not sufficient: a sparse-expiry or high-hit-rate map -- the stated target workload -- would otherwise let the scan walk the entire live list under one continuous exclusive lock before finding `kReapBatch` expired entries to erase.
 
-**Safe resume by key.** The loop carries its position across lock releases in `State::sweepResume`, a `std::optional\<K\>`, never a `std::list` iterator: on re-acquiring the lock, it resumes at the node for the saved key if `index` still finds it, or restarts from the LRU front if that key was erased by a concurrent writer meanwhile (a redundant re-scan of the already-swept prefix, never a skip of a live entry). `now` is re-sampled per chunk, so a multi-chunk sweep of a large map still reaps entries that cross their expiry mid-sweep.
+**Safe resume by key.** The loop carries its position across lock releases in `State::sweepResume`, a `std::optional<K>`, never a `std::list` iterator: on re-acquiring the lock, it resumes at the node for the saved key if `index` still finds it, or restarts from the LRU front if that key was erased by a concurrent writer meanwhile (a redundant re-scan of the already-swept prefix, never a skip of a live entry). `now` is re-sampled per chunk, so a multi-chunk sweep of a large map still reaps entries that cross their expiry mid-sweep.
 
 **Per-invocation visit ceiling -- the termination guard.** `visitCeiling` is computed once, at the top of the call, as the map's size at entry plus one `kScanBudget` chunk. The outer `for (;;)` loop bails once `totalScanned` reaches that ceiling (or a chunk reaches the true end of the list), independent of whether the resume cursor keeps surviving. This guarantees termination even under an adversarial writer that repeatedly erases exactly the resume key during every released window while keeping the live prefix larger than `kScanBudget`: without the ceiling, the restart-from-front path could re-scan that prefix indefinitely and monopolize the `TimerService` thread. Forward progress does not rely on the list only shrinking (`put()` grows it at the front); it rests on the cursor advancing when the resume key survives, and on this ceiling when it does not.
 
@@ -453,11 +453,11 @@ The loop re-checks `stopping` at the top of every chunk (a liveness measure so a
 }
 ```
 
-Three steps, in this order: publish the fast-path "stop soon" hint; ask the (borrowed) `TimerService` to cancel the periodic timer (best-effort -- see Section 6 on why `cancel()` alone is not the correctness mechanism); then drop this instance's `shared_ptr\<State\>` anchor **last**. `State` and its mutex survive for as long as any other `shared_ptr\<State\>` is alive -- specifically, for the duration of any sweep handler invocation that had already `lock()`'d the `weak_ptr` before this destructor ran. The destructor touches no member after `_state.reset()`.
+Three steps, in this order: publish the fast-path "stop soon" hint; ask the (borrowed) `TimerService` to cancel the periodic timer (best-effort -- see Section 6 on why `cancel()` alone is not the correctness mechanism); then drop this instance's `shared_ptr<State>` anchor **last**. `State` and its mutex survive for as long as any other `shared_ptr<State>` is alive -- specifically, for the duration of any sweep handler invocation that had already `lock()`'d the `weak_ptr` before this destructor ran. The destructor touches no member after `_state.reset()`.
 
-`TtlMap` is explicitly non-copyable and non-movable (all four special members deleted) -- a `shared_ptr\<State\>` plus a `TimerService&` reference member make copy semantically ambiguous and move would leave a dangling registered sweep handler pointing at a relocated-but-not-really object.
+`TtlMap` is explicitly non-copyable and non-movable (all four special members deleted) -- a `shared_ptr<State>` plus a `TimerService&` reference member make copy semantically ambiguous and move would leave a dangling registered sweep handler pointing at a relocated-but-not-really object.
 
-### 3.2 `ExpiringCache\<K, V\>`
+### 3.2 `ExpiringCache<K, V>`
 
 #### 3.2.1 Construction and the eviction callback
 
@@ -467,7 +467,7 @@ explicit ExpiringCache(std::chrono::seconds ttl);
 explicit ExpiringCache(std::chrono::seconds ttl, EvictionCallback callback);
 ```
 
-All three constructors log an `info`-level line via the static `iora::core::Logger` and then call the private `startPurgeThread()`, which spawns `_purgeThread` immediately -- there is no separate "start" step. `EvictionCallback` is `std::function\<void(const K&, const V&)\>`; when supplied, it is invoked for **both** TTL-driven expiry (from `get()` or from the purge thread) **and** explicit `remove()` calls -- "eviction" here is not limited to automatic expiry.
+All three constructors log an `info`-level line via the static `iora::core::Logger` and then call the private `startPurgeThread()`, which spawns `_purgeThread` immediately -- there is no separate "start" step. `EvictionCallback` is `std::function<void(const K&, const V&)>`; when supplied, it is invoked for **both** TTL-driven expiry (from `get()` or from the purge thread) **and** explicit `remove()` calls -- "eviction" here is not limited to automatic expiry.
 
 #### 3.2.2 `set()` -- unconditional overwrite, no in-place mutation
 
@@ -688,11 +688,11 @@ sessionCache.remove("session-def");   // ALSO fires the eviction callback -- not
 ### 4.6 Anti-patterns
 
 - **Do NOT destroy the `iora::core::TimerService` before every `TtlMap` that references it.** The service is injected, not owned; a `TtlMap` outliving its `TimerService` leaves a dangling reference the moment `put`/`get`/the destructor touches `_timers`.
-- **Do NOT call `put`/`get`/`invalidate`/`clear`/`stats` concurrently with a `TtlMap`'s own destructor.** The `weak_ptr\<State\>` guard protects only the in-flight sweep handler against a racing destructor -- it does **not** protect an external caller racing `~TtlMap`, because the non-atomic `_state` member itself is not synchronized against `_state.reset()` (see Section 6).
+- **Do NOT call `put`/`get`/`invalidate`/`clear`/`stats` concurrently with a `TtlMap`'s own destructor.** The `weak_ptr<State>` guard protects only the in-flight sweep handler against a racing destructor -- it does **not** protect an external caller racing `~TtlMap`, because the non-atomic `_state` member itself is not synchronized against `_state.reset()` (see Section 6).
 - **Do NOT assume `ExpiringCache::set(key, value, std::chrono::seconds(0))` creates an immediately-expiring entry.** `0` (or any non-positive value) is the "no override" sentinel and silently falls back to the instance's default TTL.
 - **Do NOT treat `ExpiringCache`'s `EvictionCallback` as TTL-only.** It also fires for explicit `remove()` calls; if your callback assumes "this only happens because the TTL elapsed," it will be wrong for manually removed entries.
 - **Do NOT rely on `TtlMap::get()` to reclaim memory promptly for an expired entry.** It performs a deferred reap (no erase under the shared lock); physical reclamation happens on the next writer touching that node, or the next sweep. If you need bounded memory under sparse reads, size `maxEntries` and rely on the LRU eviction path, not on `get()`-driven expiry.
-- **Do NOT instantiate `TtlMap\<K, V\>` with a `V` that is copy-constructible but not (copy- or move-)assignable.** `put()` on an **existing** key performs `nodeIt->value = std::move(value)`, which requires `V` to be assignable. The class now checks this directly: a second `static_assert(std::is_move_assignable_v\<V\> || std::is_copy_assignable_v\<V\>, ...)` fails the build with an explicit message at class-template instantiation, rather than deep-erroring the first time an existing-key `put()` call is instantiated.
+- **Do NOT instantiate `TtlMap<K, V>` with a `V` that is copy-constructible but not (copy- or move-)assignable.** `put()` on an **existing** key performs `nodeIt->value = std::move(value)`, which requires `V` to be assignable. The class now checks this directly: a second `static_assert(std::is_move_assignable_v<V> || std::is_copy_assignable_v<V>, ...)` fails the build with an explicit message at class-template instantiation, rather than deep-erroring the first time an existing-key `put()` call is instantiated.
 
 ---
 
@@ -717,7 +717,7 @@ sessionCache.remove("session-def");   // ALSO fires the eviction callback -- not
 | 2 | `get` | `s.index.find(key)` hits; dereference `NodeIter`. | `shared_lock` held |
 | 3a | `get` (live) | `expiresAt > now` -> store `lastAccess` (relaxed); `hits.fetch_add(1)`; copy `value`. | `shared_lock` held |
 | 3b | `get` (expired) | `expiresAt <= now` -> `misses.fetch_add(1)`; **no erase, no splice**. | `shared_lock` held |
-| 4 | `get` | Release `s.mutex`; return `optional\<V\>`. | released |
+| 4 | `get` | Release `s.mutex`; return `optional<V>`. | released |
 
 ### 5.3 `TtlMap` periodic sweep tick
 
@@ -780,8 +780,8 @@ sessionCache.remove("session-def");   // ALSO fires the eviction callback -- not
 
 | Operation | Synchronization | Notes |
 |---|---|---|
-| `put` | `std::unique_lock\<std::shared_mutex\>` on `State::mutex`. | Single critical section: index + LRU + counters + any eviction, no intermediate release. |
-| `get` | `std::shared_lock\<std::shared_mutex\>` on `State::mutex`. | **Read-only on structure.** Writes only `Node::lastAccess` (relaxed atomic) and one of `hits`/`misses` (relaxed atomic). Never splices or erases. `const`-qualified. |
+| `put` | `std::unique_lock<std::shared_mutex>` on `State::mutex`. | Single critical section: index + LRU + counters + any eviction, no intermediate release. |
+| `get` | `std::shared_lock<std::shared_mutex>` on `State::mutex`. | **Read-only on structure.** Writes only `Node::lastAccess` (relaxed atomic) and one of `hits`/`misses` (relaxed atomic). Never splices or erases. `const`-qualified. |
 | `invalidate` | `std::unique_lock` on `State::mutex`. | Calls the shared `removeNode` helper; does not touch `evictions`. |
 | `clear` | `std::unique_lock` on `State::mutex`. | Resets `index`/`lru`/`size`; leaves `hits`/`misses`/`evictions` monotonic. |
 | `stats` | **None.** | Four independent relaxed atomic loads (`hits`, `misses`, `evictions`, `size`). Eventually consistent, not a synchronized snapshot. |
@@ -790,15 +790,15 @@ sessionCache.remove("session-def");   // ALSO fires the eviction callback -- not
 **Mutex/atomic inventory (from source):**
 
 - `State::mutex` (`mutable std::shared_mutex`) -- the map's only lock. `get()`/`stats()`-style reads take it shared (`stats()` in fact takes no lock at all); `put`/`invalidate`/`clear`/eviction/sweep take it exclusive. One mutex, no lock-ordering concern.
-- `Node::lastAccess` (`std::atomic\<std::int64_t\>`) -- relaxed load/store; the approximate-recency signal. Correct under relaxed ordering because it "guards" no other memory -- the shared/exclusive transition on `State::mutex` is what establishes happens-before for the eviction-time read.
-- `State::hits` / `State::misses` / `State::evictions` (`std::atomic\<std::uint64_t\>`) -- relaxed `fetch_add`, read via `stats()`'s relaxed loads.
-- `State::size` (`std::atomic\<std::size_t\>`) -- relaxed `fetch_add`/`fetch_sub`, maintained only under the exclusive lock (readers never touch it).
-- `State::stopping` (`std::atomic\<bool\>`) -- release store in `~TtlMap`; acquire loads in the sweep handler and at the top of every `sweepState` chunk. This is the release/acquire pair that makes "destructor asked to stop" visible to the sweep handler without requiring `State::mutex`.
-- `State::sweepResume` (`std::optional\<K\>`, plain, not atomic) -- read and written only inside `sweepState`, always under the exclusive `State::mutex`, so it needs no independent synchronization. Storing a key rather than a `std::list` iterator is what makes the cursor safe to carry across the lock release between chunks.
+- `Node::lastAccess` (`std::atomic<std::int64_t>`) -- relaxed load/store; the approximate-recency signal. Correct under relaxed ordering because it "guards" no other memory -- the shared/exclusive transition on `State::mutex` is what establishes happens-before for the eviction-time read.
+- `State::hits` / `State::misses` / `State::evictions` (`std::atomic<std::uint64_t>`) -- relaxed `fetch_add`, read via `stats()`'s relaxed loads.
+- `State::size` (`std::atomic<std::size_t>`) -- relaxed `fetch_add`/`fetch_sub`, maintained only under the exclusive lock (readers never touch it).
+- `State::stopping` (`std::atomic<bool>`) -- release store in `~TtlMap`; acquire loads in the sweep handler and at the top of every `sweepState` chunk. This is the release/acquire pair that makes "destructor asked to stop" visible to the sweep handler without requiring `State::mutex`.
+- `State::sweepResume` (`std::optional<K>`, plain, not atomic) -- read and written only inside `sweepState`, always under the exclusive `State::mutex`, so it needs no independent synchronization. Storing a key rather than a `std::list` iterator is what makes the cursor safe to carry across the lock release between chunks.
 
-**The lifetime-safety mechanism -- `std::weak_ptr\<State\>`, not `TimerService::cancel()`.** The sweep handler captures `std::weak_ptr\<State\> weak` (not `this`, not a raw `State*`). On fire, it calls `weak.lock()`; a successful lock produces a `shared_ptr\<State\>` that keeps `State` (its mutex and containers) alive for the **entire** critical section of that invocation, even if `~TtlMap` is running concurrently on another thread. `TimerService::cancel()` is a **best-effort, non-blocking** ("collect-then-fire") request: if the run loop has already collected this handler for the current tick before `cancel()` is observed, that already-collected handler still fires. The `weak_ptr` guard is what makes that fire safe rather than a use-after-free -- `cancel()` alone is not the correctness mechanism, only an optimization that reduces (not eliminates) how often a post-destruction sweep tick actually runs `sweepState`.
+**The lifetime-safety mechanism -- `std::weak_ptr<State>`, not `TimerService::cancel()`.** The sweep handler captures `std::weak_ptr<State> weak` (not `this`, not a raw `State*`). On fire, it calls `weak.lock()`; a successful lock produces a `shared_ptr<State>` that keeps `State` (its mutex and containers) alive for the **entire** critical section of that invocation, even if `~TtlMap` is running concurrently on another thread. `TimerService::cancel()` is a **best-effort, non-blocking** ("collect-then-fire") request: if the run loop has already collected this handler for the current tick before `cancel()` is observed, that already-collected handler still fires. The `weak_ptr` guard is what makes that fire safe rather than a use-after-free -- `cancel()` alone is not the correctness mechanism, only an optimization that reduces (not eliminates) how often a post-destruction sweep tick actually runs `sweepState`.
 
-**The public-API-vs-destructor contract.** `_state` itself is a plain (non-atomic) `std::shared_ptr\<State\>` member of `TtlMap`. `~TtlMap`'s `_state.reset()` is **not synchronized** against a concurrent caller thread reading `_state` inside `put`/`get`/`invalidate`/`clear`/`stats` -- there is no mutex guarding the `TtlMap` object itself, only the `State` it points to. Consequently: **public methods must not be called concurrently with `~TtlMap`.** This is a hard caller obligation, not something the class enforces internally; the `weak_ptr` guard protects only the *sweep handler's* access path, which is structurally incapable of touching `TtlMap` members in the first place (see Section 3.1.7).
+**The public-API-vs-destructor contract.** `_state` itself is a plain (non-atomic) `std::shared_ptr<State>` member of `TtlMap`. `~TtlMap`'s `_state.reset()` is **not synchronized** against a concurrent caller thread reading `_state` inside `put`/`get`/`invalidate`/`clear`/`stats` -- there is no mutex guarding the `TtlMap` object itself, only the `State` it points to. Consequently: **public methods must not be called concurrently with `~TtlMap`.** This is a hard caller obligation, not something the class enforces internally; the `weak_ptr` guard protects only the *sweep handler's* access path, which is structurally incapable of touching `TtlMap` members in the first place (see Section 3.1.7).
 
 **Lifetime contract with the injected `TimerService`.** The `TimerService&` is not owned. It must outlive every `TtlMap` constructed with it, and it must be drained/stopped only **after** the last such `TtlMap` is destroyed -- relying on member-declaration order between a `TimerService` and a `TtlMap` inside some enclosing owner is explicitly called out in the header as insufficient; the header recommends an explicit `timers.stop()`/`drain()` call sequenced after every dependent `TtlMap`'s destruction.
 
@@ -806,12 +806,12 @@ sessionCache.remove("session-def");   // ALSO fires the eviction callback -- not
 
 | Operation | Synchronization | Notes |
 |---|---|---|
-| `set` | `std::lock_guard\<std::mutex\>` on `_mutex`. | Whole-`CacheEntry` replace via `operator[]`; no in-place field mutation. |
-| `get` | `std::lock_guard\<std::mutex\>` on `_mutex`; copy-then-invoke for the expired-eviction callback. | Hit path returns from inside the lock's scope (released by RAII on return). Expired path: erase under lock, invoke callback after release. No `try`/`catch` around this callback invocation -- it runs on the caller's thread, which has its own caller to catch an exception. |
-| `remove` | `std::lock_guard\<std::mutex\>` on `_mutex`; copy-then-invoke. | Fires the callback for **any** removal, not only expiry-driven ones. |
-| `size` | `std::lock_guard\<std::mutex\>` on `mutable _mutex`. | `const`; single lock/unlock around `_cache.size()`. |
-| Purge thread body | `std::unique_lock\<std::mutex\>` on `_mutex`, held across the CV wait and the full-map scan; released before firing callbacks. | Collect-then-invoke: evicted pairs are gathered under the lock into a local `vector`, callbacks fire after release, each wrapped in `try`/`catch` (see below). |
-| Destructor | `std::lock_guard\<std::mutex\>` to set `_stop`; `notify_one()` **after** the lock is released; `join()` outside any lock. | The notify-after-unlock ordering means the purge thread's `wait_for` predicate check reliably observes `_stop == true` without a lost-wakeup window. |
+| `set` | `std::lock_guard<std::mutex>` on `_mutex`. | Whole-`CacheEntry` replace via `operator[]`; no in-place field mutation. |
+| `get` | `std::lock_guard<std::mutex>` on `_mutex`; copy-then-invoke for the expired-eviction callback. | Hit path returns from inside the lock's scope (released by RAII on return). Expired path: erase under lock, invoke callback after release. No `try`/`catch` around this callback invocation -- it runs on the caller's thread, which has its own caller to catch an exception. |
+| `remove` | `std::lock_guard<std::mutex>` on `_mutex`; copy-then-invoke. | Fires the callback for **any** removal, not only expiry-driven ones. |
+| `size` | `std::lock_guard<std::mutex>` on `mutable _mutex`. | `const`; single lock/unlock around `_cache.size()`. |
+| Purge thread body | `std::unique_lock<std::mutex>` on `_mutex`, held across the CV wait and the full-map scan; released before firing callbacks. | Collect-then-invoke: evicted pairs are gathered under the lock into a local `vector`, callbacks fire after release, each wrapped in `try`/`catch` (see below). |
+| Destructor | `std::lock_guard<std::mutex>` to set `_stop`; `notify_one()` **after** the lock is released; `join()` outside any lock. | The notify-after-unlock ordering means the purge thread's `wait_for` predicate check reliably observes `_stop == true` without a lost-wakeup window. |
 
 **Mutex/CV inventory (from source):**
 
@@ -935,7 +935,7 @@ template <typename K, typename V> struct ExpiringCacheTestAccessor
 | D-3 | Approximate LRU via a per-node relaxed `lastAccess` atomic, list order maintained by writers only. | Strict LRU needs a move-to-front on every read, incompatible with a shared-lock `get()`. Bounded second-chance eviction trades exact recency for read-path cheapness. |
 | D-4 | Lazy expiry with **deferred** physical reap in `get()`. | `std::shared_mutex` has no atomic upgrade in C++17; erasing on an expired `get()` would require dropping and reacquiring the lock exclusively, reopening a race window. Deferral to the next writer or sweep is simpler and correct. |
 | D-5 | Sweeper runs on an **injected** `iora::core::TimerService`; `TtlMap` owns no thread. | Reuses whatever scheduling infrastructure the application already runs, instead of spending one OS thread per cache instance. |
-| D-6 | Sweep handler captures `std::weak_ptr\<State\>`, dispatches to a `static` function, never touches `TtlMap` members. | `TimerService::cancel()` is best-effort/non-blocking; an already-collected handler can still fire after `~TtlMap` begins. The `weak_ptr` (backed by `State` living on the heap via `shared_ptr`) is what makes that late fire a safe no-op instead of a use-after-free. |
+| D-6 | Sweep handler captures `std::weak_ptr<State>`, dispatches to a `static` function, never touches `TtlMap` members. | `TimerService::cancel()` is best-effort/non-blocking; an already-collected handler can still fire after `~TtlMap` begins. The `weak_ptr` (backed by `State` living on the heap via `shared_ptr`) is what makes that late fire a safe no-op instead of a use-after-free. |
 | D-7 | `Config::sweepInterval` doing double duty as both sweep cadence and LRU recency threshold. | Reuses one existing "how stale is stale" notion instead of introducing a second tunable; the trade-off is a coupling a caller must understand (see Section 10). |
 | D-8 | `ExpiringCache` owns a dedicated purge `std::thread` per instance, woken by a `condition_variable` rather than a fixed `sleep_for`. | Predates `TimerService`-based scheduling in this codebase; the CV wake-on-shutdown fix (`_stopCondition`) avoids the earlier failure mode of waiting out a full 5-second sleep during teardown. |
 | D-9 | `ExpiringCache`'s `EvictionCallback` fires for explicit `remove()` as well as TTL expiry. | A single callback path covers "this key is gone" regardless of cause, at the cost of the name implying TTL-only semantics (see Section 10). |
@@ -951,7 +951,7 @@ template <typename K, typename V> struct ExpiringCacheTestAccessor
 Per this project's code-defect honesty rule, every item below is reported as a finding regardless of when the code was written or how deliberate it looks; disposition is the human's call, not this guide's.
 
 - **`Config::sweepInterval` is overloaded to mean two different things.** It sets both the periodic sweep's cadence (how often expired entries are physically reaped) and the approximate-LRU "recent" threshold in `evictOne()` (`lastAccess >= now - sweepInterval`). A caller tuning one concern (e.g. shortening the sweep interval to reclaim memory faster) unavoidably also tightens the LRU recency window, making eviction behave closer to strict LRU; lengthening it for a lighter sweep load makes almost every candidate look "recent," pushing eviction toward "always evict the strict tail" (the second-chance loop degenerates to its unconditional fallback). This coupling is not called out anywhere as a caveat for the caller, only as an internal implementation note.
-- **`TtlMap`'s public methods have no internal guard against being called concurrently with `~TtlMap`.** This is stated explicitly in the header as a caller obligation (the `weak_ptr\<State\>` guard protects only the sweep handler, not external callers, because `_state` itself is an unsynchronized plain member), but it means a single missed synchronization point in a consuming application is a live use-after-free with no diagnostic. There is no assertion, no debug-mode check, and no `shared_from_this`-style safety net for this specific path.
+- **`TtlMap`'s public methods have no internal guard against being called concurrently with `~TtlMap`.** This is stated explicitly in the header as a caller obligation (the `weak_ptr<State>` guard protects only the sweep handler, not external callers, because `_state` itself is an unsynchronized plain member), but it means a single missed synchronization point in a consuming application is a live use-after-free with no diagnostic. There is no assertion, no debug-mode check, and no `shared_from_this`-style safety net for this specific path.
 - **`ExpiringCache::set()`'s `customTtl` sentinel silently discards zero and negative values.** `customTtl.count() > 0 ? customTtl : _ttl` means a caller cannot express "expire immediately" via this parameter, and a negative duration (which is arguably caller error) is treated identically to "no override" rather than rejected or clamped.
 - **`ExpiringCache`'s `EvictionCallback` name implies TTL-only semantics but also fires on explicit `remove()`.** A consumer who wires up eviction handling assuming it only ever fires for expiry (e.g., to emit an "expired" metric) will also see it fire for ordinary, intentional removals, with no way to distinguish the two causes from the callback's arguments alone.
 - **`ExpiringCache`'s purge interval (5 seconds) is a compile-time constant with no constructor parameter.** An application needing a shorter or longer sweep cadence than 5 seconds cannot configure `ExpiringCache` to provide it; the only lever is the TTL itself.

@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-10 |
+| **Version** | 1.4 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/timer.hpp` |
 | **Namespace** | `iora::core` |
@@ -20,6 +20,8 @@
 | 1.0 | 2026-09-10 | Initial Architecture & Programmer's Guide. Authored directly against `include/iora/core/timer.hpp` (1846 lines) and cross-checked against `tests/core/iora_test_timer.cpp` and `tests/core/iora_test_timer_lifecycle.cpp`. The README "High-Performance Timer System" section describes an aspirational API that diverges from the shipped header (see Known Limitations); this guide documents the **actual** implementation. |
 | 1.1 | 2026-09-11 | Synced to the `drain`/`stop` fix (iora `a83dbc7`): `drain(0)` with active periodic timers now terminates (periodics are cancelled in both budgets by dual-marking the descriptor and its live record); a `_runLoopExited` liveness escape lets a `drain` parked on a pending timer return when a concurrent `stop()`/error-exit truncates the run loop; `stop()` forces `_accepting = false` at the terminal `Stopped` transition (`Stopped => !_accepting`); `runLoop` publishes liveness on every exit incl. exception unwind. Updated §4.7, §5.4, §5.5; removed the "`drain(0)` never completes" known limitation. |
 | 1.2 | 2026-09-11 | Synced to the null-logger fix (tracker `2026-09-10-5`): a null `std::shared_ptr<TimerLogger>` passed to `setLogger`, the logger-accepting `TimerService` constructor, or the logger-accepting `TimerServicePool` constructor is normalized to a silent default via `detail::orDefaultLogger`, so `_logger` is never null (previously a crash). Updated §8; removed the "custom-logger constructor assumes a non-null logger" known limitation. |
+| 1.3 | 2026-09-24 | DOC-4: rehomed README-only content. §3.2/§3.3 name the rejection codes (`ResourceExhausted` for `maxConcurrentTimers`/`maxPeriodicTimers`, `ServiceStopped` for a draining service); new §4.7 error-handler example (anti-patterns moved to §4.8); §7 documents `TimerStats::startTime` and what `getAggregatedStats` actually fills; Known Limitations adds the unsynchronized `startTime` and the partial aggregation; removed pointers to the deleted README section. |
+| 1.4 | 2026-09-24 | DOC-4 doc-review fixes: §8 lock ordering corrected to match §4.7 -- `_mutex` and `_handlerMutex` are never held together and `_handlerMutex` is a leaf (the §7 logging note and the §8 table row now say the same; the contrary comment at `timer.hpp` `handleError` is noted as stale). §4.7 (the error-handler section added in 1.3; the section the 1.1 row calls §4.7 is now §4.8, Anti-patterns) now lists `poke()` `SystemError`s on the `schedule*`/`cancel`/`drain`/`stop` caller's thread and a failed `start()` from `Reset`, limits "construction failures happen before a handler can be installed" to the constructor, drops the unreachable "pool has no services" `ConfigurationError` case, and restricts what an error handler on the timer thread may call; §4.8 adds the same rule for timer handlers, and Known Limitations adds the unrecoverable `stop()`/destruction-from-the-timer-thread case (including that a later `stop()` reports success without joining, so destruction then calls `std::terminate`). §7 and Known Limitations list every writer of `TimerStats::startTime` (`TimerService::reset()`, pool `resetStats()`, `getAggregatedStats(out)`), including two threads aggregating into one `out`, and cite tracker -22. The 1.0 row's original wording is restored; the README section it mentions has since been removed from the README. |
 
 ---
 
@@ -179,7 +181,7 @@ template <typename Handler> std::uint64_t scheduleAt(TimePoint tp, Handler &&han
 1. `static_assert(std::is_invocable_v<Handler>)` -- the handler must be callable with no arguments.
 2. **Lock-free gate:** if `!_accepting` (service draining/not running), call `handleError(ServiceStopped, ...)` and **return 0**.
 3. **Lock-free validity:** `isValidTimeout(tp)` checks `tp - now <= limits.maxTimeout`; on failure `handleError(InvalidTimeout, ...)` and **return 0**.
-4. Under `_mutex`: **re-check** `_accepting` (drain may have flipped it since step 2), then check `_records.size() >= limits.maxConcurrentTimers`. Either failing sets a *pending* error to be reported after unlock and yields id 0.
+4. Under `_mutex`: **re-check** `_accepting` (drain may have flipped it since step 2), then check `_records.size() >= limits.maxConcurrentTimers`. Either failing sets a *pending* error to be reported after unlock and yields id 0: a draining service reports `TimerError::ServiceStopped`, and an exceeded `maxConcurrentTimers` reports `TimerError::ResourceExhausted` ("Maximum concurrent timers exceeded").
 5. Otherwise `id = ++_nextId`; emplace `Record{tp, forward(handler), false}`; push `HeapItem{tp, id}`; `siftUp`.
 6. Release `_mutex`; if a pending error was set, `handleError(...)` and return 0; else `poke()` the eventfd and return the id.
 
@@ -193,7 +195,7 @@ The error is captured under the lock and *reported after* releasing it, so the l
 template <typename F> std::uint64_t schedulePeriodic(Duration interval, F &&handler);
 ```
 
-Same accept/validity gates as `scheduleAt`, plus a `_periodicTimers.size() >= limits.maxPeriodicTimers` check and the `maxConcurrentTimers` check. The subtlety, called out in a header comment: the handler is **copied into a `std::function<void()>` before** it is forwarded into the `Record`:
+Same accept/validity gates as `scheduleAt`, plus a `_periodicTimers.size() >= limits.maxPeriodicTimers` check and the `maxConcurrentTimers` check. Exceeding either limit reports `TimerError::ResourceExhausted` through the error handler ("Maximum periodic timers exceeded" is checked first, then "Maximum concurrent timers exceeded") and returns 0; a draining service reports `TimerError::ServiceStopped`. The subtlety, called out in a header comment: the handler is **copied into a `std::function<void()>` before** it is forwarded into the `Record`:
 
 ```cpp
 std::function<void()> storedFn(handler);                       // copy FIRST
@@ -245,7 +247,7 @@ template <typename Handler> void asyncWait(Handler &&handler);   // handler is N
 bool cancel();
 ```
 
-`asyncWait` first `cancel()`s any prior arm, allocates a fresh `std::shared_ptr<Shared>` (holding an `atomic<bool> canceled`), captures a `weak_ptr` to it, and schedules a wrapper on the service. The wrapper `lock()`s the weak_ptr and only invokes the user handler if the `Shared` still exists and is not cancelled. `cancel()` sets `Shared::canceled` and cancels the service token. The destructor cancels and resets the shared state. This gives a race-safe cancel: if the timer fires after `cancel()`/destruction, the wrapper observes the flag (or the expired weak_ptr) and does nothing. **The handler is nullary** -- `SteadyTimer` does not pass an `error_code` (contrary to the README sketch).
+`asyncWait` first `cancel()`s any prior arm, allocates a fresh `std::shared_ptr<Shared>` (holding an `atomic<bool> canceled`), captures a `weak_ptr` to it, and schedules a wrapper on the service. The wrapper `lock()`s the weak_ptr and only invokes the user handler if the `Shared` still exists and is not cancelled. `cancel()` sets `Shared::canceled` and cancels the service token. The destructor cancels and resets the shared state. This gives a race-safe cancel: if the timer fires after `cancel()`/destruction, the wrapper observes the flag (or the expired weak_ptr) and does nothing. **The handler is nullary** -- `SteadyTimer` does not pass an `error_code` the way ASIO's `async_wait` does; there is no cancellation/error argument to inspect.
 
 ### 3.9 `TimerServicePool` -- fan-out
 
@@ -387,7 +389,43 @@ service.reset(); // Stopped -> Reset; clears all timer state
 service.start(); // Reset -> Running; re-creates fds and thread
 ```
 
-### 4.7 Anti-patterns
+### 4.7 Observing rejections and runtime errors with an error handler
+
+The error handler is installed with `setErrorHandler` at runtime; it is **not** a `TimerServiceConfig` field. It receives every error the service reports: schedule rejections (`ServiceStopped`, `InvalidTimeout`, `ResourceExhausted`), handler exceptions (`HandlerException`), runtime system-call failures in the run loop (`SystemError` for `timerfd_settime`/`epoll_wait`), and `SystemError` "eventfd write failed" from `poke()`, the doorbell write that `schedule*`, `cancel`, `drain` and `stop` perform. Failures of the **constructor** happen before a handler can be installed; they throw `TimerException` from the constructor. A later `start()` from `Reset` re-runs the same initialization: if it fails, the installed handler is called (on the `start()` caller's thread) and `start()` returns a failed `LifecycleResult` ("Start failed: ...") instead of throwing. `TimerError::ConfigurationError` never reaches the handler; it appears only in a `TimerException` thrown by `TimerServicePool::getLeastLoadedService()` when the pool has no services, which cannot happen in practice (both pool constructors clamp the service count to at least 1 and no API removes a service).
+
+```cpp
+auto config = TimerConfigBuilder().maxConcurrentTimers(2).build();
+TimerService service(config);
+
+std::atomic<int> exhausted{0};
+service.setErrorHandler(
+  [&exhausted](TimerError error, const std::string &message, int errnoVal)
+  {
+    if (error == TimerError::ResourceExhausted)
+    {
+      ++exhausted;
+    }
+    std::cerr << "timer error: " << message << " (errno " << errnoVal << ")\n";
+  });
+
+service.scheduleAfter(1s, []() {});
+service.scheduleAfter(1s, []() {});
+std::uint64_t id = service.scheduleAfter(1s, []() {}); // third exceeds the limit
+// id == 0 and the handler ran once with TimerError::ResourceExhausted
+```
+
+`handleError` copies the logger and handler under `_handlerMutex`, releases it, logs through the `TimerLogger`, then invokes the handler. No call site holds `_mutex` when it calls `handleError` (schedule rejections are recorded under the lock and reported after it is released), so the handler runs with **neither** `_mutex` nor `_handlerMutex` held. It runs on the thread that detected the error: the scheduling thread for rejections; the thread that called `schedule*`/`cancel`/`drain`/`stop` for a `poke()` failure; the `start()` caller for a failed restart; the timer thread for `HandlerException` and run-loop `SystemError`s. An exception thrown by the handler is caught and logged at critical level.
+
+**What a handler on the timer thread may call.** A handler invoked on the timer thread (`HandlerException`, run-loop `SystemError`) may call `schedule*` and `cancel` on the same service, and nothing that waits for the timer thread:
+
+- `drain(0)` can hang forever. For `HandlerException`, the handler is still inside `safeRun`, whose `CountGuard` keeps `_executingCallbacks` above zero, so `drain`'s predicate never becomes true. For a run-loop `SystemError`, the pending timers `drain(0)` waits for can only be fired by the thread that is blocked in it.
+- `drain(N)` with `N > 0` waits out its whole budget for the same reason, then times out and restores `Running`.
+- `stop()` first runs `drain(5000)` (the 5 s budget is burned as above), then sets `_running = false` and calls `_thread.join()` on the timer thread itself. The join throws `std::system_error` (`resource_deadlock_would_occur`); `handleError`'s `catch (...)` swallows it and logs "Error handler threw exception". `cleanup()` and the `Stopped` transition are skipped: the service is left with `_running == false`, its fds open, and its state at `Running` (restored by the timed-out internal drain), and the run loop exits when the handler returns. A later `stop()` from any thread then finds `_running` already false, reports success ("Already stopped") and sets `Stopped` without joining the exited thread or running `cleanup()`; destroying the service after that calls `std::terminate`, because its `std::thread` member is still joinable (both observed in a scratch build against this header).
+- Destroying the service (for example releasing the last `shared_ptr` to it) runs `~TimerService()`, which calls `stop()`. The same `std::system_error` escapes the implicitly `noexcept` destructor, so the process calls `std::terminate` before `handleError`'s `catch (...)` is reached.
+
+Handlers on other threads (a rejection, a `poke()` failure, a failed `start()`) are not on the timer thread, so these restrictions do not apply to them.
+
+### 4.8 Anti-patterns
 
 | Do | Don't |
 |---|---|
@@ -397,6 +435,7 @@ service.start(); // Reset -> Running; re-creates fds and thread
 | Let the handler run to completion quickly, or dispatch heavy work elsewhere. | Block the handler -- there is one timer thread; a slow handler delays every later timer on that service. |
 | Cancel via `SteadyTimer::cancel()` / let it destruct. | Rely on cancelling a raw id you passed to `SteadyTimer` -- the service holds a wrapper token, not your id. |
 | Size `maxConcurrentTimers` to your load. | Rely on `maxHeapSize` / `maxHandlerExecutionTime` limits -- they are declared but not enforced (see Known Limitations). |
+| From inside a timer handler, call only `schedule*` / `cancel` on the same service; hand lifecycle calls to another thread. | Call `drain`, `stop`, or destroy the service from a timer handler -- the handler runs on the timer thread: `drain(0)` never returns (the handler's own `CountGuard` keeps `_executingCallbacks` above zero), `drain(N)` burns its whole budget, `stop()` burns 5 s in its internal drain and then joins the timer thread from itself (the `std::system_error` escapes the handler into `safeRun`, is reported as `HandlerException`, and leaves the service with `_running == false`, no `cleanup()`, and state `Running`; a later `stop()` reports "Already stopped" without joining, and destroying the service then calls `std::terminate` on the still-joinable `std::thread`), and destruction from the handler calls `std::terminate` (the same exception escapes the `noexcept` destructor). The same rule applies to an error handler running on the timer thread (section 4.7). |
 
 ---
 
@@ -504,9 +543,9 @@ When `TimerServiceConfig::enableStatistics` is `true` (the default), the service
 | `timerfdTriggers` | `timerfd` expiries handled. |
 | `totalHandlerExecutionTimeNs` / `maxHandlerExecutionTimeNs` / `avgHandlerExecutionTimeNs` | Handler timing (avg is approximate under concurrency). |
 
-`getUptimeSeconds()` reports wall time since construction/last reset. `TimerStats` is non-copyable in the usual sense (atomics), so `TimerServicePool::getAggregatedStats(TimerStats &out)` fills a caller-provided instance by summing per-service counters.
+`TimerStats` also has a public `std::chrono::steady_clock::time_point startTime`, set when the block is constructed and again by every `TimerStats::reset()`: through `TimerService::resetStats()`, `TimerService::reset()` (the `Stopped -> Reset` transition), `TimerServicePool::resetStats()` (once per service), and `TimerServicePool::getAggregatedStats(out)` (on `out`). `getUptimeSeconds()` returns the steady-clock time elapsed since `startTime`, in seconds at millisecond resolution. `startTime` is a plain, non-atomic field: any of those writers on one thread concurrently with `getUptimeSeconds()` (or any read or other write of `startTime`) on another is a data race -- including two threads calling `getAggregatedStats` with the same `out` (see Known Limitations). `TimerStats` is non-copyable in the usual sense (atomics), so `TimerServicePool::getAggregatedStats(TimerStats &out)` fills a caller-provided instance: it calls `out.reset()` and then sums the eleven event counters (`timersScheduled` through `timerfdTriggers`) across services. The three handler-timing counters are not summed (they stay 0), and `out.startTime` is the moment of the aggregation call, so `out.getUptimeSeconds()` is not the pool's uptime.
 
-**Logging.** A pluggable `TimerLogger` (default `ConsoleTimerLogger`, which is *disabled* by default -- construct with `enabled = false`) receives lifecycle and error messages. Swap it at runtime with `setLogger(std::shared_ptr<TimerLogger>)`, and install an `ErrorHandler` (`std::function<void(TimerError, const std::string&, int)>`) with `setErrorHandler`. Both are guarded by `_handlerMutex` and are snapshotted before invocation, so neither runs while `_mutex` is held.
+**Logging.** A pluggable `TimerLogger` (default `ConsoleTimerLogger`, which is *disabled* by default -- construct with `enabled = false`) receives lifecycle and error messages. Swap it at runtime with `setLogger(std::shared_ptr<TimerLogger>)`, and install an `ErrorHandler` (`std::function<void(TimerError, const std::string&, int)>`) with `setErrorHandler`. Both are guarded by `_handlerMutex` and are snapshotted before invocation; `_handlerMutex` is a leaf that is never held together with `_mutex`, so neither runs while either lock is held (section 8).
 
 ---
 
@@ -521,7 +560,7 @@ When `TimerServiceConfig::enableStatistics` is `true` (the default), the service
 | `drain` | Under `_mutex` for the `Running->Draining` CAS + `_accepting` store + cancellation sweep + inflight count; then `_drainCV.wait_for` releasing `_mutex`. | `DrainStats` accounting computed after the wait. Timeout path CAS-restores `Running`. |
 | `stop` | `_running` CAS (acq_rel); `_thread.join()`; `cleanup()`; then `finalizeStoppedLocked()` stores `_accepting = false` **and** `Stopped` together under `_mutex`. | Joins the timer thread; safe to call from the destructor. The joint terminal store enforces `Stopped => !_accepting` even if `stop`'s internal drain timed out and restored `_accepting`. |
 | `getStats` / `getConfig` | None (returns `const&`); counters are atomics. | `getInFlightCount` takes `_mutex`. |
-| `setLogger` / `setErrorHandler` / `loggerSnapshot` / `handleError` | `std::lock_guard<std::mutex>` on `_handlerMutex`. | Logger/handler are copied under `_handlerMutex` then invoked outside it. `_handlerMutex` is always the **inner** lock -- never held while acquiring `_mutex`. A null logger passed to `setLogger`, the logger-accepting `TimerService` constructor, or the logger-accepting `TimerServicePool` constructor is normalized to a silent default (`ConsoleTimerLogger`, disabled) via `detail::orDefaultLogger`, so `_logger` is never null and every read site is safe by construction. `setLogger` builds the substitute *before* taking `_handlerMutex` to keep the critical section minimal. |
+| `setLogger` / `setErrorHandler` / `loggerSnapshot` / `handleError` | `std::lock_guard<std::mutex>` on `_handlerMutex`. | Logger/handler are copied under `_handlerMutex` then invoked outside it. `_handlerMutex` is a **leaf**: no code path holds it together with `_mutex` in either order. A null logger passed to `setLogger`, the logger-accepting `TimerService` constructor, or the logger-accepting `TimerServicePool` constructor is normalized to a silent default (`ConsoleTimerLogger`, disabled) via `detail::orDefaultLogger`, so `_logger` is never null and every read site is safe by construction. `setLogger` builds the substitute *before* taking `_handlerMutex` to keep the critical section minimal. |
 
 **Mutex/CV/atomic inventory (from the header):**
 
@@ -535,7 +574,7 @@ When `TimerServiceConfig::enableStatistics` is `true` (the default), the service
 - `std::atomic<iora::common::LifecycleState> _lifecycleState` -- lifecycle state.
 - `std::atomic<int> _eventFd` -- the doorbell fd (accessed cross-thread by `poke()`); `_epollFd`/`_timerFd` are plain `int` touched only by the init/run-loop/cleanup single-thread sequence.
 
-**Lock ordering.** `_mutex` -> `_handlerMutex` is the only nesting (`handleError` may be called while `_mutex` is held, and it takes `_handlerMutex` to snapshot then invokes off both locks). `_handlerMutex` is never held while acquiring `_mutex`, so there is no cycle. `_mutex` is otherwise a leaf.
+**Lock ordering.** There is no nesting: `_mutex` and `_handlerMutex` are never held together. Every `handleError` and `loggerSnapshot` call runs after `_mutex` has been released (schedule rejections are recorded under `_mutex` and reported after unlock), and `handleError` takes `_handlerMutex` only to copy the logger and handler, then invokes both with no lock held. `_handlerMutex` is a leaf. The comment in `handleError` (`timer.hpp`, "Safe to call from both locked (_mutex held) and unlocked contexts because _handlerMutex is always the inner lock") and the `_mutex (outer) then _handlerMutex (inner)` note at the `_handlerMutex` declaration describe a nesting no call site uses; they are stale (coding_trackers: tasks/iora/backlog/2026-09-24-22_timerstats-starttime-race-and-aggregate-gaps_P1.json).
 
 **Drain wakeup correctness.** The `CountGuard` destructor takes/releases `_mutex` before `notify_all` so the `_executingCallbacks` decrement is visible to `drain()`'s predicate -- otherwise a notify could be lost if `drain()` had not yet entered `wait_for`. This is the same "notify under (or fenced by) the lock the destroyer observes" discipline used across iora.
 
@@ -773,6 +812,9 @@ public:
 - **`TimerLimits::maxHeapSize` and `TimerLimits::maxHandlerExecutionTime` are not enforced.** Both fields are declared and defaulted (`50000`, `30s`) but are never read anywhere in `timer.hpp`. Admission control uses `maxConcurrentTimers` against `_records.size()`, not heap size; there is no watchdog on slow handlers. Configuring these values has no effect today (candidate defect -- tracked in `tasks/iora/backlog/2026-09-10-8_timer-dead-timerlimits-fields_P2.json`).
 - **`getLeastLoadedService()` degenerates when statistics are disabled.** Load is `timersScheduled - timersExecuted`, both only incremented when `enableStatistics == true`; with statistics off, every service reports load 0 and the first service is always returned. (Statistics are on by default, so this bites only if explicitly disabled.) Tracked -- including the unsigned-underflow edge in the `timersScheduled - timersExecuted` subtraction -- in `tasks/iora/backlog/2026-09-10-9_timer-least-loaded-service-stats-disabled_P2.json`.
 - **Single thread per service.** All handlers on one service run serially on its timer thread; a long-running handler delays every subsequent timer on that service. Distribute heavy or blocking work across a `TimerServicePool` or hand off to a thread pool inside the handler.
-- **No `reschedule`.** Unlike `ITimerService`/`TimingWheel`, `TimerService` has no `reschedule(id, newDelay)`; cancel and re-schedule instead. (The README sketch lists `reschedule`; it does not exist.)
+- **No `reschedule`.** Unlike `ITimerService`/`TimingWheel`, `TimerService` has no `reschedule(id, newDelay)`; cancel and re-schedule instead.
+- **`TimerStats::startTime` is not synchronized.** It is a plain `std::chrono::steady_clock::time_point` written by `TimerStats::reset()` -- reached through `TimerService::resetStats()`, `TimerService::reset()`, `TimerServicePool::resetStats()`, and `TimerServicePool::getAggregatedStats(out)` (`out.reset()`) -- and read by `getUptimeSeconds()`, with no lock or atomic. Any writer concurrent with a reader or another writer is a data race, including two threads aggregating into one shared `out` (coding_trackers: tasks/iora/backlog/2026-09-24-22_timerstats-starttime-race-and-aggregate-gaps_P1.json).
+- **`stop()` or destruction from the timer thread is unrecoverable.** `stop()` called from a timer handler or from an error handler running on the timer thread joins the timer thread from itself; the `std::system_error` is swallowed, the service is left `Running` with `_running == false` and its fds open, a later `stop()` reports "Already stopped" without joining or cleaning up, and destroying the service then calls `std::terminate` (joinable `std::thread`). Destroying the service from the timer thread calls `std::terminate` directly. `drain` from the timer thread hangs (`drain(0)`) or burns its budget (section 4.7). There is no `isOnTimerThread()` guard inside `stop()`/`drain()`; callers such as `DnsTransport` check it themselves.
+- **`getAggregatedStats` omits timing counters and uptime.** It sums only the eleven event counters; `totalHandlerExecutionTimeNs`, `maxHandlerExecutionTimeNs` and `avgHandlerExecutionTimeNs` in the output are 0, and its `startTime` is reset to the call time (coding_trackers: tasks/iora/backlog/2026-09-24-22_timerstats-starttime-race-and-aggregate-gaps_P1.json).
 - **Statistics `avg`/aggregate are approximate.** `avgHandlerExecutionTimeNs` is computed from independently-loaded atomics under concurrency, and `getAggregatedStats` sums non-atomically across services -- both are monitoring hints, not exact accounting.
 - **This guide documents `TimerService` (and its `SteadyTimer`/`TimerServicePool`/`TimerConfigBuilder` companions) only.** The sibling `iora::core::TimingWheel` scheduler and the `ITimerService` interface are a separate component; see [`docs/core/timing_wheel.md`](timing_wheel.md).

@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-14 |
+| **Version** | 1.2 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Headers** | `include/iora/network/circuit_breaker.hpp`, `include/iora/network/connection_health.hpp` |
 | **Namespace** | `iora::network` |
@@ -18,6 +18,8 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-14 | Initial guide. Documents `CircuitBreaker`/`CircuitBreakerManager` and `ConnectionHealth`/`HealthMonitor` as standalone, application-composable primitives. Records that the transport layer does not auto-wire either primitive (the dead auto-wire members and the no-op `autoHealthMonitoring` flag were removed in iora `7f38bcb`). |
+| 1.1 | 2026-09-24 | DOC-4: rehomed README-unique content (§4 "Tuning & integration notes": conservative starting thresholds tuned against the dependency's SLA, breakers at service boundaries, a degradation path when `allowRequest()` is false, and logging transitions by comparing `getState()` because no state-change callback exists). |
+| 1.2 | 2026-09-24 | DOC-4 doc-review fixes: the §4 "Log transitions" note now lists `reset()` (→ Closed) and the manager's `reset(name)`/`resetAll()` among the transitions. It documents the concurrency caveats: duplicate Open → HalfOpen logs from two threads, and misattribution of another thread's transition. The advice is approximate but safe, because each `getState()` is a single atomic load. Made the snippet a single compilable unit, and fixed the list markup so the code fence and the caveat text are indented inside the list item. |
 
 ---
 
@@ -347,6 +349,60 @@ for (SessionId id : monitor.getUnhealthyConnections())
 
 monitor.removeConnection(sessionId);  // on close
 ```
+
+### Tuning & integration notes
+
+- **Start conservative, then tune against the dependency's SLA.** Begin with a `failureThreshold` high enough that routine transient errors do not trip the circuit, and a `timeout` on the order of the dependency's real recovery time. Adjust both from observed error rates and the dependency's published availability/latency targets, not from guesses.
+- **Place breakers at service boundaries.** One breaker per downstream dependency (one `CircuitBreakerManager` name per service), wrapped around the outbound call — not one per call site, and not one shared across unrelated dependencies.
+- **Implement a degradation path.** When `allowRequest()` returns `false`, do something useful: serve a cached or default value, fail fast with a clear error to the caller, or route to an alternate. A breaker without a fallback only changes how the failure looks.
+- **Log transitions by comparing `getState()`.** There is no state-change callback or listener. Compare `getState()` before and after each call that can change the state:
+  - `allowRequest()`: Open → HalfOpen.
+  - `recordSuccess()`/`recordFailure()`: HalfOpen → Closed, and Closed/HalfOpen → Open.
+  - `reset()`: any state → Closed. The manager's `CircuitBreakerManager::reset(name)` and `resetAll()` call this on the named breaker, or on every breaker.
+
+  For example:
+
+  ```cpp
+  #include <iora/network/circuit_breaker.hpp>
+
+  #include <iostream>
+
+  using iora::network::CircuitBreaker;
+  using iora::network::CircuitBreakerState;
+
+  void logIfChanged(CircuitBreakerState before, CircuitBreakerState after)
+  {
+    if (before != after)
+    {
+      std::cerr << "breaker state " << static_cast<int>(before) << " -> "
+                << static_cast<int>(after) << "\n";
+    }
+  }
+
+  int main()
+  {
+    CircuitBreaker breaker;
+
+    auto before = breaker.getState();
+    bool allowed = breaker.allowRequest();
+    logIfChanged(before, breaker.getState());
+    if (allowed)
+    {
+      before = breaker.getState();
+      breaker.recordFailure();   // or recordSuccess(), from the outcome of the guarded call
+      logIfChanged(before, breaker.getState());
+    }
+
+    before = breaker.getState();
+    breaker.reset();
+    logIfChanged(before, breaker.getState());
+    return 0;
+  }
+  ```
+
+  Treat the result as an approximate log of transitions. It is not an exact per-transition trace, although it is always safe, because each `getState()` is a single atomic load and never returns a torn value. Two effects make it approximate under concurrency:
+  - **Duplicates.** Two threads can both read Open before calling `allowRequest()`. Both calls return after the transition, so both threads log Open → HalfOpen, even though the internal compare-and-swap performed it only once.
+  - **Misattribution.** Another thread can change the state between your two reads, so your log line can report a transition your call did not make. Conversely, it can miss one your call did make that was then overwritten.
 
 ### Anti-Patterns
 

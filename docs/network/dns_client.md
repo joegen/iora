@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-14 |
+| **Version** | 1.2 |
+| **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/network/dns_client.hpp` |
 | **Internal headers** | `include/iora/network/dns/dns_resolver.hpp`, `dns_transport.hpp`, `dns_cache.hpp`, `dns_message.hpp`, `dns_types.hpp`, `dns_utils.hpp` |
@@ -19,6 +19,8 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-14 | Initial guide, authored against the hardened implementation. Documents `DnsClient` and its `dns/` backing layer (`DnsResolver`, `DnsTransport`, `DnsCache`, `DnsMessage`) as a standalone, application-facing DNS-protocol client, distinct from the transport-internal `NameResolver`/`getaddrinfo` path. RFC 3263 support is the SIP `S`/`A`-flag server-location subset (no `U`-flag/ENUM, no chained NAPTR), with ascending-`ORDER` NAPTR descent (RFC 3403 §8) and per-service SRV `.` handling (RFC 2782). Negative responses (NXDOMAIN and NODATA) are cached only when an SOA is present (RFC 2308 §5). `cacheTimeout` drives the cache default TTL; `maxUdpSize`/`tcpTimeout` remain declared-but-unused and `maxCacheSize` is not an entry cap (the cache is time-based). |
+| 1.1 | 2026-09-24 | DOC-4: rehomed README-unique content (`dns::DnsType` enumerators and typed-accessor coverage, typed record struct fields in §8; `markCompleted()` step in the §5 async-cancellation flow; application-level failover pattern in §4); corrected §3.5 (an RDATA security-check throw fails the whole `DnsMessage::parse`, it is not skipped) and described `validateRdataSecurity`'s actual checks; recorded its false positives on valid AAAA records, UTF-8 or 192–255-byte-string TXT records and `192.[0-63].0.0` A records, and the zero-length TXT/AAAA RDATA null read (process crash) in Known Limitations. |
+| 1.2 | 2026-09-24 | DOC-4 doc-review fixes: `DnsTransport::stop()` now documented as collect-under-lock / fire-with-no-lock (deadlock warning and stale citation removed); raw-callback cancel semantics (the callback always fires exactly once, even after `cancel()`) and `CancellableFuture::cancel()` semantics corrected; callback threads now include the caller's thread and the `stop()` caller; NODATA/NXDOMAIN surfacing and the three disjoint exception roots documented, and every §4 example now catches them; §4 snippets made single compilable units and the failover recipe extended to transport errors and server-local rcodes; RFC 3263 direct-SRV ranking, `preferredTransports` reorder-only behavior and the async path's `addressResolutionPolicy` gap documented; lock order and stale `dns_transport.hpp` citations corrected; the invented RFC 3263 quote replaced with RFC 3403 §8; new Known Limitations for the resolver's `DnsResolverException`-only catches, the inert retry path, the `resolveA` immediate-error `std::bad_function_call`, the double-invoked throwing callback, malformed-response no-retry, and the `start()` failure path, each with its tracker status. |
 
 ---
 
@@ -38,7 +40,7 @@ Applications in the Iora ecosystem — a SIP proxy locating an upstream registra
 
 - **`DnsClient`** (`dns_client.hpp`) — the public façade. Synchronous record accessors (`resolveA`/`resolveSRV`/`resolveNAPTR`/…), a callback-async primary path (`resolveA(host, cb)`), and `CancellableFuture`-based wrappers (`resolveAAsync`, `resolveServiceDomainFuture`).
 - **`dns::DnsResolver`** — the RFC 3263 engine: NAPTR→SRV→A/AAAA chaining, RFC 2782 SRV priority/weight selection, and the `AddressResolutionPolicy` (IPv4/IPv6 ordering).
-- **`dns::DnsTransport`** — UDP-first with TCP fallback on truncation, exponential-backoff-with-jitter retries, per-query timeouts, round-robin server selection, and a per-session TCP receive-buffer cap for DoS resistance. It rides two `iora::network::Transport` instances (the UDP and TCP engines).
+- **`dns::DnsTransport`** — UDP-first with TCP fallback on truncation, exponential-backoff-with-jitter retries (configured but currently inert on the normal path — §10), per-query timeouts, round-robin server selection, and a per-session TCP receive-buffer cap for DoS resistance. It rides two `iora::network::Transport` instances (the UDP and TCP engines).
 - **`dns::DnsMessage`** — a hardened DNS wire codec (encode query / parse response) with compression-pointer loop detection, label/name size limits, and per-record bounds validation.
 - **`dns::DnsCache`** — a TTL-aware positive/negative cache backed by `util::ExpiringCache` (time-based expiration only).
 
@@ -51,7 +53,7 @@ Applications in the Iora ecosystem — a SIP proxy locating an upstream registra
 
 ### `NameResolver` vs `DnsClient` (boundary)
 
-NameResolver (name_resolver.hpp) vs DnsClient (dns_client.hpp). NameResolver is a single-shot host->socket-address helper that wraps the OS stub resolver (::getaddrinfo) and runs it off the I/O thread on blockingIoPool(), handing back an RAII addrinfo chain (OwnedAddrInfo) ready for an immediate connect(). It answers exactly one question -- 'which socket addresses back this host:port right now, per the system resolver?' -- and is an INTERNAL step of Transport's named-host connect path; applications do not call it directly. ('Async' here means off the caller/I/O thread; the resolution itself is a blocking getaddrinfo on a pool thread, not a non-blocking DNS-protocol implementation.) DnsClient is a standalone client that speaks the DNS wire protocol directly for a fixed set of record types -- A, AAAA, CNAME, MX, TXT, PTR, SRV, NAPTR (dns_client.hpp:178) -- plus RFC 3263 service discovery (NAPTR->SRV->A/AAAA, dns_client.hpp:179,289), exposed as synchronous, callback-async, and cancellable-future (AsyncDnsRequest) APIs, and consumed directly by application code (e.g. http_client.hpp). IMPORTANT -- the two consult DIFFERENT resolution stacks and can return different answers: NameResolver/getaddrinfo honors /etc/hosts, NSS ordering, and resolv.conf search/ndots options; DnsClient reads only the nameserver entries from /etc/resolv.conf and queries them directly (no /etc/hosts, no search-list processing), falling back to public resolvers 8.8.8.8/1.1.1.1 if none are configured -- so in split-horizon / internal-DNS deployments (common for SIP/SBC) the two can disagree, and DnsClient can bypass /etc/hosts overrides or leak to public DNS on a misconfigured host. Rule of thumb: connecting a Transport to a hostname -> NameResolver does it for you (internal, getaddrinfo, system resolution semantics); need DNS records or SIP/HTTP SRV service-location as data -> use DnsClient (direct DNS client). The record-type list alone proves they are different tools: MX/TXT/NAPTR/SRV are impossible via getaddrinfo, so DnsClient is not a NameResolver wrapper.
+NameResolver (name_resolver.hpp) vs DnsClient (dns_client.hpp). NameResolver is a single-shot host->socket-address helper that wraps the OS stub resolver (::getaddrinfo) and runs it off the I/O thread on blockingIoPool(), handing back an RAII addrinfo chain (OwnedAddrInfo) ready for an immediate connect(). It answers exactly one question -- 'which socket addresses back this host:port right now, per the system resolver?' -- and is an INTERNAL step of Transport's named-host connect path; applications do not call it directly. ('Async' here means off the caller/I/O thread; the resolution itself is a blocking getaddrinfo on a pool thread, not a non-blocking DNS-protocol implementation.) DnsClient is a standalone client that speaks the DNS wire protocol directly for a fixed set of record types -- A, AAAA, CNAME, MX, TXT, PTR, SRV, NAPTR (dns_client.hpp:178) -- plus RFC 3263 service discovery (NAPTR->SRV->A/AAAA, dns_client.hpp:179,288), exposed as synchronous, callback-async, and cancellable-future (AsyncDnsRequest) APIs, and consumed directly by application code (e.g. http_client.hpp). IMPORTANT -- the two consult DIFFERENT resolution stacks and can return different answers: NameResolver/getaddrinfo honors /etc/hosts, NSS ordering, and resolv.conf search/ndots options; DnsClient reads only the nameserver entries from /etc/resolv.conf and queries them directly (no /etc/hosts, no search-list processing), falling back to public resolvers 8.8.8.8/1.1.1.1 if none are configured -- so in split-horizon / internal-DNS deployments (common for SIP/SBC) the two can disagree, and DnsClient can bypass /etc/hosts overrides or leak to public DNS on a misconfigured host. Rule of thumb: connecting a Transport to a hostname -> NameResolver does it for you (internal, getaddrinfo, system resolution semantics); need DNS records or SIP/HTTP SRV service-location as data -> use DnsClient (direct DNS client). The record-type list alone proves they are different tools: MX/TXT/NAPTR/SRV are impossible via getaddrinfo, so DnsClient is not a NameResolver wrapper.
 
 ---
 
@@ -74,7 +76,7 @@ DnsClient  (dns_client.hpp:204)
     _config     : dns::DnsConfig
     _rng        : std::mt19937                          // weighted SRV selection (seedable, _rngMutex)
 
-  dns::DnsTransport (dns_transport.hpp:79)
+  dns::DnsTransport (dns_transport.hpp:83)
     _udpTransport : shared_ptr<Transport>              // Transport::udp(config) — created for mode UDP/Both
     _tcpTransport : shared_ptr<Transport>              // Transport::tcp(config) — created for mode TCP/Both
     _pendingQueries : map<QueryKey, shared_ptr<PendingQuery>>   // guarded by _queriesMutex
@@ -123,19 +125,20 @@ sequenceDiagram
         Resolver->>Cache: put(question, result)
     end
     Resolver-->>Client: DnsResult
-    Client-->>App: vector<SrvRecord> (or throws DnsNoRecordsException)
+    Client-->>App: vector<SrvRecord> (or throws; see §3.1 Error surfacing)
 ```
 
 ### Threading Model
 
 | Thread | Responsibility |
 |---|---|
-| **Caller thread** | Runs the synchronous accessors (`resolveA`/`resolveSRV`/`query`/…); blocks on `std::future::wait_for` inside `DnsTransport::queryMultiple`. Immediate submission errors invoke the async callback here. |
+| **Caller thread** | Runs the synchronous accessors (`resolveA`/`resolveSRV`/`query`/…); blocks on `std::future::wait_for` inside `DnsTransport::queryMultiple` (`dns_transport.hpp:1020`). Immediate submission errors invoke the async callback here, **before `resolveA` returns**: no transport (`dns_client.hpp:1086-1091`), transport not running (`dns_transport.hpp:1050-1054`), registration refused because a `stop()` raced the submit (`:1091-1095`), or a send/connect failure (`:1113-1123`). A cache hit (positive or negative) in `DnsClient::queryAsync` also calls back here. |
+| **Thread calling `stop()`** | `DnsTransport::stop()` fails every still-pending query with `DnsTransportException("Transport stopped")` from the stopping thread (`dns_transport.hpp:917`) — the destructor of `DnsClient`, `updateConfig`/`setDnsServers`/…, or an explicit `stop()`. |
 | **Transport engine I/O thread** | Owned by the two `Transport` engines. Delivers normal DNS responses: `onData` → `DnsMessage::parse` → `processResponse` → `completeQuery` → user callback. |
-| **`DnsRetryTimer` (TimerService) thread** | Fires per-query timeout completions (`scheduleQueryTimeout`) and retry re-sends (`retryQuery`). A timeout's user callback runs here. |
+| **`DnsRetryTimer` (TimerService) thread** | Fires per-query timeout completions (`scheduleQueryTimeout`) and retry re-sends (`retryQuery` — pre-empted by the timeout in practice, §3.4). A timeout's user callback runs here. |
 | **Cleanup thread** (`_cleanupThread`) | A 10-second sweep (`cleanupExpiredQueries`) that retries or times out queries the fast paths missed; those completion callbacks run here. |
 
-**Consequence for callers:** an async callback (or `CancellableFuture` continuation) may run on any of three internal threads — the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread — never assume it runs on the caller's thread. Callbacks must be thread-safe. This is documented on `DnsClient::resolveA(host, cb)` (`dns_client.hpp:460-464`).
+**Consequence for callers:** an async callback (or the promise behind a `CancellableFuture`) may run on the caller's own thread before the submitting call returns, on the thread that calls `stop()`, or on any of three internal threads — the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread. Callbacks must be thread-safe, and **must not take a lock the caller holds across `resolveA`/`queryAsync`** — on the caller-thread path that is a self-deadlock (or undefined behavior for a non-recursive `std::mutex`). The header lists the caller/transport/timer cases on `DnsClient::resolveA(host, cb)` (`dns_client.hpp:450-455`).
 
 ---
 
@@ -147,7 +150,7 @@ sequenceDiagram
 
 **Construction and lifecycle.** Both constructors (default, and one taking a `dns::DnsConfig`) call `initialize()`, which: creates `_cache` iff `_config.enableCache` — seeding its default TTL from `_config.cacheTimeout` (else resets it); constructs `_transport` from `_config`; constructs `_resolver` from `(_transport, _cache, _config)`; and starts the transport, wrapping any start failure in `dns::DnsResolverException`. `start()` is a no-op that returns `true` (the transport is already started in the constructor); the destructor calls `stop()`, which stops the transport threads.
 
-**Synchronous accessors.** Each typed accessor issues one `query()` and unpacks the typed record vector, throwing `dns::DnsNoRecordsException` when the corresponding vector is empty:
+**Synchronous accessors.** Each typed accessor issues one `query()` and unpacks the typed record vector, throwing `dns::DnsNoRecordsException` when the corresponding vector is empty (which, because `query()` already throws for an empty answer section, happens only when the answer section is non-empty but holds no record of the asked type — for example a CNAME-only answer). See **Error surfacing** below:
 
 - `resolveA` / `resolveAAAA` → `std::vector<std::string>` of address strings.
 - `resolveSRV` → `std::vector<dns::SrvRecord>`; `resolveNAPTR` → `std::vector<dns::NaptrRecord>`.
@@ -156,7 +159,7 @@ sequenceDiagram
 
 **Reverse DNS.** `resolvePTR` builds the query name via `createReverseQuery` (`dns_client.hpp:975`): IPv4 → dotted-octet-reversed `in-addr.arpa`; IPv6 → `createIpv6ReverseQuery` (`:877`) which strips brackets/zone, expands `::` to the full 32-nibble form via `expandIpv6Address` (`:913`), then emits the nibble-reversed `ip6.arpa` name. A malformed address throws `dns::DnsResolverException`.
 
-**Service discovery** delegates straight to the resolver: `resolveServiceDomain` / `resolveServiceDomainAsync` / `resolveCustomServiceDomain[Async]`. The SIP-named `resolveSipDomain[Async]` are thin, `\deprecated` forwarders to the service-domain methods (`dns_client.hpp:701`).
+**Service discovery** delegates straight to the resolver: `resolveServiceDomain` / `resolveServiceDomainAsync` / `resolveCustomServiceDomain[Async]`. The SIP-named `resolveSipDomain[Async]` are thin, `\deprecated` forwarders to the service-domain methods (`dns_client.hpp:695`, `:708`).
 
 **Cancellable async.** The façade adds the future-based ergonomics the resolver lacks:
 
@@ -164,13 +167,26 @@ sequenceDiagram
 - `resolveAAsync(host)` → `CancellableFuture<std::vector<std::string>>`.
 - `resolveServiceDomainFuture(domain, …)` → `CancellableFuture<dns::ServiceResolutionResult>`.
 
-These wrap the resolver's callback API in a `std::promise`, guarding against double-set with a shared `std::atomic<bool>` (`promiseSet`) compare-exchange. `resolveAInternal` (`dns_client.hpp:1008`) adds a second guard, `RequestState::deliveryAttempted`, so exactly one thread delivers a given result even if response and timeout race.
+These wrap the resolver's callback API in a `std::promise`, guarding against double-set with a shared `std::atomic<bool>` (`promiseSet`) compare-exchange. `resolveAInternal` (`dns_client.hpp:1008`) adds a second guard, `RequestState::deliveryAttempted`, so exactly one thread enters delivery even if response and timeout race. Two caveats on "exactly once": a user callback that **throws** is invoked a **second** time, with the thrown exception, from the `catch (...)` at `dns_client.hpp:1037-1066` (the second throw is swallowed by the transport); and the immediate-error branch of `resolveA` can throw `std::bad_function_call` without invoking the callback at all (§10). Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json` (the double invoke).
+
+**Error surfacing.** `DnsResult::isSuccess()` is `rcode == NOERROR && ancount > 0` (`dns_types.hpp:381`), and `DnsResolver::query` throws `DnsResolutionFailedException(qname, rcode)` whenever it is false (`dns_resolver.hpp:613-616`; the same for a negative-cache hit, `:599-602`). So:
+
+| Server answer | Synchronous accessor throws | `getResponseCode()` |
+|---|---|---|
+| NXDOMAIN | `DnsResolutionFailedException` | `NXDOMAIN` |
+| NODATA (NOERROR, empty answer section) | `DnsResolutionFailedException` | `NOERROR` |
+| SERVFAIL / REFUSED / NOTIMP / FORMERR / … | `DnsResolutionFailedException` | that rcode |
+| NOERROR, answers present but none of the asked type | `DnsNoRecordsException` | `NXDOMAIN` (hard-coded, `dns_resolver.hpp:376-381`) |
+| No reply within `timeout`, send/connect failure, transport stopped | `DnsTransportException` / `DnsTimeoutException` | — (not a `DnsResolverException`) |
+| Response rejected by the parser | `DnsParseException` | — (not a `DnsResolverException`) |
+
+The raw callback path (`resolveA(host, cb)`, which calls `DnsTransport::queryAsync` directly and bypasses the resolver and cache) differs: any response without A records — NXDOMAIN, NODATA, SERVFAIL — arrives as `DnsNoRecordsException` with `getResponseCode() == NXDOMAIN`, so the real rcode is lost.
 
 ### 3.2 `AsyncDnsRequest` and `CancellableFuture<T>`
 
-`AsyncDnsRequest` (`dns_client.hpp:35`) is a cancellation handle over a shared `RequestState` — three `std::atomic<bool>` flags (`cancelled`, `completed`, `deliveryAttempted`) plus the queried `hostname`. `cancel()` does `cancelled.exchange(true, acq_rel)` and returns whether *this* call flipped it. Cancellation is **best-effort**: a callback already in flight on a transport thread may still fire (documented at `:54-58`).
+`AsyncDnsRequest` (`dns_client.hpp:35`) is a cancellation handle over a shared `RequestState` — three `std::atomic<bool>` flags (`cancelled`, `completed`, `deliveryAttempted`) plus the queried `hostname`. `cancel()` does `cancelled.exchange(true, acq_rel)` and returns whether *this* call flipped it — it does not look at `completed`, so the header's "false if already completed" (`dns_client.hpp:46`) is wrong (Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`). Cancellation does **not** suppress the raw callback: nothing removes the pending query, so the callback is **always invoked exactly once** (barring the throwing-callback double invoke and the `std::bad_function_call` path in §10) — with the real result if delivery claimed `deliveryAttempted` before `cancel()`, otherwise with `DnsResolverException("DNS request cancelled")` when the response, timeout, or `stop()` eventually arrives (`dns_client.hpp:1021-1033`). Anything the callback captures must therefore outlive the request (capture a `shared_ptr`/`weak_ptr`, never a stack reference). The header calls this "best-effort" (`:41-43`).
 
-`CancellableFuture<T>` (`dns_client.hpp:104`) pairs a `std::future<T>` with the request handle and the shared promise + `promiseSet` guard. Its `cancel()` (`:118`) cancels the request and, if it wins the `promiseSet` CAS, immediately sets the promise to a `dns::DnsResolverException("DNS request cancelled")` so a thread blocked in `future.get()` wakes without waiting for the network timeout.
+`CancellableFuture<T>` (`dns_client.hpp:104`) pairs a `std::future<T>` with the request handle and the shared promise + `promiseSet` guard. Its `cancel()` (`:118`) cancels the request and, if it wins the `promiseSet` CAS, immediately sets the promise to a `dns::DnsResolverException("DNS request cancelled")` so a thread blocked in `future.get()` wakes without waiting for the network timeout. `cancel()` returning `true` does **not** imply `get()` throws: a delivery that won the `promiseSet` CAS first has already set the value (or the real error), and `get()` returns it.
 
 ### 3.3 `dns::DnsResolver` (RFC 3263 engine)
 
@@ -181,17 +197,18 @@ The resolver turns questions into results and orchestrates the service-location 
 - Query `A` when policy ∈ {IPv4Only, IPv4First, IPv6First}; query `AAAA` when ∈ {IPv6Only, IPv4First, IPv6First}.
 - Combine: IPv4Only → A only; IPv6Only → AAAA only; IPv4First → A then AAAA; IPv6First → AAAA then A.
 - The legacy `prefer_ipv6 == true` bumps `IPv4First` to `IPv6First` for backward compatibility. Empty result throws `dns::DnsNoRecordsException`.
+- Each per-family `query()` is wrapped in `catch (const DnsResolverException &)` only (`dns_resolver.hpp:710`, `:729`, and the outer `:772`). A `DnsTimeoutException`/`DnsTransportException` or `DnsParseException` from either family escapes and **discards the other family's results** — under the default `IPv4First`, an AAAA timeout (or the AAAA parser false positive, §10) throws away already-resolved A addresses. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`.
 
 **Service resolution — `resolveServiceDomain`** (`dns_resolver.hpp:457`) drives `performServiceResolution` (`:1166`):
 
-1. **NAPTR query** the domain. If it fails (no NAPTR), fall back to `performDirectSrvResolution(domain, …, nullopt)` and return. If NAPTR succeeds but yields no usable target, the same direct-SRV fallback runs (sync and async behave identically here).
+1. **NAPTR query** the domain. If it fails with a `DnsResolverException` (NXDOMAIN, NODATA, an rcode error), fall back to `performDirectSrvResolution(domain, …, nullopt)` and return (`dns_resolver.hpp:1179`). A timeout, transport error, or parse error is **not** caught there: it aborts the whole resolution instead of falling back (§10). If NAPTR succeeds but yields no usable target, the same direct-SRV fallback runs (sync and async behave identically here).
 2. `processNaptrRecords` sorts by `order` then `preference` and processes NAPTR records in **ascending `ORDER`**, advancing to the next `ORDER` tier only when the current one yields no usable target and stopping at the first tier that does (RFC 3403 §4.1/§8 DDDS ordering). Within the chosen tier it maps each service string via `parseServiceType`, applies the `preferredTransports` filter, validates the replacement, and splits into `S`-flag SRV targets and `A`-flag direct targets. **`U`-flag (ENUM/regexp, RFC 6116) and empty-flag (chained NAPTR) records are intentionally skipped.**
-3. For each `S` target, **SRV query** the replacement and append `ServiceTarget`s carrying the NAPTR preference; failed SRV queries are skipped.
+3. For each `S` target, **SRV query** the replacement and append `ServiceTarget`s carrying the NAPTR preference; SRV queries that fail with a `DnsResolverException` are skipped (`:1206`), but a single SRV timeout/transport/parse failure aborts the whole resolution (§10).
 4. For each `A` target, synthesize a `ServiceTarget` directly (no SRV): `port = getDefaultServicePort(service)`, `priority = weight = 0`, `naptrPreference =` the record's NAPTR preference field.
-5. `resolveTargetAddresses` A/AAAA-resolves every target and drops those with no addresses.
+5. `resolveTargetAddresses` resolves every target through `resolveHostname` (so `addressResolutionPolicy` applies) and drops those with no addresses; a target whose lookup throws anything other than `DnsResolverException` aborts the whole resolution (`:1738`). **The async path differs:** `resolveTargetAddressesAsync` (`:1873`) queries A and then AAAA **only if A returned nothing** (`:1912`), ignoring `addressResolutionPolicy` (an `IPv6Only`/`IPv6First` caller still gets IPv4 first, and a dual-stack target gets no IPv6 addresses). The async chain also calls `DnsTransport::queryAsync` directly, so it neither consults nor populates the cache. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json` (the policy gap).
 6. `sortTargetsByPriority` stable-sorts by NAPTR preference (primary) then SRV priority (secondary).
 
-**`performDirectSrvResolution`** is the no-NAPTR (and no-usable-NAPTR) path: it tries the standard SIP SRV names (`_sips._tcp`, `_sip._tcp`, `_sip._udp`, `_sip._sctp`), reordered by `preferredTransports`. An SRV RRset whose target is the root `.` (RFC 2782 "service decidedly not available") is skipped and marks that **service** denied. If no targets result, it calls `performFallbackResolution`, which does a plain A/AAAA lookup of the bare domain and builds one target per preferred transport (defaulting to `SIP_UDP`) — **excluding any service a `.` explicitly denied** (per-service suppression, not domain-wide: a `_sips._tcp` `.` does not strand plain SIP reachable via a bare A record).
+**`performDirectSrvResolution`** is the no-NAPTR (and no-usable-NAPTR) path: it tries the standard SIP SRV names (`_sips._tcp`, `_sip._tcp`, `_sip._udp`, `_sip._sctp`), reordered by `preferredTransports` (`buildOrderedSrvQueries`, `dns_resolver.hpp:1557-1581`). `preferredTransports` **only reorders, it does not filter**: every one of the four SRV names is still queried and every answer is kept. All direct-SRV targets carry `naptrPreference = 0`, so `sortTargetsByPriority` (`:1756`) and `getPreferredTarget` rank them by SRV `priority` **across different SRV record sets** — comparing a `_sip._udp` priority with a `_sips._tcp` priority, which RFC 2782 defines only within one RRset — and that ranking overrides the `preferredTransports` query order. A caller that needs SIPS (RFC 3263 §4.1: a SIPS URI must use TLS) must filter the result itself with `getTargetsForTransport(dns::ServiceType::SIPS_TLS)`. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. SRV queries that fail with a `DnsResolverException` are skipped (`:825`); any other exception aborts the path, and the bare-domain A/AAAA fallback likewise catches only `DnsResolverException` (`:1790`). An SRV RRset whose target is the root `.` (RFC 2782 "service decidedly not available") is skipped and marks that **service** denied. If no targets result, it calls `performFallbackResolution`, which does a plain A/AAAA lookup of the bare domain and builds one target per preferred transport (defaulting to `SIP_UDP`) — **excluding any service a `.` explicitly denied** (per-service suppression, not domain-wide: a `_sips._tcp` `.` does not strand plain SIP reachable via a bare A record).
 
 **RFC 2782 weighted selection.** `ServiceResolutionResult::getPreferredTarget` finds the lowest-`naptrPreference` tier, then the lowest `priority` within it, then performs a cumulative-weight walk over `uniform_int_distribution<uint32_t>(0, total_weight-1)`. Three flavors exist: a deterministic-seed const overload, a `thread_local`-RNG production overload `getPreferredTargetWithDefaultRng`, and a caller-RNG template. The resolver-level `getPreferredTarget(result)` uses the resolver's own seedable `_rng` (`setRngSeed`) — guarded by `_rngMutex` — so tests can make selection reproducible without a data race.
 
@@ -199,21 +216,21 @@ The resolver turns questions into results and orchestrates the service-location 
 
 ### 3.4 `dns::DnsTransport` (wire transport)
 
-`DnsTransport` must be owned by a `shared_ptr` — `start()` calls `shared_from_this()`, so a stack instance throws `std::bad_weak_ptr` (`dns_transport.hpp:87-90`). It instantiates the engine(s) the configured `transportMode` needs — `Transport::udp(config)` for `UDP`/`Both`, `Transport::tcp(config)` for `TCP`/`Both` — and wires their `onData`/`onConnect`/`onClose` callbacks, each captured as a `weak_ptr<DnsTransport>` promoted per-use to avoid a reference cycle.
+`DnsTransport` must be owned by a `shared_ptr` — `start()` calls `shared_from_this()`, so a stack instance throws `std::bad_weak_ptr` (`dns_transport.hpp:90-94`). It instantiates the engine(s) the configured `transportMode` needs — `Transport::udp(config)` for `UDP`/`Both`, `Transport::tcp(config)` for `TCP`/`Both` — and wires their `onData`/`onConnect`/`onClose` callbacks, each captured as a `weak_ptr<DnsTransport>` promoted per-use to avoid a reference cycle.
 
-**Query lifecycle.** `queryMultiple` (sync, `:578`) and `queryAsync` (`:675`) mint a unique 16-bit query ID (`generateUniqueQueryId`, `:1446`), build a `QueryKey{id, server, port}` (`:167`), register a `PendingQuery` under `_queriesMutex`, encode the request with `DnsMessage::buildQuery`, and send over UDP (or TCP per `transportMode`). The sync path then blocks on `future.wait_for(calculateMaxSyncWaitTime())` (`:645`).
+**Query lifecycle.** `queryMultiple` (sync, `:949`) and `queryAsync` (`:1047`) mint a unique 16-bit query ID (`generateUniqueQueryId`, `:2056`), build a `QueryKey{id, server, port}` (`:177`), register a `PendingQuery` under `_queriesMutex`, encode the request with `DnsMessage::buildQuery`, and send over UDP (or TCP per `transportMode`). The sync path then blocks on `future.wait_for(calculateMaxSyncWaitTime())` (`:1020`). `start()` is at `:676`.
 
-**Query-to-response matching** is by `QueryKey` — the `(queryId, server, port)` triple. Because the UDP and TCP engines mint colliding `SessionId`s, the response path maps a session back to its server via `_sessionToServer`, keyed by `(bool isTcp, SessionId)` (`:373`), preventing cross-engine confusion.
+**Query-to-response matching** is by `QueryKey` — the `(queryId, server, port)` triple. Because the UDP and TCP engines mint colliding `SessionId`s, the response path maps a session back to its server via `_sessionToServer`, keyed by `(bool isTcp, SessionId)` (`:578`), preventing cross-engine confusion.
 
-**UDP→TCP fallback** is truncation-driven, not size-driven: in `processResponse` (`:1129`) a UDP response with the `TC` flag set, when `transportMode == Both` and the query has not already fallen back, sets `tcpFallback = true` and re-sends over TCP. (`_config.maxUdpSize` is **not** consulted — see Known Limitations.)
+**UDP→TCP fallback** is truncation-driven, not size-driven: in `processResponse` (`:1673`) a UDP response with the `TC` flag set, when `transportMode == Both` and the query has not already fallen back, sets `tcpFallback = true` and re-sends over TCP. (`_config.maxUdpSize` is **not** consulted — see Known Limitations.)
 
-**Retry / backoff / jitter.** `retryQuery` (`:1852`) computes `baseDelay = min(initialRetryDelay * retryMultiplier^retryCount, maxRetryDelay)`, then applies multiplicative jitter `× U(1 - jitterFactor, 1 + jitterFactor)` when `jitterFactor > 0`, and schedules the re-send on `_timerService`. Once `retryCount >= _config.retryCount`, the query completes with `dns::DnsTimeoutException`.
+**Retry / backoff / jitter.** `retryQuery` (`:2539`) computes `baseDelay = min(initialRetryDelay * retryMultiplier^retryCount, maxRetryDelay)`, then applies multiplicative jitter `× U(1 - jitterFactor, 1 + jitterFactor)` when `jitterFactor > 0`, and schedules the re-send on `_timerService`. Once `retryCount >= _config.retryCount`, the query completes with `dns::DnsTimeoutException`. **`retryQuery` is reached only from the cleanup sweep, and in practice never runs:** the per-query timeout timer (below) completes the query with `DnsTimeoutException` as soon as `timeout` elapses, removing it from `_pendingQueries` before the 10-second sweep can see it expired. Each query is therefore sent **once** and fails after `timeout` (measured: `timeout = 1000 ms`, `retryCount = 3` → one datagram on the wire, `DnsTimeoutException("Query timeout after 1000ms")` after ~1001 ms). See §10.
 
-**Timeouts.** Each query arms a `TimerService` timeout of `_config.timeout` via `scheduleQueryTimeout` (`:1696`); the 10-second cleanup sweep (`cleanupExpiredQueries`, `:1774`) is a backstop that retries or times out anything the timer missed.
+**Timeouts.** Each query arms a `TimerService` timeout of `_config.timeout` via `scheduleQueryTimeout` (`:2415`); when it fires it takes the query out of `_pendingQueries` and fails it with `DnsTimeoutException` — it does not retry. The 10-second cleanup sweep (`cleanupExpiredQueries`, `:2480`) is a backstop that retries or times out only what the timer missed (for example when no timer service was available).
 
-**DoS resistance.** TCP DNS is 2-byte length-prefixed. In `handleTcpData` (`:1031`, under `_tcpBuffersMutex`) the per-session accumulation buffer is capped at `_config.maxTcpBufferSize` (default 65536): exceeding it, or a length prefix that is zero / `> 65535` / `> maxTcpBufferSize`, clears the buffer and **closes the session**. `Transport::close` is enqueue-only, so calling it from inside the I/O-thread `onData` callback is safe.
+**DoS resistance.** TCP DNS is 2-byte length-prefixed. In `handleTcpData` (`:1539`, under `_tcpBuffersMutex`) the per-session accumulation buffer is capped at `_config.maxTcpBufferSize` (default 65536): exceeding it, or a length prefix that is zero / `> 65535` / `> maxTcpBufferSize`, clears the buffer and **closes the session**. `Transport::close` is enqueue-only, so calling it from inside the I/O-thread `onData` callback is safe.
 
-**Server selection.** `getNextServer` (`:1339`) is round-robin over `_config.servers` via an atomic cursor, chosen per query only when the caller passes an empty `server`. There is **no per-query failover**: a retry re-sends to the same server; only a *new* query advances the cursor.
+**Server selection.** `getNextServer` (`:1939`) is round-robin over `_config.servers` via an atomic cursor, chosen per query when the `DnsTransport` caller passes an empty `server` — which `DnsClient`/`DnsResolver` always do (the façade has no per-call server parameter). There is **no per-query failover**: a retry, if one ran, would re-send to the same server; only a *new* query advances the cursor.
 
 ### 3.5 `dns::DnsMessage` (wire codec)
 
@@ -221,9 +238,15 @@ The resolver turns questions into results and orchestrates the service-location 
 
 **Encode.** `buildQuery` (the `recursionDesired` overload at `:328`, reached via the `:315`/`:321` forwarders) writes the 12-byte header (`RD` flag from `recursionDesired`; `opcode`/`rcode` implicitly 0), then the encoded question. `encodeName` (`:277`) enforces the 63-byte label limit and a 253-octet total-name limit — the RFC 1035 §3.1 presentation-format bound, marginally conservative against the 255-octet wire ceiling — throwing `DnsParseException` on violation. `generateQueryId` (`:222`) draws from a `thread_local` `mt19937` in the range 1–65535.
 
-**Decode.** `parse` (`:366`) validates a minimum 12-byte header, decodes flags/counts (`parseHeader`, `:428`), then walks each section calling `parseResourceRecord` and `parseTypedRecord` (`:764`), which dispatches by `DnsType` into the typed vectors (`a_records`, `srv_records`, `naptr_records`, …). Per-record parse failures are logged and skipped, not fatal.
+**Decode.** `parse` (`:366`) validates a minimum 12-byte header, decodes flags/counts (`parseHeader`, `:428`), then walks each section calling `parseResourceRecord` and `parseTypedRecord` (`:764`), which dispatches by `DnsType` into the typed vectors (`a_records`, `srv_records`, `naptr_records`, …). A failure inside `parseTypedRecord` (for example an SRV with a short `rdlength`) is logged and that typed record is skipped; the raw record stays in its section vector. A throw from `parseResourceRecord` itself — a bounds violation or a `validateRdataSecurity` rejection — is **not** caught: it escapes `parse` and the whole response fails. `DnsTransport::processResponse` then completes the pending query matched by the first two bytes (query ID) plus the source server/port with a `DnsParseException` immediately — no retry and no waiting for a well-formed reply (`dns_transport.hpp:1735-1751`), where RFC 5452 practice is to drop the malformed packet and keep waiting. So one malformed or spoofed datagram that guesses the ID fails the query. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`.
 
-**Security.** Every read goes through `checkBounds` (`:268`). Name **decompression is loop-protected**: `decodeNameWithLoopDetection` (`:566`) tracks visited pointer offsets in an `unordered_set<uint16_t>` and throws on a repeated pointer or an out-of-range pointer (`0xC0` mask, `0x3FFF` offset). Each per-type parser validates its minimum `rdlength` (A == 4, AAAA == 16, SRV ≥ 6, NAPTR ≥ 4, MX ≥ 2, SOA ≥ 20), and `validateRdataSecurity` (`:1072`) runs after each RDATA read.
+**Security.** Every read goes through `checkBounds` (`:268`). Name **decompression is loop-protected**: `decodeNameWithLoopDetection` (`:566`) tracks visited pointer offsets in an `unordered_set<uint16_t>` and throws on a repeated pointer or an out-of-range pointer (`0xC0` mask, `0x3FFF` offset). Each per-type parser validates its minimum `rdlength` (A == 4, AAAA == 16, SRV ≥ 6, NAPTR ≥ 4, MX ≥ 2, SOA ≥ 20), and `validateRdataSecurity` (`:1072`) runs inside `parseResourceRecord` after each RDATA read. Its checks are narrow heuristics for compression pointers (`0xC0` mask) that should not appear in RDATA:
+
+- **A, `rdlength != 4`:** throws when `rdlength >= 2` and the first byte has both top bits set (`>= 0xC0`); other wrong-length A records are left to the typed parser's length check.
+- **A, `rdlength == 4`:** throws only when the first byte has both top bits set, the 14-bit "pointer" `((b0 & 0x3F) << 8) | b1` is `< 64`, and bytes 2 and 3 are `0x00`. In practice that is exactly the 64 addresses `192.X.0.0` for `X` = 0–63 (not a contiguous range).
+- **AAAA and TXT (any length):** every RDATA byte except the last (including a TXT character-string's length byte) is tested against the `0xC0` mask; any byte `>= 0xC0` throws `DnsParseException`.
+
+A throw fails the whole `DnsMessage::parse` (see Decode above). The AAAA/TXT rule rejects legitimate data — see Known Limitations.
 
 ### 3.6 `dns::DnsCache`
 
@@ -241,130 +264,267 @@ All examples assume `#include "iora/network/dns_client.hpp"` and `using namespac
 
 ### Basic record queries (synchronous)
 
+The synchronous calls can throw from three unrelated exception roots (§8): `DnsResolverException` (and its subclasses), `DnsTransportException` (including `DnsTimeoutException`), and `DnsParseException`. Catch all three, or `std::exception` last — catching only `DnsResolverException`, as the header `\throws` comments suggest, lets timeouts and parse failures escape.
+
 ```cpp
-DnsClient client; // default config: system resolv.conf servers, cache on
-
-try
+void basicQueries()
 {
-  std::vector<std::string> ipv4 = client.resolveA("www.example.com");
-  for (const auto &addr : ipv4)
+  try
   {
-    std::cout << "A: " << addr << "\n";
-  }
+    DnsClient client; // default config: system resolv.conf servers, cache on
 
-  std::vector<dns::MxRecord> mx = client.resolveMX("example.com");
-  for (const auto &rec : mx)
-  {
-    std::cout << rec.preference << " " << rec.exchange << "\n";
+    std::vector<std::string> ipv4 = client.resolveA("www.example.com");
+    for (const auto &addr : ipv4)
+    {
+      std::cout << "A: " << addr << "\n";
+    }
+
+    std::vector<dns::MxRecord> mx = client.resolveMX("example.com");
+    for (const auto &rec : mx)
+    {
+      std::cout << rec.preference << " " << rec.exchange << "\n";
+    }
   }
-}
-catch (const dns::DnsNoRecordsException &e)
-{
-  std::cerr << "no records: " << e.what() << "\n";
-}
-catch (const dns::DnsResolverException &e)
-{
-  std::cerr << "resolve failed: " << e.what() << "\n";
+  catch (const dns::DnsNoRecordsException &e)
+  {
+    std::cerr << "answer had no records of that type: " << e.what() << "\n";
+  }
+  catch (const dns::DnsResolutionFailedException &e)
+  {
+    // NXDOMAIN, NODATA (getResponseCode() == NOERROR), SERVFAIL, REFUSED, ...
+    std::cerr << "resolution failed (rcode " << static_cast<int>(e.getResponseCode())
+              << "): " << e.what() << "\n";
+  }
+  catch (const dns::DnsResolverException &e)
+  {
+    std::cerr << "resolver error: " << e.what() << "\n";
+  }
+  catch (const dns::DnsTransportException &e)
+  {
+    // DnsTimeoutException, send/connect failure, "Transport stopped"
+    std::cerr << "transport error: " << e.what() << "\n";
+  }
+  catch (const dns::DnsParseException &e)
+  {
+    std::cerr << "malformed or rejected response: " << e.what() << "\n";
+  }
+  catch (const std::exception &e)
+  {
+    std::cerr << "other error: " << e.what() << "\n";
+  }
 }
 ```
 
 ### RFC 3263 SIP service location
 
 ```cpp
-DnsClient client;
-
-// NAPTR -> SRV -> A/AAAA, ordered by NAPTR preference then SRV priority.
-dns::ServiceResolutionResult result =
-  client.resolveServiceDomain("example.com",
-                              {dns::ServiceType::SIP_TCP, dns::ServiceType::SIP_UDP});
-
-for (const auto &target : result.targets)
+void locateSipServer()
 {
-  std::cout << target.hostname << ":" << target.port
-            << " transport=" << target.getTransportString()
-            << " prio=" << target.priority << " weight=" << target.weight << "\n";
+  try
+  {
+    DnsClient client;
+
+    // NAPTR -> SRV -> A/AAAA, ordered by NAPTR preference then SRV priority.
+    dns::ServiceResolutionResult result =
+      client.resolveServiceDomain("example.com",
+                                  {dns::ServiceType::SIP_TCP, dns::ServiceType::SIP_UDP});
+
+    for (const auto &target : result.targets)
+    {
+      std::cout << target.hostname << ":" << target.port
+                << " transport=" << target.getTransportString()
+                << " prio=" << target.priority << " weight=" << target.weight << "\n";
+    }
+
+    // Pick one target using RFC 2782 weighted selection:
+    if (result.isSuccess())
+    {
+      dns::ServiceTarget chosen = result.getPreferredTargetWithDefaultRng();
+      std::cout << "chosen: " << chosen.hostname << ":" << chosen.port << "\n";
+    }
+  }
+  catch (const std::exception &e)
+  {
+    // DnsResolverException, and also DnsTransportException / DnsParseException:
+    // a timeout or parse failure at any step aborts the whole chain (see §10).
+    std::cerr << "service location failed: " << e.what() << "\n";
+  }
 }
 
-// Pick one target using RFC 2782 weighted selection:
-if (result.isSuccess())
+void locateSipsServer(DnsClient &client)
 {
-  dns::ServiceTarget chosen = result.getPreferredTargetWithDefaultRng();
+  // preferredTransports only reorders; filter explicitly for a SIPS (TLS-only) target set.
+  dns::ServiceResolutionResult result =
+    client.resolveServiceDomain("example.com", {dns::ServiceType::SIPS_TLS});
+  std::vector<dns::ServiceTarget> tls = result.getTargetsForTransport(dns::ServiceType::SIPS_TLS);
+  std::cout << tls.size() << " TLS targets\n";
 }
 ```
 
 ### Explicit SRV lookup
 
 ```cpp
-DnsClient client;
-std::vector<dns::SrvRecord> srv = client.resolveSRV("_sip._tcp.example.com");
-for (const auto &rec : srv)
+void listSrv(DnsClient &client)
 {
-  std::cout << rec.priority << " " << rec.weight << " "
-            << rec.target << ":" << rec.port << "\n";
+  std::vector<dns::SrvRecord> srv = client.resolveSRV("_sip._tcp.example.com");
+  for (const auto &rec : srv)
+  {
+    std::cout << rec.priority << " " << rec.weight << " "
+              << rec.target << ":" << rec.port << "\n";
+  }
 }
 ```
 
 ### Cancellable async resolution (future)
 
 ```cpp
-DnsClient client;
-
-CancellableFuture<std::vector<std::string>> f = client.resolveAAsync("slow.example.com");
-
-// ... elsewhere, give up early:
-f.cancel(); // wakes a blocked get() with DnsResolverException immediately
-
-try
+void resolveWithDeadline(DnsClient &client)
 {
-  std::vector<std::string> addrs = f.future.get();
-}
-catch (const dns::DnsResolverException &e)
-{
-  std::cerr << "cancelled or failed: " << e.what() << "\n";
+  CancellableFuture<std::vector<std::string>> f = client.resolveAAsync("slow.example.com");
+
+  if (f.future.wait_for(std::chrono::seconds{1}) != std::future_status::ready)
+  {
+    // If cancel() wins the promiseSet CAS, get() throws DnsResolverException("DNS request
+    // cancelled") at once. If a delivery won first, get() returns that result or error.
+    f.cancel();
+  }
+
+  try
+  {
+    std::vector<std::string> addrs = f.future.get();
+    std::cout << addrs.size() << " addresses\n";
+  }
+  catch (const std::exception &e)
+  {
+    // DnsResolverException (cancelled, no records), DnsTransportException (timeout,
+    // send failure, stopped), DnsParseException (rejected response).
+    std::cerr << "cancelled or failed: " << e.what() << "\n";
+  }
 }
 ```
 
 ### Callback async (primary path)
 
 ```cpp
-DnsClient client;
+struct LookupState
+{
+  std::mutex mutex;
+  std::vector<std::string> addrs;
+  std::exception_ptr error;
+  bool done = false;
+};
 
-AsyncDnsRequest req = client.resolveA(
-  "www.example.com",
-  [](std::vector<std::string> addrs, std::exception_ptr err)
-  {
-    // WARNING: this runs on an internal thread (engine I/O, retry-timer, or cleanup).
-    if (err) { /* handle */ return; }
-    for (const auto &a : addrs) { /* use a */ }
-  });
+std::shared_ptr<LookupState> startLookup(DnsClient &client)
+{
+  // The callback always runs exactly once — even after cancel() — so everything it
+  // touches must outlive it: capture a shared_ptr (or a weak_ptr), never a stack reference.
+  auto state = std::make_shared<LookupState>();
 
-// best-effort cancel; the callback may still fire if already in flight
-req.cancel();
+  AsyncDnsRequest req = client.resolveA(
+    "www.example.com",
+    [state](std::vector<std::string> addrs, std::exception_ptr err)
+    {
+      // Runs on the caller's thread before resolveA returns (immediate errors), an engine
+      // I/O thread, the DnsRetryTimer thread, the cleanup thread, or the stop() caller.
+      std::lock_guard<std::mutex> lock(state->mutex);
+      state->addrs = std::move(addrs);
+      state->error = err;
+      state->done = true;
+    });
+
+  // Does NOT suppress the callback: it still fires once, with
+  // DnsResolverException("DNS request cancelled") if this cancel() won.
+  req.cancel();
+  return state;
+}
 ```
+
+Never hold a lock across `resolveA(host, cb)` that the callback also takes: an immediate error runs the callback on your thread before `resolveA` returns.
 
 ### Configuring servers and cache
 
 ```cpp
-dns::DnsConfig cfg;
-cfg.setServers({"8.8.8.8", "1.1.1.1:53", "[2001:4860:4860::8888]:53"});
-cfg.timeout = std::chrono::milliseconds{2000};
-cfg.retryCount = 2;
-cfg.enableCache = true;
+void configuredClient()
+{
+  dns::DnsConfig cfg;
+  cfg.setServers({"8.8.8.8", "1.1.1.1:53", "[2001:4860:4860::8888]:53"});
+  cfg.timeout = std::chrono::milliseconds{2000};
+  cfg.enableCache = true;
 
-DnsClient client(cfg);
-client.setCacheTtl(std::chrono::seconds{600});
-dns::DnsCacheStats stats = client.getCacheStats();
-std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
+  DnsClient client(cfg);
+  client.setCacheTtl(std::chrono::seconds{600});
+  dns::DnsCacheStats stats = client.getCacheStats();
+  std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
+}
 ```
+
+### Failing over to a second server set
+
+There is no per-query failover (§10): a query is sent only to the server it started on. For hard failover, catch the failures that mean "this server did not give a usable answer" and re-issue the query on a second `DnsClient` configured with different servers:
+
+```cpp
+std::vector<std::string> resolveWithFailover(DnsClient &primary, DnsClient &secondary,
+                                             const std::string &host)
+{
+  try
+  {
+    return primary.resolveA(host);
+  }
+  catch (const dns::DnsTransportException &)
+  {
+    // DnsTimeoutException, send/connect failure: the primary server was not reached.
+    return secondary.resolveA(host);
+  }
+  catch (const dns::DnsResolutionFailedException &e)
+  {
+    const dns::DnsResponseCode rc = e.getResponseCode();
+    if (rc == dns::DnsResponseCode::NXDOMAIN || rc == dns::DnsResponseCode::NOERROR)
+    {
+      throw; // authoritative: the name does not exist (NXDOMAIN) or has no A records (NODATA)
+    }
+    return secondary.resolveA(host); // SERVFAIL / REFUSED / NOTIMP / FORMERR are server-local
+  }
+}
+
+dns::DnsConfig makeConfig(const std::string &server)
+{
+  dns::DnsConfig cfg;
+  cfg.setServers({server});
+  cfg.timeout = std::chrono::milliseconds{1500}; // bounds how long the primary can stall
+  return cfg;
+}
+
+struct FailoverResolver
+{
+  DnsClient primary{makeConfig("10.0.0.53")};
+  DnsClient secondary{makeConfig("10.0.1.53")};
+
+  std::vector<std::string> resolve(const std::string &host)
+  {
+    return resolveWithFailover(primary, secondary, host);
+  }
+};
+```
+
+What to fail over on:
+
+- **`DnsTransportException`** (which includes `DnsTimeoutException`): no reply within `timeout`, or a send/connect failure (`dns_transport.hpp:1232`, `:1271`).
+- **`DnsResolutionFailedException` whose `getResponseCode()` is not `NXDOMAIN` or `NOERROR`**: SERVFAIL, REFUSED, NOTIMP and FORMERR describe the server that answered, not the name, so another server may succeed.
+- **Not** `NXDOMAIN`, NODATA (`DnsResolutionFailedException` with `NOERROR`) or `DnsNoRecordsException`: these are authoritative answers about the name, and a second server should give the same one.
+- `DnsParseException` is not caught above: with the current parser false positives (§10) the secondary rejects the same data.
+
+Cost: failover begins only after the primary has used its whole attempt window. Because the retry path is currently inert (§10) that window is one `timeout` (5 s by default); if retries are fixed it becomes every attempt plus the backoff delays. Lower `timeout` (and `retryCount`) on the primary to bound the stall. Two clients also mean two sets of transport threads (engine I/O, timer, cleanup) and two independent caches. `DnsClient` is move-only (copy is deleted, move construction and move assignment are defaulted), so the pair can be held by value in an owning object, as `FailoverResolver` does.
 
 ### Anti-Patterns
 
-- **Do NOT assume the async callback runs on your thread.** It runs on the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread. Never touch caller-thread-only state without synchronization from inside the callback.
+- **Do NOT assume the async callback runs on an internal thread — or on yours.** It may run on your thread before the call returns (immediate errors), on the thread that calls `stop()`, or on the engine I/O, `DnsRetryTimer`, or cleanup thread. Synchronize everything it touches, and never hold a lock across `resolveA` that the callback takes.
 - **Do NOT use `DnsClient` for a plain "connect me to this host".** That is `Transport`'s job via `NameResolver`/`getaddrinfo`, which honors `/etc/hosts`, NSS, and the resolv.conf search list. `DnsClient` queries nameservers directly and can disagree (see the §1 boundary).
-- **Do NOT treat `cancel()` as a guarantee.** It is best-effort; a callback already dispatched on a transport thread will still fire. Guard your callback for the "cancelled but delivered" case.
+- **Do NOT expect `cancel()` to suppress the raw callback.** `AsyncDnsRequest::cancel()` never stops delivery: the callback still runs exactly once, possibly with `DnsResolverException("DNS request cancelled")`, possibly much later (when the response, timeout, or `stop()` arrives). Do not capture stack references or `this` of an object that may be destroyed after cancelling — capture a `shared_ptr`/`weak_ptr`.
+- **Do NOT assume `CancellableFuture::cancel() == true` means `get()` throws.** A delivery that already won the `promiseSet` CAS has set the real value or error.
+- **Do NOT catch only `DnsResolverException`.** Timeouts and transport failures (`DnsTransportException`, a `std::runtime_error`) and parse failures (`DnsParseException`) are separate roots.
 - **Do NOT construct a `dns::DnsTransport` on the stack.** It requires `shared_ptr` ownership (`shared_from_this` in `start()`); a stack/`unique_ptr` instance throws `std::bad_weak_ptr`. Use `DnsClient`, which owns it correctly.
-- **Do NOT rely on `maxCacheSize`, `maxUdpSize`, or `tcpTimeout`.** They are declared on `DnsConfig` for compatibility but are not enforced (see Configuration Reference and Known Limitations).
-- **Do NOT expect a single failing query to try the next server.** Server selection is round-robin per query; a retry re-sends to the same server. Rotate by issuing independent queries, or pass an explicit `server`.
+- **Do NOT rely on `maxCacheSize`, `maxUdpSize`, or `tcpTimeout`.** They are declared on `DnsConfig` for compatibility but are not enforced (see Configuration Reference and Known Limitations). The retry fields are also inert today (§10).
+- **Do NOT expect a single failing query to try the next server.** Server selection is round-robin per query and a query is sent only to that server. Rotate by issuing independent queries, or fail over explicitly with a second client (§4 "Failing over to a second server set"); `DnsClient` has no per-call server parameter.
 
 ---
 
@@ -381,7 +541,7 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 | 5 | Caller thread | Block on `future.wait_for(calculateMaxSyncWaitTime())`. |
 | 6 | Engine I/O thread | `onData` → `DnsMessage::parse` → `processResponse` → `completeQuery` sets the promise. |
 | 7 | `DnsResolver::query` | Populate `_cache->put()`; return `DnsResult`. |
-| 8 | `DnsClient::resolveA` | Extract `a_records`; throw `DnsNoRecordsException` if empty, else return addresses. |
+| 8 | `DnsClient::resolveA` | Extract `a_records`; throw `DnsNoRecordsException` if empty (answers present, none of type A), else return addresses. An NXDOMAIN or NODATA reply already threw `DnsResolutionFailedException` at step 7 (§3.1 Error surfacing). |
 
 ### Truncation → TCP fallback
 
@@ -398,15 +558,16 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 | Step | Component | Action |
 |---|---|---|
 | 1 | `CancellableFuture::cancel` | `request.cancel()` flips `RequestState::cancelled` (acq_rel exchange). |
-| 2 | `CancellableFuture::cancel` | Win the `promiseSet` CAS → set promise to `DnsResolverException("cancelled")`; a blocked `future.get()` wakes now. |
-| 3 | Later, transport thread | The real response arrives; the delivery callback loses the `promiseSet` CAS and returns without re-setting the promise (no double-set). |
+| 2 | `CancellableFuture::cancel` | Win the `promiseSet` CAS → set promise to `DnsResolverException("DNS request cancelled")`; a blocked `future.get()` wakes now. If a delivery already won the CAS, the promise keeps that value/error. |
+| 3 | `CancellableFuture::cancel` | Because `request.cancel()` succeeded, and a promise is attached, call `request.markCompleted()` (whether or not this call won the `promiseSet` CAS): `isCompleted()` is now `true`, and — when the CAS was won — the future is immediately ready (holding the cancellation exception). |
+| 4 | Later, transport thread | The real response (or timeout, or `stop()`) arrives; `resolveAInternal` sees `cancelled` and invokes the wrapper callback with `DnsResolverException("DNS request cancelled")`; the wrapper loses the `promiseSet` CAS and returns without re-setting the promise (no double-set). With a raw `resolveA(host, cb)` callback there is no `promiseSet`: the user callback itself receives that exception here. |
 
 ### Timeout completion (retries exhausted)
 
 | Step | Component | Action |
 |---|---|---|
-| 1 | `DnsRetryTimer` thread | Per-query timeout lambda fires (`scheduleQueryTimeout`) or `retryQuery` sees `retryCount >= _config.retryCount`. |
-| 2 | `DnsTransport::completeQuery` | Remove the `PendingQuery` under `_queriesMutex`, release the lock, then invoke callback / set promise with `DnsTimeoutException`. |
+| 1 | `DnsRetryTimer` thread | The per-query timeout lambda (`scheduleQueryTimeout`) fires `timeout` after the send. (`retryQuery` seeing `retryCount >= _config.retryCount` is the cleanup-sweep path, which the timer pre-empts in practice — §3.4.) |
+| 2 | Timeout lambda → `failOne` | `takePending` removes the `PendingQuery` under `_queriesMutex` and releases the lock; the callback (guarded) is invoked / the promise is set with `DnsTimeoutException("Query timeout after <timeout>ms")`. No retry is sent. |
 
 ---
 
@@ -417,23 +578,24 @@ std::cout << "hit ratio: " << stats.getHitRatio() << "\n";
 | Component / operation | Synchronization | Notes |
 |---|---|---|
 | `DnsTransport` pending-query map | `_queriesMutex` | Guards `_pendingQueries`. `completeQuery` and the timeout lambda are **copy-then-invoke** (release before callback). |
-| `DnsTransport::stop()` | `_queriesMutex` held during callback | The single callback-under-lock site: `stop()` invokes each pending query's error callback while holding `_queriesMutex` (`dns_transport.hpp:523-527`). A callback that re-enters the transport can deadlock. |
+| `DnsTransport::stop()` | collect under `_queriesMutex`, fire with no lock | Step 6 collects and clears the pending queries under `_queriesMutex` without firing them (`dns_transport.hpp:889-898`); step 7 calls `failCollected(toFail, DnsTransportException("Transport stopped"))` with **no lock held**, before `Stopped` is published (`:913-917`). The worker joins run with no `DnsTransport` lock held; a re-entrant `stop()` from a joined worker (or the teardown driver) is exempted and returns at once (`:824-829`). The callbacks run on the thread calling `stop()`. |
 | `DnsTransport` sessions | `_sessionsMutex` | Guards `_serverSessions`, `_sessionToServer`, `_connectedSessions`, `_pendingOnConnect`. |
 | `DnsTransport` TCP buffers | `_tcpBuffersMutex` | Guards per-session accumulation; the DoS cap + `close()` run here. |
-| `DnsTransport` cleanup thread | `_cleanupMutex` + `_cleanupCv` | 10-second wait loop; `_cleanupRunning`/`_running` are atomics. |
+| `DnsTransport` cleanup thread | `_cleanupMutex` + `_cleanupCv` | 10-second wait loop; `_cleanupRunning` is an atomic. |
+| `DnsTransport` lifecycle | `std::atomic<Lifecycle> _state` + `_stateMutex`/`_stateCv` | `_state` (`dns_transport.hpp:548`) replaced the old `_running` flag; transitions are serialized under `_stateMutex`, the query hot paths read `_state` lock-free. |
 | `DnsTransport` statistics | `std::atomic` counters | `InternalStatistics` (8 atomics); snapshot via `getStatistics()`. |
-| `DnsTransport` lock ordering | Documented | `_stateMutex / _cleanupMutex > _tcpBuffersMutex > _queriesMutex > _sessionsMutex` (`dns_transport.hpp:320-342`). The truncation path holds `_queriesMutex` while `sendTcpQuery` takes `_sessionsMutex` (an intentional inner co-hold). |
+| `DnsTransport` lock ordering | Documented, strict | `_stateMutex > _cleanupMutex > _tcpBuffersMutex > _queriesMutex > _sessionsMutex` (`dns_transport.hpp:507-522`). Inner co-holds: `handleTcpData` holds `_tcpBuffersMutex` across `_sessionsMutex`; the UDP-truncation path holds `_queriesMutex` while `sendTcpQuery` takes `_sessionsMutex`. |
 | `DnsResolver` async coordination | per-op `std::mutex` + atomics | `resultMutex` + `remainingQueries` (`fetch_sub(acq_rel)`) + `callbackFired` + `deniedServices` are local to each async call, not members. Async continuations capture `self = shared_from_this()` to stay alive across the callback chain. |
 | `DnsResolver::_rng` | `_rngMutex` | Guards the weighted-selection generator against concurrent `getPreferredTarget(result)` / `setRngSeed`; a leaf lock. |
 | `DnsCache` container | `std::shared_mutex _cacheMutex` | Shared for `get`/`put`/`putNegative`/`remove`, exclusive for `clear()` (which replaces the `ExpiringCache`). Guards the pointer; the store is itself internally synchronized. |
 | `DnsCache` stats | `_statsMutex` (inner) + `std::atomic` counters | Ordering `_cacheMutex → _statsMutex`; the eviction callback takes neither (atomic `fetch_sub` only). |
-| Async callback delivery | `RequestState::deliveryAttempted` + `promiseSet` CAS | Exactly-once delivery even when response and timeout race across threads. |
+| Async callback delivery | `RequestState::deliveryAttempted` + `promiseSet` CAS | One delivery even when response and timeout race across threads — except that a throwing user callback is invoked a second time from `catch (...)` (`dns_client.hpp:1037-1066`). Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
 
 ---
 
 ## 7. Configuration Reference
 
-All fields are on `dns::DnsConfig` (`dns_types.hpp:542`). Timeouts use `std::chrono` types.
+All fields are on `dns::DnsConfig` (`dns_types.hpp:543`). Timeouts use `std::chrono` types.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -441,8 +603,8 @@ All fields are on `dns::DnsConfig` (`dns_types.hpp:542`). Timeouts use `std::chr
 | `timeout` | `std::chrono::milliseconds` | `5000` | Per-query response timeout (UDP **and** TCP — see below). |
 | `tcpTimeout` | `std::chrono::milliseconds` | `10000` | **Declared but unused** by `DnsTransport`; TCP uses `timeout`. |
 | `cacheTimeout` | `std::chrono::seconds` | `300` | Default cache TTL for records that carry no TTL (seeds the `DnsCache`; also adjustable at runtime via `setCacheTtl`). |
-| `retryCount` | `int` | `3` | Retry attempts per query (4 total attempts). |
-| `initialRetryDelay` | `std::chrono::milliseconds` | `500` | First retry delay; grows by `retryMultiplier`. |
+| `retryCount` | `int` | `3` | Intended retry attempts per query (4 total). **Currently inert:** the timeout timer fails the query first, so each query is sent once (§3.4, §10). |
+| `initialRetryDelay` | `std::chrono::milliseconds` | `500` | First retry delay; grows by `retryMultiplier`. Inert with `retryCount` (§10); it still lengthens the sync wait bound `calculateMaxSyncWaitTime`. |
 | `retryMultiplier` | `double` | `2.0` | Exponential backoff multiplier. |
 | `maxRetryDelay` | `std::chrono::milliseconds` | `10000` | Backoff cap. |
 | `jitterFactor` | `double` | `0.1` | Multiplicative jitter `× U(1−f, 1+f)` when `> 0`. |
@@ -573,7 +735,59 @@ public:
 };
 ```
 
-Key `iora::network::dns` types (see `dns_types.hpp` / `dns_resolver.hpp`):
+Record types (`dns_types.hpp:54`):
+
+```cpp
+enum class DnsType : std::uint16_t
+{
+  A = 1, NS = 2, CNAME = 5, SOA = 6, PTR = 12, MX = 15, TXT = 16, AAAA = 28,
+  SRV = 33, NAPTR = 35,
+  AXFR = 252, MAILB = 253, MAILA = 254, ANY = 255
+};
+```
+
+| `DnsType` | Typed `DnsClient` accessor | Typed `DnsResult` vector |
+|---|---|---|
+| `A` | `resolveA` (sync, callback, future) → address strings | `a_records` |
+| `AAAA` | `resolveAAAA` → address strings | `aaaa_records` |
+| `CNAME` | `resolveCNAME` → name strings | `cname_records` |
+| `PTR` | `resolvePTR(ip)` (builds the reverse name) → name strings | `ptr_records` |
+| `MX` | `resolveMX` → `MxRecord` | `mx_records` |
+| `TXT` | `resolveTXT` → `TxtRecord` | `txt_records` |
+| `SRV` | `resolveSRV` → `SrvRecord` | `srv_records` |
+| `NAPTR` | `resolveNAPTR` → `NaptrRecord` | `naptr_records` |
+| `SOA` | none | `soa_records` (parsed from any section; used for the RFC 2308 negative-cache TTL) |
+| `NS` | none | none — use `query(DnsQuestion{name, DnsType::NS, DnsClass::IN})` and read the raw `answers`/`authority`/`additional` records |
+| `AXFR`, `ANY`, `MAILA`, `MAILB` | none | Effectively unsupported via `query()`: AXFR needs a multi-message TCP exchange (RFC 5936) that `DnsTransport` does not implement (it completes on the first message); ANY is answered minimally or refused by modern servers (RFC 8482); MAILA/MAILB are obsolete. |
+
+Record structs (`dns_types.hpp:199`–`:357`). Every typed record derives from `DnsResourceRecord`:
+
+```cpp
+struct DnsResourceRecord
+{
+  std::string name; DnsType type; DnsClass cls; std::uint32_t ttl;
+  std::uint16_t rdlength; std::vector<std::uint8_t> rdata;   // raw RDATA (empty in typed records)
+  std::chrono::steady_clock::time_point getExpirationTime() const;
+  bool hasExpired() const;
+};
+struct ARecord     : DnsResourceRecord { std::string address; };
+struct AAAARecord  : DnsResourceRecord { std::string address; };
+struct CnameRecord : DnsResourceRecord { std::string cname; };
+struct PtrRecord   : DnsResourceRecord { std::string ptrdname; };
+struct MxRecord    : DnsResourceRecord { std::uint16_t preference; std::string exchange; };
+struct TxtRecord   : DnsResourceRecord { std::vector<std::string> text; };
+struct SrvRecord   : DnsResourceRecord { std::uint16_t priority; std::uint16_t weight;
+                                         std::uint16_t port; std::string target; };
+struct NaptrRecord : DnsResourceRecord { std::uint16_t order; std::uint16_t preference;
+                                         std::string flags; std::string service;
+                                         std::string regexp; std::string replacement; };
+struct SoaRecord   : DnsResourceRecord { std::string mname; std::string rname;
+                                         std::uint32_t serial, refresh, retry, expire, minimum; };
+```
+
+(Inheritance is `public`; each struct also has a defaulted-argument constructor that sets `type`/`cls = IN`.) The typed records in `a_records`, `srv_records`, … are built through those constructors (`dns_message.hpp:819`, `:836`, `:873`, …), so they carry **no raw RDATA** — `rdata` is empty, `rdlength` is 0 — and `cls` is forced to `IN` whatever the wire class was. Raw RDATA is available only on the generic records in `answers`/`authority`/`additional`.
+
+Other key `iora::network::dns` types (see `dns_types.hpp` / `dns_resolver.hpp`):
 
 ```cpp
 enum class ServiceType { SIPS_TLS, SIPS_SCTP, SIPS_WSS, SIP_TCP, SIP_UDP,
@@ -602,14 +816,20 @@ struct ServiceResolutionResult
   template <typename RNG> ServiceTarget getPreferredTarget(RNG &rng) const;
 };
 
-// Exceptions (dns_resolver.hpp): base + two subclasses
-class DnsResolverException : public std::exception { /* getResponseCode() */ };
-class DnsResolutionFailedException : public DnsResolverException {};
-class DnsNoRecordsException : public DnsResolverException {}; // rcode NXDOMAIN
-// dns_transport.hpp: DnsTransportException, DnsServerException (carries a DnsResponseCode),
-//                    DnsTimeoutException
-// dns_message.hpp:   DnsParseException (std::runtime_error)
+// Exceptions — three disjoint roots (no common DNS base class):
+// dns_resolver.hpp
+class DnsResolverException : public std::exception { /* getResponseCode() */ };   // :349
+class DnsResolutionFailedException : public DnsResolverException {};              // :367
+class DnsNoRecordsException : public DnsResolverException {}; // rcode NXDOMAIN   // :376
+// dns_transport.hpp
+class DnsTransportException : public std::runtime_error {};                        // :44
+class DnsTimeoutException : public DnsTransportException {};                       // :53
+class DnsServerException : public DnsTransportException { DnsResponseCode responseCode; }; // :62
+// dns_message.hpp
+class DnsParseException : public std::runtime_error {};                            // :27
 ```
+
+`DnsResolverException` derives from `std::exception`; `DnsTransportException`/`DnsTimeoutException` and `DnsParseException` derive from `std::runtime_error`. A `catch (const dns::DnsResolverException &)` therefore does not catch timeouts, transport failures, or parse failures — catch each root, or `std::exception` last. The header `\throws dns::DnsResolverException` comments on the synchronous and service-discovery methods are incomplete for the same reason. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`.
 
 ---
 
@@ -624,9 +844,9 @@ class DnsNoRecordsException : public DnsResolverException {}; // rcode NXDOMAIN
 | Move-only façade owning `shared_ptr` components. | The transport owns threads and timers; copying would double-own them. Move preserves single ownership. Across async work the transport captures a `weak_ptr` (breaking a reference cycle) while the resolver captures a shared `self` (deliberate keep-alive for fire-and-forget resolution). |
 | Query matched by `(queryId, server, port)`, session mapped by `(isTcp, SessionId)`. | The UDP and TCP engines mint colliding `SessionId`s; the composite session key prevents cross-engine response misattribution. |
 | Truncation (TC flag) drives TCP fallback, not a size check. | The authoritative signal that a UDP answer was cut is the server's TC flag; falling back on a local size guess would be both over- and under-inclusive. |
-| Exponential backoff with multiplicative jitter. | Bounded retry (`min(base·mult^n, cap)`) with `× U(1−f, 1+f)` jitter avoids synchronized retry storms (thundering herd) against a recovering server. |
+| Exponential backoff with multiplicative jitter. | Bounded retry (`min(base·mult^n, cap)`) with `× U(1−f, 1+f)` jitter avoids synchronized retry storms (thundering herd) against a recovering server. As implemented the retry path is pre-empted by the timeout timer and does not run (§10). |
 | Per-session TCP buffer cap that closes on breach. | TCP DNS is length-prefixed; without a cap a malicious peer can force unbounded buffering. Closing the session bounds memory and is safe from the I/O thread (`close` is enqueue-only). |
-| Best-effort cancellation with a `promiseSet` CAS. | A network request cannot be truly un-sent; the CAS lets `cancel()` win the race to set the promise so a blocked caller wakes immediately, while the later real response harmlessly loses the CAS (no double-set). |
+| Best-effort cancellation with a `promiseSet` CAS. | A network request cannot be truly un-sent; the CAS lets `cancel()` win the race to set the promise so a blocked caller wakes immediately, while the later real response harmlessly loses the CAS (no double-set). The raw-callback path has no such suppression: the callback still runs once, with a cancellation exception. |
 | TTL = minimum record TTL (RFC 1035); negative TTL from SOA (RFC 2308). | The shortest TTL in a response bounds correctness; SOA `minimum` bounds negative caching. Both are standards-mandated conservative choices. |
 | Negatives cached only when an SOA is present (RFC 2308 §5). | NXDOMAIN and NODATA are cached only if the response carries an SOA (the authoritative source of the negative TTL); a no-SOA negative is re-queried rather than cached with a guessed lifetime. |
 | Cache is time-based (`ExpiringCache`); no entry-count cap. | A TTL-driven cache needs no LRU/size eviction for correctness; `maxCacheSize` is retained only for API compatibility and is not enforced. |
@@ -640,12 +860,23 @@ class DnsNoRecordsException : public DnsResolverException {}; // rcode NXDOMAIN
 | **`maxUdpSize` is declared but unused.** | `DnsConfig::maxUdpSize` (default 512) is never consulted by `DnsTransport`; outbound UDP size is not checked and TCP fallback is purely TC-flag-driven. Setting it has no effect. |
 | **`tcpTimeout` is declared but unused.** | `DnsConfig::tcpTimeout` (default 10000 ms) is never referenced; TCP queries use `_config.timeout` (5000 ms) like UDP. Do not rely on a distinct TCP timeout. |
 | **`maxCacheSize` is not enforced.** | The cache has no entry-count bound; it is expiration-based only. A flood of distinct short-TTL names is bounded only by their TTLs, not by a size cap. |
-| **NAPTR tier-descent does not re-descend on SRV-resolution failure.** | `processNaptrRecords` commits to the first `ORDER` tier that produces a selectable `S`/`A` record; if that tier's SRV RRset later resolves to nothing, a usable higher-`ORDER` tier is not retried. RFC 3263 §4.1 permits this ("first selectable tier wins"), but a peer that publishes fallback tiers expecting SRV-failure re-descent will not get it. |
+| **NAPTR tier-descent does not re-descend on SRV-resolution failure.** | `processNaptrRecords` commits to the first `ORDER` tier that produces a selectable `S`/`A` record; if that tier's SRV RRset later resolves to nothing, a usable higher-`ORDER` tier is not retried. This matches RFC 3403 §8 ("If the lookup after a rewrite fails, clients are strongly encouraged to report a failure, rather than backing up to pursue other rewrite paths"), but a peer that publishes fallback tiers expecting SRV-failure re-descent will not get it. |
 | **Cache statistics are approximate under concurrent same-key writes.** | The insertion/replacement counters can drift by ±1 when a key expires in the window between a `put`'s existence check and its count update (the eviction callback decrements without `_statsMutex`). Cached data is unaffected; only the monitoring counters are approximate (tracked backlog). |
-| **No per-query server failover.** | A failing query retries against the *same* server; only a new query advances the round-robin cursor. A single dead server is not skipped mid-query. |
-| **`stop()` invokes callbacks under `_queriesMutex`.** | `DnsTransport::stop()` is the one callback-under-lock site (`dns_transport.hpp:523-527`); a callback that re-enters the transport during shutdown can deadlock. Keep shutdown-time callbacks non-re-entrant. |
+| **No per-query server failover.** | A query is sent only to the server it started on; only a new query advances the round-robin cursor. A single dead server is not skipped mid-query. For hard failover, catch `DnsTransportException` (including `DnsTimeoutException`) and server-local rcodes, and re-issue on a second `DnsClient` with different servers (§4 "Failing over to a second server set"). |
+| **The retry path is inert: each query is sent once.** | The per-query timeout timer (`scheduleQueryTimeout`, `dns_transport.hpp:2415`) removes the query and fails it with `DnsTimeoutException` when `timeout` elapses; `retryQuery` (`:2539`) is reached only from the 10-second cleanup sweep (`:2525`), which by then no longer finds the query. `retryCount`, `initialRetryDelay`, `retryMultiplier`, `maxRetryDelay` and `jitterFactor` therefore have no effect on the normal path, and one lost UDP datagram fails the query after `timeout`. Measured with a non-answering UDP server, `timeout = 1000 ms`, `retryCount = 3`: one datagram sent, `DnsTimeoutException` after ~1001 ms. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-31_dnstransport-retry-path-never-runs_P0.json`. |
+| **Valid AAAA records with any byte `>= 0xC0` fail the whole response.** | `validateRdataSecurity` treats every AAAA RDATA byte except the last as a possible compression pointer. Real addresses such as `2607:f8b0::…` (byte `0xf8`) or `fe80::…` (byte `0xfe`) throw `DnsParseException`, which escapes `parseResourceRecord`, so the entire `DnsMessage::parse` fails and the query completes with `DnsParseException` — including any other records in the same response. Most addresses hit it: a random 64-bit interface identifier contains a byte `>= 0xC0` with high probability. It also fails **non-AAAA** queries whose responses carry AAAA records in the additional section, which SRV and NAPTR responses routinely do (RFC 2782 urges servers to return target addresses there; RFC 3403 §4.2 allows it). Through the resolver's `DnsResolverException`-only catches (row below) the `DnsParseException` then aborts `resolveHostname` (discarding A results) and `resolveServiceDomain`. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-10_dns-validate-rdata-security-crash-and-false-rejects_P0.json`. |
+| **TXT records containing UTF-8, or any character-string of 192–255 bytes, fail the whole response.** | The same check applies to TXT RDATA. A UTF-8 lead byte (`0xC2`–`0xF4`) rejects the response, and so does a character-string length byte `>= 192` — so a plain-ASCII TXT record carrying a 192–255-byte string (common for long SPF/DKIM values) is rejected too. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-10_dns-validate-rdata-security-crash-and-false-rejects_P0.json`. |
+| **The 64 A records `192.X.0.0` (`X` = 0–63) fail the whole response.** | A 4-byte A record whose bytes are `192, X, 0, 0` with `X < 64` matches the "disguised compression pointer" heuristic and throws `DnsParseException`. These are 64 separate addresses, not a contiguous range. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-10_dns-validate-rdata-security-crash-and-false-rejects_P0.json`. |
+| **A zero-length TXT or AAAA RDATA crashes the parser.** | For `rdlength == 0`, the loop bound `rdata.size() - 1` wraps to `SIZE_MAX` and the check reads `rdata[0]` of an empty vector (observed as a null-pointer SEGV under AddressSanitizer). The check runs on every record in every section of every response the transport parses — before the query ID is matched — so a single crafted datagram containing a zero-length TXT or AAAA record can terminate the process. The datagram must be accepted as coming from a configured server — a spoofed source address, an on-path attacker, or a malicious or broken upstream — and the TCP path is affected the same way. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-10_dns-validate-rdata-security-crash-and-false-rejects_P0.json`. |
+| **The resolver catches only `DnsResolverException`.** | Every recovery site in `DnsResolver` — `dns_resolver.hpp:710`, `:729`, `:825`, `:1179`, `:1206`, `:1738`, `:1790` — catches `DnsResolverException` only, so `DnsTimeoutException`/`DnsTransportException` and `DnsParseException` escape. A NAPTR timeout aborts RFC 3263 resolution instead of falling back to SRV; a single SRV or target-address failure aborts the whole result; `resolveHostname` under `IPv4First` discards the A results when the AAAA query throws. Combined with the AAAA false positive above, a dual-stack SIP target with an ordinary IPv6 address fails both `resolveHostname` and `resolveServiceDomain`. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
+| **RFC 3263 direct-SRV ranking crosses record sets; `preferredTransports` does not filter.** | Without NAPTR, all targets have `naptrPreference = 0` and are ranked by SRV priority across different SRV RRsets (`sortTargetsByPriority`, `dns_resolver.hpp:1756`), overriding the `preferredTransports` order, which only reorders the queries (`:1557-1581`). A SIPS caller can receive UDP/TCP targets and must filter with `getTargetsForTransport(ServiceType::SIPS_TLS)` (§3.3). Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
+| **The async service path ignores `addressResolutionPolicy` and the cache.** | `resolveTargetAddressesAsync` queries AAAA only when A returned nothing (`dns_resolver.hpp:1912`) and calls the transport directly (§3.3 step 5). Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
+| **A malformed response fails the query at once.** | A response that fails to parse but whose first two bytes match a pending query ID from the same server/port completes that query with `DnsParseException` immediately, with no retry and no wait for a well-formed reply (`dns_transport.hpp:1735-1751`); RFC 5452 practice is to drop it and keep waiting. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
+| **A throwing user callback is invoked twice.** | In `resolveAInternal`, a callback that throws is called again with the thrown exception from `catch (...)` (`dns_client.hpp:1037-1066`). Callbacks should not throw. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
+| **`resolveA(host, cb)` can throw `std::bad_function_call` instead of calling back.** | The immediate-error branch (`dns_client.hpp:1100-1105`) calls `callback`, but it was already moved into `resolveAInternal` (`:1097`), so the call throws `std::bad_function_call` out of `resolveA` and the user callback is never invoked. Reproduced with a hostname containing a 70-byte label: `DnsMessage::encodeName` throws `DnsParseException` inside `DnsTransport::queryAsync` (before the query is registered), and `resolveA` throws `std::bad_function_call`. Open — P1, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-32_dnsclient-resolvea-callback-moved-then-invoked_P1.json`. |
+| **A `start()` failure after publishing can strand running transports.** | `DnsTransport::start()` publishes the transports and `Running` before `startCleanupTimer()`, whose thread creation can throw; the failure path then reports `Stopped` while the started transports stay published, `stop()` returns early, and the next `start()` drops them under `_stateMutex` (`dns_transport.hpp:757-771`). `DnsClient` surfaces it as `DnsResolverException("Failed to start DNS transport: …")` from its constructor or `initialize()`. Open — P1, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-30_dnstransport-start-publishes-before-cleanup-thread-can-throw_P1.json`. |
 | **`cleanupCache()` / `setCacheCleanupCallback` are no-ops.** | `cleanupExpired()` always returns 0 (ExpiringCache sweeps itself every ~5 s) and the stored cleanup callback is never invoked. Do not use them for monitoring. |
 | **`resolveHost` swallows per-family errors.** | It returns `success = false` only when *both* A and AAAA fail; individual family errors are discarded, so a partial failure is invisible to the caller. Use `resolveA`/`resolveAAAA` when you need per-family error detail. |
-| **Async callbacks run on internal threads.** | Callbacks fire on the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread — never the caller's. Non-thread-safe callback bodies are a data race. |
-| **Best-effort cancellation.** | `AsyncDnsRequest::cancel()` / `CancellableFuture::cancel()` cannot prevent an in-flight callback from firing; guard for the cancelled-but-delivered case. |
+| **Async callbacks run on several threads, including the caller's.** | Callbacks fire on the engine I/O thread, the `DnsRetryTimer` thread, or the cleanup thread; on the caller's thread before `resolveA`/`queryAsync` returns for immediate errors (no transport, transport not running, registration refused, send failure) and, for `queryAsync`, cache hits; and on the thread calling `stop()` for queries still pending at shutdown (`dns_transport.hpp:917`). Non-thread-safe callback bodies are a data race, and a lock held across `resolveA` that the callback takes is a self-deadlock. |
+| **Cancellation never suppresses the raw callback.** | After `AsyncDnsRequest::cancel()` the callback is still invoked exactly once — with the real result if delivery won, else with `DnsResolverException("DNS request cancelled")` when the response, timeout, or `stop()` arrives (`dns_client.hpp:1021-1033`); nothing removes the pending query. Captured state must outlive it. `CancellableFuture::cancel()` returning `true` does not guarantee `get()` throws. The header's "false if already completed" (`dns_client.hpp:46`) is wrong. Open — P0, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-29_dns-resolver-catches-only-resolver-exception-and-rfc3263-gaps_P0.json`. |
 | **No DNSSEC, EDNS(0), or `/etc/hosts` / search-list processing.** | `DnsClient` queries configured nameservers directly for a fixed record-type set; it does not validate DNSSEC, negotiate EDNS buffer sizes, or honor `/etc/hosts` or resolv.conf `search`/`ndots`. In split-horizon deployments it can disagree with the system resolver (§1). |
