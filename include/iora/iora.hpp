@@ -194,6 +194,11 @@ public:
   /// main().
   static void shutdown()
   {
+    // SD-2 (R3 TS L-5): reject a shutdown() from plugin code holding
+    // _loadModulesMutex BEFORE mutating _isRunning / destroying the webhook server
+    // — else a lifecycle hook calling shutdown() half-shuts the service and the
+    // double-shutdown guard below blocks any retry.
+    throwIfUnderLoaderLock("IoraService::shutdown()");
     try
     {
       auto instancePtr = getInstancePtr();
@@ -705,19 +710,22 @@ public:
       module = *owner;
     }
 
-    // (1b) Is-loaded gate (DP-6b): reject a call to a not-yet-loaded (mid-onLoad)
-    // or mid-unload-claim module, mirroring SafeApiFunction::operator(). This
-    // _loadModulesMutex acquisition is taken-and-released here, NEVER nested with
-    // _apiMutex or _apiCallGuard, so no lock-order edge is introduced.
-    if (!isModuleLoaded(module))
+    // (2) Admission gate (SD-1, DP-10c). The gate is the SINGLE is-loaded/draining
+    // check — the old step (1b) isModuleLoaded (which took _loadModulesMutex) is
+    // GONE, so plugin code running under _loadModulesMutex (onLoad/onUnload/
+    // onDependency*) can call callExportedApi without re-locking the non-recursive
+    // mutex (the self-deadlock this fixes). enterApiCall consults _apiCallableModules
+    // + the drain gate under the leaf _apiCallGuard only. A rejected call never
+    // materializes a copy. NOT_LOADED = not (yet) a member (unloaded, or mid-onLoad
+    // before markApiCallable); DRAINING = an unload has claimed it.
+    switch (enterApiCall(module))
     {
+    case ApiEnterResult::NOT_LOADED:
       throw std::runtime_error("plugin API unavailable: module " + module + " not loaded");
-    }
-
-    // (2) Enter the drain gate. A rejected call never materializes a copy.
-    if (!enterApiCall(module))
-    {
+    case ApiEnterResult::DRAINING:
       throw std::runtime_error("plugin API unavailable: module " + module + " is unloading");
+    case ApiEnterResult::ENTERED:
+      break;
     }
 
     // (3)+(4) Arm the leave-guard IMMEDIATELY (M-A: before the thread-local push,
@@ -801,6 +809,8 @@ public:
   /// validation.
   bool loadSingleModule(const std::string &modulePath)
   {
+    // SD-2: fail fast if called from plugin code holding _loadModulesMutex.
+    throwIfUnderLoaderLock("IoraService::loadSingleModule()");
     try
     {
       // Validate path to prevent directory traversal attacks
@@ -846,6 +856,8 @@ public:
   /// \return true if the module was successfully unloaded, false if it wasn't loaded
   bool unloadSingleModule(const std::string &pluginName)
   {
+    // SD-2: fail fast if called from plugin code holding _loadModulesMutex.
+    throwIfUnderLoaderLock("IoraService::unloadSingleModule()");
     // LoadModulesGuard keeps ownsLoadModulesMutex() in sync with the lock across
     // the release/re-acquire window used for the off-lock cache clear.
     LoadModulesGuard guard(_loadModulesMutex);
@@ -941,15 +953,34 @@ public:
     }
     openGate(pluginName);
 
+    // 2.3d: release _loadModulesMutex BEFORE building/pushing the module.unload
+    // event. pushEvent enqueues onto the EventQueue (its own mutex); holding L
+    // across it would add an L -> EventQueue-mutex edge. The build+push is wrapped
+    // log-and-continue so a bad_alloc AFTER a successful unload does not propagate
+    // (reloadModule would otherwise skip its load half; R3 TS L-6). Consumer caveat
+    // (R3 TS L-8): a module.unload.X does NOT mean "X is currently absent" (a
+    // concurrent same-name load may finish first); unload events may be reordered
+    // across rapid load/unload cycles; the post-unlock tail relies on the existing
+    // "no (un)load concurrent with IoraService destruction" precondition.
+    guard.unlock();
+
     if (ok)
     {
-      IORA_LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
-      // Emit module unloaded event
-      auto event = parsers::Json::object();
-      event["eventId"] = "module_unloaded_" + pluginName;
-      event["eventName"] = "module.unload." + pluginName;
-      event["moduleName"] = pluginName;
-      pushEvent(event);
+      try
+      {
+        IORA_LOG_INFO("Plugin " + pluginName + " unloaded successfully.");
+        // Emit module unloaded event
+        auto event = parsers::Json::object();
+        event["eventId"] = "module_unloaded_" + pluginName;
+        event["eventName"] = "module.unload." + pluginName;
+        event["moduleName"] = pluginName;
+        pushEvent(event);
+      }
+      catch (const std::exception &e)
+      {
+        IORA_LOG_ERROR("Plugin " + pluginName +
+                       " unloaded, but emitting its module.unload event failed: " + e.what());
+      }
     }
     return ok;
   }
@@ -959,6 +990,9 @@ public:
   /// \return true if the module was successfully reloaded, false otherwise
   bool reloadModule(const std::string &pluginName)
   {
+    // SD-2: fail fast if called from plugin code holding _loadModulesMutex (also
+    // guards the two nested loadSingleModule/unloadSingleModule calls below).
+    throwIfUnderLoaderLock("IoraService::reloadModule()");
     // Store the plugin path before unloading
     std::string pluginPath;
     {
@@ -982,7 +1016,17 @@ public:
   /// \brief Check if a module is currently loaded
   bool isModuleLoaded(const std::string &moduleName) const
   {
-    std::lock_guard<std::mutex> lock(_loadModulesMutex);
+    // SD-2: owner-aware. When THIS thread already holds _loadModulesMutex (a plugin
+    // lifecycle hook), read WITHOUT re-locking the non-recursive mutex (a re-lock
+    // would be UB/deadlock); otherwise take the lock. This makes isModuleLoaded
+    // safe to call from onLoad/onUnload while keeping the host-path locked read.
+    // (A std::optional<lock_guard> can't express "conditionally hold", so the lock
+    // is scoped to a conditional block that dominates the single return below.)
+    if (!ownsLoadModulesMutex())
+    {
+      std::lock_guard<std::mutex> lock(_loadModulesMutex);
+      return isModuleLoadedLocked(moduleName);
+    }
     return isModuleLoadedLocked(moduleName);
   }
 
@@ -1005,6 +1049,8 @@ protected:
 public:
   bool unloadAllModules()
   {
+    // SD-2: fail fast if called from plugin code holding _loadModulesMutex.
+    throwIfUnderLoaderLock("IoraService::unloadAllModules()");
     LoadModulesGuard guard(_loadModulesMutex);
     bool success = true;
 
@@ -1249,6 +1295,10 @@ public:
 protected:
   bool loadSingleModule(const std::filesystem::directory_entry &entry)
   {
+    // SD-2: the protected overload gets the same fail-fast (plugin-unreachable in
+    // practice — plugins reach only the public string overload — but covered for
+    // the autoload path and any host subclass; R3 cpp17 L-4).
+    throwIfUnderLoaderLock("IoraService::loadSingleModule()");
     std::string pluginName;
     std::string pluginPath;
     bool loadSuccess = false;
@@ -1348,13 +1398,35 @@ protected:
           pluginInstance->_path = pluginPath; // Set the plugin path
           try
           {
+            // SD-4(a): snapshot X's dependents BEFORE onLoad (nothing can add to
+            // _dependents[X] during X's own onLoad under SD-2), via find()+copy —
+            // never operator[], which would insert an empty entry. Passed to the
+            // no-throw notify so a require() from a dependent's onDependencyLoaded
+            // can push onto the live _dependents[X] without invalidating iteration
+            // (2.3c).
+            std::vector<std::string> dependentsSnapshot;
+            {
+              auto depIt = _dependents.find(pluginName);
+              if (depIt != _dependents.end())
+              {
+                dependentsSnapshot = depIt->second;
+              }
+            }
+
             pluginInstance->onLoad(this);
 
             // Only add to _loadedModules if onLoad succeeds
             _loadedModules.insert({pluginName, std::move(pluginInstance)});
 
-            // Notify dependents that this module is now loaded
-            notifyDependentsOfLoad(pluginName);
+            // SD-4/DP-10c: mark the module callExportedApi-callable — the LAST
+            // fallible step of the load, right after the successful insert and
+            // BEFORE the no-throw notify (a dependent's onDependencyLoaded may call
+            // the newly loaded module). Admission for X begins here; no step after
+            // it may fail X's load.
+            markApiCallable(pluginName);
+
+            // Notify dependents that this module is now loaded (no-throw; SD-4b).
+            notifyDependentsOfLoad(pluginName, dependentsSnapshot);
 
             // Only mark as successful if we reach this point
             loadSuccess = true;
@@ -1781,67 +1853,89 @@ protected:
     _isRunning = true;
   }
 
+public:
   // Implementation of dependency management methods
-  /// \brief Registers a dependency relationship between two modules (thread-safe)
+  /// \brief Registers a dependency relationship between two modules (thread-safe).
+  /// SD-2: a PUBLIC host-driven entry point (a plugin registers its own edges via
+  /// Plugin::require(), which runs under the loader lock). Rejects a call made from
+  /// plugin code holding _loadModulesMutex.
   /// \param dependent The module that depends on another module
   /// \param dependency The module that the dependent module requires
   void registerDependency(const std::string &dependent, const std::string &dependency)
   {
-    std::lock_guard<std::mutex> lock(_loadModulesMutex);
+    // SD-2: fail fast if called from plugin code holding _loadModulesMutex.
+    throwIfUnderLoaderLock("IoraService::registerDependency()");
+    // LoadModulesGuard (not a bare lock_guard) so ownsLoadModulesMutex() is TRUE
+    // when registerDependencyLocked's 2.3a assert runs on this public path.
+    LoadModulesGuard guard(_loadModulesMutex);
     registerDependencyLocked(dependent, dependency);
   }
 
+protected:
   /// \brief Registers a dependency relationship assuming the mutex is already held
   /// \param dependent The module that depends on another module
   /// \param dependency The module that the dependent module requires
   /// \note PRECONDITION: Caller must hold _loadModulesMutex
   void registerDependencyLocked(const std::string &dependent, const std::string &dependency)
   {
-    // PRECONDITION: Caller must hold _loadModulesMutex
-#ifdef DEBUG
-    // In debug builds, try to detect if mutex is held by attempting a try_lock
-    // If try_lock succeeds, we didn't hold the mutex (bad!) - unlock and assert
-    if (_loadModulesMutex.try_lock())
-    {
-      _loadModulesMutex.unlock();
-      assert(false && "registerDependencyLocked called without holding _loadModulesMutex");
-    }
-#endif
+    // PRECONDITION: caller holds _loadModulesMutex (2.3a: replaces the DEBUG
+    // try_lock probe — a try_lock by the mutex's owning thread is itself UB — with
+    // an owns-flag assert).
+    assert(ownsLoadModulesMutex() &&
+           "registerDependencyLocked called without holding _loadModulesMutex");
 
-    _dependents[dependency].push_back(dependent);
+    // 2.3f: de-duplicate the edge. Without this, every reload of a dependent (or a
+    // repeated require) appends another entry, so notifyDependentsOfLoad /
+    // notifyDependentsOfUnload fire onDependency* N times for one logical edge.
+    auto &deps = _dependents[dependency];
+    if (std::find(deps.begin(), deps.end(), dependent) == deps.end())
+    {
+      deps.push_back(dependent);
+    }
 
     // Don't use [] operator as it creates entries - use find instead
     auto pluginIt = _loadedModules.find(dependent);
     if (pluginIt != _loadedModules.end() && pluginIt->second)
     {
-      pluginIt->second->_dependencies.push_back(dependency);
+      auto &pd = pluginIt->second->_dependencies;
+      if (std::find(pd.begin(), pd.end(), dependency) == pd.end())
+      {
+        pd.push_back(dependency);
+      }
     }
 
-    // If dependency is not loaded, add to pending
+    // If dependency is not loaded, add to pending (de-duplicated).
     if (_loadedModules.find(dependency) == _loadedModules.end())
     {
-      _pendingDependencies[dependent].push_back(dependency);
+      auto &pend = _pendingDependencies[dependent];
+      if (std::find(pend.begin(), pend.end(), dependency) == pend.end())
+      {
+        pend.push_back(dependency);
+      }
     }
   }
 
-  void notifyDependentsOfLoad(const std::string &moduleName)
+  void notifyDependentsOfLoad(const std::string &moduleName,
+                              const std::vector<std::string> &dependentsSnapshot)
   {
-    // This is called after a module is loaded - notify dependents synchronously
-    // PRECONDITION: Caller must hold _loadModulesMutex
-#ifdef DEBUG
-    // In debug builds, try to detect if mutex is held by attempting a try_lock
-    // If try_lock succeeds, we didn't hold the mutex (bad!) - unlock and assert
-    if (_loadModulesMutex.try_lock())
-    {
-      _loadModulesMutex.unlock();
-      assert(false && "notifyDependentsOfLoad called without holding _loadModulesMutex");
-    }
-#endif
+    // This is called after a module is loaded - notify dependents synchronously.
+    // PRECONDITION: caller holds _loadModulesMutex (2.3a: replaces the old DEBUG
+    // try_lock probe — a try_lock by the mutex's owning thread is itself UB — with
+    // an owns-flag assert).
+    assert(ownsLoadModulesMutex() &&
+           "notifyDependentsOfLoad called without holding _loadModulesMutex");
 
-    auto it = _dependents.find(moduleName);
-    if (it != _dependents.end())
+    // NO-THROW (SD-4b / DP-10c): markApiCallable already ran, so notify is a step
+    // that MUST NOT fail the load. The OUTER catch(...) covers onDependencyLoaded
+    // AND the IORA_LOG_ERROR string building inside the per-dependent handlers (a
+    // try nested inside a handler would not); abi::__forced_unwind is deliberately
+    // swallowed (A8) rather than allowed to reach the no-drain cleanup. Iterating
+    // the caller's SNAPSHOT (taken before the _loadedModules.insert, 2.3c) makes a
+    // require() from onDependencyLoaded — which push_backs onto the live
+    // _dependents[moduleName] — safe against iterator invalidation.
+    try
     {
-      for (const auto &dependent : it->second)
+      for (const auto &dependent : dependentsSnapshot)
       {
         auto pluginIt = _loadedModules.find(dependent);
         if (pluginIt != _loadedModules.end() && pluginIt->second)
@@ -1878,21 +1972,28 @@ protected:
         }
       }
     }
+    catch (...)
+    {
+      // Fully no-throw: even the log's string build is guarded so a bad_alloc here
+      // cannot escape into loadSingleModule and fail the (already-marked) load.
+      try
+      {
+        IORA_LOG_ERROR(std::string("notifyDependentsOfLoad(") + moduleName +
+                       "): swallowed a throw from dependent notification (load must not fail)");
+      }
+      catch (...)
+      {
+      }
+    }
   }
 
   void notifyDependentsOfUnload(const std::string &moduleName)
   {
-    // This is called before a module is unloaded - notify dependents synchronously
-    // PRECONDITION: Caller must hold _loadModulesMutex
-#ifdef DEBUG
-    // In debug builds, try to detect if mutex is held by attempting a try_lock
-    // If try_lock succeeds, we didn't hold the mutex (bad!) - unlock and assert
-    if (_loadModulesMutex.try_lock())
-    {
-      _loadModulesMutex.unlock();
-      assert(false && "notifyDependentsOfUnload called without holding _loadModulesMutex");
-    }
-#endif
+    // This is called before a module is unloaded - notify dependents synchronously.
+    // PRECONDITION: caller holds _loadModulesMutex (2.3a: replaces the DEBUG
+    // try_lock UB probe with an owns-flag assert).
+    assert(ownsLoadModulesMutex() &&
+           "notifyDependentsOfUnload called without holding _loadModulesMutex");
 
     auto it = _dependents.find(moduleName);
     if (it != _dependents.end())
@@ -1963,7 +2064,9 @@ private:
   // 2026-09-07-8, architecture/iora/api_module_reverse_map.json, A-DP-1).
   // Guarded by _apiMutex and mutated in the SAME critical sections as
   // _apiExports, so the two maps never disagree. Populated ONLY by the
-  // identity-overload exportApi(pluginIdentity, name, func); erased by
+  // identity-overload exportApi(pluginIdentity, name, func) — INCLUDING the
+  // exportApi(Plugin&, ...) overload, which reaches it by delegation (see :459),
+  // so callExportedApi resolves BOTH overloads' exports; erased by
   // removeExportsForModule; cleared together with _apiExports at shutdown.
   std::unordered_map<std::string, std::string> _apiToModule;
   // Lock order: _loadModulesMutex (outer) -> _apiMutex (inner). Any code
@@ -2047,6 +2150,24 @@ private:
   std::unordered_map<std::string, ApiCallGate> _apiCallGates;
   std::condition_variable _apiDrainCv;
 
+  // --- callExportedApi admission set (tracker 2026-09-24-9, SD-1/SD-4/SD-5).
+  // The set of modules that are IN _loadedModules and therefore callable via
+  // callExportedApi. It REPLACES callExportedApi's old is-loaded gate
+  // (isModuleLoaded -> _loadModulesMutex), which self-deadlocked when plugin code
+  // running UNDER _loadModulesMutex (onLoad/onUnload/onDependency*) called
+  // callExportedApi: the non-recursive mutex was re-locked. callExportedApi now
+  // consults ONLY this set + the drain gate (both under the leaf _apiCallGuard) —
+  // it never touches _loadModulesMutex, so it cannot re-lock it (DP-10c
+  // supersedes DP-10b for callExportedApi; SafeApiFunction / non-owner
+  // isModuleLoaded still take L). Invariant (SD-5): name in _apiCallableModules
+  // <=> name in _loadedModules whenever no load/unload critical section is in
+  // progress. Guarded by the LEAF _apiCallGuard (a THIRD concern co-located with
+  // _safeApiRegistry + the drain gates; the leaf takes no other lock). Marked as
+  // the LAST fallible step of loadSingleModule (after the _loadedModules.insert,
+  // before the no-throw notify; SD-4); unmarked at the successful teardown erase
+  // and in cleanupPartialLoadLocked. unordered_set::erase does not allocate/throw.
+  std::unordered_set<std::string> _apiCallableModules;
+
 public:
   /// \brief Whether this thread currently holds _loadModulesMutex, so
   /// getExportedApiSafe can REJECT (throw on) a call made from a plugin onLoad
@@ -2057,6 +2178,22 @@ public:
   /// guarantee a single TLS instance across a dlopen boundary. Mirrors
   /// Logger::handlerReentryDepth().
   static bool &ownsLoadModulesMutex();
+
+  /// \brief SD-2 fail-fast: throw std::logic_error if THIS thread already holds
+  /// _loadModulesMutex — i.e. the call came from plugin code running inside a
+  /// lifecycle hook (onLoad/onUnload/onDependency*/ctor/dtor) under the module
+  /// loader lock. Every public loader entry point that acquires _loadModulesMutex
+  /// calls this BEFORE acquiring, turning the self-deadlock (a re-lock of the
+  /// non-recursive mutex) into an immediate, diagnosable programming-error throw.
+  static void throwIfUnderLoaderLock(const char *method)
+  {
+    if (ownsLoadModulesMutex())
+    {
+      throw std::logic_error(std::string(method) +
+                             " is not callable during module load/unload (from plugin code "
+                             "running under the module loader lock)");
+    }
+  }
 
   /// \brief Thread-local MULTISET of module names with a callExportedApi call
   /// currently in-flight on THIS thread (pushed at the drain-gate enter, popped
@@ -2159,20 +2296,59 @@ private:
   // acyclic _loadModulesMutex -> _apiCallGuard edge — same as
   // teardownModuleHostSideLocked -> pruneSafeApiRegistry).
 
-  /// \brief Mark a callExportedApi call in-flight for a module. Returns false if
-  /// the module is draining (an unload has claimed it) — the caller then rejects
-  /// without taking a copy. operator[] is intended: enterApiCall is the gate's
-  /// creator. Guarded by the leaf _apiCallGuard.
-  bool enterApiCall(const std::string &moduleName)
+  /// \brief Outcome of enterApiCall (SD-1). NOT_LOADED and DRAINING are the two
+  /// rejections; ENTERED means an in-flight count was taken and the caller MUST
+  /// pair it with leaveApiCall.
+  enum class ApiEnterResult
+  {
+    ENTERED,
+    NOT_LOADED,
+    DRAINING
+  };
+
+  /// \brief Mark a module callable via callExportedApi — the last fallible step of
+  /// a successful load (SD-4). PRE: caller holds _loadModulesMutex (this adds the
+  /// existing acyclic _loadModulesMutex -> _apiCallGuard edge). std::unordered_set
+  /// insert has the strong guarantee, so a throw leaves nothing marked.
+  void markApiCallable(const std::string &moduleName)
   {
     std::lock_guard<std::mutex> lock(_apiCallGuard);
+    _apiCallableModules.insert(moduleName);
+  }
+
+  /// \brief Remove a module from the callExportedApi admission set — at the
+  /// successful teardown erase and in cleanupPartialLoadLocked (SD-5).
+  /// std::unordered_set::erase does not allocate or throw; only _apiCallGuard.lock
+  /// can throw (the effectively-impossible L-3 class). PRE: holds _loadModulesMutex.
+  void unmarkApiCallable(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    _apiCallableModules.erase(moduleName);
+  }
+
+  /// \brief Try to enter the callExportedApi gate for a module (SD-1). Rejects
+  /// NOT_LOADED when the module is not an admission-set member (not loaded, or
+  /// mid-onLoad and not yet marked, or already unmarked at teardown), and DRAINING
+  /// when an unload has claimed it (beginApiDrain set draining in the same
+  /// _loadModulesMutex critical section as the claim). Membership is checked
+  /// BEFORE operator[] so a NOT_LOADED call leaves no idle gate. On ENTERED the
+  /// in-flight count is incremented; the caller MUST call leaveApiCall. This is
+  /// the SINGLE admission check — callExportedApi no longer touches
+  /// _loadModulesMutex. Guarded by the leaf _apiCallGuard.
+  [[nodiscard]] ApiEnterResult enterApiCall(const std::string &moduleName)
+  {
+    std::lock_guard<std::mutex> lock(_apiCallGuard);
+    if (_apiCallableModules.find(moduleName) == _apiCallableModules.end())
+    {
+      return ApiEnterResult::NOT_LOADED;
+    }
     auto &g = _apiCallGates[moduleName];
     if (g.draining)
     {
-      return false;
+      return ApiEnterResult::DRAINING;
     }
     ++g.inFlight;
-    return true;
+    return ApiEnterResult::ENTERED;
   }
 
   /// \brief Mark an in-flight callExportedApi call complete. MUST use find() +
@@ -2304,6 +2480,19 @@ private:
         ServiceRegistry::unregisterModule(name);
         _loadedModules.erase(it); // unique_ptr will delete
         erased = true;
+        // SD-5: unmark from the callExportedApi admission set immediately after the
+        // erase, so a later throw in this function cannot leave the module
+        // loaded-but-unmarked. Its own try/catch(...) (like openGate): erase is
+        // no-throw, only _apiCallGuard.lock() can throw (the effectively-impossible
+        // L-3 class) — and a stale member of an erased module is harmless (the
+        // owner re-resolve in callExportedApi's copy step yields "API not found").
+        try
+        {
+          unmarkApiCallable(name);
+        }
+        catch (...)
+        {
+        }
       }
     }
     catch (const std::exception &e)
@@ -2388,6 +2577,14 @@ private:
   /// leaks), so it is never ordered after the dlclose.
   void cleanupPartialLoadLocked(const std::string &name)
   {
+    // SD-4/DP-10c defence-in-depth: unmark FIRST. markApiCallable is the last
+    // fallible load step and cannot be followed by a load failure today (SD-2 makes
+    // every owner-thread loader entry point throw), so a marked-but-failing load is
+    // unreachable — but if a future post-mark failure path is added it MUST drain
+    // before cleanup; this unmark does NOT replace a drain. Unreachable today, so
+    // not test-pinned. (unordered_set::erase is no-throw; matches the function's
+    // existing unguarded tail — a throw here safely SKIPS the caller's dlclose.)
+    unmarkApiCallable(name);
     removeExportsForModule(name);
     ServiceRegistry::unregisterModule(name);
     _loadedModules.erase(name); // ~Plugin (if present) while the .so is still mapped
@@ -2679,6 +2876,15 @@ public:
   /// per-call drain/counter is needed.
   R operator()(Args... args) const
   {
+    // SD-2 (order constraint TS H1(c)): reject a call made from plugin code running
+    // under _loadModulesMutex (owns==true) as the FIRST statement — before
+    // registerEventHandler() (which would add an L -> EventQueue-mutex edge) and
+    // before the owner-aware isModuleLoaded fast path (an L -> cacheMutex edge that
+    // inverts the documented cacheMutex -> L order). SafeApiFunction is host-only.
+    // Reuses the shared SD-2 helper so the message cannot diverge from the loader
+    // entry points'.
+    IoraService::throwIfUnderLoaderLock("SafeApiFunction::operator()");
+
     // Ensure event handler is registered (lazy initialization)
     registerEventHandler();
 
@@ -2725,7 +2931,14 @@ public:
   }
 
   /// \brief Check if the API is currently available
-  bool isAvailable() const { return service->isModuleLoaded(moduleName); }
+  bool isAvailable() const
+  {
+    // SD-2: host-only, for API consistency with operator() (this takes no
+    // cacheMutex; the reason is uniform "SafeApiFunction is host-only"). Reuses the
+    // shared SD-2 helper.
+    IoraService::throwIfUnderLoaderLock("SafeApiFunction::isAvailable()");
+    return service->isModuleLoaded(moduleName);
+  }
 
   /// \brief Get the module name for this API
   const std::string &getModuleName() const { return moduleName; }
@@ -2756,6 +2969,17 @@ inline void IoraService::Plugin::require(const std::string &moduleName)
   if (!_service)
   {
     throw std::runtime_error("Plugin::require() called with null service");
+  }
+
+  // 2.3b: require() reads/writes _loadedModules/_dependents via isModuleLoadedLocked
+  // + registerDependencyLocked, which are only safe under _loadModulesMutex.
+  // require() is designed to be called from a lifecycle hook (onLoad /
+  // onDependencyLoaded) where THIS thread holds the loader lock. Called off L (e.g.
+  // a plugin worker thread), it would race those maps unsynchronised -> reject.
+  if (!_service->ownsLoadModulesMutex())
+  {
+    throw std::logic_error("Plugin::require() is only callable from a plugin lifecycle hook "
+                           "(onLoad/onDependencyLoaded) running under the module loader lock");
   }
 
   // Simply check if the required module is loaded

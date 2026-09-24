@@ -157,3 +157,9 @@ create_iora_plugin_target(transitiveinnerplugin
 create_iora_plugin_target(reentrantselfplugin
     SOURCES ReentrantSelfPlugin.cpp
 )
+
+# onLoad/onUnload callExportedApi self-deadlock probe (tracker 2026-09-24-9).
+# One configurable probe driven by a host-owned control block; covers cases a-r.
+create_iora_plugin_target(onloadapicallerplugin
+    SOURCES OnLoadApiCallerPlugin.cpp
+)

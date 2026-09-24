@@ -16,15 +16,15 @@ namespace iora
 namespace test
 {
 
-/// Drives a blocking onLoad so the host can observe that a concurrent
-/// callExportedApi is serialized behind the load (DP-10b: loadSingleModule holds
-/// _loadModulesMutex monolithically across onLoad; callExportedApi's is-loaded
-/// gate acquires the same mutex). Protocol: the plugin's onLoad exports its API,
-/// sets onLoadEntered=1 (the export is now visible and onLoad is holding
-/// _loadModulesMutex), then spins until the host sets release=1, then THROWS
-/// (the load fails). A concurrent host thread calling the exported API must stay
-/// blocked on the is-loaded gate until release is set and the failed load
-/// unwinds and releases the lock.
+/// Drives a blocking onLoad so the host can observe SD-1 admission behaviour: a
+/// concurrent callExportedApi is REJECTED "not loaded" promptly (it no longer
+/// takes _loadModulesMutex; the module is not yet markApiCallable'd), while a
+/// concurrent non-owner isModuleLoaded — which still acquires _loadModulesMutex —
+/// stays BLOCKED behind the monolithic load hold (the retained DP-10b guard).
+/// Protocol: the plugin's onLoad exports its API, sets onLoadEntered=1 (the export
+/// is now visible and onLoad is holding _loadModulesMutex), then spins until the
+/// host sets release=1, then THROWS (the load fails). The isModuleLoaded thread
+/// must stay blocked until release is set and the failed load unwinds.
 struct BlockOnLoadControl
 {
   std::atomic<int> onLoadEntered{0}; // set by the plugin once onLoad holds the lock + exported

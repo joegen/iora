@@ -26,6 +26,22 @@ public:
     svc->exportApi(*this, "probe.handlerReentryDepthInstanceAddr",
                    []() -> std::uint64_t
                    { return reinterpret_cast<std::uint64_t>(&iora::core::Logger::handlerReentryDepth()); });
+
+    // SD-2 / 2.5: the callExportedApi self-deadlock fix relies on
+    // ownsLoadModulesMutex() being ONE thread_local instance process-wide (a
+    // plugin-.so copy would make the owner flag disagree across the dlopen boundary
+    // and re-open the re-lock). Same for inFlightApiModules() (the self-unload
+    // guard's TLS multiset). Both are out-of-line singletons in iora_core.cpp
+    // (PAT-3); probe the INSTANCE, read on the caller's thread so both sides
+    // compare the same thread's thread_local.
+    svc->exportApi(*this, "probe.ownsLoadModulesMutexInstanceAddr",
+                   []() -> std::uint64_t {
+                     return reinterpret_cast<std::uint64_t>(&iora::IoraService::ownsLoadModulesMutex());
+                   });
+    svc->exportApi(*this, "probe.inFlightApiModulesInstanceAddr",
+                   []() -> std::uint64_t {
+                     return reinterpret_cast<std::uint64_t>(&iora::IoraService::inFlightApiModules());
+                   });
   }
 
   void onUnload() override {}

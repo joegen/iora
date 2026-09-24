@@ -2,10 +2,15 @@
 //
 // Tests for the load-failure teardown hardening (tracker 2026-09-07-9,
 // architecture/iora/callexportedapi_gating.json).
-//   F-4: the DP-10b monolithic-hold invariant — a concurrent callExportedApi is
-//        serialized behind a blocking onLoad and, when the load fails, throws
-//        without ever invoking (proves no in-flight copy against a failing
-//        first-time load; trips if a mid-load release window is ever added).
+//   F-4: SD-1 semantics (tracker 2026-09-24-9). callExportedApi no longer takes
+//        _loadModulesMutex, so a concurrent call during a blocking onLoad is
+//        REJECTED "not loaded" PROMPTLY by the admission gate (the module is not
+//        yet markApiCallable'd) and never invokes — it does NOT serialize behind
+//        the load. The DP-10b monolithic-hold invariant is RETAINED for the paths
+//        that still take the lock: a concurrent non-owner isModuleLoaded stays
+//        BLOCKED while onLoad holds _loadModulesMutex and returns false after the
+//        failed load (trips if a mid-load release window is ever added). This is a
+//        deliberate semantics change (SD-1 / DP-6b amended, DP-10c), not a weakening.
 //   S-2: the inner-catch cleanup runs the shared dependency/registry prune
 //        (require-a-loaded-dep-then-throw) without crashing; reloadable after.
 //   Regression: existing export-then-throw failures still clean up + reload.
@@ -95,7 +100,7 @@ void expectCleanFailedLoad(iora::IoraService &svc, const std::string &soName,
 // monolithic-hold invariant that makes a load-failure drain unnecessary): if a
 // future edit introduces a mid-load release window, the concurrent caller would
 // stop being blocked and this test's "still blocked" assertion fails.
-TEST_CASE("F-4 concurrent callExportedApi serializes behind a blocking onLoad")
+TEST_CASE("F-4 concurrent callExportedApi rejects promptly during a blocking onLoad")
 {
   iora::IoraService &svc = *globalSvc;
   UnloadAllOnExit cleanup{svc};
@@ -105,34 +110,36 @@ TEST_CASE("F-4 concurrent callExportedApi serializes behind a blocking onLoad")
 
   std::thread loader;
   std::thread caller;
+  std::thread monitor;
 
   // Status atomics the worker lambdas capture by reference. Declared BEFORE
-  // threadGuard so they OUTLIVE it: locals destruct in reverse declaration
-  // order, so threadGuard (declared last) destructs FIRST and joins the threads
-  // while these are still alive. The threads write these on their way out, so
-  // destroying them before the join would be a use-after-scope on the
-  // REQUIRE-failure unwind path. All are set before their thread starts, so
-  // declaring them up here is safe.
+  // threadGuard so they OUTLIVE it (locals destruct in reverse declaration order,
+  // so threadGuard destructs FIRST and joins while these are still alive).
   std::atomic<bool> loadReturned{false};
   std::atomic<bool> loadResult{true};
   std::atomic<bool> callStarted{false};
   std::atomic<bool> callReturned{false};
   std::atomic<bool> callThrew{false};
-  std::atomic<bool> callInvoked{false}; // true only if the callable actually ran
+  std::atomic<bool> callSawNotLoaded{false}; // the throw's message contained "not loaded"
+  std::atomic<bool> callInvoked{false};      // true only if the callable actually ran
   std::atomic<int> callResult{-1};
+  // The retained DP-10b monolithic-hold guard: a non-owner isModuleLoaded STILL
+  // takes _loadModulesMutex, so it must stay BLOCKED while onLoad holds the lock.
+  std::atomic<bool> monStarted{false};
+  std::atomic<bool> monReturned{false};
+  std::atomic<bool> monResult{true};
 
   // RAII teardown, declared LAST so it destructs FIRST: on EVERY exit path
-  // (including a REQUIRE-failure unwind) it wakes the blocked onLoad so the
-  // loader can unwind and release _loadModulesMutex, then joins both threads (a
-  // joinable std::thread destroyed during unwinding would std::terminate the
-  // binary), then clears g_blockCtl. It references ctl/loader/caller (all
-  // declared above) and joins while every atomic the workers write is still
-  // alive.
+  // (including a REQUIRE-failure unwind) it wakes the blocked onLoad so the loader
+  // can unwind and release _loadModulesMutex, then joins all threads (a joinable
+  // std::thread destroyed during unwinding would std::terminate the binary), then
+  // clears g_blockCtl.
   struct ThreadGuard
   {
     iora::test::BlockOnLoadControl &ctl;
     std::thread &loader;
     std::thread &caller;
+    std::thread &monitor;
     ~ThreadGuard()
     {
       ctl.release.store(1); // unblock onLoad so the loader can unwind
@@ -140,13 +147,17 @@ TEST_CASE("F-4 concurrent callExportedApi serializes behind a blocking onLoad")
       {
         caller.join();
       }
+      if (monitor.joinable())
+      {
+        monitor.join();
+      }
       if (loader.joinable())
       {
         loader.join();
       }
       g_blockCtl.store(nullptr);
     }
-  } threadGuard{ctl, loader, caller};
+  } threadGuard{ctl, loader, caller, monitor};
 
   // Thread A: load the plugin. onLoad blocks (holding _loadModulesMutex) until
   // ctl.release is set, then throws -> loadSingleModule returns false.
@@ -162,10 +173,11 @@ TEST_CASE("F-4 concurrent callExportedApi serializes behind a blocking onLoad")
   REQUIRE(waitFor([&] { return ctl.onLoadEntered.load() == 1; }, 5s));
   REQUIRE(loadReturned.load() == false); // load is genuinely blocked in onLoad
 
-  // Thread B: call the exported API. resolve() (under _apiMutex) succeeds because
-  // onLoad already published the export; the is-loaded gate (under
-  // _loadModulesMutex) then blocks behind onLoad. (Its status atomics are
-  // declared above, before threadGuard.)
+  // Thread B: call the exported API. SD-1: callExportedApi no longer takes
+  // _loadModulesMutex — resolve() (under _apiMutex) sees the published export, but
+  // the admission gate rejects NOT_LOADED because the blocking module has not yet
+  // been markApiCallable'd (mark happens after onLoad returns). So the call throws
+  // "not loaded" PROMPTLY and never blocks or invokes.
   caller = std::thread(
     [&]
     {
@@ -176,22 +188,46 @@ TEST_CASE("F-4 concurrent callExportedApi serializes behind a blocking onLoad")
         callResult.store(r);
         callInvoked.store(true); // reached only if the plugin lambda ran
       }
-      catch (const std::exception &)
+      catch (const std::exception &e)
       {
         callThrew.store(true);
+        if (std::string(e.what()).find("not loaded") != std::string::npos)
+        {
+          callSawNotLoaded.store(true);
+        }
       }
       callReturned.store(true);
     });
 
-  REQUIRE(waitFor([&] { return callStarted.load(); }, 5s));
+  // Thread C (retained DP-10b guard): a non-owner isModuleLoaded takes
+  // _loadModulesMutex, so it must BLOCK behind the blocking onLoad and only return
+  // after the failed load releases the lock. A mid-load release-window regression
+  // would let it return early.
+  monitor = std::thread(
+    [&]
+    {
+      monStarted.store(true);
+      const bool loaded = svc.isModuleLoaded("blockingonloadplugin.so");
+      monResult.store(loaded);
+      monReturned.store(true);
+    });
 
-  // DISCRIMINATING ASSERTION: while onLoad holds _loadModulesMutex, thread B's
-  // is-loaded gate cannot proceed, so its call must NOT return. If a mid-load
-  // release window were introduced, B would acquire the lock and return early,
-  // failing this. Bounded wait (not perfectly deterministic, but a release-window
-  // regression makes B return within it).
+  REQUIRE(waitFor([&] { return callStarted.load(); }, 5s));
+  REQUIRE(waitFor([&] { return monStarted.load(); }, 5s));
+
+  // SD-1 SEMANTICS: thread B (callExportedApi) returns PROMPTLY with a "not loaded"
+  // throw, WITHOUT invoking — even while onLoad still holds _loadModulesMutex.
+  REQUIRE(waitFor([&] { return callReturned.load(); }, 5s));
+  REQUIRE(callThrew.load() == true);
+  REQUIRE(callSawNotLoaded.load() == true);
+  REQUIRE(callInvoked.load() == false);
+  REQUIRE(callResult.load() == -1);
+
+  // RETAINED DP-10b GUARD: thread C (isModuleLoaded) stays BLOCKED while onLoad
+  // holds the lock, and the load has not returned either. Bounded wait: a mid-load
+  // release-window regression makes C (or the load) return within it.
   std::this_thread::sleep_for(200ms);
-  REQUIRE(callReturned.load() == false);
+  REQUIRE(monReturned.load() == false);
   REQUIRE(loadReturned.load() == false);
 
   // Release onLoad -> it throws -> load fails -> _loadModulesMutex released.
@@ -200,15 +236,12 @@ TEST_CASE("F-4 concurrent callExportedApi serializes behind a blocking onLoad")
   REQUIRE(waitFor([&] { return loadReturned.load(); }, 5s));
   REQUIRE(loadResult.load() == false); // the load failed
 
-  // Now B's is-loaded gate proceeds, sees the module NOT loaded, and throws
-  // WITHOUT invoking the callable.
-  REQUIRE(waitFor([&] { return callReturned.load(); }, 5s));
-  REQUIRE(callThrew.load() == true);
-  REQUIRE(callInvoked.load() == false);
-  REQUIRE(callResult.load() == -1);
+  // Thread C now unblocks and reports the module NOT loaded.
+  REQUIRE(waitFor([&] { return monReturned.load(); }, 5s));
+  REQUIRE(monResult.load() == false);
 
-  // The failed module is not loaded and leaves no stale export. (threadGuard
-  // joins both threads on scope exit.)
+  // The failed module is not loaded and leaves no stale export. (threadGuard joins
+  // all threads on scope exit.)
   REQUIRE(svc.isModuleLoaded("blockingonloadplugin.so") == false);
   auto names = svc.getExportedApiNames();
   REQUIRE(std::find(names.begin(), names.end(), "blocking.call") == names.end());

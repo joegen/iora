@@ -432,6 +432,37 @@ if(TARGET iora_test_logger)
     target_compile_definitions(iora_test_logger PRIVATE IORA_ENABLE_TEST_HOOKS)
 endif()
 
+# The onLoad/onUnload callExportedApi self-deadlock test (tracker 2026-09-24-9)
+# is created EXPLICITLY (like the rpc client_pool block), NOT via SERVICE_TESTS:
+# it needs ONE add_test PER CASE (per-case [case_x] tag) so a genuine re-lock
+# deadlock in one case fails THAT case via its ctest TIMEOUT instead of _Exiting
+# the whole binary at the first hang. Compiled with -UNDEBUG so the 2.3a asserts
+# and case (q) are live even in the default Release build (-DNDEBUG). Added to
+# IORA_SANITIZED_TEST_TARGETS below; plugin dependencies wired after
+# add_subdirectory(plugins). Placed here, before the sanitizer loop.
+if(IORA_BUILD_SERVICE_TESTS AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/service/iora_test_onload_api_deadlock.cpp")
+    create_iora_test_target(iora_test_onload_api_deadlock
+        SOURCES service/iora_test_onload_api_deadlock.cpp)
+    target_include_directories(iora_test_onload_api_deadlock PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}) # test_helpers.hpp lives in tests/
+    target_link_libraries(iora_test_onload_api_deadlock PRIVATE ${CMAKE_DL_LIBS})
+    # -UNDEBUG AFTER the global flags so assert() is live in Release (the 2.3a
+    # try_lock precondition asserts + case (q) depend on it).
+    target_compile_options(iora_test_onload_api_deadlock PRIVATE -UNDEBUG)
+    # One ctest entry per case tag. FAIL_REGULAR_EXPRESSION guards the Catch2
+    # v2.13.10 "exit 0 on an empty filter" gap (a mistyped/absent tag must FAIL,
+    # not silently pass); never PASS_REGULAR_EXPRESSION. TIMEOUT 120 is the outer
+    # backstop behind the in-test bounded _Exit.
+    set(_onload_api_cases a b c d e f g h i j k l m n o p q r)
+    foreach(_case ${_onload_api_cases})
+        add_test(NAME service::onload_api_deadlock_case_${_case}
+            COMMAND iora_test_onload_api_deadlock "[case_${_case}]")
+        set_tests_properties(service::onload_api_deadlock_case_${_case} PROPERTIES
+            TIMEOUT 120 FAIL_REGULAR_EXPRESSION "No test cases matched")
+    endforeach()
+endif()
+
 # The init()-vs-teardown race test drives init()'s depth>0 branch and the
 # worker-generation race through the compile-gated park seams in logger.hpp
 # (pauseWorkerBeforeExitPublish / pauseTeardownAfterJoin / testInvokeAtHandlerDepth),
@@ -508,10 +539,11 @@ if(TEST service::iora_test_callexportedapi_gating)
     set_tests_properties(service::iora_test_callexportedapi_gating PROPERTIES TIMEOUT 120)
 endif()
 
-# The load-failure teardown test (tracker 2026-09-07-9, F-4) has a blocking-
-# onLoad liveness case; a monolithic-hold regression that wedged a caller must
-# FAIL via this TIMEOUT rather than hang the suite (the in-test bounded waits are
-# the first line; this is the outer backstop).
+# The load-failure teardown test (tracker 2026-09-07-9 F-4, re-scoped for SD-1
+# tracker 2026-09-24-9) has a blocking-onLoad liveness case; a regression that
+# wedged the isModuleLoaded thread (or a mid-load release window) must FAIL via
+# this TIMEOUT rather than hang the suite (the in-test bounded waits are the first
+# line; this is the outer backstop).
 if(TEST service::iora_test_loadfailure_teardown)
     set_tests_properties(service::iora_test_loadfailure_teardown PROPERTIES TIMEOUT 120)
 endif()
@@ -535,6 +567,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_timer_lifecycle
     iora_test_plugin_drain
     iora_test_callexportedapi_gating
+    iora_test_onload_api_deadlock
     iora_test_loadfailure_teardown
     iora_test_unload_teardown_exception
     iora_test_plugin
@@ -822,6 +855,18 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_callexportedapi_gating PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The onLoad/onUnload callExportedApi self-deadlock test (tracker 2026-09-24-9)
+    # dlopen's the configurable probe + baseplugin/dependentplugin at runtime;
+    # depend on them so a targeted build of the test also builds the .so's it loads.
+    if(TARGET iora_test_onload_api_deadlock)
+        foreach(_onload_plugin onloadapicallerplugin baseplugin dependentplugin)
+            if(TARGET ${_onload_plugin})
+                add_dependencies(iora_test_onload_api_deadlock ${_onload_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_onload_api_deadlock PRIVATE ${CMAKE_DL_LIBS})
     endif()
 
     # The load-failure teardown-hardening test (tracker 2026-09-07-9, F-4/S-2)

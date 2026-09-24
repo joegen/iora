@@ -70,6 +70,31 @@ TEST_CASE("Singleton isolation: Logger and IoraService shared across plugin boun
     REQUIRE(hostInstance == pluginInstance);
   }
 
+  SECTION("ownsLoadModulesMutex resolves to ONE thread_local instance host<->plugin")
+  {
+    // SD-2 (tracker 2026-09-24-9): the callExportedApi self-deadlock fix and every
+    // SD-2 owner-thread fail-fast select on this thread_local flag. A divergent
+    // plugin-.so copy would make a plugin-code caller's owns==true be read as
+    // owns==false in the host TU, re-opening the re-lock the fix removes. Defined
+    // once in iora_core.cpp (PAT-3); assert the INSTANCE, read on the caller's
+    // thread so both sides see the same thread's thread_local.
+    auto hostInstance = reinterpret_cast<std::uint64_t>(&iora::IoraService::ownsLoadModulesMutex());
+    auto pluginInstance =
+      svc.callExportedApi<std::uint64_t>("probe.ownsLoadModulesMutexInstanceAddr");
+    REQUIRE(hostInstance == pluginInstance);
+  }
+
+  SECTION("inFlightApiModules resolves to ONE thread_local instance host<->plugin")
+  {
+    // The self-unload guard's per-thread in-flight multiset (DP-7). A divergent
+    // plugin copy would make the unloader's self-unload check miss an in-flight
+    // call recorded in the caller's copy. Out-of-line singleton in iora_core.cpp.
+    auto hostInstance = reinterpret_cast<std::uint64_t>(&iora::IoraService::inFlightApiModules());
+    auto pluginInstance =
+      svc.callExportedApi<std::uint64_t>("probe.inFlightApiModulesInstanceAddr");
+    REQUIRE(hostInstance == pluginInstance);
+  }
+
   SECTION("Cross-boundary API calls work through shared IoraService")
   {
     auto loggerAddr = svc.callExportedApi<std::uint64_t>("probe.loggerAddr");

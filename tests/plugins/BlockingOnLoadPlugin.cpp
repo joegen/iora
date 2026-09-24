@@ -1,14 +1,15 @@
 // File: iora/tests/plugins/BlockingOnLoadPlugin.cpp
 //
-// DP-10b invariant probe (tracker 2026-09-07-9, F-4). Its onLoad exports an API
-// (so a concurrent host caller can RESOLVE it and reach the is-loaded gate),
-// then blocks holding _loadModulesMutex until the host releases it, then THROWS
-// (the load fails). This lets the host prove that a concurrent callExportedApi
-// is serialized behind the whole load (it must stay blocked on the is-loaded
-// gate's _loadModulesMutex acquire until the failed load unwinds). If a future
-// edit ever introduces a mid-load release window in loadSingleModule, the host's
-// "concurrent caller stays blocked" assertion fails — the mechanized guard for
-// the invariant that makes the load-failure drain unnecessary.
+// Blocking-onLoad probe (tracker 2026-09-07-9 F-4, re-scoped for SD-1 tracker
+// 2026-09-24-9). Its onLoad exports an API (so a concurrent host caller can
+// RESOLVE it), then blocks holding _loadModulesMutex until the host releases it,
+// then THROWS (the load fails). SD-1: callExportedApi no longer takes
+// _loadModulesMutex, so a concurrent call is REJECTED "not loaded" PROMPTLY (the
+// module is not yet markApiCallable'd) rather than serialized behind the load.
+// The RETAINED DP-10b guard is a concurrent non-owner isModuleLoaded, which still
+// takes _loadModulesMutex and so stays blocked until the failed load unwinds; if
+// a future edit introduces a mid-load release window in loadSingleModule, that
+// "stays blocked" assertion fails.
 #include "iora/iora.hpp"
 
 #include "blocking_onload_control.hpp"
@@ -23,10 +24,11 @@ public:
 
   void onLoad(iora::IoraService *svc) override
   {
-    // Export first so a concurrent caller can resolve the name and reach the
-    // is-loaded gate (step 1b of callExportedApi). Keyed by getIdentity()==_name,
-    // which loadSingleModule set BEFORE onLoad — so it is cleaned by the
-    // inner-catch removeExportsForModule when this load fails.
+    // Export first so a concurrent caller can resolve the name (SD-1: the
+    // admission gate then rejects it "not loaded" because the module is not yet
+    // markApiCallable'd). Keyed by getIdentity()==_name, which loadSingleModule set
+    // BEFORE onLoad — so it is cleaned by the inner-catch removeExportsForModule
+    // when this load fails.
     svc->exportApi(*this, "blocking.call", [](int x) { return x; });
 
     // Fetch the host-owned control block via a host-exported getter.
@@ -45,7 +47,8 @@ public:
       std::this_thread::yield();
     }
     // Intentional load failure AFTER the export, exercising the inner-catch
-    // cleanup while a concurrent caller is (was) blocked on the is-loaded gate.
+    // cleanup while a concurrent isModuleLoaded is (was) blocked on _loadModulesMutex
+    // and a concurrent callExportedApi was rejected "not loaded".
     throw std::runtime_error("BlockingOnLoadPlugin: intentional onLoad failure after unblock");
   }
 
