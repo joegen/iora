@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -74,34 +75,26 @@ struct SpawnOptions
   /// Redirect stderr to file
   std::string stderrFile;
 
-  /// Close stdin (redirect to /dev/null)
-  /// Useful for background processes that should not read from TTY
+  /// Close stdin (redirect to /dev/null). Currently ignored: the child always
+  /// inherits the parent's stdin.
   bool closeStdin = false;
 
   /// Create new process group
   bool createProcessGroup = true;
 
-  /// Kill entire process group on termination (default true)
-  /// When enabled, signals are sent to the entire process group (-pgid)
-  /// instead of just the parent process. This ensures child processes
-  /// spawned by shell commands are also terminated.
-  ///
-  /// Note: Only effective when createProcessGroup is true. If createProcessGroup
-  /// is false, the process is not in its own group, so only the PID is killed.
-  ///
-  /// IMPORTANT: This is a behavior change from previous versions. To restore
-  /// the old behavior (kill only parent process), set this to false.
-  ///
-  /// Known limitation: In rare cases, if the process exits and its PID is
-  /// reused between the existence check and kill() call, signals may be
-  /// sent to the wrong process group. This is an inherent POSIX limitation.
+  /// Destructor kills the entire process group (default true): the destructor's
+  /// SIGKILL goes to -pgid instead of the PID, so children the shell spawned die
+  /// too -- provided the leader is still alive at destruction and leads its own
+  /// group (createProcessGroup); otherwise only the PID is signalled, never the
+  /// caller's own group. terminate(), kill(), signal() and the Graceful
+  /// escalation always target the PID only.
   bool killProcessGroup = true;
 
   /// Termination strategy on handle destruction
   enum class TerminationStrategy
   {
-    Graceful,  // SIGTERM → wait → SIGKILL (default)
-    Immediate, // SIGKILL immediately
+    Graceful,  // SIGKILL (not SIGTERM), then wait up to 5s + 1s to reap (default)
+    Immediate, // SIGKILL, then wait up to 1s to reap
     None       // Detach process, no termination
   };
 
@@ -110,10 +103,12 @@ struct SpawnOptions
 
 /// \brief RAII handle for background process lifecycle management.
 ///
-/// ProcessHandle provides automatic process termination on scope exit,
-/// ensuring no orphaned processes even during exceptions. Supports
-/// graceful termination (SIGTERM → SIGKILL), process state queries,
-/// and timeout-based waiting.
+/// ProcessHandle terminates the process on scope exit, including during
+/// exceptions: SIGKILL (to the PID or its process group) followed by a bounded
+/// reap, while the process is still running. The PID is that of the /bin/sh -c
+/// wrapper unless the command is exec'd (dash never execs a -c command in place;
+/// bash does for a simple command). Also supports state queries and
+/// timeout-based waiting.
 class ProcessHandle
 {
 public:
@@ -129,9 +124,9 @@ public:
   /// Result of wait() operation
   struct WaitResult
   {
-    bool exited = false;      // True if process exited
-    int exitCode = 0;         // Exit code (if exited == true)
-    int signal = 0;           // Signal number (if signaled)
+    bool exited = false;      // True once reaped -- also when a signal killed it (use state)
+    int exitCode = 0;         // Exit code (when state == State::Exited)
+    int signal = 0;           // Signal number (when state == State::Signaled)
     bool timedOut = false;    // True if wait timed out
     State state = State::Unknown; // Final process state
   };
@@ -162,8 +157,7 @@ public:
     }
     catch (...)
     {
-      // Cannot throw from destructor - silent failure
-      // Note: Errors during cleanup are logged silently to prevent std::terminate
+      // Cannot throw from a destructor: any failure is swallowed (nothing is logged)
     }
   }
 
@@ -209,8 +203,7 @@ public:
     }
     catch (...)
     {
-      // Cannot throw from noexcept move assignment - silent failure
-      // Note: Errors during move are logged silently to prevent std::terminate
+      // Cannot throw from noexcept move assignment: any failure is swallowed (nothing is logged)
     }
     return *this;
   }
@@ -296,7 +289,7 @@ public:
   }
 
   /// \brief Wait for process to exit.
-  /// \param timeout Maximum time to wait (0 = wait forever).
+  /// \param timeout Maximum time to wait (<= 0 = wait forever).
   /// \return WaitResult with exit status.
   WaitResult wait(std::chrono::milliseconds timeout = std::chrono::milliseconds(0))
   {
@@ -305,15 +298,6 @@ public:
       WaitResult result;
       result.state = State::Unknown;
       return result;
-    }
-
-    // Check if we already have a cached result
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (_cachedWaitResult.has_value())
-      {
-        return _cachedWaitResult.value();
-      }
     }
 
     auto startTime = std::chrono::steady_clock::now();
@@ -326,6 +310,11 @@ public:
       // CRITICAL: Only hold mutex during waitpid and cache update
       {
         std::lock_guard<std::mutex> lock(_mutex);
+        // Another thread may have reaped the child while this one slept.
+        if (_cachedWaitResult.has_value())
+        {
+          return _cachedWaitResult.value();
+        }
         result = waitpidWithEINTR(_pid, &status, WNOHANG);
 
         if (result == _pid)
@@ -364,35 +353,25 @@ public:
     }
   }
 
-  /// \brief Send SIGKILL to process (was SIGTERM, changed to avoid Catch2 signal handler issues).
+  /// \brief Same as kill(): SIGKILL to the PID only (not its group, regardless of
+  /// killProcessGroup). Was SIGTERM; changed to avoid Catch2 signal handler issues.
+  ///
+  /// Known limitation (terminate/kill/signal): the PID is the /bin/sh -c wrapper,
+  /// so the command itself survives unless the shell exec'd it; and these do not
+  /// consult the cached wait result, so after wait()/isRunning()/getState() (or a
+  /// foreign reaper) has reaped the child, the PID may have been reused and the
+  /// signal can reach an unrelated process.
   bool terminate()
   {
-    if (_pid <= 0)
-    {
-      return false;
-    }
-    // MAJOR FIX #7: Add basic PID validation
-    if (::kill(_pid, 0) != 0)
-    {
-      return false; // Process doesn't exist
-    }
-
-    // WORKAROUND: Use SIGKILL instead of SIGTERM to avoid Catch2's signal handler
-    // catching the signal and causing test failures. SIGKILL cannot be caught/forwarded.
-    return ::kill(_pid, SIGKILL) == 0;
+    return kill();
   }
 
-  /// \brief Send SIGKILL to process.
+  /// \brief Send SIGKILL to the process PID only.
   bool kill()
   {
-    if (_pid <= 0)
+    if (!pidExists())
     {
       return false;
-    }
-    // MAJOR FIX #7: Add basic PID validation
-    if (::kill(_pid, 0) != 0)
-    {
-      return false; // Process doesn't exist
     }
 
     // Send SIGKILL to the process
@@ -402,14 +381,9 @@ public:
   /// \brief Send arbitrary signal to process.
   bool signal(int sig)
   {
-    if (_pid <= 0)
+    if (!pidExists())
     {
       return false;
-    }
-    // MAJOR FIX #7: Add basic PID validation
-    if (::kill(_pid, 0) != 0)
-    {
-      return false; // Process doesn't exist
     }
     return ::kill(_pid, sig) == 0;
   }
@@ -422,17 +396,15 @@ public:
     _detached = true;
   }
 
-  /// \brief Wait until process is fully started and ready.
-  /// \param timeout Maximum time to wait for process to become ready.
-  /// \return True if process is ready, false if timeout or process doesn't exist.
+  /// \brief Wait until the PID exists (existence check only, not readiness).
+  /// \param timeout Maximum time to wait.
+  /// \return True once the PID exists (an unreaped zombie counts), false on
+  /// timeout or if the handle has no PID.
   ///
-  /// This method polls the process state to verify it exists and is running.
-  /// Use this after spawn() to ensure the process has fully started before
-  /// performing operations that depend on the process being ready.
-  ///
-  /// Note: For shell-wrapped commands (spawned via /bin/sh -c), this only checks
-  /// if the shell wrapper PID exists. To wait for the actual command to appear,
-  /// use waitForCommandPattern() instead.
+  /// This method polls kill(pid, 0) until the PID exists. It is an existence
+  /// check only, not a readiness check: an exited but not yet reaped (zombie)
+  /// child also passes, so it does not prove the exec succeeded, and for a
+  /// /bin/sh -c wrapper it says nothing about the command itself.
   bool waitUntilReady(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000))
   {
     if (_pid <= 0)
@@ -445,8 +417,8 @@ public:
 
     while (true)
     {
-      // Check if process exists using kill with signal 0 (no signal sent, just existence check)
-      if (::kill(_pid, 0) == 0)
+      // Existence check only (kill(pid, 0)); a zombie also passes
+      if (pidExists())
       {
         // Process exists and is ready
         return true;
@@ -471,19 +443,10 @@ public:
   /// \param timeout Maximum time to wait for command to appear.
   /// \return True if command found in process table, false if timeout.
   ///
-  /// This method is useful when spawning commands via shell wrapper (e.g., /bin/sh -c).
-  /// The shell wrapper PID exists immediately, but takes time to spawn the actual
-  /// command as a child process. This method waits until the actual command appears
-  /// in the process table by polling for a pattern derived from the stored command.
-  ///
-  /// Example:
-  /// \code
-  ///   auto proc = ShellRunner::spawn("sleep 100");
-  ///   // Wait for the actual "sleep" command to appear, not just the shell wrapper
-  ///   if (proc.waitForCommandReady()) {
-  ///     // Now safe to perform operations that depend on the command running
-  ///   }
-  /// \endcode
+  /// Polls /proc for any process whose command line contains both "sh" and the
+  /// spawned command string. The sh -c wrapper itself matches, so this normally
+  /// returns true almost at once; it does not prove the command is running, let
+  /// alone ready (and once sh execs the command the pattern no longer matches).
   bool waitForCommandReady(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000))
   {
     if (_pid <= 0 || _command.empty())
@@ -506,7 +469,7 @@ public:
         {
           // Check if directory name is a number (PID)
           std::string name = entry->d_name;
-          if (!name.empty() && std::isdigit(name[0]))
+          if (!name.empty() && std::isdigit(static_cast<unsigned char>(name[0])))
           {
             // Read command line from /proc/[pid]/cmdline
             std::string cmdlinePath = "/proc/" + name + "/cmdline";
@@ -589,6 +552,35 @@ private:
   mutable std::optional<WaitResult> _cachedWaitResult;
   mutable std::mutex _mutex;
 
+  /// \brief True if the PID is set and kill(pid, 0) succeeds (a zombie counts).
+  bool pidExists() const
+  {
+    return _pid > 0 && ::kill(_pid, 0) == 0;
+  }
+
+  /// \brief SIGKILL the process for cleanup: its whole group when
+  /// killProcessGroup is set and the child leads its own group, else the PID.
+  /// A child spawned with createProcessGroup=false shares the caller's group,
+  /// and -pgid would then SIGKILL the caller itself. Called with _mutex held.
+  void killForCleanup() const noexcept
+  {
+    // Both callers run this right after waitpid(_pid, WNOHANG) returned 0 under
+    // _mutex, so _pid is an unreaped child of this process -- but not necessarily
+    // this handle's child if the handle already reaped it and the PID was reused,
+    // or if something outside the handle reaps it concurrently (SR-11). The guard
+    // only guarantees the target is never the caller's own group: the caller's
+    // group ID names a live group, so it can never equal a child's PID -- unless
+    // the caller has since moved itself into the child's group.
+    if (_killProcessGroup && getpgid(_pid) == _pid)
+    {
+      ::kill(-_pid, SIGKILL);
+    }
+    else
+    {
+      ::kill(_pid, SIGKILL);
+    }
+  }
+
   /// \brief Cleanup helper - performs termination based on strategy.
   /// \note Called by destructor and move assignment operator.
   void cleanupProcess() noexcept
@@ -611,33 +603,11 @@ private:
 
         if (result == 0) // Process is running
         {
-          // WORKAROUND: Use SIGKILL instead of SIGTERM to avoid signal propagation issues
-          // with /bin/dash shell when process is in its own session
-          if (_pid > 0 && ::kill(_pid, 0) == 0)
-          {
-            if (_killProcessGroup)
-            {
-              // Kill entire process group to terminate child processes
-              pid_t pgid = getpgid(_pid);
-              if (pgid > 0)
-              {
-                ::kill(-pgid, SIGKILL);  // Negative PID sends to entire process group
-              }
-              else
-              {
-                // Fallback: kill just the PID if getpgid fails
-                // This handles the race where the process died between checks
-                ::kill(_pid, SIGKILL);
-              }
-            }
-            else
-            {
-              // Kill only the specific PID
-              ::kill(_pid, SIGKILL);
-            }
-          }
+          // SIGKILL, not SIGTERM: a historical workaround for SIGTERM delivery to
+          // the sh wrapper (see TerminationStrategy::Graceful).
+          killForCleanup();
 
-          // Wait with timeout for graceful shutdown
+          // Reap with a timeout
           auto startTime = std::chrono::steady_clock::now();
           auto timeout = std::chrono::seconds(5);
 
@@ -656,8 +626,8 @@ private:
 
             if (elapsed >= timeout)
             {
-                // Timeout - escalate to SIGKILL
-              if (_pid > 0 && ::kill(_pid, 0) == 0)
+              // Timeout - re-send SIGKILL, to the PID only
+              if (pidExists())
               {
                 ::kill(_pid, SIGKILL);
               }
@@ -718,30 +688,7 @@ private:
 
         if (result == 0) // Process is running
         {
-          // Send SIGKILL
-          if (_pid > 0 && ::kill(_pid, 0) == 0)
-          {
-            if (_killProcessGroup)
-            {
-              // Kill entire process group to terminate child processes
-              pid_t pgid = getpgid(_pid);
-              if (pgid > 0)
-              {
-                ::kill(-pgid, SIGKILL);  // Negative PID sends to entire process group
-              }
-              else
-              {
-                // Fallback: kill just the PID if getpgid fails
-                // This handles the race where the process died between checks
-                ::kill(_pid, SIGKILL);
-              }
-            }
-            else
-            {
-              // Kill only the specific PID
-              ::kill(_pid, SIGKILL);
-            }
-          }
+          killForCleanup();
 
           // Wait with timeout for termination
           auto startTime = std::chrono::steady_clock::now();
@@ -1050,7 +997,7 @@ public:
     {
       // Check if directory name is a number (PID)
       std::string name = entry->d_name;
-      if (name.empty() || !std::isdigit(name[0]))
+      if (name.empty() || !std::isdigit(static_cast<unsigned char>(name[0])))
       {
         continue;
       }
@@ -1164,7 +1111,7 @@ public:
 
   /// \brief Wait for specific process.
   /// \param pid Process ID to wait for.
-  /// \param timeout Maximum time to wait (0 = wait forever).
+  /// \param timeout Maximum time to wait (<= 0 = wait forever).
   /// \return WaitResult with exit status.
   static ProcessHandle::WaitResult waitForProcess(
     pid_t pid, std::chrono::milliseconds timeout = std::chrono::milliseconds(0))
@@ -1245,9 +1192,11 @@ public:
   /// \param pgid Process group ID.
   /// \param sig Signal to send (default: SIGKILL).
   /// \return True if signal was sent successfully.
+  /// \note pgid 1 is refused: kill(-1, sig) is a broadcast to every process
+  /// the caller may signal, not "process group 1".
   static bool killProcessGroup(pid_t pgid, int sig = SIGKILL)
   {
-    if (pgid <= 0)
+    if (pgid <= 1)
     {
       return false;
     }
@@ -1323,7 +1272,7 @@ private:
   [[noreturn]] static void childProcessSetup(const std::string &command,
                                              const SpawnOptions &options)
   {
-    // Create new process group if requested AND new session for better isolation
+    // New process group (and, if setsid() wins the race, a new session)
     if (options.createProcessGroup)
     {
       // CRITICAL: Reset signal handlers to default BEFORE setsid()
@@ -1332,13 +1281,12 @@ private:
       signal(SIGINT, SIG_DFL);
       signal(SIGHUP, SIG_DFL);
 
-      // Use setsid() instead of setpgid() to create a new session
-      // This provides better isolation from the parent's signal handling
+      // Try for a new session. The parent's setpgid(pid, pid) usually wins the
+      // race, making this child a group leader so setsid() fails (EPERM) and it
+      // stays in the caller's session with its own process group.
       if (setsid() == -1)
       {
-        // setsid() can fail if we're already a process group leader
-        // In that case, try setpgid as fallback
-        setpgid(0, 0);
+        setpgid(0, 0); // fallback
       }
     }
 
@@ -1350,14 +1298,21 @@ private:
       {
         _exit(127); // Exit if file open fails
       }
-      // MAJOR FIX #5: Add fcntl() fallback for O_CLOEXEC
-      fcntl(fd, F_SETFD, FD_CLOEXEC);
-      if (dup2(fd, STDOUT_FILENO) < 0)
+      if (fd == STDOUT_FILENO)
       {
-        close(fd);
-        _exit(127); // Exit if dup2 fails
+        // The parent had this fd closed, so open() reused it: keep it, and
+        // clear O_CLOEXEC so it survives exec (dup2 onto itself would not).
+        fcntl(fd, F_SETFD, 0);
       }
-      close(fd);
+      else
+      {
+        if (dup2(fd, STDOUT_FILENO) < 0)
+        {
+          close(fd);
+          _exit(127); // Exit if dup2 fails
+        }
+        close(fd);
+      }
     }
 
     // Redirect stderr
@@ -1368,18 +1323,25 @@ private:
       {
         _exit(127); // Exit if file open fails
       }
-      // MAJOR FIX #5: Add fcntl() fallback for O_CLOEXEC
-      fcntl(fd, F_SETFD, FD_CLOEXEC);
-      if (dup2(fd, STDERR_FILENO) < 0)
+      if (fd == STDERR_FILENO)
       {
-        close(fd);
-        _exit(127); // Exit if dup2 fails
+        // The parent had this fd closed, so open() reused it: keep it, and
+        // clear O_CLOEXEC so it survives exec (dup2 onto itself would not).
+        fcntl(fd, F_SETFD, 0);
       }
-      close(fd);
+      else
+      {
+        if (dup2(fd, STDERR_FILENO) < 0)
+        {
+          close(fd);
+          _exit(127); // Exit if dup2 fails
+        }
+        close(fd);
+      }
     }
 
-    // MAJOR FIX #6: Replace setenv() with execve() for async-signal-safety
-    // Build environment array for execve
+    // Build the environment array for execve (allocates after fork; see the
+    // async-signal-safety note in the ShellRunner guide)
     std::vector<std::string> envStrings;
     std::vector<char*> envp;
 

@@ -370,6 +370,12 @@
         "ids/uuid.hpp"
       ]
     },
+    "system/shell_runner.md": {
+      "area": "system",
+      "headers": [
+        "system/shell_runner.hpp"
+      ]
+    },
     "common/i_lifecycle_managed.md": {
       "area": "common",
       "headers": [

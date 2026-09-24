@@ -230,7 +230,7 @@ Each guide opens with a `Back to index` link to this README. The header-to-guide
 ### crypto / ids / system / common
 - **SecureRng** — OpenSSL-backed secure random bytes plus the SHA-1 / SHA-256 / HMAC-SHA-256 one-shot helpers — [`docs/crypto/secure_rng.md`](docs/crypto/secure_rng.md)
 - **Uuid** — RFC 9562 v4 (random) and v7 (Unix-ms time-ordered) UUID strings — [`docs/ids/uuid.md`](docs/ids/uuid.md)
-- **ShellRunner** — `docs/system/` _(planned)_
+- **ShellRunner** — shell command execution and RAII background-process management (`ProcessHandle`) — [`docs/system/shell_runner.md`](docs/system/shell_runner.md)
 - **ILifecycleManaged** — the start / drain / stop / reset lifecycle contract implemented by `ThreadPool` and `TimerService` — [`docs/common/i_lifecycle_managed.md`](docs/common/i_lifecycle_managed.md)
 
 ---
