@@ -107,6 +107,15 @@ public:
                                            std::uint16_t port) = 0;
   virtual bool close(SessionId sid) = 0;
 
+  /// \brief Is \p sid live for observer purposes — an open (present, not-closed)
+  /// session OR a sid still connecting (connect()/connectViaListener() returned it,
+  /// setup pending)? Read under the same session lock as the engine's sendability
+  /// check. Transport::observe() queries this to hand the close terminal off exactly
+  /// once: the map/registry-presence check is the load-bearing synchronizer paired
+  /// with the "liveness cleared happens-before onClose" invariant. NO default — a
+  /// `true` default would leak observers, a `false` default would self-fire them.
+  virtual bool isSessionLive(SessionId sid) const = 0;
+
   // Data operations (raw pointer — Transport wraps in BufferView at the public API level)
   virtual bool send(SessionId sid, const void *data, std::size_t len) = 0;
 

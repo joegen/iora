@@ -595,7 +595,9 @@ TEST_CASE("stop() with sends queued on a connecting (inserted) sid: exactly one 
 
   REQUIRE(client.stopAndCountCloses(cr.value()) == 1);
   const auto code = client.closeInfo(cr.value()).code;
-  REQUIRE((code == TransportError::ShuttingDown || code == TransportError::Unknown));
+  // A6.4 (A-ext): the session drain now reports ShuttingDown uniformly (was
+  // Unknown "shutdown"), matching the pending drain.
+  REQUIRE(code == TransportError::ShuttingDown);
   REQUIRE(client.tx->getStats().bytesOut == 0);
   REQUIRE(TA::connectingCount(*client.tx) == 0);
 }

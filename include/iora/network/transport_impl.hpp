@@ -83,6 +83,47 @@ struct Transport::Impl
   std::unordered_map<ObserverId, SessionId> observerToSession;
   std::atomic<ObserverId> nextObserverId{1};
 
+  /// \brief Erase observer \p id from BOTH observer maps (steps-4-8 R1 simp-M4: the
+  /// single implementation shared by unobserve() and observe()'s reclaim path —
+  /// cleaning only `observers` would leak `observerToSession[id]` forever since sid is
+  /// monotonic). The CALLER MUST hold observerMutex. If \p outCb is non-null, the
+  /// removed callback is captured into it before erasure. Returns true iff \p id was
+  /// present.
+  bool eraseObserverLocked(ObserverId id, CloseCallback *outCb = nullptr)
+  {
+    auto sessIt = observerToSession.find(id);
+    if (sessIt == observerToSession.end())
+    {
+      return false;
+    }
+    SessionId sid = sessIt->second;
+    observerToSession.erase(sessIt);
+    auto obsIt = observers.find(sid);
+    if (obsIt != observers.end())
+    {
+      auto &vec = obsIt->second;
+      if (outCb)
+      {
+        for (auto &p : vec)
+        {
+          if (p.first == id)
+          {
+            *outCb = p.second;
+            break;
+          }
+        }
+      }
+      vec.erase(std::remove_if(vec.begin(), vec.end(),
+                               [id](const auto &p) { return p.first == id; }),
+                vec.end());
+      if (vec.empty())
+      {
+        observers.erase(obsIt);
+      }
+    }
+    return true;
+  }
+
   // Lock order 4: Protects user data map (_sessionData).
   // Acquired by: setSessionData(), getSessionData(), and close handler
   //   (to extract and remove data before cleanup invocation).
@@ -545,7 +586,15 @@ struct Transport::Impl
       }
       if (closeCb)
       {
-        closeCb(sid, reason);
+        // A6.3: guard the global onClose so a throwing handler cannot skip the
+        // observer section below (which delivers the observe() exactly-once terminal).
+        try
+        {
+          closeCb(sid, reason);
+        }
+        catch (...)
+        {
+        }
       }
 
       // 3-5. Invoke per-session observers (copy-then-iterate, HR-7)
@@ -568,7 +617,15 @@ struct Transport::Impl
       {
         if (obsCb)
         {
-          obsCb(sid, reason);
+          // A6.3: guard each observer so a throwing one does not skip the remaining
+          // observers or the receiveSync wakeup below.
+          try
+          {
+            obsCb(sid, reason);
+          }
+          catch (...)
+          {
+          }
         }
       }
 
@@ -891,6 +948,12 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   // registered (onConnect fires after the I/O thread inserts it), so the returned
   // sid is immediately usable by a subsequent sync send. Otherwise the enqueue-time
   // sessionSendable check (CF-H1) would race the async UDP session insert (F-1).
+  // A3.2 (A-ext) note: the UDP engine now also keeps a connect()'d sid in its
+  // _connecting registry until insert, so sessionSendable is true throughout the
+  // parking window — but connectSync still WAITS for onConnect so the caller gets a
+  // fully-registered session. This parking is on the connectSync consumer path
+  // (HttpClient etc.); SipUdpTransport does NOT use connectSync (it uses the async
+  // connectViaListener + sendSync), so no SIP UDP send-semantics depend on it.
   timeout = _impl->resolveSyncTimeout(timeout);
 
   // Acquire syncMutex BEFORE calling engine->connect(). This ensures the
@@ -1456,37 +1519,73 @@ inline void Transport::onError(ErrorCallback cb)
 
 inline ObserverId Transport::observe(SessionId sid, CloseCallback cb)
 {
+  // A6.2: race-free observe. Register the observer, RELEASE observerMutex, then ask
+  // the engine whether the session is still live (isSessionLive takes the engine's
+  // own session lock; A2.1: liveness is cleared happens-before the engine's onClose,
+  // which is where the close handler copies-then-fires observers). Exactly-once
+  // handoff:
+  //   - live  -> the close handler will fire this observer later; return the id.
+  //   - not live -> re-take observerMutex and try to reclaim OUR entry. If it is
+  //     still present, the close handler did NOT take it, so THIS call owns the
+  //     terminal and delivers it asynchronously (never inline — observe() may be
+  //     called under a caller lock, e.g. SseServer::_mutex). If it is absent, the
+  //     close handler already took it and will fire it; return the id.
   ObserverId id = _impl->nextObserverId.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lk(_impl->observerMutex);
-  _impl->observers[sid].emplace_back(id, std::move(cb));
-  _impl->observerToSession[id] = sid;
-  return id;
+  {
+    std::lock_guard<std::mutex> lk(_impl->observerMutex);
+    _impl->observers[sid].emplace_back(id, cb); // keep a copy of cb for the owned-terminal path
+    _impl->observerToSession[id] = sid;
+  }
+
+  if (_impl->engine && _impl->engine->isSessionLive(sid))
+  {
+    return id; // live: the close handler owns the terminal
+  }
+
+  // Not live: try to reclaim our own entry from BOTH maps in one critical section
+  // (cleaning only observers[sid] would leak observerToSession[id] forever, since
+  // sid is monotonic and never revisited).
+  CloseCallback ownedCb;
+  bool ownsTerminal = false;
+  {
+    std::lock_guard<std::mutex> lk(_impl->observerMutex);
+    // simp-M4: same map-surgery as unobserve(), capturing the callback for delivery.
+    ownsTerminal = _impl->eraseObserverLocked(id, &ownedCb);
+  }
+
+  if (!ownsTerminal)
+  {
+    // The close handler took our entry between the register and the reclaim; it will
+    // fire it. Return the real id (unobserve may find it already gone / in flight).
+    return id;
+  }
+
+  // We own the terminal. Deliver it ASYNC on the I/O thread — NEVER inline on the
+  // caller (observe() runs under SseServer::_mutex on the SSE upgrade path).
+  //   - post succeeds  -> return the REAL id (callback fires async, entry already
+  //                       removed; unobserve(id)==false = "may be in flight").
+  //   - engine gone / not running / post fails (queue closed) -> sentinel 0:
+  //                       "already closed; callback not retained, not invoked".
+  if (!_impl->engine || !_impl->engine->isRunning())
+  {
+    return 0;
+  }
+  const SessionId sidCopy = sid;
+  bool posted = _impl->engine->runOnIoThread(
+    [cbCopy = std::move(ownedCb), sidCopy]() mutable
+    {
+      if (cbCopy)
+      {
+        cbCopy(sidCopy, TransportErrorInfo{TransportError::Unknown, "session already closed", 0, 0});
+      }
+    });
+  return posted ? id : static_cast<ObserverId>(0);
 }
 
 inline bool Transport::unobserve(ObserverId id)
 {
   std::lock_guard<std::mutex> lk(_impl->observerMutex);
-  auto sessIt = _impl->observerToSession.find(id);
-  if (sessIt == _impl->observerToSession.end())
-  {
-    return false;
-  }
-  SessionId sid = sessIt->second;
-  _impl->observerToSession.erase(sessIt);
-
-  auto obsIt = _impl->observers.find(sid);
-  if (obsIt != _impl->observers.end())
-  {
-    auto &vec = obsIt->second;
-    vec.erase(std::remove_if(vec.begin(), vec.end(),
-                             [id](const auto &p) { return p.first == id; }),
-              vec.end());
-    if (vec.empty())
-    {
-      _impl->observers.erase(obsIt);
-    }
-  }
-  return true;
+  return _impl->eraseObserverLocked(id); // simp-M4: shared map-surgery
 }
 
 // ── Session Introspection ────────────────────────────────────────────────────

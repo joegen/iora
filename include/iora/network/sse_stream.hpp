@@ -407,10 +407,15 @@ inline void upgradeToSse(HttpServer &server, const HttpServer::Request &req,
   // bounded drain wait and race _transport.reset() (also under _mutex), so an
   // unguarded raw deref here would be a use-after-free (the defect class of
   // tracker 2026-05-30-2). _mutex is the outermost lock; setReadMode/observe take
-  // only the transport's own internal locks, so no inversion. The observer
-  // closure must NOT be invoked under _mutex — but observe() only REGISTERS it
-  // (the engine dispatches markClosed later, lock-free), so registration under
-  // _mutex is safe.
+  // only the transport's own internal locks, so no inversion. The observer closure
+  // must NOT be invoked under _mutex — observe() honors that (A6.2): it either
+  // registers the closure (engine dispatches markClosed later, lock-free) OR, if the
+  // session is ALREADY closed, delivers the terminal ASYNC on the I/O thread and
+  // returns sentinel 0. In the sentinel-0 case the closure is neither retained nor
+  // invoked, so this call must mark the stream closed itself — but only AFTER
+  // releasing _mutex (calling markClosed under _mutex is safe, but we keep the
+  // terminal off the lock for uniformity with the callback path).
+  bool observeReturnedSentinel = false;
   {
     std::lock_guard<std::mutex> lock(server._mutex);
     if (server._transport && !server._shutdown)
@@ -421,10 +426,18 @@ inline void upgradeToSse(HttpServer &server, const HttpServer::Request &req,
       // Step 5 (thread-H1/H2/M3): register the disconnect observer. The closure
       // captures the shared_ptr BY VALUE (strong ref) so the stream survives an
       // in-flight publish; the engine auto-purges per-session observers on close,
-      // so no explicit unobserve is needed. The returned ObserverId is discarded.
-      server._transport->observe(
+      // so no explicit unobserve is needed. A6.2: capture the ObserverId — sentinel
+      // 0 means the session was already closed and the closure was NOT retained.
+      ObserverId oid = server._transport->observe(
         req.sid, [stream](SessionId, const TransportErrorInfo &) { stream->markClosed(); });
+      observeReturnedSentinel = (oid == 0);
     }
+  }
+  if (observeReturnedSentinel)
+  {
+    // The session closed before/at observe(); the closure will never fire. Mark the
+    // stream closed here (outside server._mutex — no re-entrant deadlock).
+    stream->markClosed();
   }
 
   // Step 6 (RD-1/H-5): suppress the worker's terminal response — clean

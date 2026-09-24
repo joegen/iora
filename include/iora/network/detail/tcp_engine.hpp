@@ -452,10 +452,6 @@ public:
   /// \brief Queue a send on a session (non-blocking; may enqueue on EAGAIN).
   bool send(SessionId sid, const void *data, std::size_t n) override
   {
-    if (n == 0)
-    {
-      return true;
-    }
     // CF-H1: reject an unknown/closed session at enqueue time rather than
     // enqueuing a command doSend would silently drop (which returned true —
     // masking a dead connection from SIP RFC 3263 failover). A sid returned by
@@ -463,10 +459,17 @@ public:
     // session is established (TLS: until handshake Open) and setup failures
     // surface only via onClose. true means accepted, not delivered; a close
     // queued before this Send drops it (accepted TOCTOU); a stream write-queue
-    // overflow closes the session (WriteBackpressure).
+    // overflow closes the session (WriteBackpressure). steps-4-8 R2 (simp): the
+    // sendability check precedes the n==0 short-circuit (matching sendAsync + the
+    // UDP trySend) so a 0-length send to an unknown sid reports failure, not a
+    // spurious true.
     if (!sessionSendable(sid))
     {
       return false;
+    }
+    if (n == 0)
+    {
+      return true;
     }
     return enqueueSend(sid, data, n);
   }
@@ -554,8 +557,9 @@ public:
     {
       if (cb)
       {
-        cb(sid,
-           SendResult::err(TransportErrorInfo{TransportError::Socket, "session not connected"}));
+        // A3.3: structured NotConnected (was Socket "session not connected").
+        cb(sid, SendResult::err(
+                  TransportErrorInfo{TransportError::NotConnected, "session not connected"}));
       }
       return;
     }
@@ -568,7 +572,12 @@ public:
       }
       else
       {
-        cb(sid, SendResult::err(TransportErrorInfo{TransportError::Socket, "send enqueue failed"}));
+        // A3.3: an enqueue failure (queue closed at teardown) also reports the
+        // structured NotConnected (was Socket "send enqueue failed") — the session
+        // is unreachable. Unifying both failures avoids a close racing between the
+        // sendability check and the enqueue reporting the wrong code.
+        cb(sid, SendResult::err(
+                  TransportErrorInfo{TransportError::NotConnected, "session not connected"}));
       }
     }
   }
@@ -844,6 +853,18 @@ private:
       return true;
     }
     return _connecting.find(sid) != _connecting.end();
+  }
+
+  /// \brief Is \p sid live for observer purposes: an open session OR still
+  /// connecting? Read under the SAME lock as sessionSendable (_sessionRwMutex) — the
+  /// map/registry-presence check is the load-bearing synchronizer for
+  /// Transport::observe()'s exactly-once terminal handoff (A2.1: liveness cleared
+  /// happens-before onClose). See EngineBase::isSessionLive.
+  bool isSessionLive(SessionId sid) const override
+  {
+    // steps-4-8 R1 simp-M3: identical predicate to sessionSendable — delegate (one
+    // source of truth; the two names document "may I send" vs "alive for observers").
+    return sessionSendable(sid);
   }
 
   /// \brief Copy \p n > 0 bytes into a Send command and enqueue it (no
@@ -1728,8 +1749,10 @@ private:
       // already released above, so a throw here loses at most one onClose.
       try
       {
+        // A6.4: session drain reports ShuttingDown (was Unknown "shutdown"), matching
+        // the pending drain (preInsertTerminal ShuttingDown) for a uniform drain code.
         invokeUserCallback(copyCallback(_cbMutex, _cbs.onClose), s->id,
-                           TransportErrorInfo{TransportError::Unknown, "shutdown", 0, 0});
+                           TransportErrorInfo{TransportError::ShuttingDown, "shutdown", 0, 0});
       }
       catch (...)
       {
@@ -1842,6 +1865,23 @@ private:
         try
         {
           preInsertTerminal(c.c.sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown", 0, 0});
+        }
+        catch (...)
+        {
+        }
+      }
+      else if (c.t == Cmd::RunOnIo && c.fn)
+      {
+        // A6.3 (A-ext steps-4-8 R1 H1): INVOKE residual RunOnIo closures — do NOT
+        // drop them. A Transport::observe() owned-terminal is delivered via
+        // runOnIoThread; one posted in the post-process()/pre-_cmdsClosed window
+        // lands here as a residual command. Dropping it strands the observer callback
+        // (zero fires, breaking A6.2 exactly-once) and leaks the SSE stream.
+        // _cmdsClosed is already set, so it runs against a dead queue safely (a
+        // stranded resolver resume no-ops — _pendingConnects is drained). Guarded.
+        try
+        {
+          c.fn();
         }
         catch (...)
         {

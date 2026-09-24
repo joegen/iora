@@ -337,7 +337,9 @@ TEST_CASE("C4/CF-H1: sendSync to an unknown/closed session returns an error",
                        iora::core::BufferView{reinterpret_cast<const std::uint8_t *>(msg), 1},
                        500ms);
   REQUIRE(r.isErr());
-  REQUIRE(r.error().code == TransportError::Socket); // "session not connected" (CF-H1)
+  // A3.3 (A-ext): a send to an unknown/closed session now reports the structured
+  // NotConnected (was Socket "session not connected").
+  REQUIRE(r.error().code == TransportError::NotConnected);
 
   t->stop();
 }

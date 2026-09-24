@@ -44,6 +44,7 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace iora
@@ -271,50 +272,97 @@ public:
         TransportErrorInfo{TransportError::Config, "TLS/DTLS not supported on UDP"});
     }
     SessionId sid = _nextSessionId++;
-    ConnectReq cr;
-    cr.sid = sid;
-    cr.host = host;
-    cr.port = port;
-    // Surface the closed-queue reject (DD-5): returning ok(sid) when the command
-    // was dropped would promise a connection that never completes/fires onConnect.
-    if (!enqueue(Cmd::connect(cr)))
-    {
-      return ConnectResult::err(
-        TransportErrorInfo{TransportError::ShuttingDown, "connect: transport shutting down"});
-    }
-    return ConnectResult::ok(sid);
+    return insertConnectingAndEnqueue(
+      sid, [&] { return Cmd::connect(ConnectReq{sid, host, port}); },
+      "connect: transport shutting down");
   }
   ConnectResult connectViaListener(ListenerId lid, const std::string &host, std::uint16_t port) override
   {
     SessionId sid = _nextSessionId++;
-    ViaReq vr{sid, lid, host, port};
-    // Same closed-queue reject surface as connect() (DD-5). UDP-specific: unlike
-    // TCP (a not-supported stub), connectViaListener genuinely enqueues here.
-    if (!enqueue(Cmd::via(vr)))
-    {
-      return ConnectResult::err(
-        TransportErrorInfo{TransportError::ShuttingDown,
-          "connectViaListener: transport shutting down"});
-    }
-    return ConnectResult::ok(sid);
+    // UDP-specific: unlike TCP (a not-supported stub), connectViaListener genuinely
+    // enqueues here; same A3.1a ordering via the shared helper.
+    return insertConnectingAndEnqueue(
+      sid, [&] { return Cmd::via(ViaReq{sid, lid, host, port}); },
+      "connectViaListener: transport shutting down");
   }
-  bool send(SessionId sid, const void *p, std::size_t n) override
+  /// \brief A3.1a shared front-end (steps-4-8 R1 simp-L2): build the command (inside
+  /// the try, so a throwing ConnectReq/ViaReq construction is also caught), insert the
+  /// sid into _connecting under the write lock, RELEASE, then enqueue on the noexcept
+  /// path. The returned sid is immediately sendable (datagrams buffer in the
+  /// PendingConnect entry until the session materializes). On enqueue-false (queue
+  /// closed, DD-5) or a throw, roll the _connecting entry back via a SEPARATE
+  /// eraseConnecting critical section — NEVER hold _sessionRwMutex across enqueue
+  /// (that would nest _sessionRwMutex->_qmx). FAILURE-CODE PARITY (documented choice):
+  /// UDP reports a single ShuttingDown on any enqueue-false (queue closed, or a rare
+  /// allocation throw converted to false by enqueue's noexcept catch). TCP distinguishes
+  /// queue-closed vs Unknown; the two public entry points keep their own message.
+  template <typename BuildCmd>
+  ConnectResult insertConnectingAndEnqueue(SessionId sid, BuildCmd buildCmd,
+                                           const char *shuttingDownMsg)
   {
-    if (n == 0)
-      return true;
-    // CF-H1: reject an unknown/closed session at enqueue time rather than
-    // enqueuing a command sendDo would silently drop (which returned true —
-    // masking a dead connection from SIP RFC 3263 failover).
+    bool inserted = false;
+    try
+    {
+      Cmd cmd = buildCmd();
+      {
+        std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+        _connecting.insert(sid);
+      }
+      inserted = true;
+      if (enqueue(std::move(cmd)))
+      {
+        return ConnectResult::ok(sid);
+      }
+    }
+    catch (...)
+    {
+    }
+    if (inserted)
+    {
+      // steps-4-8 R3 (TS LOW): the rollback erases _connecting and fires NO onClose.
+      // That owes no terminal because an err-returned sid NEVER escapes to
+      // observer-capable code — connect()/connectViaListener() return this sid to the
+      // caller ONLY via ConnectResult::ok; an err result hands the sid to nobody, so
+      // no legitimate observe(sid) can exist. Re-audit if any future path observes a
+      // sid before its ConnectResult is known.
+      eraseConnecting(sid);
+    }
+    return ConnectResult::err(TransportErrorInfo{TransportError::ShuttingDown, shuttingDownMsg});
+  }
+  /// \brief Single sendability decision (A3.3): make it ONCE so a close racing
+  /// between two separate checks cannot mis-report. Ok = accepted; NotConnected =
+  /// unknown/closed/cap-rejected sid; EnqueueFailed = queue closed at teardown.
+  enum class SendOutcome
+  {
+    Ok,
+    NotConnected,
+    EnqueueFailed
+  };
+  SendOutcome trySend(SessionId sid, const void *p, std::size_t n)
+  {
+    // CF-H1: reject an unknown/closed session at enqueue time rather than enqueuing
+    // a command sendDo would silently drop (which returned true — masking a dead
+    // connection from SIP RFC 3263 failover). ONE sessionSendable acquisition. The
+    // sendability check precedes the n==0 short-circuit (matching TCP) so a 0-length
+    // send to an UNKNOWN sid reports NotConnected, not a spurious Ok (steps-4-8 R1 L1).
     if (!sessionSendable(sid))
     {
-      return false;
+      return SendOutcome::NotConnected;
+    }
+    if (n == 0)
+    {
+      return SendOutcome::Ok;
     }
     ByteBuffer b(n);
     std::memcpy(b.data(), p, n);
     SendReq sr;
     sr.sid = sid;
     sr.payload = std::move(b);
-    return enqueue(Cmd::send(std::move(sr)));
+    return enqueue(Cmd::send(std::move(sr))) ? SendOutcome::Ok : SendOutcome::EnqueueFailed;
+  }
+  bool send(SessionId sid, const void *p, std::size_t n) override
+  {
+    return trySend(sid, p, n) == SendOutcome::Ok;
   }
   bool close(SessionId sid) override { return enqueue(Cmd::close(sid)); }
   bool isRunning() const override { return _running.load(std::memory_order_acquire); }
@@ -364,32 +412,25 @@ public:
   void sendAsync(SessionId sid, const void *data, std::size_t len,
                  SendCompleteCallback cb) override
   {
-    // CF-H1: validate synchronously — do NOT report OK for an unknown/closed
-    // session. The decision is copied out from under the session read lock and
-    // the lock released BEFORE cb runs (never invoke a user callback while
-    // holding _sessionRwMutex). Completion stays SYNCHRONOUS on the caller
-    // thread, the contract Transport::sendSync relies on (see EngineBase).
-    if (!sessionSendable(sid))
+    // CF-H1 + A3.3 single-decision send: make ONE sendability decision (trySend) so
+    // a close racing between two checks cannot yield the wrong code. The decision is
+    // taken under the session read lock, released BEFORE cb runs (never invoke a user
+    // callback while holding _sessionRwMutex). Completion stays SYNCHRONOUS on the
+    // caller thread, the contract Transport::sendSync relies on (see EngineBase).
+    const SendOutcome oc = trySend(sid, data, len);
+    if (!cb)
     {
-      if (cb)
-      {
-        cb(sid,
-           SendResult::err(TransportErrorInfo{TransportError::Socket, "session not connected"}));
-      }
       return;
     }
-    bool ok = send(sid, data, len);
-    if (cb)
+    if (oc == SendOutcome::Ok)
     {
-      if (ok)
-      {
-        cb(sid, SendResult::ok(len));
-      }
-      else
-      {
-        cb(sid, SendResult::err(TransportErrorInfo{TransportError::Socket, "send enqueue failed"}));
-      }
+      cb(sid, SendResult::ok(len));
+      return;
     }
+    // Both NotConnected and EnqueueFailed (queue closed at teardown) report the
+    // structured NotConnected code — the session is not reachable. This replaces the
+    // former Socket "session not connected" / "send enqueue failed" pair.
+    cb(sid, SendResult::err(TransportErrorInfo{TransportError::NotConnected, "session not connected"}));
   }
 
   TransportAddress getListenerAddress(ListenerId lid) const override
@@ -594,7 +635,31 @@ private:
   {
     std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
     auto it = _sessions.find(sid);
-    return it != _sessions.end() && !it->second->closed.load(std::memory_order_relaxed);
+    if (it != _sessions.end() && !it->second->closed.load(std::memory_order_relaxed))
+    {
+      return true;
+    }
+    // A sid returned by connect()/connectViaListener() is immediately sendable while
+    // still connecting: its datagrams buffer in the PendingConnect entry (A3.1b).
+    return _connecting.find(sid) != _connecting.end();
+  }
+
+  /// \brief Is \p sid live for observer purposes: an open session OR still
+  /// connecting? Read under the SAME lock as sessionSendable (_sessionRwMutex),
+  /// which is the load-bearing synchronizer for Transport::observe()'s exactly-once
+  /// terminal handoff — the map/registry-presence check (NOT the relaxed `closed`
+  /// flag) is what pairs with A2.1 (liveness cleared happens-before onClose). A
+  /// future "optimization" that drops the map-presence check silently breaks
+  /// exactly-once. Pure virtual on EngineBase; both engines implement it.
+  bool isSessionLive(SessionId sid) const override
+  {
+    // steps-4-8 R1 simp-M3: identical predicate to sessionSendable — delegate so the
+    // one map/registry-presence check has a single source of truth (the two names are
+    // kept to document caller intent: "may I accept a send" vs "is this session alive
+    // for observer purposes"). That _sessionRwMutex-guarded presence check — NOT the
+    // relaxed `closed` flag — is the load-bearing synchronizer for observe()
+    // exactly-once (A2.1); a future edit that "optimizes" it silently breaks it.
+    return sessionSendable(sid);
   }
   void armGc(std::chrono::seconds s)
   {
@@ -636,10 +701,122 @@ private:
   void error(TransportError e, const std::string &m)
   {
     _atomicStats.errors.fetch_add(1, std::memory_order_relaxed);
-    decltype(_cbs.onError) cb;
-    { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
-    if (cb)
-      cb(e, m);
+    // steps-4-8 R1 simp-M2: reuse the EngineBase copy-then-invoke helper (matches the
+    // TcpEngine sibling) — invokeUserCallback swallows+logs a throwing user callback.
+    invokeUserCallback(copyCallback(_cbMutex, _cbs.onError), e, m);
+  }
+
+  /// \brief Erase \p sid from the connecting registry; true iff it was present.
+  /// A SEPARATE _sessionRwMutex critical section — the connect() rollback path uses
+  /// it AFTER releasing the insert lock, never nesting _sessionRwMutex->_qmx.
+  bool eraseConnecting(SessionId sid) noexcept
+  {
+    std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+    return _connecting.erase(sid) == 1;
+  }
+
+  /// \brief Erase \p sid's _pendingConnects entry; true iff it was present. I/O
+  /// thread only. UDP has NO TimerService — the resolve-timeout is a GC-observed
+  /// deadline, so dropping the entry disarms it (no timer to cancel, unlike TCP).
+  bool takePending(SessionId sid) noexcept { return _pendingConnects.erase(sid) == 1; }
+
+  /// \brief Fire the SINGLE pre-insert terminal for a sid that never reached
+  /// _sessions (I/O thread). ORDER: copy onClose, RELEASE the pending + connecting
+  /// registry ownership (liveness cleared happens-before onClose, A2.1), THEN
+  /// exactly one onClose(\p info). Returns false, firing nothing, if the sid owned
+  /// neither (a terminal already fired). Erasing the pending entry drops any
+  /// datagrams still buffered in it (A3.1b). Mirrors tcp_engine preInsertTerminal.
+  /// OOM WINDOW (steps-4-8 R2 cpp17 L-1, accepted): the copyCallback runs BEFORE the
+  /// erases because A2.1 requires the erase to happen-before the onClose when the copy
+  /// SUCCEEDS. If the copy throws (extreme bad_alloc) on a non-drain terminal, the
+  /// registry entry is left un-erased and stays sendable/live for a dead sid until the
+  /// next shutdownDrain final-sweep clears it — a narrow CF-H1/observe-leak window
+  /// bounded by the drain sweep; the copy-first order is the required trade for A2.1.
+  bool preInsertTerminal(SessionId sid, const TransportErrorInfo &info)
+  {
+    // steps-4-8 R1 simp-M2: use the EngineBase copy-then-invoke helper (matches the
+    // TcpEngine sibling). invokeUserCallback swallows+logs a throwing onClose, so a
+    // user handler that throws here CANNOT skip the caller's subsequent error()
+    // (the uniform "onClose + error() both fire on resolve/connect terminals" policy).
+    const auto closeCb = copyCallback(_cbMutex, _cbs.onClose);
+    const bool pending = takePending(sid);
+    const bool connecting = eraseConnecting(sid);
+    if (!pending && !connecting)
+    {
+      return false;
+    }
+    invokeUserCallback(closeCb, sid, info);
+    return true;
+  }
+
+  /// \brief A3.1b: replay datagrams buffered during a named-host resolve window, in
+  /// order, through the role-correct send path (ClientConnected -> ::send/s->wq;
+  /// ServerPeer -> ::sendto/lst->wq). Called after onConnect at both insert sites.
+  void replayPendingWq(SessionId sid, std::deque<ByteBuffer> &pendingWq)
+  {
+    for (auto &payload : pendingWq)
+    {
+      SendReq rsr;
+      rsr.sid = sid;
+      rsr.payload = std::move(payload);
+      sendDo(std::move(rsr));
+    }
+  }
+
+  friend struct UdpEngineTestAccess;
+
+  /// I/O-thread points at which the connect path throws once (test seam, AX9.1b).
+  enum class ConnectThrowPoint
+  {
+    NONE,
+    BEFORE_INSERT_LITERAL,           // connectDo literal branch, before connectFromAddrs
+    BEFORE_INSERT_RESUME,            // resumeConnect/resumeVia, before *FromAddrs
+    VIA_KICKOFF_AFTER_PENDING_INSERT // viaDo, after _pendingConnects insert
+  };
+  std::atomic<ConnectThrowPoint> _testConnectThrowPoint{ConnectThrowPoint::NONE};
+  std::atomic<bool> _testEnqueueFailure{false};
+
+  /// \brief Test seam: throw ONCE if the armed point matches (then disarm).
+  void testMaybeThrowAt(ConnectThrowPoint point)
+  {
+    ConnectThrowPoint expected = point;
+    if (_testConnectThrowPoint.load(std::memory_order_relaxed) == expected &&
+        _testConnectThrowPoint.compare_exchange_strong(expected, ConnectThrowPoint::NONE,
+                                                       std::memory_order_relaxed))
+    {
+      throw std::runtime_error("injected connect-path throw");
+    }
+  }
+
+  /// \brief A3.1c exception guard around the I/O-thread connect path (the Cmd entry
+  /// AND the RunOnIo->resume entry). On an UNEXPECTED throw the connecting-sid /
+  /// pending ownership must not leak: fire exactly ONE terminal iff we still own the
+  /// sid (preInsertTerminal erases _connecting AND _pendingConnects, returning false
+  /// if a terminal already fired); if the sid already reached _sessions, route through
+  /// closeNow instead. Never a second terminal after an in-path onClose.
+  template <typename F> void withConnectGuard(SessionId sid, F &&fn)
+  {
+    try
+    {
+      fn();
+    }
+    catch (...)
+    {
+      try
+      {
+        if (!preInsertTerminal(sid, TransportErrorInfo{TransportError::Unknown, "internal error"}))
+        {
+          auto it = _sessions.find(sid);
+          if (it != _sessions.end())
+          {
+            closeNow(it->second.get(), TransportError::Unknown, "internal error", 0);
+          }
+        }
+      }
+      catch (...)
+      {
+      }
+    }
   }
 
   enum class CmdType
@@ -685,6 +862,32 @@ private:
   struct PendingConnect
   {
     MonoTime resolveDeadline{}; // absolute; default (epoch) == disabled
+    // A3.1b: datagrams sent to this sid while it is still resolving (sendable via
+    // _connecting, no Session yet). Bounded by maxWriteQueue with an UNCONDITIONAL
+    // drop-OLDEST that always keeps >=1 (no Session exists, so no closeOnBackpressure
+    // path applies; a UDP retransmit burst leaves >=1 deliverable). MOVED OUT before
+    // the pending entry is erased and replayed in order after the session is inserted;
+    // dropped if a pre-insert terminal fires instead.
+    //
+    // SIP-LAYER SOUNDNESS (why drop-oldest keeps this recoverable): the common case
+    // is an initial request + its Timer-A/E retransmits, each re-emitted by the owning
+    // client transaction (INVITE Timer A uncapped -> Timer B, s17.1.1.2; non-INVITE
+    // Timer E capped at T2, s17.1.2.2) and absorbed as a byte-identical retransmit by
+    // the peer server transaction (s17.2.1/s17.2.2/s17.2.3) -> a dropped copy is bounded
+    // latency, not loss. CAVEAT (steps-4-8 R2 sip-M2): SipUdpTransport coalesces one
+    // UDP session PER DESTINATION ADDRESS, so when a dialog's remote target diverges to
+    // a fresh FQDN next-hop (Contact/loose-route with no Record-Route), the FIRST
+    // datagram on a brand-new session can be an ACK-for-2xx or an in-dialog request.
+    // In-dialog requests (BYE/re-INVITE/UPDATE) ARE client transactions -> Timer A/E
+    // still recovers them; but an ACK-for-2xx is generated end-to-end by the UAC core
+    // and is NOT retransmitted by any client transaction (RFC 3261 s13.2.2.4) -> a
+    // dropped ACK-for-2xx is recovered only by the UAS retransmitting the 2xx
+    // (s13.3.1.4 / s17.2.1). The floor-at-1 policy preserves the LONE-datagram case
+    // (the realistic ACK shape), and the SIP default maxWriteQueue (1024) means
+    // overflow-drop effectively never fires; so practical loss is negligible. But if a
+    // design change ever raised the pre-establishment buffer pressure, this ACK path is
+    // where drop-oldest stops being lossless — flag it.
+    std::deque<ByteBuffer> wq;
   };
   struct SendReq
   {
@@ -757,33 +960,6 @@ private:
   // / testStrategy c1_c3_unit "RunOnIo keeps Command/Cmd copyable").
   static_assert(std::is_copy_constructible<Cmd>::value,
                 "Cmd must remain copyable after adding the RunOnIo fn member");
-  // Push a command and wake the I/O loop. The deque push, the _qClosed check,
-  // and the _eventFd wakeup ::write all happen UNDER _qmx so they are atomic
-  // w.r.t. shutdownDrain()'s `close(_eventFd); _eventFd=-1` (which also runs
-  // under _qmx). Returns false WITHOUT pushing if the queue has been closed by
-  // teardown (DD-1/DD-2/DD-5, tracker 2026-06-14-1). The wakeup write is held
-  // under the lock safely because _eventFd is EFD_NONBLOCK (bounded counter
-  // increment). UDP enqueue has no try/catch by long-standing design: a throwing
-  // push_back propagates to the caller (engine virtuals are not noexcept) rather
-  // than routing to onError — unchanged by this fix (the TcpEngine sibling's
-  // catch only adds an onError + false-return, no stronger guarantee).
-  bool enqueue(const Cmd &c)
-  {
-    std::lock_guard<std::mutex> g(_qmx);
-    if (_qClosed)
-    {
-      return false;
-    }
-    _q.push_back(c);
-    _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
-    if (_eventFd >= 0)
-    {
-      std::uint64_t one = 1;
-      (void)::write(_eventFd, &one, sizeof(one));
-    }
-    return true;
-  }
-
   /// \brief EngineBase seam: post \p fn onto the I/O thread as a RunOnIo command.
   /// NOEXCEPT and callback-free — on any failure (queue closed, or allocation)
   /// it returns false and fires NO user callback; a dropped resolve post is
@@ -812,21 +988,41 @@ private:
       return false;
     }
   }
-  bool enqueue(Cmd &&c)
+  // Push a command and wake the I/O loop. The deque push, the _qClosed check, and
+  // the _eventFd wakeup ::write all happen UNDER _qmx so they are atomic w.r.t.
+  // shutdownDrain()'s `close(_eventFd); _eventFd=-1` (also under _qmx). Returns false
+  // WITHOUT pushing if the queue was closed by teardown (DD-1/DD-2/DD-5). A3.1a:
+  // enqueue CATCHES a throwing push_back and returns false (instead of propagating)
+  // so connect()/connectViaListener() roll the _connecting entry back on the SAME
+  // path as the queue-closed reject. The single rvalue-ref overload is the only one
+  // (steps-4-8 R1 simp-M1: every caller passes an rvalue — a factory prvalue or an
+  // explicit std::move — so the former const& overload was dead code, deleted).
+  bool enqueue(Cmd &&c) noexcept
   {
-    std::lock_guard<std::mutex> g(_qmx);
-    if (_qClosed)
+    try
+    {
+      std::lock_guard<std::mutex> g(_qmx);
+      if (_qClosed)
+      {
+        return false;
+      }
+      if (_testEnqueueFailure.load(std::memory_order_relaxed))
+      {
+        throw std::runtime_error("injected enqueue failure"); // caught below -> false
+      }
+      _q.push_back(std::move(c));
+      _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
+      if (_eventFd >= 0)
+      {
+        std::uint64_t one = 1;
+        (void)::write(_eventFd, &one, sizeof(one));
+      }
+      return true;
+    }
+    catch (...)
     {
       return false;
     }
-    _q.push_back(std::move(c));
-    _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
-    if (_eventFd >= 0)
-    {
-      std::uint64_t one = 1;
-      (void)::write(_eventFd, &one, sizeof(one));
-    }
-    return true;
   }
   void drainEvt()
   {
@@ -918,6 +1114,48 @@ private:
     // shutdownDrain, so _loop.get_id() is the null id here and such an assert
     // would spuriously fire (DD-12). The _timerFd/_epollFd confinement and the
     // _eventFd-close serialization below rely on this invariant.
+
+    // A6.3 (ii): BACKSTOP guard armed BEFORE process(). shutdownDrain's OWN
+    // allocation sites (toClose.reserve/push_back, fdsToClose, pendingSids, the
+    // unique_locks) can throw and unwind PAST the _qClosed teardown block below
+    // with _qClosed still false — then a later runOnIoThread posts into a dead
+    // queue (breaks observe() exactly-once) and receiveSync waiters never wake.
+    // This forces _qClosed=true + _eventFd closed on ANY unwinding exit, IDEMPOTENT
+    // vs the normal-path teardown block (after which it is a no-op). It is a
+    // BACKSTOP, not a substitute for the per-callback-site try/catch in (i).
+    // ACCEPTED LIMITATION (steps-4-8 R3 TS LOW, spec A6.3 "(ii) alone skips remaining
+    // onCloses + the residual promise drain"): the backstop guarantees _qClosed (so a
+    // later runOnIoThread returns false rather than posting into a dead queue), but it
+    // does NOT drain residual promise-bearing commands or fire remaining session-drain
+    // onCloses. So if a bad_alloc unwinds one of shutdownDrain's OWN allocation sites
+    // (toClose/fdsToClose/pendingSids reserves, a unique_lock) BEFORE the normal
+    // residual drain at the bottom, a synchronous addListener caller's future may hang
+    // and a residual observe owned-terminal may not fire. This is the accepted
+    // OOM-during-teardown trade (the (i) per-site guards keep the common callback-throw
+    // path reaching the normal drain); the allocation-unwind path is not covered.
+    auto closeQueueBackstop = [this]() noexcept
+    {
+      try
+      {
+        std::lock_guard<std::mutex> g(_qmx);
+        _qClosed = true;
+        if (_eventFd >= 0)
+        {
+          delEpoll(_eventFd);
+          ::close(_eventFd);
+          _eventFd = -1;
+        }
+      }
+      catch (...)
+      {
+      }
+    };
+    struct QGuard
+    {
+      std::function<void()> fn;
+      ~QGuard() { if (fn) { fn(); } }
+    } qGuard{closeQueueBackstop};
+
     process();
     // Collect sessions to close to avoid iterator invalidation
     std::vector<Session *> toClose;
@@ -953,12 +1191,12 @@ private:
       }
       _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
       _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-      {
-        closeCb(s->id, TransportErrorInfo{TransportError::Unknown, "shutdown"});
-      }
+      // A6.4: session drain reports ShuttingDown (was Unknown "shutdown"), matching
+      // the pending drain. A6.3 + simp-M2: invokeUserCallback copies onClose under
+      // _cbMutex and swallows+logs a throwing handler, so one session's throw cannot
+      // skip the rest or unwind past the teardown.
+      invokeUserCallback(copyCallback(_cbMutex, _cbs.onClose), s->id,
+                         TransportErrorInfo{TransportError::ShuttingDown, "shutdown"});
     }
     {
       std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
@@ -999,11 +1237,13 @@ private:
       _postGuard->engine = nullptr;
     }
 
-    // (b) DRAIN in-flight named-host resolves (#7b): COLLECT-THEN-FIRE. Fire
-    // exactly one onClose(ShuttingDown) per pending sid, COPY-THEN-INVOKE (copy
-    // onClose under _cbMutex, mirror the session drain above), OUTSIDE gate->m
-    // and outside the _qmx teardown block (#14/HR-3). Erase before firing so a
-    // re-entrant callback cannot double-fire an entry.
+    // (b) DRAIN in-flight named-host resolves (#7b): COLLECT-THEN-FIRE. Route each
+    // pending sid through preInsertTerminal (A3.1a) so the ONE onClose(ShuttingDown)
+    // fires AFTER erasing BOTH _pendingConnects AND _connecting — else a racing
+    // observe() sees isSessionLive==true after the onClose (A2.1/A6.1 violation ->
+    // observer leak/double-classify). Outside gate->m and the _qmx teardown block
+    // (#14/HR-3). A6.3: guard each terminal so a throw on one does not skip the rest
+    // and cannot unwind past the teardown block.
     if (!_pendingConnects.empty())
     {
       std::vector<SessionId> pendingSids;
@@ -1012,19 +1252,17 @@ private:
       {
         pendingSids.push_back(kv.first);
       }
-      decltype(_cbs.onClose) drainCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); drainCb = _cbs.onClose; }
       for (SessionId sid : pendingSids)
       {
-        auto it = _pendingConnects.find(sid);
-        if (it == _pendingConnects.end())
+        if (_pendingConnects.count(sid) != 0)
         {
-          continue;
-        }
-        _pendingConnects.erase(it);
-        if (drainCb)
-        {
-          drainCb(sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown"});
+          try
+          {
+            preInsertTerminal(sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown"});
+          }
+          catch (...)
+          {
+          }
         }
       }
     }
@@ -1055,7 +1293,62 @@ private:
       {
         try { c.listenerReady->set_value(false); } catch (...) {}
       }
+      // A6.3 R3 HIGH-1: a residual Cmd::Connect/Cmd::Via landed in _q in the
+      // post-process()/pre-_qClosed window returned ok(sid) + inserted sid into
+      // _connecting, then would be silently DROPPED here (no terminal) — neither
+      // onConnect nor onClose fires (lost completion, DD-5) AND a racing observe()
+      // that saw isSessionLive(sid)==true leaks. Fire the ONE onClose(ShuttingDown)
+      // per residual connect sid through preInsertTerminal (erase _connecting first),
+      // guarded, BEFORE the final clear() sweep. Mirrors tcp_engine :1838-1849.
+      if (c.t == CmdType::Connect)
+      {
+        try
+        {
+          preInsertTerminal(c.c.sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown"});
+        }
+        catch (...)
+        {
+        }
+      }
+      else if (c.t == CmdType::Via)
+      {
+        try
+        {
+          preInsertTerminal(c.v.sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown"});
+        }
+        catch (...)
+        {
+        }
+      }
+      else if (c.t == CmdType::RunOnIo && c.fn)
+      {
+        // A6.3 (steps-4-8 R1 H1): INVOKE residual RunOnIo closures — do NOT drop
+        // them. A Transport::observe() owned-terminal is delivered via runOnIoThread;
+        // one posted in the post-process()/pre-_qClosed window lands here as a
+        // residual command. Dropping it strands the observer callback (zero fires,
+        // breaking A6.2 exactly-once) and leaks the SSE stream. _qClosed is already
+        // set, so the closure runs against a dead queue safely (a stranded resolver
+        // resume no-ops — _pendingConnects is drained). Guarded so one throw cannot
+        // skip the rest or unwind past the final sweep.
+        try
+        {
+          c.fn();
+        }
+        catch (...)
+        {
+        }
+      }
     }
+    // A3.1a(6) / TS3-R3-1: unconditional final sweep. preInsertTerminal releases its
+    // registry entry AFTER the allocating copy, so a swallowed bad_alloc above could
+    // leave a _connecting/_pendingConnects entry behind. Clear both so the drain
+    // leaves them provably empty. NO end-of-drain assert (a concurrent connect()
+    // legitimately holds an entry until its enqueue sees _qClosed and rolls back).
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _connecting.clear();
+    }
+    _pendingConnects.clear();
     if (_epollFd >= 0)
     {
       ::close(_epollFd);
@@ -1162,7 +1455,9 @@ private:
           break;
         }
         case CmdType::Connect:
-          connectDo(c.c);
+          // A3.1c: guard the connect dispatch so a throw cannot leak the _connecting
+          // entry connect() inserted (fire exactly one terminal, no registry leak).
+          withConnectGuard(c.c.sid, [&]() { connectDo(c.c); });
           break;
         case CmdType::RunOnIo:
           if (c.fn)
@@ -1171,7 +1466,7 @@ private:
           }
           break;
         case CmdType::Via:
-          viaDo(c.v);
+          withConnectGuard(c.v.sid, [&]() { viaDo(c.v); });
           break;
         case CmdType::Send:
           sendDo(std::move(c.s));
@@ -1179,19 +1474,14 @@ private:
         case CmdType::Close:
         {
           // Close DURING the resolve window (task-4.6): the session was never
-          // created (resolution still in flight), so consult _pendingConnects
-          // FIRST. If found, erase and fire the single terminal onClose; the
-          // later resumeConnect/resumeVia finds no entry and no-ops.
-          auto pit = _pendingConnects.find(c.closeSid);
-          if (pit != _pendingConnects.end())
+          // created (resolution still in flight OR the literal path has not run
+          // connectDo yet), so route through the ONE pre-insert terminal helper —
+          // it erases _pendingConnects AND _connecting and fires the single
+          // onClose. A later resumeConnect/resumeVia then finds no entry and no-ops.
+          // (Also covers the sid-in-_connecting-only case a bare _pendingConnects
+          // lookup missed, which previously leaked.)
+          if (preInsertTerminal(c.closeSid, TransportErrorInfo{TransportError::Unknown, "closed by app"}))
           {
-            _pendingConnects.erase(pit);
-            decltype(_cbs.onClose) closeCb;
-            { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-            if (closeCb)
-            {
-              closeCb(c.closeSid, TransportErrorInfo{TransportError::Unknown, "closed by app"});
-            }
             break;
           }
           auto it = _sessions.find(c.closeSid);
@@ -1207,12 +1497,26 @@ private:
         {
           try { c.listenerReady->set_value(false); } catch (...) {}
         }
-        decltype(_cbs.onError) cb;
-        { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
-        if (cb)
+        // steps-4-8 R2 (cpp17 H-1 / simp): report via error() (copyCallback +
+        // invokeUserCallback) — a throwing onError is swallowed+logged. R3 (cpp17 LOW):
+        // the message build + copyCallback can themselves throw bad_alloc, so wrap the
+        // report so an OOM here cannot re-escape process() and unwind the loop / skip
+        // the drain.
+        try { error(TransportError::Unknown, std::string("cmd dispatch: ") + ex.what()); }
+        catch (...) {}
+      }
+      catch (...)
+      {
+        // A6.3 (i): a NON-std throw must NOT escape process() — when process() runs
+        // inside shutdownDrain a throw here would unwind past the _qClosed/_eventFd
+        // teardown block, leaving a later runOnIoThread to post into a dead queue
+        // (breaks observe() exactly-once) and receiveSync waiters unwoken.
+        if (c.listenerReady)
         {
-          cb(TransportError::Unknown, std::string("cmd dispatch: ") + ex.what());
+          try { c.listenerReady->set_value(false); } catch (...) {}
         }
+        try { error(TransportError::Unknown, "cmd dispatch: non-standard exception"); }
+        catch (...) {}
       }
     }
   }
@@ -1354,22 +1658,28 @@ private:
           _peerIndex.emplace(k, sid);
           _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
           bumpSess();
-          decltype(_cbs.onAccept) acceptCb;
-          { std::lock_guard<std::mutex> g(_cbMutex); acceptCb = _cbs.onAccept; }
-          if (acceptCb)
-            acceptCb(sid, addressFromSockaddr(from));
+          // steps-4-8 R2 (simp/cpp17): route onAccept through invokeUserCallback so a
+          // throwing user handler cannot unwind the I/O loop (mirror tcp_engine).
+          invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid,
+                             addressFromSockaddr(from));
         }
         else
         {
           sid = it->second;
         }
-        auto &sp = _sessions[sid];
-        sp->lastActivity = MonoClock::now();
-        decltype(_cbs.onData) dataCb;
-        { std::lock_guard<std::mutex> g(_cbMutex); dataCb = _cbs.onData; }
-        if (dataCb)
-          dataCb(sid, iora::core::BufferView{buf.data(), static_cast<std::size_t>(n)},
-                 std::chrono::steady_clock::now());
+        // steps-4-8 R3 (cpp17/TS LOW): use const find() (not non-const operator[])
+        // on the I/O thread — operator[] is a non-const member and would be a formal
+        // data race against caller-thread sessionSendable/isSessionLive readers holding
+        // a shared_lock (the sid always pre-exists here, so find never misses).
+        auto sit = _sessions.find(sid);
+        if (sit == _sessions.end())
+        {
+          continue; // defensive: never expected (sid just inserted / in _peerIndex)
+        }
+        sit->second->lastActivity = MonoClock::now();
+        invokeUserCallback(copyCallback(_cbMutex, _cbs.onData), sid,
+                           iora::core::BufferView{buf.data(), static_cast<std::size_t>(n)},
+                           std::chrono::steady_clock::now());
         continue;
       }
       if (n < 0)
@@ -1483,10 +1793,12 @@ private:
       // mislead, so use a fixed string for it (cpp17-#2, mirrors sip-L-4).
       const std::string msg = (rc != 0) ? std::string("getaddrinfo: ") + gai_strerror(rc)
                                         : "resolve returned no addresses";
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-        closeCb(sid, TransportErrorInfo{TransportError::Resolve, msg});
+      // A3.1a: fire the ONE pre-insert terminal (erase _connecting -> onClose(Resolve))
+      // through preInsertTerminal so a racing observe() cannot see the sid live after
+      // its onClose (A2.1). error()/onError is kept as a SEPARATE diagnostic channel
+      // (the uniform policy across all four resolve/connect terminals). Shared by
+      // connectDo AND viaDo — both have the sid in _connecting.
+      preInsertTerminal(sid, TransportErrorInfo{TransportError::Resolve, msg});
       error(TransportError::Resolve, "getaddrinfo failed");
       return false;
     }
@@ -1503,9 +1815,10 @@ private:
   {
     const std::string msg =
       (gai != 0) ? iora::network::resolveErrorMessage(gai) : "resolve returned no addresses";
-    decltype(_cbs.onClose) closeCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-    if (closeCb) closeCb(sid, TransportErrorInfo{TransportError::Resolve, msg});
+    // A3.1a: resumeConnect/resumeVia have already erased _pendingConnects (moving any
+    // buffered wq out), so takePending finds nothing here — eraseConnecting fires the
+    // ONE terminal. error() is kept as the separate diagnostic channel.
+    preInsertTerminal(sid, TransportErrorInfo{TransportError::Resolve, msg});
     error(TransportError::Resolve, std::string("resolve failed: ") + msg);
   }
 
@@ -1538,6 +1851,7 @@ private:
       {
         return false;
       }
+      testMaybeThrowAt(ConnectThrowPoint::BEFORE_INSERT_LITERAL);
       return connectFromAddrs(cr, owned.get());
     }
 
@@ -1573,20 +1887,35 @@ private:
     {
       return; // resolve-timeout or close already fired the terminal
     }
+    // A3.1b: MOVE the buffered datagrams out BEFORE erasing the pending entry, then
+    // pass them to connectFromAddrs to replay in order at insert. On resolve failure
+    // the moved-out buffer is simply dropped.
+    std::deque<ByteBuffer> pendingWq = std::move(it->second.wq);
     _pendingConnects.erase(it);
     if (gai != 0 || !addrs || !addrs->get())
     {
       emitResolveFailure(sid, gai);
       return;
     }
-    connectFromAddrs(ConnectReq{sid, host, port}, addrs->get());
+    // A3.1c: the resume path runs inside a RunOnIo command whose process() catch does
+    // NOT clean the _connecting entry — guard connectFromAddrs so a throw here fires
+    // the ONE terminal instead of leaking the sid.
+    withConnectGuard(sid,
+                     [&]()
+                     {
+                       testMaybeThrowAt(ConnectThrowPoint::BEFORE_INSERT_RESUME);
+                       connectFromAddrs(ConnectReq{sid, host, port}, addrs->get(),
+                                        std::move(pendingWq));
+                     });
   }
 
   /// \brief Connect using an EXTERNALLY-owned addrinfo chain. NEVER calls
   /// ::freeaddrinfo — the caller owns res (an OwnedAddrInfo for the literal path,
   /// a shared_ptr<OwnedAddrInfo> for the resume path); a free here would
-  /// double-free (#6). Runs on the I/O thread.
-  bool connectFromAddrs(const ConnectReq &cr, addrinfo *res)
+  /// double-free (#6). Runs on the I/O thread. \p pendingWq carries datagrams
+  /// buffered during a named-host resolve (empty on the literal path).
+  bool connectFromAddrs(const ConnectReq &cr, addrinfo *res,
+                        std::deque<ByteBuffer> pendingWq = {})
   {
     // Admission cap (tracker 2026-09-14-1): reject a new client connect() at the
     // aggregate session cap BEFORE materializing any fd/epoll/session — placing this
@@ -1620,14 +1949,17 @@ private:
     std::string connectErr = lastErr();
     if (sfd < 0)
     {
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-        closeCb(cr.sid,
-                TransportErrorInfo{TransportError::Connect, connectErr, connectErrno});
+      // A3.1a: erase _connecting -> onClose(Connect) via the ONE terminal helper
+      // (resumeConnect already erased _pendingConnects, so takePending is a no-op).
+      // pendingWq destructs here, dropping the buffered datagrams. error() kept.
+      preInsertTerminal(cr.sid, TransportErrorInfo{TransportError::Connect, connectErr, connectErrno});
       error(TransportError::Connect, "UDP connect: " + connectErr);
       return false;
     }
+    // A3.1c: RAII-guard the connected fd until the _sessions insert commits, so a
+    // throw on the make_unique/addEpoll/emplace path below cannot leak it. Released
+    // (fd=-1) once _tags/_sessions own the fd.
+    detail::FdCloser fdGuard(sfd, &_preCloseHook);
     // Apply the configured DSCP mark to the connected client socket at creation
     // (C1); 0 leaves default best-effort marking.
     if (_config.dscpValue != 0)
@@ -1650,9 +1982,25 @@ private:
     addEpoll(sfd, ev);
     Session *sPtr = s.get();
     {
+      // A3.1a: erase _connecting WITH the _sessions insert in ONE unique-lock
+      // section — the sid transitions from "connecting" to "live" atomically, so a
+      // concurrent sessionSendable/isSessionLive never sees it in neither set.
+      // ORDER (steps-4-8 R2 TS-H1, mirror tcp_engine :2789-2790): the THROWING
+      // _sessions.emplace runs FIRST; the noexcept _connecting.erase(integral) runs
+      // SECOND. If emplace throws (bad_alloc), _connecting stays populated so
+      // withConnectGuard -> preInsertTerminal fires the ONE terminal (no lost
+      // completion / observer leak). Erase-first would clear _connecting and then
+      // never insert, leaving the guard with nothing to fire.
       std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
       _sessions.emplace(s->id, std::move(s));
+      _connecting.erase(cr.sid);
     }
+    // A3.1c + steps-4-8 R1 TS-M2: disarm the fd guard the INSTANT the session owns
+    // the fd (the _sessions.emplace above), BEFORE the allocating _tags insert. A
+    // bad_alloc in make_unique<Tag>/_tags.emplace now unwinds through withConnectGuard
+    // -> closeNow (sid is in _sessions) which closes the fd exactly ONCE; a late
+    // disarm here would let fdGuard double-close it. Mirrors TCP's disarm placement.
+    fdGuard.fd = -1;
     auto tag = std::make_unique<Tag>();
     tag->isListener = false;
     tag->sess = sPtr;
@@ -1660,8 +2008,11 @@ private:
     bumpSess();
     {
       _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
-      decltype(_cbs.onConnect) connectCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
+      // steps-4-8 R2 (simp/cpp17/TS): route onConnect through invokeUserCallback
+      // (mirror tcp_engine) — a throwing onConnect is swallowed+logged and does NOT
+      // propagate into withConnectGuard (which would spuriously tear the just-connected
+      // session down, diverging from TCP).
+      const auto connectCb = copyCallback(_cbMutex, _cbs.onConnect);
       if (connectCb)
       {
         sockaddr_storage peerSs{};
@@ -1671,9 +2022,14 @@ private:
         {
           peerAddr = addressFromSockaddr(peerSs);
         }
-        connectCb(cr.sid, peerAddr);
+        invokeUserCallback(connectCb, cr.sid, peerAddr);
       }
     }
+    // A3.1b: replay datagrams buffered during the resolve window, in order, through
+    // the role-correct send path (replaying via sendDo — rather than moving raw bytes
+    // into s->wq — also attempts an immediate ::send and routes the ServerPeer twin
+    // to its listener queue).
+    replayPendingWq(cr.sid, pendingWq);
     return true;
   }
 
@@ -1707,6 +2063,7 @@ private:
       pc.resolveDeadline = MonoClock::now() + _config.resolveTimeout;
     }
     _pendingConnects[vr.sid] = pc;
+    testMaybeThrowAt(ConnectThrowPoint::VIA_KICKOFF_AFTER_PENDING_INSERT);
 
     const SessionId sid = vr.sid;
     const ListenerId lid = vr.lid;
@@ -1727,13 +2084,20 @@ private:
     {
       return; // resolve-timeout or close already fired the terminal
     }
+    // A3.1b: MOVE the buffered datagrams out BEFORE erasing the pending entry.
+    std::deque<ByteBuffer> pendingWq = std::move(it->second.wq);
     _pendingConnects.erase(it);
     if (gai != 0 || !addrs || !addrs->get())
     {
       emitResolveFailure(sid, gai);
       return;
     }
-    viaFromAddrs(sid, lid, addrs->get());
+    withConnectGuard(sid,
+                     [&]()
+                     {
+                       testMaybeThrowAt(ConnectThrowPoint::BEFORE_INSERT_RESUME);
+                       viaFromAddrs(sid, lid, addrs->get(), std::move(pendingWq));
+                     });
   }
 
   /// \brief Create a via-listener peer session from an EXTERNALLY-owned addrinfo
@@ -1743,25 +2107,23 @@ private:
   /// owns res (#6). Every post-resolution terminal is a one-shot eraser-fire:
   /// listener-gone / AF-mismatch / session-cap -> onClose(Config); success ->
   /// onConnect. Runs on the I/O thread.
-  bool viaFromAddrs(SessionId sid, ListenerId lid, addrinfo *res)
+  bool viaFromAddrs(SessionId sid, ListenerId lid, addrinfo *res,
+                    std::deque<ByteBuffer> pendingWq = {})
   {
     auto lit = _listeners.find(lid);
     if (lit == _listeners.end())
     {
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-        closeCb(sid, TransportErrorInfo{TransportError::Config, "listener not found"});
+      // A3.1a: route every via pre-insert terminal through preInsertTerminal (erase
+      // _connecting -> onClose once); pendingWq destructs, dropping the buffer.
+      preInsertTerminal(sid, TransportErrorInfo{TransportError::Config, "listener not found"});
       return false;
     }
     Listener *lst = lit->second.get();
     int af = sockAf(lst->fd);
     if (af != AF_INET && af != AF_INET6)
     {
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-        closeCb(sid, TransportErrorInfo{TransportError::Config, "listener AF unknown/unsupported"});
+      preInsertTerminal(sid,
+                        TransportErrorInfo{TransportError::Config, "listener AF unknown/unsupported"});
       return false;
     }
     const addrinfo *chosen = nullptr;
@@ -1778,10 +2140,7 @@ private:
       // NO ::freeaddrinfo — caller owns res (#6).
       std::string m = (af == AF_INET) ? "AF mismatch: listener IPv4, remote IPv6 only"
                                       : "AF mismatch: listener IPv6, remote IPv4 only";
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-        closeCb(sid, TransportErrorInfo{TransportError::Config, m});
+      preInsertTerminal(sid, TransportErrorInfo{TransportError::Config, m});
       return false;
     }
     sockaddr_storage to{};
@@ -1821,18 +2180,24 @@ private:
     s->lastWriteProgress = s->created;
     s->connectPending = false;
     {
+      // A3.1a: erase _connecting WITH the _sessions insert in ONE unique-lock
+      // section (atomic connecting -> live transition; see connectFromAddrs). ORDER
+      // (steps-4-8 R2 TS-H1): throwing emplace FIRST, noexcept erase SECOND, so a
+      // bad_alloc leaves _connecting populated for the guard terminal.
       std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
       _sessions.emplace(s->id, std::move(s));
+      _connecting.erase(sid);
     }
     if (!peerExists)
     {
       _peerIndex.emplace(k, sid);
     }
     bumpSess();
-    decltype(_cbs.onConnect) connectCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
-    if (connectCb)
-      connectCb(sid, addressFromSockaddr(to));
+    // steps-4-8 R2: onConnect via invokeUserCallback (see connectFromAddrs).
+    invokeUserCallback(copyCallback(_cbMutex, _cbs.onConnect), sid, addressFromSockaddr(to));
+    // A3.1b: replay datagrams buffered during the resolve window, in order (ServerPeer
+    // -> ::sendto on the listener fd / the owning listener's write queue).
+    replayPendingWq(sid, pendingWq);
     return true;
   }
 
@@ -1849,20 +2214,18 @@ private:
         {
           _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
           s->lastActivity = MonoClock::now();
-          decltype(_cbs.onData) dataCb;
-          { std::lock_guard<std::mutex> g(_cbMutex); dataCb = _cbs.onData; }
-          if (dataCb)
-            dataCb(s->id, iora::core::BufferView{buf.data(), static_cast<std::size_t>(n)},
-                   std::chrono::steady_clock::now());
+          // steps-4-8 R2 (simp/cpp17): onData via invokeUserCallback — a throwing
+          // handler on the read path (onClient has NO outer try) would otherwise
+          // std::terminate the process (mirror tcp_engine).
+          invokeUserCallback(copyCallback(_cbMutex, _cbs.onData), s->id,
+                             iora::core::BufferView{buf.data(), static_cast<std::size_t>(n)},
+                             std::chrono::steady_clock::now());
           continue;
         }
         if (n == 0)
         {
-          decltype(_cbs.onData) dataCb;
-          { std::lock_guard<std::mutex> g(_cbMutex); dataCb = _cbs.onData; }
-          if (dataCb)
-            dataCb(s->id, iora::core::BufferView{nullptr, 0},
-                   std::chrono::steady_clock::now());
+          invokeUserCallback(copyCallback(_cbMutex, _cbs.onData), s->id,
+                             iora::core::BufferView{nullptr, 0}, std::chrono::steady_clock::now());
           break;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -1925,7 +2288,34 @@ private:
   {
     auto it = _sessions.find(sr.sid);
     if (it == _sessions.end())
+    {
+      // A3.1b: the sid may be a named-host/Via connect still resolving (sendable via
+      // _connecting, no Session yet). Buffer the datagram in its PendingConnect entry
+      // to replay in order after insert. Overflow drops OLDEST but always keeps >=1
+      // (unconditional pop_front — no Session exists, so no closeOnBackpressure path;
+      // a UDP retransmit burst leaves >=1 deliverable, and RFC 3261 s17 retransmission
+      // + peer server-transaction absorption recover a dropped pre-establishment copy).
+      auto pit = _pendingConnects.find(sr.sid);
+      if (pit != _pendingConnects.end())
+      {
+        pit->second.wq.emplace_back(std::move(sr.payload));
+        while (pit->second.wq.size() > _config.maxWriteQueue && pit->second.wq.size() > 1)
+        {
+          pit->second.wq.pop_front();
+        }
+      }
+      // A sid that passed sessionSendable (in _connecting) but is in NEITHER _sessions
+      // NOR _pendingConnects does not occur on the normal FIFO path — Cmd::connect/
+      // Cmd::via is dequeued (inserting the session for a literal host, or recording the
+      // _pendingConnects entry for a named host) BEFORE any racing Cmd::send. It CAN
+      // occur benignly on the connect-throw terminal path (steps-4-8 R2 sip-L1): send()
+      // passes sessionSendable, connectDo/resume throws, withConnectGuard ->
+      // preInsertTerminal -> eraseConnecting removes the entry before this queued
+      // Cmd::send's sendDo runs -> the datagram is dropped here AFTER the session's ONE
+      // terminal already fired (correct: it would be dropped regardless). Re-verify
+      // before reordering command dispatch.
       return;
+    }
     Session *s = it->second.get();
     if (s->closed.load(std::memory_order_relaxed))
       return;
@@ -2048,12 +2438,11 @@ private:
       detail::FdCloser closer(fdToClose, &_preCloseHook);
     }
 
-    decltype(_cbs.onClose) closeCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-    if (closeCb)
-    {
-      closeCb(sid, TransportErrorInfo{why, m, savedErrno});
-    }
+    // steps-4-8 R2 (simp/cpp17): onClose via invokeUserCallback — closeNow is called
+    // from the read/write/GC paths that have NO outer try, so a throwing onClose would
+    // otherwise unwind the I/O loop and skip shutdownDrain (mirror tcp_engine).
+    invokeUserCallback(copyCallback(_cbMutex, _cbs.onClose), sid,
+                       TransportErrorInfo{why, m, savedErrno});
   }
   void runGc()
   {
@@ -2124,16 +2513,13 @@ private:
   /// onClose(Resolve) iff this call erased the entry.
   void resolveTimeoutOnIo(SessionId sid)
   {
-    auto it = _pendingConnects.find(sid);
-    if (it == _pendingConnects.end())
+    // A3.1a: erase _pendingConnects AND _connecting -> onClose(Resolve) via the ONE
+    // terminal helper. preInsertTerminal returns false (fires nothing) if resume/close
+    // already won the race and cleared both — in which case we skip error() too.
+    if (preInsertTerminal(sid, TransportErrorInfo{TransportError::Resolve, "resolve timeout"}))
     {
-      return; // resume/close won the race
+      error(TransportError::Resolve, "resolve timeout");
     }
-    _pendingConnects.erase(it);
-    decltype(_cbs.onClose) closeCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-    if (closeCb) closeCb(sid, TransportErrorInfo{TransportError::Resolve, "resolve timeout"});
-    error(TransportError::Resolve, "resolve timeout");
   }
 
   /// \brief True when the aggregate session cap is reached. Shared by all three
@@ -2160,12 +2546,9 @@ private:
     {
       return false;
     }
-    decltype(_cbs.onClose) closeCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-    if (closeCb)
-    {
-      closeCb(sid, TransportErrorInfo{TransportError::ResourceLimit, "session cap reached"});
-    }
+    // A3.1a: erase _connecting -> onClose(ResourceLimit) via the ONE terminal helper
+    // (both callers — connectFromAddrs, viaFromAddrs — hold a _connecting entry).
+    preInsertTerminal(sid, TransportErrorInfo{TransportError::ResourceLimit, "session cap reached"});
     return true;
   }
 
@@ -2233,18 +2616,42 @@ private:
   // mutually-exclusive LEAVES — at most one is held at a time, never nested.
   // - _cbMutex protects callback copies (copy-then-invoke: acquired/released
   //   before any callback fires and before any _sessionRwMutex use).
-  // - _sessionRwMutex protects session/listener maps (shared for reads, unique
-  //   for mutations).
+  // - _sessionRwMutex protects session/listener maps AND the _connecting
+  //   connecting-sid registry (shared for reads, unique for mutations).
   // - _qmx protects the command queue (_q) AND serializes the _eventFd wakeup-
   //   write (enqueue) against the _eventFd close (shutdownDrain), plus the
   //   _qClosed teardown flag. process() swaps _q out under _qmx then RELEASES
   //   before dispatching handlers, so command handlers never run with _qmx held.
   //   NEVER acquire another lock while holding _qmx.
   // - _errorMutex protects the sticky last-error string.
+  //
+  // CONNECT-THEN-SEND ORDER (A-ext): connect()/connectViaListener() take
+  //   _sessionRwMutex(insert into _connecting) -> RELEASE -> _qmx(enqueue) in that
+  //   SEQUENTIAL, never-co-held order; the send path takes _sessionRwMutex
+  //   (sessionSendable/isSessionLive) then, released, _qmx (enqueue). Both engine
+  //   leaves stay leaves. The external nesting is acyclic:
+  //   - SipUdpTransport::_sessionMutex WRAPS both legs sequentially (getOrCreateSession
+  //     calls connectViaListener then, released, sendSync) -> _sessionMutex ->
+  //     _sessionRwMutex -> RELEASE -> _qmx. The engine fires every consumer callback
+  //     (connectFromAddrs/viaFromAddrs onConnect, closeNow/preInsertTerminal onClose)
+  //     AFTER releasing _sessionRwMutex, so there is NO _sessionRwMutex->_sessionMutex
+  //     back-edge.
+  //   - Transport observe(): SseServer::_mutex -> observerMutex -> _sessionRwMutex
+  //     (isSessionLive) -> RELEASE -> _qmx (runOnIoThread). All acyclic; engine locks
+  //     are leaves.
   std::mutex _cbMutex;
   detail::EngineBase::Callbacks _cbs{};
 
   mutable std::shared_mutex _sessionRwMutex;
+  // Connecting-sid registry (guarded by _sessionRwMutex). A SINGLE unified set for
+  // BOTH connect() and connectViaListener(): holds a sid from the moment either
+  // enqueues its Cmd until the session is inserted into _sessions, OR a pre-insert
+  // terminal fires (preInsertTerminal), OR the connect() call is still in flight.
+  // sessionSendable()/isSessionLive() read exactly this one set so a connect()'d sid
+  // is immediately sendable (its datagrams buffer in the PendingConnect entry until
+  // the session materializes). Invariant (A2.1): the registry entry is cleared
+  // happens-before its onClose dispatch, which is what makes observe() exactly-once.
+  std::unordered_set<SessionId> _connecting;
   std::mutex _qmx;
   std::deque<Cmd> _q;
   // Set true under _qmx by shutdownDrain() once the I/O loop has exited and the

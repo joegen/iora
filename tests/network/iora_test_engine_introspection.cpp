@@ -607,8 +607,10 @@ TEST_CASE("UDP isOnIoThread: false off-thread, true inside data callback", "[udp
   REQUIRE(tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
   auto cr = tx.connect("127.0.0.1", port, TlsMode::None);
   REQUIRE(cr.isOk());
-  // Await onConnect before sending: connect() is async (the session is inserted on
-  // the I/O thread), and send() now rejects a not-yet-established session (CF-H1).
+  // Await onConnect before sending here for clarity. (Under A-ext a UDP connect()'d
+  // sid is ALSO immediately sendable — see iora_test_udp_connect_then_send.cpp — so
+  // this await is no longer required for correctness, only to keep this
+  // introspection test focused on the I/O-thread-identity assertions below.)
   REQUIRE(waitFor([&] { return connected.load(); }));
 
   const char msg[] = "ping";

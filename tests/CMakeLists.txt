@@ -108,6 +108,7 @@ set(NETWORK_TESTS
     network/iora_test_websocket
     network/iora_test_websocket_upgrade_race
     network/iora_test_transport
+    network/iora_test_transport_observe
     network/iora_test_transport_sync_dscp_fixes
     network/iora_test_tls_identity
     network/iora_test_engine_introspection
@@ -123,6 +124,10 @@ set(NETWORK_TESTS
     # resolve-window cases stall the blockingIoPool() (PoolStall), so it is
     # ISOLATED and LAST-ORDERED like the resolve binaries above.
     network/iora_test_tcp_connect_then_send
+    # UdpEngine connect-then-send parity (tracker 2026-09-24-2 A-ext): its
+    # named-host/Via registry-hygiene resolve cases stall the blockingIoPool()
+    # (PoolStall), so it is ISOLATED and LAST-ORDERED like the resolve binaries.
+    network/iora_test_udp_connect_then_send
 )
 
 
@@ -598,6 +603,8 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_tcp_engine_teardown_race
     iora_test_tcp_connect_then_send
     iora_test_tcp_setup_close_codes
+    iora_test_transport_observe
+    iora_test_udp_connect_then_send
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race
     iora_test_batch_processor

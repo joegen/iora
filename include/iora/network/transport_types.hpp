@@ -85,9 +85,20 @@ enum class TransportError
   // migrating the TCP/TLS cap sites to this discriminator is a tracked follow-on
   // (coding_trackers tasks/iora/backlog/2026-09-16-2).
   // Appended before Unknown to preserve existing enum ordinals (some operator-facing
-  // logs stringify static_cast<int>(code)).
+  // logs stringify static_cast<int>(code)). NOTE: both append-before-Unknown (as
+  // ResourceLimit above) and append-after-Unknown (as NotConnected below) preserve
+  // every PRIOR ordinal; NotConnected is appended AFTER Unknown specifically so that
+  // Unknown's OWN ordinal also stays stable for any consumer that persists/stringifies
+  // static_cast<int>(code).
   ResourceLimit,
-  Unknown
+  Unknown,
+  // A synchronous send targeted a session that is not connected (an unknown, closed, or
+  // cap-rejected sid). Distinct from Socket ('send enqueue failed'): NotConnected is the
+  // structured "no live session" signal the UDP/TCP engines report from their
+  // single-decision send path (trySend -> {Ok, NotConnected, EnqueueFailed}); iora_sip's
+  // isTransientSessionNotConnected carve-out is rekeyed onto it. Appended AFTER Unknown to
+  // keep Unknown's ordinal stable (see the note above).
+  NotConnected
 };
 
 struct IoResult
