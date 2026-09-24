@@ -357,6 +357,24 @@
       "headers": [
         "web/middleware_interfaces.hpp"
       ]
+    },
+    "crypto/secure_rng.md": {
+      "area": "crypto",
+      "headers": [
+        "crypto/secure_rng.hpp"
+      ]
+    },
+    "ids/uuid.md": {
+      "area": "ids",
+      "headers": [
+        "ids/uuid.hpp"
+      ]
+    },
+    "common/i_lifecycle_managed.md": {
+      "area": "common",
+      "headers": [
+        "common/i_lifecycle_managed.hpp"
+      ]
     }
   }
 }

@@ -69,19 +69,19 @@ struct LifecycleResult
 /// that need graceful shutdown and reset capabilities. Components implementing
 /// this interface follow a state machine:
 ///
-///   Created → Running → Draining → Stopped → Reset → (back to Created)
+///   Created → Running → Draining → Stopped → Reset → (start() → Running)
 ///
 /// Key principles:
 /// - drain() stops accepting new work and waits for in-flight work to complete
-/// - stop() triggers drain of dependencies and exits event loops
-/// - reset() returns component to clean state ready for restart
-/// - All methods are thread-safe unless documented otherwise
+/// - stop() drains the component itself (and a composite, its dependencies) and exits event loops
+/// - reset() returns component to clean state; start() restarts it from Reset
+/// - All methods are thread-safe unless documented otherwise (implementers may deviate; see their docs)
 class ILifecycleManaged
 {
 public:
   virtual ~ILifecycleManaged() = default;
 
-  /// Start the component (Created → Running)
+  /// Start the component (Created or Reset → Running)
   ///
   /// This method initializes the component and transitions it to the Running state.
   /// After successful start(), the component is ready to accept and process work.
@@ -97,27 +97,31 @@ public:
   /// the component type:
   ///
   /// - ThreadPool: Waits for task queue to empty and all workers to become idle
-  /// - Timer: Cancels or completes active timers and waits for callbacks to finish
-  /// - Higher-level components: Implements component-specific cleanup (e.g., sending
-  ///   SIP CANCEL/500 responses)
+  /// - TimerService: Cancels or completes active timers and waits for callbacks to finish
+  /// - Higher-level components: Implements component-specific cleanup of their
+  ///   own in-flight work
   ///
   /// This is a blocking call that returns when:
   /// 1. All in-flight work has completed, OR
   /// 2. The timeout expires
   ///
-  /// @param timeoutMs Maximum time to wait in milliseconds (0 = wait indefinitely)
+  /// The state after a timeout is implementer-defined; read LifecycleResult::newState
+  /// (ThreadPool stays Draining; TimerService returns to Running if its run loop is
+  /// still alive and no concurrent stop() intervened).
+  ///
+  /// @param timeoutMs Maximum time to wait in milliseconds (0 = no deadline requested;
+  ///        an implementer may still cap it -- ThreadPool caps at one hour)
   /// @return Result with drain statistics showing completed vs remaining work
   virtual LifecycleResult drain(std::uint32_t timeoutMs = 30000) = 0;
 
-  /// Stop the component (Draining → Stopped)
+  /// Stop the component (Running or Draining → Stopped)
   ///
-  /// This method triggers drain() on all dependencies (if any), then exits
-  /// event loops and stops all background threads. It does NOT release resources;
-  /// use reset() for that.
+  /// From Running this first drains the component's own work (and a composite
+  /// drains its dependencies), then exits event loops and stops all background
+  /// threads. It does NOT release resources; use reset() for that.
   ///
-  /// For components with dependencies:
-  /// - Transaction Layer calls drain() on Timer and ThreadPool
-  /// - Higher layers call drain() on Transaction Layer
+  /// For components with dependencies: a component that owns a TimerService and a
+  /// ThreadPool drains them from its own stop(), and its owner in turn drains it.
   ///
   /// @return Result indicating success and new state
   virtual LifecycleResult stop() = 0;
@@ -150,16 +154,16 @@ public:
   /// - Load balancing decisions
   ///
   /// The exact definition of "in-flight" is component-specific:
-  /// - ThreadPool: _tasks.size() + _busyThreads
-  /// - Timer: _activeTimers.size() + _callbacksExecuting
-  /// - Transaction Layer: Number of non-terminated transactions
+  /// - ThreadPool: queued tasks + busy workers
+  /// - TimerService: non-cancelled timer records (executing callbacks not counted)
+  /// - Higher-level components: their own unit of work (e.g. live transactions)
   ///
   /// @return Number of in-flight work items
   virtual std::uint32_t getInFlightCount() const = 0;
 };
 
 /// Helper function to convert LifecycleState to string
-inline const char *lifecycleStateToString(LifecycleState state)
+inline const char *lifecycleStateToString(LifecycleState state) noexcept
 {
   switch (state)
   {

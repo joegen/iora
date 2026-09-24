@@ -27,6 +27,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <arpa/inet.h> // ::inet_pton for IPv6-literal recognition (isIPAddress / parseUrl)
 

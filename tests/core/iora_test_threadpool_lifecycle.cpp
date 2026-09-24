@@ -11,6 +11,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <string>
 #include <thread>
 
 using namespace iora::core;
@@ -757,4 +758,14 @@ TEST_CASE("ThreadPool lifecycle: concurrent start() from Reset does not over-spa
     // The discriminator: exactly kInitial workers, not up to kThreads * kInitial.
     REQUIRE(pool.getTotalThreadCount() == kInitial);
   }
+}
+
+TEST_CASE("lifecycleStateToString names every state", "[lifecycle]")
+{
+  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Created)) == "Created");
+  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Running)) == "Running");
+  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Draining)) == "Draining");
+  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Stopped)) == "Stopped");
+  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Reset)) == "Reset");
+  REQUIRE(std::string(lifecycleStateToString(static_cast<LifecycleState>(99))) == "Unknown");
 }

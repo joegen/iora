@@ -177,6 +177,8 @@ set(UTIL_TESTS
     util/iora_test_gzip_decode
     util/iora_test_expiring_cache
     util/iora_test_shell_runner
+    util/iora_test_secure_rng
+    util/iora_test_uuid
     util/iora_test_ttl_map
     util/iora_test_base64
     util/iora_test_filesystem

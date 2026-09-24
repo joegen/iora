@@ -9,6 +9,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -21,9 +22,9 @@ namespace ids
 
 /// \brief UUID generator supporting v4 (random) and v7 (time-ordered) variants.
 ///
-/// Generates RFC 4122 compliant UUIDs:
+/// Generates RFC 9562 (which obsoletes RFC 4122) UUIDs:
 /// - v4: Fully random UUIDs for general use
-/// - v7: Time-ordered UUIDs for sortable identifiers (draft RFC)
+/// - v7: Time-ordered UUIDs (48-bit Unix-epoch millisecond prefix)
 class Uuid
 {
 public:
@@ -46,9 +47,10 @@ public:
   /// \brief Generate a version 7 (time-ordered) UUID.
   /// \return String representation of time-ordered UUID
   ///
-  /// Version 7 UUIDs contain a timestamp in the most significant bits,
-  /// making them naturally sortable by creation time while maintaining
-  /// sufficient randomness for uniqueness.
+  /// Version 7 UUIDs contain a millisecond timestamp in the most significant
+  /// bits, so they sort by creation time at millisecond granularity only: two
+  /// UUIDs generated within the same millisecond order randomly (no
+  /// sub-millisecond counter), and a backwards system_clock step breaks order.
   static std::string v7()
   {
     std::array<std::uint8_t, 16> b{};
@@ -127,8 +129,8 @@ private:
     std::string s;
     s.resize(36); // 32 hex chars + 4 hyphens
 
-    int p = 0;
-    for (int i = 0; i < 16; ++i)
+    std::size_t p = 0;
+    for (std::size_t i = 0; i < 16; ++i)
     {
       // Insert hyphens at standard positions
       if (i == 4 || i == 6 || i == 8 || i == 10)

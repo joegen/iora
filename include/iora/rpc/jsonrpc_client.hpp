@@ -150,7 +150,7 @@ private:
 ///     before the compression wrapper (which sits outside sendJsonWithRetries_)
 ///     gets to handle the fallback.
 ///   * NOT an HttpRequestNotSentError / HttpClientCancelledError — a 415 is a
-///     successful round trip, so isRequestProvablyNotSent (http_client.hpp:577,
+///     successful round trip, so isRequestProvablyNotSent (in http_client.hpp,
 ///     a dynamic_cast over HttpRequestNotSentError) correctly returns false for
 ///     it and the not-sent retry gate leaves it to the bare rethrow.
 ///   * WITHOUT an Http* prefix — an Http-prefixed type in namespace rpc
