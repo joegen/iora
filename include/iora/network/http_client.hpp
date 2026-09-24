@@ -218,10 +218,10 @@ public:
 };
 
 /// \brief Thrown when the transport connect phase (TCP handshake, and for an https
-/// endpoint the TLS handshake) exceeds its deadline — i.e. connectSync returns
-/// TransportError::Timeout. The request was PROVABLY NOT SENT (no request byte is
-/// written until after a connection is established), so it is safely retryable for
-/// ANY method per RFC 9110 §9.2.2.
+/// endpoint the TLS handshake) exceeds its deadline — i.e. connectSync fails with a
+/// connect-phase timeout (isConnectPhaseTimeout). The request was PROVABLY NOT SENT
+/// (no request byte is written until after a connection is established), so it is
+/// safely retryable for ANY method per RFC 9110 §9.2.2.
 ///
 /// It IS a subclass of HttpRequestNotSentError, exactly like HttpLeaseAcquireTimeoutError
 /// and for the same reason: this failure never reached the wire. Retry classification
@@ -230,12 +230,14 @@ public:
 /// connect-timeout path — NO retry-behaviour change. It is given a DISTINCT type
 /// SOLELY so a caller can classify a connect timeout by TYPE for a timeoutRequests
 /// metric (tracker 2026-09-03-3); the classification is keyed on the structured
-/// TransportError::Timeout code, never on the message text. The transport's own
-/// message is passed through unaltered (e.g. "...connectSync timed out" from the
-/// connectSync deadline, or "...Connect timeout" from the tcp_engine watchdog — both
-/// set code == Timeout), but that text is DEFENSIVE-ONLY: no consumer keys on it, and
-/// none should — a substring match on transport messages is exactly the fragility this
-/// typing exists to remove.
+/// TransportError code and sysErrno (isConnectPhaseTimeout), never on the message
+/// text. The transport's own message is passed through unaltered: "...connectSync
+/// timed out" from the connectSync deadline (TransportError::Timeout), "...Connect
+/// timeout" from the tcp_engine connect watchdog (TransportError::Connect + ETIMEDOUT)
+/// or "...TLS handshake timeout" from the tcp_engine handshake watchdog
+/// (TransportError::TLSHandshake + ETIMEDOUT). That text is DEFENSIVE-ONLY: no iora
+/// consumer keys on it, and none should — a substring match on transport messages is
+/// exactly the fragility this typing exists to remove.
 ///
 /// INVARIANT: same visibility/inline shape as its sibling timeout types so the
 /// dynamic_cast in the separately-compiled jsonrpc_client module resolves across the
@@ -1601,17 +1603,19 @@ private:
       // until after connect), so surface it as HttpConnectTimeoutError — a
       // HttpRequestNotSentError subclass, so retry semantics are unchanged, but a
       // distinct TYPE the timeoutRequests classifier can key on (tracker
-      // 2026-09-03-3). Discriminate on the STRUCTURED transport code, never the
-      // message text: BOTH connect-timeout producers surface as
-      // TransportError::Timeout here — the connectSync wait_for deadline
-      // (transport_impl.hpp) and the tcp_engine CloseOrigin::ConnectTimeout watchdog
-      // (delivered via onClose). Every other connect failure stays a plain
+      // 2026-09-03-3). Discriminate on the STRUCTURED transport code + sysErrno,
+      // never the message text (isConnectPhaseTimeout): the connectSync wait_for
+      // deadline (transport_impl.hpp) surfaces as TransportError::Timeout; the
+      // tcp_engine connect watchdog as TransportError::Connect + ETIMEDOUT; the
+      // tcp_engine handshake watchdog as TransportError::TLSHandshake + ETIMEDOUT
+      // (both delivered via onClose). Every other connect failure stays a plain
       // runtime_error, flattened to HttpRequestNotSentError by the generic pre-send
-      // catch below: a refusal/reset is TransportError::Connect and a resolution
-      // failure is TransportError::Resolve — neither is a timeout (DNS/resolution is
-      // a distinct failure domain, deliberately NOT counted; tracker 2026-09-03-3
-      // DQ-2 scope_out).
-      if (connectResult.error().code == TransportError::Timeout)
+      // catch below: a refusal/reset is TransportError::Connect with a non-ETIMEDOUT
+      // errno, a handshake/verify failure is TransportError::TLSHandshake with a
+      // non-ETIMEDOUT errno, and a resolution failure is TransportError::Resolve —
+      // none is a timeout (DNS/resolution is a distinct failure domain, deliberately
+      // NOT counted; tracker 2026-09-03-3 DQ-2 scope_out).
+      if (isConnectPhaseTimeout(connectResult.error()))
       {
         throw HttpConnectTimeoutError(detail);
       }

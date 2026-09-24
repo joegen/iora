@@ -111,6 +111,7 @@ set(NETWORK_TESTS
     network/iora_test_transport_sync_dscp_fixes
     network/iora_test_tls_identity
     network/iora_test_engine_introspection
+    network/iora_test_tcp_setup_close_codes
     # Event-driven DNS-resolve tests (tracker 2026-09-06-4). The three below
     # monopolise the process-wide blockingIoPool() (block all workers / fill the
     # queue) to drive resolve-timeout and reject-fast paths deterministically, so
@@ -118,6 +119,10 @@ set(NETWORK_TESTS
     network/iora_test_tcp_engine_resolve
     network/iora_test_udp_engine_resolve
     network/iora_test_name_resolver_saturation
+    # TcpEngine connect-then-send (tracker 2026-09-24-1): its registry-hygiene
+    # resolve-window cases stall the blockingIoPool() (PoolStall), so it is
+    # ISOLATED and LAST-ORDERED like the resolve binaries above.
+    network/iora_test_tcp_connect_then_send
 )
 
 
@@ -591,6 +596,8 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_transport_improvements
     iora_test_tcp_engine
     iora_test_tcp_engine_teardown_race
+    iora_test_tcp_connect_then_send
+    iora_test_tcp_setup_close_codes
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race
     iora_test_batch_processor

@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Component** | `iora::network::HttpClient`, `iora::network::HttpClientPool` (+ `PooledHttpClient`) |
-| **Version** | 2.3 |
+| **Version** | 2.4 |
 | **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/network/http_client.hpp` (client, RFC-9112 framing, exception taxonomy) and `include/iora/network/http_client_pool.hpp` (pool + `PooledHttpClient`) |
@@ -30,6 +30,7 @@
 | 2.1 | 2026-09-12 | **Re-synced to the landed Group-5 fixes (iora 1af4b25).** `HttpClientPool::createClient()` now copies `leaseAcquireTimeout` (plus the previously-copied set) so a pooled client's async API works purely from the pool `Config` (CLI-F1). `PooledHttpClient` now forwards the full surface -- `head`/`postStream`/`getAsync`/`postJsonAsync` added (CLI-F3) -- and its `setTlsConfig` forwarder was removed (CLI-F5); the "footgun" and "does-not-forward" Known-Limitations rows are retired. `Config::enableCompression` is now explicitly RESERVED AND INERT rather than an undocumented dead flag (CLI-F2). `parseUrl` now lowercases the scheme (case-insensitive `HTTP://`/`HTTPS://`, RFC 3986 §3.1, CLI-NEW1) and parses bracketed IPv6-literal authorities (`http://[::1]:8080/`, re-bracketed in `Host`, CLI-NEW2) -- both removed from anti-patterns/limitations. Documented the `_connections` lazy idle sweep (CLI-CACHE) and the `setTlsConfig`-before-DNS-setters ordering constraint. |
 | 2.2 | 2026-09-24 | DOC-4: rehomed README-unique content (§6.5 pairing `HttpClientPool` with `core::ThreadPool`); corrected §5.3 statistics (mutex-guarded `BlockingQueue` calls, not atomic reads) and the `close()` description (a client returned after `close()` is destroyed); recorded in Known Limitations that the pool statistics stop tracking checkouts after `close()` and there is no supported way to wait for checkouts to drain. |
 | 2.3 | 2026-09-24 | DOC-4 doc-review fixes: corrected the §5.3 / §7.4 claim that no acquisition succeeds after `close()`. An acquisition that starts after `close()` fails, but one already past its `_closed` check can still dequeue an idle client, because a closed `BlockingQueue` still hands out items it holds (`tryDequeue` ignores the closed flag). Idle clients keep their keep-alive connections until `~HttpClientPool`. Widened the lifetime invariant (§8, Known Limitations): the pool must outlive every call into it, including a blocked `get()`, because the destructor wakes the waiter and then destroys `_queue`. Qualified the §6.5 `ThreadPool` declaration-order advice: it holds only for `ShutdownMode::IMMEDIATE` with no timed-out `stop()` (a detached worker may touch a destroyed pool). Noted that teardown is unbounded because every queued task runs, and recommended `pool.get(timeout)`. Added the missing `leaseAcquireTimeout` field to the §10.3 `HttpClientPool::Config` listing. The Known Limitations drain-wait row now cites `coding_trackers:` tracker -15. Replaced the "not include-safe in multiple TUs" constraint with the evidence (all `transport_impl.hpp` definitions are `inline`, and a two-TU link succeeds), tracked in -21. |
+| 2.4 | 2026-09-25 | **Connect-timeout classification follows the TCP engine's setup-close codes** (tracker 2026-09-24-1, A7.1). The engine connect watchdog now closes `TransportError::Connect` + `sysErrno` `ETIMEDOUT` (was `Timeout`) and the handshake watchdog `TLSHandshake` + `ETIMEDOUT`; `acquireConnection` throws `HttpConnectTimeoutError` when the new free function `isConnectPhaseTimeout(err)` holds (`Timeout`, or `Connect`/`TLSHandshake` with `ETIMEDOUT`). Refusals, resets, handshake/verify failures and resolution failures stay `HttpRequestNotSentError`. The transport message is passed through unaltered and still contains "timeout"/"timed out". |
 
 ---
 
@@ -123,7 +124,7 @@ sequenceDiagram
     Note over ER: Timeout => healthy; any other outcome => dropConnection + throw (not-sent)
   else fresh
     AC->>T: connectSync(resolvedHost, port, tlsMode, tlsOpts, timeout)
-    Note over AC: TransportError::Timeout -> HttpConnectTimeoutError
+    Note over AC: isConnectPhaseTimeout(err) -> HttpConnectTimeoutError<br/>(Timeout, or Connect/TLSHandshake + ETIMEDOUT)
     AC-->>ER: {id, reused=false}
   end
   ER->>T: setReadMode(id, Sync)
@@ -205,7 +206,7 @@ std::runtime_error
 │   └── HttpExchangeDeadlineError    (totalRequestTimeout exceeded -- terminal for the attempt)
 ├── HttpRequestNotSentError          (provably not sent -- retry-eligible for ANY method)
 │   ├── HttpLeaseAcquireTimeoutError (leaseAcquireTimeout expired before any connect)
-│   └── HttpConnectTimeoutError      (connectSync TransportError::Timeout -- TCP/TLS handshake)
+│   └── HttpConnectTimeoutError      (connect-phase timeout: isConnectPhaseTimeout -- TCP/TLS handshake)
 ├── HttpResponseTimeoutError         (response-read timeout -- POSSIBLY sent; retry only if idempotent)
 └── HttpClientCancelledError         (client closing -- NEVER retried; send-ambiguous)
 
@@ -430,8 +431,8 @@ Best-effort only: peer close is observed asynchronously, so a missed FIN lets th
 | Trigger | Where | Exception | Retryable? |
 |---|---|---|---|
 | Lease wait exceeds `leaseAcquireTimeout` | `acquireLease` | `HttpLeaseAcquireTimeoutError` | Yes -- any method (never touched the wire) |
-| `connectSync` returns `TransportError::Timeout` | `acquireConnection` | `HttpConnectTimeoutError` | Yes -- any method |
-| Other connect failure (refuse/reset/DNS) | `acquireConnection` -> generic pre-send catch | `HttpRequestNotSentError` | Yes -- any method |
+| `connectSync` fails with a connect-phase timeout (`isConnectPhaseTimeout`: the connectSync deadline `Timeout`, the engine connect watchdog `Connect` + `ETIMEDOUT`, or the engine handshake watchdog `TLSHandshake` + `ETIMEDOUT`) | `acquireConnection` | `HttpConnectTimeoutError` | Yes -- any method |
+| Other connect failure (refuse/reset/handshake or verify failure/DNS) | `acquireConnection` -> generic pre-send catch | `HttpRequestNotSentError` | Yes -- any method |
 | `sendSync` enqueue failure | `executeRequest` | `HttpRequestNotSentError` | Yes -- any method |
 | Per-iteration read timeout (unclamped) | receive loop | `HttpResponseTimeoutError` | Idempotent only |
 | `totalRequestTimeout` elapsed | receive loop top | `HttpExchangeDeadlineError` | No |
@@ -496,7 +497,7 @@ Best-effort only: peer close is observed asynchronously, so a missed FIN lets th
 
 | Field | Type | Default | Effect / range |
 |-------|------|---------|--------|
-| `connectTimeout` | `std::chrono::milliseconds` | `2000` | TCP (and TLS) connect deadline. Clamped to `min(., 200ms)` for loopback (so not observable there). |
+| `connectTimeout` | `std::chrono::milliseconds` | `2000` | TCP (and TLS) connect deadline: the `connectSync` timeout and the transport `connectTimeout`. The `connectSync` deadline is clamped to `min(., 200ms)` for loopback (so not observable there). The transport's own TLS budget is `connectTimeout` + the transport `handshakeTimeout` (30 s default, not set by `HttpClient`), so a stalled TLS handshake normally ends on the `connectSync` deadline. |
 | `requestTimeout` | `std::chrono::milliseconds` | `3000` | Per-iteration send/receive sync timeout (re-arms each `receiveSync`). |
 | `maxRedirects` | `int` | `5` | **RESERVED AND INERT** -- no redirect logic exists. |
 | `followRedirects` | `bool` | `false` | **RESERVED AND INERT** -- defaults `false` so the config advertises no capability it lacks. |
@@ -557,6 +558,8 @@ class HttpResponseTimeoutError  : public std::runtime_error { public: explicit H
 class HttpExchangeDeadlineError : public HttpFramingError   { public: explicit HttpExchangeDeadlineError(const std::string&); };
 class HttpConnectTimeoutError   : public HttpRequestNotSentError { public: explicit HttpConnectTimeoutError(const std::string&); };
 
+// isConnectPhaseTimeout(err) -- Timeout, or Connect/TLSHandshake + ETIMEDOUT -- is declared in
+// iora/network/transport_types.hpp (namespace iora::network, next to TransportErrorInfo).
 inline std::string formatHostHeaderField(const std::string& host, std::uint16_t port, bool isHttps);
 inline bool isHttpTokenChar(unsigned char c);
 inline bool isValidHttpFieldName(const std::string& name);

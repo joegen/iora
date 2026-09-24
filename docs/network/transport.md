@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 1.10 |
+| **Version** | 1.11 |
 | **Date** | 2026-09-24 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/network/transport.hpp` |
@@ -28,6 +28,7 @@
 | 1.8 | 2026-09-14 | **`EPOLLRDHUP` peer-half-close detection + connect-error scoping.** (1) The TCP engine now arms `EPOLLRDHUP` on every session (in `updateInterest` and the accept/connect masks), so a `ReadMode::Disabled` (write-only/SSE) session detects a graceful peer FIN and fires `onClose(PeerClosed)` — previously the read-gate withheld `EPOLLIN` and left such a session's disconnect undetected. Documented the `ReadMode::Disabled` DR-1 contract (a peer close discards unread buffered inbound). (2) The `SO_ERROR` connect-completion probe is now gated on `connectPending`, so an **established** session's socket error (e.g. peer `RST`) is no longer mislabeled `Connect` (it surfaces as `PeerClosed`/`Socket`). |
 | 1.9 | 2026-09-24 | DOC-4: rehomed README-unique content (legacy-name navigation note in §9: `UnifiedSharedTransport` and `SyncAsyncTransport` were consolidated into `Transport`; `SharedTransport`/`SharedUdpTransport` became the internal `TcpEngine`/`UdpEngine`). Restored chronological order of the 1.7/1.8 rows. |
 | 1.10 | 2026-09-24 | DOC-4 doc-review fixes: the §9 legacy-names row now cites `coding_trackers:` tracker -21 for the stale `SyncAsyncTransport` comments (`detail/tcp_engine.hpp:470` plus a test comment). §4's "exactly one TU" pitfall is marked disputed: all `transport_impl.hpp` definitions are `inline` and a two-TU link succeeds. Verification is tracked in -21. |
+| 1.11 | 2026-09-25 | **TCP/TLS connect-then-send + deterministic setup-close codes** (tracker 2026-09-24-1). (1) A sid returned by the TCP engine's `connect()` is immediately sendable: `sessionSendable` also admits the connecting-sid registry; bytes are buffered FIFO until TCP-established (TLS: until handshake Open) and setup failures surface only via `onClose`. UDP is unchanged (await `onConnect` / use `connectSync`). (2) Setup-close invariant: a peer/network/error/timer-driven close during the TCP phase reports `Connect`, during the TLS handshake `TLSHandshake`; the connect timeout closes `Connect` + `sysErrno` `ETIMEDOUT` (message `"Connect timeout"`, was `Timeout`), the handshake timeout `TLSHandshake` + `ETIMEDOUT`; `sysErrno` is the handshake transport-abort discriminator. (3) TLS setup budget = `connectTimeout` + `handshakeTimeout` (the handshake timer is armed at TCP-established). (4) TCP/TLS write-queue overflow always closes the session (`WriteBackpressure`, never a silent drop); `closeOnBackpressure` applies to UDP only (drops the oldest datagram when `false`); a setup-phase overflow closes `WriteBackpressure` at setup completion before any byte is sent. (5) The write-stall timer is armed only once the session is writable and measures from the last write progress. (6) Review round 1: `connect()`/`addListener()` issued before `start()` are processed by `start()` alone; a setup-overflow close carries `sysErrno` `ENOBUFS`; local resource exhaustion closes `ResourceLimit`; the setup relabel and the `sysErrno` discriminator are client-role only (server-role `TLSHandshake` reports `0`); `GCClosed` is never relabelled; the GC applies the connect/handshake/write-stall deadline to a phase whose timer is not armed (TimerService at capacity, or a lost timer close); the TLS handshake no longer arms `EPOLLOUT` for queued bytes (busy-loop fix); `connectSyncCancellable` keeps polling through engine connect-phase timeouts; `isConnectPhaseTimeout` moved to `transport_types.hpp`; `maxWriteQueue` must be `>= 1`. |
 
 ---
 
@@ -141,7 +142,7 @@ sequenceDiagram
   participant App as User callback
 
   U->>E: transport->send(sid, data)
-  Note over E: sessionSendable(sid) check (CF-H1);<br/>enqueue on write queue; write eventfd to wake epoll
+  Note over E: sessionSendable(sid) check (CF-H1: open session, or a TCP sid still connecting);<br/>enqueue on write queue; write eventfd to wake epoll
   E->>E: epoll_wait returns (writable): write to socket
   E->>E: epoll_wait returns (readable): recv();<br/>capture receiveTime = steady_clock::now()
   E->>CB: engine onData(sid, BufferView, receiveTime)
@@ -302,15 +303,15 @@ struct TransportErrorInfo
 | `Bind` | Bind failure (address in use, permission denied) |
 | `Listen` | Listen failure |
 | `Accept` | Accept failure |
-| `Connect` | Connection refused or failed |
-| `TLSHandshake` | TLS handshake failure |
+| `Connect` | The TCP connect phase failed (refused, unreachable, reset, or any peer/network/timer-driven close before TCP-established; `sysErrno` is always non-zero); a connect timeout carries `sysErrno` `ETIMEDOUT` and the message `"Connect timeout"`. An immediate refusal reads `"Connection refused to host:port - ..."`, an immediate `ENETUNREACH`/`EHOSTUNREACH` `"Connection failed to host:port - ..."` |
+| `TLSHandshake` | TLS handshake failure, or any peer/network/timer-driven close during the handshake. Client role: `sysErrno != 0` <=> transport abort (`ETIMEDOUT` = handshake timeout; `ECONNRESET`/`EPIPE`/other socket errno; `ECONNABORTED` = EOF without an alert), `sysErrno == 0` <=> TLS-protocol failure (alert incl. `close_notify`, verify or certificate failure). Server role (accepted sessions): always `sysErrno` `0` |
 | `TLSIO` | TLS read/write error |
 | `PeerClosed` | Remote peer closed the connection |
-| `WriteBackpressure` | Write queue overflow |
+| `WriteBackpressure` | Write-queue overflow. TCP/TLS always close the session; UDP closes only when `closeOnBackpressure` is true. TCP/TLS setup-phase overflow closes at setup completion with `sysErrno` `ENOBUFS` (zero bytes sent, buffered requests discarded -- failover-safe); an established overflow carries `0` |
 | `Config` | Configuration error (also returned by `lastError()` when the transport is uninitialized) |
-| `GCClosed` | Closed by garbage collection (idle/age) |
+| `GCClosed` | Closed by the GC safety net (idle/age); never relabelled, even for a TCP session still in setup (only the connect/handshake deadlines, which the GC also applies to an unarmed timer, report `Connect`/`TLSHandshake`) |
 | `Cancelled` | Operation cancelled via `CancellationToken`, or a rejected overlapping sync op |
-| `Timeout` | Operation timed out |
+| `Timeout` | Operation timed out (sync-op deadlines, e.g. `"connectSync timed out"`; engine write stall `"Write stall timeout"`, from the timer or the GC fallback) |
 | `BufferOverflow` | Sync receive buffer exceeded `maxSyncReceiveBuffer` (data dropped; terminal for that session's buffer) |
 | `ShuttingDown` | Transport is being torn down; the sync op was released without completing |
 | `TooManyPendingSyncOps` | The concurrent parked-sync-op cap (`config.maxPendingSyncOps`) was reached; the sync op (`connectSync`/`sendSync`/`receiveSync`) was rejected rather than parked |
@@ -332,6 +333,8 @@ Key points:
 
 - **`onAccept`/`onConnect` fire only on success.** Failed accepts are engine-internal retries; failed connects surface via `onClose` (per-session) or `onError` (transport-level).
 - **`Connect` is a still-connecting error only.** The engine's `SO_ERROR` connect-completion probe is gated on the session's `connectPending` flag, so a socket error on an **established** session (e.g. a peer `RST` while a write is pending) surfaces as `onClose(PeerClosed)` / `Socket`, **not** `Connect`. A consumer that branches on the close code (e.g. retry-on-connect-failure) can rely on `Connect` meaning the initial connection never completed.
+- **Setup-close invariant (TCP engine, client role).** Every peer/network/error/timer-driven close of an outbound session is relabelled centrally in `closeNow`: while the TCP phase is pending it reports `Connect`; during the TLS handshake it reports `TLSHandshake` (the TCP phase wins). The exemption is by code: `Unknown` (app `close()` `"closed by app"`, and the internal-error close of a connect-path or dispatch exception), `ShuttingDown`, `WriteBackpressure`, `ResourceLimit` and `GCClosed` are never relabelled -- so a peer/network close must never be reported as `Unknown`. Accepted (server-role) sessions are not relabelled. **Failover safety:** a `Connect` or `TLSHandshake` close means zero request bytes reached the kernel (`::send` is withheld during the TCP phase and TLS withholds application data until Open), so the request is safe to fail over.
+- **`sysErrno` is explicit, `tlsError` is overloaded.** `sysErrno` is the errno captured immediately after the failing syscall, `SO_ERROR` for an event-only trigger (`EPOLLHUP`/`EPOLLERR`/`EPOLLRDHUP`), or an explicit value for timer/app closes -- never ambient errno. `tlsError` may hold an OpenSSL error code, an X509 verify result or an injected code, so classify on `code` + `sysErrno` only. A client-role handshake transport-abort consumer key is `TLSHandshake && sysErrno != 0`. Local resource exhaustion before the connect is issued (`socket()` `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`, `connect()` `EADDRNOTAVAIL`) closes `ResourceLimit` with that errno, not `Connect`.
 - **`onData` receives a `BufferView`** -- a non-owning, zero-copy view over the engine's read buffer, which is reused after the callback returns. Copy the data if you need it beyond the callback.
 - **`onData` receives `receiveTime`** -- a `steady_clock::time_point` captured immediately after `recv()`/`recvfrom()`, before any peer lookup. Critical for RTP jitter.
 - **`onError` carries no `SessionId`** -- it is for non-session transport-level errors (bind failure, epoll error, TLS context init). Per-session errors arrive through `onClose`.
@@ -419,7 +422,7 @@ Synchronous operations are methods on `Transport`, not a separate wrapper layer.
 
 **Timeout sentinels.** The primary sync ops (`connectSync`, `sendSync`, `receiveSync`) default their `timeout` parameter to the sentinel `kUseConfigSyncTimeout` (a `-1 ms` value defined in `transport_types.hpp`). At the top of each op, `Impl::resolveSyncTimeout()` maps any negative value to `config.defaultSyncTimeout` -- so the SIP presets' tuned timeouts (`forSipTcp` 32000 ms, `forSipUdp` 500 ms) apply by default. A misconfigured non-positive `defaultSyncTimeout` is floored to `kFallbackSyncTimeout` (30000 ms) so a sync op never silently degrades to a non-blocking poll; an explicit non-negative timeout (including `0` = non-blocking) is respected as-is. The `*Cancellable` variants are `ITransport` methods with no config access, so they default to the literal `kFallbackSyncTimeout` instead.
 
-**`connectSync`** -- blocks until the TCP handshake (and optional TLS handshake) completes, or the timeout expires. It calls the async `connect()`, registers a pending operation in `pendingConnects`, and waits on a CV that the engine `onConnect` handler signals; the global `onConnect` is **not** fired. **UDP now parks in `pendingConnects` exactly like TCP** (the former short-circuit that returned immediately was removed): it returns only once the I/O thread has registered the session and fired `onConnect`, so the returned `sid` is immediately usable by a subsequent send and does not race the async session insert against the send-time `sessionSendable` check (below). On timeout the pending entry is retained so the eventual `onClose` reaps it and suppresses the spurious global `onClose`; the session is closed and `TransportError::Timeout` is returned. If teardown has begun, it returns `TransportError::ShuttingDown`; if the concurrent-sync-op cap is reached, `TransportError::TooManyPendingSyncOps`.
+**`connectSync`** -- blocks until the TCP handshake (and optional TLS handshake) completes, or the timeout expires. It calls the async `connect()`, registers a pending operation in `pendingConnects`, and waits on a CV that the engine `onConnect` handler signals; the global `onConnect` is **not** fired. **UDP now parks in `pendingConnects` exactly like TCP** (the former short-circuit that returned immediately was removed): it returns only once the I/O thread has registered the session and fired `onConnect`, so the returned `sid` is immediately usable by a subsequent send and does not race the async session insert against the send-time `sessionSendable` check (below). On timeout the pending entry is retained so the eventual `onClose` reaps it and suppresses the spurious global `onClose`; the session is closed and `TransportError::Timeout` is returned. A setup failure reported by the engine first is returned as its `onClose` error -- including the engine watchdogs: `Connect` + `sysErrno` `ETIMEDOUT` (`connectTimeout`) and `TLSHandshake` + `ETIMEDOUT` (`handshakeTimeout`) -- so a caller classifying connect timeouts must accept all three (`isConnectPhaseTimeout`, declared in `transport_types.hpp` next to `TransportErrorInfo`). `connectSyncCancellable` keeps polling through any connect-phase timeout (not only `Timeout`) until its own deadline, then returns `Timeout` `"connectSync timed out"`. If teardown has begun, it returns `TransportError::ShuttingDown`; if the concurrent-sync-op cap is reached, `TransportError::TooManyPendingSyncOps`.
 
 ```cpp
 ConnectResult connectSync(const std::string &host, std::uint16_t port,
@@ -436,7 +439,7 @@ The four-argument-plus-timeout overload threads per-connection TLS client identi
 
 **`receiveSync`** -- blocks until data is available in the session's sync receive buffer. The session must be in `ReadMode::Sync`. It copies available bytes into the caller's buffer, sets `len` to the actual count, and returns. It enforces a **single-waiter contract** per session (a second concurrent `receiveSync`, or overlap with a `Sync->Async` flush, returns `TransportError::Cancelled`). If the buffer overflowed it returns `TransportError::BufferOverflow` (terminal -- the caller must close the session); if the peer closed after draining, `TransportError::PeerClosed`; if teardown began, `TransportError::ShuttingDown`; if the concurrent-sync-op cap is reached, `TransportError::TooManyPendingSyncOps`.
 
-> **Send validation (CF-H1).** Both engines reject a `send` to a session that is not currently present-and-open, via `sessionSendable(sid)`: `send()` returns `false` for an unknown or closing session instead of silently enqueuing a command the engine would later drop (which used to return `true`, masking a dead connection from SIP RFC 3263 failover). A connect-then-send consumer must therefore **await `onConnect`** (or use `connectSync`, which returns only a usable session) before sending -- FIFO command ordering between an async `connect` and a following `send` is no longer assumed. The mechanism detail lives in the [sync-lifecycle deep dive](transport_sync_lifecycle.md).
+> **Send validation (CF-H1).** Both engines reject a `send` to a session that is neither present-and-open nor (TCP engine) still connecting, via `sessionSendable(sid)`: `send()` returns `false` for an unknown or closed session instead of silently enqueuing a command the engine would later drop (which used to return `true`, masking a dead connection from SIP RFC 3263 failover). **TCP/TLS:** a sid returned by `connect()` is immediately sendable -- the bytes are buffered FIFO behind the connect until TCP-established (TLS: until handshake Open), a setup failure surfaces only via `onClose` (`Connect`/`TLSHandshake`/`Resolve`), and a stream write-queue overflow closes the session (`WriteBackpressure`). `true` means accepted, not delivered; a close queued before the send drops it (accepted TOCTOU). **UDP:** a connect-then-send consumer must still **await `onConnect`** (or use `connectSync`). The mechanism detail lives in the [sync-lifecycle deep dive](transport_sync_lifecycle.md).
 
 > **Deep dive: [transport_sync_lifecycle.md](transport_sync_lifecycle.md)** -- `SyncReceiveBuffer` fields and invariants, drain-before-close ordering, the tombstone-GC gate, and the four-counter teardown handshake.
 
@@ -574,8 +577,9 @@ using namespace iora::network;
 
 void runClient(std::shared_ptr<Transport> transport)
 {
-  // send() is issued from onConnect: the async connect must complete before a
-  // send is valid (CF-H1 rejects a send to a not-yet-open session).
+  // send() is issued from onConnect here. On TCP/TLS a send() right after
+  // connect() is also valid: the bytes are buffered until the session is
+  // established (TLS: handshake Open). UDP requires awaiting onConnect.
   transport->onConnect([transport](SessionId sid, const TransportAddress &)
   {
     const std::string msg = "hello";
@@ -671,7 +675,7 @@ transport->unobserve(oid);
 - **Do NOT block in a callback.** Callbacks run on the single I/O thread; blocking (disk I/O, a contended mutex, a network round-trip) stalls all I/O for the transport. Copy the data and post the work to a thread pool (e.g. `iora::core::async`).
 - **Do NOT forget `transport_impl.hpp` in exactly one TU.** Including only `transport.hpp` yields linker errors for every `Transport` method; including `transport_impl.hpp` in two TUs yields ODR/duplicate-symbol errors. (**Disputed:** every `Transport` member definition in `transport_impl.hpp` is `inline`, and a two-TU program that includes `http_client.hpp`, and through it `transport_impl.hpp`, in both TUs compiles and links cleanly. Whether the one-TU rule is still needed, here and in the metadata and §2, is **Open -- P2**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-21_stale-transport-comments-syncasynctransport-and-one-tu_P2.json`.)
 - **Do NOT call `stop()`, `addListener()`, or any sync op (`connectSync`/`sendSync`/`receiveSync`) or `setReadMode()` from a callback.** Each throws `std::logic_error` on the I/O thread (deadlock or UB). Use `isOnIoThread()` if you need to branch.
-- **Do NOT `send()` before the connection is open.** An async `connect()` followed immediately by `send()` will have the `send` rejected (`sessionSendable` / CF-H1) -- wait for `onConnect`, or use `connectSync`.
+- **Do NOT `send()` on a UDP session before it is open.** On UDP an async `connect()` followed immediately by `send()` has the `send` rejected (`sessionSendable` / CF-H1) -- wait for `onConnect`, or use `connectSync`. (TCP/TLS buffer the bytes until established; a setup failure then arrives via `onClose`, not as a `send()` failure.)
 - **Do NOT assume a `BufferView` outlives the callback.** The engine reuses its read buffer after `onData` returns -- copy anything you retain.
 - **Do NOT capture an owning `shared_ptr<Transport>` of the transport itself in a callback** (reference cycle -- §3.2.1). Capture the raw pointer or a promoted `weak_ptr`.
 - **Do NOT run two `receiveSync` calls concurrently on one session** -- the second returns `TransportError::Cancelled` (single-waiter contract).
@@ -789,10 +793,10 @@ All fields are members of `TransportConfig` (`transport_types.hpp`). `std::chron
 | `protocol` | `Protocol` | `TCP` | Selects the engine (`TcpEngine` vs `UdpEngine`). |
 | `idleTimeout` | `std::chrono::seconds` | `600` | Close sessions idle for this long. `0` disables. |
 | `maxConnAge` | `std::chrono::seconds` | `0` (`seconds::zero()`) | Max connection age before forced close. `0` = unlimited. |
-| `connectTimeout` | `std::chrono::milliseconds` | `30000` | TCP outbound connect timeout (TCP only). |
-| `handshakeTimeout` | `std::chrono::milliseconds` | `30000` | TLS handshake timeout (TCP+TLS only). |
+| `connectTimeout` | `std::chrono::milliseconds` | `30000` | TCP-phase connect timeout (TCP only). Expiry closes `Connect` + `sysErrno` `ETIMEDOUT`, message `"Connect timeout"`. For TLS the timer is cancelled at TCP-established. |
+| `handshakeTimeout` | `std::chrono::milliseconds` | `30000` | TLS handshake timeout (TCP+TLS only), armed at TCP-established, so the TLS setup budget is `connectTimeout + handshakeTimeout` (keep it below SIP Timer B/F = 64*T1 for SIP use). Expiry closes `TLSHandshake` + `ETIMEDOUT`, message `"TLS handshake timeout"`. |
 | `resolveTimeout` | `std::chrono::milliseconds` | `5000` | Off-thread name-resolution timeout for the event-driven `doConnect`. `count() == 0` disables it; **SIP transports MUST NOT disable it** (aggregate-budget violation). See the DNS deep dive. |
-| `writeStallTimeout` | `std::chrono::milliseconds` | `0` | Close if the write queue stalls this long. `0` disables. |
+| `writeStallTimeout` | `std::chrono::milliseconds` | `0` | Close (`Timeout`, `"Write stall timeout"`) when a writable session's non-empty write queue makes no write progress for this long (measured from the last successful write). Never armed during setup. `0` disables. |
 | `gcInterval` | `std::chrono::seconds` | `5` | Idle/age garbage-collection sweep interval. |
 
 ### 7.2 I/O, Socket
@@ -801,8 +805,8 @@ All fields are members of `TransportConfig` (`transport_types.hpp`). `std::chron
 |-------|------|---------|---------|
 | `epollMaxEvents` | `int` | `256` | Max events per `epoll_wait`. |
 | `ioReadChunk` | `std::size_t` | `65536` (64 KB) | Read buffer size. |
-| `maxWriteQueue` | `std::size_t` | `1024` | Max pending writes per session; overflow behavior per `closeOnBackpressure`. |
-| `closeOnBackpressure` | `bool` | `true` | On write-queue overflow, close the session; if `false`, drop new writes (`send` returns `false`). |
+| `maxWriteQueue` | `std::size_t` | `1024` | Max queued payloads per session; must be `>= 1` (the TCP engine's `start()` rejects `0` with `Config`). Enforced on the I/O thread (overflow is reported asynchronously via `onClose`; `send()` already returned `true`). TCP/TLS never silently drop: overflow always terminates the session. An established session closes `WriteBackpressure`; a setup-phase buffer (TCP connect, TLS handshake, named-host resolve) discards the overflowing payload and closes `WriteBackpressure` + `ENOBUFS` at setup completion before any byte is sent (a failed setup still reports `Connect`/`TLSHandshake`). UDP: per `closeOnBackpressure`. |
+| `closeOnBackpressure` | `bool` | `true` | UDP only: on write-queue overflow close the session (`WriteBackpressure`); if `false`, drop the **oldest** queued datagram. Ignored by the TCP engine (stream sessions always close on overflow). |
 | `useEdgeTriggered` | `bool` | `true` | Use `EPOLLET`. |
 | `enableTcpNoDelay` | `bool` | `true` | Set `TCP_NODELAY` (TCP only). |
 | `soRcvBuf` | `int` | `0` | `SO_RCVBUF`; `0` = OS default. |
@@ -1060,9 +1064,11 @@ static constexpr unsigned kSipHostFlags   = 0x2u | 0x20u;   // RFC 5922: NO_WILD
 | Zero-copy read path | `DataCallback` takes `BufferView` + `receiveTime` | Downstream parsing without a copy; `receiveTime` captured at the `recv()` site (RTP jitter). |
 | `Result<T,E>` for errors | All fallible ops return `Result<T, TransportErrorInfo>` | Composable, monadic error handling. |
 | Individual callback setters | `onAccept(cb)`, `onConnect(cb)`, ... | Clearer API than one `Callbacks` struct; engines still use one struct internally. |
-| `connectSync` wraps async connect (TCP + UDP) | Blocking connect + CV wait; global `onConnect` suppressed; UDP parks like TCP | Simplifies connect-then-send; the result goes to the blocking caller and the returned `sid` is guaranteed usable (no race with the send-time `sessionSendable` check). |
+| `connectSync` wraps async connect (TCP + UDP) | Blocking connect + CV wait; global `onConnect` suppressed; UDP parks like TCP | The result goes to the blocking caller and the returned `sid` is guaranteed usable (no race with the send-time `sessionSendable` check). |
 | Blocking `sendSync` | Register a completion op, park on a CV signalled by the engine's `SendCompleteCallback`, gated by `activeSends` | Honors `timeout`; forward-correct for an engine that defers completion. Current engines complete synchronously at enqueue. |
-| Send validation (CF-H1) | Engines reject a send to a not-present-or-closed session (`sessionSendable`) | A dropped-but-`true` send masked a dead connection from SIP RFC 3263 failover; connect-then-send must await `onConnect`. |
+| Send validation (CF-H1) | Engines reject a send to an unknown or closed session (`sessionSendable`); the TCP engine also admits a sid still connecting and buffers its bytes | A dropped-but-`true` send masked a dead connection from SIP RFC 3263 failover. TCP connect-then-send needs no `onConnect` round-trip; setup failures surface via `onClose` with a deterministic setup code. |
+| Deterministic setup-close codes | Central relabel in `closeNow`; explicit `sysErrno`; connect timeout = `Connect`/`ETIMEDOUT` | A consumer can fail over on `Connect`/`TLSHandshake` (zero bytes sent) and tell a handshake timeout/abort from a verify failure without parsing message text. |
+| Stream overflow closes | TCP/TLS ignore `closeOnBackpressure` | Dropping a queued payload silently corrupts a byte stream; closing surfaces the failure. |
 | Split-header pattern | `transport.hpp` (light) + `transport_impl.hpp` (one TU) | No epoll/OpenSSL leakage into consumers. `transport_types.hpp` is OpenSSL-include-free. |
 | Success-only accept/connect callbacks | No error parameter | Failed accepts are engine-internal; failed connects come via `onClose`/`onError`. |
 | Single protocol per instance | Each `Transport` handles TCP, UDP, or TLS/TCP | SIP composes two transports; multi-protocol would add complexity with no clear benefit. |
@@ -1082,6 +1088,8 @@ static constexpr unsigned kSipHostFlags   = 0x2u | 0x20u;   // RFC 5922: NO_WILD
 | Limitation | Description | Status |
 |------------|-------------|--------|
 | **`sendSync` completion is enqueue-time for the current engines** | `sendSync` blocks until the engine's `SendCompleteCallback` fires, but the current TCP/UDP engines signal completion at the synchronous post-copy acceptance of the bytes (not wire transmission or a TLS flush), so it returns effectively immediately and the `timeout` rarely elapses. The parked-waiter machinery is forward-correct for a future engine that defers completion. | By design (current engines). |
+| **A close queued before a send drops the send** | `sessionSendable` is checked on the caller thread; a close already queued (or a setup failure already in flight) ahead of the `Send` command drops it on the I/O thread after `send()` returned `true`. The loss is always reported by the session's `onClose`. | Accepted TOCTOU (closing it would need `_sessionRwMutex` held across enqueue and dispatch). |
+| **Write-queue accounting is on the I/O thread** | `maxWriteQueue` is enforced when the I/O thread processes each `Send`, so a burst accepted by `send()` can exceed the cap before the overflow close is reported. | Tracked (backlog 2026-09-24-3). |
 | **`sendSyncCancellable` post-enqueue cancel is advisory** | Because current-engine completion is immediate at enqueue, a `cancel()` observed after the bytes are accepted still returns after they are already queued and will be sent. | Consequence of the current engines' enqueue-time completion above. |
 | **`ReadMode::Disabled` on UDP still incurs `recv()`** | UDP multiplexes many virtual sessions over one shared socket, so `setReadEnabled` cannot remove `EPOLLIN` for a single session; disabled UDP sessions still `recv()` and drop the data at the dispatch handler. TCP removes `EPOLLIN` and avoids the syscall. | By design (shared-socket UDP). |
 | **`BufferOverflow` is terminal per session** | Once a `Sync`-mode append exceeds `maxSyncReceiveBuffer`, the buffer's overflow flag is set and never cleared (dropped bytes corrupt the stream irrecoverably); a retry re-reports `BufferOverflow`. The caller **must** close the session. | By design (N-2). |

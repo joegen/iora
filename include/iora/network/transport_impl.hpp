@@ -54,6 +54,13 @@ struct Transport::Impl
   // callbacks fire. Transport callback handlers then acquire Transport locks
   // briefly to copy state, release them, then invoke user callbacks with
   // zero locks held.
+  //
+  // Transport -> engine edge: connectSync holds syncMutex across
+  // engine->connect(), which takes the TcpEngine leaf _sessionRwMutex (connecting
+  // registry insert), releases it, then takes the leaf _cmdMutex (enqueue) —
+  // sequential, never co-held. Engine locks are leaves and are never held while a
+  // Transport lock is acquired, so the edge syncMutex -> {_sessionRwMutex; then
+  // _cmdMutex} cannot close a cycle.
   // ──────────────────────────────────────────────────────────────────────────
 
   // Lock order 1: Protects global callback storage.
@@ -889,9 +896,11 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   // Acquire syncMutex BEFORE calling engine->connect(). This ensures the
   // I/O thread's onConnect callback (which acquires syncMutex) cannot fire
   // until we have registered in pendingConnects and entered cv.wait_for()
-  // (which atomically releases syncMutex). engine->connect() only acquires
-  // the engine's internal _cmdMutex (atomic++ + push + eventfd write ≈ μs),
-  // not syncMutex — no AB-BA deadlock risk, no convoy under concurrency.
+  // (which atomically releases syncMutex). engine->connect() acquires only
+  // engine-internal leaf locks, sequentially and never co-held (TCP: the
+  // _sessionRwMutex connecting-registry insert, released, then _cmdMutex for the
+  // push + eventfd write, each ≈ μs) and never syncMutex — no AB-BA deadlock risk,
+  // no convoy under concurrency.
   // Acquire syncMutex BEFORE calling engine->connect() and hold it CONTINUOUSLY
   // through entry into wait_for (INV-8). This serializes connectSync against the
   // teardown handshake on the same mutex: teardown either wins the lock first
@@ -924,11 +933,12 @@ inline ConnectResult Transport::connectSync(const std::string &host, std::uint16
   auto result = _impl->engine->connect(host, port, tls, opts);
   if (result.isErr())
   {
-    // Defensive: the current TcpEngine::connect() always returns ok(sid) and
-    // reports failures asynchronously via onClose, so this branch is unreachable
-    // for TCP today. It guards future engines / a connect() that gains a
-    // synchronous-failure mode. Returns before the connect guard is constructed,
-    // so a synchronous failure is never parked and never counted (M-NEW-1/L-5/L-A).
+    // A synchronous connect() failure means nothing was queued: TcpEngine returns
+    // err(ShuttingDown) when its command queue is closed (teardown) and
+    // err(Unknown) when the enqueue itself failed; every setup failure of a
+    // queued connect is reported asynchronously via onClose instead. Returns
+    // before the connect guard is constructed, so a synchronous failure is never
+    // parked and never counted (M-NEW-1/L-5/L-A).
     return result;
   }
   SessionId sid = result.value();
@@ -1561,9 +1571,9 @@ inline ConnectResult ITransport::connectSyncCancellable(
   {
     return result;
   }
-  if (result.error().code != TransportError::Timeout)
+  if (!isConnectPhaseTimeout(result.error()))
   {
-    return result; // Non-timeout error — return immediately
+    return result; // Not a connect-phase timeout — return immediately
   }
 
   // The initial connectSync timed out with the sub-interval. For TCP, the
@@ -1586,7 +1596,7 @@ inline ConnectResult ITransport::connectSyncCancellable(
     }
     subTimeout = std::min(remaining, subInterval);
     result = connectSync(host, port, tls, opts, subTimeout);
-    if (result.isOk() || result.error().code != TransportError::Timeout)
+    if (result.isOk() || !isConnectPhaseTimeout(result.error()))
     {
       return result;
     }

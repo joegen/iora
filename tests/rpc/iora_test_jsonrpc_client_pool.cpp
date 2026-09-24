@@ -5929,42 +5929,48 @@ TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 't
 // =========================================================================
 // tracker 2026-09-03-3 — the transport CONNECT timeout is now typed
 // (HttpConnectTimeoutError, a HttpRequestNotSentError subclass) and keyed on the
-// structured TransportError::Timeout code, so ClientStats::timeoutRequests counts
-// it. The classifier isTimeoutFailure_ is shared by the single-call and batch
+// structured transport code + sysErrno (iora::network::isConnectPhaseTimeout;
+// tracker 2026-09-24-1 A7.1), so ClientStats::timeoutRequests counts it. The classifier isTimeoutFailure_ is shared by the single-call and batch
 // paths. DQ-2 scope_out: a DNS/RESOLUTION failure surfaces as TransportError::Resolve
 // and is deliberately NOT counted here.
 //
 // All connect-timeout cases use 192.0.2.1 (RFC 5737 TEST-NET-1): a non-routable SYN
-// is black-holed, so connectSync unwinds on its deadline as TransportError::Timeout.
-// If a future host FAST-REFUSES 192.0.2.1 (ENETUNREACH/ECONNREFUSED) the outcome is
-// TransportError::Connect instead and timeoutRequests would read 0 — the ==1 asserts
-// then fail LOUDLY rather than going vacuously green (same host assumption the
-// task-7.1a black-hole test documents, verified 2026-09-02).
+// is black-holed, so the attempt ends on whichever connect-timeout producer fires
+// first (both are armed with the same budget): the connectSync deadline
+// (TransportError::Timeout) or the engine connect watchdog (TransportError::Connect +
+// ETIMEDOUT). Both classify as a connect timeout. If a future host FAST-REFUSES
+// 192.0.2.1 (ENETUNREACH/ECONNREFUSED) the outcome is TransportError::Connect with a
+// non-ETIMEDOUT errno and timeoutRequests would read 0 — the ==1 asserts then fail
+// LOUDLY rather than going vacuously green (same host assumption the task-7.1a
+// black-hole test documents, verified 2026-09-02).
 //
 // KNOWN LIMITATIONS (verified during the steps-4-8 review, recorded here so the
 // coverage boundary is explicit rather than silently absent):
-//   * Two producers set TransportError::Timeout on connectResult and both are counted:
-//     the connectSync wait_for deadline (transport_impl.hpp) and the tcp_engine
-//     CloseOrigin::ConnectTimeout watchdog (tcp_engine.hpp, via onClose). These tests
-//     exercise the deadline producer (the 192.0.2.1 SYN black-hole). The watchdog
-//     producer sets the IDENTICAL code, so the discriminator logic is validated for
-//     both, but no jsonrpc-layer test forces the watchdog path specifically — it is a
-//     transport-layer concern (cpp17 steps-4-8 finding #3).
+//   * Three producers end a connect attempt with a connect timeout and all are
+//     counted: the connectSync wait_for deadline (transport_impl.hpp,
+//     TransportError::Timeout), the tcp_engine connect watchdog (tcp_engine.hpp via
+//     onClose, TransportError::Connect + ETIMEDOUT) and the tcp_engine handshake
+//     watchdog (TransportError::TLSHandshake + ETIMEDOUT). The 192.0.2.1 black-hole
+//     races the first two (same budget). The watchdog path is forced
+//     deterministically at the transport layer (engine connectTimeout < connectSync
+//     timeout) in tests/network/iora_test_tcp_setup_close_codes.cpp, which also pins
+//     isConnectPhaseTimeout for every producer.
 //   * TLS-handshake STALL on an https endpoint IS counted: connectSync spans TCP +
-//     TLS, and its connectTimeout (default 2s; 50ms here) fires well before the engine
-//     handshakeTimeout (30s default, never overridden by HttpClient), so a stalled TLS
-//     handshake closes with TransportError::Timeout -> counted. This holds for every
-//     normal config; only a caller setting connectTimeout > 30s would let the engine
-//     handshakeTimeout win and surface TransportError::TLSHandshake (uncounted). Test
-//     2.7 exercises the TCP-connect timeout on an https URL; the pure TLS-stall
-//     sub-case is not driven deterministically (would need an accept-then-stall TLS
-//     server) (web steps-4-8 finding #1).
+//     TLS, and its connectTimeout (default 2s; 50ms here) normally fires before the
+//     engine handshake watchdog (the engine TLS budget is connectTimeout +
+//     handshakeTimeout, 30s default, never overridden by HttpClient), so a stalled TLS
+//     handshake ends with TransportError::Timeout -> counted. Should the engine
+//     handshake watchdog win instead, it reports TLSHandshake + ETIMEDOUT -> also
+//     counted. Test 2.7 exercises the TCP-connect timeout on an https URL; the pure
+//     TLS-stall sub-case (an accept-then-stall loopback listener) is driven by the
+//     HttpClient TLS-stall case in tests/network/iora_test_tcp_setup_close_codes.cpp.
 //   * A TLS-handshake FAILURE (cert verify / protocol mismatch -> TransportError::
-//     TLSHandshake) is correctly NOT a timeout: it flattens to HttpRequestNotSentError
-//     (retried like any not-sent failure) and never increments timeoutRequests. The
-//     discriminator must NOT be widened to include TLSHandshake, because that same code
-//     also carries handshake FAILURES which are not timeouts. Untested here (needs a
-//     bad-cert TLS server fixture) (web steps-4-8 finding #2).
+//     TLSHandshake with sysErrno != ETIMEDOUT) is correctly NOT a timeout: it flattens
+//     to HttpRequestNotSentError (retried like any not-sent failure) and never
+//     increments timeoutRequests. The discriminator admits TLSHandshake ONLY with
+//     sysErrno == ETIMEDOUT, because that same code also carries handshake FAILURES
+//     which are not timeouts. Untested here (needs a bad-cert TLS server fixture)
+//     (web steps-4-8 finding #2).
 //   * A RESOLUTION failure (TransportError::Resolve) is NOT counted — the negative
 //     side of the discriminator for a non-Timeout code is proven DETERMINISTICALLY by
 //     test 2.4 (a refusal -> TransportError::Connect). A Resolve-SPECIFIC assertion was

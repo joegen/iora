@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -254,6 +255,45 @@ struct TransportAddress
   bool operator!=(const TransportAddress &other) const { return !(*this == other); }
 };
 
+/// \brief Structured transport error.
+///
+/// \c tlsError is OVERLOADED and must not be used to classify a failure: it may
+/// carry an OpenSSL ERR_get_error() code, an X509 verify result
+/// (X509_V_ERR_*), or an injected test code -- and the SSL_get_error() values
+/// SSL_ERROR_SYSCALL/SSL_ERROR_ZERO_RETURN (5/6) collide with X509_V_ERR 5/6.
+///
+/// \c sysErrno is the discriminator. TcpEngine sets it from the errno captured
+/// immediately after the failing syscall, from getsockopt(SO_ERROR) for an
+/// event-only trigger (EPOLLHUP/EPOLLERR/EPOLLRDHUP), or explicitly for timer
+/// and app closes (never from ambient errno). Client-role (outbound) setup-phase
+/// closes:
+///   - Connect: the TCP phase failed (sysErrno != 0); a connect timeout reports
+///     ETIMEDOUT.
+///   - ResourceLimit: local resource exhaustion before the connect was issued
+///     (socket() EMFILE/ENFILE/ENOBUFS/ENOMEM, connect() EADDRNOTAVAIL; errno kept).
+///   - TLSHandshake + ETIMEDOUT: handshake timeout.
+///   - TLSHandshake + ECONNRESET/EPIPE/...: transport abort (SSL_ERROR_SYSCALL errno).
+///   - TLSHandshake + ECONNABORTED: EOF without an alert.
+///   - TLSHandshake + 0: alert received (incl. close_notify), verify/certificate
+///     failure, "no peer certificate", or any other TLS-protocol failure.
+///   - WriteBackpressure + ENOBUFS: the setup succeeded but a setup-phase buffer
+///     had overflowed maxWriteQueue: ZERO bytes were sent and the buffered requests
+///     were discarded -- failover-safe. An established-session overflow reports
+///     WriteBackpressure with sysErrno 0 (bytes may have been sent).
+/// CONTRACT (client-role TLSHandshake): sysErrno != 0 <=> transport abort
+/// (timeout = ETIMEDOUT; RST/EPIPE/EOF/any socket errno); sysErrno == 0 <=>
+/// TLS-protocol failure. The discriminator is client-role only: a server-role
+/// (accepted) session's TLSHandshake close always reports sysErrno 0, and the
+/// setup-phase relabel (Connect/TLSHandshake) is not applied to it.
+/// SCOPE (important for a reachability/failover consumer): this server-role
+/// sysErrno-0 invariant is TLSHandshake-CODE-scoped -- i.e. the handshake phase
+/// only. A server-role (inbound/accepted) session that COMPLETES its handshake and
+/// is then reset/broken by the peer closes with code PeerClosed/Socket/TLSIO
+/// carrying a LIVE errno (ECONNRESET/EPIPE/...). So a peer-unreachable classifier
+/// must NOT infer "outbound probe" from sysErrno alone: gate the transport-abort
+/// discriminator on session DIRECTION (inbound vs outbound) -- direction, not just
+/// phase, is the real discriminator. An inbound session close is never a
+/// peer-reachability signal in any phase.
 struct TransportErrorInfo
 {
   TransportError code{TransportError::Unknown};
@@ -261,6 +301,21 @@ struct TransportErrorInfo
   int sysErrno{0};
   int tlsError{0};
 };
+
+/// \brief True iff a failed connectSync result is a connect-phase TIMEOUT: the
+/// connectSync deadline (TransportError::Timeout), the engine connect watchdog
+/// (TransportError::Connect with sysErrno ETIMEDOUT) or the engine TLS handshake
+/// watchdog (TransportError::TLSHandshake with sysErrno ETIMEDOUT). A refusal, reset,
+/// handshake/verify failure or resolution failure is not a timeout.
+inline bool isConnectPhaseTimeout(const TransportErrorInfo &err) noexcept
+{
+  if (err.code == TransportError::Timeout)
+  {
+    return true;
+  }
+  return err.sysErrno == ETIMEDOUT &&
+         (err.code == TransportError::Connect || err.code == TransportError::TLSHandshake);
+}
 
 using ObserverId = std::uint64_t;
 
@@ -433,7 +488,20 @@ struct TransportConfig
   // === I/O ===
   int epollMaxEvents{256};
   std::size_t ioReadChunk{64 * 1024};
+  /// \brief Per-session write-queue cap (queued payloads); MUST be >= 1
+  /// (TcpEngine::start() rejects 0 with TransportError::Config). Enforced on the
+  /// I/O thread, so an overflow is reported ASYNCHRONOUSLY: send() has already
+  /// returned true and the session later closes via onClose. TCP/TLS sessions
+  /// never silently drop: overflow always terminates the session. An established
+  /// session closes with WriteBackpressure; a setup-phase buffer (TCP connect, TLS
+  /// handshake, named-host resolve) discards the overflowing payload and closes
+  /// WriteBackpressure + ENOBUFS at setup completion, before any byte is sent (a
+  /// failed setup still reports Connect/TLSHandshake).
   std::size_t maxWriteQueue{1024};
+  /// \brief Datagram (UDP) sessions only: on write-queue overflow, true closes the
+  /// session (WriteBackpressure); false drops the OLDEST queued datagram and keeps
+  /// the new one. TcpEngine ignores it: TCP/TLS sessions always close on overflow
+  /// (see maxWriteQueue).
   bool closeOnBackpressure{true};
   bool useEdgeTriggered{true};
 

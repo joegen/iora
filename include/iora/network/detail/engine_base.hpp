@@ -5,6 +5,7 @@
 
 #include "iora/core/atomic_thread_id.hpp"
 #include "iora/core/buffer_view.hpp"
+#include "iora/core/logger.hpp"
 #include "iora/network/transport_types.hpp"
 
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace iora
 {
@@ -122,7 +124,9 @@ public:
   virtual void sendAsync(SessionId sid, const void *data, std::size_t len,
                          SendCompleteCallback cb) = 0;
 
-  // Callbacks (set once before start)
+  /// \brief Install the callbacks (set once before start).
+  /// \note An exception thrown by a user callback is caught (and logged) by the
+  ///   engine and otherwise ignored: it never unwinds the I/O loop.
   virtual void setCallbacks(Callbacks cbs) = 0;
 
   // Stats
@@ -211,6 +215,40 @@ protected:
   /// to the default id so isOnIoThread() correctly returns false post-detach and
   /// never yields a recycled-thread-id false positive.
   void clearIoThread() noexcept { _ioThreadId.clear(); }
+
+  /// \brief Copy a user callback out under \p m (copy-then-invoke: the copy is
+  /// invoked after \p m is released). May throw (std::function copy).
+  template <typename Callback> static Callback copyCallback(std::mutex &m, const Callback &cb)
+  {
+    std::lock_guard<std::mutex> g(m);
+    return cb;
+  }
+
+  /// \brief Invoke a copied user callback, catching and logging any exception so a
+  /// throwing callback can never unwind the I/O loop. \p cb must be a copy taken
+  /// under the callback mutex and released before this call.
+  template <typename Callback, typename... Args>
+  static void invokeUserCallback(const Callback &cb, Args &&...args) noexcept
+  {
+    if (!cb)
+    {
+      return;
+    }
+    try
+    {
+      cb(std::forward<Args>(args)...);
+    }
+    catch (...)
+    {
+      try
+      {
+        IORA_LOG_WARN("engine: user callback threw; exception ignored");
+      }
+      catch (...)
+      {
+      }
+    }
+  }
 
   /// \brief Shared post gate captured by resolver continuations. Re-created in
   /// each derived engine's start() before the loop; closed (closed=true,

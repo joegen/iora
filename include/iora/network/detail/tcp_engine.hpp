@@ -35,9 +35,11 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -203,6 +205,13 @@ public:
     _postGuard = std::make_shared<detail::EnginePostGate>();
     _postGuard->engine = this;
 
+    if (_config.maxWriteQueue == 0)
+    {
+      setLastFatal(IoResult::failure(TransportError::Config, "maxWriteQueue must be >= 1"));
+      _running.store(false);
+      return StartResult::err(lastError());
+    }
+
     if (!initTls())
     {
       _running.store(false);
@@ -212,8 +221,7 @@ public:
     _epollFd = ::epoll_create1(EPOLL_CLOEXEC);
     if (_epollFd < 0)
     {
-      setLastFatal(IoResult::failure(TransportError::Config, "epoll_create1: " + lastErr(), errno));
-      err(TransportError::Config, "epoll_create1: " + lastErr());
+      startSyscallFailed("epoll_create1: ", errno);
       _running.store(false);
       freeTls();
       return StartResult::err(lastError());
@@ -222,19 +230,27 @@ public:
     _eventFd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (_eventFd < 0)
     {
-      setLastFatal(IoResult::failure(TransportError::Config, "eventfd: " + lastErr(), errno));
-      err(TransportError::Config, "eventfd: " + lastErr());
+      startSyscallFailed("eventfd: ", errno);
       cleanupStartFail();
       return StartResult::err(lastError());
     }
     addEpoll(_eventFd, EPOLLIN);
+    // Commands queued before start() (connect()/addListener() on a stopped
+    // engine) were pushed while _eventFd was -1, so no wakeup was written for
+    // them: signal the fresh eventfd so the first epoll_wait processes them.
+    {
+      std::lock_guard<std::mutex> g(_cmdMutex);
+      if (!_cmds.empty())
+      {
+        std::uint64_t one = 1;
+        (void)::write(_eventFd, &one, sizeof(one));
+      }
+    }
 
     _timerFd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (_timerFd < 0)
     {
-      setLastFatal(
-        IoResult::failure(TransportError::Config, "timerfd_create: " + lastErr(), errno));
-      err(TransportError::Config, "timerfd_create: " + lastErr());
+      startSyscallFailed("timerfd_create: ", errno);
       cleanupStartFail();
       return StartResult::err(lastError());
     }
@@ -309,7 +325,15 @@ public:
     {
       return;
     }
-    enqueue(Command::shutdown());
+    if (!enqueue(Command::shutdown()))
+    {
+      std::lock_guard<std::mutex> g(_cmdMutex);
+      if (_eventFd >= 0)
+      {
+        std::uint64_t one = 1;
+        (void)::write(_eventFd, &one, sizeof(one));
+      }
+    }
     if (_loop.joinable())
     {
       _loop.join();
@@ -382,21 +406,47 @@ public:
 
   /// \brief Begin an outbound connection (async); result via onConnect.
   /// Primitive 4-arg override — carries per-connection TLS identity options.
+  /// The returned sid is immediately sendable (bytes are buffered FIFO until TCP
+  /// established; TLS: until handshake Open). A setup failure is reported ONLY
+  /// via onClose (never synchronously); an err() result means nothing was queued.
   ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls,
                         const TlsClientOptions &opts) override
   {
     SessionId sid = _nextSessionId++;
-    ConnectReq cr{sid, host, port, tls, opts.verifyName, opts.x509HostFlags};
-    // Surface the closed-queue reject (DD-5): if the transport is tearing down,
-    // enqueue() returns false and the connect command is dropped — returning
-    // ok(sid) here would promise a connection that will never complete or fire
-    // onConnect/onClose (lost-completion). Mirror send()/close() and report it.
-    if (!enqueue(Command::connect(cr)))
+    bool inserted = false;
+    bool queueClosed = false;
+    try
+    {
+      ConnectReq cr{sid, host, port, tls, opts.verifyName, opts.x509HostFlags};
+      Command cmd = Command::connect(cr);
+      {
+        std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+        _connecting.insert(sid);
+      }
+      inserted = true;
+      // Surface the closed-queue reject (DD-5): if the transport is tearing down,
+      // enqueue() returns false and the connect command is dropped — returning
+      // ok(sid) here would promise a connection that will never complete or fire
+      // onConnect/onClose (lost-completion). Mirror send()/close() and report it.
+      if (enqueue(std::move(cmd)))
+      {
+        return ConnectResult::ok(sid);
+      }
+      queueClosed = cmdQueueClosed();
+    }
+    catch (...)
+    {
+    }
+    if (inserted)
+    {
+      eraseConnecting(sid);
+    }
+    if (queueClosed)
     {
       return ConnectResult::err(
         TransportErrorInfo{TransportError::ShuttingDown, "connect: transport shutting down"});
     }
-    return ConnectResult::ok(sid);
+    return ConnectResult::err(TransportErrorInfo{TransportError::Unknown, "connect failed"});
   }
 
   /// \brief Queue a send on a session (non-blocking; may enqueue on EAGAIN).
@@ -408,20 +458,17 @@ public:
     }
     // CF-H1: reject an unknown/closed session at enqueue time rather than
     // enqueuing a command doSend would silently drop (which returned true —
-    // masking a dead connection from SIP RFC 3263 failover).
+    // masking a dead connection from SIP RFC 3263 failover). A sid returned by
+    // connect() is immediately sendable: bytes are buffered FIFO until the
+    // session is established (TLS: until handshake Open) and setup failures
+    // surface only via onClose. true means accepted, not delivered; a close
+    // queued before this Send drops it (accepted TOCTOU); a stream write-queue
+    // overflow closes the session (WriteBackpressure).
     if (!sessionSendable(sid))
     {
       return false;
     }
-    IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() called for sid=" << sid << ", size=" << n);
-    ByteBuffer b(n);
-    std::memcpy(b.data(), data, n);
-    SendReq sr;
-    sr.sid = sid;
-    sr.payload = std::move(b);
-    bool result = enqueue(Command::send(std::move(sr)));
-    IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() enqueue " << (result ? "succeeded" : "failed") << " for sid=" << sid);
-    return result;
+    return enqueueSend(sid, data, n);
   }
 
   /// \brief Close a session (idempotent). onClose will fire.
@@ -495,10 +542,14 @@ public:
                  SendCompleteCallback cb) override
   {
     // CF-H1: validate synchronously — do NOT report OK for an unknown/closed
-    // session. The decision is copied out from under the session read lock and
+    // session (a connecting sid returned by connect() IS sendable: its bytes are
+    // buffered FIFO until established / TLS Open; OK means accepted, not
+    // delivered). The decision is copied out from under the session read lock and
     // the lock released BEFORE cb runs (never invoke a user callback while
     // holding _sessionRwMutex). Completion stays SYNCHRONOUS on the caller
     // thread, the contract Transport::sendSync relies on (see EngineBase).
+    // ONE sessionSendable acquisition: a close racing after it still reports OK
+    // (the accepted TOCTOU, see sessionSendable).
     if (!sessionSendable(sid))
     {
       if (cb)
@@ -508,7 +559,7 @@ public:
       }
       return;
     }
-    bool ok = send(sid, data, len);
+    const bool ok = len == 0 || enqueueSend(sid, data, len);
     if (cb)
     {
       if (ok)
@@ -716,9 +767,32 @@ protected:
   }
 
 private:
+  /// Test-only access (tests/network/tcp_engine_test_access.hpp): the test seams
+  /// below are reachable only through it, never through the production API.
+  friend struct TcpEngineTestAccess;
+
+  /// I/O-thread points at which the connect path throws once (test seam).
+  enum class ConnectThrowPoint
+  {
+    NONE,
+    BEFORE_INSERT_LITERAL,
+    BEFORE_INSERT_RESUME,
+    AFTER_INSERT,
+    NAMED_KICKOFF_AFTER_PENDING_INSERT
+  };
+
   // ===== helpers =====
 
   static std::string lastErr() { return iora::core::errnoMessage(errno); }
+
+  /// \brief start() syscall failure: \p savedErrno is the errno captured once,
+  /// immediately after the failing call (the diagnostics below may clobber errno).
+  void startSyscallFailed(const char *what, int savedErrno)
+  {
+    const std::string msg = what + iora::core::errnoMessage(savedErrno);
+    setLastFatal(IoResult::failure(TransportError::Config, msg, savedErrno));
+    err(TransportError::Config, msg);
+  }
 
   bool addEpoll(int fd, std::uint32_t ev)
   {
@@ -748,20 +822,43 @@ private:
     return iora::network::applyDscpToFd(fd, dscp);
   }
 
-  /// \brief CF-H1: is \p sid a currently-known, not-closed session? Takes the
-  /// session read lock briefly. send()/sendAsync() call this to reject an
-  /// unknown/closed session synchronously at enqueue time — enqueuing a Send
+  /// \brief CF-H1: is \p sid sendable — a known, not-closed session OR a sid in the
+  /// connecting registry (connect() returned it, setup still pending)? Both checks
+  /// run under ONE shared-lock acquisition. send()/sendAsync() call this to reject
+  /// an unknown/closed session synchronously at enqueue time — enqueuing a Send
   /// command that doSend then silently drops reported false success and masked
-  /// connection failure (defeating SIP RFC 3263 failover). This is the SAME
-  /// validity notion doSend uses (present in _sessions AND !closed). A close
-  /// racing right after this check is the accepted narrow TOCTOU: it shrinks the
-  /// false-OK window from "always" to a rare race, and cannot be closed without
-  /// holding _sessionRwMutex across enqueue+dispatch.
+  /// connection failure (defeating SIP RFC 3263 failover). A sid returned by
+  /// connect() is immediately sendable: its bytes are buffered FIFO until
+  /// established (TLS: until handshake Open), setup failures surface only via
+  /// onClose, and a stream overflow closes the session (WriteBackpressure).
+  /// Completion means accepted, not delivered. A close racing right after this
+  /// check (a close queued before the Send drops it) is the accepted narrow
+  /// TOCTOU: it shrinks the false-OK window from "always" to a rare race, and
+  /// cannot be closed without holding _sessionRwMutex across enqueue+dispatch.
   bool sessionSendable(SessionId sid) const
   {
     std::shared_lock<std::shared_mutex> rl(_sessionRwMutex);
     auto it = _sessions.find(sid);
-    return it != _sessions.end() && !it->second->closed.load(std::memory_order_relaxed);
+    if (it != _sessions.end() && !it->second->closed.load(std::memory_order_relaxed))
+    {
+      return true;
+    }
+    return _connecting.find(sid) != _connecting.end();
+  }
+
+  /// \brief Copy \p n > 0 bytes into a Send command and enqueue it (no
+  /// sendability check — the caller has done it). True iff queued.
+  bool enqueueSend(SessionId sid, const void *data, std::size_t n)
+  {
+    IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() called for sid=" << sid << ", size=" << n);
+    SendReq sr;
+    sr.sid = sid;
+    sr.payload.resize(n);
+    std::memcpy(sr.payload.data(), data, n);
+    const bool result = enqueue(Command::send(std::move(sr)));
+    IORA_LOG_DEBUG("[SHARED-TRANSPORT] send() enqueue " << (result ? "succeeded" : "failed")
+                   << " for sid=" << sid);
+    return result;
   }
 
   static std::string keyFromSockaddr(const sockaddr_storage &ss)
@@ -822,9 +919,7 @@ private:
   void err(TransportError te, const std::string &m)
   {
     _atomicStats.errors.fetch_add(1, std::memory_order_relaxed);
-    decltype(_cbs.onError) cb;
-    { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
-    if (cb) cb(te, m);
+    invokeUserCallback(copyCallback(_cbMutex, _cbs.onError), te, m);
   }
 
   void setLastFatal(const IoResult &r) const
@@ -865,6 +960,13 @@ private:
   struct PendingConnect
   {
     std::uint64_t resolveTimeoutId{0}; // TimerService id; 0 == none armed
+    // The buffer overflowed maxWriteQueue (see Session::setupOverflowed).
+    bool setupOverflowed{false};
+    // Sends accepted for the sid while it resolves, in FIFO order. Moved into
+    // Session::wq by connectFromAddrs; dropped (the failure surfaces via onClose)
+    // on close-during-pending, resolve failure/timeout and shutdown drain. Must
+    // survive per-address failover (F2, tracker 2026-09-06-3).
+    std::deque<ByteBuffer> buffer;
   };
 
   struct SendReq
@@ -901,6 +1003,7 @@ private:
     SessionId closeSid{};
     TransportError closeReason{TransportError::Unknown};
     std::string closeMsg;
+    int closeErrno{0};
     CloseOrigin closeOrigin{CloseOrigin::App};
     SessionId readSid{};              // Cmd::SetReadEnabled target session
     bool readEnabledVal{true};        // Cmd::SetReadEnabled desired EPOLLIN state
@@ -943,12 +1046,13 @@ private:
     }
     static Command close(SessionId sid, TransportError reason = TransportError::Unknown,
                          const std::string &msg = "closed by app",
-                         CloseOrigin origin = CloseOrigin::App)
+                         CloseOrigin origin = CloseOrigin::App, int sysErrno = 0)
     {
       Command x{Cmd::Close};
       x.closeSid = sid;
       x.closeReason = reason;
       x.closeMsg = msg;
+      x.closeErrno = sysErrno;
       x.closeOrigin = origin;
       return x;
     }
@@ -960,14 +1064,35 @@ private:
   static_assert(std::is_copy_constructible<Command>::value,
                 "Command must remain copyable after adding the RunOnIo fn member");
 
-  // Push a command and wake the I/O loop. The deque push, the _cmdsClosed
-  // check, and the _eventFd wakeup ::write all happen UNDER _cmdMutex so they
-  // are atomic w.r.t. shutdownDrain()'s `close(_eventFd); _eventFd=-1` (which
-  // also runs under _cmdMutex). Returns false WITHOUT pushing if the queue has
-  // been closed by teardown (DD-1/DD-2/DD-5, tracker 2026-06-14-1). The wakeup
-  // write is held under the lock safely because _eventFd is EFD_NONBLOCK.
-  // NOTE: on the exception path the onError callback is invoked synchronously on
-  // the CALLER's thread (copy-then-invoke, outside _cbMutex), not the I/O thread.
+  /// \brief Push \p cmd and wake the I/O loop, all UNDER _cmdMutex so the push,
+  /// the _cmdsClosed check and the _eventFd wakeup ::write are atomic w.r.t.
+  /// shutdownDrain()'s `close(_eventFd); _eventFd=-1` (also under _cmdMutex). The
+  /// wakeup write is safe under the lock because _eventFd is EFD_NONBLOCK; it is
+  /// skipped while _eventFd is -1 (before start(), which signals any queued
+  /// commands itself). Returns false WITHOUT pushing if teardown closed the queue
+  /// (DD-1/DD-2/DD-5, tracker 2026-06-14-1). Throws on allocation failure or an
+  /// injected enqueue failure (test seam).
+  bool pushLockedAndWake(Command &&cmd)
+  {
+    std::lock_guard<std::mutex> g(_cmdMutex);
+    if (_cmdsClosed)
+    {
+      return false;
+    }
+    if (_testEnqueueFailure.load(std::memory_order_relaxed))
+    {
+      throw std::runtime_error("injected enqueue failure");
+    }
+    _cmds.push_back(std::move(cmd));
+    _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
+    if (_eventFd >= 0)
+    {
+      std::uint64_t one = 1;
+      (void)::write(_eventFd, &one, sizeof(one));
+    }
+    return true;
+  }
+
   /// \brief EngineBase seam: post \p fn onto the I/O thread as a RunOnIo command.
   /// NOEXCEPT and callback-free — on any failure (closed, or allocation) it
   /// returns false and fires NO user callback; a dropped resolve post is
@@ -976,19 +1101,7 @@ private:
   {
     try
     {
-      std::lock_guard<std::mutex> g(_cmdMutex);
-      if (_cmdsClosed)
-      {
-        return false;
-      }
-      _cmds.push_back(Command::runOnIo(std::move(fn)));
-      _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
-      if (_eventFd >= 0)
-      {
-        std::uint64_t one = 1;
-        (void)::write(_eventFd, &one, sizeof(one));
-      }
-      return true;
+      return pushLockedAndWake(Command::runOnIo(std::move(fn)));
     }
     catch (...)
     {
@@ -996,66 +1109,106 @@ private:
     }
   }
 
-  bool enqueue(const Command &cmd)
+  /// \brief Queue \p cmd for the I/O thread. CALLBACK-FREE: enqueue() never
+  /// invokes a user callback. It is reached from connect/send/close/setReadEnabled
+  /// (possibly under Transport's syncMutex) and from timer closes on the
+  /// TimerService thread. On the exception path it records the sticky last-fatal
+  /// diagnostic (outside _cmdMutex: the lock_guard has unwound before the handler
+  /// runs) and returns false; the ordinary queue-closed path returns false without
+  /// touching the sticky diagnostic.
+  bool enqueue(Command &&cmd) noexcept
   {
     try
     {
-      {
-        std::lock_guard<std::mutex> g(_cmdMutex);
-        if (_cmdsClosed)
-        {
-          return false;
-        }
-        _cmds.push_back(cmd);
-        _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
-        if (_eventFd >= 0)
-        {
-          std::uint64_t one = 1;
-          (void)::write(_eventFd, &one, sizeof(one));
-        }
-      }
-      return true;
+      return pushLockedAndWake(std::move(cmd));
     }
     catch (const std::exception &ex)
     {
-      setLastFatal(
-        IoResult::failure(TransportError::Unknown, std::string("enqueue(copy): ") + ex.what()));
-      decltype(_cbs.onError) cb;
-      { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
-      if (cb) cb(TransportError::Unknown, std::string("enqueue(copy): ") + ex.what());
+      recordEnqueueFailure("enqueue: ", ex.what());
+      return false;
+    }
+    catch (...)
+    {
+      recordEnqueueFailure("enqueue: ", "unknown exception");
       return false;
     }
   }
 
-  bool enqueue(Command &&cmd)
+  void recordEnqueueFailure(const char *where, const char *what) noexcept
   {
     try
     {
-      {
-        std::lock_guard<std::mutex> g(_cmdMutex);
-        if (_cmdsClosed)
-        {
-          return false;
-        }
-        _cmds.push_back(std::move(cmd));
-        _atomicStats.commands.fetch_add(1, std::memory_order_relaxed);
-        if (_eventFd >= 0)
-        {
-          std::uint64_t one = 1;
-          (void)::write(_eventFd, &one, sizeof(one));
-        }
-      }
-      return true;
+      setLastFatal(IoResult::failure(TransportError::Unknown, std::string(where) + what));
     }
-    catch (const std::exception &ex)
+    catch (...)
     {
-      setLastFatal(
-        IoResult::failure(TransportError::Unknown, std::string("enqueue(move): ") + ex.what()));
-      decltype(_cbs.onError) cb;
-      { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
-      if (cb) cb(TransportError::Unknown, std::string("enqueue(move): ") + ex.what());
+    }
+  }
+
+  void testMaybeThrowAt(ConnectThrowPoint point)
+  {
+    ConnectThrowPoint expected = point;
+    if (_testConnectThrowPoint.load(std::memory_order_relaxed) == expected &&
+        _testConnectThrowPoint.compare_exchange_strong(expected, ConnectThrowPoint::NONE,
+                                                       std::memory_order_relaxed))
+    {
+      throw std::runtime_error("injected connect-path throw");
+    }
+  }
+
+  /// \brief Erase \p sid from the connecting registry; true iff it was present.
+  bool eraseConnecting(SessionId sid) noexcept
+  {
+    std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+    return _connecting.erase(sid) == 1;
+  }
+
+  /// \brief Erase \p sid's _pendingConnects entry, cancelling its resolve timer;
+  /// true iff it was present. I/O thread only.
+  bool takePending(SessionId sid) noexcept
+  {
+    auto pit = _pendingConnects.find(sid);
+    if (pit == _pendingConnects.end())
+    {
       return false;
     }
+    if (_timerService && pit->second.resolveTimeoutId != 0)
+    {
+      try
+      {
+        _timerService->cancel(pit->second.resolveTimeoutId);
+      }
+      catch (...)
+      {
+      }
+    }
+    _pendingConnects.erase(pit);
+    return true;
+  }
+
+  /// \brief Terminal for a sid that never reached _sessions (I/O thread). ORDER:
+  /// every allocating step first -- the onClose copy here, \p info by the caller --
+  /// then the noexcept ownership release (the _pendingConnects entry and the
+  /// connecting-registry entry), then exactly one onClose(\p info). A throw
+  /// therefore leaves the sid owned for the connect guard / teardown drain. Returns
+  /// false, firing nothing, if the sid owned neither (a terminal already fired).
+  bool preInsertTerminal(SessionId sid, const TransportErrorInfo &info)
+  {
+    const auto closeCb = copyCallback(_cbMutex, _cbs.onClose);
+    const bool pending = takePending(sid);
+    const bool connecting = eraseConnecting(sid);
+    if (!pending && !connecting)
+    {
+      return false;
+    }
+    invokeUserCallback(closeCb, sid, info);
+    return true;
+  }
+
+  bool cmdQueueClosed()
+  {
+    std::lock_guard<std::mutex> g(_cmdMutex);
+    return _cmdsClosed;
   }
 
   void drainEvt()
@@ -1092,7 +1245,6 @@ private:
     TlsMode tlsMode{TlsMode::None};
     SSL *ssl{nullptr};
     TlsState tlsState{TlsState::None};
-    MonoTime tlsStart{};
     // Track SSL_ERROR_WANT_WRITE during handshake and renegotiation.
     // I/O thread only - not thread-safe, accessed exclusively from epoll loop.
     bool tlsWantWrite{false};
@@ -1115,8 +1267,43 @@ private:
     MonoTime created{}, lastActivity{};
 
     // Safety-net tracking
+    // connectPending spans the WHOLE outbound setup (TCP connect + TLS handshake):
+    // it exempts setup sessions from idle expiry (runGc) and keeps EPOLLOUT armed
+    // outside the handshake (updateInterest).
     bool connectPending{false};
+    // tcpConnectPending spans ONLY the TCP phase (set at connect start, cleared at
+    // TCP-established for BOTH plain TCP and TLS, before any handshake is driven).
+    // Per-reader decision:
+    //  - stale-ConnectTimeout filter (process Cmd::Close) -> tcpConnectPending
+    //  - GC connect-timeout expiry (runGc)                  -> tcpConnectPending
+    //  - GC / no-timer handshake expiry gate                -> !tcpConnectPending
+    //  - doSend / writePending ::send withholding            -> tcpConnectPending
+    //  - onSession TCP-phase probe (SO_ERROR + getpeername) -> tcpConnectPending
+    //  - closeNow setup-close code (setupCloseCode)          -> tcpConnectPending
+    //  - updateInterest handshake-phase EPOLLOUT            -> tcpConnectPending
+    // SETUP-CLOSE INVARIANT (closeNow, client role only): a peer/network/error/
+    // timer-driven close while tcpConnectPending reports TransportError::Connect;
+    // else while a TLS client is in the handshake it reports
+    // TransportError::TLSHandshake (tcpConnectPending wins: a TLS client enters
+    // Handshake at connect start). BY-CODE EXEMPTION: the relabel keys on the
+    // requested code, not the caller -- Unknown (app close, connect-guard internal
+    // error), ShuttingDown, WriteBackpressure, ResourceLimit and GCClosed are never
+    // relabelled, so NEVER pass Unknown for a peer/network close (it would escape
+    // the relabel and break the failover contract).
+    // FAILOVER-SAFETY INVARIANT: a Connect or TLSHandshake close means ZERO request
+    // bytes reached the kernel -- ::send is withheld during the TCP phase and TLS
+    // withholds application data until Open -- so the request is safe to fail over.
+    bool tcpConnectPending{false};
     MonoTime connectStart{};
+    // Stamped at TCP-established (start of the TLS handshake phase; the accept time
+    // for a server-side TLS session). The handshake budget runs from here, so the
+    // TLS setup budget is connectTimeout + handshakeTimeout.
+    MonoTime handshakeStart{};
+    // A setup-phase buffer (TCP-phase wq, TLS handshake queue, or the named-host
+    // pending buffer) overflowed maxWriteQueue: the overflowing payload was
+    // discarded and the session closes WriteBackpressure at setup completion,
+    // before any byte is flushed. A setup failure still reports Connect/TLSHandshake.
+    bool setupOverflowed{false};
     MonoTime lastWriteProgress{};
     // High-resolution timer IDs (0 = not scheduled)
     std::uint64_t connectTimeoutId{0};
@@ -1186,6 +1373,32 @@ private:
     }
   }
 
+  /// \brief Write-stall deadline check (I/O thread, on a fired write-stall timer).
+  /// The stall window runs from Session::lastWriteProgress, as on the GC path: if
+  /// bytes were written less than writeStallTimeout ago the timer is re-armed for
+  /// the remainder of the window and true is returned (no close). The spent (just-
+  /// fired) timer id is dropped to 0 BEFORE scheduling the replacement, so a
+  /// throwing scheduleAfter (bad_alloc) OR a refused one (id 0, TimerService at
+  /// capacity) both leave writeStallTimeoutId 0 and runGc applies the write-stall
+  /// deadline instead of a stale non-zero id suppressing the GC fallback.
+  bool rearmWriteStallOnProgress(Session *s)
+  {
+    const auto sinceProgress = MonoClock::now() - s->lastWriteProgress;
+    if (!_timerService || sinceProgress >= _config.writeStallTimeout)
+    {
+      return false;
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             _config.writeStallTimeout - sinceProgress) +
+                           std::chrono::milliseconds(1);
+    // Drop the spent timer id first (cancel of an already-fired timer is a no-op);
+    // if scheduleAfter throws, the assignment below never runs and the id stays 0.
+    cancelWriteStallTimeout(s);
+    s->writeStallTimeoutId = _timerService->scheduleAfter(
+      remaining, [this, sid = s->id]() { handleWriteStallTimeout(sid); });
+    return true;
+  }
+
   void cancelAllTimers(Session *s)
   {
     cancelConnectTimeout(s);
@@ -1193,19 +1406,166 @@ private:
     cancelWriteStallTimeout(s);
   }
 
+  /// \brief True while a TLS session (either role) is in its handshake.
+  static bool inHandshake(const Session *s)
+  {
+    return s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake;
+  }
+
+  /// \brief True once the session may put application bytes on the wire: TCP
+  /// established (plain TCP) or handshake Open (TLS). Until then every queued
+  /// payload is a setup-phase buffer.
+  static bool sessionWritable(const Session *s)
+  {
+    return !s->tcpConnectPending && (s->tlsMode == TlsMode::None || s->tlsState == TlsState::Open);
+  }
+
+  /// \brief Close code for a close of \p s requested as \p why (setup-close
+  /// invariant, see Session::tcpConnectPending). Client role only: a server-role
+  /// (accepted) session keeps \p why. The by-code exemptions are never relabelled.
+  static TransportError setupCloseCode(const Session *s, TransportError why)
+  {
+    if (why == TransportError::Unknown || why == TransportError::ShuttingDown ||
+        why == TransportError::WriteBackpressure || why == TransportError::ResourceLimit ||
+        why == TransportError::GCClosed)
+    {
+      return why;
+    }
+    if (s->tcpConnectPending)
+    {
+      return TransportError::Connect;
+    }
+    if (s->tlsMode == TlsMode::Client && s->tlsState == TlsState::Handshake)
+    {
+      return TransportError::TLSHandshake;
+    }
+    return why;
+  }
+
+  /// \brief True for a socket()/connect() errno that reports LOCAL resource
+  /// exhaustion (descriptor limits, buffer/memory pressure, no free local
+  /// address/port) rather than a failure to reach the peer.
+  static bool isLocalResourceErrno(int e)
+  {
+    return e == EMFILE || e == ENFILE || e == ENOBUFS || e == ENOMEM || e == EADDRNOTAVAIL;
+  }
+
+  /// \brief sysErrno for an EVENT-ONLY close trigger (EPOLLHUP/EPOLLERR/EPOLLRDHUP):
+  /// the pending socket error via getsockopt(SO_ERROR) (read-and-clear, so this is
+  /// fetched once, before any other syscall on the fd).
+  static int eventCloseErrno(const Session *s)
+  {
+    int soErr = 0;
+    socklen_t el = sizeof(soErr);
+    if (::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &soErr, &el) != 0)
+    {
+      soErr = errno;
+    }
+    return soErr;
+  }
+
   void handleConnectTimeout(SessionId sid)
   {
-    enqueue(Command::close(sid, TransportError::Timeout, "Connect timeout", CloseOrigin::ConnectTimeout));
+    enqueueTimerClose(sid, TransportError::Connect, "Connect timeout", CloseOrigin::ConnectTimeout,
+                      ETIMEDOUT);
   }
 
   void handleHandshakeTimeout(SessionId sid)
   {
-    enqueue(Command::close(sid, TransportError::TLSHandshake, "TLS handshake timeout", CloseOrigin::HandshakeTimeout));
+    enqueueTimerClose(sid, TransportError::TLSHandshake, "TLS handshake timeout",
+                      CloseOrigin::HandshakeTimeout, ETIMEDOUT);
   }
 
   void handleWriteStallTimeout(SessionId sid)
   {
-    enqueue(Command::close(sid, TransportError::Timeout, "Write stall timeout", CloseOrigin::WriteStall));
+    enqueueTimerClose(sid, TransportError::Timeout, "Write stall timeout", CloseOrigin::WriteStall,
+                      0);
+  }
+
+  static constexpr std::chrono::milliseconds TIMER_CLOSE_RETRY_DELAY{10};
+
+  /// \brief TimerService thread: enqueue a timer-originated close. A failed
+  /// enqueue while the command queue is still OPEN (a transient exception, e.g.
+  /// bad_alloc) reschedules a short retry so the timeout is never silently lost;
+  /// a closed queue (teardown) drops it — shutdownDrain terminates the session.
+  /// If the retry itself cannot be scheduled (TimerService at capacity, or a
+  /// throw), the session is marked so the next runGc applies that deadline.
+  void enqueueTimerClose(SessionId sid, TransportError reason, const char *msg,
+                         CloseOrigin origin, int sysErrno)
+  {
+    bool queued = false;
+    try
+    {
+      queued = enqueue(Command::close(sid, reason, msg, origin, sysErrno));
+    }
+    catch (...)
+    {
+    }
+    if (queued || !_timerService || cmdQueueClosed())
+    {
+      return;
+    }
+    std::uint64_t retryId = 0;
+    try
+    {
+      retryId = _timerService->scheduleAfter(
+        TIMER_CLOSE_RETRY_DELAY, [this, sid, reason, msg, origin, sysErrno]()
+        { enqueueTimerClose(sid, reason, msg, origin, sysErrno); });
+    }
+    catch (...)
+    {
+    }
+    if (retryId == 0)
+    {
+      markTimerCloseLost(sid, origin);
+    }
+  }
+
+  /// \brief Record that the timer-originated close of \p sid (\p origin) could
+  /// neither be enqueued nor retried. runGc drains these marks on the I/O thread
+  /// and clears the matching timer id, so its GC deadline check takes over.
+  void markTimerCloseLost(SessionId sid, CloseOrigin origin) noexcept
+  {
+    try
+    {
+      std::lock_guard<std::mutex> g(_lostTimerMutex);
+      _lostTimerCloses.emplace_back(sid, origin);
+    }
+    catch (...)
+    {
+    }
+  }
+
+  /// \brief I/O thread (runGc): clear the timer id of every session whose
+  /// timer-originated close was lost (markTimerCloseLost).
+  void applyLostTimerCloses()
+  {
+    std::vector<std::pair<SessionId, CloseOrigin>> lost;
+    {
+      std::lock_guard<std::mutex> g(_lostTimerMutex);
+      lost.swap(_lostTimerCloses);
+    }
+    for (const auto &l : lost)
+    {
+      auto it = _sessions.find(l.first);
+      if (it == _sessions.end())
+      {
+        continue;
+      }
+      Session *s = it->second.get();
+      if (l.second == CloseOrigin::ConnectTimeout)
+      {
+        cancelConnectTimeout(s);
+      }
+      else if (l.second == CloseOrigin::HandshakeTimeout)
+      {
+        cancelHandshakeTimeout(s);
+      }
+      else if (l.second == CloseOrigin::WriteStall)
+      {
+        cancelWriteStallTimeout(s);
+      }
+    }
   }
 
   struct Listener
@@ -1226,21 +1586,86 @@ private:
   void loop()
   {
     if (_batchProcessor)
+    {
       loopBatched();
+    }
     else
+    {
       loopUnbatched();
+    }
   }
 
+  /// \brief Dispatch one epoll event. An exception escaping a session dispatch
+  /// closes THAT session (Unknown, "internal error") and the loop continues; one
+  /// escaping a listener dispatch is dropped (the listener stays armed).
   void handleFdEvent(int fd, std::uint32_t events)
   {
     auto it = _fdTags.find(fd);
     if (it == _fdTags.end())
+    {
       return;
+    }
     Tag *t = it->second.get();
     if (t->isListener)
-      onListener(t->lst);
-    else
+    {
+      try
+      {
+        onListener(t->lst);
+      }
+      catch (...)
+      {
+      }
+      return;
+    }
+    const SessionId sid = t->sess->id;
+    events = filterSessionEvents(sid, events);
+    if (events == 0)
+    {
+      return;
+    }
+    try
+    {
       onSession(t->sess, events);
+    }
+    catch (...)
+    {
+      closeAfterDispatchThrow(sid);
+    }
+  }
+
+  /// \brief Close \p sid (Unknown, "internal error") after an exception escaped
+  /// its dispatch; a no-op if the dispatch already closed it.
+  void closeAfterDispatchThrow(SessionId sid) noexcept
+  {
+    try
+    {
+      auto it = _sessions.find(sid);
+      if (it != _sessions.end())
+      {
+        closeNow(it->second.get(), TransportError::Unknown, "internal error", 0, 0);
+      }
+    }
+    catch (...)
+    {
+    }
+  }
+
+  /// \brief Swallowing wrapper for the test event filter: a throwing filter
+  /// delivers \p events unchanged.
+  std::uint32_t filterSessionEvents(SessionId sid, std::uint32_t events) noexcept
+  {
+    if (!_sessionEventFilterHook)
+    {
+      return events;
+    }
+    try
+    {
+      return _sessionEventFilterHook(sid, events);
+    }
+    catch (...)
+    {
+      return events;
+    }
   }
 
   void shutdownDrain()
@@ -1259,7 +1684,9 @@ private:
     std::vector<Session *> toClose;
     toClose.reserve(_sessions.size());
     for (auto &kv : _sessions)
+    {
       toClose.push_back(kv.second.get());
+    }
 
     // fd-reuse fix (tracker 2026-09-15-3): detach sessions/listeners and COLLECT their
     // fds; ::close them only AFTER both maps are cleared under the write lock (fdsToClose
@@ -1273,8 +1700,11 @@ private:
     for (auto *s : toClose)
     {
       if (!s || s->closed.load(std::memory_order_relaxed))
+      {
         continue;
+      }
       s->closed.store(true, std::memory_order_relaxed);
+      cancelAllTimersNoThrow(s);
       delEpoll(s->fd);
       // Erase the fd->Tag entry too (mirrors closeNow and the listener loop below):
       // _sessions.clear() destroys the Session, so a surviving _fdTags entry would
@@ -1292,11 +1722,17 @@ private:
       fdsToClose.emplace_back(s->fd, &_preCloseHook); // ::close after _sessions.clear()
       _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
       _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
+      // TS-3: guard each drain terminal so an allocation failure (e.g. a large
+      // onClose std::function copy) on one session cannot truncate the drain and
+      // skip the remaining sessions' onClose. The fd/SSL for THIS session were
+      // already released above, so a throw here loses at most one onClose.
+      try
       {
-        closeCb(s->id, TransportErrorInfo{TransportError::Unknown, "shutdown", 0, 0});
+        invokeUserCallback(copyCallback(_cbMutex, _cbs.onClose), s->id,
+                           TransportErrorInfo{TransportError::Unknown, "shutdown", 0, 0});
+      }
+      catch (...)
+      {
       }
     }
     {
@@ -1338,10 +1774,10 @@ private:
     }
 
     // (b) DRAIN in-flight named-host resolves (#7b): COLLECT-THEN-FIRE. Fire
-    // exactly one onClose(ShuttingDown) per pending sid, COPY-THEN-INVOKE (copy
-    // onClose under _cbMutex, mirror the session drain above), OUTSIDE gate->m
-    // and outside the _cmdMutex teardown block (#14/HR-3). Erase before firing so
-    // a re-entrant callback cannot double-fire an entry.
+    // exactly one onClose(ShuttingDown) per pending sid (preInsertTerminal:
+    // copy-then-invoke, release before firing so a re-entrant callback cannot
+    // double-fire an entry), OUTSIDE gate->m and outside the _cmdMutex teardown
+    // block (#14/HR-3).
     if (!_pendingConnects.empty())
     {
       std::vector<SessionId> pendingSids;
@@ -1350,23 +1786,19 @@ private:
       {
         pendingSids.push_back(kv.first);
       }
-      decltype(_cbs.onClose) drainCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); drainCb = _cbs.onClose; }
       for (SessionId sid : pendingSids)
       {
-        auto it = _pendingConnects.find(sid);
-        if (it == _pendingConnects.end())
+        if (_pendingConnects.count(sid) != 0)
         {
-          continue;
-        }
-        if (_timerService && it->second.resolveTimeoutId != 0)
-        {
-          _timerService->cancel(it->second.resolveTimeoutId);
-        }
-        _pendingConnects.erase(it);
-        if (drainCb)
-        {
-          drainCb(sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown", 0, 0});
+          // TS-3: guard each terminal so an allocation failure on one pending sid
+          // does not skip the remaining pending sids' onClose.
+          try
+          {
+            preInsertTerminal(sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown", 0, 0});
+          }
+          catch (...)
+          {
+          }
         }
       }
     }
@@ -1395,9 +1827,37 @@ private:
     {
       if (c.listenerReady)
       {
-        try { c.listenerReady->set_value(false); } catch (...) {}
+        try
+        {
+          c.listenerReady->set_value(false);
+        }
+        catch (...)
+        {
+        }
+      }
+      if (c.t == Cmd::Connect)
+      {
+        // TS-3: guard each residual terminal so an allocation failure on one does
+        // not skip the remaining residual Connect commands' onClose.
+        try
+        {
+          preInsertTerminal(c.c.sid, TransportErrorInfo{TransportError::ShuttingDown, "shutdown", 0, 0});
+        }
+        catch (...)
+        {
+        }
       }
     }
+    // TS3-R3-1: unconditional final sweep. preInsertTerminal releases its registry
+    // entry AFTER the allocating copyCallback, so a swallowed bad_alloc above could
+    // leave a _pendingConnects/_connecting entry behind. Clear both registries so
+    // the drain leaves them provably empty (a monotonic sid is never re-issued, but
+    // a resurrected entry would still violate the drain-empties invariant).
+    {
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      _connecting.clear();
+    }
+    _pendingConnects.clear();
     if (_epollFd >= 0)
     {
       ::close(_epollFd);
@@ -1528,23 +1988,11 @@ private:
           // _sessions (resolution is still in flight), so consult _pendingConnects
           // FIRST. If found, cancel the resolve timeout, erase, fire the single
           // terminal onClose; the later resumeConnect finds no entry and no-ops.
+          if (_pendingConnects.count(c.closeSid) != 0)
           {
-            auto pit = _pendingConnects.find(c.closeSid);
-            if (pit != _pendingConnects.end())
-            {
-              if (_timerService && pit->second.resolveTimeoutId != 0)
-              {
-                _timerService->cancel(pit->second.resolveTimeoutId);
-              }
-              _pendingConnects.erase(pit);
-              decltype(_cbs.onClose) closeCb;
-              { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-              if (closeCb)
-              {
-                closeCb(c.closeSid, TransportErrorInfo{c.closeReason, c.closeMsg, 0, 0});
-              }
-              break;
-            }
+            preInsertTerminal(c.closeSid,
+                              TransportErrorInfo{c.closeReason, c.closeMsg, c.closeErrno, 0});
+            break;
           }
           auto it = _sessions.find(c.closeSid);
           if (it != _sessions.end())
@@ -1556,17 +2004,34 @@ private:
             // may have completed the operation that triggered the timeout.
             if (c.closeOrigin == CloseOrigin::ConnectTimeout)
             {
-              if (!s->connectPending) break; // Connect completed, ignore stale timeout
+              if (!s->tcpConnectPending)
+              {
+                break; // TCP phase completed, ignore stale timeout
+              }
             }
             else if (c.closeOrigin == CloseOrigin::HandshakeTimeout)
             {
-              if (s->tlsState != TlsState::Handshake) break; // Handshake completed
+              if (s->tlsState != TlsState::Handshake)
+              {
+                break; // Handshake completed
+              }
             }
             else if (c.closeOrigin == CloseOrigin::WriteStall)
             {
-              if (s->wq.empty()) break; // Write queue drained
+              // Queue drained, or setup not complete (a slow connect never closes as
+              // a write stall).
+              if (s->wq.empty() || !sessionWritable(s))
+              {
+                break;
+              }
+              // Write progress since the timer was armed: re-arm for the rest of
+              // the window measured from lastWriteProgress (the GC path's rule).
+              if (rearmWriteStallOnProgress(s))
+              {
+                break;
+              }
             }
-            closeNow(s, c.closeReason, c.closeMsg, 0);
+            closeNow(s, c.closeReason, c.closeMsg, c.closeErrno, 0);
           }
           break;
         }
@@ -1577,15 +2042,36 @@ private:
       }
       catch (const std::exception &ex)
       {
-        // Fulfill any pending addListener promise to prevent caller deadlock
-        if (c.listenerReady)
-        {
-          try { c.listenerReady->set_value(false); } catch (...) {}
-        }
-        decltype(_cbs.onError) cb;
-        { std::lock_guard<std::mutex> g(_cbMutex); cb = _cbs.onError; }
-        if (cb) cb(TransportError::Unknown, std::string("cmd dispatch: ") + ex.what());
+        dispatchFailed(c, ex.what());
       }
+      catch (...)
+      {
+        dispatchFailed(c, "unknown exception");
+      }
+    }
+  }
+
+  /// \brief A command handler threw: fail any addListener promise (so a caller
+  /// blocked in fut.get() returns) and report onError. Never throws.
+  void dispatchFailed(Command &c, const char *what) noexcept
+  {
+    if (c.listenerReady)
+    {
+      try
+      {
+        c.listenerReady->set_value(false);
+      }
+      catch (...)
+      {
+      }
+    }
+    try
+    {
+      invokeUserCallback(copyCallback(_cbMutex, _cbs.onError), TransportError::Unknown,
+                         std::string("cmd dispatch: ") + what);
+    }
+    catch (...)
+    {
     }
   }
 
@@ -1738,7 +2224,7 @@ private:
         ::SSL_set_fd(s->ssl, cfd);
         ::SSL_set_accept_state(s->ssl);
         s->tlsState = TlsState::Handshake;
-        s->tlsStart = MonoClock::now();
+        s->handshakeStart = MonoClock::now();
         scheduleHandshakeTimeout(s.get());
       }
 
@@ -1766,9 +2252,7 @@ private:
       _fdTags.emplace(cfd, std::move(tg));
 
       _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
-      decltype(_cbs.onAccept) acceptCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); acceptCb = _cbs.onAccept; }
-      if (acceptCb) acceptCb(sid, addressFromSockaddr(peer));
+      invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid, addressFromSockaddr(peer));
     }
   }
 
@@ -1776,6 +2260,19 @@ private:
   /// is resolved OFF the I/O thread, event-driven, then resumed via
   /// resumeConnect. Enqueue-only contract preserved (returns without blocking).
   bool doConnect(const ConnectReq &cr)
+  {
+    try
+    {
+      return doConnectImpl(cr);
+    }
+    catch (...)
+    {
+      connectGuardFail(cr.sid);
+      return false;
+    }
+  }
+
+  bool doConnectImpl(const ConnectReq &cr)
   {
     // Literal IP short-circuit — SYNCHRONOUS, no resolver. Build a STACK-owned
     // addrinfo and connect directly; connectFromAddrs never frees it.
@@ -1808,7 +2305,7 @@ private:
         inet_pton(AF_INET6, cr.host.c_str(), &(sa6.sin6_addr));
         manualHints.ai_addr = reinterpret_cast<sockaddr *>(&sa6);
       }
-      return connectFromAddrs(cr, &manualHints);
+      return connectFromAddrs(cr, &manualHints, std::deque<ByteBuffer>{}, false, false);
     }
 
     // NAMED host: resolve OFF the I/O thread, EVENT-DRIVEN. Arm the resolve
@@ -1830,13 +2327,13 @@ private:
     // filtering, orthogonal to F2 multi-address failover.
     hints.ai_flags = AI_ADDRCONFIG;
 
-    PendingConnect pc;
+    PendingConnect &pc = _pendingConnects[cr.sid];
     if (_timerService && _config.resolveTimeout.count() > 0)
     {
       pc.resolveTimeoutId = _timerService->scheduleAfter(
         _config.resolveTimeout, [this, sid = cr.sid] { handleResolveTimeout(sid); });
     }
-    _pendingConnects[cr.sid] = pc;
+    testMaybeThrowAt(ConnectThrowPoint::NAMED_KICKOFF_AFTER_PENDING_INSERT);
 
     resolveHostAsync(cr.host, std::to_string(cr.port), hints, makeResolveContinuation(cr));
     return true;
@@ -1882,31 +2379,40 @@ private:
                      const std::string &verifyName, unsigned x509HostFlags,
                      std::shared_ptr<iora::network::OwnedAddrInfo> addrs, int gai)
   {
-    auto it = _pendingConnects.find(sid);
-    if (it == _pendingConnects.end())
+    try
     {
-      return; // resolve-timeout or close already fired the terminal
-    }
-    if (_timerService && it->second.resolveTimeoutId != 0)
-    {
-      _timerService->cancel(it->second.resolveTimeoutId);
-    }
-    _pendingConnects.erase(it);
+      auto it = _pendingConnects.find(sid);
+      if (it == _pendingConnects.end())
+      {
+        return; // resolve-timeout or close already fired the terminal
+      }
+      if (_timerService && it->second.resolveTimeoutId != 0)
+      {
+        _timerService->cancel(it->second.resolveTimeoutId);
+      }
+      std::deque<ByteBuffer> buffered = std::move(it->second.buffer);
+      const bool setupOverflowed = it->second.setupOverflowed;
+      _pendingConnects.erase(it);
 
-    if (gai != 0 || !addrs || !addrs->get())
-    {
-      // gai==0 with a null/empty chain is defensive (glibc returns EAI_* + null
-      // together); resolveErrorMessage(0) would say "Success", so use a fixed
-      // string for that path (sip-voip L-4).
-      const std::string msg =
-        (gai != 0) ? iora::network::resolveErrorMessage(gai) : "resolve returned no addresses";
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb) closeCb(sid, TransportErrorInfo{TransportError::Resolve, msg});
-      err(TransportError::Resolve, std::string("resolve failed: ") + msg);
-      return;
+      if (gai != 0 || !addrs || !addrs->get())
+      {
+        // gai==0 with a null/empty chain is defensive (glibc returns EAI_* + null
+        // together); resolveErrorMessage(0) would say "Success", so use a fixed
+        // string for that path (sip-voip L-4).
+        const std::string msg =
+          (gai != 0) ? iora::network::resolveErrorMessage(gai) : "resolve returned no addresses";
+        buffered.clear();
+        preInsertTerminal(sid, TransportErrorInfo{TransportError::Resolve, msg});
+        err(TransportError::Resolve, std::string("resolve failed: ") + msg);
+        return;
+      }
+      connectFromAddrs(ConnectReq{sid, host, port, tls, verifyName, x509HostFlags}, addrs->get(),
+                       std::move(buffered), setupOverflowed, true);
     }
-    connectFromAddrs(ConnectReq{sid, host, port, tls, verifyName, x509HostFlags}, addrs->get());
+    catch (...)
+    {
+      connectGuardFail(sid);
+    }
   }
 
   /// \brief Resolve-timeout, TimerService thread. MARSHALS to the I/O thread —
@@ -1918,7 +2424,19 @@ private:
   /// _pendingConnects.
   void handleResolveTimeout(SessionId sid)
   {
-    runOnIoThread([this, sid] { resolveTimeoutOnIo(sid); });
+    if (runOnIoThread([this, sid] { resolveTimeoutOnIo(sid); }) || !_timerService ||
+        cmdQueueClosed())
+    {
+      return;
+    }
+    try
+    {
+      (void)_timerService->scheduleAfter(TIMER_CLOSE_RETRY_DELAY,
+                                         [this, sid]() { handleResolveTimeout(sid); });
+    }
+    catch (...)
+    {
+    }
   }
 
   /// \brief Resolve-timeout apply (I/O thread). One-shot eraser: fire
@@ -1926,39 +2444,137 @@ private:
   /// leaves nothing to do.
   void resolveTimeoutOnIo(SessionId sid)
   {
-    auto it = _pendingConnects.find(sid);
-    if (it == _pendingConnects.end())
+    try
     {
-      return; // resume/close won the race
+      if (_pendingConnects.count(sid) == 0)
+      {
+        return; // resume/close won the race
+      }
+      preInsertTerminal(sid, TransportErrorInfo{TransportError::Resolve, "resolve timeout"});
+      err(TransportError::Resolve, "resolve timeout");
     }
-    _pendingConnects.erase(it);
-    decltype(_cbs.onClose) closeCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-    if (closeCb) closeCb(sid, TransportErrorInfo{TransportError::Resolve, "resolve timeout"});
-    err(TransportError::Resolve, "resolve timeout");
+    catch (...)
+    {
+      connectGuardFail(sid);
+    }
+  }
+
+  /// \brief RAII owner of an outbound socket, its SSL object and its armed timers
+  /// until the Session is inserted into _sessions (after which closeNow owns them).
+  /// release() is the explicit early cleanup of a pre-insert terminal; disarm()
+  /// hands ownership to _sessions. Nothing leaks if the connect path unwinds.
+  struct PreInsertResources
+  {
+    TcpEngine *engine;
+    int fd{-1};
+    Session *session{nullptr};
+
+    explicit PreInsertResources(TcpEngine *e) : engine(e) {}
+    ~PreInsertResources() { release(); }
+    PreInsertResources(const PreInsertResources &) = delete;
+    PreInsertResources &operator=(const PreInsertResources &) = delete;
+
+    void release() noexcept
+    {
+      if (session)
+      {
+        try
+        {
+          engine->cancelAllTimers(session);
+        }
+        catch (...)
+        {
+        }
+        if (session->ssl)
+        {
+          ::SSL_free(session->ssl);
+          session->ssl = nullptr;
+        }
+        session = nullptr;
+      }
+      if (fd >= 0)
+      {
+        ::close(fd);
+        fd = -1;
+      }
+    }
+
+    void disarm() noexcept
+    {
+      session = nullptr;
+      fd = -1;
+    }
+  };
+
+  /// \brief Exception guard terminal for the I/O-thread connect path (doConnect,
+  /// resumeConnect, connectFromAddrs). Fires exactly one onClose(Unknown,
+  /// "internal error") iff this call removed the sid from the connecting registry
+  /// or from _pendingConnects; a sid already in _sessions is closed via closeNow;
+  /// otherwise a terminal already fired and nothing is done. Never throws.
+  void connectGuardFail(SessionId sid) noexcept
+  {
+    try
+    {
+      if (preInsertTerminal(sid, TransportErrorInfo{TransportError::Unknown, "internal error", 0, 0}))
+      {
+        return;
+      }
+      auto it = _sessions.find(sid);
+      if (it != _sessions.end())
+      {
+        closeNow(it->second.get(), TransportError::Unknown, "internal error", 0, 0);
+      }
+    }
+    catch (...)
+    {
+    }
   }
 
   /// \brief Connect using an EXTERNALLY-owned addrinfo chain (single-address,
   /// terminal-on-failure — core scope; F2 adds multi-address failover). NEVER
   /// calls ::freeaddrinfo — the caller owns \p res (a stack addrinfo for the
   /// literal path, or a shared_ptr<OwnedAddrInfo> for the resume path); a free
-  /// here would double-free (#6, cpp17 H3). Runs on the I/O thread.
-  bool connectFromAddrs(const ConnectReq &cr, addrinfo *res)
+  /// here would double-free (#6, cpp17 H3). Runs on the I/O thread. \p buffered
+  /// holds sends accepted while a named host resolved (empty on the literal path);
+  /// they are moved into Session::wq in order. \p setupOverflowed carries the
+  /// pending buffer's overflow mark into Session::setupOverflowed.
+  bool connectFromAddrs(const ConnectReq &cr, addrinfo *res, std::deque<ByteBuffer> &&buffered,
+                        bool setupOverflowed, bool viaResume)
+  {
+    try
+    {
+      return connectFromAddrsImpl(cr, res, std::move(buffered), setupOverflowed, viaResume);
+    }
+    catch (...)
+    {
+      connectGuardFail(cr.sid);
+      return false;
+    }
+  }
+
+  bool connectFromAddrsImpl(const ConnectReq &cr, addrinfo *res, std::deque<ByteBuffer> &&buffered,
+                            bool setupOverflowed, bool viaResume)
   {
     std::string ps = std::to_string(cr.port);
 
-    int cfd = -1;
+    // Declared BEFORE `held` so the Session outlives it on unwind (held.release()
+    // reads the Session's timers and SSL object).
+    std::unique_ptr<Session> s;
+    PreInsertResources held(this);
     addrinfo *chosen = nullptr;
+    int loopErrno = 0;
     for (addrinfo *ai = res; ai; ai = ai->ai_next)
     {
-      cfd = ::socket(ai->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-      if (cfd < 0)
+      held.fd = ::socket(ai->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+      if (held.fd < 0)
       {
+        loopErrno = errno;
         continue;
       }
-      applySockOpts(cfd);
-      int connectResult = ::connect(cfd, ai->ai_addr, ai->ai_addrlen);
-      if (connectResult == 0 || errno == EINPROGRESS)
+      applySockOpts(held.fd);
+      int connectResult = ::connect(held.fd, ai->ai_addr, ai->ai_addrlen);
+      loopErrno = connectResult == 0 ? 0 : errno;
+      if (connectResult == 0 || loopErrno == EINPROGRESS)
       {
         chosen = ai;
         break;
@@ -1966,36 +2582,27 @@ private:
       // CRITICAL FIX for SIP: Immediately handle connection refused for local
       // connections This prevents hanging when connecting to non-existent
       // local ports
-      if (errno == ECONNREFUSED || errno == ENETUNREACH || errno == EHOSTUNREACH)
+      if (loopErrno == ECONNREFUSED || loopErrno == ENETUNREACH || loopErrno == EHOSTUNREACH)
       {
-        // Save errno before system calls clobber it
-        int connectErrno = errno;
-        std::string connectErr = lastErr();
+        const int connectErrno = loopErrno;
+        const std::string connectErr = iora::core::errnoMessage(loopErrno);
 
-        ::close(cfd);
-        cfd = -1;
+        held.release();
 
         // NO ::freeaddrinfo — the caller owns res (#6, cpp17 H3).
-
-        // Report immediate failure
-        decltype(_cbs.onClose) closeCb;
-        { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-        if (closeCb)
-        {
-          std::string errMsg =
-            "Connection refused to " + cr.host + ":" + ps + " - " + connectErr;
-          closeCb(cr.sid, TransportErrorInfo{TransportError::Connect, errMsg, connectErrno, 0});
-        }
+        const char *what =
+          connectErrno == ECONNREFUSED ? "Connection refused to " : "Connection failed to ";
+        preInsertTerminal(cr.sid,
+                          TransportErrorInfo{TransportError::Connect,
+                                             what + cr.host + ":" + ps + " - " + connectErr,
+                                             connectErrno, 0});
         err(TransportError::Connect, "connect immediately failed: " + connectErr);
         return false;
       }
-      ::close(cfd);
-      cfd = -1;
+      held.release();
     }
 
-    // Save errno from the connect loop BEFORE cleanup calls clobber it.
-    int loopErrno = errno;
-    std::string loopErr = lastErr();
+    std::string loopErr = iora::core::errnoMessage(loopErrno);
 
     // Copy the peer address out of the chosen entry. NO ::freeaddrinfo — the
     // caller owns res (#6, cpp17 H3); chosen stays valid for the caller's frame,
@@ -2008,26 +2615,30 @@ private:
       std::memcpy(&savedPeer, chosen->ai_addr, savedPeerLen);
     }
 
-    if (cfd < 0)
+    if (held.fd < 0)
     {
-      decltype(_cbs.onClose) closeCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-      if (closeCb)
-      {
-        closeCb(cr.sid, TransportErrorInfo{TransportError::Connect, loopErr, loopErrno, 0});
-      }
-      err(TransportError::Connect, "connect: " + loopErr);
+      // Local resource exhaustion (fd limits, buffer/memory, no local address) is
+      // not a failure to reach the peer: ResourceLimit, errno kept.
+      const TransportError code =
+        isLocalResourceErrno(loopErrno) ? TransportError::ResourceLimit : TransportError::Connect;
+      preInsertTerminal(cr.sid, TransportErrorInfo{code, loopErr, loopErrno, 0});
+      err(code, "connect: " + loopErr);
       return false;
     }
+    const int cfd = held.fd;
 
-    auto s = std::make_unique<Session>();
+    s = std::make_unique<Session>();
+    held.session = s.get();
     s->id = cr.sid;
     s->fd = cfd;
     s->created = MonoClock::now();
     s->lastActivity = s->created;
     s->lastWriteProgress = s->created;
     s->connectPending = true;
+    s->tcpConnectPending = true;
     s->connectStart = MonoClock::now();
+    s->wq = std::move(buffered);
+    s->setupOverflowed = setupOverflowed;
     scheduleConnectTimeout(s.get());
 
     if (savedPeerLen > 0)
@@ -2044,24 +2655,16 @@ private:
       // Single PRE-INSERTION fail-closed terminal for TLS-client setup. The session
       // is not yet in _sessions / epoll, so closeNow MUST NOT be used here (it would
       // decrement sessionsCurrent for a never-counted session and delEpoll an
-      // unregistered fd). Fires exactly one onClose(TLSHandshake), counts the TLS
-      // failure, cancels the connect timer, frees the SSL object (null-safe + nulled
-      // to keep the free-then-null invariant), and closes the fd. Shared by the
-      // SSL_new failure and every identity-binding failure so the fail-closed path
-      // cannot drift (arch FAIL-CLOSED-IDENTITY-BINDING).
+      // unregistered fd). ORDER: release resources (connect timer, SSL object, fd)
+      // -> erase the connecting registry -> fire exactly one onClose(TLSHandshake).
+      // Shared by the SSL_new failure and every identity-binding failure so the
+      // fail-closed path cannot drift (arch FAIL-CLOSED-IDENTITY-BINDING).
       auto failClosedPreInsertion = [&](const char *why)
       {
-        decltype(_cbs.onClose) closeCb;
-        { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
-        if (closeCb)
-        {
-          closeCb(cr.sid, TransportErrorInfo{TransportError::TLSHandshake, why});
-        }
-        err(TransportError::TLSHandshake, why);
         _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
-        cancelConnectTimeout(s.get()); // release the timer scheduled at connect start
-        if (s->ssl) { ::SSL_free(s->ssl); s->ssl = nullptr; }
-        ::close(cfd);
+        held.release();
+        preInsertTerminal(cr.sid, TransportErrorInfo{TransportError::TLSHandshake, why});
+        err(TransportError::TLSHandshake, why);
       };
 
       s->ssl = ::SSL_new(_sslCli);
@@ -2135,16 +2738,21 @@ private:
       }
 
       s->tlsState = TlsState::Handshake;
-      s->tlsStart = MonoClock::now();
       s->tlsWantWrite = true; // Client needs to send ClientHello first
-      scheduleHandshakeTimeout(s.get());
     }
+
+    testMaybeThrowAt(viaResume ? ConnectThrowPoint::BEFORE_INSERT_RESUME
+                               : ConnectThrowPoint::BEFORE_INSERT_LITERAL);
 
     Session *sPtr = s.get();
     {
       std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
-      _sessions.emplace(s->id, std::move(s));
+      // operator[] default-constructs the (null) slot then move-assigns, all under
+      // this one unique lock, so a shared-lock reader never observes a null entry.
+      _sessions[cr.sid] = std::move(s);
+      _connecting.erase(cr.sid);
     }
+    held.disarm();
     bumpSess();
 
     // EPOLLRDHUP armed for uniform peer-half-close detection (defense-in-depth;
@@ -2161,73 +2769,123 @@ private:
     tg->sess = sPtr;
     _fdTags.emplace(cfd, std::move(tg));
 
-    // DEFENSE-IN-DEPTH: Check if socket is already writable (handles immediate connects)
-    // This prevents edge-triggered epoll from missing the initial EPOLLOUT event
-    // when the TCP handshake completes before the first epoll_wait()
-    // Only do this for non-TLS connections; TLS needs handshake to complete first
-    if (cr.tls == TlsMode::None)
-    {
-      int err = 0;
-      socklen_t el = sizeof(err);
-      int rc = ::getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &el);
-      if (rc < 0)
-      {
-        // getsockopt() syscall failed - socket is invalid
-        int gso_errno = errno;
-        IORA_LOG_ERROR("[IMMEDIATE-CONNECT] getsockopt() failed for sid=" << cr.sid
-                       << ", errno=" << gso_errno);
-        closeNow(sPtr, TransportError::Socket,
-                 std::string("getsockopt failed: ") + iora::core::errnoMessage(gso_errno), gso_errno);
-        return true;
-      }
-      else if (err == 0)
-      {
-        // SO_ERROR is 0, but must verify connection is truly established using getpeername()
-        // For non-routable addresses, SO_ERROR may be 0 before network error is detected
-        struct sockaddr_storage addr;
-        socklen_t addrlen = sizeof(addr);
-        if (::getpeername(cfd, reinterpret_cast<struct sockaddr *>(&addr), &addrlen) == 0)
-        {
-          IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] Connection truly established for sid=" << cr.sid);
-          // Connection completed immediately - manually trigger the connect callback
-          decltype(_cbs.onConnect) connectCb;
-          { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
-          if (connectCb)
-          {
-            _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
-            connectCb(cr.sid, addressFromSockaddr(sPtr->peer));
-          }
-          sPtr->connectPending = false;
-          sPtr->lastWriteProgress = MonoClock::now();
-          cancelConnectTimeout(sPtr);
-        }
-        else
-        {
-          // getpeername() failed - check errno to determine if connection has definitely failed
-          int gp_errno = errno;
-          if (gp_errno == ECONNREFUSED || gp_errno == ENETUNREACH ||
-              gp_errno == EHOSTUNREACH || gp_errno == ETIMEDOUT)
-          {
-            IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] getpeername() detected connection failure for sid="
-                           << cr.sid << ", errno=" << gp_errno);
-            closeNow(sPtr, TransportError::Connect, iora::core::errnoMessage(gp_errno), gp_errno);
-            return true;
-          }
-          // else ENOTCONN or other transient error - connection not yet established, wait for epoll/timeout
-          IORA_LOG_DEBUG("[IMMEDIATE-CONNECT] getpeername() returned errno=" << gp_errno
-                         << " for sid=" << cr.sid << ", waiting for epoll/timeout");
-        }
-      }
-      else
-      {
-        IORA_LOG_DEBUG("[IMMEDIATE-CONNECT-FAIL] SO_ERROR indicates connection failed for sid=" << cr.sid
-                       << ", error=" << iora::core::errnoMessage(err));
-        // Connection failed immediately - clean up and invoke failure callback
-        closeNow(sPtr, TransportError::Connect, iora::core::errnoMessage(err), err);
-        return true;
-      }
-    }
+    testMaybeThrowAt(ConnectThrowPoint::AFTER_INSERT);
 
+    // DEFENSE-IN-DEPTH: Check if the TCP connect already completed (handles
+    // immediate connects) for BOTH plain TCP and TLS. This prevents edge-triggered
+    // epoll from missing the initial EPOLLOUT event when the TCP handshake
+    // completes before the first epoll_wait(). For TLS only the TCP phase is
+    // completed here; the handshake is then driven by the pending EPOLLOUT.
+    int soErr = 0;
+    probeTcpEstablished(sPtr, "[IMMEDIATE-CONNECT]", soErr);
+    return true;
+  }
+
+  /// \brief TCP-phase completion probe (SO_ERROR, then getpeername) for a session
+  /// still in its TCP phase. Returns false iff the session was closed (caller must
+  /// not touch \p s again). On success runs onTcpEstablished + updateInterest;
+  /// a transient "not yet connected" leaves the session pending. \p soErrOut
+  /// receives the SO_ERROR value the probe consumed (read-and-clear).
+  bool probeTcpEstablished(Session *s, const char *tag, int &soErrOut)
+  {
+    int &soErr = soErrOut;
+    soErr = 0;
+    socklen_t el = sizeof(soErr);
+    int rc = ::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &soErr, &el);
+    if (rc < 0)
+    {
+      // getsockopt() syscall failed - socket is invalid
+      int gso_errno = errno;
+      IORA_LOG_ERROR(tag << " getsockopt() failed for sid=" << s->id << ", errno=" << gso_errno);
+      closeNow(s, TransportError::Socket,
+               std::string("getsockopt failed: ") + iora::core::errnoMessage(gso_errno), gso_errno,
+               0);
+      return false;
+    }
+    if (soErr != 0)
+    {
+      IORA_LOG_DEBUG(tag << " SO_ERROR indicates connection failed for sid=" << s->id
+                     << ", error=" << iora::core::errnoMessage(soErr));
+      closeNow(s, TransportError::Connect, iora::core::errnoMessage(soErr), soErr, 0);
+      return false;
+    }
+    // SO_ERROR == 0 doesn't mean the connection is established: for non-routable
+    // addresses SO_ERROR may be 0 before the network error is detected, so verify
+    // with getpeername().
+    struct sockaddr_storage addr;
+    socklen_t addrlen = sizeof(addr);
+    if (::getpeername(s->fd, reinterpret_cast<struct sockaddr *>(&addr), &addrlen) == 0)
+    {
+      IORA_LOG_DEBUG(tag << " TCP connection established for sid=" << s->id);
+      if (!onTcpEstablished(s))
+      {
+        return false;
+      }
+      updateInterest(s);
+      return true;
+    }
+    int gp_errno = errno;
+    if (gp_errno == ECONNREFUSED || gp_errno == ENETUNREACH || gp_errno == EHOSTUNREACH ||
+        gp_errno == ETIMEDOUT)
+    {
+      IORA_LOG_DEBUG(tag << " getpeername() detected connection failure for sid=" << s->id
+                     << ", errno=" << gp_errno);
+      closeNow(s, TransportError::Connect, iora::core::errnoMessage(gp_errno), gp_errno, 0);
+      return false;
+    }
+    // else ENOTCONN or other transient error - not yet established, wait for epoll/timeout
+    IORA_LOG_DEBUG(tag << " getpeername() returned errno=" << gp_errno << " for sid=" << s->id
+                   << ", waiting for epoll/timeout");
+    return true;
+  }
+
+  /// \brief TCP-established transition for BOTH plain TCP and TLS. Clears the TCP
+  /// phase, cancels the connect timer and stamps handshakeStart. For TLS it arms
+  /// the handshake timer (budget = connectTimeout + handshakeTimeout); for plain
+  /// TCP this is also setup completion (completeSetup). Returns false iff \p s was
+  /// closed.
+  bool onTcpEstablished(Session *s)
+  {
+    if (_beforeTcpEstablishedHook)
+    {
+      invokeUserCallback(_beforeTcpEstablishedHook, s->id);
+    }
+    s->tcpConnectPending = false;
+    s->handshakeStart = MonoClock::now();
+    cancelConnectTimeout(s);
+    if (s->tlsMode != TlsMode::None)
+    {
+      scheduleHandshakeTimeout(s);
+      return true;
+    }
+    return completeSetup(s);
+  }
+
+  /// \brief Setup completion (plain TCP at TCP-established, TLS at handshake Open):
+  /// state is mutated BEFORE onConnect is invoked. A setup-overflowed session
+  /// closes WriteBackpressure + ENOBUFS instead (zero bytes sent, buffered requests
+  /// discarded), before any byte is flushed. Queued bytes are flushed by the
+  /// EPOLLOUT path. Returns false iff \p s was closed.
+  bool completeSetup(Session *s)
+  {
+    s->connectPending = false;
+    s->lastWriteProgress = MonoClock::now();
+    if (s->setupOverflowed)
+    {
+      _atomicStats.backpressureCloses.fetch_add(1, std::memory_order_relaxed);
+      closeNow(s, TransportError::WriteBackpressure, "write queue overflow", ENOBUFS, 0);
+      return false;
+    }
+    if (!s->wq.empty())
+    {
+      scheduleWriteStallTimeout(s);
+    }
+    const auto connectCb = copyCallback(_cbMutex, _cbs.onConnect);
+    if (connectCb)
+    {
+      _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
+      invokeUserCallback(connectCb, s->id, addressFromSockaddr(s->peer));
+    }
     return true;
   }
 
@@ -2240,32 +2898,43 @@ private:
 
     IORA_LOG_DEBUG("[EPOLL-EVENT] onSession called for sid=" << s->id
                    << ", events=0x" << std::hex << events << std::dec
-                   << ", connectPending=" << s->connectPending
+                   << ", tcpConnectPending=" << s->tcpConnectPending
                    << ", tlsMode=" << static_cast<int>(s->tlsMode));
 
-    // Connect-completion SO_ERROR probe (tracker 2026-09-11-19 steps-4-8 cpp17-#1):
-    // gate on connectPending so an ESTABLISHED session's async socket error (e.g.
-    // a peer RST while a write is pending) is NOT mislabeled as a connect failure.
-    // An established session's error surfaces via EPOLLHUP|EPOLLERR (-> PeerClosed)
-    // or the write/read paths (-> Socket/PeerClosed); only a still-connecting
-    // session's SO_ERROR is a genuine TransportError::Connect.
-    if ((events & EPOLLOUT) && s->connectPending)
+    // TCP phase, BOTH plain TCP and TLS (A1.2): on ANY event, first probe
+    // establishment (SO_ERROR, then getpeername): an EPOLLIN must never recv() on,
+    // or drive a TLS handshake over, a socket whose connect is unconfirmed. Gated on
+    // tcpConnectPending so a TLS handshake's or an ESTABLISHED session's async
+    // socket error is never mislabeled Connect (tracker 2026-09-11-19 cpp17-#1):
+    // those surface via the handshake, EPOLLHUP|EPOLLERR or the read/write paths.
+    if (s->tcpConnectPending)
     {
-      IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT detected for sid=" << s->id
-                     << ", checking for connection errors");
-      int err = 0;
-      socklen_t el = sizeof(err);
-      if (::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err != 0)
+      int probeSoErr = 0;
+      if (!probeTcpEstablished(s, "[EPOLL-EVENT]", probeSoErr))
       {
-        IORA_LOG_DEBUG("[EPOLL-EVENT] Connection error detected: " << iora::core::errnoMessage(err));
-        errno = err; // Ensure closeNow's savedErrno captures the SO_ERROR value
-        closeNow(s, TransportError::Connect, iora::core::errnoMessage(err), 0);
         return;
       }
-      IORA_LOG_DEBUG("[EPOLL-EVENT] No connection errors detected");
+      if (s->tcpConnectPending)
+      {
+        // Still in the TCP phase: no read, no handshake, no flush; only a
+        // peer/network error terminates it, always with a non-zero sysErrno.
+        if (events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP))
+        {
+          int e = eventCloseErrno(s);
+          if (e == 0)
+          {
+            e = probeSoErr != 0 ? probeSoErr : ECONNABORTED;
+          }
+          closeNow(s, TransportError::PeerClosed,
+                   (events & (EPOLLHUP | EPOLLERR)) ? "Connection closed by peer (EPOLLHUP/EPOLLERR)"
+                                                    : "Connection closed by peer (EPOLLRDHUP)",
+                   e, 0);
+        }
+        return;
+      }
     }
 
-    if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake)
+    if (inHandshake(s))
     {
       IORA_LOG_DEBUG("[EPOLL-EVENT] TLS handshake in progress for sid=" << s->id);
       SessionId sid = s->id;
@@ -2283,94 +2952,14 @@ private:
       }
       s = it->second.get();
     }
-    else
-    {
-      IORA_LOG_DEBUG("[EPOLL-EVENT] Not in TLS handshake, checking EPOLLOUT for connect callback");
-      if (events & EPOLLOUT)
-      {
-        IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT is set, connectPending=" << s->connectPending);
-        // P2 fix: Only handle non-TLS connections here; TLS goes through handshake state machine
-        if (s->connectPending && s->tlsMode == TlsMode::None)
-        {
-          // CRITICAL: SO_ERROR == 0 doesn't mean connection is established!
-          // For non-routable addresses, SO_ERROR returns 0 initially before network error is detected.
-          // Must use getpeername() to verify connection is truly established.
-          int err = 0;
-          socklen_t el = sizeof(err);
-          int rc = ::getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &err, &el);
-          if (rc < 0)
-          {
-            // getsockopt() syscall failed - socket is invalid
-            int gso_errno = errno;
-            IORA_LOG_ERROR("[EPOLL-EVENT] getsockopt() failed for sid=" << s->id
-                           << ", errno=" << gso_errno);
-            closeNow(s, TransportError::Socket,
-                     std::string("getsockopt failed: ") + iora::core::errnoMessage(gso_errno), gso_errno);
-            return;
-          }
-          else if (err == 0)
-          {
-            // SO_ERROR is 0, but verify connection is truly established using getpeername()
-            struct sockaddr_storage addr;
-            socklen_t addrlen = sizeof(addr);
-            if (::getpeername(s->fd, reinterpret_cast<struct sockaddr *>(&addr), &addrlen) == 0)
-            {
-              IORA_LOG_DEBUG("[EPOLL-EVENT] Connection truly established for sid=" << s->id);
-              decltype(_cbs.onConnect) connectCb;
-              { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
-              if (connectCb)
-              {
-                _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
-                connectCb(s->id, addressFromSockaddr(s->peer));
-              }
-              s->connectPending = false;
-              s->lastWriteProgress = MonoClock::now();
-              cancelConnectTimeout(s);
-              updateInterest(s);
-            }
-            else
-            {
-              // getpeername() failed - check errno to determine if connection has definitely failed
-              int gp_errno = errno;
-              if (gp_errno == ECONNREFUSED || gp_errno == ENETUNREACH ||
-                  gp_errno == EHOSTUNREACH || gp_errno == ETIMEDOUT)
-              {
-                IORA_LOG_DEBUG("[EPOLL-EVENT] getpeername() detected connection failure for sid="
-                               << s->id << ", errno=" << gp_errno);
-                closeNow(s, TransportError::Connect, iora::core::errnoMessage(gp_errno), gp_errno);
-                return;
-              }
-              // else ENOTCONN or other transient error - connection not yet established, wait for timeout
-              IORA_LOG_DEBUG("[EPOLL-EVENT] getpeername() returned errno=" << gp_errno
-                             << " for sid=" << s->id << ", waiting for timeout");
-            }
-          }
-          else
-          {
-            // SO_ERROR indicates connection failed
-            IORA_LOG_DEBUG("[EPOLL-EVENT] SO_ERROR indicates connection failed for sid=" << s->id
-                           << ", error=" << iora::core::errnoMessage(err));
-            closeNow(s, TransportError::Connect, iora::core::errnoMessage(err), err);
-            return;
-          }
-        }
-        else
-        {
-          IORA_LOG_DEBUG("[EPOLL-EVENT] connectPending is false, skipping connect callback");
-        }
-      }
-      else
-      {
-        IORA_LOG_DEBUG("[EPOLL-EVENT] EPOLLOUT not set in events mask");
-      }
-    }
 
     // Handle error conditions first (connection closed, etc.)
     if (events & (EPOLLHUP | EPOLLERR))
     {
       core::Logger::debug("Transport: Detected EPOLLHUP/EPOLLERR for session " +
                           std::to_string(s->id) + ", events=0x" + std::to_string(events));
-      closeNow(s, TransportError::PeerClosed, "Connection closed by peer (EPOLLHUP/EPOLLERR)", 0);
+      closeNow(s, TransportError::PeerClosed, "Connection closed by peer (EPOLLHUP/EPOLLERR)",
+               eventCloseErrno(s), 0);
       return;
     }
 
@@ -2399,7 +2988,8 @@ private:
     // block below would dereference freed memory (use-after-free).
     if (events & EPOLLRDHUP)
     {
-      closeNow(s, TransportError::PeerClosed, "Connection closed by peer (EPOLLRDHUP)", 0);
+      closeNow(s, TransportError::PeerClosed, "Connection closed by peer (EPOLLRDHUP)",
+               eventCloseErrno(s), 0);
       return;
     }
     if (events & EPOLLOUT)
@@ -2408,32 +2998,42 @@ private:
     }
   }
 
+  /// \brief Close a failed TLS handshake (TLSHandshake) and count the failure.
+  void failHandshake(Session *s, const std::string &msg, int sysErrno, int tlsErr)
+  {
+    closeNow(s, TransportError::TLSHandshake, msg, sysErrno, tlsErr);
+    _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+  }
+
   bool driveHandshake(Session *s)
   {
-    // Only check timeout here if high-resolution timers are not available
+    // Only check timeout here if high-resolution timers are not available. Reached
+    // only after the TCP phase (onSession gates the handshake on !tcpConnectPending),
+    // so the budget runs from handshakeStart.
     if (!_timerService && _config.handshakeTimeout.count() > 0 &&
-        (MonoClock::now() - s->tlsStart) > _config.handshakeTimeout)
+        (MonoClock::now() - s->handshakeStart) > _config.handshakeTimeout)
     {
-      closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", 0);
+      closeNow(s, TransportError::TLSHandshake, "TLS handshake timeout", ETIMEDOUT, 0);
       return false;
     }
 
     // B6 Hook: Allow subclass to inject fault before handshake
     if (!beforeSslHandshake(s->id, s->peerKey))
     {
-      closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
-      _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+      failHandshake(s, getInjectedErrorMessage(), 0, getInjectedSslError());
       return false;
     }
 
+    ::ERR_clear_error();
+    errno = 0;
     int rc = ::SSL_do_handshake(s->ssl);
+    const int hsErrno = errno;
     if (rc == 1)
     {
       // B6 Hook: Allow subclass to reject successful handshake
       if (!afterSslHandshake(s->id, true, 0))
       {
-        closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
-        _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+        failHandshake(s, getInjectedErrorMessage(), 0, getInjectedSslError());
         return false;
       }
 
@@ -2463,17 +3063,14 @@ private:
         X509 *pc = fetchPeerCertificate(s->ssl); // test seam; default = SSL_get1_peer_certificate
         if (!pc)
         {
-          closeNow(s, TransportError::TLSHandshake, "no peer certificate", 0);
-          _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+          failHandshake(s, "no peer certificate", 0, 0);
           return false;
         }
         long vr = ::SSL_get_verify_result(s->ssl);
         if (vr != X509_V_OK)
         {
           ::X509_free(pc);
-          closeNow(s, TransportError::TLSHandshake, ::X509_verify_cert_error_string(vr),
-                   static_cast<int>(vr));
-          _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+          failHandshake(s, ::X509_verify_cert_error_string(vr), 0, static_cast<int>(vr));
           return false;
         }
         ::X509_free(pc);
@@ -2483,17 +3080,11 @@ private:
       s->tlsWantWrite = false; // Reset handshake tracking
       _atomicStats.tlsHandshakes.fetch_add(1, std::memory_order_relaxed);
       cancelHandshakeTimeout(s);
-
-      decltype(_cbs.onConnect) connectCb;
-      { std::lock_guard<std::mutex> g(_cbMutex); connectCb = _cbs.onConnect; }
-      if (connectCb)
+      if (!completeSetup(s))
       {
-        _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
-        connectCb(s->id, addressFromSockaddr(s->peer));
+        return false;
       }
-      s->connectPending = false;
-      s->lastWriteProgress = MonoClock::now();
-      cancelConnectTimeout(s);
+      // Arms EPOLLOUT when the handshake queue holds bytes to flush.
       updateInterest(s);
 
       // BUGFIX: Immediately check for pending data after TLS handshake
@@ -2509,8 +3100,7 @@ private:
     // B6 Hook: Allow subclass to override error handling
     if (!afterSslHandshake(s->id, false, errc))
     {
-      closeNow(s, TransportError::TLSHandshake, getInjectedErrorMessage(), getInjectedSslError());
-      _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+      failHandshake(s, getInjectedErrorMessage(), 0, getInjectedSslError());
       return false;
     }
 
@@ -2524,31 +3114,100 @@ private:
       return false;
     }
 
-    unsigned long e = ::ERR_get_error();
-    char msg[256];
-    ::ERR_error_string_n(e, msg, sizeof(msg));
-    closeNow(s, TransportError::TLSHandshake, msg, (int)e);
-    _atomicStats.tlsFailures.fetch_add(1, std::memory_order_relaxed);
+    bool unexpectedEof = false;
+    const unsigned long e = drainSslErrors(unexpectedEof);
+    failHandshake(s, sslFailureMessage(errc, e, hsErrno),
+                  handshakeFailureErrno(errc, hsErrno, e, unexpectedEof), (int)e);
     return false;
+  }
+
+  /// \brief Close message for a failed SSL call. SSL_ERROR_SYSCALL leaves the
+  /// OpenSSL error queue empty (ERR_error_string would read
+  /// "error:00000000:lib(0)::reason(0)"), so it reports the syscall errno text, or
+  /// "unexpected EOF" when errno is 0; otherwise the queued OpenSSL error string.
+  static std::string sslFailureMessage(int sslError, unsigned long errCode, int sysErrno)
+  {
+    if (sslError == SSL_ERROR_SYSCALL && errCode == 0)
+    {
+      return sysErrno != 0 ? iora::core::errnoMessage(sysErrno) : std::string("unexpected EOF");
+    }
+    char msg[256];
+    ::ERR_error_string_n(errCode, msg, sizeof(msg));
+    return msg;
+  }
+
+  /// \brief Pop the whole OpenSSL error queue: returns the FIRST (earliest) error
+  /// code (0 if the queue is empty) and sets \p unexpectedEof if ANY queued error
+  /// is SSL_R_UNEXPECTED_EOF_WHILE_READING.
+  static unsigned long drainSslErrors(bool &unexpectedEof)
+  {
+    unexpectedEof = false;
+    const unsigned long first = ::ERR_get_error();
+    for (unsigned long e = first; e != 0; e = ::ERR_get_error())
+    {
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+      if (ERR_GET_REASON(e) == SSL_R_UNEXPECTED_EOF_WHILE_READING)
+      {
+        unexpectedEof = true;
+      }
+#endif
+    }
+    return first;
+  }
+
+  /// \brief Raw classification of a failed SSL_do_handshake into a sysErrno:
+  /// SSL_ERROR_SYSCALL with an errno -> that errno; EOF without an alert (a queued
+  /// SSL_R_UNEXPECTED_EOF_WHILE_READING, or SSL_ERROR_SYSCALL with neither an errno
+  /// nor a queued error) -> ECONNABORTED; an alert, close_notify, verify failure, or
+  /// SSL_ERROR_SYSCALL with a queued protocol error -> 0. This is role-AGNOSTIC: it
+  /// is the transport-abort discriminator only for an OUTBOUND (client-role) session;
+  /// closeNow applies the role scope (a server-role TLSHandshake close is zeroed
+  /// centrally there), so the discriminator never leaks into an inbound session.
+  static int handshakeFailureErrno(int sslError, int hsErrno, unsigned long errCode,
+                                   bool unexpectedEof)
+  {
+    if (sslError == SSL_ERROR_SYSCALL && hsErrno != 0)
+    {
+      return hsErrno;
+    }
+    if (unexpectedEof)
+    {
+      return ECONNABORTED;
+    }
+    if (sslError == SSL_ERROR_SYSCALL && errCode == 0)
+    {
+      return ECONNABORTED;
+    }
+    return 0;
+  }
+
+  /// \brief Close \p s with TLSIO for a failed SSL_read/SSL_write (\p sslError from
+  /// SSL_get_error, \p sysErrno the errno captured right after the call).
+  void closeTlsIo(Session *s, int sslError, int sysErrno)
+  {
+    const unsigned long e = ::ERR_get_error();
+    closeNow(s, TransportError::TLSIO, sslFailureMessage(sslError, e, sysErrno),
+             sslError == SSL_ERROR_SYSCALL ? sysErrno : 0, (int)e);
   }
 
   void readAvail(Session *s)
   {
+    std::vector<std::uint8_t> buf(_config.ioReadChunk);
     for (;;)
     {
-      std::vector<std::uint8_t> buf;
-      buf.resize(_config.ioReadChunk);
       int n = 0;
       if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
       {
         // B6 Hook: Allow subclass to inject read fault
         if (!beforeSslRead(s->id))
         {
-          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), getInjectedSslError());
+          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), 0, getInjectedSslError());
           return;
         }
 
+        errno = 0;
         n = ::SSL_read(s->ssl, buf.data(), (int)buf.size());
+        const int readErrno = errno;
         if (n <= 0)
         {
           int ge = ::SSL_get_error(s->ssl, n);
@@ -2562,35 +3221,33 @@ private:
           }
           if (ge == SSL_ERROR_ZERO_RETURN)
           {
-            closeNow(s, TransportError::PeerClosed, "TLS peer closed", 0);
+            closeNow(s, TransportError::PeerClosed, "TLS peer closed", 0, 0);
             return;
           }
-          unsigned long e = ::ERR_get_error();
-          char msg[256];
-          ::ERR_error_string_n(e, msg, sizeof(msg));
-          closeNow(s, TransportError::TLSIO, msg, (int)e);
+          closeTlsIo(s, ge, readErrno);
           return;
         }
       }
       else
       {
         n = ::recv(s->fd, buf.data(), (int)buf.size(), 0);
-        IORA_LOG_DEBUG("[RECV] recv() called for sid=" << s->id << ", returned n=" << n << ", errno=" << errno);
+        const int recvErrno = errno;
+        IORA_LOG_DEBUG("[RECV] recv() called for sid=" << s->id << ", returned n=" << n << ", errno=" << recvErrno);
         if (n < 0)
         {
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
+          if (recvErrno == EAGAIN || recvErrno == EWOULDBLOCK)
           {
             IORA_LOG_DEBUG("[RECV] EAGAIN/EWOULDBLOCK for sid=" << s->id << ", breaking from read loop");
             break;
           }
-          closeNow(s, TransportError::Socket, lastErr(), 0);
+          closeNow(s, TransportError::Socket, iora::core::errnoMessage(recvErrno), recvErrno, 0);
           return;
         }
         if (n == 0)
         {
           core::Logger::debug("Transport: recv() returned 0 for session " + std::to_string(s->id) +
                               " - peer closed connection");
-          closeNow(s, TransportError::PeerClosed, "peer closed", 0);
+          closeNow(s, TransportError::PeerClosed, "peer closed", 0, 0);
           return;
         }
       }
@@ -2599,12 +3256,12 @@ private:
       {
         _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
         s->lastActivity = MonoClock::now();
-        decltype(_cbs.onData) dataCb;
-        { std::lock_guard<std::mutex> g(_cbMutex); dataCb = _cbs.onData; }
+        const auto dataCb = copyCallback(_cbMutex, _cbs.onData);
         if (dataCb)
         {
           IORA_LOG_DEBUG("[RECV] Calling onData callback for sid=" << s->id << ", bytes=" << n);
-          dataCb(s->id, iora::core::BufferView{buf.data(), (std::size_t)n}, std::chrono::steady_clock::now());
+          invokeUserCallback(dataCb, s->id, iora::core::BufferView{buf.data(), (std::size_t)n},
+                             std::chrono::steady_clock::now());
         }
         else
         {
@@ -2629,11 +3286,13 @@ private:
         // B6 Hook: Allow subclass to inject write fault
         if (!beforeSslWrite(s->id, d.size()))
         {
-          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), getInjectedSslError());
+          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), 0, getInjectedSslError());
           return;
         }
 
+        errno = 0;
         n = ::SSL_write(s->ssl, d.data(), (int)d.size());
+        const int writeErrno = errno;
         if (n <= 0)
         {
           int ge = ::SSL_get_error(s->ssl, n);
@@ -2645,25 +3304,23 @@ private:
             updateInterest(s);
             break;
           }
-          unsigned long e = ::ERR_get_error();
-          char msg[256];
-          ::ERR_error_string_n(e, msg, sizeof(msg));
-          closeNow(s, TransportError::TLSIO, msg, (int)e);
+          closeTlsIo(s, ge, writeErrno);
           return;
         }
       }
       else
       {
         n = ::send(s->fd, d.data(), (int)d.size(), MSG_NOSIGNAL);
+        const int sendErrno = errno;
         if (n < 0)
         {
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
+          if (sendErrno == EAGAIN || sendErrno == EWOULDBLOCK)
           {
             s->wantWrite = true;
             updateInterest(s);
             break;
           }
-          closeNow(s, TransportError::Socket, lastErr(), 0);
+          closeNow(s, TransportError::Socket, iora::core::errnoMessage(sendErrno), sendErrno, 0);
           return;
         }
       }
@@ -2672,6 +3329,10 @@ private:
       {
         _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
         s->lastWriteProgress = MonoClock::now();
+        // Write progress counts as activity: a write-only, actively-flushing session
+        // receiving no inbound bytes must not be idle-GC'd mid-flush (matches
+        // queueRemainderAfterWrite, which sets both).
+        s->lastActivity = s->lastWriteProgress;
 
         // Handle partial writes - only remove sent bytes from buffer
         if (static_cast<size_t>(n) < d.size())
@@ -2722,7 +3383,7 @@ private:
     // withholding EPOLLIN mid-handshake would starve them and stall the session
     // until the handshake timeout. The C5 read-disable only suppresses delivery
     // of APPLICATION data.
-    if (s->readEnabled || s->tlsState == TlsState::Handshake)
+    if (s->readEnabled || inHandshake(s))
     {
       ev |= EPOLLIN;
     }
@@ -2730,26 +3391,16 @@ private:
     {
       ev |= EPOLLET;
     }
-    // CRITICAL FIX: Keep EPOLLOUT registered while connection is pending
-    // This ensures we receive the EPOLLOUT event when TCP handshake completes,
-    // even in edge-triggered mode where events can be missed if we unregister too early
-    //
-    // TLS HANDSHAKE FIX: During TLS handshake, only set EPOLLOUT when SSL actually
-    // needs to write (SSL_ERROR_WANT_WRITE). Previously we always set EPOLLOUT during
-    // handshake, which caused edge-triggered epoll to re-arm and fire immediately
-    // (since socket is always writable), creating a tight CPU-burning loop.
-    bool needWrite = s->wantWrite || !s->wq.empty();
-    if (s->tlsState == TlsState::Handshake)
-    {
-      // During TLS handshake, only use tlsWantWrite for EPOLLOUT decision
-      // Don't use connectPending - that's only for TCP connect phase
-      needWrite = needWrite || s->tlsWantWrite;
-    }
-    else
-    {
-      // For non-TLS or established TLS connections, use connectPending
-      needWrite = needWrite || s->connectPending;
-    }
+    // EPOLLOUT policy. Outside the TLS handshake: pending writes, or the TCP
+    // connect still pending (keep EPOLLOUT armed so the connect completion is seen
+    // even in edge-triggered mode). DURING the TLS handshake (either role): ONLY the
+    // TCP connect or SSL's own SSL_ERROR_WANT_WRITE -- never queued application
+    // bytes, which cannot be flushed before Open. Arming EPOLLOUT on a writable fd
+    // mid-handshake makes every EPOLL_CTL_MOD re-fire immediately (a busy loop);
+    // the Open transition re-derives the interest and arms EPOLLOUT for the flush.
+    const bool needWrite = inHandshake(s)
+                             ? (s->tcpConnectPending || s->tlsWantWrite)
+                             : (s->wantWrite || !s->wq.empty() || s->connectPending);
     if (needWrite)
     {
       ev |= EPOLLOUT;
@@ -2784,6 +3435,20 @@ private:
     auto it = _sessions.find(sr.sid);
     if (it == _sessions.end())
     {
+      // Named host still resolving: buffer in FIFO order behind the connect.
+      auto pit = _pendingConnects.find(sr.sid);
+      if (pit != _pendingConnects.end())
+      {
+        // Setup-phase buffer: an overflow marks the entry and discards the new
+        // payload; the session closes WriteBackpressure at setup completion.
+        if (pit->second.buffer.size() >= _config.maxWriteQueue)
+        {
+          pit->second.setupOverflowed = true;
+          return;
+        }
+        pit->second.buffer.emplace_back(std::move(sr.payload));
+        return;
+      }
       IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " not found");
       return;
     }
@@ -2797,16 +3462,26 @@ private:
     IORA_LOG_DEBUG("[IO-THREAD] doSend() - session " << sr.sid << " wq.size=" << s->wq.size()
                   << ", tlsMode=" << (int)s->tlsMode << ", fd=" << s->fd);
 
-    // If TLS handshake is still in progress, queue data — do NOT send raw bytes
-    // over a TLS session. Raw ::send() during handshake causes the peer's SSL_accept
-    // to fail with SSL_ERROR_SSL (protocol error) because it sees non-TLS data.
-    if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake)
+    // Setup phase: queue, never ::send, and leave the epoll interest alone. While
+    // the TCP connect is pending EPOLLOUT is already armed and the flush happens at
+    // TCP-established (a failed connect then surfaces as onClose(Connect), never
+    // Socket). During the TLS handshake no raw bytes may be sent (the peer's
+    // SSL_accept would fail on non-TLS data) and EPOLLOUT must not be armed for
+    // them (busy loop, see updateInterest); the flush happens at Open. A
+    // setup-phase overflow marks the session and discards the new payload; the
+    // connect/handshake keeps running so a dead peer still reports
+    // Connect/TLSHandshake, and a successful setup closes WriteBackpressure before
+    // any byte is flushed.
+    if (!sessionWritable(s))
     {
-      IORA_LOG_DEBUG("[IO-THREAD] TLS handshake in progress for sid=" << sr.sid
-                    << ", queuing " << sr.payload.size() << " bytes until handshake completes");
+      IORA_LOG_DEBUG("[IO-THREAD] setup in progress for sid=" << sr.sid
+                    << ", queuing " << sr.payload.size() << " bytes until writable");
+      if (s->wq.size() >= _config.maxWriteQueue)
+      {
+        s->setupOverflowed = true;
+        return;
+      }
       s->wq.emplace_back(std::move(sr.payload));
-      s->wantWrite = true;
-      updateInterest(s);
       return;
     }
 
@@ -2818,41 +3493,25 @@ private:
         // B6 Hook: Allow subclass to inject write fault
         if (!beforeSslWrite(s->id, sr.payload.size()))
         {
-          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), getInjectedSslError());
+          closeNow(s, TransportError::TLSIO, getInjectedErrorMessage(), 0, getInjectedSslError());
           return;
         }
 
         IORA_LOG_DEBUG("[IO-THREAD] About to call SSL_write for sid=" << sr.sid << ", size=" << sr.payload.size());
+        errno = 0;
         n = ::SSL_write(s->ssl, sr.payload.data(), (int)sr.payload.size());
+        const int writeErrno = errno;
         IORA_LOG_DEBUG("[IO-THREAD] SSL_write returned " << n << " for sid=" << sr.sid);
         if (n > 0)
         {
-          _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
-          s->lastActivity = MonoClock::now();
-          s->lastWriteProgress = MonoClock::now();
-
-          // Check if partial write occurred - queue remaining bytes
-          if (static_cast<size_t>(n) < sr.payload.size())
-          {
-            IORA_LOG_DEBUG("[IO-THREAD] SSL PARTIAL WRITE for sid=" << sr.sid << ": sent " << n
-                         << " of " << sr.payload.size() << " bytes, queuing remaining "
-                         << (sr.payload.size() - n) << " bytes");
-            // Queue the unsent portion for later transmission
-            ByteBuffer remaining(sr.payload.begin() + n, sr.payload.end());
-            s->wq.emplace_front(std::move(remaining));
-            s->wantWrite = true;
-            updateInterest(s);
-          }
+          queueRemainderAfterWrite(s, sr.payload, n);
           return;
         }
         int ge = ::SSL_get_error(s->ssl, n);
         if (!(ge == SSL_ERROR_WANT_WRITE || ge == SSL_ERROR_WANT_READ))
         {
-          unsigned long e = ::ERR_get_error();
-          char msg[256];
-          ::ERR_error_string_n(e, msg, sizeof(msg));
-          IORA_LOG_DEBUG("[IO-THREAD] SSL error for sid=" << sr.sid << ", error=" << msg);
-          closeNow(s, TransportError::TLSIO, msg, (int)e);
+          IORA_LOG_DEBUG("[IO-THREAD] SSL error for sid=" << sr.sid << ", ssl_error=" << ge);
+          closeTlsIo(s, ge, writeErrno);
           return;
         }
         IORA_LOG_DEBUG("[IO-THREAD] SSL_write would block for sid=" << sr.sid << ", queuing data");
@@ -2860,32 +3519,18 @@ private:
       else
       {
         n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL);
+        const int sendErrno = errno;
         IORA_LOG_DEBUG("[IO-THREAD] ::send() for sid=" << sr.sid << " returned " << n
                       << " (requested " << sr.payload.size() << " bytes)");
         if (n >= 0)
         {
-          _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
-          s->lastActivity = MonoClock::now();
-          s->lastWriteProgress = MonoClock::now();
-
-          // Check if partial write occurred - queue remaining bytes
-          if (static_cast<size_t>(n) < sr.payload.size())
-          {
-            IORA_LOG_DEBUG("[IO-THREAD] PARTIAL WRITE for sid=" << sr.sid << ": sent " << n
-                         << " of " << sr.payload.size() << " bytes, queuing remaining "
-                         << (sr.payload.size() - n) << " bytes");
-            // Queue the unsent portion for later transmission
-            ByteBuffer remaining(sr.payload.begin() + n, sr.payload.end());
-            s->wq.emplace_front(std::move(remaining));
-            s->wantWrite = true;
-            updateInterest(s);
-          }
+          queueRemainderAfterWrite(s, sr.payload, n);
           return;
         }
-        if (!(errno == EAGAIN || errno == EWOULDBLOCK))
+        if (!(sendErrno == EAGAIN || sendErrno == EWOULDBLOCK))
         {
-          IORA_LOG_DEBUG("[IO-THREAD] Socket error for sid=" << sr.sid << ", errno=" << errno << ", msg=" << lastErr());
-          closeNow(s, TransportError::Socket, lastErr(), 0);
+          IORA_LOG_DEBUG("[IO-THREAD] Socket error for sid=" << sr.sid << ", errno=" << sendErrno);
+          closeNow(s, TransportError::Socket, iora::core::errnoMessage(sendErrno), sendErrno, 0);
           return;
         }
         IORA_LOG_DEBUG("[IO-THREAD] send() would block (EAGAIN/EWOULDBLOCK) for sid=" << sr.sid << ", queuing data");
@@ -2899,42 +3544,79 @@ private:
       // First item in queue - schedule write stall timeout
       scheduleWriteStallTimeout(s);
     }
+    // Stream sessions never drop queued bytes: overflow of an established
+    // session's queue closes it (closeOnBackpressure is forced on for TCP/TLS).
     if (s->wq.size() > _config.maxWriteQueue)
     {
       _atomicStats.backpressureCloses.fetch_add(1, std::memory_order_relaxed);
-      if (_config.closeOnBackpressure)
-      {
-        IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", closing connection");
-        closeNow(s, TransportError::WriteBackpressure, "write queue overflow", 0);
-        return;
-      }
-      else
-      {
-        IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", dropping oldest");
-        s->wq.pop_front();
-      }
+      IORA_LOG_DEBUG("[IO-THREAD] Write queue overflow for sid=" << sr.sid << ", closing connection");
+      closeNow(s, TransportError::WriteBackpressure, "write queue overflow", 0, 0);
+      return;
     }
     s->wantWrite = true;
     updateInterest(s);
     IORA_LOG_DEBUG("[IO-THREAD] doSend() completed for sid=" << sr.sid << ", final wq.size=" << s->wq.size());
   }
 
-  void closeNow(Session *s, TransportError why, const std::string &msg, int tlsErr)
+  /// \brief Account a direct write of \p n >= 0 bytes of \p payload (doSend, empty
+  /// queue) and queue any unsent remainder at the FRONT of wq, arming the
+  /// write-stall timer and EPOLLOUT for it.
+  void queueRemainderAfterWrite(Session *s, const ByteBuffer &payload, int n)
+  {
+    _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
+    s->lastActivity = MonoClock::now();
+    s->lastWriteProgress = s->lastActivity;
+    if (static_cast<std::size_t>(n) >= payload.size())
+    {
+      return;
+    }
+    IORA_LOG_DEBUG("[IO-THREAD] PARTIAL WRITE for sid=" << s->id << ": sent " << n << " of "
+                   << payload.size() << " bytes, queuing remaining " << (payload.size() - n)
+                   << " bytes");
+    s->wq.emplace_front(payload.begin() + n, payload.end());
+    scheduleWriteStallTimeout(s);
+    s->wantWrite = true;
+    updateInterest(s);
+  }
+
+  /// \brief Terminal close of an inserted session. \p sysErrno is supplied by the
+  /// caller (never ambient errno): the errno captured immediately after the
+  /// failing syscall, SO_ERROR for an event-only trigger, or an explicit value for
+  /// timer/app closes. The reported code follows the setup-close invariant
+  /// (setupCloseCode); a server-role TLSHandshake close reports sysErrno 0 (the
+  /// transport-abort discriminator is client-role only). ORDER: the allocating
+  /// steps (onClose copy, TransportErrorInfo) run BEFORE the session is marked
+  /// closed and erased, so a throw leaves it intact and owned; then the release,
+  /// then exactly one onClose.
+  void closeNow(Session *s, TransportError why, const std::string &msg, int sysErrno, int tlsErr)
   {
     if (!s || s->closed.load(std::memory_order_relaxed))
     {
       return;
     }
     IORA_LOG_DEBUG("[IO-THREAD] closeNow called for session " << s->id << ", reason: " << msg);
-    s->closed.store(true, std::memory_order_relaxed);
-    cancelAllTimers(s);
+    const TransportError code = setupCloseCode(s, why);
+    // Producer invariant (A4.6): the TLS transport-abort discriminator -- a non-zero
+    // sysErrno on a TLSHandshake close -- is meaningful ONLY for an outbound
+    // (client-role) session; it is what iora_sip's reachability probe consumes. A
+    // server-role (accepted) handshake abort has no reachability consumer, so its
+    // sysErrno is zeroed HERE, centrally, covering the real syscall errno, the
+    // handshake-timeout ETIMEDOUT and the EOF synthesis alike. This is what keeps an
+    // unauthenticated inbound RST/EOF from ever injecting a peer-down signal into
+    // failover (RFC 3261 s16.7 blast radius).
+    if (code == TransportError::TLSHandshake && s->tlsMode != TlsMode::Client)
+    {
+      sysErrno = 0;
+    }
+    const auto closeCb = copyCallback(_cbMutex, _cbs.onClose);
+    const TransportErrorInfo info{code, msg, sysErrno, tlsErr};
 
-    // Save caller's errno before system calls that overwrite it
-    int savedErrno = errno;
+    s->closed.store(true, std::memory_order_relaxed);
+    cancelAllTimersNoThrow(s);
 
     // Save fields before erasing session from map
-    int fd = s->fd;
-    SessionId sid = s->id;
+    const int fd = s->fd;
+    const SessionId sid = s->id;
     SSL *ssl = s->ssl;
     s->ssl = nullptr; // Take ownership to prevent double-free
 
@@ -2965,24 +3647,73 @@ private:
     _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
     _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
 
-    decltype(_cbs.onClose) closeCb;
-    { std::lock_guard<std::mutex> g(_cbMutex); closeCb = _cbs.onClose; }
+    invokeUserCallback(closeCb, sid, info);
+  }
 
-    if (closeCb)
+  /// \brief cancelAllTimers for a terminal path that must not unwind.
+  void cancelAllTimersNoThrow(Session *s) noexcept
+  {
+    try
     {
-      closeCb(sid, TransportErrorInfo{why, msg, savedErrno, tlsErr});
+      cancelAllTimers(s);
+    }
+    catch (...)
+    {
     }
   }
+
+  struct GcClose
+  {
+    SessionId sid;
+    TransportError reason;
+    const char *msg;
+    int sysErrno;
+  };
 
   void runGc()
   {
     _atomicStats.gcRuns.fetch_add(1, std::memory_order_relaxed);
+    try
+    {
+      applyLostTimerCloses();
+    }
+    catch (...)
+    {
+    }
     const auto now = MonoClock::now();
     const bool age = _config.maxConnAge.count() > 0;
 
-    std::vector<SessionId> toClose;
-    toClose.reserve(_sessions.size());
+    std::vector<GcClose> toClose;
+    try
+    {
+      collectGcCloses(now, age, toClose);
+    }
+    catch (...)
+    {
+    }
 
+    for (const auto &gc : toClose)
+    {
+      auto it = _sessions.find(gc.sid);
+      if (it == _sessions.end())
+      {
+        continue;
+      }
+      try
+      {
+        closeNow(it->second.get(), gc.reason, gc.msg, gc.sysErrno, 0);
+      }
+      catch (...)
+      {
+        closeAfterDispatchThrow(gc.sid);
+      }
+    }
+  }
+
+  /// \brief runGc scan: append every session past a GC deadline to \p toClose.
+  void collectGcCloses(MonoTime now, bool age, std::vector<GcClose> &toClose)
+  {
+    toClose.reserve(_sessions.size());
     for (auto &kv : _sessions)
     {
       Session *s = kv.second.get();
@@ -2991,55 +3722,54 @@ private:
         continue;
       }
 
-      if (_config.idleTimeout.count() > 0 && (now - s->lastActivity) > _config.idleTimeout)
+      // Idle expiry exempts sessions still in setup, so the connect/handshake
+      // budgets own them: outbound TCP connect + TLS handshake (connectPending),
+      // AND inbound (accepted) TLS handshake (inHandshake -- an accepted session is
+      // never connectPending, so !connectPending alone would let idleTimeout <
+      // handshakeTimeout close it as GCClosed instead of TLSHandshake). A4.4.
+      if (_config.idleTimeout.count() > 0 && !s->connectPending && !inHandshake(s) &&
+          (now - s->lastActivity) > _config.idleTimeout)
       {
-        toClose.push_back(s->id);
+        toClose.push_back({s->id, TransportError::GCClosed, "GC safety-net timeout", 0});
         _atomicStats.gcClosedIdle.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
       if (age && (now - s->created) > _config.maxConnAge)
       {
-        toClose.push_back(s->id);
+        toClose.push_back({s->id, TransportError::GCClosed, "GC safety-net timeout", 0});
         _atomicStats.gcClosedAged.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
-      // Use high-resolution timers if available, otherwise fall back to GC-based timeout checking
-      if (!_timerService)
+      // Deadline fallback: applied to a phase whose high-resolution timer is not
+      // armed -- timers disabled, or its id is 0 because the TimerService refused
+      // it (capacity) or its timer-originated close was lost.
+      // Connect timeout (TCP phase, from connectStart).
+      if (_config.connectTimeout.count() > 0 && s->tcpConnectPending &&
+          (!_timerService || s->connectTimeoutId == 0) &&
+          (now - s->connectStart) > _config.connectTimeout)
       {
-        if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Handshake &&
-            _config.handshakeTimeout.count() > 0 &&
-            (now - s->tlsStart) > _config.handshakeTimeout)
-        {
-          toClose.push_back(s->id);
-          continue;
-        }
-
-        // Safety-net: connect timeout
-        if (_config.connectTimeout.count() > 0 && s->connectPending &&
-            (now - s->connectStart) > _config.connectTimeout)
-        {
-          toClose.push_back(s->id);
-          continue;
-        }
-
-        // Safety-net: write stall with queued data
-        if (_config.writeStallTimeout.count() > 0 && !s->wq.empty() &&
-            (now - s->lastWriteProgress) > _config.writeStallTimeout)
-        {
-          toClose.push_back(s->id);
-          continue;
-        }
+        toClose.push_back({s->id, TransportError::Connect, "Connect timeout", ETIMEDOUT});
+        continue;
       }
-    }
 
-    for (auto sid : toClose)
-    {
-      auto it = _sessions.find(sid);
-      if (it != _sessions.end())
+      // TLS handshake timeout (after the TCP phase, from handshakeStart).
+      if (inHandshake(s) && !s->tcpConnectPending && _config.handshakeTimeout.count() > 0 &&
+          (!_timerService || s->handshakeTimeoutId == 0) &&
+          (now - s->handshakeStart) > _config.handshakeTimeout)
       {
-        closeNow(it->second.get(), TransportError::GCClosed, "GC safety-net timeout", 0);
+        toClose.push_back({s->id, TransportError::TLSHandshake, "TLS handshake timeout", ETIMEDOUT});
+        continue;
+      }
+
+      // Write stall with queued data, only once the session is writable.
+      if (_config.writeStallTimeout.count() > 0 && sessionWritable(s) && !s->wq.empty() &&
+          (!_timerService || s->writeStallTimeoutId == 0) &&
+          (now - s->lastWriteProgress) > _config.writeStallTimeout)
+      {
+        toClose.push_back({s->id, TransportError::Timeout, "Write stall timeout", 0});
+        continue;
       }
     }
   }
@@ -3387,12 +4117,30 @@ private:
   // loop-lambda epilogue post-loop()); no synchronization — see EngineBase.
   std::function<void()> _selfDestruct;
 
-  // Lock ordering: _cmdMutex, _cbMutex, _sessionRwMutex and _fatalMx are all
-  // mutually-exclusive LEAVES — at most one is held at a time; no nesting.
+  // Lock ordering: _cmdMutex, _cbMutex, _sessionRwMutex, _fatalMx and
+  // _lostTimerMutex are mutually-exclusive LEAVES — at most one is held at a time;
+  // no nesting among them. connect() takes _sessionRwMutex (registry insert),
+  // RELEASES it, and only then takes _cmdMutex (enqueue) — sequential, never
+  // co-held. The ONE nesting edge into a leaf is the post gate:
+  //   - gate->m -> _cmdMutex: the resolver continuation (blockingIoPool thread)
+  //     calls runOnIoThread while holding _postGuard->m (makeResolveContinuation);
+  //     shutdownDrain takes gate->m in its own section, never with _cmdMutex held.
+  // TimerService edges: the engine calls TimerService::scheduleAfter/cancel (its
+  // internal mutex) from the I/O thread with NO engine lock held; timer callbacks
+  // run on the TimerService thread without that mutex and take only _cmdMutex
+  // (enqueue / runOnIoThread) or _lostTimerMutex (markTimerCloseLost), so no
+  // engine lock is ever held while a TimerService lock is acquired or vice versa.
+  // External edges into these leaves (callers' locks held across an engine call):
+  //   - Transport syncMutex -> _sessionRwMutex, then (released) _cmdMutex:
+  //     Transport::connectSync holds syncMutex across engine->connect().
+  //   - iora_sip _connectionMutex -> _sessionRwMutex, released, then _cmdMutex
+  //     (sequential): SipTransport calls connect()/send() under _connectionMutex.
+  //   No engine lock is ever held while a caller's lock is acquired, so these
+  //   edges cannot close a cycle.
   // - _cbMutex protects callback copies (copy-then-invoke: acquired/released
   //   before any callback fires and before any _sessionRwMutex use).
-  // - _sessionRwMutex protects session/listener maps (shared for reads, unique
-  //   for mutations).
+  // - _sessionRwMutex protects session/listener maps and the _connecting
+  //   registry (shared for reads, unique for mutations).
   // - _cmdMutex protects the command queue (_cmds) AND serializes the _eventFd
   //   wakeup-write (enqueue) against the _eventFd close (shutdownDrain), plus
   //   the _cmdsClosed teardown flag. process() swaps _cmds out under _cmdMutex
@@ -3414,10 +4162,27 @@ private:
 
   std::unordered_map<ListenerId, std::unique_ptr<Listener>> _listeners;
   std::unordered_map<SessionId, std::unique_ptr<Session>> _sessions;
+  // Connecting-sid registry (guarded by _sessionRwMutex). Invariant: holds only
+  // sids whose Cmd::Connect / resolve is pending or whose connect() call is still
+  // in flight. Inserted by connect() before the enqueue; erased in the SAME
+  // unique-lock critical section as the _sessions insert, or at every pre-insert
+  // terminal BEFORE its onClose is invoked. Makes a sid returned by connect()
+  // immediately sendable (sessionSendable).
+  std::unordered_set<SessionId> _connecting;
   std::unordered_map<int, std::unique_ptr<Tag>> _fdTags;
   // TEST-ONLY seam (tracker 2026-09-15-3): see testSetPreCloseHook. Empty in production;
   // installed before start(), then read-only on the I/O thread (no locking needed).
   std::function<void(int)> _preCloseHook;
+  // TEST-ONLY seams (set through TcpEngineTestAccess before start(), then read
+  // lock-free on the I/O thread). _beforeTcpEstablishedHook runs with the sid just
+  // before the TCP-established transition; _sessionEventFilterHook maps each session
+  // epoll event mask before dispatch (0 drops the event). Both are invoked through
+  // swallowing wrappers. Empty in production.
+  std::function<void(SessionId)> _beforeTcpEstablishedHook;
+  std::function<std::uint32_t(SessionId, std::uint32_t)> _sessionEventFilterHook;
+  // TEST-ONLY seams (toggled after start(), hence atomic relaxed). Inert in production.
+  std::atomic<bool> _testEnqueueFailure{false};
+  std::atomic<ConnectThrowPoint> _testConnectThrowPoint{ConnectThrowPoint::NONE};
 
   std::atomic<SessionId> _nextSessionId{1};
   std::atomic<ListenerId> _nextListenerId{1};
@@ -3430,6 +4195,12 @@ private:
   // Sticky fatal (for start/init failures)
   mutable std::mutex _fatalMx;
   mutable IoResult _lastFatal{IoResult::success()};
+
+  // Timer-originated closes that could be neither enqueued nor retried (see
+  // markTimerCloseLost). _lostTimerMutex is a leaf: written on the TimerService
+  // thread, drained by runGc on the I/O thread; never held with another lock.
+  std::mutex _lostTimerMutex;
+  std::vector<std::pair<SessionId, CloseOrigin>> _lostTimerCloses;
 
   // High-resolution timer service
   std::unique_ptr<iora::core::TimerService> _timerService;

@@ -2,6 +2,7 @@
 #include <catch2/catch.hpp>
 #include "iora/network/detail/tcp_engine.hpp"
 #include "iora_test_net_utils.hpp"
+#include "network/tcp_connect_test_fixtures.hpp"
 #include "test_helpers.hpp"
 
 using namespace std::chrono_literals;
@@ -79,28 +80,35 @@ TEST_CASE("SIP-optimized timeout configuration", "[shared_transport][timers][sip
 
 TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][timers][integration]")
 {
+  // A loopback listener with a full accept queue: the SYN is dropped, so the
+  // connect deterministically stays in the TCP phase until the timeout.
+  tcptest::Blackhole bh;
+  if (!tcptest::fillOrSkip(bh))
+  {
+    return;
+  }
+
+  std::atomic<bool> connectionFailed{false};
+  std::atomic<bool> connected{false};
+  std::string lastErrorMessage;
+  TransportError lastErrorCode{TransportError::None};
+  int lastSysErrno{0};
+
   TransportConfig cfg{};
   cfg.enableHighResolutionTimers = true;
   cfg.connectTimeout = 100ms; // Very short timeout for testing
 
   TcpEngine transport(cfg);
 
-  std::atomic<bool> connectionFailed{false};
-  std::atomic<bool> connected{false};
-  std::string lastErrorMessage;
-  TransportError lastErrorCode{TransportError::None};
-
   iora::network::detail::EngineBase::Callbacks cbs{};
-  cbs.onConnect = [&](SessionId sid, const TransportAddress &addr)
-  {
-    connected = true;
-  };
+  cbs.onConnect = [&](SessionId, const TransportAddress &) { connected = true; };
 
-  cbs.onClose = [&](SessionId sid, const TransportErrorInfo &err)
+  cbs.onClose = [&](SessionId, const TransportErrorInfo &err)
   {
-    connectionFailed = true;
     lastErrorMessage = err.message;
     lastErrorCode = err.code;
+    lastSysErrno = err.sysErrno;
+    connectionFailed = true;
     std::cout << "Connection closed: " << err.message << " (code " << static_cast<int>(err.code)
               << ")\n";
   };
@@ -108,9 +116,7 @@ TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][time
   transport.setCallbacks(cbs);
   REQUIRE(transport.start().isOk());
 
-  // Try to connect to a non-routable address that should timeout quickly
-  // Using 10.254.254.254 which should be non-routable
-  auto cr = transport.connect("10.254.254.254", 9999, TlsMode::None);
+  auto cr = transport.connect("127.0.0.1", bh.lst.port, TlsMode::None);
   REQUIRE(cr.isOk());
 
   // Wait for timeout to occur (should be around 100ms)
@@ -123,10 +129,12 @@ TEST_CASE("Connect timeout with high-resolution timer", "[shared_transport][time
 
   auto elapsed = std::chrono::steady_clock::now() - start;
 
-  // Should timeout much faster than the old default of 30 seconds
-  REQUIRE((connectionFailed || connected));
-  REQUIRE(elapsed < 500ms); // Should be much faster than 5 seconds
-  REQUIRE(lastErrorCode == TransportError::Timeout);
+  REQUIRE(connectionFailed);
+  REQUIRE_FALSE(connected);
+  REQUIRE(elapsed < 500ms);
+  REQUIRE(lastErrorCode == TransportError::Connect);
+  REQUIRE(lastSysErrno == ETIMEDOUT);
+  REQUIRE(lastErrorMessage == "Connect timeout");
 
   transport.stop();
 }

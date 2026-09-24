@@ -3073,9 +3073,12 @@ private:
   ///   - the response-read timeout (HttpResponseTimeoutError — tracker 2026-09-03-2,
   ///     formerly a generic runtime_error matched by a now-removed find("timeout"));
   ///   - the connect timeout (HttpConnectTimeoutError — tracker 2026-09-03-3; a TCP/TLS
-  ///     handshake exceeding its deadline, keyed on the structured TransportError::Timeout
-  ///     code at the throw site, never on the transport message, which varies by producer
-  ///     ("...connectSync timed out" vs "...Connect timeout")).
+  ///     handshake exceeding its deadline, keyed at the throw site on the structured
+  ///     transport code + sysErrno (iora::network::isConnectPhaseTimeout: Timeout from the
+  ///     connectSync deadline, Connect+ETIMEDOUT from the engine connect watchdog,
+  ///     TLSHandshake+ETIMEDOUT from the engine handshake watchdog), never on the
+  ///     transport message, which varies by producer ("...connectSync timed out" vs
+  ///     "...Connect timeout" vs "...TLS handshake timeout")).
   /// Shared by the single-call retry loop AND the batch path (task-7.8 M2) so both
   /// classify identically. NOTE: a DNS/resolution failure is deliberately NOT counted
   /// here — it surfaces as TransportError::Resolve (a distinct failure domain from a
