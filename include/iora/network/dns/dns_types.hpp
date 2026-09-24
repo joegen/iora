@@ -786,6 +786,12 @@ constexpr std::size_t DNS_MAX_LABEL_SIZE = 63;
 constexpr std::size_t DNS_MAX_NAME_SIZE = 253;
 constexpr std::uint8_t DNS_COMPRESSION_MASK = 0xC0;
 constexpr std::uint16_t DNS_COMPRESSION_POINTER_MASK = 0x3FFF;
+// Minimum on-the-wire size of one resource record / question, used to clamp
+// pre-allocation against untrusted header counts (memory-amplification guard).
+// RR: NAME(1) + TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) + RDATA(0) = 11.
+// Question: QNAME(1) + QTYPE(2) + QCLASS(2) = 5.
+constexpr std::size_t DNS_MIN_RR_SIZE = 11;
+constexpr std::size_t DNS_MIN_QUESTION_SIZE = 5;
 } // namespace constants
 
 } // namespace dns

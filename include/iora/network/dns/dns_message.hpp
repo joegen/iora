@@ -8,6 +8,7 @@
 
 #include "dns_types.hpp"
 #include "iora/core/logger.hpp"
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cstring>
 #include <iomanip>
@@ -22,6 +23,21 @@ namespace network
 {
 namespace dns
 {
+
+namespace detail
+{
+/// \brief Clamp a pre-allocation to what the remaining bytes can physically hold.
+///
+/// Guards std::vector::reserve() against an untrusted DNS header count (up to 65535)
+/// forcing a large reservation on a short datagram (memory-amplification DoS). Returns
+/// min(rawCount, bytesRemaining / minRecordSize); under-reserving is correctness-safe
+/// (reserve is only a capacity hint). \a minRecordSize is a nonzero wire-format constant.
+inline std::size_t clampReserveCount(std::size_t rawCount, std::size_t bytesRemaining,
+                                     std::size_t minRecordSize)
+{
+  return std::min(rawCount, bytesRemaining / minRecordSize);
+}
+} // namespace detail
 
 /// \brief DNS parsing exceptions
 class DnsParseException : public std::runtime_error
@@ -126,11 +142,6 @@ private:
   static void parseTypedRecord(const DnsResourceRecord &rr, DnsResult &result,
                                const std::uint8_t *messageData, std::size_t messageSize,
                                std::size_t rdataOffset);
-
-  /// \brief Security validation for RDATA to detect malicious compression pointers
-  /// \param rr Resource record to validate
-  /// \throws DnsParseException if malicious compression patterns are detected
-  static void validateRdataSecurity(const DnsResourceRecord &rr);
 
   /// \brief Parse A record data
   static ARecord parseARecord(const DnsResourceRecord &rr);
@@ -378,8 +389,11 @@ inline DnsResult DnsMessage::parse(const std::uint8_t *data, std::size_t size)
   // Parse header
   offset = parseHeader(data, offset, size, result.header);
 
-  // Parse questions
-  result.questions.reserve(result.header.qdcount);
+  // Parse questions. Clamp every pre-allocation to what the remaining bytes can physically
+  // hold: an untrusted header count (up to 65535) must not force a large reservation on a
+  // short datagram (memory-amplification guard). See detail::clampReserveCount.
+  result.questions.reserve(detail::clampReserveCount(
+    result.header.qdcount, size - offset, constants::DNS_MIN_QUESTION_SIZE));
   for (std::uint16_t i = 0; i < result.header.qdcount; ++i)
   {
     DnsQuestion question;
@@ -388,7 +402,8 @@ inline DnsResult DnsMessage::parse(const std::uint8_t *data, std::size_t size)
   }
 
   // Parse answers
-  result.answers.reserve(result.header.ancount);
+  result.answers.reserve(
+    detail::clampReserveCount(result.header.ancount, size - offset, constants::DNS_MIN_RR_SIZE));
   for (std::uint16_t i = 0; i < result.header.ancount; ++i)
   {
     DnsResourceRecord rr;
@@ -399,7 +414,8 @@ inline DnsResult DnsMessage::parse(const std::uint8_t *data, std::size_t size)
   }
 
   // Parse authority records
-  result.authority.reserve(result.header.nscount);
+  result.authority.reserve(
+    detail::clampReserveCount(result.header.nscount, size - offset, constants::DNS_MIN_RR_SIZE));
   for (std::uint16_t i = 0; i < result.header.nscount; ++i)
   {
     DnsResourceRecord rr;
@@ -411,7 +427,8 @@ inline DnsResult DnsMessage::parse(const std::uint8_t *data, std::size_t size)
   }
 
   // Parse additional records
-  result.additional.reserve(result.header.arcount);
+  result.additional.reserve(
+    detail::clampReserveCount(result.header.arcount, size - offset, constants::DNS_MIN_RR_SIZE));
   for (std::uint16_t i = 0; i < result.header.arcount; ++i)
   {
     DnsResourceRecord rr;
@@ -505,9 +522,6 @@ inline std::size_t DnsMessage::parseResourceRecord(const std::uint8_t *data, std
   checkBounds(offset, rr.rdlength, size);
   rr.rdata.assign(data + offset, data + offset + rr.rdlength);
 
-  // Security validation: detect malicious compression pointers in RDATA where they shouldn't exist
-  validateRdataSecurity(rr);
-
   offset += rr.rdlength;
 
   return offset;
@@ -546,9 +560,6 @@ inline std::size_t DnsMessage::parseResourceRecord(const std::uint8_t *data, std
   // Parse RDATA
   checkBounds(offset, rr.rdlength, size);
   rr.rdata.assign(data + offset, data + offset + rr.rdlength);
-
-  // Security validation: detect malicious compression pointers in RDATA where they shouldn't exist
-  validateRdataSecurity(rr);
 
   offset += rr.rdlength;
 
@@ -991,7 +1002,9 @@ inline TxtRecord DnsMessage::parseTxtRecord(const DnsResourceRecord &rr)
   while (offset < rr.rdata.size())
   {
     std::uint8_t len = rr.rdata[offset++];
-    if (offset + len > rr.rdata.size())
+    // Overflow-safe bounds check (offset <= size() here, so size() - offset >= 0);
+    // a truncated trailing character-string is dropped.
+    if (len > rr.rdata.size() - offset)
       break;
 
     std::string text(reinterpret_cast<const char *>(rr.rdata.data() + offset), len);
@@ -1067,59 +1080,6 @@ inline SoaRecord DnsMessage::parseSoaRecord(const DnsResourceRecord &rr,
   record.minimum = readUint32(rr.rdata.data(), offset);
 
   return record;
-}
-
-inline void DnsMessage::validateRdataSecurity(const DnsResourceRecord &rr)
-{
-  // Validate A records for malicious compression pointers and wrong lengths
-  if (rr.type == DnsType::A)
-  {
-    // A records must have exactly 4 bytes of RDATA (IP address)
-    // If they have wrong length AND contain compression pointer patterns, it's malicious
-    if (rr.rdata.size() != 4)
-    {
-      // Check if the wrong-length RDATA contains compression pointers (definitely malicious)
-      if (rr.rdata.size() >= 2 &&
-          (rr.rdata[0] & constants::DNS_COMPRESSION_MASK) == constants::DNS_COMPRESSION_MASK)
-      {
-        throw DnsParseException(
-          "Malicious compression pointer in A record RDATA with invalid length");
-      }
-      // If no compression pointer pattern, let normal parsing handle the length error
-    }
-    else
-    {
-      // For correctly-sized A records, check for compression pointers disguised as IP addresses
-      if ((rr.rdata[0] & constants::DNS_COMPRESSION_MASK) == constants::DNS_COMPRESSION_MASK)
-      {
-        std::uint16_t pointer = ((rr.rdata[0] & 0x3F) << 8) | rr.rdata[1];
-
-        // Additional check: if the remaining bytes are 0x00, 0x00, it's likely padding for a
-        // pointer
-        if (pointer < 64 && rr.rdata[2] == 0x00 && rr.rdata[3] == 0x00)
-        {
-          throw DnsParseException("Malicious compression pointer detected in A record RDATA");
-        }
-      }
-    }
-  }
-
-  // Validate other record types that should never contain compression pointers in RDATA
-  if (rr.type == DnsType::TXT || rr.type == DnsType::AAAA)
-  {
-    for (std::size_t i = 0; i < rr.rdata.size() - 1; ++i)
-    {
-      if ((rr.rdata[i] & constants::DNS_COMPRESSION_MASK) == constants::DNS_COMPRESSION_MASK)
-      {
-        throw DnsParseException("Malicious compression pointer detected in " +
-                                std::to_string(static_cast<std::uint16_t>(rr.type)) +
-                                " record RDATA at offset " + std::to_string(i));
-      }
-    }
-  }
-
-  // Additional validation for other record types that shouldn't have compression pointers
-  // in specific parts of their RDATA could be added here in the future
 }
 
 } // namespace dns

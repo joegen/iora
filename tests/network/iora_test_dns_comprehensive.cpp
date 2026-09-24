@@ -216,97 +216,313 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Service Discovery SRV Records",
 // WIRE-FORMAT AND NETWORK BEHAVIOR TESTS
 // =============================================================================
 
-TEST_CASE_METHOD(DnsTestFixture, "DNS Parser Compression Pointer Security",
-                 "[dns][parser][security]")
+// Helpers for hand-assembled, socket-free wire-format parse KATs (DnsMessage::parse is static).
+namespace
 {
-  SECTION("Compression pointer loop detection")
+/// 12-byte DNS header with the given question/answer/authority/additional counts.
+inline std::vector<std::uint8_t> dnsHeader(std::uint16_t qd, std::uint16_t an, std::uint16_t ns,
+                                           std::uint16_t ar)
+{
+  return {0x12, 0x34, 0x81, 0x80,
+          static_cast<std::uint8_t>(qd >> 8), static_cast<std::uint8_t>(qd & 0xFF),
+          static_cast<std::uint8_t>(an >> 8), static_cast<std::uint8_t>(an & 0xFF),
+          static_cast<std::uint8_t>(ns >> 8), static_cast<std::uint8_t>(ns & 0xFF),
+          static_cast<std::uint8_t>(ar >> 8), static_cast<std::uint8_t>(ar & 0xFF)};
+}
+/// Question "test.com" A IN: occupies offsets 12..25 (name at offset 12); records begin at 26.
+inline void appendTestComQuestion(std::vector<std::uint8_t> &m)
+{
+  const std::uint8_t q[] = {0x04, 't', 'e', 's', 't', 0x03, 'c', 'o', 'm', 0x00,
+                            0x00, 0x01, 0x00, 0x01};
+  m.insert(m.end(), std::begin(q), std::end(q));
+}
+inline void append(std::vector<std::uint8_t> &m, std::initializer_list<std::uint8_t> b)
+{
+  m.insert(m.end(), b.begin(), b.end());
+}
+} // namespace
+
+// Post-fix behavior of removing validateRdataSecurity (the bogus 0xC0 RDATA byte-scan +
+// A-record 192.[0-63].0.0 heuristic). RDATA is never compression-decoded, so a 0xC0 byte in
+// A/AAAA/TXT RDATA is ordinary data and must not fail the record, let alone the whole message.
+TEST_CASE("DNS Parser removes the bogus RDATA compression scan (post-fix)",
+          "[dns][parser][security]")
+{
+  SECTION("size-4 A record whose RDATA leads with 0xC0 parses as an address")
   {
-    // Create malicious DNS message with pointer loop
-    // Message format: Header(12) + Question(varies) + Answer with pointer loop
-
-    std::vector<std::uint8_t> maliciousMessage = {
-      // DNS Header (12 bytes)
-      0x12, 0x34, // Query ID
-      0x81, 0x80, // Flags: QR=1, OPCODE=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0
-      0x00, 0x01, // QDCOUNT=1
-      0x00, 0x01, // ANCOUNT=1
-      0x00, 0x00, // NSCOUNT=0
-      0x00, 0x00, // ARCOUNT=0
-
-      // Question section: "test.com" A IN
-      0x04, 't', 'e', 's', 't', // label "test"
-      0x03, 'c', 'o', 'm',      // label "com"
-      0x00,                     // null terminator
-      0x00, 0x01,               // QTYPE=A
-      0x00, 0x01,               // QCLASS=IN
-
-      // Answer section with compression pointer loop
-      0xc0, 0x0c,             // NAME: pointer to offset 12 (question name)
-      0x00, 0x01,             // TYPE=A
-      0x00, 0x01,             // CLASS=IN
-      0x00, 0x00, 0x0e, 0x10, // TTL=3600
-      0x00, 0x04,             // RDLENGTH=4
-
-      // RDATA with pointer loop: points back to itself
-      0xc0, 0x20, // Pointer to offset 32 (points to this very pointer!)
-      0x00, 0x00  // Padding to make RDLENGTH=4
-    };
-
-    // Test that DnsMessage throws on pointer loop
-    REQUIRE_THROWS_AS(DnsMessage::parse(maliciousMessage), DnsParseException);
+    // Pre-fix: validateRdataSecurity rejected c0 20 00 00 as a 'malicious compression pointer'.
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c,             // NAME -> question name (offset 12)
+               0x00, 0x01,             // TYPE=A
+               0x00, 0x01,             // CLASS=IN
+               0x00, 0x00, 0x0e, 0x10, // TTL
+               0x00, 0x04,             // RDLENGTH=4
+               0xc0, 0x20, 0x00, 0x00}); // RDATA = 192.32.0.0
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.answers.size() == 1);
+    REQUIRE(r.answers[0].type == DnsType::A);
+    REQUIRE(r.a_records.size() == 1);
+    REQUIRE(r.a_records[0].address == "192.32.0.0");
   }
 
-  SECTION("Compression pointer beyond bounds")
+  SECTION("wrong-length A record is dropped per-record; the message still parses")
   {
-    std::vector<std::uint8_t> maliciousMessage = {
-      // DNS Header
-      0x12, 0x34, // Query ID
-      0x81, 0x80, // Flags
-      0x00, 0x01, // QDCOUNT=1
-      0x00, 0x01, // ANCOUNT=1
-      0x00, 0x00, // NSCOUNT=0
-      0x00, 0x00, // ARCOUNT=0
-
-      // Question section
-      0x04, 't', 'e', 's', 't', 0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, // TYPE=A
-      0x00, 0x01,                                                      // CLASS=IN
-
-      // Answer section
-      0xc0, 0x0c,             // NAME: pointer to question
-      0x00, 0x01,             // TYPE=A
-      0x00, 0x01,             // CLASS=IN
-      0x00, 0x00, 0x0e, 0x10, // TTL
-      0x00, 0x02,             // RDLENGTH=2
-
-      // RDATA with pointer beyond message bounds
-      0xc0, 0xFF // Pointer to offset 255 (beyond message!)
-    };
-
-    REQUIRE_THROWS_AS(DnsMessage::parse(maliciousMessage), DnsParseException);
+    // Pre-fix: the wrong-length-with-0xC0 branch threw out of the WHOLE message.
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               0x00, 0x02,   // RDLENGTH=2 (invalid for an A record)
+               0xc0, 0xff}); // 2-byte RDATA
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.a_records.empty());   // parseARecord threw inside the per-record catch -> dropped
+    REQUIRE(r.answers.size() == 1); // the raw RR is still present
+    REQUIRE(r.answers[0].rdlength == 2);
   }
 
-  SECTION("Compression pointer to non-label position")
+  SECTION("size-4 A record 192.0.0.0 (the recorded reproducer) parses")
   {
-    std::vector<std::uint8_t> maliciousMessage = {
-      // DNS Header
-      0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-
-      // Question section
-      0x04, 't', 'e', 's', 't', 0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01,
-
-      // Answer section
-      0xc0, 0x0c,             // NAME: pointer to question
-      0x00, 0x01,             // TYPE=A
-      0x00, 0x01,             // CLASS=IN
-      0x00, 0x00, 0x0e, 0x10, // TTL
-      0x00, 0x02,             // RDLENGTH=2
-
-      // RDATA with pointer to middle of TYPE field (invalid position)
-      0xc0, 0x1a // Pointer to offset 26 (middle of question TYPE)
-    };
-
-    REQUIRE_THROWS_AS(DnsMessage::parse(maliciousMessage), DnsParseException);
+    // 192.0.0.0 == c0 00 00 00 sits in the deleted A heuristic's 192.[0-63].0.0 range.
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               0x00, 0x04,               // RDLENGTH=4
+               0xc0, 0x00, 0x00, 0x00}); // RDATA = 192.0.0.0
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.a_records.size() == 1);
+    REQUIRE(r.a_records[0].address == "192.0.0.0");
   }
+}
+
+// The real compression-pointer defense lives in the NAME decoder, not the deleted RDATA scan.
+// These drive decodeName through actual NAME fields (the old A-RDATA 'security' tests never did).
+TEST_CASE("DNS Parser NAME-field compression safety", "[dns][parser][security]")
+{
+  SECTION("self-referential compression-pointer loop is rejected")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x1a}); // answer NAME at offset 26 -> pointer to offset 26 (itself) => loop
+    REQUIRE_THROWS_AS(DnsMessage::parse(m), DnsParseException);
+  }
+
+  SECTION("out-of-bounds compression pointer is rejected")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0xff}); // answer NAME -> pointer to offset 255 (beyond the message)
+    REQUIRE_THROWS_AS(DnsMessage::parse(m), DnsParseException);
+  }
+
+  SECTION("valid compression pointer in CNAME RDATA resolves")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c,             // NAME -> "test.com"
+               0x00, 0x05,             // TYPE=CNAME
+               0x00, 0x01,             // CLASS=IN
+               0x00, 0x00, 0x0e, 0x10, // TTL
+               0x00, 0x02,             // RDLENGTH=2
+               0xc0, 0x0c});           // RDATA: compressed name -> "test.com"
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.cname_records.size() == 1);
+    REQUIRE(r.cname_records[0].cname == "test.com");
+  }
+
+  SECTION("SOA with compressed MNAME and RNAME resolves both names")
+  {
+    auto m = dnsHeader(1, 0, 1, 0); // one authority record
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c,             // NAME -> "test.com"
+               0x00, 0x06,             // TYPE=SOA
+               0x00, 0x01,             // CLASS=IN
+               0x00, 0x00, 0x0e, 0x10, // TTL
+               0x00, 0x18,             // RDLENGTH=24 (2 + 2 + 20)
+               0xc0, 0x0c,             // MNAME -> "test.com"
+               0xc0, 0x0c,             // RNAME -> "test.com"
+               0x00, 0x00, 0x00, 0x01, // SERIAL
+               0x00, 0x00, 0x0e, 0x10, // REFRESH
+               0x00, 0x00, 0x07, 0x08, // RETRY
+               0x00, 0x00, 0x1c, 0x20, // EXPIRE
+               0x00, 0x00, 0x00, 0x3c}); // MINIMUM
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.soa_records.size() == 1);
+    REQUIRE(r.soa_records[0].mname == "test.com");
+    REQUIRE(r.soa_records[0].rname == "test.com");
+  }
+}
+
+// RDATA bytes with the 0xC0 mask set are legitimate data; the deleted scan false-rejected them.
+TEST_CASE("DNS Parser accepts RDATA bytes with the 0xC0 mask (false-reject regression)",
+          "[dns][parser][security]")
+{
+  SECTION("AAAA with high-order octets (fe80::, fc00::, 2607:f8b0::) is accepted")
+  {
+    auto m = dnsHeader(1, 3, 0, 0);
+    appendTestComQuestion(m);
+    auto aaaa = [&m](std::initializer_list<std::uint8_t> addr) {
+      append(m, {0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x10});
+      append(m, addr);
+    };
+    aaaa({0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}); // fe80::1 (0xfe >= 0xC0)
+    aaaa({0xfc, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}); // fc00::1 (0xfc >= 0xC0)
+    aaaa({0x26, 0x07, 0xf8, 0xb0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}); // 2607:f8b0::1
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.aaaa_records.size() == 3);
+  }
+
+  SECTION("TXT with a >=192-byte character-string and high bytes is accepted")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    const std::size_t txtLen = 200; // length octet 0xC8 has the 0xC0 bits set (pre-fix tripped it)
+    const std::uint16_t rdlen = static_cast<std::uint16_t>(1 + txtLen);
+    append(m, {0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               static_cast<std::uint8_t>(rdlen >> 8), static_cast<std::uint8_t>(rdlen & 0xFF)});
+    m.push_back(static_cast<std::uint8_t>(txtLen)); // character-string length octet
+    m.insert(m.end(), txtLen, 0xC2);                // 200 content bytes, each >= 0xC0
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.txt_records.size() == 1);
+    REQUIRE(r.txt_records[0].text.size() == 1);
+    REQUIRE(r.txt_records[0].text[0].size() == txtLen);
+  }
+
+  SECTION("multi-string TXT RDATA parses every character-string")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    std::vector<std::uint8_t> rdata;
+    auto addStr = [&rdata](std::size_t n, std::uint8_t fill) {
+      rdata.push_back(static_cast<std::uint8_t>(n));
+      rdata.insert(rdata.end(), n, fill);
+    };
+    addStr(255, 0x41); // "A" x255
+    addStr(255, 0x42); // "B" x255
+    addStr(3, 0x43);   // "CCC"
+    const std::uint16_t rdlen = static_cast<std::uint16_t>(rdata.size()); // 516
+    append(m, {0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               static_cast<std::uint8_t>(rdlen >> 8), static_cast<std::uint8_t>(rdlen & 0xFF)});
+    m.insert(m.end(), rdata.begin(), rdata.end());
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.txt_records.size() == 1);
+    REQUIRE(r.txt_records[0].text.size() == 3);
+    REQUIRE(r.txt_records[0].text[0].size() == 255);
+    REQUIRE(r.txt_records[0].text[1].size() == 255);
+    REQUIRE(r.txt_records[0].text[2].size() == 3);
+  }
+
+  SECTION("truncated trailing TXT character-string is dropped without error")
+  {
+    // Exercises parseTxtRecord's overflow-safe `len > size() - offset` break branch.
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    // One complete 3-byte string, then a length octet (5) claiming more than the 2 bytes left.
+    const std::uint8_t rdata[] = {0x03, 'a', 'b', 'c', 0x05, 'x', 'y'};
+    const std::uint16_t rdlen = static_cast<std::uint16_t>(sizeof(rdata)); // 7
+    append(m, {0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               static_cast<std::uint8_t>(rdlen >> 8), static_cast<std::uint8_t>(rdlen & 0xFF)});
+    m.insert(m.end(), std::begin(rdata), std::end(rdata));
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.txt_records.size() == 1);
+    REQUIRE(r.txt_records[0].text.size() == 1); // the truncated trailer is dropped, not an error
+    REQUIRE(r.txt_records[0].text[0] == "abc");
+  }
+
+  SECTION("valid UTF-8 TXT content round-trips byte-exact")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    const std::uint8_t utf8[] = {0x63, 0x61, 0x66, 0xC3, 0xA9}; // "café" (0xC3 lead byte >= 0xC0)
+    const std::uint8_t clen = static_cast<std::uint8_t>(sizeof(utf8)); // 5
+    const std::uint16_t rdlen = static_cast<std::uint16_t>(1 + clen);
+    append(m, {0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               static_cast<std::uint8_t>(rdlen >> 8), static_cast<std::uint8_t>(rdlen & 0xFF)});
+    m.push_back(clen);
+    m.insert(m.end(), std::begin(utf8), std::end(utf8));
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.txt_records.size() == 1);
+    REQUIRE(r.txt_records[0].text.size() == 1);
+    REQUIRE(r.txt_records[0].text[0] == std::string("caf\xC3\xA9"));
+  }
+}
+
+// Malformed RDATA must not crash (the original zero-length SEGV) or force a large allocation.
+TEST_CASE("DNS Parser malformed-RDATA robustness", "[dns][parser][security]")
+{
+  SECTION("zero-length TXT and AAAA RDATA do not crash")
+  {
+    // Pre-fix: `for (i=0; i < rdata.size()-1; ++i)` underflowed to SIZE_MAX -> OOB read -> SEGV.
+    auto m = dnsHeader(1, 2, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x00}); // TXT r=0
+    append(m, {0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x00}); // AAAA r=0
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.answers.size() == 2);
+    REQUIRE(r.aaaa_records.empty());    // zero-length AAAA rejected per-record
+    REQUIRE(r.txt_records.size() == 1); // zero-length TXT accepted as empty
+    REQUIRE(r.txt_records[0].text.empty());
+  }
+
+  SECTION("zero-length A RDATA is rejected per-record; the message still parses")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x00}); // A rdlen=0
+    DnsResult r;
+    REQUIRE_NOTHROW(r = DnsMessage::parse(m));
+    REQUIRE(r.a_records.empty());   // size != 4 threw inside the per-record catch -> dropped
+    REQUIRE(r.answers.size() == 1); // the raw RR is still present
+  }
+
+  SECTION("rdlength exceeding the remaining bytes is rejected cleanly")
+  {
+    auto m = dnsHeader(1, 1, 0, 0);
+    appendTestComQuestion(m);
+    append(m, {0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10,
+               0x00, 0x40}); // RDLENGTH=64 with no RDATA following
+    REQUIRE_THROWS_AS(DnsMessage::parse(m), DnsParseException);
+  }
+
+  SECTION("oversized section counts do not force a large allocation")
+  {
+    // A header claiming 0xFFFF records per section with no record bytes: clampReserveCount caps
+    // each reserve() to (bytesRemaining / MIN_RR_SIZE) == 0, so parse returns promptly (throwing
+    // on the first absent record) instead of reserving tens of MB. The clamp arithmetic itself is
+    // verified directly by the "DNS clampReserveCount ..." unit test below; here we drive each of
+    // the four clamp CALL SITES (questions / answers / authority / additional).
+    REQUIRE_THROWS_AS(DnsMessage::parse(dnsHeader(0xFFFF, 0, 0, 0)), DnsParseException); // questions
+    REQUIRE_THROWS_AS(DnsMessage::parse(dnsHeader(0, 0xFFFF, 0, 0)), DnsParseException); // answers
+    REQUIRE_THROWS_AS(DnsMessage::parse(dnsHeader(0, 0, 0xFFFF, 0)), DnsParseException); // authority
+    REQUIRE_THROWS_AS(DnsMessage::parse(dnsHeader(0, 0, 0, 0xFFFF)), DnsParseException); // additional
+  }
+}
+
+// White-box unit test for the memory-amplification guard: this discriminates the clamp
+// (min(count, bytes/minSize)) that the parse()-level KATs above cannot observe, because a lying
+// header count always throws before parse() returns a result whose capacity could be inspected.
+TEST_CASE("DNS clampReserveCount bounds untrusted counts", "[dns][parser][security]")
+{
+  using iora::network::dns::detail::clampReserveCount;
+  // A lying count with no (or too few) backing bytes clamps to 0.
+  REQUIRE(clampReserveCount(0xFFFF, 0, 11) == 0);
+  REQUIRE(clampReserveCount(0xFFFF, 10, 11) == 0);
+  REQUIRE(clampReserveCount(0xFFFF, 0, 5) == 0);
+  // A count the remaining bytes can hold passes through unchanged.
+  REQUIRE(clampReserveCount(3, 33, 11) == 3);  // 33/11 == 3, count is the bound
+  REQUIRE(clampReserveCount(3, 100, 11) == 3); // count still the smaller bound
+  REQUIRE(clampReserveCount(10, 33, 11) == 3); // bytes are the smaller bound -> clamped down
+  REQUIRE(clampReserveCount(2, 10, 5) == 2);   // question floor (min size 5)
 }
 
 TEST_CASE_METHOD(DnsTestFixture, "DNS UDP Truncation and TCP Fallback",
