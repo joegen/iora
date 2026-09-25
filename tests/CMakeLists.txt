@@ -75,6 +75,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_transport_callback_deadlock
     network/iora_test_dns_transport_lifecycle_restructure
     network/iora_test_dns_transport_close_robustness
+    network/iora_test_dns_transport_retry
     network/iora_test_http
     network/iora_test_http_request_framing
     network/iora_test_http_framing_detail
@@ -321,6 +322,14 @@ foreach(test_path ${ALL_TESTS})
         create_individual_test(${test_path})
     endif()
 endforeach()
+
+# The DNS retry regression suite drives real timers, a silent-UDP probe, and delayed-answer threads;
+# a reintroduced missed-wakeup during backoff/stop() could wedge ctest. Enforce a per-test TIMEOUT in
+# the build system (not only via the operator's --timeout) so a hang FAILS this test rather than
+# stalling the whole run (tracker 2026-09-24-31; project lesson "bounded background gates").
+if(IORA_BUILD_NETWORK_TESTS AND TEST network::iora_test_dns_transport_retry)
+    set_tests_properties(network::iora_test_dns_transport_retry PROPERTIES TIMEOUT 60)
+endif()
 
 # task-1.4 carrier-agnostic invariant probe (registered by task-2.1): a
 # COMPILE-ONLY object-library target whose TU includes ONLY
@@ -615,6 +624,13 @@ set(IORA_SANITIZED_TEST_TARGETS
     # in-flight queries under _queriesMutex as a separate, non-co-held critical section from
     # _sessionsMutex -- the lock-order (no-co-hold) property is a cross-thread invariant TSan checks.
     iora_test_dns_transport_close_robustness
+
+    # DnsTransport retry-path sole-driver claim (tracker 2026-09-24-31): the per-query timeout
+    # timer claims a retransmission (retryCount increment + startTime reset + retryClaimed) as one
+    # critical section under _queriesMutex while the cleanup sweep, timer resend, and truncation
+    # fallback run concurrently -- the exactly-once claim / no-double-send property is a
+    # cross-thread invariant only TSan can prove clean.
+    iora_test_dns_transport_retry
 
     iora_test_name_resolver
     iora_test_tcp_engine_resolve

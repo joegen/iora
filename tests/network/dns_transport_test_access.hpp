@@ -82,6 +82,9 @@ struct DnsTransportTestAccess
 
   // ---- config ----
   static int configRetryCount(const T &t) { return t.loadConfig()->retryCount; }
+  /// The transport's own computed sync-wait budget (so a test asserts against the real formula
+  /// rather than re-deriving it and silently drifting -- C-L2, 2026-09-24-31).
+  static std::chrono::milliseconds calcMaxSyncWait(const T &t) { return t.calculateMaxSyncWaitTime(); }
 
   // ---- cleanup thread ----
   static void setCleanupInterval(T &t, std::chrono::milliseconds interval)
@@ -193,11 +196,46 @@ struct DnsTransportTestAccess
     auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
     return it == t._pendingQueries.end() ? 0 : it->second->activeTimerId.load();
   }
+  /// Simulate a live scheduled timer on a registered query (2026-09-24-31): the orphan-backstop
+  /// sweep skips any query with activeTimerId != 0, so tests set a non-zero id to model a healthy
+  /// (mid-backoff / timeout-armed) query, and leave it 0 to model a genuine orphan.
+  static void setActiveTimerId(T &t, std::uint16_t id, const std::string &server,
+                               std::uint16_t port, std::uint64_t timerId)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    if (it != t._pendingQueries.end())
+    {
+      it->second->activeTimerId.store(timerId);
+    }
+  }
   static int retryCountOf(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
   {
     std::lock_guard<std::mutex> l(t._queriesMutex);
     auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
     return it == t._pendingQueries.end() ? -1 : it->second->retryCount.load();
+  }
+  /// Set the retry/fallback arbitration flag on a registered query (2026-09-24-31): models a
+  /// UDP retransmission already CLAIMED by the per-query timeout callback, so a subsequently
+  /// injected truncated response must be dropped (retry-wins-first) instead of starting a TCP
+  /// fallback -- UDP retry and TCP fallback never both act on one query.
+  static void setRetryClaimed(T &t, std::uint16_t id, const std::string &server, std::uint16_t port,
+                              bool v)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    if (it != t._pendingQueries.end())
+    {
+      it->second->retryClaimed = v;
+    }
+  }
+  /// Read the tcpFallback flag of a registered query (2026-09-24-31): true iff a TCP fallback
+  /// was initiated for it. -1-style sentinel is not needed -- callers guard with hasPending().
+  static bool tcpFallbackOf(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    return it != t._pendingQueries.end() && it->second->tcpFallback;
   }
   /// Bind a registered query to a sender session (tracker 2026-09-11-7 M-1): sets the
   /// query's sentSession so handleClose(sid,isTcp) fast-fails it by EXACT session match.

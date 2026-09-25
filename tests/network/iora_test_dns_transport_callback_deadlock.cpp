@@ -187,28 +187,47 @@ TEST_CASE("dns callback-deadlock: F-3 stop() fires outside _stateMutex (no re-en
   }
 }
 
-// F-4b retry-preserved: a retriable expired query stays in the map and its retryCount
-// advances (collect-AND-erase must NOT erase retriable entries).
-TEST_CASE("dns callback-deadlock: F-4b cleanup preserves a retriable expired query",
+// F-4b sole-driver sweep (2026-09-24-31): the per-query timeout timer is the SOLE retry driver,
+// so cleanupExpiredQueries NEVER retries. It is a strict orphan BACKSTOP: it SKIPS a healthy
+// query that still has a live timer (activeTimerId != 0) and FAILS only a genuinely orphaned one
+// (expired-by-startTime AND activeTimerId == 0, e.g. a reschedule rejected during drain).
+TEST_CASE("dns callback-deadlock: F-4b cleanup skips healthy, fails orphaned",
           "[dns][callback-deadlock]")
 {
-  auto t = makeTransport();
-  REQUIRE(Access::configRetryCount(*t) > 0); // else this test is vacuous
-  std::atomic<int> fired{0};
-  Access::registerPending(*t, ID_A, SERVER_A, PORT_A,
-                          [&fired](const DnsResult &, const std::exception_ptr &) { ++fired; },
-                          /*retryCount=*/0, /*timeout=*/std::chrono::milliseconds(10),
-                          /*startTimeOffset=*/std::chrono::milliseconds(60000)); // already expired
+  SECTION("healthy expired query with a live timer is SKIPPED (never retried by the sweep)")
+  {
+    auto t = makeTransport();
+    REQUIRE(Access::configRetryCount(*t) > 0); // else the retry path is vacuous
+    std::atomic<int> fired{0};
+    Access::registerPending(*t, ID_A, SERVER_A, PORT_A,
+                            [&fired](const DnsResult &, const std::exception_ptr &) { ++fired; },
+                            /*retryCount=*/0, /*timeout=*/std::chrono::milliseconds(10),
+                            /*startTimeOffset=*/std::chrono::milliseconds(60000)); // already expired
+    Access::setActiveTimerId(*t, ID_A, SERVER_A, PORT_A, /*live timer*/ 42);
 
-  Access::callCleanup(*t);
+    Access::callCleanup(*t);
 
-  CHECK(Access::hasPending(*t, ID_A, SERVER_A, PORT_A)); // retriable -> left in map
-  CHECK(Access::retryCountOf(*t, ID_A, SERVER_A, PORT_A) == 1); // retry advanced
-  CHECK(fired.load() == 0); // not failed (still retrying)
-  // M1 (cpp17-MED, round 2): a cleanup-driven retry must leave a live, cancellable timer id
-  // in the map -- retryQuery schedules the retry timer and records its id. A regression that
-  // zeroed activeTimerId on the retry path (the removed store(0) clobber) would show 0 here.
-  CHECK(Access::activeTimerIdOf(*t, ID_A, SERVER_A, PORT_A) != 0);
+    CHECK(Access::hasPending(*t, ID_A, SERVER_A, PORT_A));         // left in map
+    CHECK(Access::retryCountOf(*t, ID_A, SERVER_A, PORT_A) == 0);  // sweep does NOT retry
+    CHECK(fired.load() == 0);                                      // not failed
+    CHECK(Access::activeTimerIdOf(*t, ID_A, SERVER_A, PORT_A) == 42); // its live timer is untouched
+  }
+
+  SECTION("orphaned expired query (no live timer) is FAILED by the backstop")
+  {
+    auto t = makeTransport();
+    std::atomic<int> fired{0};
+    // activeTimerId defaults to 0 (registerPending arms no timer) -> a genuine orphan.
+    Access::registerPending(*t, ID_A, SERVER_A, PORT_A,
+                            [&fired](const DnsResult &, const std::exception_ptr &) { ++fired; },
+                            /*retryCount=*/0, /*timeout=*/std::chrono::milliseconds(10),
+                            /*startTimeOffset=*/std::chrono::milliseconds(60000)); // already expired
+
+    Access::callCleanup(*t);
+
+    CHECK_FALSE(Access::hasPending(*t, ID_A, SERVER_A, PORT_A)); // orphan -> erased
+    CHECK(fired.load() == 1);                                    // failed exactly once
+  }
 }
 
 // F-4b exactly-once: a query that is both expired (retry-exhausted -> cleanup fails it)

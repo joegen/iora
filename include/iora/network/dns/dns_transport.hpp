@@ -240,6 +240,13 @@ private:
     // _queriesMutex when a truncated UDP answer is retried over TCP; read under
     // _queriesMutex. NOT single-writer despite the group heading above.
     bool tcpFallback;
+    // retryClaimed (2026-09-24-31): the retry/fallback arbitration flag. Set true under
+    // _queriesMutex by the per-query timeout callback when it CLAIMS a UDP retransmission
+    // (between the claim and the resend actually going out during backoff); cleared under
+    // _queriesMutex by the resend lambda when the new attempt is sent. While set, a
+    // concurrently-arriving truncated response (retry-wins-first race) is dropped instead of
+    // initiating a TCP fallback, so a UDP retry and a TCP fallback never both act on one query.
+    bool retryClaimed;
 
     // Thread-safe concurrent fields - accessed from multiple threads
     std::atomic<std::chrono::steady_clock::time_point> startTime;
@@ -253,11 +260,18 @@ private:
     PendingQuery(std::uint16_t id, std::chrono::milliseconds to, const std::string &srv,
                  std::uint16_t prt, std::vector<std::uint8_t> data)
         : queryId(id), timeout(to), server(srv), port(prt), queryData(std::move(data)),
-          transportMode(DnsTransportMode::UDP), tcpFallback(false),
+          transportMode(DnsTransportMode::UDP), tcpFallback(false), retryClaimed(false),
           startTime(std::chrono::steady_clock::now()), retryCount(0)
     {
     }
   };
+
+  // startTime is std::atomic<std::chrono::steady_clock::time_point> (LT-1, T-L3): on the LP64 Linux
+  // target its rep is a 64-bit integer and the atomic is lock-free (no libatomic on this hot path).
+  // Assert it so a platform where it degrades to a locked atomic fails loudly at compile time rather
+  // than silently routing every startTime access through a global lock.
+  static_assert(std::atomic<std::chrono::steady_clock::time_point>::is_always_lock_free,
+                "PendingQuery::startTime must be a lock-free atomic on this platform");
 
   /// \brief Send query using UDP transport
   void sendUdpQuery(std::shared_ptr<PendingQuery> query);
@@ -321,8 +335,31 @@ private:
   void completeQuery(const QueryKey &key, const DnsResult &result);
   void completeQuery(const QueryKey &key, const std::exception_ptr &error);
 
+  /// \brief Identity-checked failure completion (T2R-1): fail \p query with \p error ONLY if the map
+  ///        still holds THIS instance under its key. Use at every site that holds a specific
+  ///        PendingQuery it wants to fail (timer/send-failure/session-close paths) so a stale
+  ///        operation can never fail a DIFFERENT query that reused the freed 16-bit id. (The
+  ///        response-correlation completeQuery(key,...) sites are inherently key-based and excluded.)
+  void completeQueryIfSame(const std::shared_ptr<PendingQuery> &query,
+                           const std::exception_ptr &error);
+
+  /// \brief Identity-checked bulk failure completion: completeQueryIfSame for each query (mirrors
+  ///        failCollected for the identity-checked path).
+  void completeAllIfSame(const std::vector<std::shared_ptr<PendingQuery>> &queries,
+                         const std::exception_ptr &error);
+
+  /// \brief Terminal error tail shared by completeQuery/completeQueryIfSame: cancel the timer, log,
+  ///        bump _stats.errors, and fire the callback/promise. Caller MUST have already removed
+  ///        \p query from _pendingQueries.
+  void finishFailedQuery(const std::shared_ptr<PendingQuery> &query, const std::exception_ptr &error);
+
   /// \brief Atomically find+erase a pending query by key (returns nullptr if absent)
   std::shared_ptr<PendingQuery> takePending(const QueryKey &key);
+
+  /// \brief Atomically erase the pending query at \p key ONLY if it is still the same instance as
+  ///        \p query (identity-checked; guards against 16-bit query-id reuse, T2R-1). Returns true
+  ///        iff this call performed the erase.
+  bool takePendingIfSame(const QueryKey &key, const std::shared_ptr<PendingQuery> &query);
 
   /// \brief Registration gate (NEW-6): insert \p query into _pendingQueries iff the
   /// transport is still Running, atomically under _queriesMutex. Returns false (no insert)
@@ -358,7 +395,23 @@ private:
                                                  std::uint16_t sourcePort);
 
   /// \brief Retry query logic
-  void retryQuery(std::shared_ptr<PendingQuery> query, const std::string &reason);
+  /// \brief Send+reschedule a claimed UDP retransmission (2026-09-24-31). The retry CLAIM
+  /// (limit-check + retryCount increment + startTime reset + retryClaimed=true) is performed by
+  /// the caller under _queriesMutex BEFORE calling this; this helper only computes the backoff
+  /// (from \p preClaimIndex, the pre-increment attempt index so the first retry uses exponent 0)
+  /// and schedules the delayed resend. It performs NO counter/epoch mutation and has NO
+  /// retry-limit branch (the caller's claim owns that). Runs OUTSIDE _queriesMutex.
+  void retryQuery(std::shared_ptr<PendingQuery> query, int preClaimIndex, const std::string &reason);
+
+  /// \brief The (pre-jitter) exponential-backoff delay for retry attempt \p attemptIndex.
+  ///
+  /// Returns min(initial * multiplier^attemptIndex, cap). The cap is applied on EVERY step, so an
+  /// overgrown intermediate can never overflow the millisecond rep before the clamp (V-L2), and the
+  /// two callers (retryQuery's per-attempt delay and calculateMaxSyncWaitTime's tier accumulation)
+  /// are consistent BY CONSTRUCTION rather than by two hand-derived formulas (S-M1). Pure/static.
+  static std::chrono::milliseconds backoffDelayForAttempt(std::chrono::milliseconds initial,
+                                                          int attemptIndex, double multiplier,
+                                                          std::chrono::milliseconds cap);
 
   /// \brief Cleanup expired queries
   void cleanupExpiredQueries();
@@ -530,7 +583,12 @@ private:
   // longer co-held with _queriesMutex. The cleanup thread releases _cleanupMutex before
   // cleanupExpiredQueries() (item 3), so _cleanupMutex is no longer co-held with
   // _queriesMutex. The UDP-truncation TCP fallback (processResponse, mode==UDP, reached
-  // only from handleUdpData) holds _queriesMutex across sendTcpQuery's _sessionsMutex.
+  // only from handleUdpData) holds _queriesMutex across sendTcpQuery's _sessionsMutex. This is the
+  // ONE deliberate exception to the retry path's "decide under _queriesMutex, do the send AFTER
+  // release" rule (fix_proposal item I): the fallback must set tcpFallback=true and issue the TCP
+  // send as a single atomic step (else a concurrent UDP timeout/retry could race the transition), so
+  // the send runs under the lock ON PURPOSE. Safe: the order (outer _queriesMutex -> inner
+  // _sessionsMutex) holds and no user callback runs under the lock.
   // handleClose deliberately uses THREE sequential, NON-co-held critical sections
   // (_sessionsMutex, then _tcpBuffersMutex, then completeQuery's _queriesMutex) and MUST
   // NOT merge them: co-holding _sessionsMutex (acquired first, so outer) with
@@ -1034,11 +1092,10 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
   {
     // Single cleanup path for every failure: remove from pending AND cancel the query's
     // still-scheduled retry/timeout timer (simplification L1 -- match the completeQuery
-    // idiom; leaving the timer armed would fire a dead callback later).
-    {
-      std::lock_guard<std::mutex> lock(_queriesMutex);
-      _pendingQueries.erase(key);
-    }
+    // idiom; leaving the timer armed would fire a dead callback later). Identity-checked erase
+    // (T2R-1): erase ONLY this instance, never a new query that reused the freed 16-bit id at the
+    // same server:port between this query's completion and here.
+    takePendingIfSame(key, query);
     cancelActiveTimer(query);
     throw;
   }
@@ -1109,14 +1166,11 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
   }
   catch (const std::exception &e)
   {
-    // Remove from pending and call callback with error
-    {
-      std::lock_guard<std::mutex> lock(_queriesMutex);
-      _pendingQueries.erase(key);
-    }
-
+    // Send failed right after registration: fail this query. Identity-checked (T2R-1) so a reused-id
+    // sibling is never mis-failed (window is narrow here -- no timer armed yet -- but keep the whole
+    // completion surface uniform per the sibling-audit rule).
     auto error = std::make_exception_ptr(DnsTransportException(e.what()));
-    failOne(query, error);
+    completeQueryIfSame(query, error);
   }
 }
 
@@ -1383,6 +1437,12 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
   // Atomic increments - no mutex needed
   _stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
   _stats.tcpQueries.fetch_add(1, std::memory_order_relaxed);
+  // tcpFallback is _queriesMutex-guarded (T-L2): this read is race-free by call-path exclusion --
+  // its ONLY writer is the UDP-truncation fallback in processResponse, which calls sendTcpQuery
+  // WHILE holding _queriesMutex; the other callers (initial-TCP send, TCP resend) reach here with
+  // tcpFallback==false and cannot overlap that writer for a given query. If a future path calls
+  // sendTcpQuery for a query that a concurrent thread may be transitioning to fallback, snapshot
+  // tcpFallback under _queriesMutex first.
   if (query->tcpFallback)
   {
     _stats.tcpFallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -1696,6 +1756,15 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
       {
         std::lock_guard<std::mutex> lock(_queriesMutex);
         auto it = _pendingQueries.find(key);
+        if (it != _pendingQueries.end() && it->second->retryClaimed)
+        {
+          // Retry-wins-first race (2026-09-24-31): a UDP retransmission was just CLAIMED for this
+          // query, so this truncated datagram is a stale response to the superseded attempt. Drop
+          // it (drop-and-wait) rather than starting a competing TCP fallback -- the retry's own
+          // answer or truncation drives completion/fallback, so UDP retry and TCP fallback never
+          // both act on one query.
+          return;
+        }
         if (it != _pendingQueries.end() && !it->second->tcpFallback)
         {
           iora::core::Logger::debug("Initiating TCP fallback for truncated response, query ID=" +
@@ -1734,21 +1803,39 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
   }
   catch (const std::exception &e)
   {
-    iora::core::Logger::warning("DNS response parse failed from " + sourceServer + ":" +
+    if (!parsed)
+    {
+      // UNPARSEABLE datagram (V-H1 / item K, 2026-09-24-31): DROP and WAIT. A malformed response
+      // whose id+source happen to match a pending query must NOT terminate it -- the timeout/retry
+      // machinery stays the sole thing that advances the query (RFC 1035 §7.3 / RFC 5452 §9.1
+      // Query Matching Rules: a response that fails to parse/match is invalid -- discard it and keep
+      // waiting for a valid one until timeout).
+      // Completing here would (a) defeat retransmission -- a single lost/corrupted datagram would
+      // kill the query at the first attempt -- and (b) let an off-path attacker who guesses the
+      // (deliberately reused) 16-bit query id terminate the query with one crafted packet. Broader
+      // malformed-parse hardening / RFC 5452 source-port entropy is tracked separately (-34/-29).
+      // Log at DEBUG, not WARNING (V-R2-L1): this path is attacker-reachable and now fires once PER
+      // dropped datagram for the query's lifetime, so a per-packet warning would be a log-amplifier.
+      iora::core::Logger::debug("DNS response dropped (unparseable) from " + sourceServer + ":" +
+                                std::to_string(sourcePort) + " (" + std::to_string(size) +
+                                " bytes): " + e.what());
+      return;
+    }
+
+    // A genuine post-parse processing error on a validly-parsed response is rare and worth a warning.
+    iora::core::Logger::warning("DNS response processing failed from " + sourceServer + ":" +
                                 std::to_string(sourcePort) + " (" + std::to_string(size) +
                                 " bytes): " + e.what());
 
-    // If we can extract query ID from malformed response, complete that query
+    // If we can extract query ID from a genuine post-parse error, complete that query
     if (size >= 2)
     {
       std::uint16_t queryId = (data[0] << 8) | data[1];
       QueryKey key(queryId, sourceServer, sourcePort);
-      // A post-parse throw that reaches here (parsed==true; a DnsTransportException is
-      // already handled by the catch above) is NOT a parse error -- surface the raw
-      // exception rather than mislabeling it DnsParseException (tracker 2026-09-11-7 L-2).
-      auto error = parsed ? std::current_exception()
-                          : std::make_exception_ptr(DnsParseException(e.what()));
-      completeQuery(key, error);
+      // parsed==true: the response WAS parsed, but a later step threw (a DnsTransportException is
+      // already handled by the catch above). This is NOT a parse error -- surface the raw exception
+      // rather than mislabeling it DnsParseException (tracker 2026-09-11-7 L-2).
+      completeQuery(key, std::current_exception());
     }
     else
     {
@@ -1896,12 +1983,11 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
   // entry is harmless. This mirrors the existing "failed to send" error handling.
   if (!orphaned.empty())
   {
+    // Identity-checked (T2R-1): we hold the specific instances, so fail exactly them, never a
+    // reused-id sibling registered under the same key after one completed.
     auto error = std::make_exception_ptr(DnsTransportException(
       "DNS session closed before connect (" + std::string(isTcp ? "TCP" : "UDP") + ")"));
-    for (auto &query : orphaned)
-    {
-      completeQuery(QueryKey(query->queryId, query->server, query->port), error);
-    }
+    completeAllIfSame(orphaned, error);
   }
 
   // M-1 (tracker 2026-09-11-7): fast-fail already-SENT in-flight queries bound to the
@@ -1913,7 +1999,10 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
   // _sessionsMutex section above is already released), then fire completeQuery OUTSIDE
   // the lock -- it re-takes _queriesMutex via takePending (exactly-once erase + timer
   // cancel) and no-ops for a query a concurrent path already completed.
-  std::vector<QueryKey> inFlightKeys;
+  // Collect the specific PendingQuery INSTANCES (not just keys) so the fail below is identity-checked
+  // (T2R-1): completing by bare key could mis-fail a reused-id sibling registered under the same key
+  // between this collection and the completion. The shared_ptr also keeps each query alive until fired.
+  std::vector<std::shared_ptr<PendingQuery>> inFlight;
   {
     std::lock_guard<std::mutex> lock(_queriesMutex);
     const std::uint64_t closedPacked = packSentSession(sessionId, isTcp);
@@ -1921,18 +2010,15 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
     {
       if (kv.second->sentSession.load(std::memory_order_relaxed) == closedPacked)
       {
-        inFlightKeys.push_back(kv.first);
+        inFlight.push_back(kv.second);
       }
     }
   }
-  if (!inFlightKeys.empty())
+  if (!inFlight.empty())
   {
     auto error = std::make_exception_ptr(DnsTransportException(
       "DNS session closed (" + std::string(isTcp ? "TCP" : "UDP") + ") with in-flight query"));
-    for (const auto &key : inFlightKeys)
-    {
-      completeQuery(key, error);
-    }
+    completeAllIfSame(inFlight, error);
   }
 }
 
@@ -2007,6 +2093,33 @@ inline void DnsTransport::updateConfig(const DnsConfig &config)
   _config.store(std::make_shared<const DnsConfig>(config));
 }
 
+inline std::chrono::milliseconds DnsTransport::backoffDelayForAttempt(
+  std::chrono::milliseconds initial, int attemptIndex, double multiplier,
+  std::chrono::milliseconds cap)
+{
+  using rep = std::chrono::milliseconds::rep;
+  const double capCount = static_cast<double>(cap.count());
+  auto delay = initial;
+  for (int i = 0; i < attemptIndex; ++i)
+  {
+    if (delay >= cap)
+    {
+      return cap; // monotone: once at/over the cap, further attempts stay capped
+    }
+    // Clamp the product in DOUBLE against the cap BEFORE the cast (LOW-1): delay < cap here, but
+    // delay*multiplier can still exceed the millisecond rep for a pathological maxRetryDelay, and a
+    // double->rep cast that is out of range is UB. Comparing in double first makes the step safe for
+    // any config.
+    const double next = static_cast<double>(delay.count()) * multiplier;
+    delay = (next >= capCount) ? cap : std::chrono::milliseconds(static_cast<rep>(next));
+  }
+  if (delay > cap)
+  {
+    delay = cap;
+  }
+  return delay;
+}
+
 inline std::chrono::milliseconds DnsTransport::calculateMaxSyncWaitTime() const
 {
   // INV-2 (L-1): pin ONE config snapshot — this reads six config fields, which must all
@@ -2017,30 +2130,24 @@ inline std::chrono::milliseconds DnsTransport::calculateMaxSyncWaitTime() const
   // Base timeout for initial attempt
   auto totalWait = cfg->timeout;
 
-  // Calculate retry delays with exponential backoff and accurate per-retry jitter
-  auto delay = cfg->initialRetryDelay;
+  // Retry delays with exponential backoff and accurate per-retry jitter. Use the shared
+  // backoffDelayForAttempt helper so the sync-wait budget matches the delay retryQuery actually
+  // schedules, tier for tier (S-M1) -- previously two independent formulas that could diverge.
   std::chrono::milliseconds totalJitter{0};
 
   for (int retry = 0; retry < cfg->retryCount; ++retry)
   {
+    auto delay = backoffDelayForAttempt(cfg->initialRetryDelay, retry, cfg->retryMultiplier,
+                                        cfg->maxRetryDelay);
     totalWait += delay;
 
     // Calculate jitter for this specific retry delay (more accurate than using maxRetryDelay)
     if (cfg->jitterFactor > 0.0)
     {
-      // Worst case: this retry gets maximum positive jitter based on actual delay
-      auto jitterForThisRetry =
-        std::chrono::milliseconds(static_cast<long>(delay.count() * cfg->jitterFactor));
+      // Worst case: this retry gets maximum positive jitter based on actual (capped) delay.
+      auto jitterForThisRetry = std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(delay.count() * cfg->jitterFactor));
       totalJitter += jitterForThisRetry;
-    }
-
-    // Apply exponential backoff multiplier
-    delay = std::chrono::milliseconds(static_cast<long>(delay.count() * cfg->retryMultiplier));
-
-    // Cap at maximum delay
-    if (delay > cfg->maxRetryDelay)
-    {
-      delay = cfg->maxRetryDelay;
     }
   }
 
@@ -2136,6 +2243,22 @@ DnsTransport::takePending(const QueryKey &key)
   auto query = it->second;
   _pendingQueries.erase(it);
   return query;
+}
+
+inline bool DnsTransport::takePendingIfSame(const QueryKey &key,
+                                            const std::shared_ptr<PendingQuery> &query)
+{
+  // Identity-checked atomic find+erase (T2R-1): erase ONLY when the entry under \p key is still the
+  // SAME PendingQuery instance the caller holds -- so a stale timer whose 16-bit query id was reused
+  // by a new query cannot erase/fail the unrelated new instance. Returns true iff this call erased.
+  std::lock_guard<std::mutex> lock(_queriesMutex);
+  auto it = _pendingQueries.find(key);
+  if (it == _pendingQueries.end() || it->second != query)
+  {
+    return false;
+  }
+  _pendingQueries.erase(it);
+  return true;
 }
 
 inline bool DnsTransport::registerPendingIfRunning(const QueryKey &key,
@@ -2298,43 +2421,70 @@ inline void DnsTransport::completeQuery(const QueryKey &key, const DnsResult &re
   }
 }
 
+inline void DnsTransport::finishFailedQuery(const std::shared_ptr<PendingQuery> &query,
+                                            const std::exception_ptr &error)
+{
+  // Caller has ALREADY removed `query` from _pendingQueries (via takePending / takePendingIfSame),
+  // so this owns the terminal error tail: cancel the query's timer, log, count, and fire.
+  cancelActiveTimer(query);
+
+  // Calculate query duration for performance monitoring (atomic read)
+  auto queryDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - query->startTime.load())
+                         .count();
+
+  // Log the error with context
+  std::string errorMessage = "unknown error";
+  try
+  {
+    std::rethrow_exception(error);
+  }
+  catch (const std::exception &e)
+  {
+    errorMessage = e.what();
+  }
+  catch (...)
+  {
+    errorMessage = "non-standard exception";
+  }
+
+  iora::core::Logger::error(
+    "DNS query failed: ID=" + std::to_string(query->queryId) + " server=" + query->server + ":" +
+    std::to_string(query->port) + " duration=" + std::to_string(queryDuration) + "ms" +
+    " retries=" + std::to_string(query->retryCount.load()) + " error=" + errorMessage);
+
+  // Atomic increment - no mutex needed
+  _stats.errors.fetch_add(1, std::memory_order_relaxed);
+
+  failOne(query, error);
+}
+
 inline void DnsTransport::completeQuery(const QueryKey &key, const std::exception_ptr &error)
 {
-  std::shared_ptr<PendingQuery> query = takePending(key);
-
-  if (query)
+  if (auto query = takePending(key))
   {
-    cancelActiveTimer(query);
+    finishFailedQuery(query, error);
+  }
+}
 
-    // Calculate query duration for performance monitoring (atomic read)
-    auto queryDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - query->startTime.load())
-                           .count();
+inline void DnsTransport::completeQueryIfSame(const std::shared_ptr<PendingQuery> &query,
+                                              const std::exception_ptr &error)
+{
+  QueryKey key(query->queryId, query->server, query->port);
+  if (!takePendingIfSame(key, query))
+  {
+    return; // already completed, or the key was reused by a different query instance (T2R-1)
+  }
+  finishFailedQuery(query, error);
+}
 
-    // Log the error with context
-    std::string errorMessage = "unknown error";
-    try
-    {
-      std::rethrow_exception(error);
-    }
-    catch (const std::exception &e)
-    {
-      errorMessage = e.what();
-    }
-    catch (...)
-    {
-      errorMessage = "non-standard exception";
-    }
-
-    iora::core::Logger::error(
-      "DNS query failed: ID=" + std::to_string(query->queryId) + " server=" + query->server + ":" +
-      std::to_string(query->port) + " duration=" + std::to_string(queryDuration) + "ms" +
-      " retries=" + std::to_string(query->retryCount.load()) + " error=" + errorMessage);
-
-    // Atomic increment - no mutex needed
-    _stats.errors.fetch_add(1, std::memory_order_relaxed);
-
-    failOne(query, error);
+inline void DnsTransport::completeAllIfSame(const std::vector<std::shared_ptr<PendingQuery>> &queries,
+                                            const std::exception_ptr &error)
+{
+  // Identity-checked bulk fail (mirrors failCollected, but via the identity-checked completion path).
+  for (const auto &query : queries)
+  {
+    completeQueryIfSame(query, error);
   }
 }
 
@@ -2435,42 +2585,90 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
     [weakSelf, query]()
     {
       auto self = weakSelf.lock();
-      // Check if transport is still alive/running before accessing any members
       if (!self || !self->isRunning())
       {
         return; // Transport has been stopped/destroyed
       }
-
-      // Also check if timer service is still valid (defensive programming) — INV-2 snapshot.
       if (!self->loadTimer())
       {
-        return; // Timer service has been destroyed
+        return; // Timer service has been destroyed (INV-2 snapshot)
       }
 
-      // Check if query is still pending (not completed/cancelled)
       QueryKey key(query->queryId, query->server, query->port);
+      auto cfg = self->loadConfig();
 
-      std::shared_ptr<PendingQuery> pendingQuery = self->takePending(key);
-      if (!pendingQuery)
+      // The per-query timeout timer is the SOLE retry driver (2026-09-24-31). Make the retry
+      // decision as ONE claim under _queriesMutex: because startTime (the cleanup sweep's expiry
+      // predicate) is reset here, any sweep serialized after this sees a healthy mid-backoff
+      // query as not-expired and skips it -- exactly-once retry without a CAS. The claim only
+      // decides; the send / completeQuery run AFTER releasing the lock (no I/O under the lock;
+      // completeQuery re-locks for its atomic find+erase, so calling it here would self-deadlock).
+      bool doRetry = false;
+      int preClaimIndex = 0;
       {
-        return; // Query already completed or cancelled
+        std::lock_guard<std::mutex> lock(self->_queriesMutex);
+        auto it = self->_pendingQueries.find(key);
+        if (it == self->_pendingQueries.end() || it->second != query)
+        {
+          // Not found, OR a DIFFERENT query instance now occupies this (id,server,port) key
+          // (T2R-1, 2026-09-24-31): the 16-bit query id is reusable once a prior query completes,
+          // so a stale timer dispatched for the old instance must NOT act on the new one. Compare
+          // pointer identity, not just key presence, before touching the entry.
+          return;
+        }
+        // We are the timer that fired; clear our id so nothing else tries to cancel it. Cleared
+        // UNCONDITIONALLY here, BEFORE the tcpFallback gate: the whole TC=1 TCP-fallback-timeout
+        // handling (a fallback's own silent-server timeout, the stale-UDP-vs-fallback clobber, and
+        // the resend-window arbitration) needs timer-identity and is owned by tracker 2026-09-25-2.
+        // Leaving activeTimerId set on the fallback-defer path would strand a silent-TCP fallback
+        // past the orphan sweep (permanent async hang); clearing it keeps the query reapable by the
+        // sweep (bounded), the pre-identity-redesign behavior.
+        query->activeTimerId.store(0, std::memory_order_relaxed);
+
+        if (query->tcpFallback)
+        {
+          // A TCP fallback owns this query now; its own timeout / the orphan sweep governs it. Defer.
+          return;
+        }
+
+        // relaxed is sufficient for the counter r/m/w (LOW-2): this whole claim runs under
+        // _queriesMutex, which already provides the ordering; seq_cst would be needless cost.
+        int rc = query->retryCount.load(std::memory_order_relaxed);
+        if (rc < cfg->retryCount)
+        {
+          // CLAIM the retransmission: increment, reset the expiry clock, and mark retryClaimed so
+          // a concurrently-arriving truncated response (retry-wins-first) is dropped rather than
+          // starting a competing TCP fallback -- UDP retry and TCP fallback never both act.
+          preClaimIndex = rc;
+          query->retryCount.store(rc + 1, std::memory_order_relaxed);
+          query->startTime.store(std::chrono::steady_clock::now());
+          query->retryClaimed = true;
+          doRetry = true;
+        }
+      } // release _queriesMutex before any send / completeQuery
+
+      if (doRetry)
+      {
+        self->retryQuery(query, preClaimIndex, "timeout");
       }
-
-      // Clear the timer ID since timeout fired
-      pendingQuery->activeTimerId.store(0, std::memory_order_relaxed);
-
-      // Complete query with timeout error
-      auto error = std::make_exception_ptr(DnsTimeoutException(
-        "Query timeout after " + std::to_string(query->timeout.count()) + "ms"));
-
-      // Fire via the shared guarded helper (item 9 + S-3): matches completeQuery's error
-      // path -- callback (guarded) then promise.set_exception (guarded). Guards against an
-      // uncaught user-callback throw escaping the timer lambda (-> std::terminate); for an
-      // async query the promise has no future consumer, so setting it is a harmless no-op.
-      self->failOne(pendingQuery, error);
-
-      // Update timeout statistics
-      self->_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+      else
+      {
+        // Retry budget exhausted -> terminal timeout. Fail via takePending (atomic find+erase) so
+        // this counts EXACTLY ONCE against a racing orphan-backstop sweep, and count it as a timeout
+        // ONLY (item H): completeQuery would ALSO bump _stats.errors, whereas the sweep and the sync
+        // paths count timeouts-only -- so we fail inline to match them and avoid a timeout being
+        // double-counted as an error.
+        auto error =
+          std::make_exception_ptr(DnsTimeoutException("DNS query timeout after maximum retries"));
+        // Identity-checked erase (T2R-1): only fail THIS query instance, never a new query that
+        // reused the key between the lock release above and here. activeTimerId was already cleared
+        // to 0 under the claim lock, so no cancelActiveTimer is needed on this path.
+        if (self->takePendingIfSame(key, query))
+        {
+          self->failOne(query, error);
+          self->_stats.timeouts.fetch_add(1, std::memory_order_relaxed); // terminal timeout, once
+        }
+      }
     });
 
   // Store timer ID for potential cancellation
@@ -2480,33 +2678,26 @@ inline void DnsTransport::scheduleQueryTimeout(std::shared_ptr<PendingQuery> que
 inline void DnsTransport::cleanupExpiredQueries()
 {
   auto now = std::chrono::steady_clock::now();
-  auto cfg = loadConfig(); // INV-2: one config snapshot for this sweep.
-  std::vector<std::shared_ptr<PendingQuery>> retryList;
   std::vector<std::shared_ptr<PendingQuery>> failList;
 
-  // Collect-AND-ERASE under _queriesMutex (tracker 2026-09-11-6 item 4 -- exactly-once):
-  // partition the expired queries in ONE critical section. Non-retriable ones are ERASED
-  // here so exactly one path owns and fires them (a concurrent completeQuery's atomic
-  // find+erase can no longer race the old copy-then-later-erase, which double-fired the
-  // callback). Retriable queries STAY in the map -- retryQuery re-sends and the eventual
-  // response / next timeout must still find the entry.
+  // Orphan BACKSTOP only (2026-09-24-31): the per-query timeout timer is the sole retry driver,
+  // so this sweep NEVER retries. It fails ONLY orphaned entries -- expired-by-startTime AND with
+  // no live timer (activeTimerId == 0), e.g. a query whose reschedule was rejected during stop()/
+  // drain (timer->scheduleAfter returned 0). A healthy retrying query always has a live timer
+  // (its backoff resend timer or the re-armed timeout timer) OR a freshly-reset startTime during
+  // the claim->reschedule window, so the CONJUNCTIVE predicate skips it and the sweep can neither
+  // double-drive a retry nor prematurely fail a mid-backoff query. Erase-under-lock keeps the
+  // exactly-once completion gate (a concurrent completeQuery's atomic find+erase can't double-fire).
   {
     std::lock_guard<std::mutex> lock(_queriesMutex);
     for (auto it = _pendingQueries.begin(); it != _pendingQueries.end();)
     {
       auto &query = it->second;
-      if (now - query->startTime.load() > query->timeout)
+      if (query->activeTimerId.load(std::memory_order_relaxed) == 0 &&
+          now - query->startTime.load() > query->timeout)
       {
-        if (query->retryCount.load() < cfg->retryCount)
-        {
-          retryList.push_back(query);
-          ++it;
-        }
-        else
-        {
-          failList.push_back(query);
-          it = _pendingQueries.erase(it);
-        }
+        failList.push_back(query);
+        it = _pendingQueries.erase(it);
       }
       else
       {
@@ -2515,18 +2706,9 @@ inline void DnsTransport::cleanupExpiredQueries()
     }
   }
 
-  // Process ALL retries FIRST, then fire failures (item 4 / M-D ordering): retryQuery
-  // touches _timerService (scheduleAfter), and a failList callback may call stop() which
-  // nulls _timerService. Doing every _timerService-touching retry before any fail fire
-  // removes the null-deref hazard. retryQuery runs OUTSIDE _queriesMutex (it re-locks it
-  // via completeQuery on the retry-limit path).
-  for (auto &query : retryList)
-  {
-    retryQuery(query, "timeout");
-  }
-
   // Fire timeouts without holding any lock.
-  auto error = std::make_exception_ptr(DnsTimeoutException("Query timeout after maximum retries"));
+  auto error =
+    std::make_exception_ptr(DnsTimeoutException("DNS query timeout after maximum retries"));
   failCollected(failList, error);
 
   if (!failList.empty())
@@ -2536,12 +2718,14 @@ inline void DnsTransport::cleanupExpiredQueries()
   }
 }
 
-inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const std::string &reason)
+inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, int preClaimIndex,
+                                     const std::string &reason)
 {
-  // Defensive (M-D): if the timer service is gone (stop() in progress / a prior fail
-  // callback called stop()), do not touch it -- leave the query in the map for stop()'s
-  // drain to fail. This makes the cleanup retryList-before-failList ordering robust.
-  // INV-2 snapshots: one timer handle + one config for this retry.
+  // The caller has already CLAIMED this retry under _queriesMutex (retryCount incremented,
+  // startTime reset, retryClaimed=true). This helper only computes the backoff and schedules the
+  // delayed resend -- NO counter/epoch mutation, NO retry-limit branch (the claim owns that).
+  // Defensive (M-D/E): if the timer service is gone (stop() in progress), leave the query in the
+  // map for stop()'s drain / the orphan-backstop sweep to fail. INV-2: one timer + one config.
   auto timer = loadTimer();
   if (!timer)
   {
@@ -2549,128 +2733,103 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, const 
   }
   auto cfg = loadConfig();
 
-  if (query->retryCount.load() >= cfg->retryCount)
-  {
-    // Maximum retries exceeded, complete with error
-    // Log total attempts made (retryCount + 1 = initial attempt + retries)
-    iora::core::Logger::debug(
-      "DNS query retry limit exceeded: ID=" + std::to_string(query->queryId) +
-      " server=" + query->server + ":" + std::to_string(query->port) + " reason=" + reason +
-      " totalAttempts=" + std::to_string(query->retryCount.load() + 1));
-    auto error =
-      std::make_exception_ptr(DnsTimeoutException("Maximum retries exceeded: " + reason));
-    completeQuery(QueryKey(query->queryId, query->server, query->port), error);
-    return;
-  }
+  // Exponential backoff from the PRE-claim attempt index, so the first retry uses exponent 0
+  // (baseDelay == initialRetryDelay); the claim's increment must not shift the first tier. The
+  // shared helper caps every step (no overflow) and keeps this consistent with the sync-wait budget.
+  auto baseDelay = backoffDelayForAttempt(cfg->initialRetryDelay, preClaimIndex, cfg->retryMultiplier,
+                                          cfg->maxRetryDelay);
 
-  // Calculate exponential backoff delay with jitter
-  auto baseDelay = cfg->initialRetryDelay;
-  for (int i = 0; i < query->retryCount.load(); ++i)
-  {
-    baseDelay =
-      std::chrono::milliseconds(static_cast<long>(baseDelay.count() * cfg->retryMultiplier));
-  }
-
-  // Cap at maximum delay
-  if (baseDelay > cfg->maxRetryDelay)
-  {
-    baseDelay = cfg->maxRetryDelay;
-  }
-
-  // Add jitter to prevent thundering herd. Draw under _rngMutex (TS-HIGH-1): the resurrect
-  // window can transiently overlap two cleanup sweepers, and a concurrent draw from the
-  // non-atomic mt19937 would be a data race. The lock scopes ONLY the draw (an innermost
-  // leaf), not the schedule below.
+  // Add jitter to prevent thundering herd. Draw under _rngMutex (the non-atomic mt19937 must not
+  // be drawn concurrently); the lock scopes ONLY the draw (an innermost leaf).
   if (cfg->jitterFactor > 0.0)
   {
     std::uniform_real_distribution<double> dis(1.0 - cfg->jitterFactor, 1.0 + cfg->jitterFactor);
-
     double jitter;
     {
       std::lock_guard<std::mutex> rngLock(_rngMutex);
       jitter = dis(_rng);
     }
-    baseDelay = std::chrono::milliseconds(static_cast<long>(baseDelay.count() * jitter));
+    baseDelay = std::chrono::milliseconds(
+      static_cast<std::chrono::milliseconds::rep>(baseDelay.count() * jitter));
+    // Re-clamp AFTER jitter (V-L1): positive jitter can push the delay past maxRetryDelay, which is
+    // meant as a hard ceiling on the scheduled delay, not just on the pre-jitter base.
+    if (baseDelay > cfg->maxRetryDelay)
+    {
+      baseDelay = cfg->maxRetryDelay;
+    }
   }
 
-  // Reset the expiry clock at retry-scheduling time (item G / cpp17-LOW-2): the query
-  // stays in _pendingQueries during the backoff, so without this the NEXT cleanup sweep
-  // (which fires when now - startTime > timeout) would re-expire it before the scheduled
-  // re-send runs and burn retryCount prematurely. The retry lambda refreshes startTime
-  // again when it actually re-sends (post-backoff).
-  query->startTime.store(std::chrono::steady_clock::now());
-
-  // Increment retry count atomically
-  int newRetryCount = query->retryCount.fetch_add(1) + 1;
-
-  // Log the upcoming attempt number (retryCount + 1 = initial + retries)
   iora::core::Logger::debug("DNS query retry scheduled: ID=" + std::to_string(query->queryId) +
                             " server=" + query->server + ":" + std::to_string(query->port) +
                             " reason=" + reason +
-                            " upcomingAttempt=" + std::to_string(newRetryCount + 1) +
+                            " upcomingAttempt=" + std::to_string(preClaimIndex + 2) +
                             " delay=" + std::to_string(baseDelay.count()) + "ms");
 
-  // Schedule retry after delay using timer service (avoids sleeping in worker threads).
-  // Weak capture (item 10) to avoid the DnsTransport -> _timerService -> lambda -> self cycle.
+  // Schedule the resend after the backoff (no sleeping in worker threads). Weak capture avoids
+  // the DnsTransport -> _timerService -> lambda -> self cycle.
   std::weak_ptr<DnsTransport> weakSelf = weak_from_this();
   std::uint64_t timerId = timer->scheduleAfter(
     baseDelay,
     [weakSelf, query]()
     {
       auto self = weakSelf.lock();
-      // Check if transport is still alive/running before accessing any members
       if (!self || !self->isRunning())
       {
         return; // Transport has been stopped/destroyed
       }
 
-      // Check if query is still valid (not completed/cancelled)
-      // SAFE: queryId, server, port are const fields, so QueryKey is always consistent
+      QueryKey key(query->queryId, query->server, query->port);
       {
         std::lock_guard<std::mutex> lock(self->_queriesMutex);
-        QueryKey key(query->queryId, query->server, query->port);
         auto it = self->_pendingQueries.find(key);
-        if (it == self->_pendingQueries.end())
+        if (it == self->_pendingQueries.end() || it->second != query)
         {
-          return; // Query already completed or cancelled
+          // Completed/cancelled during backoff, OR the key was reused by a new query instance
+          // (T2R-1): identity-check before resending so a stale backoff timer never sends a datagram
+          // on behalf of, or mis-correlates a response to, an unrelated same-key query.
+          return;
         }
+        if (query->tcpFallback)
+        {
+          return; // a TCP fallback took over during backoff; do not send a competing UDP retry
+        }
+        // This attempt is now going live: clear the claim so the NEXT timeout can retry again,
+        // and reset startTime so the timeout is measured from the actual (re)send.
+        query->retryClaimed = false;
+        query->startTime.store(std::chrono::steady_clock::now());
       }
 
-      // Update start time for timeout calculations (fixes retry/timeout race)
-      query->startTime.store(std::chrono::steady_clock::now());
-
-      // Retry the query
+      // Send OUTSIDE _queriesMutex (sendUdp/TcpQuery take _sessionsMutex and re-arm the timeout
+      // timer via scheduleQueryTimeout, which stores a fresh activeTimerId). Mirror the
+      // initial-send dispatch (queryAsync/queryMultiple): Both == UDP-first, so a Both-mode query
+      // still in its UDP phase RETRANSMITS over UDP (H-1, 2026-09-24-31: a bare `== UDP` test sent
+      // NOTHING for the default Both mode, leaving retries inert and stranding the query). A Both
+      // query that has already fallen back to TCP returns at the tcpFallback gate above, so this
+      // resend never competes with an in-flight fallback.
       try
       {
-        if (query->transportMode == DnsTransportMode::UDP)
-        {
-          self->sendUdpQuery(query);
-        }
-        else if (query->transportMode == DnsTransportMode::TCP)
+        if (query->transportMode == DnsTransportMode::TCP)
         {
           self->sendTcpQuery(query);
         }
-
-        // Atomic increment - no mutex needed
+        else
+        {
+          self->sendUdpQuery(query); // UDP and Both
+        }
         self->_stats.retries.fetch_add(1, std::memory_order_relaxed);
       }
       catch (const std::exception &e)
       {
-        // Retry failed, complete with error
         auto error =
           std::make_exception_ptr(DnsTransportException("Retry failed: " + std::string(e.what())));
-        self->completeQuery(QueryKey(query->queryId, query->server, query->port), error);
+        // Identity-checked completion (T2R-1): fail ONLY this query instance, never a new query that
+        // reused the 16-bit id at the same server:port between the lock release above and here.
+        self->completeQueryIfSame(query, error);
       }
-
-      // Do NOT clear activeTimerId here (M1 / cpp17-MED): on the SUCCESS path
-      // sendUdpQuery/sendTcpQuery -> scheduleQueryTimeout has just stored a FRESH timeout
-      // timer id into activeTimerId; a store(0) here would clobber it, leaving a live,
-      // un-cancellable timeout timer (completeQuery would read 0 and not cancel it). On the
-      // ERROR path completeQuery already claimed+cancelled the id via cancelActiveTimer, so
-      // clearing it here is redundant. Either way this store(0) is wrong -- removed.
     });
 
-  // Store timer ID for potential cancellation
+  // Store the backoff timer id so cancelActiveTimer/stop() can cancel it during the backoff and so
+  // the orphan-backstop sweep sees a live timer (activeTimerId != 0) and skips this query.
   query->activeTimerId.store(timerId, std::memory_order_relaxed);
 }
 
