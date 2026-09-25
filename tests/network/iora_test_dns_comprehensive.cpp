@@ -102,9 +102,10 @@ private:
 };
 
 /// \brief Run resolveServiceDomainAsync and block for the result (test helper).
+/// \param secure RFC 3263 §4.1 SIPS SIP-scoped secure resolution (defaulted false).
 inline ServiceResolutionResult
 resolveServiceBlocking(DnsClient &c, const std::string &domain,
-                       const std::vector<ServiceType> &preferred = {})
+                       const std::vector<ServiceType> &preferred = {}, bool secure = false)
 {
   // Hold the promise in a shared_ptr captured BY VALUE: if the 5s wait times out and this
   // function throws, the in-flight async op is not cancelled and may still fire the callback —
@@ -115,7 +116,7 @@ resolveServiceBlocking(DnsClient &c, const std::string &domain,
   c.resolveServiceDomainAsync(
     domain, [prom](const ServiceResolutionResult &r, const std::exception_ptr &)
     { prom->set_value(r); },
-    preferred);
+    preferred, secure);
   if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
   {
     throw std::runtime_error("async service resolve timed out: " + domain);
@@ -843,6 +844,335 @@ inline void append(std::vector<std::uint8_t> &m, std::initializer_list<std::uint
   m.insert(m.end(), b.begin(), b.end());
 }
 } // namespace
+
+// =============================================================================
+// RFC 3263 §4.1 SIPS / secure hard-filter tests (tracker 2026-09-25-12, slice b2)
+// =============================================================================
+
+namespace
+{
+/// \brief True if any target uses a non-SIPS-SIP (plaintext or non-SIP) transport.
+inline bool hasInsecureTarget(const ServiceResolutionResult &r)
+{
+  for (const auto &t : r.targets)
+  {
+    if (t.transport != ServiceType::SIPS_TLS && t.transport != ServiceType::SIPS_SCTP &&
+        t.transport != ServiceType::SIPS_WSS)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// \brief Assert every target is a SIPS_TLS/5061 target and none is plaintext.
+inline void checkAllTls5061(const ServiceResolutionResult &r)
+{
+  REQUIRE_FALSE(r.targets.empty());
+  CHECK_FALSE(hasInsecureTarget(r));
+  for (const auto &t : r.targets)
+  {
+    CHECK(t.transport == ServiceType::SIPS_TLS);
+    CHECK(t.port == 5061);
+  }
+}
+
+/// \brief Build a NAPTR record for the mock server (flags default to 'S').
+inline MockDnsServer::DnsRecord naptr(const std::string &name, std::uint16_t order,
+                                      std::uint16_t pref, const std::string &service,
+                                      const std::string &replacement,
+                                      const std::string &flags = "S")
+{
+  MockDnsServer::DnsRecord rec;
+  rec.name = name;
+  rec.type = "NAPTR";
+  rec.naptrOrder = order;
+  rec.naptrPreference = pref;
+  rec.naptrFlags = flags;
+  rec.naptrService = service;
+  rec.naptrReplacement = replacement;
+  return rec;
+}
+} // namespace
+
+TEST_CASE_METHOD(DnsTestFixture, "DNS SIPS secure hard-filter (RFC 3263 4.1)",
+                 "[dns][srv][sips][secure][rfc3263]")
+{
+  startServer();
+
+  SECTION("Direct-SRV mixed preferredTransports: only _sips._tcp, zero plaintext (H-A)")
+  {
+    server().addRecord({"_sips._tcp.mix.example.com", "SRV", "tls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_sip._udp.mix.example.com", "SRV", "udp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._tcp.mix.example.com", "SRV", "tcp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"tls.example.com", "A", "192.168.2.1", 3600});
+    server().addRecord({"udp.example.com", "A", "192.168.2.2", 3600});
+    server().addRecord({"tcp.example.com", "A", "192.168.2.3", 3600});
+
+    const std::vector<ServiceType> pref{ServiceType::SIP_UDP, ServiceType::SIP_TCP,
+                                        ServiceType::SIPS_TLS};
+    checkAllTls5061(client().resolveServiceDomain("mix.example.com", pref, /*secure=*/true)); // sync
+    checkAllTls5061(resolveServiceBlocking(client(), "mix.example.com", pref, /*secure=*/true));
+  }
+
+  SECTION("NAPTR HTTPS+D2T is discarded for a sips: resolution (H-fold-1, 4.1)")
+  {
+    server().addRecord(
+      naptr("svc.example.com", 10, 10, "SIPS+D2T", "_sips._tcp.svc.example.com"));
+    server().addRecord(
+      naptr("svc.example.com", 10, 20, "HTTPS+D2T", "_https._tcp.svc.example.com"));
+    server().addRecord({"_sips._tcp.svc.example.com", "SRV", "tls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_https._tcp.svc.example.com", "SRV", "web.example.com", 3600, 10, 0, 443});
+    server().addRecord({"tls.example.com", "A", "192.168.2.10", 3600});
+    server().addRecord({"web.example.com", "A", "192.168.2.11", 3600});
+
+    auto r = client().resolveServiceDomain("svc.example.com", {}, /*secure=*/true);
+    REQUIRE_FALSE(r.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(r));
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIPS_TLS);
+      CHECK(t.hostname != "web.example.com");
+    }
+  }
+
+  SECTION("NAPTR SIPS+D2S discarded when client supports only SIPS_TLS (M-fold-1, 4.1 support)")
+  {
+    server().addRecord(
+      naptr("sctp.example.com", 10, 10, "SIPS+D2S", "_sips._sctp.sctp.example.com"));
+    server().addRecord(
+      naptr("sctp.example.com", 10, 20, "SIPS+D2T", "_sips._tcp.sctp.example.com"));
+    server().addRecord(
+      {"_sips._sctp.sctp.example.com", "SRV", "sctp1.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_sips._tcp.sctp.example.com", "SRV", "tls1.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"sctp1.example.com", "A", "192.168.2.20", 3600});
+    server().addRecord({"tls1.example.com", "A", "192.168.2.21", 3600});
+
+    auto r = client().resolveServiceDomain("sctp.example.com", {ServiceType::SIPS_TLS}, true);
+    REQUIRE_FALSE(r.targets.empty());
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIPS_TLS);
+      CHECK(t.transport != ServiceType::SIPS_SCTP);
+    }
+  }
+
+  SECTION("Secure fallback: no SRV -> TLS/5061 A-fallback, never plaintext (4.1)")
+  {
+    server().addRecord({"fallback.example.com", "A", "192.168.2.30", 3600});
+    checkAllTls5061(client().resolveServiceDomain("fallback.example.com", {}, true));
+  }
+
+  SECTION("Secure fallback on the ASYNC path -> TLS/5061, zero plaintext (L-1)")
+  {
+    server().addRecord({"afallback.example.com", "A", "192.168.2.31", 3600});
+    checkAllTls5061(resolveServiceBlocking(client(), "afallback.example.com", {}, /*secure=*/true));
+  }
+
+  SECTION("Owner-name mapping: SIPS_SCTP preference queries _sips._sctp (M-b)")
+  {
+    server().addRecord(
+      {"_sips._sctp.osctp.example.com", "SRV", "sctpx.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"sctpx.example.com", "A", "192.168.2.40", 3600});
+    auto r = client().resolveServiceDomain("osctp.example.com", {ServiceType::SIPS_SCTP}, true);
+    REQUIRE_FALSE(r.targets.empty());
+    bool found = false;
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIPS_SCTP);
+      if (t.hostname == "sctpx.example.com")
+      {
+        found = true;
+      }
+    }
+    CHECK(found);
+  }
+
+  SECTION("Empty preferredTransports + secure on direct-SRV queries only _sips._tcp (L3)")
+  {
+    server().addRecord({"_sips._tcp.eps.example.com", "SRV", "epstls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_sip._udp.eps.example.com", "SRV", "epsudp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"epstls.example.com", "A", "192.168.2.50", 3600});
+    server().addRecord({"epsudp.example.com", "A", "192.168.2.51", 3600});
+    auto r = client().resolveServiceDomain("eps.example.com", {}, true);
+    REQUIRE_FALSE(r.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(r));
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIPS_TLS);
+    }
+  }
+
+  SECTION("Async custom-SRV + secure filters plaintext custom queries (cpp17 HIGH-1)")
+  {
+    server().addRecord(
+      {"_sips._tcp.cust.example.com", "SRV", "custtls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_sip._udp.cust.example.com", "SRV", "custudp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"custtls.example.com", "A", "192.168.2.60", 3600});
+    server().addRecord({"custudp.example.com", "A", "192.168.2.61", 3600});
+
+    std::vector<std::pair<std::string, ServiceType>> custom{
+      {"_sips._tcp.cust.example.com", ServiceType::SIPS_TLS},
+      {"_sip._udp.cust.example.com", ServiceType::SIP_UDP}};
+
+    auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+    auto fut = prom->get_future();
+    client().resolveCustomServiceDomainAsync(
+      "cust.example.com", custom,
+      [prom](const ServiceResolutionResult &r, const std::exception_ptr &) { prom->set_value(r); },
+      {}, /*secure=*/true);
+    REQUIRE(fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto r = fut.get();
+    REQUIRE_FALSE(r.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(r));
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIPS_TLS);
+    }
+  }
+
+  SECTION("Plain sip: supported-set discards an unsupported published transport (M-a)")
+  {
+    server().addRecord({"_sip._tcp.plain.example.com", "SRV", "ptcp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.plain.example.com", "SRV", "pudp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"ptcp.example.com", "A", "192.168.2.70", 3600});
+    server().addRecord({"pudp.example.com", "A", "192.168.2.71", 3600});
+    // Client supports only UDP -> the published TCP target must be DISCARDED, not trailing.
+    auto r = client().resolveServiceDomain("plain.example.com", {ServiceType::SIP_UDP});
+    REQUIRE_FALSE(r.targets.empty());
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIP_UDP);
+    }
+  }
+
+  SECTION("SIPS+D2U NAPTR yields no SIPS-over-UDP target (SIPS+D2U SHOULD NOT exist, 4.1)")
+  {
+    server().addRecord(
+      naptr("d2u.example.com", 10, 10, "SIPS+D2U", "_sips._udp.d2u.example.com"));
+    server().addRecord({"_sips._udp.d2u.example.com", "SRV", "x.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"x.example.com", "A", "192.168.2.80", 3600});
+    // Give the domain a bare A record so the secure fallback yields a NON-EMPTY TLS/5061
+    // set — the loop below is then a real (non-vacuous) check that the _sips._udp SRV host
+    // was never followed.
+    server().addRecord({"d2u.example.com", "A", "192.168.2.81", 3600});
+    // SIPS+D2U parses to Unknown -> discarded; the _sips._udp SRV is never queried; the
+    // resolution falls back to a TLS/5061 target on d2u.example.com's A record.
+    auto r = client().resolveServiceDomain("d2u.example.com", {}, true);
+    checkAllTls5061(r);
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.hostname != "x.example.com");
+    }
+  }
+
+  SECTION("Cache-hit secure resolution still filters plaintext (M1, steady-state 4.1)")
+  {
+    server().addRecord(
+      naptr("cache.example.com", 10, 10, "SIPS+D2T", "_sips._tcp.cache.example.com"));
+    server().addRecord(naptr("cache.example.com", 10, 20, "SIP+D2U", "_sip._udp.cache.example.com"));
+    server().addRecord({"_sips._tcp.cache.example.com", "SRV", "ctls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_sip._udp.cache.example.com", "SRV", "cudp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"ctls.example.com", "A", "192.168.2.90", 3600});
+    server().addRecord({"cudp.example.com", "A", "192.168.2.91", 3600});
+
+    // First resolution populates the NAPTR/SRV/A caches.
+    auto first = client().resolveServiceDomain("cache.example.com", {}, /*secure=*/true);
+    REQUIRE_FALSE(first.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(first));
+    // Second resolution takes the NAPTR cache hit -> processCachedServiceResolution(secure);
+    // the SIPS filter must still hold on the steady-state path.
+    auto second = client().resolveServiceDomain("cache.example.com", {}, /*secure=*/true);
+    REQUIRE_FALSE(second.targets.empty());
+    CHECK(second.fromCache);
+    CHECK_FALSE(hasInsecureTarget(second));
+    // Async cache path too.
+    auto asyncR = resolveServiceBlocking(client(), "cache.example.com", {}, /*secure=*/true);
+    REQUIRE_FALSE(asyncR.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(asyncR));
+  }
+
+  SECTION("Secure SRV '.' denial yields no target and no plaintext (M2, RFC 2782 + 4.1)")
+  {
+    // _sips._tcp explicitly denied ("."); no other secure service. The secure fallback must be
+    // suppressed for the denied service -> no target, and never a plaintext leak from the A record.
+    server().addRecord({"_sips._tcp.deny.example.com", "SRV", ".", 3600, 0, 0, 5060});
+    server().addRecord({"deny.example.com", "A", "192.168.2.100", 3600});
+    auto r = client().resolveServiceDomain("deny.example.com", {}, /*secure=*/true);
+    CHECK(r.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(r));
+  }
+
+  SECTION("Secure discard applies to an 'A'-flag NAPTR target too (M3, 4.1)")
+  {
+    // Mixed NAPTR: an 'S'-flag SIPS service + an 'A'-flag plaintext service. Under secure the
+    // plaintext direct-A target must be discarded, not just the SRV one.
+    server().addRecord(
+      naptr("aflag.example.com", 10, 10, "SIPS+D2T", "_sips._tcp.aflag.example.com"));
+    server().addRecord(
+      naptr("aflag.example.com", 10, 20, "SIP+D2U", "sipudp.aflag.example.com", /*flags=*/"A"));
+    server().addRecord({"_sips._tcp.aflag.example.com", "SRV", "atls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"atls.example.com", "A", "192.168.2.110", 3600});
+    server().addRecord({"sipudp.aflag.example.com", "A", "192.168.2.111", 3600});
+    auto r = client().resolveServiceDomain("aflag.example.com", {}, /*secure=*/true);
+    REQUIRE_FALSE(r.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(r));
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.hostname != "sipudp.aflag.example.com");
+    }
+  }
+
+  SECTION("resolveServiceDomainFuture under secure filters plaintext (M4)")
+  {
+    server().addRecord({"_sips._tcp.fut.example.com", "SRV", "futtls.example.com", 3600, 10, 0, 5061});
+    server().addRecord({"_sip._udp.fut.example.com", "SRV", "futudp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"futtls.example.com", "A", "192.168.2.120", 3600});
+    server().addRecord({"futudp.example.com", "A", "192.168.2.121", 3600});
+    auto cf = client().resolveServiceDomainFuture(
+      "fut.example.com", {ServiceType::SIP_UDP, ServiceType::SIPS_TLS}, /*secure=*/true);
+    REQUIRE(cf.future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    auto r = cf.future.get();
+    REQUIRE_FALSE(r.targets.empty());
+    CHECK_FALSE(hasInsecureTarget(r));
+  }
+
+  SECTION("Owner-name mapping: SIPS_WSS preference queries _sips._wss (M5, M-b)")
+  {
+    server().addRecord({"_sips._wss.owss.example.com", "SRV", "wssx.example.com", 3600, 10, 0, 443});
+    server().addRecord({"wssx.example.com", "A", "192.168.2.130", 3600});
+    auto r = client().resolveServiceDomain("owss.example.com", {ServiceType::SIPS_WSS}, true);
+    REQUIRE_FALSE(r.targets.empty());
+    bool found = false;
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIPS_WSS);
+      if (t.hostname == "wssx.example.com")
+      {
+        found = true;
+      }
+    }
+    CHECK(found);
+  }
+
+  SECTION("Plain sip: NAPTR path discards an unsupported published transport (M6, M-a parity)")
+  {
+    // NAPTR publishes SIP+D2U and SIP+D2S; client supports only UDP -> the SCTP service must be
+    // discarded on the NAPTR path (parity with the direct-SRV supported-set discard).
+    server().addRecord(naptr("pnaptr.example.com", 10, 10, "SIP+D2U", "_sip._udp.pnaptr.example.com"));
+    server().addRecord(naptr("pnaptr.example.com", 10, 20, "SIP+D2S", "_sip._sctp.pnaptr.example.com"));
+    server().addRecord({"_sip._udp.pnaptr.example.com", "SRV", "nudp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._sctp.pnaptr.example.com", "SRV", "nsctp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"nudp.example.com", "A", "192.168.2.140", 3600});
+    server().addRecord({"nsctp.example.com", "A", "192.168.2.141", 3600});
+    auto r = client().resolveServiceDomain("pnaptr.example.com", {ServiceType::SIP_UDP});
+    REQUIRE_FALSE(r.targets.empty());
+    for (const auto &t : r.targets)
+    {
+      CHECK(t.transport == ServiceType::SIP_UDP);
+    }
+  }
+}
 
 // Post-fix behavior of removing validateRdataSecurity (the bogus 0xC0 RDATA byte-scan +
 // A-record 192.[0-63].0.0 heuristic). RDATA is never compression-decoded, so a 0xC0 byte in

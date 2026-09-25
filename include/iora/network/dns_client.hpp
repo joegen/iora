@@ -285,11 +285,16 @@ public:
   /// \param preferredTransports Preferred transport types in order of preference
   /// \return Service resolution result with prioritized targets
   /// \throws dns::DnsResolverException on resolution failure
+  /// \param secure RFC 3263 §4.1 SIPS SIP-secure resolution (SIP-scoped: non-SIPS-SIP
+  ///        services incl. HTTPS are discarded; A/AAAA fallback defaults to TLS/5061).
+  ///        NOT generic transport security. Defaulted false; the SIP layer drives it true
+  ///        for a sips: URI.
   dns::ServiceResolutionResult
   resolveServiceDomain(const std::string &domain,
-                       const std::vector<dns::ServiceType> &preferredTransports = {})
+                       const std::vector<dns::ServiceType> &preferredTransports = {},
+                       bool secure = false)
   {
-    return _resolver->resolveServiceDomain(domain, preferredTransports);
+    return _resolver->resolveServiceDomain(domain, preferredTransports, secure);
   }
 
   /// \brief Seed the resolver's RNG for deterministic RFC 2782 weighted SRV ordering.
@@ -307,24 +312,28 @@ public:
   /// \param preferredTransports Preferred transport types in order of preference
   /// \return Service resolution result with prioritized targets
   /// \throws dns::DnsResolverException on resolution failure
+  /// \param secure SIP-scoped SIPS §4.1 resolution (see resolveServiceDomain); when true
+  ///        the custom SRV set is filtered to secure SIP services.
   dns::ServiceResolutionResult resolveCustomServiceDomain(
     const std::string &domain,
     const std::vector<std::pair<std::string, dns::ServiceType>> &srvQueries,
-    const std::vector<dns::ServiceType> &preferredTransports = {})
+    const std::vector<dns::ServiceType> &preferredTransports = {}, bool secure = false)
   {
     return _resolver->performDirectSrvResolution(domain, preferredTransports,
-                                                 std::make_optional(srvQueries));
+                                                 std::make_optional(srvQueries), secure);
   }
 
   /// \brief Resolve service domain asynchronously
   /// \param domain Service domain to resolve
   /// \param callback Callback function for result notification
   /// \param preferredTransports Preferred transport types in order of preference
+  /// \param secure SIP-scoped SIPS §4.1 resolution (see resolveServiceDomain).
   void resolveServiceDomainAsync(const std::string &domain,
                                  dns::DnsResolver::ServiceResolutionCallback callback,
-                                 const std::vector<dns::ServiceType> &preferredTransports = {})
+                                 const std::vector<dns::ServiceType> &preferredTransports = {},
+                                 bool secure = false)
   {
-    _resolver->resolveServiceDomainAsync(domain, callback, preferredTransports);
+    _resolver->resolveServiceDomainAsync(domain, callback, preferredTransports, secure);
   }
 
   /// \brief Resolve custom service domain asynchronously
@@ -332,23 +341,28 @@ public:
   /// \param srvQueries Custom SRV queries to try
   /// \param callback Callback function for result notification
   /// \param preferredTransports Preferred transport types in order of preference
+  /// \param secure SIP-scoped SIPS §4.1 resolution (see resolveServiceDomain); when true
+  ///        the custom SRV set is filtered to secure SIP services.
   void resolveCustomServiceDomainAsync(
     const std::string &domain,
     const std::vector<std::pair<std::string, dns::ServiceType>> &srvQueries,
     dns::DnsResolver::ServiceResolutionCallback callback,
-    const std::vector<dns::ServiceType> &preferredTransports = {})
+    const std::vector<dns::ServiceType> &preferredTransports = {}, bool secure = false)
   {
     _resolver->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
-                                               std::make_optional(srvQueries));
+                                               std::make_optional(srvQueries), secure);
   }
 
   /// \brief Resolve service domain and return future
   /// \param domain Service domain to resolve
   /// \param preferredTransports Preferred transport types in order of preference
+  /// \param secure SIP-scoped SIPS §4.1 resolution (see resolveServiceDomain); NOT generic
+  ///        transport security. Defaulted false.
   /// \return CancellableFuture containing service resolution result
   CancellableFuture<dns::ServiceResolutionResult>
   resolveServiceDomainFuture(const std::string &domain,
-                             const std::vector<dns::ServiceType> &preferredTransports = {})
+                             const std::vector<dns::ServiceType> &preferredTransports = {},
+                             bool secure = false)
   {
     auto state = std::make_shared<AsyncDnsRequest::RequestState>(domain);
     auto promise = std::make_shared<std::promise<dns::ServiceResolutionResult>>();
@@ -405,7 +419,7 @@ public:
         // Set completion flag after processing callback
         state->completed.store(true, std::memory_order_release);
       },
-      preferredTransports);
+      preferredTransports, secure);
 
     return make_cancellable_future(std::move(future), std::move(request), promise, promiseSet);
   }
@@ -707,9 +721,10 @@ public:
   /// \throws dns::DnsResolverException on resolution failure
   dns::SipResolutionResult
   resolveSipDomain(const std::string &domain,
-                   const std::vector<dns::SipServiceType> &preferredTransports = {})
+                   const std::vector<dns::SipServiceType> &preferredTransports = {},
+                   bool secure = false)
   {
-    return resolveServiceDomain(domain, preferredTransports);
+    return resolveServiceDomain(domain, preferredTransports, secure);
   }
 
   /// \brief Resolve SIP domain asynchronously
@@ -720,9 +735,9 @@ public:
   void resolveSipDomainAsync(
     const std::string &domain,
     std::function<void(const dns::SipResolutionResult &, const std::exception_ptr &)> callback,
-    const std::vector<dns::SipServiceType> &preferredTransports = {})
+    const std::vector<dns::SipServiceType> &preferredTransports = {}, bool secure = false)
   {
-    resolveServiceDomainAsync(domain, callback, preferredTransports);
+    resolveServiceDomainAsync(domain, callback, preferredTransports, secure);
   }
 
   /// \brief Check if caching is enabled

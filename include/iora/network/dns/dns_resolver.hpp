@@ -42,6 +42,26 @@ enum class ServiceType
   Unknown    ///< Unknown or unsupported service
 };
 
+/// \brief Generic "secure transport" predicate — the single source of truth for
+/// ServiceTarget::isSecure(). Includes HTTPS_TCP (secure but non-SIP), so it is
+/// NOT suitable for the RFC 3263 §4.1 SIPS discard — use isSecureSipService for that.
+/// Declared before ServiceTarget so its inline isSecure() body can call it.
+inline bool isSecureService(ServiceType transport)
+{
+  return transport == ServiceType::SIPS_TLS || transport == ServiceType::SIPS_SCTP ||
+         transport == ServiceType::SIPS_WSS || transport == ServiceType::HTTPS_TCP;
+}
+
+/// \brief SIP-scoped secure predicate (SIPS_TLS/SIPS_SCTP/SIPS_WSS only, EXCLUDES
+/// HTTPS_TCP). RFC 3263 §4.1 requires the service-field protocol to be SIPS, so a
+/// secure SIP resolution must discard non-SIP encrypted services (e.g. HTTPS+D2T).
+/// This is the predicate every secure §4.1 discard/filter uses.
+inline bool isSecureSipService(ServiceType transport)
+{
+  return transport == ServiceType::SIPS_TLS || transport == ServiceType::SIPS_SCTP ||
+         transport == ServiceType::SIPS_WSS;
+}
+
 /// \brief Resolved service target with all connection details
 struct ServiceTarget
 {
@@ -85,12 +105,9 @@ struct ServiceTarget
     }
   }
 
-  /// \brief Check if this is a secure transport
-  bool isSecure() const
-  {
-    return transport == ServiceType::SIPS_TLS || transport == ServiceType::SIPS_SCTP ||
-           transport == ServiceType::SIPS_WSS || transport == ServiceType::HTTPS_TCP;
-  }
+  /// \brief Check if this is a secure transport (generic; delegates to the single
+  /// source of truth isSecureService — includes HTTPS_TCP).
+  bool isSecure() const { return isSecureService(transport); }
 };
 
 /// \brief NAPTR 'S' flag target — SRV domain name for SRV resolution
@@ -284,11 +301,17 @@ public:
   /// \brief Resolve service domain using RFC 3263 NAPTR→SRV→A/AAAA procedure
   /// \param domain Service domain to resolve (e.g., "example.com", "sip.example.com")
   /// \param preferredTransports Preferred transport types in order of preference
+  /// \param secure RFC 3263 §4.1 SIPS SIP-secure resolution: when true, every path
+  ///        discards non-SIPS-SIP services (isSecureSipService) and the A/AAAA fallback
+  ///        defaults to TLS/5061. This means SIP-secure, NOT generic transport security
+  ///        (HTTPS_TCP targets are discarded). Defaulted false; the SIP layer
+  ///        (iora_sip SipDnsAdapter) drives it true for a sips: URI.
   /// \return Service resolution result with prioritized targets
   /// \throws DnsResolverException on resolution failure
   ServiceResolutionResult
   resolveServiceDomain(const std::string &domain,
-                       const std::vector<ServiceType> &preferredTransports = {})
+                       const std::vector<ServiceType> &preferredTransports = {},
+                       bool secure = false)
   {
     // Validate input domain
     if (!validateHostname(domain))
@@ -306,7 +329,7 @@ public:
         iora::core::Logger::debug("DNS service resolution cache hit for domain: " + domain);
         ServiceResolutionResult result(domain);
         result.fromCache = true;
-        processCachedServiceResolution(result, naptrResult, preferredTransports);
+        processCachedServiceResolution(result, naptrResult, preferredTransports, secure);
         if (result.isSuccess())
         {
           return result;
@@ -327,7 +350,7 @@ public:
     iora::core::Logger::debug("DNS starting fresh service resolution for domain: " + domain);
     auto startTime = std::chrono::steady_clock::now();
 
-    auto result = performServiceResolution(domain, preferredTransports);
+    auto result = performServiceResolution(domain, preferredTransports, secure);
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - startTime)
@@ -345,8 +368,12 @@ public:
   /// \param domain Service domain to resolve
   /// \param callback Callback function for result notification
   /// \param preferredTransports Preferred transport types in order of preference
+  /// \param secure RFC 3263 §4.1 SIPS SIP-scoped secure resolution (non-SIPS-SIP services,
+  ///        incl. HTTPS, are discarded; A/AAAA fallback defaults to TLS/5061); NOT generic
+  ///        transport security. Defaulted false; the SIP layer drives it true for sips:.
   void resolveServiceDomainAsync(const std::string &domain, ServiceResolutionCallback callback,
-                                 const std::vector<ServiceType> &preferredTransports = {})
+                                 const std::vector<ServiceType> &preferredTransports = {},
+                                 bool secure = false)
   {
     // Check cache first
     if (_cache)
@@ -360,7 +387,7 @@ public:
         {
           ServiceResolutionResult result(domain);
           result.fromCache = true;
-          processCachedServiceResolution(result, naptrResult, preferredTransports);
+          processCachedServiceResolution(result, naptrResult, preferredTransports, secure);
           if (result.isSuccess())
           {
             callback(result, nullptr);
@@ -394,6 +421,8 @@ public:
       domain,
       [domain, startTime, callback](const ServiceResolutionResult &result, std::exception_ptr error)
       {
+        // (secure is applied inside performServiceResolutionAsync; this logging wrapper
+        // does not re-filter.)
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - *startTime)
                           .count();
@@ -413,7 +442,7 @@ public:
 
         callback(result, error);
       },
-      preferredTransports);
+      preferredTransports, secure);
   }
 
   /// \brief Perform standard DNS query
@@ -648,15 +677,18 @@ public:
   /// \param preferredTransports Preferred transport types
   /// \param srvQueries Custom SRV queries to perform (defaults to SIP services for backward
   /// compatibility)
+  /// \param secure RFC 3263 §4.1 SIPS SIP-scoped secure resolution (custom set filtered to
+  ///        secure SIP services; non-SIPS-SIP discarded); NOT generic transport security.
   /// \return Service resolution result
   ServiceResolutionResult performDirectSrvResolution(
     const std::string &domain, const std::vector<ServiceType> &preferredTransports,
     const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries =
-      std::nullopt)
+      std::nullopt,
+    bool secure = false)
   {
     ServiceResolutionResult result(domain);
 
-    auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports);
+    auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports, secure);
 
     // Query SRV records. Track which services returned an RFC 2782 "." abort so the
     // A/AAAA fallback is suppressed per-service (not domain-wide).
@@ -699,13 +731,13 @@ public:
     if (!result.targets.empty())
     {
       resolveTargetAddresses(result);
-      sortTargetsByPriority(result);
+      sortTargetsByPriority(result, secure);
     }
     else
     {
       // No SRV targets: fall back to A/AAAA on the domain for the transports that
       // were NOT explicitly declared unavailable by an SRV "." (RFC 2782).
-      performFallbackResolution(domain, result, preferredTransports, deniedServices);
+      performFallbackResolution(domain, result, preferredTransports, deniedServices, secure);
     }
 
     return result;
@@ -717,13 +749,16 @@ public:
   /// \param preferredTransports Preferred transport types
   /// \param srvQueries Custom SRV queries to perform (defaults to SIP services for backward
   /// compatibility)
+  /// \param secure RFC 3263 §4.1 SIPS SIP-scoped secure resolution (custom set filtered to
+  ///        secure SIP services; non-SIPS-SIP discarded); NOT generic transport security.
   void performDirectSrvResolutionAsync(
     const std::string &domain, ServiceResolutionCallback callback,
     const std::vector<ServiceType> &preferredTransports,
     const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries =
-      std::nullopt)
+      std::nullopt,
+    bool secure = false)
   {
-    auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports);
+    auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports, secure);
 
     auto result = std::make_shared<ServiceResolutionResult>(domain);
 
@@ -732,7 +767,7 @@ public:
     // the sync path and fall back directly.
     if (actualSrvQueries.empty())
     {
-      performFallbackResolutionAsync(domain, result, callback, preferredTransports, {});
+      performFallbackResolutionAsync(domain, result, callback, preferredTransports, {}, secure);
       return;
     }
 
@@ -760,8 +795,8 @@ public:
       _transport->queryAsync(
         srvQuestion,
         [self, result, service, transportRank, remainingQueries, callbackFired, resultMutex,
-         deniedServices, callback, domain, preferredTransports](const DnsResult &srvResult,
-                                                                const std::exception_ptr &srvError)
+         deniedServices, callback, domain, preferredTransports, secure](
+          const DnsResult &srvResult, const std::exception_ptr &srvError)
         {
           if (!srvError)
           {
@@ -787,7 +822,7 @@ public:
           {
             if (!result->targets.empty())
             {
-              self->resolveTargetAddressesAsync(result, callback);
+              self->resolveTargetAddressesAsync(result, callback, secure);
             }
             else
             {
@@ -796,7 +831,7 @@ public:
               // denied, performFallbackResolutionAsync yields an empty result and
               // still fires the callback exactly once.
               self->performFallbackResolutionAsync(domain, result, callback, preferredTransports,
-                                                   *deniedServices);
+                                                   *deniedServices, secure);
             }
           }
         });
@@ -1035,17 +1070,19 @@ private:
   /// \brief Perform complete service resolution (NAPTR -> SRV -> A/AAAA)
   /// \param domain Domain to resolve
   /// \param preferredTransports Preferred transport types
+  /// \param secure RFC 3263 §4.1 SIPS SIP-scoped secure resolution; NOT generic transport
+  ///        security.
   /// \return Service resolution result
   ServiceResolutionResult
   performServiceResolution(const std::string &domain,
-                           const std::vector<ServiceType> &preferredTransports)
+                           const std::vector<ServiceType> &preferredTransports, bool secure = false)
   {
     ServiceResolutionResult result(domain);
 
     // Every NAPTR-failure and no-usable-NAPTR path converges on the same RFC 3263
     // §4.1 direct-SRV fallback, so name it once (review L-f).
     auto fallbackToDirectSrv = [&]()
-    { return performDirectSrvResolution(domain, preferredTransports, std::nullopt); };
+    { return performDirectSrvResolution(domain, preferredTransports, std::nullopt, secure); };
 
     // Step 1: Query NAPTR records
     std::vector<NaptrRecord> naptrRecords;
@@ -1080,7 +1117,7 @@ private:
     // out-of-scope concern (flagged for a later review).
     std::vector<NaptrSrvTarget> srvTargets;
     std::vector<NaptrDirectTarget> aTargets;
-    processNaptrRecords(naptrRecords, srvTargets, aTargets, preferredTransports);
+    processNaptrRecords(naptrRecords, srvTargets, aTargets, preferredTransports, secure);
 
     // NAPTR present but no usable target (all records unknown-service, filtered
     // by preferredTransports, or invalid replacement across every ORDER tier):
@@ -1133,8 +1170,9 @@ private:
     // Step 4: Resolve hostnames to IP addresses
     resolveTargetAddresses(result);
 
-    // Step 5: Sort targets by priority
-    sortTargetsByPriority(result);
+    // Step 5: Sort targets by priority (and, when secure, discard any non-SIPS-SIP
+    // target as belt-and-suspenders — the primary NAPTR/SRV filters already excluded them).
+    sortTargetsByPriority(result, secure);
 
     return result;
   }
@@ -1144,7 +1182,8 @@ private:
   /// \param callback Result callback
   /// \param preferredTransports Preferred transport types
   void performServiceResolutionAsync(const std::string &domain, ServiceResolutionCallback callback,
-                                     const std::vector<ServiceType> &preferredTransports)
+                                     const std::vector<ServiceType> &preferredTransports,
+                                     bool secure = false)
   {
     // Step 1: Start with async NAPTR query
     DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
@@ -1152,13 +1191,14 @@ private:
     auto self = shared_from_this();
     _transport->queryAsync(
       naptrQuestion,
-      [self, domain, callback, preferredTransports](const DnsResult &naptrResult,
-                                                    const std::exception_ptr &naptrError)
+      [self, domain, callback, preferredTransports, secure](const DnsResult &naptrResult,
+                                                            const std::exception_ptr &naptrError)
       {
         if (naptrError)
         {
           // No NAPTR records, try direct SRV resolution
-          self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt);
+          self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt,
+                                                secure);
           return;
         }
 
@@ -1167,7 +1207,8 @@ private:
         std::vector<NaptrDirectTarget> aTargets;
         try
         {
-          self->processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets, preferredTransports);
+          self->processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets,
+                                    preferredTransports, secure);
         }
         catch (const std::exception &e)
         {
@@ -1178,7 +1219,8 @@ private:
         if (srvTargets.empty() && aTargets.empty())
         {
           // No valid targets, try direct SRV resolution
-          self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt);
+          self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt,
+                                                secure);
           return;
         }
 
@@ -1201,7 +1243,7 @@ private:
         if (srvTargets.empty())
         {
           // Only A-flag targets — resolve addresses and return
-          self->resolveTargetAddressesAsync(result, callback);
+          self->resolveTargetAddressesAsync(result, callback, secure);
           return;
         }
 
@@ -1220,7 +1262,7 @@ private:
           self->_transport->queryAsync(
             srvQuestion,
             [self, result, service, naptrPref, remainingQueries, callbackFired, resultMutex,
-             callback](const DnsResult &srvResult, const std::exception_ptr &srvError)
+             callback, secure](const DnsResult &srvResult, const std::exception_ptr &srvError)
             {
               if (!srvError)
               {
@@ -1241,7 +1283,7 @@ private:
                   !callbackFired->exchange(true))
               {
                 // All SRV queries done, now resolve hostnames asynchronously
-                self->resolveTargetAddressesAsync(result, callback);
+                self->resolveTargetAddressesAsync(result, callback, secure);
               }
             });
         }
@@ -1253,12 +1295,13 @@ private:
   /// \param naptrResult Cached NAPTR result
   /// \param preferredTransports Preferred transport types
   void processCachedServiceResolution(ServiceResolutionResult &result, const DnsResult &naptrResult,
-                                      const std::vector<ServiceType> &preferredTransports)
+                                      const std::vector<ServiceType> &preferredTransports,
+                                      bool secure = false)
   {
     // Step 1: Process NAPTR records to get SRV and direct-A targets
     std::vector<NaptrSrvTarget> srvTargets;
     std::vector<NaptrDirectTarget> aTargets;
-    processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets, preferredTransports);
+    processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets, preferredTransports, secure);
 
     if (srvTargets.empty() && aTargets.empty())
     {
@@ -1335,8 +1378,8 @@ private:
                                         { return target.addresses.empty(); }),
                          result.targets.end());
 
-    // Step 5: Sort targets by priority
-    sortTargetsByPriority(result);
+    // Step 5: Sort targets by priority (secure belt-discard as defense-in-depth)
+    sortTargetsByPriority(result, secure);
   }
 
   /// \brief Process NAPTR records to extract SRV and direct-A targets
@@ -1347,7 +1390,8 @@ private:
   void processNaptrRecords(const std::vector<NaptrRecord> &naptrRecords,
                            std::vector<NaptrSrvTarget> &srvTargets,
                            std::vector<NaptrDirectTarget> &aTargets,
-                           const std::vector<ServiceType> &preferredTransports)
+                           const std::vector<ServiceType> &preferredTransports,
+                           bool secure = false)
   {
     if (naptrRecords.empty())
     {
@@ -1393,14 +1437,26 @@ private:
         continue;
       }
 
-      // Check if this service type is preferred (if preferences specified)
-      if (!preferredTransports.empty())
+      const bool inPreferred =
+        preferredTransports.empty() ||
+        std::find(preferredTransports.begin(), preferredTransports.end(), service) !=
+          preferredTransports.end();
+      if (secure)
       {
-        if (std::find(preferredTransports.begin(), preferredTransports.end(), service) ==
-            preferredTransports.end())
+        // RFC 3263 §4.1: a client resolving a SIPS URI MUST discard any service whose
+        // protocol is not SIPS (SIP-scoped — HTTPS+D2T and any non-SIP service are
+        // dropped), AND discard SIPS+D2X for a transport X the client does not support.
+        // This discard is UNCONDITIONAL (not gated on preferredTransports being non-empty).
+        if (!isSecureSipService(service) || !inPreferred)
         {
-          continue; // Skip non-preferred transports
+          continue;
         }
+      }
+      else if (!inPreferred)
+      {
+        // Plain sip: supported-set model — discard published transports the client
+        // does not support (preferredTransports is the client's supported set).
+        continue; // Skip non-supported transports
       }
 
       // Skip records with empty or terminal-dot replacement
@@ -1440,18 +1496,76 @@ private:
   /// \param srvRecords SRV records to process
   /// \param service Service type for these records
   /// \param result Result to populate
+  /// \brief The client's secure SIP transport set (RFC 3263 §4.1): preferredTransports
+  /// filtered to secure SIP services, defaulting to {SIPS_TLS} when the caller named no
+  /// secure transport. Shared by the default-set SRV query builder (owner-name mapping)
+  /// and the A/AAAA-fallback transport list so the §4.1 secure-default rule lives once.
+  std::vector<ServiceType>
+  secureSupportedOrDefault(const std::vector<ServiceType> &preferredTransports) const
+  {
+    std::vector<ServiceType> secure;
+    std::copy_if(preferredTransports.begin(), preferredTransports.end(),
+                 std::back_inserter(secure), isSecureSipService);
+    if (secure.empty())
+    {
+      secure.push_back(ServiceType::SIPS_TLS);
+    }
+    return secure;
+  }
+
+  /// \brief Map a secure SIP transport to its RFC 3263 SRV owner name.
+  /// Only _sips._tcp is RFC 3263-normative; _sips._sctp and _sips._wss are de-facto
+  /// convention — RFC 4168 (SIPS+D2S) and RFC 7118 §5 (SIPS+D2W, wss default port 443)
+  /// define the NAPTR services but defer SRV mechanics to RFC 3263 and mandate no
+  /// owner-name string. Never _sips._udp: SIPS+D2U SHOULD NOT exist (RFC 3263 §4.1).
+  static std::string secureSrvOwnerName(ServiceType transport, const std::string &domain)
+  {
+    switch (transport)
+    {
+    case ServiceType::SIPS_SCTP:
+      return "_sips._sctp." + domain;
+    case ServiceType::SIPS_WSS:
+      return "_sips._wss." + domain;
+    case ServiceType::SIPS_TLS:
+    default:
+      return "_sips._tcp." + domain;
+    }
+  }
+
   /// \brief Build the SRV query list (custom, or the default SIP service set) and
   /// order it by the caller's preferred transports. Shared by the sync and async
   /// direct-SRV paths so the query set and ordering are defined once.
   std::vector<std::pair<std::string, ServiceType>> buildOrderedSrvQueries(
     const std::string &domain,
     const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries,
-    const std::vector<ServiceType> &preferredTransports) const
+    const std::vector<ServiceType> &preferredTransports, bool secure = false) const
   {
     std::vector<std::pair<std::string, ServiceType>> actualSrvQueries;
     if (srvQueries.has_value())
     {
       actualSrvQueries = srvQueries.value();
+      if (secure)
+      {
+        // Custom set + secure (RFC 3263 §4.1): filter the caller's set to secure SIP
+        // services — do NOT silently replace it.
+        actualSrvQueries.erase(
+          std::remove_if(actualSrvQueries.begin(), actualSrvQueries.end(),
+                         [](const std::pair<std::string, ServiceType> &q)
+                         { return !isSecureSipService(q.second); }),
+          actualSrvQueries.end());
+      }
+    }
+    else if (secure)
+    {
+      // Default set + secure: build the query set BY MAPPING each supported secure SIP
+      // transport to its _sips._<proto> owner name (RFC 3263 §4.1 — never query a
+      // plaintext service). Default to SIPS_TLS (_sips._tcp) when the caller named no
+      // secure transport. Owner names for sctp/wss are de-facto convention (see
+      // secureSrvOwnerName); _sips._udp is never emitted (SIPS+D2U SHOULD NOT exist).
+      for (ServiceType t : secureSupportedOrDefault(preferredTransports))
+      {
+        actualSrvQueries.push_back({secureSrvOwnerName(t, domain), t});
+      }
     }
     else
     {
@@ -1459,6 +1573,21 @@ private:
                           {"_sip._tcp." + domain, ServiceType::SIP_TCP},
                           {"_sip._udp." + domain, ServiceType::SIP_UDP},
                           {"_sip._sctp." + domain, ServiceType::SIP_SCTP}};
+      // Plain sip: supported-set model — discard DEFAULT-set queries whose transport the
+      // client does not support (preferredTransports is the supported set, RFC 3263 §4.1).
+      // Empty preferredTransports = permissive (backward-compatible no-constraint caller).
+      if (!preferredTransports.empty())
+      {
+        actualSrvQueries.erase(
+          std::remove_if(actualSrvQueries.begin(), actualSrvQueries.end(),
+                         [&preferredTransports](const std::pair<std::string, ServiceType> &q)
+                         {
+                           return std::find(preferredTransports.begin(),
+                                            preferredTransports.end(),
+                                            q.second) == preferredTransports.end();
+                         }),
+          actualSrvQueries.end());
+      }
     }
 
     if (!preferredTransports.empty())
@@ -1496,12 +1625,24 @@ private:
   /// unavailable (RFC 2782). An empty result means every candidate transport was
   /// denied, so no fallback target is produced.
   std::vector<ServiceType> fallbackTransports(const std::vector<ServiceType> &preferredTransports,
-                                              const std::vector<ServiceType> &deniedServices) const
+                                              const std::vector<ServiceType> &deniedServices,
+                                              bool secure = false) const
   {
-    std::vector<ServiceType> transports = preferredTransports;
-    if (transports.empty())
+    std::vector<ServiceType> transports;
+    if (secure)
     {
-      transports.push_back(ServiceType::SIP_UDP);
+      // RFC 3263 §4.1: "If no SRV records are found, the client SHOULD use TCP for a
+      // SIPS URI." FILTER-then-DEFAULT: keep only the client's secure SIP transports,
+      // and default to SIPS_TLS (TLS/5061) when none remain. NEVER a plaintext fallback.
+      transports = secureSupportedOrDefault(preferredTransports);
+    }
+    else
+    {
+      transports = preferredTransports;
+      if (transports.empty())
+      {
+        transports.push_back(ServiceType::SIP_UDP);
+      }
     }
     transports.erase(std::remove_if(transports.begin(), transports.end(),
                                     [&deniedServices](ServiceType t)
@@ -1674,8 +1815,25 @@ private:
   /// _rngMutex — advancing the master so successive/concurrent resolutions differ — then order
   /// UNLOCKED on the local generator. _rngMutex is a leaf lock (never held across a callback,
   /// never co-held with a result lock).
-  void sortTargetsByPriority(ServiceResolutionResult &result)
+  /// \brief Belt-and-suspenders: on a secure resolution, erase any target whose
+  /// transport is not a secure SIP service (RFC 3263 §4.1). No-op when not secure.
+  /// The primary NAPTR/SRV query filters already exclude these; this guards the
+  /// SRV/NAPTR/cache delivery paths that flow through sortTargetsByPriority.
+  void discardInsecure(ServiceResolutionResult &result, bool secure) const
   {
+    if (!secure)
+    {
+      return;
+    }
+    result.targets.erase(std::remove_if(result.targets.begin(), result.targets.end(),
+                                        [](const ServiceTarget &t)
+                                        { return !isSecureSipService(t.transport); }),
+                         result.targets.end());
+  }
+
+  void sortTargetsByPriority(ServiceResolutionResult &result, bool secure = false)
+  {
+    discardInsecure(result, secure);
     std::stable_sort(result.targets.begin(), result.targets.end(),
                      [](const ServiceTarget &a, const ServiceTarget &b)
                      {
@@ -1786,14 +1944,19 @@ private:
   /// \param domain Domain to resolve
   /// \param result Result to populate
   /// \param preferredTransports Preferred transport types
+  /// \param secure RFC 3263 §4.1 SIPS secure resolution: fallback yields TLS/5061, never
+  ///        plaintext. NOT generic transport security.
   void performFallbackResolution(const std::string &domain, ServiceResolutionResult &result,
                                  const std::vector<ServiceType> &preferredTransports,
-                                 const std::vector<ServiceType> &deniedServices = {})
+                                 const std::vector<ServiceType> &deniedServices = {},
+                                 bool secure = false)
   {
     try
     {
       // Transports to build fallback targets for, minus any SRV-"." denied service.
-      std::vector<ServiceType> transports = fallbackTransports(preferredTransports, deniedServices);
+      // When secure, fallbackTransports yields only SIPS transports (TLS/5061 default).
+      std::vector<ServiceType> transports =
+        fallbackTransports(preferredTransports, deniedServices, secure);
       if (transports.empty())
       {
         return; // Every candidate transport was declared unavailable (RFC 2782).
@@ -1818,11 +1981,14 @@ private:
                                       std::shared_ptr<ServiceResolutionResult> result,
                                       ServiceResolutionCallback callback,
                                       const std::vector<ServiceType> &preferredTransports,
-                                      const std::vector<ServiceType> &deniedServices = {})
+                                      const std::vector<ServiceType> &deniedServices = {},
+                                      bool secure = false)
   {
     // Transports to build fallback targets for, minus any SRV-"." denied service.
+    // When secure, fallbackTransports yields only SIPS transports (TLS/5061 default),
+    // so appendFallbackTargets below never produces a plaintext target — no belt needed.
     // If none remain, there is nothing to resolve — fire the callback immediately.
-    auto transportsToUse = fallbackTransports(preferredTransports, deniedServices);
+    auto transportsToUse = fallbackTransports(preferredTransports, deniedServices, secure);
     if (transportsToUse.empty())
     {
       callback(*result, nullptr);
@@ -1887,7 +2053,7 @@ private:
   /// \param result Result containing targets to resolve (must be shared_ptr for async safety)
   /// \param callback Result callback
   void resolveTargetAddressesAsync(std::shared_ptr<ServiceResolutionResult> result,
-                                   ServiceResolutionCallback callback)
+                                   ServiceResolutionCallback callback, bool secure = false)
   {
     if (result->targets.empty())
     {
@@ -1912,8 +2078,8 @@ private:
 
       _transport->queryAsync(
         aQuestion,
-        [self, targetIndex, initialTargetCount, remainingTargets, result, callback,
-         hostname](const DnsResult &aResult, const std::exception_ptr &aError)
+        [self, targetIndex, initialTargetCount, remainingTargets, result, callback, hostname,
+         secure](const DnsResult &aResult, const std::exception_ptr &aError)
         {
           // Safe bounds check using initial count (targets vector won't be modified until all
           // complete)
@@ -1932,8 +2098,8 @@ private:
 
             self->_transport->queryAsync(
               aaaaQuestion,
-              [self, targetIndex, initialTargetCount, remainingTargets, result,
-               callback](const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
+              [self, targetIndex, initialTargetCount, remainingTargets, result, callback,
+               secure](const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
               {
                 if (!aaaaError && targetIndex < initialTargetCount)
                 {
@@ -1953,7 +2119,7 @@ private:
                                    [](const ServiceTarget &t) { return t.addresses.empty(); }),
                     result->targets.end());
 
-                  self->sortTargetsByPriority(*result);
+                  self->sortTargetsByPriority(*result, secure);
 
                   callback(*result, nullptr);
                 }
@@ -1970,7 +2136,7 @@ private:
                                                    { return t.addresses.empty(); }),
                                     result->targets.end());
 
-              self->sortTargetsByPriority(*result);
+              self->sortTargetsByPriority(*result, secure);
 
               callback(*result, nullptr);
             }
