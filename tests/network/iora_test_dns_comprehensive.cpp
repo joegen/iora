@@ -167,6 +167,134 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Client AAAA Record Resolution", "[dns][bas
 }
 
 // =============================================================================
+// CATCH-SCOPE / PARTIAL-RESULTS REGRESSION TESTS (tracker 2026-09-24-29, slice a1)
+// The sync DnsResolver catch sites were broadened from DnsResolverException-only
+// to also catch DnsTransportException (incl. DnsTimeoutException) and
+// DnsParseException, so a timeout/transport/parse error on one query no longer
+// aborts the whole RFC 3263 resolution or discards already-collected results.
+//
+// Coverage notes (tracker step-0 residuals R2-M3 + steps-4-8 review):
+//  * The timeout injections below throw DnsTimeoutException, which derives from
+//    DnsTransportException, so they exercise the newly-added DnsTransportException
+//    catch clauses in resolveHostname (A/AAAA), performServiceResolution (NAPTR),
+//    and the direct-SRV / NAPTR-derived-SRV loops. All DnsTransportException
+//    subtypes share the identical catch body, so the DnsTimeoutException subclass
+//    suffices to prove a NON-timeout transport error also falls back rather than
+//    aborting (review L-a / tracker test #5).
+//  * The added DnsParseException catch clauses are DEFENSIVE and currently
+//    UNREACHABLE: the transport drops-and-waits on a malformed datagram
+//    (dns_transport.hpp:1804-1823, the -31 fix) so a parse failure surfaces as a
+//    timeout, not a DnsParseException. They are kept per the human's
+//    enumerate-the-three-types decision; there is intentionally no test for them
+//    (review M-a / R2-M3). The -31 drop-and-wait behavior itself is regression-
+//    guarded by -31's own suite and the parser tests in this file (review L-b).
+//  * Tracker test #6 (-10 validateRdataSecurity false-positive AAAA drop must not
+//    abort the sibling A) is UNCONSTRUCTABLE here: validateRdataSecurity has been
+//    fully removed from the DNS tree. The general sibling-isolation mechanism is
+//    covered by the dual-stack and SRV-sibling tests below (review M-b).
+//  * Assertions match on exception TYPE / behavior, never on exact timeout
+//    wording, which differs between the sync and async paths (review R2-L3).
+// =============================================================================
+
+namespace
+{
+/// \brief A DnsClient with a short timeout and no retries, pointed at the
+/// fixture's mock server, so timeout-injection tests finish quickly.
+/// Shared by the catch-scope regression tests and the "Very short timeout"
+/// error-handling section (review L-g).
+std::unique_ptr<DnsClient>
+makeFastTimeoutClient(std::chrono::milliseconds timeout = std::chrono::milliseconds(150))
+{
+  DnsConfig cfg;
+  cfg.setServers({"127.0.0.1:" + std::to_string(TEST_UDP_PORT)});
+  cfg.timeout = timeout;
+  cfg.retryCount = 0;
+  cfg.transportMode = DnsTransportMode::UDP;
+  cfg.enableCache = false;
+  return std::make_unique<DnsClient>(cfg);
+}
+} // namespace
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS resolveHostname keeps A results when AAAA times out",
+                 "[dns][resolver][catch-scope][regression][ipv6]")
+{
+  startServer();
+  server().addRecord({"dual.example.com", "A", "192.0.2.10", 3600});
+  // AAAA query for the SAME name times out (per-type injection).
+  MockDnsServer::QueryConfig aaaaTimeout;
+  aaaaTimeout.shouldTimeout = true;
+  server().configureQuery("dual.example.com", "AAAA", aaaaTimeout);
+
+  auto fast = makeFastTimeoutClient();
+  // IPv4First (default): before the fix the AAAA DnsTimeoutException escaped
+  // resolveHostname and discarded the already-collected A result -> this threw.
+  // After the fix the A result is retained and returned.
+  std::vector<std::string> addrs;
+  REQUIRE_NOTHROW(addrs = fast->resolveHostname("dual.example.com"));
+  REQUIRE(addrs.size() == 1);
+  CHECK(addrs[0] == "192.0.2.10");
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS NAPTR timeout falls back to direct SRV instead of aborting",
+                 "[dns][resolver][catch-scope][regression][rfc3263]")
+{
+  startServer();
+  // NAPTR for the domain times out; the direct-SRV records still resolve.
+  MockDnsServer::QueryConfig naptrTimeout;
+  naptrTimeout.shouldTimeout = true;
+  server().configureQuery("srvfallback.example.com", "NAPTR", naptrTimeout);
+  server().addRecord(
+    {"_sip._udp.srvfallback.example.com", "SRV", "sip1.srvfallback.example.com", 3600, 10, 5, 5060});
+  server().addRecord({"sip1.srvfallback.example.com", "A", "192.0.2.20", 3600});
+
+  auto fast = makeFastTimeoutClient();
+  // Before the fix the NAPTR DnsTimeoutException escaped the NAPTR catch and
+  // aborted resolution. After the fix it falls back to direct SRV (RFC 3263 4.1).
+  auto result = fast->resolveServiceDomain("srvfallback.example.com");
+  REQUIRE(result.isSuccess());
+  REQUIRE_FALSE(result.targets.empty());
+  bool found = false;
+  for (const auto &t : result.targets)
+  {
+    if (t.hostname == "sip1.srvfallback.example.com")
+    {
+      found = true;
+    }
+  }
+  CHECK(found);
+}
+
+TEST_CASE_METHOD(DnsTestFixture,
+                 "DNS one SRV set timing out does not abort sibling SRV sets",
+                 "[dns][resolver][catch-scope][regression][rfc3263]")
+{
+  startServer();
+  // No NAPTR configured -> direct-SRV path queries _sips._tcp/_sip._tcp/_sip._udp.
+  // Make the _sip._tcp SRV query time out; _sip._udp must still yield a target.
+  MockDnsServer::QueryConfig srvTimeout;
+  srvTimeout.shouldTimeout = true;
+  server().configureQuery("_sip._tcp.sibling.example.com", "SRV", srvTimeout);
+  server().addRecord(
+    {"_sip._udp.sibling.example.com", "SRV", "u.sibling.example.com", 3600, 10, 5, 5060});
+  server().addRecord({"u.sibling.example.com", "A", "192.0.2.30", 3600});
+
+  auto fast = makeFastTimeoutClient();
+  auto result = fast->resolveServiceDomain("sibling.example.com");
+  REQUIRE(result.isSuccess());
+  bool foundUdp = false;
+  for (const auto &t : result.targets)
+  {
+    if (t.hostname == "u.sibling.example.com")
+    {
+      foundUdp = true;
+    }
+  }
+  CHECK(foundUdp);
+}
+
+// =============================================================================
 // SERVICE DISCOVERY TESTS (RFC 3263)
 // =============================================================================
 
@@ -675,16 +803,10 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Error Handling", "[dns][error-handling]")
 
   SECTION("Very short timeout handling (50ms)")
   {
-    // Create a client with very short timeout to test transport layer timeout precision
-    DnsConfig shortTimeoutConfig;
-    std::vector<std::string> shortTimeoutServers = {"127.0.0.1:" + std::to_string(TEST_UDP_PORT)};
-    shortTimeoutConfig.setServers(shortTimeoutServers);
-    shortTimeoutConfig.timeout = std::chrono::milliseconds(50); // Very short timeout
-    shortTimeoutConfig.retryCount = 0; // No retries to ensure we test raw timeout
-    shortTimeoutConfig.transportMode = DnsTransportMode::UDP;
-    shortTimeoutConfig.enableCache = false; // Disable cache to ensure network query
-
-    DnsClient shortTimeoutClient(shortTimeoutConfig);
+    // Create a client with very short timeout to test transport layer timeout
+    // precision (shared short-timeout builder — review L-g).
+    auto shortTimeoutClientPtr = makeFastTimeoutClient(std::chrono::milliseconds(50));
+    DnsClient &shortTimeoutClient = *shortTimeoutClientPtr;
 
     // Configure mock server to delay response longer than timeout
     MockDnsServer::QueryConfig delayConfig;

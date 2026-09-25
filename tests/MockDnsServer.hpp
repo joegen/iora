@@ -137,6 +137,11 @@ private:
   std::unordered_map<std::string, WireResponse> wireResponses_;
   std::unordered_map<std::string, TcpFragmentation> tcpFragments_;
   std::unordered_map<std::string, QueryConfig> queryConfigs_;
+  // Per-(name,type) overrides, checked BEFORE the name-only map so a test can,
+  // e.g., time out only the AAAA query for a name whose A query still succeeds
+  // (RFC 3263 dual-stack partial-results regression, tracker 2026-09-24-29).
+  // Key = name + '\x1f' + uppercase type string ("A"/"AAAA"/"SRV"/...).
+  std::unordered_map<std::string, QueryConfig> queryConfigsByType_;
 
   // Query logging and statistics
   mutable std::mutex logMutex_;
@@ -286,12 +291,24 @@ public:
     queryConfigs_[name] = config;
   }
 
+  /// \brief Configure behavior for a specific (name, record-type) pair.
+  /// Takes precedence over the name-only configureQuery() for that type.
+  /// \param name Question name (e.g. "dual.example.com")
+  /// \param type Uppercase record type string ("A", "AAAA", "SRV", "NAPTR", ...)
+  /// \param config Query behavior to apply for that name+type only
+  void configureQuery(const std::string &name, const std::string &type, const QueryConfig &config)
+  {
+    std::lock_guard<std::mutex> lock(recordsMutex_);
+    queryConfigsByType_[name + "\x1f" + type] = config;
+  }
+
   /// \brief Clear all DNS records
   void clearRecords()
   {
     std::lock_guard<std::mutex> lock(recordsMutex_);
     records_.clear();
     queryConfigs_.clear();
+    queryConfigsByType_.clear();
   }
 
   /// \brief Get query log
@@ -612,6 +629,12 @@ private:
                (isTcp ? "TCP" : "UDP"));
     }
 
+    // A (name,type) or name-only QueryConfig is snapshotted under the lock below
+    // and applied AFTER the lock is released (review L-c: never sleep or build a
+    // response while holding recordsMutex_).
+    bool haveConfig = false;
+    QueryConfig queryConfig;
+
     // Check for configured wire response
     {
       std::lock_guard<std::mutex> lock(recordsMutex_);
@@ -680,41 +703,63 @@ private:
         }
       }
 
-      // Check for query-specific configuration (timeout, failure, etc.)
-      auto configIt = queryConfigs_.find(questionName);
-      if (configIt != queryConfigs_.end())
+      // Snapshot any query-specific configuration. A (name,type) override takes
+      // precedence over the name-only config so a test can inject per-type
+      // behavior (e.g. AAAA-only timeout). Copy BY VALUE so it is applied after
+      // the lock is released (review L-c).
+      const std::string qtStr = queryTypeToString(queryType);
+      if (!qtStr.empty())
       {
-        const auto &queryConfig = configIt->second;
-
-        // Handle timeout (no response)
-        if (queryConfig.shouldTimeout)
+        auto byType = queryConfigsByType_.find(questionName + "\x1f" + qtStr);
+        if (byType != queryConfigsByType_.end())
         {
-          return {}; // No response (simulates timeout)
+          queryConfig = byType->second;
+          haveConfig = true;
         }
-
-        // Handle server failure (return SERVFAIL response)
-        if (queryConfig.shouldFail)
+      }
+      if (!haveConfig)
+      {
+        auto configIt = queryConfigs_.find(questionName);
+        if (configIt != queryConfigs_.end())
         {
-          return generateServfailResponse(queryId, questionName, queryType);
+          queryConfig = configIt->second;
+          haveConfig = true;
         }
+      }
+    } // recordsMutex_ released here
 
-        // Handle RFC 2308 NODATA (NOERROR, no answers, SOA in authority)
-        if (queryConfig.shouldReturnNodata)
-        {
-          return generateNodataResponse(queryId, questionName, queryType);
-        }
+    // Apply the snapshotted query config OUTSIDE recordsMutex_ (review L-c): the
+    // delay sleep and the response builders must not run while holding the lock.
+    if (haveConfig)
+    {
+      // Handle timeout (no response)
+      if (queryConfig.shouldTimeout)
+      {
+        return {}; // No response (simulates timeout)
+      }
 
-        // NODATA WITHOUT an SOA (RFC 2308 §5 negative-control: must NOT be cached)
-        if (queryConfig.shouldReturnNodataNoSoa)
-        {
-          return generateNodataResponse(queryId, questionName, queryType, /*includeSoa=*/false);
-        }
+      // Handle server failure (return SERVFAIL response)
+      if (queryConfig.shouldFail)
+      {
+        return generateServfailResponse(queryId, questionName, queryType);
+      }
 
-        // Apply delay only for successful responses
-        if (queryConfig.delay.count() > 0)
-        {
-          std::this_thread::sleep_for(queryConfig.delay);
-        }
+      // Handle RFC 2308 NODATA (NOERROR, no answers, SOA in authority)
+      if (queryConfig.shouldReturnNodata)
+      {
+        return generateNodataResponse(queryId, questionName, queryType);
+      }
+
+      // NODATA WITHOUT an SOA (RFC 2308 §5 negative-control: must NOT be cached)
+      if (queryConfig.shouldReturnNodataNoSoa)
+      {
+        return generateNodataResponse(queryId, questionName, queryType, /*includeSoa=*/false);
+      }
+
+      // Apply delay only for successful responses
+      if (queryConfig.delay.count() > 0)
+      {
+        std::this_thread::sleep_for(queryConfig.delay);
       }
     }
 
@@ -750,6 +795,31 @@ private:
     return name;
   }
 
+  /// \brief Map a DNS QTYPE numeric code to its record-type string.
+  /// Single source of truth shared by the per-(name,type) config lookup in
+  /// processDnsQuery and by generateStructuredResponse (review M-c) so the two
+  /// mappings cannot drift.
+  static std::string queryTypeToString(std::uint16_t queryType)
+  {
+    switch (queryType)
+    {
+    case 1:
+      return "A";
+    case 28:
+      return "AAAA";
+    case 33:
+      return "SRV";
+    case 35:
+      return "NAPTR";
+    case 5:
+      return "CNAME";
+    case 15:
+      return "MX";
+    default:
+      return "";
+    }
+  }
+
   std::vector<std::uint8_t> generateStructuredResponse(std::uint16_t queryId,
                                                        const std::string &questionName,
                                                        std::uint16_t queryType)
@@ -766,32 +836,8 @@ private:
     const auto &allRecords = recordIt->second;
     std::vector<DnsRecord> filteredRecords;
 
-    // Map query type to record type string
-    std::string typeStr;
-    switch (queryType)
-    {
-    case 1:
-      typeStr = "A";
-      break;
-    case 28:
-      typeStr = "AAAA";
-      break;
-    case 33:
-      typeStr = "SRV";
-      break;
-    case 35:
-      typeStr = "NAPTR";
-      break;
-    case 5:
-      typeStr = "CNAME";
-      break;
-    case 15:
-      typeStr = "MX";
-      break;
-    default:
-      typeStr = "";
-      break;
-    }
+    // Map query type to record type string (shared helper — review M-c)
+    const std::string typeStr = queryTypeToString(queryType);
 
     // Only include records matching the query type
     for (const auto &record : allRecords)

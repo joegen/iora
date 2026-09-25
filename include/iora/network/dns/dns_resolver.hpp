@@ -692,90 +692,108 @@ public:
     std::vector<std::string> ipv4Addresses;
     std::vector<std::string> ipv6Addresses;
 
-    try
+    // Query A records (IPv4) if policy allows
+    if (policy == AddressResolutionPolicy::IPv4Only ||
+        policy == AddressResolutionPolicy::IPv4First ||
+        policy == AddressResolutionPolicy::IPv6First)
     {
-      // Query A records (IPv4) if policy allows
-      if (policy == AddressResolutionPolicy::IPv4Only ||
-          policy == AddressResolutionPolicy::IPv4First ||
-          policy == AddressResolutionPolicy::IPv6First)
+      try
       {
-        try
+        DnsResult ipv4Result = query(DnsQuestion(hostname, DnsType::A, DnsClass::IN));
+        for (const auto &record : ipv4Result.a_records)
         {
-          DnsResult ipv4Result = query(DnsQuestion(hostname, DnsType::A, DnsClass::IN));
-          for (const auto &record : ipv4Result.a_records)
-          {
-            ipv4Addresses.push_back(record.address);
-          }
-        }
-        catch (const DnsResolverException &)
-        {
-          // IPv4 query failed, continue
+          ipv4Addresses.push_back(record.address);
         }
       }
-
-      // Query AAAA records (IPv6) if policy allows
-      if (policy == AddressResolutionPolicy::IPv6Only ||
-          policy == AddressResolutionPolicy::IPv4First ||
-          policy == AddressResolutionPolicy::IPv6First)
+      catch (const DnsResolverException &)
       {
-        try
-        {
-          DnsResult ipv6Result = query(DnsQuestion(hostname, DnsType::AAAA, DnsClass::IN));
-          for (const auto &record : ipv6Result.aaaa_records)
-          {
-            ipv6Addresses.push_back(record.address);
-          }
-        }
-        catch (const DnsResolverException &)
-        {
-          // IPv6 query failed, continue
-        }
+        // IPv4 query failed (bad rcode / no records), continue to AAAA.
       }
-
-      // Combine results according to policy
-      std::vector<std::string> addresses;
-
-      switch (policy)
+      catch (const DnsTransportException &)
       {
-      case AddressResolutionPolicy::IPv4Only:
-        addresses = std::move(ipv4Addresses);
-        break;
-
-      case AddressResolutionPolicy::IPv6Only:
-        addresses = std::move(ipv6Addresses);
-        break;
-
-      case AddressResolutionPolicy::IPv4First:
-        // IPv4 addresses first, then IPv6
-        addresses.reserve(ipv4Addresses.size() + ipv6Addresses.size());
-        addresses.insert(addresses.end(), ipv4Addresses.begin(), ipv4Addresses.end());
-        addresses.insert(addresses.end(), ipv6Addresses.begin(), ipv6Addresses.end());
-        break;
-
-      case AddressResolutionPolicy::IPv6First:
-        // IPv6 addresses first, then IPv4
-        addresses.reserve(ipv6Addresses.size() + ipv4Addresses.size());
-        addresses.insert(addresses.end(), ipv6Addresses.begin(), ipv6Addresses.end());
-        addresses.insert(addresses.end(), ipv4Addresses.begin(), ipv4Addresses.end());
-        break;
+        // IPv4 query timed out or transport error, continue to AAAA so any
+        // AAAA result is still returned (RFC 3263 dual-stack partial results).
       }
-
-      // If no addresses found, throw exception
-      if (addresses.empty())
+      catch (const DnsParseException &)
       {
-        throw DnsNoRecordsException(
-          hostname, policy == AddressResolutionPolicy::IPv6Only ? DnsType::AAAA : DnsType::A);
+        // Defensive / currently unreachable: the transport drops-and-waits on a
+        // malformed datagram (dns_transport.hpp:1804-1823), so a parse failure
+        // surfaces to the resolver as a timeout, not a DnsParseException. This
+        // clause is kept per the enumerate-the-three-types decision. Continue to
+        // AAAA (keep partial results) if it ever does fire.
       }
-
-      return addresses;
     }
-    catch (const DnsResolverException &)
+
+    // Query AAAA records (IPv6) if policy allows
+    if (policy == AddressResolutionPolicy::IPv6Only ||
+        policy == AddressResolutionPolicy::IPv4First ||
+        policy == AddressResolutionPolicy::IPv6First)
     {
-      // If both queries failed, throw appropriate exception
-      DnsType failedType =
-        (policy == AddressResolutionPolicy::IPv6Only) ? DnsType::AAAA : DnsType::A;
-      throw DnsNoRecordsException(hostname, failedType);
+      try
+      {
+        DnsResult ipv6Result = query(DnsQuestion(hostname, DnsType::AAAA, DnsClass::IN));
+        for (const auto &record : ipv6Result.aaaa_records)
+        {
+          ipv6Addresses.push_back(record.address);
+        }
+      }
+      catch (const DnsResolverException &)
+      {
+        // IPv6 query failed (bad rcode / no records), continue.
+      }
+      catch (const DnsTransportException &)
+      {
+        // IPv6 query timed out or transport error: DO NOT discard the A
+        // results already collected above. This is the dual-stack SIP target
+        // case (finding #1) — combine returns the IPv4 addresses instead of
+        // throwing out of resolveHostname.
+      }
+      catch (const DnsParseException &)
+      {
+        // Defensive / currently unreachable (see the IPv4 note above): keep the
+        // A results already collected and continue.
+      }
     }
+
+    // Combine results according to policy
+    std::vector<std::string> addresses;
+
+    switch (policy)
+    {
+    case AddressResolutionPolicy::IPv4Only:
+      addresses = std::move(ipv4Addresses);
+      break;
+
+    case AddressResolutionPolicy::IPv6Only:
+      addresses = std::move(ipv6Addresses);
+      break;
+
+    case AddressResolutionPolicy::IPv4First:
+      // IPv4 addresses first, then IPv6
+      addresses.reserve(ipv4Addresses.size() + ipv6Addresses.size());
+      addresses.insert(addresses.end(), ipv4Addresses.begin(), ipv4Addresses.end());
+      addresses.insert(addresses.end(), ipv6Addresses.begin(), ipv6Addresses.end());
+      break;
+
+    case AddressResolutionPolicy::IPv6First:
+      // IPv6 addresses first, then IPv4
+      addresses.reserve(ipv6Addresses.size() + ipv4Addresses.size());
+      addresses.insert(addresses.end(), ipv6Addresses.begin(), ipv6Addresses.end());
+      addresses.insert(addresses.end(), ipv4Addresses.begin(), ipv4Addresses.end());
+      break;
+    }
+
+    // No addresses from either family -> RFC 3263 §4.2 no-record result.
+    // (A former outer try/catch here re-threw an identically-constructed
+    // DnsNoRecordsException; removed as a provable no-op now that the inner
+    // A/AAAA catches absorb transport/parse errors — slice a1 review L-h.)
+    if (addresses.empty())
+    {
+      throw DnsNoRecordsException(
+        hostname, policy == AddressResolutionPolicy::IPv6Only ? DnsType::AAAA : DnsType::A);
+    }
+
+    return addresses;
   }
 
   /// \brief Get preferred target from resolution result using resolver's RNG
@@ -825,6 +843,18 @@ public:
       catch (const DnsResolverException &)
       {
         // Skip failed queries
+        continue;
+      }
+      catch (const DnsTransportException &)
+      {
+        // A timeout/transport error on ONE SRV set must not abort the others
+        // (RFC 3263 §4.3 per-record isolation): skip and keep the rest.
+        continue;
+      }
+      catch (const DnsParseException &)
+      {
+        // Defensive / currently unreachable (transport drop-and-waits on malformed
+        // datagrams, dns_transport.hpp:1804-1823): skip this SRV set, keep the others.
         continue;
       }
     }
@@ -1169,6 +1199,11 @@ private:
   {
     ServiceResolutionResult result(domain);
 
+    // Every NAPTR-failure and no-usable-NAPTR path converges on the same RFC 3263
+    // §4.1 direct-SRV fallback, so name it once (review L-f).
+    auto fallbackToDirectSrv = [&]()
+    { return performDirectSrvResolution(domain, preferredTransports, std::nullopt); };
+
     // Step 1: Query NAPTR records
     std::vector<NaptrRecord> naptrRecords;
     try
@@ -1178,11 +1213,28 @@ private:
     }
     catch (const DnsResolverException &)
     {
-      // No NAPTR records, try direct SRV queries
-      return performDirectSrvResolution(domain, preferredTransports, std::nullopt);
+      // No NAPTR records / bad rcode: try direct SRV queries (RFC 3263 §4.1).
+      return fallbackToDirectSrv();
+    }
+    catch (const DnsTransportException &)
+    {
+      // NAPTR query timed out or transport error: fall back to direct SRV
+      // (RFC 3263 §4.1) instead of aborting the whole resolution.
+      return fallbackToDirectSrv();
+    }
+    catch (const DnsParseException &)
+    {
+      // Defensive / currently unreachable (transport drop-and-waits on malformed
+      // datagrams -> timeout, dns_transport.hpp:1804-1823): fall back to direct SRV.
+      return fallbackToDirectSrv();
     }
 
-    // Step 2: Process NAPTR records to get SRV and direct-A targets
+    // Step 2: Process NAPTR records to get SRV and direct-A targets.
+    // NOTE (review L-e, declined for this slice): processNaptrRecords is
+    // deliberately NOT wrapped in a try here — it throws only std::bad_alloc-class
+    // errors, which SHOULD propagate ("let real bugs propagate"). The async path's
+    // broader catch(std::exception) around the same call is a separate,
+    // out-of-scope concern (flagged for a later review).
     std::vector<NaptrSrvTarget> srvTargets;
     std::vector<NaptrDirectTarget> aTargets;
     processNaptrRecords(naptrRecords, srvTargets, aTargets, preferredTransports);
@@ -1192,7 +1244,7 @@ private:
     // fall back to direct SRV resolution, mirroring performServiceResolutionAsync.
     if (srvTargets.empty() && aTargets.empty())
     {
-      return performDirectSrvResolution(domain, preferredTransports, std::nullopt);
+      return fallbackToDirectSrv();
     }
 
     // Step 3: Query SRV records for 'S' flag targets
@@ -1206,6 +1258,18 @@ private:
       catch (const DnsResolverException &)
       {
         // Skip failed SRV queries, continue with others
+        continue;
+      }
+      catch (const DnsTransportException &)
+      {
+        // A timeout/transport error on one NAPTR-derived SRV target must not
+        // abort the sibling targets (RFC 3263 §4.3): skip and continue.
+        continue;
+      }
+      catch (const DnsParseException &)
+      {
+        // Defensive / currently unreachable (transport drop-and-waits on malformed
+        // datagrams, dns_transport.hpp:1804-1823): skip this target, keep the others.
         continue;
       }
     }
