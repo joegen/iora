@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -51,8 +50,11 @@ struct ServiceTarget
   ServiceType transport;              ///< Transport protocol
   std::uint16_t priority;             ///< SRV priority (lower = higher priority)
   std::uint16_t weight;               ///< SRV weight for load balancing
-  std::uint16_t naptrPreference{0};   ///< NAPTR preference (RFC 3403 §4.1) — lower = preferred.
-                                      ///< 0 = no NAPTR tier (direct SRV/A fallback path).
+  std::uint16_t naptrPreference{0};   ///< Transport-sequence tier — lower = preferred. On the
+                                      ///< NAPTR path it is the NAPTR preference (RFC 3403 §4.1);
+                                      ///< on the direct-SRV path it is the per-set transport rank
+                                      ///< (buildOrderedSrvQueries index). The two are mutually
+                                      ///< exclusive on one result. 0 = first tier / A fallback.
   std::vector<std::string> addresses; ///< Resolved IP addresses (A/AAAA)
 
   /// \brief Get transport protocol as string
@@ -144,204 +146,34 @@ struct ServiceResolutionResult
     return filtered;
   }
 
-  /// \brief Get preferred target with DETERMINISTIC weighted selection
+  /// \brief Get the preferred (head) target of the RFC-2782-ordered failover list.
   ///
-  /// IMPORTANT: This const overload uses a deterministic RNG seeded from candidate targets.
-  /// This provides consistent, reproducible selection for the same set of targets,
-  /// which is useful for testing and debugging. However, it does NOT provide proper
-  /// load distribution in production environments.
+  /// The failover list is ordered at construction by DnsResolver::sortTargetsByPriority,
+  /// which sequences targets per SRV owner name (naptrPreference/transport-rank, transport,
+  /// priority) and applies the RFC 2782 weighted-random ordering to each equal-priority group
+  /// (2026-09-25-4). The preferred target is therefore simply the head of the list — selection
+  /// no longer re-randomizes here (that would double-order the already-weighted list).
   ///
-  /// For production randomness with proper load balancing, use:
-  /// - getPreferredTarget(RNG&) with your own RNG
-  /// - getPreferredTargetWithDefaultRng() for thread-local randomness
+  /// PRECONDITION: the result was produced by DnsResolver. A hand-built, unordered
+  /// ServiceResolutionResult returns its first element as-is (an unweighted pick).
   ///
-  /// \return Selected target using deterministic weighted selection
+  /// \return The head target, or a default-constructed ServiceTarget if the list is empty.
   ServiceTarget getPreferredTarget() const
   {
-    if (targets.empty())
-    {
-      return ServiceTarget{};
-    }
-
-    // First: find the best (lowest) NAPTR preference tier
-    std::uint16_t bestNaptrPref = targets[0].naptrPreference;
-    for (const auto &target : targets)
-    {
-      if (target.naptrPreference < bestNaptrPref)
-      {
-        bestNaptrPref = target.naptrPreference;
-      }
-    }
-
-    // Second: within that NAPTR tier, find best (lowest) SRV priority
-    std::uint16_t best_priority = std::numeric_limits<std::uint16_t>::max();
-    for (const auto &target : targets)
-    {
-      if (target.naptrPreference == bestNaptrPref && target.priority < best_priority)
-      {
-        best_priority = target.priority;
-      }
-    }
-
-    // Third: collect candidates matching both naptrPreference and SRV priority
-    std::vector<ServiceTarget> candidates;
-    for (const auto &target : targets)
-    {
-      if (target.naptrPreference == bestNaptrPref && target.priority == best_priority)
-      {
-        candidates.push_back(target);
-      }
-    }
-
-    // If only one candidate, return it
-    if (candidates.size() == 1)
-    {
-      return candidates[0];
-    }
-
-    // Weight-based selection among equal priority targets
-    std::uint32_t total_weight = 0;
-    for (const auto &candidate : candidates)
-    {
-      total_weight += candidate.weight;
-    }
-
-    if (total_weight == 0)
-    {
-      // All weights are 0, use deterministic RNG seeded from targets for consistent selection
-      std::mt19937 deterministicRng;
-      std::size_t seed = std::hash<std::size_t>{}(candidates.size());
-      for (const auto &candidate : candidates)
-      {
-        seed ^=
-          std::hash<std::string>{}(candidate.hostname) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        seed ^= std::hash<std::uint16_t>{}(candidate.port) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-      }
-      deterministicRng.seed(static_cast<std::uint32_t>(seed));
-
-      std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-      return candidates[dist(deterministicRng)];
-    }
-
-    // RFC 2782 weighted selection with deterministic RNG seeded from candidates
-    std::mt19937 deterministicRng;
-    std::size_t seed = std::hash<std::uint32_t>{}(total_weight);
-    for (const auto &candidate : candidates)
-    {
-      seed ^= std::hash<std::string>{}(candidate.hostname) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-      seed ^= std::hash<std::uint16_t>{}(candidate.port) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-      seed ^= std::hash<std::uint16_t>{}(candidate.weight) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-    }
-    deterministicRng.seed(static_cast<std::uint32_t>(seed));
-
-    // Use the same weighted random logic as the RNG overload
-    std::uniform_int_distribution<std::uint32_t> dist(0, total_weight - 1);
-    std::uint32_t random_weight = dist(deterministicRng);
-
-    std::uint32_t cumulative_weight = 0;
-    for (const auto &candidate : candidates)
-    {
-      cumulative_weight += candidate.weight;
-      if (random_weight < cumulative_weight)
-      {
-        return candidate;
-      }
-    }
-
-    // Fallback (should never reach here)
-    return candidates.back();
+    return targets.empty() ? ServiceTarget{} : targets.front();
   }
 
-  /// \brief Get preferred target with PRODUCTION-GRADE random weighted selection
-  ///
-  /// This method uses thread-local random number generation for proper load balancing
-  /// in production environments. Each thread maintains its own RNG state seeded from
-  /// std::random_device, providing excellent distribution across multiple targets.
-  ///
-  /// \return Selected target using thread-local randomness (production recommended)
-  ServiceTarget getPreferredTargetWithDefaultRng() const
+  /// \brief API-compatibility overload. The list is already weighted-ordered at construction,
+  ///        so this returns the head (same as getPreferredTarget()).
+  ServiceTarget getPreferredTargetWithDefaultRng() const { return getPreferredTarget(); }
+
+  /// \brief API-compatibility overload. The RNG is unused: the failover list is already
+  ///        RFC-2782 weighted-ordered at construction, so selection returns the head and does
+  ///        not re-randomize (no double-ordering).
+  /// \return The head target, or a default-constructed ServiceTarget if the list is empty.
+  template <typename RNG> ServiceTarget getPreferredTarget(RNG & /*rng*/) const
   {
-    // Thread-local RNG for production randomness without coordination overhead
-    thread_local std::mt19937 productionRng(std::random_device{}());
-    return getPreferredTarget(productionRng);
-  }
-
-  /// \brief Get preferred target with RFC 2782 compliant weighted random selection
-  /// \param rng Random number generator for weighted selection
-  /// \return Selected target based on priority and weighted randomness
-  template <typename RNG> ServiceTarget getPreferredTarget(RNG &rng) const
-  {
-    if (targets.empty())
-    {
-      return ServiceTarget{};
-    }
-
-    // First: find the best (lowest) NAPTR preference tier
-    std::uint16_t bestNaptrPref = targets[0].naptrPreference;
-    for (const auto &target : targets)
-    {
-      if (target.naptrPreference < bestNaptrPref)
-      {
-        bestNaptrPref = target.naptrPreference;
-      }
-    }
-
-    // Second: within that NAPTR tier, find best (lowest) SRV priority
-    std::uint16_t best_priority = std::numeric_limits<std::uint16_t>::max();
-    for (const auto &target : targets)
-    {
-      if (target.naptrPreference == bestNaptrPref && target.priority < best_priority)
-      {
-        best_priority = target.priority;
-      }
-    }
-
-    // Third: collect candidates matching both naptrPreference and SRV priority
-    std::vector<ServiceTarget> candidates;
-    for (const auto &target : targets)
-    {
-      if (target.naptrPreference == bestNaptrPref && target.priority == best_priority)
-      {
-        candidates.push_back(target);
-      }
-    }
-
-    // If only one candidate, return it
-    if (candidates.size() == 1)
-    {
-      return candidates[0];
-    }
-
-    // RFC 2782 weighted random selection among equal priority targets
-    std::uint32_t total_weight = 0;
-    for (const auto &candidate : candidates)
-    {
-      total_weight += candidate.weight;
-    }
-
-    if (total_weight == 0)
-    {
-      // All weights are 0, choose randomly among candidates
-      std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-      return candidates[dist(rng)];
-    }
-
-    // Weighted random selection (RFC 2782)
-    std::uniform_int_distribution<std::uint32_t> dist(0, total_weight - 1);
-    std::uint32_t random_weight = dist(rng);
-
-    std::uint32_t cumulative_weight = 0;
-    for (const auto &candidate : candidates)
-    {
-      cumulative_weight += candidate.weight;
-      if (random_weight < cumulative_weight)
-      {
-        return candidate;
-      }
-    }
-
-    // Should never reach here, but return last candidate as fallback
-    return candidates.back();
+    return targets.empty() ? ServiceTarget{} : targets.front();
   }
 };
 
@@ -796,20 +628,19 @@ public:
     return addresses;
   }
 
-  /// \brief Get preferred target from resolution result using resolver's RNG
+  /// \brief Get the preferred (head) target of an RFC-2782-ordered resolution result.
   ///
-  /// This method provides access to RFC-compliant weighted random target selection
-  /// using the resolver's internal RNG, which is essential for deterministic testing
-  /// when a seed has been set via setRngSeed().
+  /// The weighted-random ordering is applied once, at resolution time, inside
+  /// sortTargetsByPriority (which draws from the resolver's _rng under _rngMutex). The
+  /// preferred target is therefore just the head of the already-ordered list; this method
+  /// no longer touches _rng (2026-09-25-4 fix D / TS-5 — the former _rngMutex acquisition
+  /// here is dead once selection returns front()).
   ///
-  /// \param result Service resolution result containing prioritized targets
-  /// \return Selected target based on priority and weighted randomness
+  /// \param result Service resolution result containing the ordered targets
+  /// \return The head target of the ordered failover list
   ServiceTarget getPreferredTarget(const ServiceResolutionResult &result) const
   {
-    // _rng is mutated (the generator advances) even on this const path; guard it
-    // so concurrent getPreferredTarget()/setRngSeed() calls don't race the state.
-    std::lock_guard<std::mutex> lock(_rngMutex);
-    return result.getPreferredTarget(_rng);
+    return result.getPreferredTarget();
   }
 
   /// \brief Handle direct SRV resolution when no NAPTR records exist (generic version)
@@ -830,12 +661,18 @@ public:
     // Query SRV records. Track which services returned an RFC 2782 "." abort so the
     // A/AAAA fallback is suppressed per-service (not domain-wide).
     std::vector<ServiceType> deniedServices;
-    for (const auto &[srvName, service] : actualSrvQueries)
+    // The query's index in the preference-ordered actualSrvQueries is the per-set transport
+    // rank, stamped as naptrPreference so sortTargetsByPriority sequences transports per set
+    // and never cross-compares SRV priority across owner names (2026-09-25-4 fix A).
+    for (std::size_t rank = 0; rank < actualSrvQueries.size(); ++rank)
     {
+      const auto &srvName = actualSrvQueries[rank].first;
+      const auto service = actualSrvQueries[rank].second;
       try
       {
         DnsResult srvResult = query(DnsQuestion(srvName, DnsType::SRV, DnsClass::IN));
-        if (processSrvRecords(srvResult.srv_records, service, result))
+        if (processSrvRecords(srvResult.srv_records, service, result,
+                              static_cast<std::uint16_t>(rank)))
         {
           deniedServices.push_back(service);
         }
@@ -909,23 +746,29 @@ public:
     // is suppressed per-service (not domain-wide), mirroring the sync path.
     auto deniedServices = std::make_shared<std::vector<ServiceType>>();
 
-    for (const auto &[srvName, service] : actualSrvQueries)
+    // The query's index in the preference-ordered actualSrvQueries is the per-set transport
+    // rank; snapshot it per-iteration and capture BY VALUE so each completion lambda stamps its
+    // own set's rank (2026-09-25-4 fix A — mirrors the NAPTR-async by-value idiom).
+    for (std::size_t rank = 0; rank < actualSrvQueries.size(); ++rank)
     {
+      const auto &srvName = actualSrvQueries[rank].first;
+      const auto service = actualSrvQueries[rank].second;
+      const auto transportRank = static_cast<std::uint16_t>(rank);
       DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
 
       auto self = shared_from_this();
       _transport->queryAsync(
         srvQuestion,
-        [self, result, service, remainingQueries, callbackFired, resultMutex, deniedServices,
-         callback, domain, preferredTransports](const DnsResult &srvResult,
-                                                 const std::exception_ptr &srvError)
+        [self, result, service, transportRank, remainingQueries, callbackFired, resultMutex,
+         deniedServices, callback, domain, preferredTransports](const DnsResult &srvResult,
+                                                                const std::exception_ptr &srvError)
         {
           if (!srvError)
           {
             try
             {
               std::lock_guard<std::mutex> lock(*resultMutex);
-              if (self->processSrvRecords(srvResult.srv_records, service, *result))
+              if (self->processSrvRecords(srvResult.srv_records, service, *result, transportRank))
               {
                 deniedServices->push_back(service);
               }
@@ -1813,10 +1656,24 @@ private:
                          result.targets.end());
   }
 
-  /// \brief Sort targets by NAPTR preference then SRV priority
-  /// NAPTR preference (RFC 3403 §4.1) is the primary key — lower = preferred transport.
-  /// SRV priority (RFC 2782) is the secondary key — lower = higher precedence within
-  /// the same NAPTR preference tier.
+  /// \brief Order the failover list: per-owner-name transport sequencing, then RFC 2782
+  ///        (priority, then weighted-random) WITHIN each owner name (2026-09-25-4).
+  ///
+  /// Outer sequencing key (owner-name-delimited): (naptrPreference/transport-rank, transport,
+  /// priority). naptrPreference carries either the NAPTR preference tier (NAPTR path) or the
+  /// per-set transport rank from buildOrderedSrvQueries (direct-SRV path) — mutually exclusive
+  /// on one result. `transport` (the ServiceType) is the SRV owner-name discriminator, so
+  /// priority is NEVER compared across owner names (RFC 2782 defines priority per RRSet).
+  ///
+  /// Within each equal-(tier, transport, priority) group the RFC 2782 weighted algorithm is
+  /// applied to the LIST (not just a single pick): weight-0 records first in the arrangement,
+  /// then repeated selection-without-replacement (recompute the remaining sum each step, draw
+  /// uniform in [0, remaining-sum] inclusive, take the first cumulative sum >= the draw).
+  ///
+  /// RNG ownership: derive a per-call generator by ONE draw of the resolver's _rng under
+  /// _rngMutex — advancing the master so successive/concurrent resolutions differ — then order
+  /// UNLOCKED on the local generator. _rngMutex is a leaf lock (never held across a callback,
+  /// never co-held with a result lock).
   void sortTargetsByPriority(ServiceResolutionResult &result)
   {
     std::stable_sort(result.targets.begin(), result.targets.end(),
@@ -1826,8 +1683,103 @@ private:
                        {
                          return a.naptrPreference < b.naptrPreference;
                        }
+                       if (a.transport != b.transport)
+                       {
+                         return a.transport < b.transport;
+                       }
                        return a.priority < b.priority;
                      });
+
+    // Nothing to weight-order with fewer than two targets — skip the RNG draw so master-stream
+    // consumption tracks actual ordering work, not call count.
+    if (result.targets.size() < 2)
+    {
+      return;
+    }
+
+    // Advance the master RNG once under the leaf lock, then order unlocked.
+    std::mt19937 local;
+    {
+      std::lock_guard<std::mutex> lock(_rngMutex);
+      local.seed(_rng());
+    }
+    applyWeightedOrdering(result.targets, local);
+  }
+
+  /// \brief Apply RFC 2782 weighted ordering to each contiguous equal-(naptrPreference,
+  ///        transport, priority) run of an already-stable-sorted target list.
+  static void applyWeightedOrdering(std::vector<ServiceTarget> &targets, std::mt19937 &rng)
+  {
+    std::size_t i = 0;
+    while (i < targets.size())
+    {
+      std::size_t j = i + 1;
+      while (j < targets.size() && targets[j].naptrPreference == targets[i].naptrPreference &&
+             targets[j].transport == targets[i].transport &&
+             targets[j].priority == targets[i].priority)
+      {
+        ++j;
+      }
+      if (j - i > 1)
+      {
+        weightedOrderGroup(targets, i, j, rng);
+      }
+      i = j;
+    }
+  }
+
+  /// \brief RFC 2782 weighted-random ordering of one equal-priority owner-name group
+  ///        (targets[begin, end)), in place. Selection WITHOUT replacement.
+  static void weightedOrderGroup(std::vector<ServiceTarget> &targets, std::size_t begin,
+                                 std::size_t end, std::mt19937 &rng)
+  {
+    // Working pool for the group. Arrange weight-0 records first (RFC 2782: "placed at the
+    // beginning of the list ... in any order"), randomized among themselves so each gets a
+    // fair share of the minimal selection chance.
+    std::vector<ServiceTarget> pool(std::make_move_iterator(targets.begin() + begin),
+                                    std::make_move_iterator(targets.begin() + end));
+    std::stable_partition(pool.begin(), pool.end(),
+                          [](const ServiceTarget &t) { return t.weight == 0; });
+    auto zeroEnd = std::find_if(pool.begin(), pool.end(),
+                                [](const ServiceTarget &t) { return t.weight != 0; });
+    std::shuffle(pool.begin(), zeroEnd, rng);
+
+    // Repeated running-sum selection: recompute the remaining sum each iteration (RFC 2782
+    // selection-without-replacement), draw uniform in [0, remaining] INCLUSIVE, pick the first
+    // cumulative sum >= the draw. Weight-0 records (running sum stays flat) win only on draw==0,
+    // yielding the RFC "very small chance"; once only weight-0 remain (remaining==0) they are
+    // emitted in their already-randomized order.
+    std::size_t out = begin;
+    while (!pool.empty())
+    {
+      std::uint32_t remaining = 0;
+      for (const auto &t : pool)
+      {
+        remaining += t.weight;
+      }
+
+      std::size_t pick = 0;
+      if (remaining != 0)
+      {
+        std::uniform_int_distribution<std::uint32_t> dist(0, remaining);
+        std::uint32_t r = dist(rng);
+        std::uint32_t running = 0;
+        pick = pool.size() - 1; // unreachable default: running reaches `remaining` (== the draw's
+                                // inclusive max) at the last element, so the scan always matches
+        for (std::size_t k = 0; k < pool.size(); ++k)
+        {
+          running += pool[k].weight;
+          if (running >= r)
+          {
+            pick = k;
+            break;
+          }
+        }
+      }
+
+      targets[out++] = std::move(pool[pick]);
+      pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(pick));
+    }
   }
 
   /// \brief Fallback to A/AAAA resolution when no SRV records exist

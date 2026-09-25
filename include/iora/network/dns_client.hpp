@@ -292,6 +292,14 @@ public:
     return _resolver->resolveServiceDomain(domain, preferredTransports);
   }
 
+  /// \brief Seed the resolver's RNG for deterministic RFC 2782 weighted SRV ordering.
+  ///
+  /// Test-only, single-threaded control: with a fixed seed the weighted failover ordering is
+  /// reproducible across resolutions on the same host. Passthrough to
+  /// dns::DnsResolver::setRngSeed (2026-09-25-4).
+  /// \param seed Seed value for the weighted-ordering RNG
+  void setRngSeed(std::uint32_t seed) { _resolver->setRngSeed(seed); }
+
   /// \brief Resolve custom service domain with specific SRV record queries
   /// \param domain Service domain to resolve (e.g., "example.com")
   /// \param srvQueries Custom SRV queries to try (e.g., {{"_xmpp-client._tcp.example.com",

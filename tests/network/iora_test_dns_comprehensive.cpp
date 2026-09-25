@@ -101,6 +101,28 @@ private:
   std::unique_ptr<DnsClient> dnsClient_;
 };
 
+/// \brief Run resolveServiceDomainAsync and block for the result (test helper).
+inline ServiceResolutionResult
+resolveServiceBlocking(DnsClient &c, const std::string &domain,
+                       const std::vector<ServiceType> &preferred = {})
+{
+  // Hold the promise in a shared_ptr captured BY VALUE: if the 5s wait times out and this
+  // function throws, the in-flight async op is not cancelled and may still fire the callback —
+  // a stack promise captured by reference would be a use-after-scope. (shared_ptr keeps the
+  // promise alive until the last of {this scope, the callback} releases it.)
+  auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+  auto fut = prom->get_future();
+  c.resolveServiceDomainAsync(
+    domain, [prom](const ServiceResolutionResult &r, const std::exception_ptr &)
+    { prom->set_value(r); },
+    preferred);
+  if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+  {
+    throw std::runtime_error("async service resolve timed out: " + domain);
+  }
+  return fut.get();
+}
+
 } // anonymous namespace
 
 // =============================================================================
@@ -336,8 +358,460 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Service Discovery SRV Records",
     CHECK(foundSip2);
   }
 
-  // Weighted SRV selection test temporarily disabled
-  // due to MockDnsServer implementation requirements
+  SECTION("Weighted SRV selection distributes across an equal-priority group (RFC 2782)")
+  {
+    // Re-enabled (2026-09-25-4): MockDnsServer surfaces SRV weight (see the basic-SRV
+    // section above), so the prior "MockDnsServer requirements" blocker is stale. One owner
+    // name, one priority, two weighted targets (90/10). With a fixed seed the sequence is
+    // deterministic; the head target's frequency tracks the weight split.
+    server().addRecord({"_sip._udp.wsel.example.com", "SRV", "w90.example.com", 3600, 10, 90, 5060});
+    server().addRecord({"_sip._udp.wsel.example.com", "SRV", "w10.example.com", 3600, 10, 10, 5060});
+    server().addRecord({"w90.example.com", "A", "192.168.1.90", 3600});
+    server().addRecord({"w10.example.com", "A", "192.168.1.10", 3600});
+
+    client().setRngSeed(12345);
+    int w90First = 0, w10First = 0;
+    const int N = 400;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("wsel.example.com", {ServiceType::SIP_UDP});
+      REQUIRE_FALSE(r.targets.empty());
+      if (r.targets.front().hostname == "w90.example.com")
+      {
+        ++w90First;
+      }
+      else if (r.targets.front().hostname == "w10.example.com")
+      {
+        ++w10First;
+      }
+    }
+    CHECK(w90First + w10First == N);
+    // Weight-90 dominates; weight-10 still wins sometimes (proves the RNG advances — a frozen
+    // master would make one of these exactly 0). Generous tolerance for 400 samples.
+    CHECK(w90First > w10First);
+    CHECK(w90First > static_cast<int>(N * 0.75));
+    CHECK(w10First > 0);
+  }
+}
+
+TEST_CASE_METHOD(DnsTestFixture, "DNS SRV RFC 2782 per-owner-name ordering + weighting",
+                 "[dns][srv][service-discovery][rfc2782][ordering]")
+{
+  startServer();
+
+  SECTION("Cross-set priority: transports sequenced per set, priority never cross-compared")
+  {
+    // Direct-SRV (no NAPTR). TCP set has a WORSE (higher) SRV priority than the UDP set, but
+    // TCP is the preferred transport (rank 0). The old (naptrPreference=0, priority) sort would
+    // cross-compare priority and put UDP (prio 5) first; the fix sequences by transport rank, so
+    // TCP (prio 10) leads. Priority is compared only WITHIN a set.
+    server().addRecord({"_sip._tcp.xset.example.com", "SRV", "tcp.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.xset.example.com", "SRV", "udp.example.com", 3600, 5, 0, 5060});
+    server().addRecord({"tcp.example.com", "A", "192.168.1.10", 3600});
+    server().addRecord({"udp.example.com", "A", "192.168.1.20", 3600});
+
+    const std::vector<ServiceType> pref{ServiceType::SIP_TCP, ServiceType::SIP_UDP};
+
+    auto check = [](const ServiceResolutionResult &r)
+    {
+      REQUIRE(r.targets.size() >= 2);
+      // TCP (rank 0) must lead despite its worse SRV priority — no cross-set priority compare.
+      CHECK(r.targets.front().transport == ServiceType::SIP_TCP);
+      CHECK(r.targets.front().hostname == "tcp.example.com");
+      // All TCP targets precede all UDP targets (owner-name-delimited sequencing).
+      bool seenUdp = false;
+      for (const auto &t : r.targets)
+      {
+        if (t.transport == ServiceType::SIP_UDP)
+        {
+          seenUdp = true;
+        }
+        else if (t.transport == ServiceType::SIP_TCP)
+        {
+          CHECK_FALSE(seenUdp); // no TCP after a UDP — not interleaved
+        }
+      }
+    };
+
+    check(client().resolveServiceDomain("xset.example.com", pref));    // sync
+    check(resolveServiceBlocking(client(), "xset.example.com", pref)); // async
+    // Re-resolved: this domain has NO NAPTR, so the NAPTR cache hit is negative and
+    // processCachedServiceResolution can't produce targets — the call falls through to a fresh
+    // direct-SRV resolution (SRV/A answers served from the DNS-answer cache), through the SAME
+    // performDirectSrvResolution sort site as the sync run. Genuine processCachedServiceResolution
+    // sort-site coverage comes from the NAPTR-backed tests below (iso / naptr-weight-iso).
+    check(client().resolveServiceDomain("xset.example.com", pref));
+  }
+
+  SECTION("Owner-name PRIORITY isolation on the NAPTR equal-preference path (H1)")
+  {
+    // Two S-flag NAPTR services in ONE order tier with EQUAL preference (20). Their SRV sets
+    // have DIFFERING priority (tcp 10, udp 5). The old outer key (naptrPreference, priority)
+    // shares naptrPreference=20 and would interleave the two RRSets by raw priority (udp prio 5
+    // first). The fix adds `transport` to the outer key, so the sets are never interleaved.
+    auto naptr = [this](const std::string &svc, const std::string &repl)
+    {
+      MockDnsServer::DnsRecord n;
+      n.name = "iso.example.com";
+      n.type = "NAPTR";
+      n.ttl = 3600;
+      n.naptrOrder = 100;
+      n.naptrPreference = 20;
+      n.naptrFlags = "s";
+      n.naptrService = svc;
+      n.naptrReplacement = repl;
+      server().addRecord(n);
+    };
+    naptr("SIP+D2T", "_sip._tcp.iso.example.com");
+    naptr("SIP+D2U", "_sip._udp.iso.example.com");
+    server().addRecord({"_sip._tcp.iso.example.com", "SRV", "t.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.iso.example.com", "SRV", "u.example.com", 3600, 5, 0, 5060});
+    server().addRecord({"t.example.com", "A", "192.168.1.10", 3600});
+    server().addRecord({"u.example.com", "A", "192.168.1.20", 3600});
+
+    auto check = [](const ServiceResolutionResult &r)
+    {
+      REQUIRE(r.targets.size() >= 2);
+      // Not interleaved by raw priority: one transport's whole RRSet, then the other's.
+      bool seenUdp = false;
+      for (const auto &t : r.targets)
+      {
+        if (t.transport == ServiceType::SIP_UDP)
+        {
+          seenUdp = true;
+        }
+        else if (t.transport == ServiceType::SIP_TCP)
+        {
+          CHECK_FALSE(seenUdp);
+        }
+      }
+      // TCP (enum-order first among equal tier) leads despite its higher priority number.
+      CHECK(r.targets.front().transport == ServiceType::SIP_TCP);
+    };
+
+    check(client().resolveServiceDomain("iso.example.com"));       // sync
+    check(resolveServiceBlocking(client(), "iso.example.com"));    // async
+    check(client().resolveServiceDomain("iso.example.com"));       // cache-hit
+  }
+
+  SECTION("Within-owner-name multi-priority: priority dominates, no cross-priority weight pool")
+  {
+    // One owner name (_sip._udp), two priority tiers. prio 5 group {p5a w10, p5b w90};
+    // prio 20 group {p20a w10, p20b w90}. Every prio-5 target must precede every prio-20
+    // target; within prio 5 the head distribution tracks 10/90 with NO contribution from the
+    // prio-20 weights (weights summed per (transport, priority) group only).
+    server().addRecord({"_sip._udp.mp.example.com", "SRV", "p5a.example.com", 3600, 5, 10, 5060});
+    server().addRecord({"_sip._udp.mp.example.com", "SRV", "p5b.example.com", 3600, 5, 90, 5060});
+    server().addRecord({"_sip._udp.mp.example.com", "SRV", "p20a.example.com", 3600, 20, 10, 5060});
+    server().addRecord({"_sip._udp.mp.example.com", "SRV", "p20b.example.com", 3600, 20, 90, 5060});
+    for (const char *h : {"p5a", "p5b", "p20a", "p20b"})
+    {
+      server().addRecord({std::string(h) + ".example.com", "A", "192.168.1.1", 3600});
+    }
+
+    client().setRngSeed(999);
+    int p5bFirst = 0, p5aFirst = 0;
+    const int N = 400;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("mp.example.com", {ServiceType::SIP_UDP});
+      REQUIRE(r.targets.size() == 4);
+      // Priority dominance: first two are the prio-5 group, last two the prio-20 group.
+      CHECK(r.targets[0].priority == 5);
+      CHECK(r.targets[1].priority == 5);
+      CHECK(r.targets[2].priority == 20);
+      CHECK(r.targets[3].priority == 20);
+      if (r.targets.front().hostname == "p5b.example.com")
+      {
+        ++p5bFirst;
+      }
+      else if (r.targets.front().hostname == "p5a.example.com")
+      {
+        ++p5aFirst;
+      }
+    }
+    CHECK(p5aFirst + p5bFirst == N);
+    // 90/10 split within prio-5, unaffected by the identical prio-20 weights.
+    CHECK(p5bFirst > p5aFirst);
+    CHECK(p5bFirst > static_cast<int>(N * 0.75));
+    CHECK(p5aFirst > 0);
+  }
+
+  SECTION("Weight-0 minimal chance: rare with a large positive sum {0,50,50}")
+  {
+    // One group {w0, w50, w50}. The weight-0 record wins the head only on draw==0 (~1/101);
+    // the positive-weight records dominate.
+    server().addRecord({"_sip._udp.w0.example.com", "SRV", "z.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.w0.example.com", "SRV", "a.example.com", 3600, 10, 50, 5060});
+    server().addRecord({"_sip._udp.w0.example.com", "SRV", "b.example.com", 3600, 10, 50, 5060});
+    server().addRecord({"z.example.com", "A", "192.168.1.1", 3600});
+    server().addRecord({"a.example.com", "A", "192.168.1.2", 3600});
+    server().addRecord({"b.example.com", "A", "192.168.1.3", 3600});
+
+    client().setRngSeed(7);
+    int zeroFirst = 0;
+    const int N = 400;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("w0.example.com", {ServiceType::SIP_UDP});
+      REQUIRE(r.targets.size() == 3);
+      if (r.targets.front().hostname == "z.example.com")
+      {
+        ++zeroFirst;
+      }
+    }
+    CHECK(zeroFirst < static_cast<int>(N * 0.15)); // rare, as the RFC "very small chance" intends
+  }
+
+  SECTION("RFC 2782 range fidelity: weight-0 IS selectable via the inclusive [0,sum] '>=' path")
+  {
+    // NON-VACUOUS discriminator for the [0,sum-1]+'<' zero-chance regression. Small-sum group
+    // {w0, w1}: inclusive [0,1] draw -> P(weight-0 head) = 1/2, so over N seeded resolutions the
+    // weight-0 record reaches the head MANY times. The old exclusive-range bug (dist(0,0)+'<')
+    // gives the weight-0 record EXACTLY ZERO chance -> zeroFirst == 0, which this CHECK catches.
+    server().addRecord({"_sip._udp.rf.example.com", "SRV", "z.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.rf.example.com", "SRV", "o.example.com", 3600, 10, 1, 5060});
+    server().addRecord({"z.example.com", "A", "192.168.1.1", 3600});
+    server().addRecord({"o.example.com", "A", "192.168.1.2", 3600});
+
+    client().setRngSeed(4242);
+    int zeroFirst = 0, oneFirst = 0;
+    const int N = 200;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("rf.example.com", {ServiceType::SIP_UDP});
+      REQUIRE(r.targets.size() == 2);
+      if (r.targets.front().hostname == "z.example.com")
+      {
+        ++zeroFirst;
+      }
+      else if (r.targets.front().hostname == "o.example.com")
+      {
+        ++oneFirst;
+      }
+    }
+    CHECK(zeroFirst + oneFirst == N);
+    CHECK(zeroFirst > 0); // the guard: bug -> 0; correct inclusive-range -> ~N/2
+    CHECK(oneFirst > 0);
+  }
+
+  SECTION("Multiple weight-0 records randomize among themselves {0,0,50,50}")
+  {
+    // Both weight-0 records must be able to reach the head across reseeds (guards the
+    // std::shuffle of the weight-0 prefix — not only the first-arranged zero).
+    server().addRecord({"_sip._udp.mz.example.com", "SRV", "z1.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.mz.example.com", "SRV", "z2.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.mz.example.com", "SRV", "p1.example.com", 3600, 10, 50, 5060});
+    server().addRecord({"_sip._udp.mz.example.com", "SRV", "p2.example.com", 3600, 10, 50, 5060});
+    for (const char *h : {"z1", "z2", "p1", "p2"})
+    {
+      server().addRecord({std::string(h) + ".example.com", "A", "192.168.1.1", 3600});
+    }
+
+    client().setRngSeed(31);
+    // Across resolutions, look at the RELATIVE order of the two zeros among themselves (both are
+    // at the tail after the positive records, but their internal order must vary with shuffle).
+    int z1BeforeZ2 = 0, z2BeforeZ1 = 0;
+    const int N = 200;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("mz.example.com", {ServiceType::SIP_UDP});
+      REQUIRE(r.targets.size() == 4);
+      std::size_t iz1 = 5, iz2 = 5;
+      for (std::size_t k = 0; k < r.targets.size(); ++k)
+      {
+        if (r.targets[k].hostname == "z1.example.com")
+        {
+          iz1 = k;
+        }
+        else if (r.targets[k].hostname == "z2.example.com")
+        {
+          iz2 = k;
+        }
+      }
+      REQUIRE((iz1 != 5 && iz2 != 5));
+      if (iz1 < iz2)
+      {
+        ++z1BeforeZ2;
+      }
+      else
+      {
+        ++z2BeforeZ1;
+      }
+    }
+    // Shuffle among the zeros -> both orderings occur (a dropped shuffle would pin one order).
+    CHECK(z1BeforeZ2 > 0);
+    CHECK(z2BeforeZ1 > 0);
+  }
+
+  SECTION("All-weights-0 group orders uniformly (non-degenerate permutation)")
+  {
+    // remaining==0 branch: order is the shuffled arrangement -> the head varies across reseeds.
+    server().addRecord({"_sip._udp.az.example.com", "SRV", "x.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.az.example.com", "SRV", "y.example.com", 3600, 10, 0, 5060});
+    server().addRecord({"_sip._udp.az.example.com", "SRV", "w.example.com", 3600, 10, 0, 5060});
+    for (const char *h : {"x", "y", "w"})
+    {
+      server().addRecord({std::string(h) + ".example.com", "A", "192.168.1.1", 3600});
+    }
+
+    client().setRngSeed(88);
+    int distinctHeads = 0;
+    bool seenX = false, seenY = false, seenW = false;
+    const int N = 200;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("az.example.com", {ServiceType::SIP_UDP});
+      REQUIRE(r.targets.size() == 3);
+      const auto &h = r.targets.front().hostname;
+      if (h == "x.example.com" && !seenX) { seenX = true; ++distinctHeads; }
+      if (h == "y.example.com" && !seenY) { seenY = true; ++distinctHeads; }
+      if (h == "w.example.com" && !seenW) { seenW = true; ++distinctHeads; }
+    }
+    CHECK(distinctHeads >= 2); // not pinned to one order
+  }
+
+  SECTION("Weighted distribution holds through the async + NAPTR cache-hit sort sites")
+  {
+    // The async (resolveTargetAddressesAsync) and NAPTR cache-hit (processCachedServiceResolution)
+    // sort sites are distinct from the sync direct-SRV site; assert the 90/10 weighting there too.
+    auto naptr = [this](const std::string &svc, const std::string &repl)
+    {
+      MockDnsServer::DnsRecord n;
+      n.name = "wdist.example.com";
+      n.type = "NAPTR";
+      n.ttl = 3600;
+      n.naptrOrder = 100;
+      n.naptrPreference = 10;
+      n.naptrFlags = "s";
+      n.naptrService = svc;
+      n.naptrReplacement = repl;
+      server().addRecord(n);
+    };
+    naptr("SIP+D2U", "_sip._udp.wdist.example.com");
+    server().addRecord({"_sip._udp.wdist.example.com", "SRV", "w90.example.com", 3600, 10, 90, 5060});
+    server().addRecord({"_sip._udp.wdist.example.com", "SRV", "w10.example.com", 3600, 10, 10, 5060});
+    server().addRecord({"w90.example.com", "A", "192.168.1.90", 3600});
+    server().addRecord({"w10.example.com", "A", "192.168.1.10", 3600});
+
+    // Warm the NAPTR cache with one sync resolve, then measure the async and cache-hit paths.
+    (void)client().resolveServiceDomain("wdist.example.com");
+
+    auto measure = [this](std::function<ServiceResolutionResult()> resolve)
+    {
+      client().setRngSeed(555);
+      int w90First = 0, w10First = 0;
+      const int N = 300;
+      for (int i = 0; i < N; ++i)
+      {
+        auto r = resolve();
+        REQUIRE_FALSE(r.targets.empty());
+        if (r.targets.front().hostname == "w90.example.com")
+        {
+          ++w90First;
+        }
+        else if (r.targets.front().hostname == "w10.example.com")
+        {
+          ++w10First;
+        }
+      }
+      CHECK(w90First + w10First == N);
+      CHECK(w90First > w10First);
+      CHECK(w10First > 0); // proves the RNG advances on this path too
+    };
+
+    measure([this] { return resolveServiceBlocking(client(), "wdist.example.com"); }); // async
+    measure([this] { return client().resolveServiceDomain("wdist.example.com"); });    // cache-hit
+  }
+
+  SECTION("Owner-name WEIGHT isolation on the NAPTR path: weights not pooled across RRSets")
+  {
+    // Two equal-preference NAPTR services, EQUAL SRV priority, DIFFERING weights per set. Weights
+    // must be summed only within one owner name (transport), never pooled across the two RRSets.
+    // Each transport's targets stay grouped; the weighted sub-order is per-set.
+    auto naptr = [this](const std::string &svc, const std::string &repl)
+    {
+      MockDnsServer::DnsRecord n;
+      n.name = "wiso.example.com";
+      n.type = "NAPTR";
+      n.ttl = 3600;
+      n.naptrOrder = 100;
+      n.naptrPreference = 20;
+      n.naptrFlags = "s";
+      n.naptrService = svc;
+      n.naptrReplacement = repl;
+      server().addRecord(n);
+    };
+    naptr("SIP+D2T", "_sip._tcp.wiso.example.com");
+    naptr("SIP+D2U", "_sip._udp.wiso.example.com");
+    server().addRecord({"_sip._tcp.wiso.example.com", "SRV", "t90.example.com", 3600, 10, 90, 5060});
+    server().addRecord({"_sip._tcp.wiso.example.com", "SRV", "t10.example.com", 3600, 10, 10, 5060});
+    server().addRecord({"_sip._udp.wiso.example.com", "SRV", "u90.example.com", 3600, 10, 90, 5060});
+    server().addRecord({"_sip._udp.wiso.example.com", "SRV", "u10.example.com", 3600, 10, 10, 5060});
+    for (const char *h : {"t90", "t10", "u90", "u10"})
+    {
+      server().addRecord({std::string(h) + ".example.com", "A", "192.168.1.1", 3600});
+    }
+
+    auto check = [](const ServiceResolutionResult &r)
+    {
+      REQUIRE(r.targets.size() == 4);
+      // Grouped by transport (owner name): the first two are one transport, the last two the
+      // other — never interleaved. This is what prevents cross-RRSet weight pooling.
+      CHECK(r.targets[0].transport == r.targets[1].transport);
+      CHECK(r.targets[2].transport == r.targets[3].transport);
+      CHECK(r.targets[0].transport != r.targets[2].transport);
+    };
+
+    client().setRngSeed(17);
+    // Also confirm the per-set weighted sub-order favors the weight-90 host within each transport,
+    // independently, over many resolutions (no pooling would let a set's own 90 dominate its set).
+    int tcp90First = 0, udp90First = 0;
+    const int N = 200;
+    for (int i = 0; i < N; ++i)
+    {
+      auto r = client().resolveServiceDomain("wiso.example.com");
+      check(r);
+      // find first target of each transport
+      for (const auto &t : r.targets)
+      {
+        if (t.transport == ServiceType::SIP_TCP)
+        {
+          if (t.hostname == "t90.example.com") { ++tcp90First; }
+          break;
+        }
+      }
+      for (const auto &t : r.targets)
+      {
+        if (t.transport == ServiceType::SIP_UDP)
+        {
+          if (t.hostname == "u90.example.com") { ++udp90First; }
+          break;
+        }
+      }
+    }
+    CHECK(tcp90First > static_cast<int>(N * 0.6)); // 90/10 within the TCP set
+    CHECK(udp90First > static_cast<int>(N * 0.6)); // 90/10 within the UDP set, independently
+
+    // sync + async + cache-hit ordering/grouping all hold.
+    check(client().resolveServiceDomain("wiso.example.com"));
+    check(resolveServiceBlocking(client(), "wiso.example.com"));
+    check(client().resolveServiceDomain("wiso.example.com"));
+  }
+
+  SECTION("getPreferredTarget returns the ordered head and does not re-randomize")
+  {
+    server().addRecord({"_sip._udp.pt.example.com", "SRV", "h.example.com", 3600, 10, 50, 5060});
+    server().addRecord({"h.example.com", "A", "192.168.1.9", 3600});
+
+    client().setRngSeed(3);
+    auto r = client().resolveServiceDomain("pt.example.com", {ServiceType::SIP_UDP});
+    REQUIRE_FALSE(r.targets.empty());
+    auto p1 = r.getPreferredTarget();
+    auto p2 = r.getPreferredTarget();
+    CHECK(p1.hostname == r.targets.front().hostname);
+    CHECK(p1.hostname == p2.hostname); // stable, no re-draw
+  }
 }
 
 // =============================================================================
@@ -1231,12 +1705,12 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS async SRV '.' suppresses the A/AAAA fallba
     server().addRecord({"_sip._udp.adenied.example.com", "SRV", ".", 3600, 0, 0, 5060});
     server().addRecord({"adenied.example.com", "A", "192.168.1.66", 3600});
 
-    std::promise<ServiceResolutionResult> prom;
-    auto fut = prom.get_future();
+    auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+    auto fut = prom->get_future();
     client().resolveServiceDomainAsync(
       "adenied.example.com",
-      [&prom](const ServiceResolutionResult &r, const std::exception_ptr &)
-      { prom.set_value(r); },
+      [prom](const ServiceResolutionResult &r, const std::exception_ptr &)
+      { prom->set_value(r); },
       {ServiceType::SIP_UDP});
 
     REQUIRE(fut.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
@@ -1291,13 +1765,13 @@ TEST_CASE_METHOD(DnsTestFixture,
   {
     server().addRecord({"h1.example.com", "A", "192.168.1.11", 3600});
 
-    std::promise<bool> prom;
-    auto fut = prom.get_future();
+    auto prom = std::make_shared<std::promise<bool>>();
+    auto fut = prom->get_future();
     std::vector<std::pair<std::string, ServiceType>> emptyQueries;
     client().resolveCustomServiceDomainAsync(
       "h1.example.com", emptyQueries,
-      [&prom](const ServiceResolutionResult &, const std::exception_ptr &)
-      { prom.set_value(true); });
+      [prom](const ServiceResolutionResult &, const std::exception_ptr &)
+      { prom->set_value(true); });
 
     // Without the zero-work guard the callback never fires and this times out.
     REQUIRE(fut.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
@@ -1342,11 +1816,11 @@ TEST_CASE_METHOD(DnsTestFixture,
     server().addRecord({"_sips._tcp.apersvc.example.com", "SRV", ".", 3600, 0, 0, 5060});
     server().addRecord({"apersvc.example.com", "A", "192.168.1.90", 3600});
 
-    std::promise<ServiceResolutionResult> prom;
-    auto fut = prom.get_future();
+    auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+    auto fut = prom->get_future();
     client().resolveServiceDomainAsync(
       "apersvc.example.com",
-      [&prom](const ServiceResolutionResult &r, const std::exception_ptr &) { prom.set_value(r); },
+      [prom](const ServiceResolutionResult &r, const std::exception_ptr &) { prom->set_value(r); },
       {ServiceType::SIP_UDP, ServiceType::SIPS_TLS});
 
     REQUIRE(fut.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
