@@ -412,41 +412,27 @@ public:
   ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tls,
                         const TlsClientOptions &opts) override
   {
-    SessionId sid = _nextSessionId++;
-    bool inserted = false;
-    bool queueClosed = false;
-    try
-    {
-      ConnectReq cr{sid, host, port, tls, opts.verifyName, opts.x509HostFlags};
-      Command cmd = Command::connect(cr);
-      {
-        std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
-        _connecting.insert(sid);
-      }
-      inserted = true;
-      // Surface the closed-queue reject (DD-5): if the transport is tearing down,
-      // enqueue() returns false and the connect command is dropped — returning
-      // ok(sid) here would promise a connection that will never complete or fire
-      // onConnect/onClose (lost-completion). Mirror send()/close() and report it.
-      if (enqueue(std::move(cmd)))
-      {
-        return ConnectResult::ok(sid);
-      }
-      queueClosed = cmdQueueClosed();
-    }
-    catch (...)
-    {
-    }
-    if (inserted)
-    {
-      eraseConnecting(sid);
-    }
-    if (queueClosed)
-    {
-      return ConnectResult::err(
-        TransportErrorInfo{TransportError::ShuttingDown, "connect: transport shutting down"});
-    }
-    return ConnectResult::err(TransportErrorInfo{TransportError::Unknown, "connect failed"});
+    // DP-SS7: the sid-agnostic path — mint here and flush in one call, behaviour
+    // byte-for-byte as before (checkInUse=false skips the single-shot lookup).
+    return connectEnqueue(_nextSessionId++, host, port, tls, opts, /*checkInUse=*/false);
+  }
+
+  /// \brief DP-SS1: mint a session id ONLY (no _connecting insert, no enqueue). See
+  /// EngineBase::allocateSid. A sid returned here is NOT yet sessionSendable — a
+  /// send() before connectWith() is rejected (not silently dropped), because
+  /// sessionSendable() finds it in neither _sessions nor _connecting.
+  SessionId allocateSid() override { return _nextSessionId++; }
+
+  /// \brief DP-SS2: the enqueue half for a caller-supplied \p sid (from
+  /// allocateSid()). Inserts into _connecting under _sessionRwMutex, RELEASES it,
+  /// then enqueues the connect command (enqueue last), so a caller who registered
+  /// against \p sid before this call is registered-before-connect. On enqueue-fail/
+  /// throw it eraseConnecting()s and returns err (err XOR onClose, DP-SS4). Single-
+  /// shot per sid (DP-SS6). See EngineBase::connectWith.
+  ConnectResult connectWith(SessionId sid, const std::string &host, std::uint16_t port,
+                            TlsMode tls, const TlsClientOptions &opts) override
+  {
+    return connectEnqueue(sid, host, port, tls, opts, /*checkInUse=*/true);
   }
 
   /// \brief Queue a send on a session (non-blocking; may enqueue on EAGAIN).
@@ -1175,6 +1161,82 @@ private:
     {
       throw std::runtime_error("injected connect-path throw");
     }
+  }
+
+  /// \brief Shared enqueue half of connect()/connectWith() (DP-SS2). Insert \p sid
+  /// into _connecting under _sessionRwMutex, RELEASE the lock, then enqueue the connect
+  /// command — ENQUEUE LAST — so a caller who registered against \p sid before calling
+  /// (connectWith) is registered-before-connect; the _cmdMutex release/acquire carries
+  /// the register write to the I/O thread (DP-SS3). \p checkInUse gates the single-shot
+  /// guard (DP-SS6): connectWith() rejects a \p sid already connecting/established (a 2nd
+  /// doConnect would overwrite _pendingConnects[sid] and leak a second fd); connect()
+  /// passes false (a freshly minted sid cannot collide) so its behaviour is unchanged
+  /// (DP-SS7). On enqueue-false (queue closed, DD-5) or a throw it eraseConnecting()s and
+  /// returns err — the registered sid gets err XOR onClose, never both (DP-SS4).
+  ConnectResult connectEnqueue(SessionId sid, const std::string &host, std::uint16_t port,
+                               TlsMode tls, const TlsClientOptions &opts, bool checkInUse)
+  {
+    // Defensive: reject the invalid-sid sentinel (0) on the connectWith path — a caller
+    // that forwards an unallocated sid, or the sid from an unsupported allocateSid()
+    // default (returns 0), must not be turned into a live reservation. connect() mints
+    // via _nextSessionId (starts at 1, checkInUse=false), so this never fires for it.
+    if (checkInUse && sid == 0)
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::Unknown, "connectWith: invalid sid"});
+    }
+    bool inserted = false;
+    bool queueClosed = false;
+    bool inUse = false;
+    try
+    {
+      // Build the Command BEFORE taking _sessionRwMutex (and thus possibly discarding it
+      // on the rare inUse path) so the lock hold stays minimal — never build/copy under
+      // the registry lock. Discarding a to-be-unused Command on single-shot rejection is
+      // cheaper than a longer hold or a double lock acquisition.
+      ConnectReq cr{sid, host, port, tls, opts.verifyName, opts.x509HostFlags};
+      Command cmd = Command::connect(cr);
+      {
+        std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+        if (checkInUse && (_connecting.find(sid) != _connecting.end() ||
+                           _sessions.find(sid) != _sessions.end()))
+        {
+          inUse = true;
+        }
+        else
+        {
+          _connecting.insert(sid);
+          inserted = true;
+        }
+      }
+      if (inUse)
+      {
+        return ConnectResult::err(
+          TransportErrorInfo{TransportError::Unknown, "connectWith: sid already in use"});
+      }
+      // Surface the closed-queue reject (DD-5): if the transport is tearing down,
+      // enqueue() returns false and the connect command is dropped — returning
+      // ok(sid) here would promise a connection that will never complete or fire
+      // onConnect/onClose (lost-completion). Mirror send()/close() and report it.
+      if (enqueue(std::move(cmd)))
+      {
+        return ConnectResult::ok(sid);
+      }
+      queueClosed = cmdQueueClosed();
+    }
+    catch (...)
+    {
+    }
+    if (inserted)
+    {
+      eraseConnecting(sid);
+    }
+    if (queueClosed)
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::ShuttingDown, "connect: transport shutting down"});
+    }
+    return ConnectResult::err(TransportErrorInfo{TransportError::Unknown, "connect failed"});
   }
 
   /// \brief Erase \p sid from the connecting registry; true iff it was present.
@@ -4161,7 +4223,20 @@ private:
   // _lostTimerMutex are mutually-exclusive LEAVES — at most one is held at a time;
   // no nesting among them. connect() takes _sessionRwMutex (registry insert),
   // RELEASES it, and only then takes _cmdMutex (enqueue) — sequential, never
-  // co-held. The ONE nesting edge into a leaf is the post gate:
+  // co-held. connectWith() (DP-SS2) takes the identical two-step path with the same
+  // ordering; connectEnqueue() is the shared body.
+  // REGISTER-BEFORE-CONNECT happens-before (DP-SS3): a caller's register write that
+  // is sequenced-before its connectWith() call is carried to the I/O thread by the
+  // connect command queue's _cmdMutex RELEASE (pushLockedAndWake) / ACQUIRE (process's
+  // q.swap(_cmds)) edge — a std::mutex unlock is a release and lock an acquire, so the
+  // register happens-before the I/O thread's doConnect and therefore before any
+  // onClose/onConnectionError for that sid. The ordering rests on the _cmdMutex
+  // release/acquire CARRYING the prior write, NOT on register and connect sharing a
+  // mutex for mutual exclusion (they run on different threads over different maps).
+  // The _eventFd wakeup ::write is a wakeup only, NEVER the synchronizer; do not
+  // replace _cmds/_cmdMutex with a lock-free queue or an atomic flag without
+  // re-establishing this edge.
+  // The ONE nesting edge into a leaf is the post gate:
   //   - gate->m -> _cmdMutex: the resolver continuation (blockingIoPool thread)
   //     calls runOnIoThread while holding _postGuard->m (makeResolveContinuation);
   //     shutdownDrain takes gate->m in its own section, never with _cmdMutex held.

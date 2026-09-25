@@ -285,6 +285,29 @@ public:
       sid, [&] { return Cmd::via(ViaReq{sid, lid, host, port}); },
       "connectViaListener: transport shutting down");
   }
+
+  /// \brief DP-SS1: mint a session id ONLY (no _connecting insert, no enqueue). See
+  /// EngineBase::allocateSid. Not yet sendable until connectWith() (a premature send()
+  /// is rejected, not dropped — trySend finds it in neither _sessions nor _connecting).
+  SessionId allocateSid() override { return _nextSessionId++; }
+
+  /// \brief DP-SS2: enqueue the connect for a caller-supplied \p sid (from
+  /// allocateSid()) via the shared helper (insert _connecting -> release -> enqueue),
+  /// with the single-shot guard (DP-SS6). Register-before-connect ordering + err XOR
+  /// onClose (DP-SS3/DP-SS4). See EngineBase::connectWith.
+  ConnectResult connectWith(SessionId sid, const std::string &host, std::uint16_t port,
+                            TlsMode tls, const TlsClientOptions &opts) override
+  {
+    (void)opts; // UDP has no TLS; identity options are not applicable
+    if (tls != TlsMode::None)
+    {
+      return ConnectResult::err(
+        TransportErrorInfo{TransportError::Config, "TLS/DTLS not supported on UDP"});
+    }
+    return insertConnectingAndEnqueue(
+      sid, [&] { return Cmd::connect(ConnectReq{sid, host, port}); },
+      "connectWith: transport shutting down", /*checkInUse=*/true);
+  }
   /// \brief A3.1a shared front-end (steps-4-8 R1 simp-L2): build the command (inside
   /// the try, so a throwing ConnectReq/ViaReq construction is also caught), insert the
   /// sid into _connecting under the write lock, RELEASE, then enqueue on the noexcept
@@ -298,17 +321,40 @@ public:
   /// queue-closed vs Unknown; the two public entry points keep their own message.
   template <typename BuildCmd>
   ConnectResult insertConnectingAndEnqueue(SessionId sid, BuildCmd buildCmd,
-                                           const char *shuttingDownMsg)
+                                           const char *shuttingDownMsg, bool checkInUse = false)
   {
+    // Defensive: reject the invalid-sid sentinel (0) on the connectWith path (checkInUse);
+    // connect()/connectViaListener() mint via _nextSessionId (starts at 1) so it never fires.
+    if (checkInUse && sid == 0)
+    {
+      return ConnectResult::err(TransportErrorInfo{TransportError::Unknown, "connectWith: invalid sid"});
+    }
     bool inserted = false;
+    bool inUse = false;
     try
     {
       Cmd cmd = buildCmd();
       {
         std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
-        _connecting.insert(sid);
+        // DP-SS6 single-shot: connectWith() rejects a sid already connecting/known so
+        // a second Via/Connect cannot double-enqueue. connect()/connectViaListener()
+        // pass false (fresh sid cannot collide) — behaviour unchanged (DP-SS7).
+        if (checkInUse && (_connecting.find(sid) != _connecting.end() ||
+                           _sessions.find(sid) != _sessions.end()))
+        {
+          inUse = true;
+        }
+        else
+        {
+          _connecting.insert(sid);
+          inserted = true;
+        }
       }
-      inserted = true;
+      if (inUse)
+      {
+        return ConnectResult::err(
+          TransportErrorInfo{TransportError::Unknown, "connectWith: sid already in use"});
+      }
       if (enqueue(std::move(cmd)))
       {
         return ConnectResult::ok(sid);
@@ -319,14 +365,23 @@ public:
     }
     if (inserted)
     {
-      // steps-4-8 R3 (TS LOW): the rollback erases _connecting and fires NO onClose.
-      // That owes no terminal because an err-returned sid NEVER escapes to
-      // observer-capable code — connect()/connectViaListener() return this sid to the
-      // caller ONLY via ConnectResult::ok; an err result hands the sid to nobody, so
-      // no legitimate observe(sid) can exist. Re-audit if any future path observes a
-      // sid before its ConnectResult is known.
+      // The rollback erases _connecting and fires NO onClose. This upholds DP-SS4
+      // (err XOR onClose for a registered sid): via connectWith() the caller obtained
+      // this sid from allocateSid() and MAY have registered against it BEFORE this call
+      // (register-before-connect) — so an err-returned sid CAN have escaped to observer-
+      // capable code. Correctness therefore rests not on "the sid escaped to nobody" but
+      // on the XOR: no Connect Cmd was enqueued (enqueue returned false / threw before
+      // push), so no doConnect and no onClose can ever fire for this sid; we return err
+      // and the caller un-registers on err. (connect()/connectViaListener() pass
+      // checkInUse=false and never hand out an err sid, so the guarantee holds a fortiori
+      // for them.) See tcp connectEnqueue + EngineBase::connectWith for the twin wording.
       eraseConnecting(sid);
     }
+    // FAILURE-CODE PARITY (documented, pre-split choice, now also on the connectWith
+    // path): UDP folds every enqueue-false — closed queue OR a caught allocation throw —
+    // to a single ShuttingDown, whereas TCP's connectEnqueue distinguishes ShuttingDown
+    // (queue closed) from Unknown (caught throw). Both satisfy DP-SS4; a caller keying on
+    // the exact code should not rely on cross-engine equality of the enqueue-fail code.
     return ConnectResult::err(TransportErrorInfo{TransportError::ShuttingDown, shuttingDownMsg});
   }
   /// \brief Single sendability decision (A3.3): make it ONCE so a close racing

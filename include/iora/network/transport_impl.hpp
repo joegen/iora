@@ -902,6 +902,18 @@ inline ConnectResult Transport::connectViaListener(ListenerId lid, const std::st
   return _impl->engine->connectViaListener(lid, host, port);
 }
 
+inline SessionId Transport::allocateSid()
+{
+  return _impl->engine->allocateSid();
+}
+
+inline ConnectResult Transport::connectWith(SessionId sid, const std::string &host,
+                                            std::uint16_t port, TlsMode tls,
+                                            const TlsClientOptions &opts)
+{
+  return _impl->engine->connectWith(sid, host, port, tls, opts);
+}
+
 inline bool Transport::close(SessionId sid)
 {
   return _impl->engine->close(sid);

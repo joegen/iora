@@ -80,6 +80,30 @@ public:
                                 const TlsClientOptions &opts) = 0;
   virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,
                                            std::uint16_t port) = 0;
+
+  /// \brief DP-SS1/DP-SS5 (register-before-connect): mint a session id WITHOUT
+  /// enqueuing a connect. Pair with connectWith(): a caller obtains the sid, registers
+  /// state against it, then flushes the connect — so a connect failure is delivered to
+  /// an already-registered sid. Non-pure (default: unsupported, returns 0) so existing
+  /// ITransport implementors are unaffected; the concrete Transport delegates to the
+  /// engine.
+  virtual SessionId allocateSid() { return 0; }
+
+  /// \brief DP-SS2: flush the connect for a caller-supplied \p sid (from allocateSid())
+  /// after the caller has registered against it. err XOR onClose for a registered sid
+  /// (DP-SS4), single-shot (DP-SS6). Non-pure default: unsupported.
+  virtual ConnectResult connectWith(SessionId sid, const std::string &host, std::uint16_t port,
+                                    TlsMode tls, const TlsClientOptions &opts)
+  {
+    (void)sid;
+    (void)host;
+    (void)port;
+    (void)tls;
+    (void)opts;
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::Config, "connectWith not supported"});
+  }
+
   virtual bool close(SessionId sid) = 0;
 
   // ===== Async Data Operations =====
@@ -251,6 +275,9 @@ public:
   using ITransport::connect; // keep both connect overloads visible (no hiding)
   ConnectResult connectViaListener(ListenerId lid, const std::string &host,
                                    std::uint16_t port) override;
+  SessionId allocateSid() override;
+  ConnectResult connectWith(SessionId sid, const std::string &host, std::uint16_t port,
+                            TlsMode tls, const TlsClientOptions &opts) override;
   bool close(SessionId sid) override;
 
   bool send(SessionId sid, iora::core::BufferView data) override;

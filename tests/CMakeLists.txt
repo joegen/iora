@@ -109,6 +109,7 @@ set(NETWORK_TESTS
     network/iora_test_websocket_upgrade_race
     network/iora_test_transport
     network/iora_test_transport_observe
+    network/iora_test_transport_sid_surfacing
     network/iora_test_transport_sync_dscp_fixes
     network/iora_test_tls_identity
     network/iora_test_engine_introspection
@@ -604,6 +605,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_tcp_connect_then_send
     iora_test_tcp_setup_close_codes
     iora_test_transport_observe
+    iora_test_transport_sid_surfacing
     iora_test_udp_connect_then_send
     iora_test_udp_engine
     iora_test_udp_engine_teardown_race

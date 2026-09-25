@@ -105,6 +105,36 @@ public:
   }
   virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,
                                            std::uint16_t port) = 0;
+
+  /// \brief DP-SS1 (register-before-connect): mint a session id WITHOUT publishing
+  /// anything engine-discoverable — no connecting-registry insert, no command
+  /// enqueued. The caller may register state against the returned sid and then call
+  /// connectWith() to flush the connect. A minted-but-never-connectWith'd sid is inert
+  /// (nothing to reclaim engine-side). Default: unsupported (returns 0, an invalid
+  /// sid — ids start at 1); the TCP/UDP engines override with a real atomic mint.
+  virtual SessionId allocateSid() { return 0; }
+
+  /// \brief DP-SS2: the enqueue half of connect() for a caller-supplied \p sid
+  /// (from allocateSid()) — insert into the connecting registry then enqueue the
+  /// connect command, ENQUEUE LAST. Because the caller's register write is sequenced
+  /// before this call and the command-queue mutex's release/acquire carries it to the
+  /// I/O thread (DP-SS3), a connect failure is delivered to an already-registered sid.
+  /// On enqueue-fail/throw it rolls the registry entry back and returns err — the
+  /// engine guarantees err XOR onClose for a registered sid (DP-SS4). Single-shot per
+  /// sid (DP-SS6). Default: unsupported; the TCP/UDP engines override.
+  virtual ConnectResult connectWith(SessionId sid, const std::string &host,
+                                    std::uint16_t port, TlsMode tls,
+                                    const TlsClientOptions &opts)
+  {
+    (void)sid;
+    (void)host;
+    (void)port;
+    (void)tls;
+    (void)opts;
+    return ConnectResult::err(
+      TransportErrorInfo{TransportError::Config, "connectWith not supported by this engine"});
+  }
+
   virtual bool close(SessionId sid) = 0;
 
   /// \brief Is \p sid live for observer purposes — an open (present, not-closed)
