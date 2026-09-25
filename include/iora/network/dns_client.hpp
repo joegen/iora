@@ -1014,9 +1014,9 @@ private:
     _transport->queryAsync(
       question,
       [callback = std::move(callback), state](const dns::DnsResult &result,
-                                              std::exception_ptr error) mutable
+                                              std::exception_ptr error)
       {
-        // Atomic delivery guard - only first caller proceeds
+        // Atomic delivery guard - only the first entry delivers.
         bool expectedDelivery = false;
         if (!state->deliveryAttempted.compare_exchange_strong(expectedDelivery, true,
                                                               std::memory_order_acq_rel))
@@ -1024,25 +1024,41 @@ private:
           return; // Already delivered or being delivered by another thread
         }
 
-        // Check cancellation after securing delivery slot
-        if (state->cancelled.load(std::memory_order_acquire))
+        // Publish completion via a scope-exit guard, constructed AFTER the delivery
+        // CAS so only the delivering entry ever publishes. Its destructor performs
+        // ONLY the atomic store (noexcept), and runs on BOTH normal return and the
+        // exceptional unwind of a throwing user callback - so completion is never
+        // skipped, and the release-store stays sequenced AFTER the callback's
+        // writes (preserving the release/acquire edge for isCompleted() pollers).
+        struct CompletionGuard
         {
-          // Invoke callback with cancellation exception to prevent future hanging
-          callback({}, std::make_exception_ptr(dns::DnsResolverException("DNS request cancelled")));
-          state->completed.store(true, std::memory_order_release);
-          return;
-        }
+          std::atomic<bool> *completed;
+          ~CompletionGuard() noexcept
+          {
+            completed->store(true, std::memory_order_release);
+          }
+        } completionGuard{&state->completed};
 
-        // Process result and invoke callback
+        // Build the result exactly once; deliver it through a single invocation
+        // site to which every branch (cancelled/error/empty/success) funnels. The
+        // build is wrapped so that even an OOM throw from make_exception_ptr on the
+        // cancelled/no-records branches still funnels to the single delivery below.
+        std::vector<std::string> addresses;
+        std::exception_ptr deliverError;
+
         try
         {
-          if (error)
+          if (state->cancelled.load(std::memory_order_acquire))
           {
-            callback({}, error);
+            deliverError =
+              std::make_exception_ptr(dns::DnsResolverException("DNS request cancelled"));
+          }
+          else if (error)
+          {
+            deliverError = std::move(error);
           }
           else
           {
-            std::vector<std::string> addresses;
             for (const auto &record : result.a_records)
             {
               addresses.push_back(record.address);
@@ -1050,23 +1066,26 @@ private:
 
             if (addresses.empty())
             {
-              auto noRecordsError = std::make_exception_ptr(
+              deliverError = std::make_exception_ptr(
                 dns::DnsNoRecordsException(state->hostname, dns::DnsType::A));
-              callback({}, noRecordsError);
-            }
-            else
-            {
-              callback(std::move(addresses), nullptr);
             }
           }
         }
         catch (...)
         {
-          callback({}, std::current_exception());
+          deliverError = std::current_exception();
         }
 
-        // Mark completed after callback processing
-        state->completed.store(true, std::memory_order_release);
+        // Contract: never deliver a partially-built vector alongside an error.
+        if (deliverError)
+        {
+          addresses.clear();
+        }
+
+        // Single delivery, OUTSIDE any re-invoking catch. A throwing user callback
+        // propagates into the transport's own catch(...) around this lambda (it is
+        // swallowed, not std::terminate); completionGuard still publishes on unwind.
+        callback(std::move(addresses), std::move(deliverError));
       });
   }
 };
