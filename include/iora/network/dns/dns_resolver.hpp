@@ -1514,10 +1514,10 @@ private:
   }
 
   /// \brief Map a secure SIP transport to its RFC 3263 SRV owner name.
-  /// Only _sips._tcp is RFC 3263-normative; _sips._sctp and _sips._wss are de-facto
-  /// convention — RFC 4168 (SIPS+D2S) and RFC 7118 §5 (SIPS+D2W, wss default port 443)
-  /// define the NAPTR services but defer SRV mechanics to RFC 3263 and mandate no
-  /// owner-name string. Never _sips._udp: SIPS+D2U SHOULD NOT exist (RFC 3263 §4.1).
+  /// _sips._tcp originates in RFC 3263 itself; the _sips._sctp / _sips._wss service
+  /// values SIPS+D2S / SIPS+D2W are normatively registered by RFC 4168 §8 / RFC 7118
+  /// §10.2 (wss default port 443), and their SRV owner names follow RFC 3263's normative
+  /// _sips._<proto> construction rule. Never _sips._udp: SIPS+D2U SHOULD NOT exist (§4.1).
   static std::string secureSrvOwnerName(ServiceType transport, const std::string &domain)
   {
     switch (transport)
