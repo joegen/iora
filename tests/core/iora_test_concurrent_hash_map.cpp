@@ -448,3 +448,73 @@ TEST_CASE("CHM: concurrent stress — readers and writers", "[chm][stress]")
   // Just verify no crashes and map is in a valid state
   REQUIRE(map.size() <= static_cast<std::size_t>(numWriters * opsPerThread));
 }
+
+TEST_CASE("ConcurrentHashMap: findOrInsertAndModify inserts-then-modifies, or modifies in place",
+          "[concurrent_hash_map]")
+{
+  TestMap map;
+  int factoryCalls = 0;
+
+  // Absent key: factory is called, value inserted, modifier runs on the new element.
+  map.findOrInsertAndModify(
+    "a", [&]() { ++factoryCalls; return 10; }, [](int& v) { v += 1; });
+  REQUIRE(factoryCalls == 1);
+  int got = 0;
+  REQUIRE(map.findAndDo("a", [&](const int& v) { got = v; }));
+  REQUIRE(got == 11);
+
+  // Present key: factory is NOT called (key already present); modifier runs on it.
+  map.findOrInsertAndModify(
+    "a", [&]() { ++factoryCalls; return 999; }, [](int& v) { v += 100; });
+  REQUIRE(factoryCalls == 1); // unchanged
+  got = 0;
+  map.findAndDo("a", [&](const int& v) { got = v; });
+  REQUIRE(got == 111);
+}
+
+TEST_CASE("ConcurrentHashMap: findOrInsertAndModify works with a move-only value",
+          "[concurrent_hash_map]")
+{
+  // TokenBucket (the RateLimiterMap value) is move-only; the primitive must never
+  // copy or return V.
+  ConcurrentHashMap<int, std::unique_ptr<int>> map;
+  map.findOrInsertAndModify(
+    1, []() { return std::make_unique<int>(5); },
+    [](std::unique_ptr<int>& p) { *p += 1; });
+  int got = 0;
+  REQUIRE(map.findAndDo(1, [&](const std::unique_ptr<int>& p) { got = *p; }));
+  REQUIRE(got == 6);
+}
+
+TEST_CASE("ConcurrentHashMap: findOrInsertAndModify is atomic under same-key contention",
+          "[concurrent_hash_map]")
+{
+  // The primitive's reason to exist: an atomic get-or-create-then-modify under one
+  // shard lock. N threads race the SAME absent key -> factory MUST run exactly once
+  // (the first inserts; the rest find it) AND every thread's modify MUST apply (no
+  // lost update). Assertions are join-gated, not timing-gated -> deterministic and
+  // non-vacuous: a shared-lock find or a two-lock gap would break factoryCalls==1 or
+  // the final count (2026-09-29-2).
+  ConcurrentHashMap<int, int> map;
+  std::atomic<int> factoryCalls{0};
+  constexpr int kThreads = 16;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kThreads; ++i)
+  {
+    threads.emplace_back(
+      [&]()
+      {
+        map.findOrInsertAndModify(
+          42, [&]() { factoryCalls.fetch_add(1); return 0; },
+          [](int& v) { ++v; });
+      });
+  }
+  for (auto& t : threads)
+  {
+    t.join();
+  }
+  REQUIRE(factoryCalls.load() == 1); // factory ran exactly once (first-inserts)
+  int got = -1;
+  REQUIRE(map.findAndDo(42, [&](const int& v) { got = v; }));
+  REQUIRE(got == kThreads); // every thread's modify applied, no lost update
+}

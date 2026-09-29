@@ -256,12 +256,13 @@ public:
       defRate = _defaultRate;
       defBurst = _defaultBurst;
     }
-    _buckets.insert(key, TokenBucket(defRate, defBurst));
-
-    _buckets.findAndModify(key, [&](TokenBucket& bucket)
-    {
-      consumed = bucket.tryConsume(tokens);
-    });
+    // Create-and-consume atomically under one shard lock: a separate insert() then
+    // findAndModify() has a gap in which a concurrent removeKey()/cleanup() could
+    // erase the just-created bucket, making findAndModify miss and spuriously deny a
+    // legitimate first request (2026-09-29-2).
+    _buckets.findOrInsertAndModify(
+      key, [&] { return TokenBucket(defRate, defBurst); },
+      [&](TokenBucket& bucket) { consumed = bucket.tryConsume(tokens); });
     return consumed;
   }
 

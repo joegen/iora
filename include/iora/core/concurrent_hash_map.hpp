@@ -249,6 +249,30 @@ public:
     return true;
   }
 
+  /// \brief Get-or-create THEN modify, all under a SINGLE unique_lock: if \p key is
+  /// absent, \p factory() builds the value and it is inserted (factory() is invoked
+  /// only when the key is absent); then \p modifier(V&) runs on the resident element
+  /// (pre-existing or just-created). Same-key racers serialize on the shard lock, so
+  /// the first inserts and each later caller finds and modifies that element — no
+  /// double-insert, no lost modify. Unlike a separate insert()+findAndModify(), there
+  /// is NO gap between two shard-lock acquisitions in which a concurrent erase could
+  /// drop the just-created element and lose the modify. Works for move-only V (V is
+  /// never copied or returned). CONTRACT: factory() and modifier() run UNDER the shard
+  /// mutex — they must not re-enter this map for the same key (self-deadlock) or take a
+  /// lock that could invert the documented ordering (cf. concurrency.md HR-3).
+  template<typename Factory, typename Modifier>
+  void findOrInsertAndModify(const K& key, Factory&& factory, Modifier&& modifier)
+  {
+    auto& shard = shardFor(key);
+    std::unique_lock lock(shard.mutex);
+    auto it = shard.map.find(key);
+    if (it == shard.map.end())
+    {
+      it = shard.map.emplace(key, factory()).first;
+    }
+    modifier(it->second);
+  }
+
 private:
   struct Shard
   {
