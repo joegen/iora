@@ -34,9 +34,13 @@
 #include "iora/network/dns/dns_transport.hpp"
 #include "iora/network/dns/dns_types.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace iora::network::dns;
@@ -597,3 +601,325 @@ TEST_CASE("Transport-level: refused TCP connect throws DnsNetworkException (type
   REQUIRE(wasNetwork);
 }
 
+
+// =============================================================================
+// PHASE 2/3 — ASYNC next-server failover (queryAsyncWithFailover helper)
+// =============================================================================
+
+namespace
+{
+constexpr std::chrono::seconds ASYNC_WAIT{5};
+
+/// \brief A DnsTransport double whose async queryAsync branches on the SERVER argument, so a
+/// deterministic per-server rcode / success / injected-throw sequence drives the resolver's
+/// async failover helper without real sockets. queryAsync is the only virtual seam.
+class FailoverDouble : public DnsTransport
+{
+public:
+  explicit FailoverDouble(const DnsConfig &cfg) : DnsTransport(cfg) {}
+
+  // Per-server-address behavior. Absent server -> SERVFAIL (server-local).
+  std::unordered_map<std::string, DnsResponseCode> rcodeByServer;
+  std::unordered_map<std::string, std::vector<std::string>> aByServer; // success addresses (A)
+  std::atomic<int> issueCount{0};
+  std::atomic<int> callbackCount{0};
+  int throwOnIssue{-1}; // 1-based Nth issue throws synchronously; -1 = off
+  bool asyncDispatch{true};
+
+  void queryAsync(const DnsQuestion &q, QueryCallback cb, const std::string &server,
+                  std::uint16_t) override
+  {
+    const int n = ++issueCount;
+    if (n == throwOnIssue)
+    {
+      throw std::runtime_error("injected synchronous issue throw @call " + std::to_string(n));
+    }
+
+    DnsResult r;
+    DnsResponseCode rc = DnsResponseCode::SERVFAIL;
+    auto it = rcodeByServer.find(server);
+    if (it != rcodeByServer.end())
+    {
+      rc = it->second;
+    }
+    r.header.rcode = rc;
+    if (rc == DnsResponseCode::NOERROR)
+    {
+      auto ait = aByServer.find(server);
+      if (ait != aByServer.end())
+      {
+        for (const auto &a : ait->second)
+        {
+          r.a_records.push_back(ARecord(q.qname, a, 3600));
+        }
+      }
+      r.header.ancount = static_cast<std::uint16_t>(r.a_records.size());
+    }
+    else
+    {
+      r.header.ancount = 0;
+    }
+
+    auto deliver = [this, cb, r]()
+    {
+      ++callbackCount;
+      try
+      {
+        cb(r, nullptr);
+      }
+      catch (...)
+      {
+      }
+    };
+    if (asyncDispatch)
+    {
+      std::thread(deliver).detach();
+    }
+    else
+    {
+      deliver();
+    }
+  }
+};
+
+struct AsyncOutcome
+{
+  DnsResult result;
+  std::exception_ptr error;
+  int callbacks{0};
+  bool completed{false};
+};
+
+// Drive the resolver's public async queryAsync twin and block (bounded) for the first callback.
+AsyncOutcome driveQueryAsync(const std::shared_ptr<DnsResolver> &r, const DnsQuestion &q)
+{
+  auto count = std::make_shared<std::atomic<int>>(0);
+  auto once = std::make_shared<std::atomic<bool>>(false);
+  auto prom = std::make_shared<std::promise<std::pair<DnsResult, std::exception_ptr>>>();
+  auto fut = prom->get_future();
+  r->queryAsync(q, [count, once, prom](const DnsResult &res, const std::exception_ptr &e)
+                {
+                  count->fetch_add(1);
+                  if (!once->exchange(true))
+                  {
+                    prom->set_value({res, e});
+                  }
+                });
+  AsyncOutcome out;
+  out.completed = fut.wait_for(ASYNC_WAIT) == std::future_status::ready;
+  if (out.completed)
+  {
+    auto p = fut.get();
+    out.result = p.first;
+    out.error = p.second;
+    std::this_thread::sleep_for(std::chrono::milliseconds(60)); // catch any spurious extra callback
+  }
+  out.callbacks = count->load();
+  return out;
+}
+
+std::shared_ptr<FailoverDouble> makeDouble(const std::vector<std::string> &servers)
+{
+  DnsConfig cfg;
+  cfg.setServers(servers);
+  cfg.timeout = std::chrono::milliseconds(400);
+  cfg.retryCount = 0;
+  return std::make_shared<FailoverDouble>(cfg);
+}
+
+std::shared_ptr<DnsResolver> resolverOver(const std::shared_ptr<FailoverDouble> &t)
+{
+  DnsConfig cfg;
+  cfg.setServers({"1.1.1.1:53", "2.2.2.2:53"}); // resolver _config server list is unused for the
+                                                 // snapshot (that comes from the transport)
+  return std::make_shared<DnsResolver>(t, nullptr, cfg);
+}
+
+} // namespace
+
+TEST_CASE("ASYNC SERVFAIL on A -> failover to B; exactly one callback", "[dns][failover][async]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->rcodeByServer["10.0.0.1"] = DnsResponseCode::SERVFAIL;
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.60"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE_FALSE(out.error);
+  REQUIRE(out.result.isSuccess());
+  REQUIRE(out.result.a_records[0].address == "192.0.2.60");
+}
+
+TEST_CASE("ASYNC all-server SERVFAIL -> transient, exactly one callback", "[dns][failover][async]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->rcodeByServer["10.0.0.1"] = DnsResponseCode::SERVFAIL;
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::SERVFAIL;
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.error);
+  bool transient = false;
+  try
+  {
+    std::rethrow_exception(out.error);
+  }
+  catch (const DnsTransientResolutionException &)
+  {
+    transient = true;
+  }
+  catch (...)
+  {
+  }
+  REQUIRE(transient);
+  REQUIRE(t->issueCount.load() == 2); // each server tried exactly once
+}
+
+TEST_CASE("ASYNC 3-server round-robin wrap never re-hits an excluded server",
+          "[dns][failover][async]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53", "10.0.0.3:53"});
+  t->rcodeByServer["10.0.0.1"] = DnsResponseCode::SERVFAIL;
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::SERVFAIL;
+  t->rcodeByServer["10.0.0.3"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.3"] = {"192.0.2.61"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.result.isSuccess());
+  REQUIRE(t->issueCount.load() == 3); // exactly N issues, no re-hit
+}
+
+TEST_CASE("ASYNC re-issue in flight never double-fires the terminal (exactly once)",
+          "[dns][failover][async][exactly-once]")
+{
+  // asyncDispatch=true: each completion is on a worker thread, so the SERVFAIL->re-issue
+  // transition is a genuine cross-thread hand-off; the callback must still fire exactly once.
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->asyncDispatch = true;
+  t->rcodeByServer["10.0.0.1"] = DnsResponseCode::SERVFAIL;
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.62"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.result.isSuccess());
+}
+
+TEST_CASE("ASYNC synchronous FIRST-issue throw -> exactly one terminal callback, no hang",
+          "[dns][failover][async][throw]")
+{
+  // The helper must NEVER propagate a synchronous issue-throw: it converts it to exactly one
+  // terminal wrappedCallback. A double-fire OR a lost callback makes this bounded wait fail.
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->asyncDispatch = false; // inline completion path (re-entrant)
+  t->throwOnIssue = 1;      // the very first issue throws synchronously
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.63"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);      // no hang
+  REQUIRE(out.callbacks == 1); // exactly one terminal
+  REQUIRE(out.error);          // a non-network injected throw is delivered terminal
+}
+
+TEST_CASE("ASYNC concurrent failovers on different owner names do not corrupt each other",
+          "[dns][failover][async][concurrent]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->rcodeByServer["10.0.0.1"] = DnsResponseCode::SERVFAIL; // primary always fails -> both rotate
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.64"};
+  auto r = resolverOver(t);
+
+  constexpr int N = 8;
+  std::vector<std::future<AsyncOutcome>> futs;
+  for (int i = 0; i < N; ++i)
+  {
+    futs.push_back(std::async(std::launch::async, [&r, i]()
+                              { return driveQueryAsync(r, aQ("host" + std::to_string(i) + ".example.com")); }));
+  }
+  for (auto &f : futs)
+  {
+    AsyncOutcome out = f.get();
+    REQUIRE(out.completed);
+    REQUIRE(out.callbacks == 1);
+    REQUIRE(out.result.isSuccess());
+  }
+}
+
+TEST_CASE("ASYNC all-server exhaustion -> resolveServiceDomainAsync outcome=TransientFailure",
+          "[dns][failover][async][outcome]")
+{
+  // Every avenue (NAPTR -> direct-SRV -> A/AAAA fallback) exhausts BOTH servers on server-local
+  // SERVFAIL, so each helper funnels a terminal transient. The delivered ServiceResolutionResult
+  // must carry the terminal avenue's per-avenue outcome = TransientFailure (retryable), never a
+  // silent empty / PermanentNoService. (The empty-server-snapshot n==0 branch in the helper is a
+  // defensive subset of this exhaustion path; a genuinely empty snapshot is unreachable through
+  // DnsConfig, whose ctor and updateConfig both reject an empty server list.)
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"}); // both default to SERVFAIL for every name
+  auto r = resolverOver(t);
+
+  auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+  auto fut = prom->get_future();
+  auto once = std::make_shared<std::atomic<bool>>(false);
+  r->resolveServiceDomainAsync(
+    "example.com",
+    [prom, once](const ServiceResolutionResult &res, const std::exception_ptr &)
+    {
+      if (!once->exchange(true))
+      {
+        prom->set_value(res);
+      }
+    },
+    {ServiceType::SIP_UDP});
+  REQUIRE(fut.wait_for(ASYNC_WAIT) == std::future_status::ready);
+  ServiceResolutionResult res = fut.get();
+  REQUIRE_FALSE(res.isSuccess());
+  REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
+}
+
+TEST_CASE("ASYNC end-to-end: two real MockDnsServer, SERVFAIL on A -> resolveServiceDomainAsync via B",
+          "[dns][failover][async][wire]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "example.net";
+  const std::string srvName = "_sip._udp." + domain;
+  // A SERVFAILs the NAPTR and SRV; B answers the full direct-SRV chain.
+  a->configureQuery(domain, "NAPTR", servfail());
+  a->configureQuery(srvName, "SRV", servfail());
+  b->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord({"sip1." + domain, "A", "192.0.2.70", 3600});
+    (*n)->addRecord({"sip1." + domain, "AAAA", "2001:db8::70", 3600});
+  }
+  auto r = makeResolver({PORT_A, PORT_B});
+
+  auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+  auto fut = prom->get_future();
+  auto once = std::make_shared<std::atomic<bool>>(false);
+  r->resolveServiceDomainAsync(
+    domain,
+    [prom, once](const ServiceResolutionResult &res, const std::exception_ptr &)
+    {
+      if (!once->exchange(true))
+      {
+        prom->set_value(res);
+      }
+    },
+    {ServiceType::SIP_UDP});
+  REQUIRE(fut.wait_for(ASYNC_WAIT) == std::future_status::ready);
+  ServiceResolutionResult res = fut.get();
+  REQUIRE(res.isSuccess()); // failover to B produced the target chain
+}

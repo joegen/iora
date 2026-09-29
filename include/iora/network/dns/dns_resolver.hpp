@@ -637,6 +637,227 @@ public:
     return false;
   }
 
+  /// \brief Per-failover-chain state for one INDEPENDENT async transport issue (tracker
+  ///        2026-09-25-8). A and AAAA are separate issues, so the failover unit is the
+  ///        per-family issue, NOT the target slot — each gets its own chain.
+  ///
+  /// Heap-allocated (make_shared) and captured BY VALUE into every helper/re-issue lambda,
+  /// alongside self = shared_from_this(). Re-issues within one chain are SERIAL (the transport's
+  /// register->complete edge under _queriesMutex gives happens-before), so the trampoline flags
+  /// and `tried` need no atomics — but they MUST live here (heap), never as stack locals.
+  struct FailoverChainState
+  {
+    std::shared_ptr<const DnsConfig> snapshot; ///< pinned server list (one snapshot per chain)
+    std::vector<char> tried;                   ///< per-server-index "already attempted" flag
+    std::size_t startIndex{0};                  ///< rotating start server (load spread)
+    std::size_t attempts{0};                    ///< bounded by server count (finiteness)
+    // Trampoline flags: distinguish a SYNCHRONOUS completion (callback fired inside the
+    // queryAsync issue call) from an ASYNC one, so a synchronously-completing transport
+    // advances via the issue LOOP (iterative) rather than deep self-recursion (ts-LOW-2).
+    bool issuing{false};                        ///< true while inside a queryAsync issue call
+    bool advance{false};                        ///< set by a synchronous server-local completion
+  };
+
+  /// \brief Build a fresh failover chain: pin one getConfig() snapshot and pick a rotating
+  ///        starting server from the resolver-owned cursor. An empty/absent snapshot yields a
+  ///        chain whose first pick fails -> the helper funnels a terminal transient (never a
+  ///        silent empty).
+  std::shared_ptr<FailoverChainState> makeFailoverChain()
+  {
+    auto chain = std::make_shared<FailoverChainState>();
+    chain->snapshot = _transport->getConfig();
+    const std::size_t n = (chain->snapshot ? chain->snapshot->servers.size() : 0);
+    chain->tried.assign(n, 0);
+    chain->startIndex =
+      (n > 0 ? (_serverRotation.fetch_add(1, std::memory_order_relaxed) % n) : 0);
+    return chain;
+  }
+
+  /// \brief Async detection gate: does an async completion (result,error) mean "rotate to the
+  ///        next server" (server-local) or "deliver terminal"? Mirrors the sync gate.
+  enum class AsyncFailoverVerdict
+  {
+    Terminal,        ///< success / authoritative-negative / lifecycle fault / Q5 -> deliver as-is
+    ServerLocalRetry ///< SERVFAIL/REFUSED/FORMERR/NOTIMP/NODATA-no-SOA/timeout/network -> rotate
+  };
+  static AsyncFailoverVerdict classifyAsyncCompletion(const DnsQuestion &question,
+                                                      const DnsResult &result,
+                                                      const std::exception_ptr &error)
+  {
+    if (error)
+    {
+      try
+      {
+        std::rethrow_exception(error);
+      }
+      catch (const DnsTimeoutException &)
+      {
+        return AsyncFailoverVerdict::ServerLocalRetry;
+      }
+      catch (const DnsNetworkException &)
+      {
+        return AsyncFailoverVerdict::ServerLocalRetry;
+      }
+      catch (...)
+      {
+        // Lifecycle DnsTransportException (not running/stopped/no questions), std::bad_alloc,
+        // and anything else are TERMINAL — no rotation.
+        return AsyncFailoverVerdict::Terminal;
+      }
+    }
+    // A delivered result (no error).
+    if (result.isSuccess() || isAuthoritativeNegative(result))
+    {
+      return AsyncFailoverVerdict::Terminal;
+    }
+    // Q5: a NAPTR answered NOTIMP/FORMERR means "NAPTR unsupported" — deliver as-is so the NAPTR
+    // completer falls straight to direct-SRV, WITHOUT rotating all servers (they are likely the
+    // same infra). NAPTR still rotates on SERVFAIL/REFUSED/timeout (below).
+    if (question.qtype == DnsType::NAPTR &&
+        (result.header.rcode == DnsResponseCode::NOTIMP ||
+         result.header.rcode == DnsResponseCode::FORMERR))
+    {
+      return AsyncFailoverVerdict::Terminal;
+    }
+    // SERVFAIL / REFUSED / FORMERR / other error rcode / NODATA-without-SOA -> rotate.
+    return AsyncFailoverVerdict::ServerLocalRetry;
+  }
+
+  /// \brief True iff \p error is a DnsTransientResolutionException (all-server exhaustion on
+  ///        server-local conditions) — the async twin of the sync transient signal. Used at the
+  ///        terminal delivery points to set ServiceResolutionResult::outcome (tracker 2026-09-25-8).
+  static bool isTransientError(const std::exception_ptr &error)
+  {
+    if (!error)
+    {
+      return false;
+    }
+    try
+    {
+      std::rethrow_exception(error);
+    }
+    catch (const DnsTransientResolutionException &)
+    {
+      return true;
+    }
+    catch (...)
+    {
+      return false;
+    }
+  }
+
+  /// \brief Async next-server failover (RFC 1035 §7.2): the drop-in replacement for a direct
+  ///        _transport->queryAsync(question, wrappedCallback) at every resolver async issue site.
+  ///
+  /// Issues \p question to the next non-excluded server in \p chain. In its own callback it
+  /// classifies the completion (classifyAsyncCompletion): a SERVER-LOCAL result with servers
+  /// remaining re-issues to the next server (does NOT invoke \p wrappedCallback, does NOT touch
+  /// any latch); every TERMINAL outcome invokes \p wrappedCallback EXACTLY ONCE. On server
+  /// exhaustion (or an empty snapshot) it invokes \p wrappedCallback once with a transient error.
+  ///
+  /// CONTRACT (load-bearing for the no-backstop A/AAAA finishTarget latch): this helper NEVER
+  /// propagates a throw to its caller — every issue (first + re-issue) is wrapped, and a
+  /// synchronous issue-throw becomes either a next-server advance (network throw) or exactly ONE
+  /// terminal \p wrappedCallback (any other throw). So a site-level catch around the helper call
+  /// is reachable only for PRE-CALL throws. The next-server advance is ITERATIVE (a synchronous
+  /// completion loops here) — never deep self-recursion (ts-LOW-2). \p wrappedCallback runs with
+  /// no resolver lock held (the caller must not hold *resultMutex across this — AP-1).
+  void queryAsyncWithFailover(const DnsQuestion &question,
+                              const std::shared_ptr<FailoverChainState> &chain,
+                              QueryCallback wrappedCallback)
+  {
+    auto self = shared_from_this();
+    while (true)
+    {
+      // Pick the next non-tried server from the pinned snapshot.
+      const std::size_t n = (chain->snapshot ? chain->snapshot->servers.size() : 0);
+      std::size_t pick = n; // sentinel = "none left"
+      for (std::size_t i = 0; i < n; ++i)
+      {
+        const std::size_t idx = (chain->startIndex + i) % n;
+        if (!chain->tried[idx])
+        {
+          pick = idx;
+          break;
+        }
+      }
+      if (pick == n)
+      {
+        // Empty snapshot OR all servers exhausted on server-local conditions -> terminal
+        // transient (retryable), delivered EXACTLY ONCE. Never a silent empty (ts-LOW-1).
+        wrappedCallback(DnsResult{},
+                        std::make_exception_ptr(DnsTransientResolutionException(question.qname)));
+        return;
+      }
+      chain->tried[pick] = 1;
+      ++chain->attempts;
+      const DnsServer server = chain->snapshot->servers[pick]; // value copy
+
+      chain->issuing = true;
+      chain->advance = false;
+      try
+      {
+        // The transport mints a fresh unique query id per issue (generateUniqueQueryId), so each
+        // re-issue is a distinct in-flight query the transport dedups exactly-once. Pass the
+        // explicit server+port so failover actually targets a DIFFERENT server.
+        _transport->queryAsync(
+          question,
+          [self, chain, question, wrappedCallback](const DnsResult &result,
+                                                   const std::exception_ptr &error)
+          {
+            if (classifyAsyncCompletion(question, result, error) ==
+                AsyncFailoverVerdict::ServerLocalRetry)
+            {
+              if (chain->issuing)
+              {
+                // Synchronous completion (inline, same stack as the issue call): signal the
+                // issue LOOP to advance to the next server (iterative, no deep recursion).
+                chain->advance = true;
+              }
+              else
+              {
+                // Asynchronous completion (worker thread, stack already unwound): re-enter the
+                // helper directly to issue to the next server.
+                self->queryAsyncWithFailover(question, chain, wrappedCallback);
+              }
+            }
+            else
+            {
+              // Terminal: success / authoritative-negative / lifecycle fault / Q5. Deliver
+              // exactly once. The completer runs with no resolver lock held (HR-3).
+              wrappedCallback(result, error);
+            }
+          },
+          server.address, server.port);
+      }
+      catch (const DnsTimeoutException &)
+      {
+        chain->issuing = false;
+        continue; // synchronous server-local issue-throw -> advance to next server
+      }
+      catch (const DnsNetworkException &)
+      {
+        chain->issuing = false;
+        continue; // synchronous per-server network issue-throw -> advance
+      }
+      catch (...)
+      {
+        // Any other synchronous issue-throw (lifecycle DnsTransportException, std::bad_alloc, a
+        // test double's injected throw) is TERMINAL -> exactly ONE wrappedCallback. NEVER
+        // rethrow (the no-backstop finishTarget latch depends on fire-XOR-nothing here).
+        chain->issuing = false;
+        wrappedCallback(DnsResult{}, std::current_exception());
+        return;
+      }
+      chain->issuing = false;
+      if (chain->advance)
+      {
+        continue; // a synchronous server-local completion asked to advance -> next server
+      }
+      return; // async issue in flight (callback will re-enter), or a terminal already fired
+    }
+  }
+
   /// \brief Perform DNS query asynchronously
   /// \param question DNS question to resolve
   /// \param callback Callback function for result
@@ -661,18 +882,21 @@ public:
       }
     }
 
-    // Perform async query. Entry-site TS-C1 (tracker 2026-09-25-5): a synchronous
-    // queryAsync throw at this single-shot issue delivers via the callback (uniform
-    // deliver-via-callback contract, human decision 2026-09-29), not to the caller.
+    // Perform async query WITH next-server failover (tracker 2026-09-25-8). The helper never
+    // propagates a throw, so this try only guards the PRE-CALL statements (makeFailoverChain /
+    // shared_from_this); a synchronous issue-throw is funneled into the callback by the helper.
     auto self = shared_from_this();
     try
     {
-      _transport->queryAsync(
-        question,
+      auto chain = makeFailoverChain();
+      queryAsyncWithFailover(
+        question, chain,
         [self, question, callback](const DnsResult &result, const std::exception_ptr &ex)
         {
           if (ex)
           {
+            // Includes DnsTransientResolutionException on all-server exhaustion (parity with
+            // the sync query() transient signal).
             callback(result, ex);
             return;
           }
@@ -1026,17 +1250,21 @@ public:
     {
       try
       {
-        // Pre-issue statements inside the try (TS-C1 wrap boundary = top of loop body).
+        // Pre-issue statements inside the try (the helper is no-throw; this catch guards only
+        // these PRE-CALL statements + makeFailoverChain, tracker 2026-09-25-8).
         const auto &srvName = actualSrvQueries[rank].first;
         const auto service = actualSrvQueries[rank].second;
         const auto transportRank = static_cast<std::uint16_t>(rank);
         DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
+        auto chain = makeFailoverChain();
 
-        _transport->queryAsync(
-          srvQuestion,
+        queryAsyncWithFailover(
+          srvQuestion, chain,
           [self, result, service, transportRank, resultMutex, deniedServices, runCompleter](
             const DnsResult &srvResult, const std::exception_ptr &srvError)
           {
+            // srvError set (incl. DnsTransientResolutionException on all-server exhaustion) ->
+            // this SRV set contributed nothing; the fan-out continues with the other sets.
             if (!srvError)
             {
               try
@@ -1423,14 +1651,16 @@ private:
   {
     auto self = shared_from_this();
 
-    // Entry-site TS-C1: a synchronous queryAsync throw at the initial NAPTR issue
-    // delivers via the callback (uniform deliver-via-callback contract, human decision
-    // 2026-09-29), never propagating to the caller's thread.
+    // Entry-site TS-C1: a synchronous issue throw at the initial NAPTR issue delivers via the
+    // callback (uniform deliver-via-callback contract). WITH next-server failover (tracker
+    // 2026-09-25-8): NAPTR rotates on SERVFAIL/REFUSED/timeout; a NAPTR NOTIMP/FORMERR is
+    // delivered as-is (Q5) so the completer falls straight to direct-SRV without rotating.
     try
     {
       DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
-      _transport->queryAsync(
-        naptrQuestion,
+      auto chain = makeFailoverChain();
+      queryAsyncWithFailover(
+        naptrQuestion, chain,
         [self, domain, callback, preferredTransports, secure](const DnsResult &naptrResult,
                                                               const std::exception_ptr &naptrError)
         {
@@ -1524,16 +1754,20 @@ private:
             {
               try
               {
-                // Pre-issue statements inside the try (TS-C1 wrap boundary = top of body).
+                // Pre-issue statements inside the try (the helper is no-throw; this catch guards
+                // only these PRE-CALL statements + makeFailoverChain, tracker 2026-09-25-8).
                 DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
                 auto service = srvTarget.service;
                 auto naptrPref = srvTarget.naptrPreference;
+                auto chain = self->makeFailoverChain();
 
-                self->_transport->queryAsync(
-                  srvQuestion,
+                self->queryAsyncWithFailover(
+                  srvQuestion, chain,
                   [self, result, service, naptrPref, resultMutex, runCompleter](
                     const DnsResult &srvResult, const std::exception_ptr &srvError)
                   {
+                    // srvError set (incl. transient exhaustion) -> this SRV set contributed
+                    // nothing; the fan-out continues with the other sets.
                     if (!srvError)
                     {
                       try
@@ -2331,15 +2565,20 @@ private:
                          const std::shared_ptr<std::vector<DnsType>> &families, std::size_t famIdx,
                          const std::shared_ptr<std::function<void()>> &finishTarget)
   {
-    // The whole body (shared_from_this + DnsQuestion construction + queryAsync issue) is
-    // inside the try, so ANY synchronous throw yields exactly one finishTarget (TS-C1).
+    // Pre-call statements (shared_from_this + DnsQuestion ctor + makeFailoverChain) are inside
+    // the try, so a synchronous PRE-CALL throw yields exactly one finishTarget (TS-C1). The
+    // failover helper itself NEVER throws — it converts a synchronous issue-throw into exactly
+    // one terminal wrappedCallback (fire-XOR-nothing), which is load-bearing here: this
+    // finishTarget latch has NO callbackFired backstop, so a helper that both fired AND rethrew
+    // would double-finish this target (tracker 2026-09-25-8).
     try
     {
       auto self = shared_from_this();
       DnsQuestion q(hostname, (*families)[famIdx], DnsClass::IN);
-      _transport->queryAsync(
-        q, [self, result, targetIndex, hostname, families, famIdx, finishTarget](
-             const DnsResult &r, const std::exception_ptr &err)
+      auto chain = self->makeFailoverChain();
+      self->queryAsyncWithFailover(
+        q, chain, [self, result, targetIndex, hostname, families, famIdx, finishTarget](
+                    const DnsResult &r, const std::exception_ptr &err)
         {
           // Guard the append so a throwing push_back (bad_alloc) still reaches the
           // chain/decrement below -- otherwise the throw is swallowed by the transport's
@@ -2383,16 +2622,22 @@ private:
   void issueFallbackFamily(const std::string &domain,
                            const std::shared_ptr<std::vector<DnsType>> &families, std::size_t famIdx,
                            const std::shared_ptr<std::vector<std::string>> &addresses,
-                           const std::shared_ptr<std::function<void()>> &finish)
+                           const std::shared_ptr<std::function<void()>> &finish,
+                           const std::shared_ptr<bool> &anyTransient)
   {
-    // Whole body inside the try so any synchronous throw yields exactly one finish (TS-C1).
+    // Pre-call statements inside the try so a synchronous PRE-CALL throw yields exactly one
+    // finish (TS-C1); the failover helper is no-throw and funnels a synchronous issue-throw into
+    // its callback (tracker 2026-09-25-8). This is a single serial chain (one family at a time),
+    // so *anyTransient is written without a data race.
     try
     {
       auto self = shared_from_this();
       DnsQuestion q(domain, (*families)[famIdx], DnsClass::IN);
-      _transport->queryAsync(
-        q, [self, domain, families, famIdx, addresses, finish](const DnsResult &r,
-                                                               const std::exception_ptr &err)
+      auto chain = self->makeFailoverChain();
+      self->queryAsyncWithFailover(
+        q, chain,
+        [self, domain, families, famIdx, addresses, finish, anyTransient](
+          const DnsResult &r, const std::exception_ptr &err)
         {
           // Guard the append (bad_alloc) so the chain/finish below always runs -- else the
           // throw is swallowed by the transport leaf catch(...) and the user callback never
@@ -2403,13 +2648,19 @@ private:
             {
               appendFamilyAddresses(*addresses, r, (*families)[famIdx]);
             }
+            else if (isTransientError(err))
+            {
+              // This family exhausted all servers on server-local conditions -> the fallback
+              // avenue is (at least partly) transient; the finish below uses it to set outcome.
+              *anyTransient = true;
+            }
           }
           catch (...)
           {
           }
           if (famIdx + 1 < families->size())
           {
-            self->issueFallbackFamily(domain, families, famIdx + 1, addresses, finish);
+            self->issueFallbackFamily(domain, families, famIdx + 1, addresses, finish, anyTransient);
           }
           else
           {
@@ -2464,8 +2715,14 @@ private:
     // resolveHostname DnsNoRecords semantics; never a fallback target with empty addresses
     // that would make isSuccess() falsely true) -- steps-4-8 sip-voip H-1.
     auto fired = std::make_shared<std::atomic<bool>>(false);
+    // Per-avenue transient signal for this fallback avenue (tracker 2026-09-25-8): set true when a
+    // family exhausts all servers on server-local conditions. Written serially in the single
+    // fallback chain, read once in finish. When the fallback yields no addresses, it distinguishes
+    // a TRANSIENT no-service (retryable) from a PERMANENT one, so the delivered result carries the
+    // terminal avenue's per-avenue outcome (the cross-step refinement is tracker 2026-09-30-1).
+    auto anyTransient = std::make_shared<bool>(false);
     auto finish = std::make_shared<std::function<void()>>(
-      [self, result, domain, transportsToUse, addresses, callback, fired]()
+      [self, result, domain, transportsToUse, addresses, callback, fired, anyTransient]()
       {
         if (fired->exchange(true))
         {
@@ -2474,11 +2731,17 @@ private:
         if (!addresses->empty())
         {
           self->appendFallbackTargets(*result, domain, transportsToUse, *addresses);
+          result->outcome = ResolutionOutcome::Resolved;
+        }
+        else
+        {
+          result->outcome =
+            *anyTransient ? ResolutionOutcome::TransientFailure : ResolutionOutcome::PermanentNoService;
         }
         callback(*result, nullptr);
       });
 
-    issueFallbackFamily(domain, families, 0, addresses, finish);
+    issueFallbackFamily(domain, families, 0, addresses, finish, anyTransient);
   }
 
   /// \brief Resolve target addresses asynchronously

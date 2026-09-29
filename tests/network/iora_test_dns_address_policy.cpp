@@ -234,6 +234,17 @@ public:
       break;
     }
 
+    // Mirror a real transport's header: a well-formed answer carries rcode=NOERROR and an
+    // ancount matching the answer records, so DnsResult::isSuccess() (rcode==NOERROR &&
+    // ancount>0) is true when records were produced. The DnsResolver failover gate classifies
+    // a completion by isSuccess()/isAuthoritativeNegative() (tracker 2026-09-25-8), so a double
+    // that left ancount==0 would be (correctly) read as NODATA and rotated/dropped. An EMPTY
+    // answer keeps ancount==0 (a NODATA that drives the direct-SRV fall-forward), matching a
+    // real server's empty response.
+    r.header.rcode = DnsResponseCode::NOERROR;
+    r.header.ancount = static_cast<std::uint16_t>(r.a_records.size() + r.aaaa_records.size() +
+                                                  r.srv_records.size() + r.naptr_records.size());
+
     // Like the real transport, swallow a throwing user callback at the leaf (the real
     // DnsTransport wraps every callback in catch(...)); this keeps a throwing-callback
     // test from terminating and faithfully models the "callbacks may throw" condition.
@@ -669,9 +680,17 @@ TEST_CASE("TS-C1 multi-target: outer/last issue throw on one target, siblings re
     auto r = makeFaultyResolver(t, AddressResolutionPolicy::IPv4First);
     auto out = driveService(r, "mt.test", {ServiceType::SIP_UDP});
     REQUIRE(out.completed);
-    CHECK(out.callbacks == 1);
-    CHECK(findTarget(out.result, "h1.mt.test") == nullptr);   // dropped (no addresses)
-    REQUIRE(findTarget(out.result, "h2.mt.test") != nullptr); // sibling resolved
+    CHECK(out.callbacks == 1); // TS-C1 invariant preserved: exactly-one finishTarget, no hang
+    // BEHAVIOR CHANGE (tracker 2026-09-25-8): with per-family failover the failover unit is the
+    // per-family issue, NOT the whole target slot — an A-family TERMINAL failure (here a sync
+    // A-issue throw) no longer aborts the target; the AAAA family is still resolved. (This also
+    // removes the pre-failover inconsistency where an async A-ERROR chained AAAA but a sync
+    // A-THROW skipped it.) So h1 survives with its AAAA address only.
+    auto *h1 = findTarget(out.result, "h1.mt.test");
+    REQUIRE(h1 != nullptr);
+    CHECK(h1->addresses.size() == 1);
+    CHECK(isIPv6(h1->addresses[0]));
+    REQUIRE(findTarget(out.result, "h2.mt.test") != nullptr); // sibling fully resolved
   }
   SECTION("throw on the LAST-issued target's outer A: completer still fires")
   {
@@ -683,8 +702,12 @@ TEST_CASE("TS-C1 multi-target: outer/last issue throw on one target, siblings re
     auto out = driveService(r, "mt.test", {ServiceType::SIP_UDP});
     REQUIRE(out.completed); // no hang when the throw is on the last target
     CHECK(out.callbacks == 1);
-    REQUIRE(findTarget(out.result, "h1.mt.test") != nullptr);
-    CHECK(findTarget(out.result, "h2.mt.test") == nullptr);
+    REQUIRE(findTarget(out.result, "h1.mt.test") != nullptr); // fully resolved
+    // Per-family failover (see above): h2's A throws terminally but its AAAA still resolves.
+    auto *h2 = findTarget(out.result, "h2.mt.test");
+    REQUIRE(h2 != nullptr);
+    CHECK(h2->addresses.size() == 1);
+    CHECK(isIPv6(h2->addresses[0]));
   }
 }
 
