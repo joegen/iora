@@ -99,6 +99,9 @@ public:
     bool injectMaliciousPointers{false}; // Test pointer loop handling
     bool shouldReturnNodata{false};      // RFC 2308 NODATA (NOERROR, 0 answers, SOA authority)
     bool shouldReturnNodataNoSoa{false}; // NODATA WITHOUT an SOA (must NOT be negative-cached)
+    bool shouldRefuse{false};            // REFUSED (rcode 5) — server-local, triggers failover
+    bool shouldReturnNotimp{false};      // NOTIMP (rcode 4) — server-local (NAPTR->direct-SRV Q5)
+    bool shouldReturnFormerr{false};     // FORMERR (rcode 1) — server-local
     std::string errorMessage;            // Custom error message
   };
 
@@ -742,6 +745,21 @@ private:
       if (queryConfig.shouldFail)
       {
         return generateServfailResponse(queryId, questionName, queryType);
+      }
+
+      // REFUSED / NOTIMP / FORMERR — server-local error rcodes that trigger next-server
+      // failover (tracker 2026-09-25-8). RA|rcode, no authority section (RFC 1035 §4.1.1).
+      if (queryConfig.shouldRefuse)
+      {
+        return generateNegativeResponse(queryId, questionName, queryType, 0x85, /*includeSoa=*/false);
+      }
+      if (queryConfig.shouldReturnNotimp)
+      {
+        return generateNegativeResponse(queryId, questionName, queryType, 0x84, /*includeSoa=*/false);
+      }
+      if (queryConfig.shouldReturnFormerr)
+      {
+        return generateNegativeResponse(queryId, questionName, queryType, 0x81, /*includeSoa=*/false);
       }
 
       // Handle RFC 2308 NODATA (NOERROR, no answers, SOA in authority)

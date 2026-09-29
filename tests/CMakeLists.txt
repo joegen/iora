@@ -78,6 +78,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_transport_lifecycle_restructure
     network/iora_test_dns_transport_close_robustness
     network/iora_test_dns_transport_retry
+    network/iora_test_dns_failover
     network/iora_test_http
     network/iora_test_http_request_framing
     network/iora_test_http_framing_detail
@@ -649,6 +650,12 @@ set(IORA_SANITIZED_TEST_TARGETS
     # fallback run concurrently -- the exactly-once claim / no-double-send property is a
     # cross-thread invariant only TSan can prove clean.
     iora_test_dns_transport_retry
+
+    # DnsResolver next-server failover (tracker 2026-09-25-8): the async failover helper's
+    # fire-XOR-re-issue + never-propagate exactly-once contract, concurrent failovers on
+    # different owner names, and the A/AAAA no-backstop finishTarget latch are cross-thread
+    # exactly-once/no-corruption invariants only TSan can prove clean.
+    iora_test_dns_failover
 
     iora_test_name_resolver
     iora_test_tcp_engine_resolve

@@ -1602,7 +1602,11 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Error Handling", "[dns][error-handling]")
     timeoutConfig.delay = std::chrono::milliseconds(5000);
     server().configureQuery("timeout.example.com", timeoutConfig);
 
-    REQUIRE_THROWS_AS(client().resolveA("timeout.example.com"), DnsTimeoutException);
+    // Contract change (tracker 2026-09-25-8): a timeout is now a SERVER-LOCAL failover
+    // condition. query() catches the transport's DnsTimeoutException, rotates through the
+    // configured servers, and on exhaustion (this fixture has one server) throws the
+    // transient-preserving DnsTransientResolutionException — NOT the raw DnsTimeoutException.
+    REQUIRE_THROWS_AS(client().resolveA("timeout.example.com"), DnsTransientResolutionException);
   }
 
   SECTION("Very short timeout handling (50ms)")
@@ -1620,21 +1624,25 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Error Handling", "[dns][error-handling]")
     // Measure actual timeout duration
     auto startTime = std::chrono::steady_clock::now();
 
-    // Should timeout quickly (around 50ms, not wait for 200ms delay)
+    // Should timeout quickly (around 50ms, not wait for 200ms delay). Contract change
+    // (tracker 2026-09-25-8): a single-server timeout now surfaces as the transient-preserving
+    // DnsTransientResolutionException after failover exhaustion (query() consumes the underlying
+    // DnsTimeoutException). The timing bounds below still prove the timeout fired PROMPTLY and
+    // was not retried unboundedly.
     try
     {
       shortTimeoutClient.resolveA("shorttimeout.example.com");
       FAIL("Expected DNS resolution to throw exception");
     }
-    catch (const DnsTimeoutException &e)
+    catch (const DnsTransientResolutionException &e)
     {
-      INFO("Got expected DnsTimeoutException: " << e.what());
+      INFO("Got expected DnsTransientResolutionException: " << e.what());
     }
     catch (const std::exception &e)
     {
       INFO("Got unexpected exception type: " << e.what());
       INFO("This indicates the DNS timeout is NOT working correctly!");
-      FAIL("Expected DnsTimeoutException but got different exception type");
+      FAIL("Expected DnsTransientResolutionException but got different exception type");
     }
 
     auto endTime = std::chrono::steady_clock::now();

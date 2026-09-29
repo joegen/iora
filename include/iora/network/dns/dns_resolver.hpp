@@ -131,6 +131,27 @@ struct NaptrDirectTarget
   std::uint16_t preference{0};
 };
 
+/// \brief Per-avenue transient-vs-permanent classification of a resolution outcome
+///        (tracker 2026-09-25-8, Slice A). ADDITIVE: isSuccess() (= !targets.empty())
+///        callers are unchanged; a consumer that needs the retryable/no-service
+///        distinction (e.g. iora_sip SipDnsAdapter, mapping a transient outage to a
+///        503 vs a permanent no-service to a 404) opts in by reading `outcome`.
+///
+/// SLICE-A SEMANTICS (per-avenue only): a SINGLE resolution avenue — one query()
+/// leaf, one resolveHostname, or one direct-SRV — sets its own outcome at its terminal:
+///   - targets non-empty                                   => Resolved
+///   - all servers rotated, still server-local/timeout      => TransientFailure
+///   - authoritative negative (NXDOMAIN / NODATA-with-SOA)  => PermanentNoService
+/// The CROSS-STEP combination across the RFC 3263 NAPTR→SRV→A/AAAA fall-forward chain
+/// (deepest-avenue-supersedes) is a SEPARATE slice (tracker 2026-09-30-1). Interim: a
+/// multi-step resolveServiceDomain carries the TERMINAL avenue's per-avenue outcome.
+enum class ResolutionOutcome
+{
+  Resolved,          ///< Targets were produced (isSuccess()==true).
+  TransientFailure,  ///< Server-local/timeout exhausted across all servers — RETRYABLE.
+  PermanentNoService ///< Authoritative negative (NXDOMAIN / NODATA-with-SOA) — no service.
+};
+
 /// \brief Service resolution result with prioritized targets
 /// Follows RFC 3263 NAPTR→SRV→A/AAAA resolution chain
 struct ServiceResolutionResult
@@ -139,6 +160,10 @@ struct ServiceResolutionResult
   std::string domain;                              ///< Original domain queried
   bool fromCache{false};                           ///< Whether result came from cache
   std::chrono::steady_clock::time_point timestamp; ///< Resolution timestamp
+  ResolutionOutcome outcome{ResolutionOutcome::Resolved}; ///< Per-avenue transient/permanent
+                                                          ///< classification (Slice A). Default
+                                                          ///< Resolved keeps existing callers
+                                                          ///< source-compatible.
 
   /// \brief Constructor
   explicit ServiceResolutionResult(const std::string &d = "")
@@ -257,6 +282,26 @@ private:
     default:
       return "Unknown";
     }
+  }
+};
+
+/// \brief Thrown by query()'s next-server failover loop when ALL configured servers are
+///        exhausted on SERVER-LOCAL conditions (SERVFAIL/REFUSED/FORMERR/NOTIMP/
+///        NODATA-without-SOA/timeout/network fault) without ever reaching an authoritative
+///        response or a success (tracker 2026-09-25-8).
+///
+/// Distinct TYPE from DnsResolutionFailedException / DnsNoRecordsException (which mark an
+/// AUTHORITATIVE negative — NXDOMAIN / NODATA-with-SOA). It derives from DnsResolverException
+/// so every existing `catch (const DnsResolverException&)` (including the RFC 3263 step-fallback
+/// handlers) still catches it; resolveHostname catches it FIRST to preserve the transient
+/// (retryable) vs permanent (no-service) distinction across its throwing return channel.
+class DnsTransientResolutionException : public DnsResolverException
+{
+public:
+  explicit DnsTransientResolutionException(const std::string &domain,
+                                           DnsResponseCode code = DnsResponseCode::SERVFAIL)
+      : DnsResolverException("Transient DNS failure (all servers exhausted) for: " + domain, code)
+  {
   }
 };
 
@@ -456,38 +501,140 @@ public:
       preferredTransports, secure);
   }
 
-  /// \brief Perform standard DNS query
+  /// \brief Perform standard DNS query, with RFC 1035 §7.2 next-server failover.
+  ///
+  /// A recursive-resolver SERVER-LOCAL failure — an rcode-bearing negative
+  /// (SERVFAIL/REFUSED/FORMERR/NOTIMP/NODATA-without-SOA/other error rcode) OR a thrown
+  /// transport fault (timeout, connect/send failure, per-server query-ID exhaustion) — is
+  /// retried on the NEXT configured server (excluding tried), until a success, an
+  /// AUTHORITATIVE negative (NXDOMAIN / NODATA-with-SOA — which STOPS rotation), or all
+  /// servers are exhausted. Server selection is OWNED here (never getNextServer()): one
+  /// getConfig() snapshot pins the server list, and a resolver-owned rotating cursor picks
+  /// the starting server (tracker 2026-09-25-8).
+  ///
   /// \param question DNS question to resolve
   /// \return DNS query result
-  /// \throws DnsResolverException on query failure
+  /// \throws DnsResolutionFailedException / DnsNoRecordsException on an AUTHORITATIVE negative
+  /// \throws DnsTransientResolutionException when all servers are exhausted on server-local
+  ///         conditions (transient, retryable — preserves the transient signal)
+  /// \throws DnsTransportException on a TERMINAL lifecycle fault (transport stopped, etc.)
   DnsResult query(const DnsQuestion &question)
   {
-    // Check cache first
+    // Cache check ONCE before the failover loop. A negative cache entry is only ever an
+    // AUTHORITATIVE negative (cacheQueryResult never caches a no-SOA negative, RFC 2308 §5),
+    // so a negative hit is permanent — throw the authoritative exception, never transient.
     if (_cache)
     {
-      DnsResult result;
-      if (_cache->get(question, result))
+      DnsResult cached;
+      if (_cache->get(question, cached))
       {
-        // For negative cache hits, still need to throw the appropriate exception
-        if (!result.isSuccess())
+        if (!cached.isSuccess())
         {
-          throw DnsResolutionFailedException(question.qname, result.header.rcode);
+          throw DnsResolutionFailedException(question.qname, cached.header.rcode);
         }
-        return result;
+        return cached;
       }
     }
 
-    // Perform query via transport
-    DnsResult result = _transport->query(question);
-
-    cacheQueryResult(question, result);
-
-    if (!result.isSuccess())
+    // Pin ONE server-list snapshot for this failover chain (INV-2): size, cursor, and each
+    // element are read from the same immutable vector a concurrent updateConfig() cannot tear.
+    auto cfg = _transport->getConfig();
+    if (!cfg || cfg->servers.empty())
     {
-      throw DnsResolutionFailedException(question.qname, result.header.rcode);
+      throw DnsTransportException("No DNS servers configured");
+    }
+    const std::size_t serverCount = cfg->servers.size();
+    const std::size_t start =
+      _serverRotation.fetch_add(1, std::memory_order_relaxed) % serverCount;
+
+    // Remember the last server-local outcome (rcode result or thrown fault) so the terminal
+    // transient throw after exhaustion is faithful to what the last server reported.
+    DnsResponseCode lastServerLocalRcode = DnsResponseCode::SERVFAIL;
+
+    for (std::size_t i = 0; i < serverCount; ++i)
+    {
+      // Explicit per-server iteration excluding tried — never getNextServer() (a blind shared
+      // round-robin with no failover memory). Each server is contacted at most once.
+      const DnsServer &srv = cfg->servers[(start + i) % serverCount];
+      try
+      {
+        DnsResult result = _transport->query(question, srv.address, srv.port);
+
+        if (result.isSuccess())
+        {
+          cacheQueryResult(question, result); // terminal (positive) — cache once
+          return result;
+        }
+
+        // Non-success rcode-bearing negative: classify by the detection gate.
+        if (isAuthoritativeNegative(result))
+        {
+          // NXDOMAIN / NODATA-with-SOA -> permanent. STOP rotation; cache the authoritative
+          // negative (RFC 2308) and throw the authoritative exception.
+          cacheQueryResult(question, result);
+          throw DnsResolutionFailedException(question.qname, result.header.rcode);
+        }
+
+        // Q5 (human decision 2026-09-30): a NAPTR query answered NOTIMP/FORMERR means the
+        // server does not implement NAPTR — the other configured servers are likely the same
+        // infrastructure, so do NOT rotate all servers. Fall STRAIGHT to direct-SRV: throw a
+        // DnsResolverException-derived type after this single NAPTR query so the NAPTR path's
+        // step-fallback catch triggers direct-SRV. (NAPTR still rotates on SERVFAIL/REFUSED/
+        // timeout — those are transient server-local faults, not "NAPTR unsupported".)
+        if (question.qtype == DnsType::NAPTR &&
+            (result.header.rcode == DnsResponseCode::NOTIMP ||
+             result.header.rcode == DnsResponseCode::FORMERR))
+        {
+          throw DnsTransientResolutionException(question.qname, result.header.rcode);
+        }
+
+        // SERVFAIL / REFUSED / FORMERR / NOTIMP / other error rcode / NODATA-without-SOA ->
+        // SERVER-LOCAL: rotate to the next server. Never cached (no SOA / not authoritative).
+        lastServerLocalRcode = result.header.rcode;
+        // fall through to next iteration
+      }
+      catch (const DnsTimeoutException &)
+      {
+        lastServerLocalRcode = DnsResponseCode::SERVFAIL; // server-local -> rotate
+      }
+      catch (const DnsNetworkException &)
+      {
+        lastServerLocalRcode = DnsResponseCode::SERVFAIL; // server-local -> rotate
+      }
+      catch (const DnsTransportException &)
+      {
+        // TERMINAL lifecycle fault (Transport not running / stopped / No questions provided /
+        // DNS session closed): not server-local — no rotation, propagate as-is.
+        throw;
+      }
+      // std::bad_alloc and any other exception propagate (terminal).
     }
 
-    return result;
+    // All servers exhausted on server-local conditions -> TRANSIENT (retryable). Preserve the
+    // transient signal as a distinct type so resolveHostname / callers can map it to a 503
+    // rather than a permanent no-service (RFC 3263). Never cached.
+    throw DnsTransientResolutionException(question.qname, lastServerLocalRcode);
+  }
+
+  /// \brief Detection gate: is a non-success DnsResult an AUTHORITATIVE negative
+  ///        (NXDOMAIN / NODATA-with-SOA) that must STOP next-server rotation, versus a
+  ///        SERVER-LOCAL negative (SERVFAIL/REFUSED/FORMERR/NOTIMP/other error rcode /
+  ///        NODATA-without-SOA) that must rotate? (tracker 2026-09-25-8).
+  /// \pre result.isSuccess() == false (a rcode-bearing negative response).
+  static bool isAuthoritativeNegative(const DnsResult &result)
+  {
+    const DnsResponseCode rc = result.header.rcode;
+    if (rc == DnsResponseCode::NXDOMAIN)
+    {
+      return true; // the name authoritatively does not exist
+    }
+    if (rc == DnsResponseCode::NOERROR)
+    {
+      // NODATA (NOERROR + no answers): authoritative iff it carries an SOA (RFC 2308 §5).
+      return negativeResponseHasSoa(result);
+    }
+    // SERVFAIL, REFUSED, FORMERR, NOTIMP, and any other error rcode are server-local.
+    return false;
   }
 
   /// \brief Perform DNS query asynchronously
@@ -573,6 +720,14 @@ public:
     std::vector<std::string> ipv4Addresses;
     std::vector<std::string> ipv6Addresses;
 
+    // Per-avenue transient tracking (tracker 2026-09-25-8): resolveHostname signals failure
+    // by THROWING. A per-family SERVER-LOCAL exhaustion surfaces from query() as a
+    // DnsTransientResolutionException; if the combined result is empty, the terminal must
+    // preserve that transient (retryable) signal rather than flattening every failure to a
+    // permanent DnsNoRecordsException(NXDOMAIN). We keep DnsNoRecordsException only for the
+    // all-authoritative-negative case.
+    bool anyTransient = false;
+
     // Query A records (IPv4) if policy allows
     if (policy == AddressResolutionPolicy::IPv4Only ||
         policy == AddressResolutionPolicy::IPv4First ||
@@ -586,14 +741,22 @@ public:
           ipv4Addresses.push_back(record.address);
         }
       }
+      catch (const DnsTransientResolutionException &)
+      {
+        // A-family server-local exhaustion (all servers SERVFAIL/timeout/etc.) -> TRANSIENT.
+        // Continue to AAAA (a sibling family may still succeed — a partial success is NOT
+        // overridden by a transient sibling), but remember the transient for the terminal.
+        anyTransient = true;
+      }
       catch (const DnsResolverException &)
       {
-        // IPv4 query failed (bad rcode / no records), continue to AAAA.
+        // IPv4 query hit an AUTHORITATIVE negative (NXDOMAIN / NODATA-with-SOA), continue.
       }
       catch (const DnsTransportException &)
       {
-        // IPv4 query timed out or transport error, continue to AAAA so any
-        // AAAA result is still returned (RFC 3263 dual-stack partial results).
+        // A TERMINAL lifecycle fault (transport stopped, etc.). Per-family timeouts no longer
+        // reach here (query() rotates and converts them to the transient exception above);
+        // keep any partial results and continue to AAAA.
       }
       catch (const DnsParseException &)
       {
@@ -618,16 +781,21 @@ public:
           ipv6Addresses.push_back(record.address);
         }
       }
+      catch (const DnsTransientResolutionException &)
+      {
+        // AAAA-family server-local exhaustion -> TRANSIENT. DO NOT discard A results already
+        // collected; remember the transient for the terminal.
+        anyTransient = true;
+      }
       catch (const DnsResolverException &)
       {
-        // IPv6 query failed (bad rcode / no records), continue.
+        // IPv6 query hit an AUTHORITATIVE negative, continue.
       }
       catch (const DnsTransportException &)
       {
-        // IPv6 query timed out or transport error: DO NOT discard the A
-        // results already collected above. This is the dual-stack SIP target
-        // case (finding #1) — combine returns the IPv4 addresses instead of
-        // throwing out of resolveHostname.
+        // TERMINAL lifecycle fault: DO NOT discard the A results already collected. This is
+        // the dual-stack SIP target case (finding #1) — combine returns the IPv4 addresses
+        // instead of throwing out of resolveHostname.
       }
       catch (const DnsParseException &)
       {
@@ -664,12 +832,20 @@ public:
       break;
     }
 
-    // No addresses from either family -> RFC 3263 §4.2 no-record result.
-    // (A former outer try/catch here re-threw an identically-constructed
-    // DnsNoRecordsException; removed as a provable no-op now that the inner
-    // A/AAAA catches absorb transport/parse errors — slice a1 review L-h.)
+    // No addresses from either family -> preserve the transient-vs-permanent distinction
+    // (tracker 2026-09-25-8). If ANY queried family exhausted all servers on server-local
+    // conditions (transient), throw the transient-preserving type so a caller maps it to a
+    // 503 (retryable) rather than a permanent no-service. Only when every queried family ended
+    // in an AUTHORITATIVE negative do we throw DnsNoRecordsException (RFC 3263 §4.2 no-record).
+    // (A former outer try/catch here re-threw an identically-constructed DnsNoRecordsException;
+    // removed as a provable no-op now that the inner A/AAAA catches absorb transport/parse
+    // errors — slice a1 review L-h.)
     if (addresses.empty())
     {
+      if (anyTransient)
+      {
+        throw DnsTransientResolutionException(hostname);
+      }
       throw DnsNoRecordsException(
         hostname, policy == AddressResolutionPolicy::IPv6Only ? DnsType::AAAA : DnsType::A);
     }
@@ -898,6 +1074,14 @@ private:
   /// \brief Centralized random number generator for deterministic testing
   mutable std::mt19937 _rng;    ///< Weighted SRV selection RNG (guarded by _rngMutex)
   mutable std::mutex _rngMutex; ///< Guards _rng against concurrent advance/seed
+
+  /// \brief Resolver-owned round-robin cursor for next-server failover (tracker 2026-09-25-8).
+  /// The resolver OWNS server selection during failover; the transport's own _serverIndex is
+  /// private and rotates per-distinct-query with no failover memory. A relaxed fetch_add gives
+  /// each new failover chain a fresh starting server (load spread) while the loop then iterates
+  /// the remainder explicitly, excluding tried servers — so getNextServer() is never called in
+  /// the loop.
+  mutable std::atomic<std::size_t> _serverRotation{0};
 
   // =============================================================================
   // Input Validation Functions (RFC Compliance & Security)

@@ -72,6 +72,23 @@ public:
   }
 };
 
+/// \brief A per-server NETWORK fault — a synchronous connect/send failure, a per-server
+///        query-ID exhaustion, or an ASYNC session close on a per-query connect refusal /
+///        mid-flight drop (handleClose) — as opposed to a global LIFECYCLE fault ("Transport
+///        not running"/"Transport stopped"/"No questions provided").
+///
+/// Introduced for tracker 2026-09-25-8 so the DnsResolver failover gate can discriminate
+/// a SERVER-LOCAL network fault (rotate to the next configured server) from a terminal
+/// lifecycle fault (stop rotation) BY TYPE. A substring match on what() is not acceptable:
+/// the network messages interpolate the server name, so a plain-base DnsTransportException
+/// would be ambiguous. ADDITIVE: because it derives from DnsTransportException, every
+/// existing `catch (const DnsTransportException&)` still catches it unchanged.
+class DnsNetworkException : public DnsTransportException
+{
+public:
+  explicit DnsNetworkException(const std::string &message) : DnsTransportException(message) {}
+};
+
 // Shared white-box test seam (SM-M1, tracker 2026-09-13-11): ONE friend struct reused by
 // every DnsTransport test file (sid-keying, callback-deadlock, lifecycle-restructure),
 // forward-declared here, befriended below, defined only by tests/network/
@@ -1289,7 +1306,7 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
       sessionId = connectAndRegisterSession(false, query->server, query->port, sk);
       if (sessionId == 0)
       {
-        throw DnsTransportException("Failed to connect to DNS server " + query->server);
+        throw DnsNetworkException("Failed to connect to DNS server " + query->server);
       }
       sendNow = false;
     }
@@ -1328,7 +1345,7 @@ inline void DnsTransport::sendUdpQuery(std::shared_ptr<PendingQuery> query)
       {
         iora::core::Logger::error("DNS UDP query failed to send to " + query->server + ":" +
                                   std::to_string(query->port));
-        throw DnsTransportException("Failed to send UDP query to " + query->server);
+        throw DnsNetworkException("Failed to send UDP query to " + query->server);
       }
     }
   }
@@ -1383,7 +1400,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
       sessionId = connectAndRegisterSession(true, query->server, query->port, sk);
       if (sessionId == 0)
       {
-        throw DnsTransportException("Failed to connect to DNS server " + query->server);
+        throw DnsNetworkException("Failed to connect to DNS server " + query->server);
       }
       sendNow = false;
     }
@@ -1425,7 +1442,7 @@ inline void DnsTransport::sendTcpQuery(std::shared_ptr<PendingQuery> query)
       {
         iora::core::Logger::error("DNS TCP query failed to send to " + query->server + ":" +
                                   std::to_string(query->port));
-        throw DnsTransportException("Failed to send TCP query to " + query->server);
+        throw DnsNetworkException("Failed to send TCP query to " + query->server);
       }
     }
   }
@@ -1991,7 +2008,14 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
   {
     // Identity-checked (T2R-1): we hold the specific instances, so fail exactly them, never a
     // reused-id sibling registered under the same key after one completed.
-    auto error = std::make_exception_ptr(DnsTransportException(
+    // A session that closed BEFORE connecting is a per-server NETWORK fault (a refused/aborted
+    // connect to THIS server) — the async twin of the synchronous connect-failure sites — so it
+    // is DnsNetworkException (server-local), letting the resolver fail over to another configured
+    // server (tracker 2026-09-25-8, human-approved 2026-09-30; supersedes the step-0 gate's
+    // literal placement of "session closed …" in the NON-FAILOVER bucket). Safe during stop():
+    // the resolver's next-server attempt then throws "Transport not running" (terminal), so a
+    // teardown-induced close self-corrects to terminal on the next rotation.
+    auto error = std::make_exception_ptr(DnsNetworkException(
       "DNS session closed before connect (" + std::string(isTcp ? "TCP" : "UDP") + ")"));
     completeAllIfSame(orphaned, error);
   }
@@ -2022,7 +2046,10 @@ inline void DnsTransport::handleClose(SessionId sessionId, const TransportErrorI
   }
   if (!inFlight.empty())
   {
-    auto error = std::make_exception_ptr(DnsTransportException(
+    // A session that dropped an ALREADY-SENT query mid-flight is likewise a per-server NETWORK
+    // fault -> DnsNetworkException (server-local), so the resolver rotates to another server
+    // (tracker 2026-09-25-8, human-approved 2026-09-30). Same stop() self-correction as above.
+    auto error = std::make_exception_ptr(DnsNetworkException(
       "DNS session closed (" + std::string(isTcp ? "TCP" : "UDP") + ") with in-flight query"));
     completeAllIfSame(inFlight, error);
   }
@@ -2217,10 +2244,12 @@ inline std::uint16_t DnsTransport::generateUniqueQueryId(const std::string &serv
     }
   }
 
-  // This should never happen unless we have 65535 concurrent queries to the same server:port
-  throw DnsTransportException("Exhausted all query IDs for server " + server + ":" +
-                              std::to_string(port) +
-                              " (65535 concurrent queries - system overload)");
+  // This should never happen unless we have 65535 concurrent queries to the same server:port.
+  // Classified as a per-server NETWORK fault (tracker 2026-09-25-8): it is server-local, so the
+  // resolver failover gate rotates to the next configured server rather than giving up.
+  throw DnsNetworkException("Exhausted all query IDs for server " + server + ":" +
+                            std::to_string(port) +
+                            " (65535 concurrent queries - system overload)");
 }
 
 inline std::shared_ptr<DnsTransport::PendingQuery>
