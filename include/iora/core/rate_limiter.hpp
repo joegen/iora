@@ -13,8 +13,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace iora {
@@ -243,10 +247,16 @@ public:
       return consumed;
     }
 
-    // Slow path: bucket doesn't exist — create and consume
-    _buckets.insert(key, TokenBucket(
-      _defaultRate.load(std::memory_order_relaxed),
-      _defaultBurst.load(std::memory_order_relaxed)));
+    // Slow path: bucket doesn't exist — create and consume. Read the (rate, burst)
+    // defaults as ONE unit under _defaultsMutex so a concurrent setDefaultRate cannot
+    // hand this new bucket a torn (newRate, oldBurst) pair (2026-06-04-1).
+    double defRate, defBurst;
+    {
+      std::lock_guard<std::mutex> lk(_defaultsMutex);
+      defRate = _defaultRate;
+      defBurst = _defaultBurst;
+    }
+    _buckets.insert(key, TokenBucket(defRate, defBurst));
 
     _buckets.findAndModify(key, [&](TokenBucket& bucket)
     {
@@ -256,11 +266,13 @@ public:
   }
 
   /// \brief Set default rate for new buckets. Does not affect existing.
-  /// Thread-safe (atomic).
+  /// Thread-safe: the (rate, burst) pair is published together under _defaultsMutex,
+  /// so a concurrent bucket creation never observes a torn (newRate, oldBurst) pair.
   void setDefaultRate(double rate, double burst)
   {
-    _defaultRate.store(rate, std::memory_order_relaxed);
-    _defaultBurst.store(burst, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(_defaultsMutex);
+    _defaultRate = rate;
+    _defaultBurst = burst;
   }
 
   /// \brief Override rate for a specific key.
@@ -268,6 +280,18 @@ public:
   {
     // Atomic replace via insertOrAssign (single shard lock acquisition)
     _buckets.insertOrAssign(key, TokenBucket(rate, burst));
+  }
+
+  /// \brief Read a key's current (rate, burst); nullopt if the key has no bucket.
+  /// Thread-safe (shared-lock read); symmetric with setKeyRate.
+  std::optional<std::pair<double, double>> getKeyRate(const K& key) const
+  {
+    std::optional<std::pair<double, double>> out;
+    _buckets.findAndDo(key, [&](const TokenBucket& bucket)
+    {
+      out = std::make_pair(bucket.rate(), bucket.burstCapacity());
+    });
+    return out;
   }
 
   /// \brief Remove a key's bucket.
@@ -323,8 +347,18 @@ private:
       scheduleNext);
   }
 
-  std::atomic<double> _defaultRate;
-  std::atomic<double> _defaultBurst;
+  // _defaultRate and _defaultBurst are ONE logical (rate, burst) invariant, so they
+  // are published together under _defaultsMutex rather than as two independent atomics:
+  // two independent atomics let a bucket-creating thread observe a TORN pair
+  // (newRate, oldBurst) mid-setDefaultRate and bake it into a new bucket for its
+  // lifetime (2026-06-04-1).
+  // LOCK ORDERING: _defaultsMutex is a LEAF lock — it is never held while a shard lock
+  // is acquired, and no shard lock is ever held while it is acquired. The slow path
+  // copies the defaults to locals under _defaultsMutex, RELEASES it, then does the
+  // shard-locked insert; keep it that way (never nest _defaultsMutex with a shard lock).
+  std::mutex _defaultsMutex;
+  double _defaultRate;
+  double _defaultBurst;
   std::chrono::seconds _maxIdle;
   ConcurrentHashMap<K, TokenBucket, Hash, KeyEqual> _buckets;
 };

@@ -266,3 +266,80 @@ TEST_CASE("RateLimiterMap: concurrent stress", "[rate_limiter][map][stress]")
   REQUIRE(consumed.load() > 0);
   REQUIRE(limiter.size() <= 100); // at most 100 keys
 }
+
+TEST_CASE("RateLimiterMap: getKeyRate reflects setKeyRate and is nullopt for an absent key",
+          "[rate_limiter][map]")
+{
+  RateLimiterMap<std::string> rl(5.0, 7.0);
+  REQUIRE_FALSE(rl.getKeyRate("absent").has_value()); // no bucket created yet
+  rl.setKeyRate("k", 3.0, 9.0);
+  auto rb = rl.getKeyRate("k");
+  REQUIRE(rb.has_value());
+  REQUIRE(rb->first == 3.0);   // verbatim-assigned, exactly representable -> exact ==
+  REQUIRE(rb->second == 9.0);
+  REQUIRE_FALSE(rl.getKeyRate("still-absent").has_value());
+}
+
+TEST_CASE("RateLimiterMap: setDefaultRate publishes (rate,burst) as an atomic pair "
+          "(no torn read on a racing bucket create)",
+          "[rate_limiter][map][concurrency]")
+{
+  // A creator racing setDefaultRate must never bake a torn (newRate,oldBurst) or
+  // (oldRate,newBurst) pair into a fresh bucket. Two DISTINCT pairs so ANY mix is
+  // detectable. Regression guard for 2026-06-04-1 (torn-pair fix): pre-fix a creator
+  // can read a mixed pair, post-fix (defaults published together under _defaultsMutex)
+  // it never does. Values are assigned verbatim (no arithmetic) so exact == is valid.
+  constexpr double R1 = 10.0, B1 = 20.0, R2 = 100.0, B2 = 200.0;
+  std::atomic<int> mixed{0};
+
+  for (int round = 0; round < 300; ++round) // repeat to widen the race window
+  {
+    RateLimiterMap<int> rl(R1, B1); // no auto-cleanup wheel; defaults for the rest
+    std::atomic<bool> go{false};
+
+    std::thread flipper(
+      [&]()
+      {
+        while (!go.load()) { std::this_thread::yield(); }
+        for (int i = 0; i < 400; ++i)
+        {
+          rl.setDefaultRate(R2, B2);
+          rl.setDefaultRate(R1, B1);
+        }
+      });
+
+    std::vector<std::thread> creators;
+    for (int t = 0; t < 4; ++t)
+    {
+      creators.emplace_back(
+        [&, t]()
+        {
+          while (!go.load()) { std::this_thread::yield(); }
+          for (int i = 0; i < 200; ++i)
+          {
+            const int key = t * 100000 + i;
+            rl.tryConsume(key); // slow path: creates a bucket from the current defaults
+            auto rb = rl.getKeyRate(key);
+            if (rb)
+            {
+              const bool p1 = rb->first == R1 && rb->second == B1;
+              const bool p2 = rb->first == R2 && rb->second == B2;
+              if (!p1 && !p2)
+              {
+                mixed.fetch_add(1);
+              }
+            }
+          }
+        });
+    }
+
+    go.store(true);
+    flipper.join();
+    for (auto& c : creators)
+    {
+      c.join();
+    }
+  }
+
+  REQUIRE(mixed.load() == 0); // never a torn (mixed rate/burst) pair
+}
