@@ -13,6 +13,27 @@
 using namespace iora::network;
 using namespace iora::core;
 
+// File-local helper for the tri-state-parse NEGATIVE cases (RFC 6455 §5.2): a wire
+// that MUST be rejected with a protocol close code. Collapses the repeated
+// BufferView/consumed/WsParseError/parse + 4-REQUIRE tail so each case reads as
+// "this wire -> this close code". Positive/accept-boundary cases and the need-more-
+// data cases (2-arg parse, no &err) legitimately differ and stay inline.
+static void expectProtocolError(const std::vector<std::uint8_t> &wire,
+                                std::uint16_t expectedCode,
+                                std::size_t maxFrameSize = WebSocketFrame::kDefaultMaxFrameSize)
+{
+  CAPTURE(expectedCode);
+  BufferView view(wire.data(), wire.size());
+  std::size_t consumed = 0;
+  WsParseError err;
+  auto parsed = WebSocketFrame::parse(view, consumed, maxFrameSize, &err);
+
+  REQUIRE_FALSE(parsed.has_value());
+  REQUIRE(consumed == 0);
+  REQUIRE(err.isError);
+  REQUIRE(err.closeCode == expectedCode);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Parse / Serialize Roundtrip
 // ══════════════════════════════════════════════════════════════════════════════
@@ -373,15 +394,7 @@ TEST_CASE("WS Frame: 64-bit length with MSB set is protocol error 1002", "[ws][f
     0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01  // MSB set (invalid per RFC 6455 §5.2)
   };
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: non-minimal 16-bit length (value <= 125) is protocol error 1002",
@@ -395,15 +408,7 @@ TEST_CASE("WS Frame: non-minimal 16-bit length (value <= 125) is protocol error 
     0x00, 0x05  // 5 (should have used the 7-bit form)
   };
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: non-minimal 64-bit length (value <= 0xFFFF) is protocol error 1002",
@@ -417,15 +422,7 @@ TEST_CASE("WS Frame: non-minimal 64-bit length (value <= 0xFFFF) is protocol err
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00  // 256 (should have used the 16-bit form)
   };
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: 16-bit length carrying exactly 125 is protocol error 1002 (reject boundary)",
@@ -440,15 +437,7 @@ TEST_CASE("WS Frame: 16-bit length carrying exactly 125 is protocol error 1002 (
     0x00, 0x7D  // 125 (largest value that still fits the 7-bit form)
   };
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: 64-bit length carrying exactly 0xFFFF is protocol error 1002 (reject boundary)",
@@ -463,15 +452,7 @@ TEST_CASE("WS Frame: 64-bit length carrying exactly 0xFFFF is protocol error 100
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF  // 65535 (largest value that fits the 16-bit form)
   };
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: minimal 16-bit length (126, value 126) parses",
@@ -542,15 +523,7 @@ TEST_CASE("WS Frame: declared length over maxFrameSize is 1009 regardless of pay
     0x07, 0xD0   // 2000
   };
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, /*maxFrameSize=*/1024, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1009);
+  expectProtocolError(wire, 1009, /*maxFrameSize=*/1024);
 }
 
 TEST_CASE("WS Frame: RSV bit set is protocol error 1002", "[ws][frame][parse]")
@@ -558,15 +531,7 @@ TEST_CASE("WS Frame: RSV bit set is protocol error 1002", "[ws][frame][parse]")
   // byte0 = FIN + RSV1 + TEXT: 0x80 | 0x40 | 0x01 = 0xC1.
   std::vector<std::uint8_t> wire = {0xC1, 0x00};
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: control frame with 126-length field is protocol error 1002",
@@ -576,15 +541,7 @@ TEST_CASE("WS Frame: control frame with 126-length field is protocol error 1002"
   // extended length). This is a protocol error, distinguishable from incomplete.
   std::vector<std::uint8_t> wire = {0x89, 0x7E};
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: hasCloseCode / isValidCloseCode / makeCloseNoCode", "[ws][frame][close]")
@@ -614,15 +571,7 @@ TEST_CASE("WS Frame: reserved data opcode 0x3 is protocol error 1002", "[ws][fra
   // (RFC 6455 §5.2) — not silently accept an undefined opcode.
   std::vector<std::uint8_t> wire = {0x83, 0x00};
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 TEST_CASE("WS Frame: reserved control opcode 0xB is protocol error 1002", "[ws][frame][parse]")
@@ -630,15 +579,7 @@ TEST_CASE("WS Frame: reserved control opcode 0xB is protocol error 1002", "[ws][
   // FIN + reserved control opcode 0xB, unmasked, zero-length.
   std::vector<std::uint8_t> wire = {0x8B, 0x00};
 
-  BufferView view(wire.data(), wire.size());
-  std::size_t consumed = 0;
-  WsParseError err;
-  auto parsed = WebSocketFrame::parse(view, consumed, WebSocketFrame::kDefaultMaxFrameSize, &err);
-
-  REQUIRE_FALSE(parsed.has_value());
-  REQUIRE(consumed == 0);
-  REQUIRE(err.isError);
-  REQUIRE(err.closeCode == 1002);
+  expectProtocolError(wire, 1002);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
