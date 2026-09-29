@@ -618,12 +618,17 @@ class FailoverDouble : public DnsTransport
 public:
   explicit FailoverDouble(const DnsConfig &cfg) : DnsTransport(cfg) {}
 
-  // Per-server-address behavior. Absent server -> SERVFAIL (server-local).
+  // Per-server-address behavior. Absent server -> SERVFAIL (server-local, rcode channel).
   std::unordered_map<std::string, DnsResponseCode> rcodeByServer;
   std::unordered_map<std::string, std::vector<std::string>> aByServer; // success addresses (A)
+  // ERROR-channel injection: deliver an exception via the callback's `error` arg (models the
+  // transport's failCallback/handleClose delivery), keyed by server. 't'=DnsTimeoutException,
+  // 'n'=DnsNetworkException, 'l'=lifecycle DnsTransportException.
+  std::unordered_map<std::string, char> errorByServer;
   std::atomic<int> issueCount{0};
   std::atomic<int> callbackCount{0};
-  int throwOnIssue{-1}; // 1-based Nth issue throws synchronously; -1 = off
+  int throwOnIssue{-1};        // 1-based Nth issue THROWS std::runtime_error synchronously; -1=off
+  int throwNetworkOnIssue{-1}; // 1-based Nth issue THROWS DnsNetworkException synchronously; -1=off
   bool asyncDispatch{true};
 
   void queryAsync(const DnsQuestion &q, QueryCallback cb, const std::string &server,
@@ -633,6 +638,31 @@ public:
     if (n == throwOnIssue)
     {
       throw std::runtime_error("injected synchronous issue throw @call " + std::to_string(n));
+    }
+    if (n == throwNetworkOnIssue)
+    {
+      // Synchronous per-server network throw (e.g. query-ID exhaustion) escaping queryAsync.
+      throw DnsNetworkException("injected synchronous network throw @call " + std::to_string(n));
+    }
+
+    // Error-channel delivery for this server?
+    std::exception_ptr deliverErr;
+    auto eit = errorByServer.find(server);
+    if (eit != errorByServer.end())
+    {
+      switch (eit->second)
+      {
+      case 't':
+        deliverErr = std::make_exception_ptr(DnsTimeoutException("injected async timeout"));
+        break;
+      case 'n':
+        deliverErr = std::make_exception_ptr(DnsNetworkException("injected async network fault"));
+        break;
+      case 'l':
+      default:
+        deliverErr = std::make_exception_ptr(DnsTransportException("Transport stopped"));
+        break;
+      }
     }
 
     DnsResult r;
@@ -660,12 +690,12 @@ public:
       r.header.ancount = 0;
     }
 
-    auto deliver = [this, cb, r]()
+    auto deliver = [this, cb, r, deliverErr]()
     {
       ++callbackCount;
       try
       {
-        cb(r, nullptr);
+        cb(r, deliverErr);
       }
       catch (...)
       {
@@ -922,4 +952,265 @@ TEST_CASE("ASYNC end-to-end: two real MockDnsServer, SERVFAIL on A -> resolveSer
   REQUIRE(fut.wait_for(ASYNC_WAIT) == std::future_status::ready);
   ServiceResolutionResult res = fut.get();
   REQUIRE(res.isSuccess()); // failover to B produced the target chain
+}
+
+// =============================================================================
+// STEPS 4-8 ROUND-1 FIXES — added test coverage
+// =============================================================================
+
+// --- M1: async ERROR-channel failover (timeout / DnsNetworkException) + synchronous network throw ---
+
+TEST_CASE("ASYNC timeout via error channel on A -> failover to B", "[dns][failover][async][errchan]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->errorByServer["10.0.0.1"] = 't'; // DnsTimeoutException via the callback error arg
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.80"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.result.isSuccess());
+  REQUIRE(out.result.a_records[0].address == "192.0.2.80");
+}
+
+TEST_CASE("ASYNC DnsNetworkException via error channel on A -> failover to B",
+          "[dns][failover][async][errchan]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->errorByServer["10.0.0.1"] = 'n'; // DnsNetworkException via the callback error arg
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.81"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.result.isSuccess());
+  REQUIRE(out.result.a_records[0].address == "192.0.2.81");
+}
+
+TEST_CASE("ASYNC lifecycle error via error channel on A -> TERMINAL, no failover",
+          "[dns][failover][async][errchan][terminal]")
+{
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->errorByServer["10.0.0.1"] = 'l'; // lifecycle DnsTransportException -> terminal
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.82"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.error);              // delivered terminal, not failed over
+  REQUIRE(t->issueCount.load() == 1); // B never contacted
+}
+
+TEST_CASE("ASYNC synchronous DnsNetworkException throw on first issue -> failover to B",
+          "[dns][failover][async][throw]")
+{
+  // Exercises the helper's catch(DnsNetworkException) -> continue advance (e.g. query-ID
+  // exhaustion escaping queryAsync). Mutation intent: the pre-H1 behavior (slicing) or a missing
+  // network-catch would make this terminal (no failover) and the address assert fail.
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->throwNetworkOnIssue = 1; // first issue throws DnsNetworkException synchronously
+  t->rcodeByServer["10.0.0.2"] = DnsResponseCode::NOERROR;
+  t->aByServer["10.0.0.2"] = {"192.0.2.83"};
+  auto r = resolverOver(t);
+
+  auto out = driveQueryAsync(r, aQ("host.example.com"));
+  REQUIRE(out.completed);
+  REQUIRE(out.callbacks == 1);
+  REQUIRE(out.result.isSuccess());
+  REQUIRE(out.result.a_records[0].address == "192.0.2.83");
+}
+
+// --- helper: drive resolveServiceDomainAsync and block for the result ---
+
+namespace
+{
+ServiceResolutionResult driveServiceAsync(const std::shared_ptr<DnsResolver> &r,
+                                          const std::string &domain,
+                                          const std::vector<ServiceType> &preferred = {},
+                                          bool secure = false)
+{
+  auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
+  auto fut = prom->get_future();
+  auto once = std::make_shared<std::atomic<bool>>(false);
+  r->resolveServiceDomainAsync(
+    domain,
+    [prom, once](const ServiceResolutionResult &res, const std::exception_ptr &)
+    {
+      if (!once->exchange(true))
+      {
+        prom->set_value(res);
+      }
+    },
+    preferred, secure);
+  if (fut.wait_for(ASYNC_WAIT) != std::future_status::ready)
+  {
+    throw std::runtime_error("async service resolve timed out: " + domain);
+  }
+  return fut.get();
+}
+} // namespace
+
+// --- M2c: async A/AAAA fan-out failover (issueTargetFamily via the helper) ---
+
+TEST_CASE("ASYNC A/AAAA fan-out failover: target host A SERVFAIL on one server, resolved via other",
+          "[dns][failover][async][wire][aaaa]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "example.net";
+  const std::string srvName = "_sip._udp." + domain;
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord(naptrS(domain, srvName));
+    (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
+  }
+  // The target host's A SERVFAILs on A but is present on B -> the A/AAAA fan-out must fail over.
+  a->configureQuery("sip1." + domain, "A", servfail());
+  b->addRecord({"sip1." + domain, "A", "192.0.2.90", 3600});
+  auto r = makeResolver({PORT_A, PORT_B});
+
+  ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
+  REQUIRE(res.isSuccess());
+  const auto *tg = &res.targets.front();
+  REQUIRE(tg->hostname == "sip1." + domain);
+  REQUIRE_FALSE(tg->addresses.empty()); // failover recovered the address
+}
+
+// --- H3: async SRV-success but ALL target A/AAAA transient -> outcome=TransientFailure ---
+
+TEST_CASE("ASYNC SRV target with all-server-transient A/AAAA -> outcome=TransientFailure",
+          "[dns][failover][async][outcome][aaaa]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "example.net";
+  const std::string srvName = "_sip._udp." + domain;
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord(naptrS(domain, srvName));
+    (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
+    // The one target host's A AND AAAA SERVFAIL on BOTH servers -> the target is wiped out, and
+    // the terminal A/AAAA avenue must classify the empty result as transient (retryable).
+    (*n)->configureQuery("sip1." + domain, "A", servfail());
+    (*n)->configureQuery("sip1." + domain, "AAAA", servfail());
+  }
+  auto r = makeResolver({PORT_A, PORT_B});
+
+  ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
+  REQUIRE_FALSE(res.isSuccess());
+  REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
+}
+
+// --- M2b: SIPS/secure-path failover preserves the b2 secure filter (no plaintext leak) ---
+
+TEST_CASE("ASYNC secure resolution failover preserves the SIPS filter (no plaintext target)",
+          "[dns][failover][async][secure]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "secure.example.net";
+  const std::string sipsSrv = "_sips._tcp." + domain;
+  // A SERVFAILs the NAPTR and the SIPS SRV; B answers the secure chain.
+  a->configureQuery(domain, "NAPTR", servfail());
+  a->configureQuery(sipsSrv, "SRV", servfail());
+  b->addRecord({sipsSrv, "SRV", "sips1." + domain, 3600, 10, 0, 5061});
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord({"sips1." + domain, "A", "192.0.2.91", 3600});
+  }
+  auto r = makeResolver({PORT_A, PORT_B});
+
+  ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIPS_TLS}, /*secure=*/true);
+  // Every produced target must be a secure SIP service after failover (RFC 3263 §4.1); a plaintext
+  // target would be a b2-filter regression across the failover boundary.
+  for (const auto &tgt : res.targets)
+  {
+    REQUIRE(isSecureSipService(tgt.transport));
+  }
+}
+
+// --- M3: NOTIMP-on-SRV failover (sync direct-SRV path) ---
+
+TEST_CASE("SYNC NOTIMP on a direct-SRV query -> failover to B", "[dns][failover][sync][gate]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "example.net";
+  const std::string srvName = "_sip._udp." + domain;
+  // No NAPTR anywhere -> direct-SRV. The SRV query gets NOTIMP on A (server-local for a NON-NAPTR
+  // query -> rotate), succeeds on B.
+  a->configureQuery(srvName, "SRV", notimp());
+  b->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord({"sip1." + domain, "A", "192.0.2.92", 3600});
+  }
+  auto r = makeResolver({PORT_A, PORT_B});
+
+  ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
+  REQUIRE(res.isSuccess());
+}
+
+// --- M3: N=1 single-server TIMEOUT -> transient ---
+
+TEST_CASE("SYNC N=1 single-server timeout -> DnsTransientResolutionException",
+          "[dns][failover][sync][timeout]")
+{
+  MockNode a(PORT_A);
+  a->configureQuery("host.example.com", timeoutCfg());
+  auto r = makeResolver({PORT_A}, SHORT_TIMEOUT, /*retryCount=*/0);
+  REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsTransientResolutionException);
+}
+
+// --- M3: resolveHostname all-server TIMEOUT variant -> transient ---
+
+TEST_CASE("resolveHostname all-server timeout -> transient throw", "[dns][failover][sync][resolvehostname]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  a->configureQuery("host.example.com", "A", timeoutCfg());
+  a->configureQuery("host.example.com", "AAAA", timeoutCfg());
+  b->configureQuery("host.example.com", "A", timeoutCfg());
+  b->configureQuery("host.example.com", "AAAA", timeoutCfg());
+  auto r = makeResolver({PORT_A, PORT_B}, SHORT_TIMEOUT, /*retryCount=*/0);
+  REQUIRE_THROWS_AS(r->resolveHostname("host.example.com"), DnsTransientResolutionException);
+}
+
+// --- H4: SYNC resolveServiceDomain per-avenue outcome ---
+
+TEST_CASE("SYNC resolveServiceDomain all-server-transient -> outcome=TransientFailure",
+          "[dns][failover][sync][outcome]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "example.net";
+  const std::string srvName = "_sip._udp." + domain;
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord(naptrS(domain, srvName));
+    (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
+    (*n)->configureQuery("sip1." + domain, "A", servfail());
+    (*n)->configureQuery("sip1." + domain, "AAAA", servfail());
+  }
+  auto r = makeResolver({PORT_A, PORT_B});
+  ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
+  REQUIRE_FALSE(res.isSuccess());
+  REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
+}
+
+TEST_CASE("SYNC resolveServiceDomain success -> outcome=Resolved", "[dns][failover][sync][outcome]")
+{
+  MockNode a(PORT_A), b(PORT_B);
+  const std::string domain = "example.net";
+  const std::string srvName = "_sip._udp." + domain;
+  for (auto *n : {&a, &b})
+  {
+    (*n)->addRecord(naptrS(domain, srvName));
+    (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
+    (*n)->addRecord({"sip1." + domain, "A", "192.0.2.93", 3600});
+  }
+  auto r = makeResolver({PORT_A, PORT_B});
+  ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
+  REQUIRE(res.isSuccess());
+  REQUIRE(res.outcome == ResolutionOutcome::Resolved);
 }

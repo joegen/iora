@@ -1187,13 +1187,16 @@ inline void DnsTransport::queryAsync(const DnsQuestion &question, QueryCallback 
       sendUdpQuery(query);
     }
   }
-  catch (const std::exception &e)
+  catch (...)
   {
-    // Send failed right after registration: fail this query. Identity-checked (T2R-1) so a reused-id
-    // sibling is never mis-failed (window is narrow here -- no timer armed yet -- but keep the whole
-    // completion surface uniform per the sibling-audit rule).
-    auto error = std::make_exception_ptr(DnsTransportException(e.what()));
-    completeQueryIfSame(query, error);
+    // Send failed right after registration: fail this query. Preserve the ORIGINAL exception
+    // (std::current_exception, not a re-wrapped base DnsTransportException) so a DnsNetworkException
+    // / DnsTimeoutException keeps its derived type — the resolver's failover gate discriminates
+    // server-local network faults from lifecycle faults BY TYPE (tracker 2026-09-25-8 steps-4-8 H1;
+    // re-wrapping as base sliced the type and defeated async connect/send-failure failover).
+    // Identity-checked (T2R-1) so a reused-id sibling is never mis-failed (window is narrow here --
+    // no timer armed yet -- but keep the whole completion surface uniform per the sibling-audit rule).
+    completeQueryIfSame(query, std::current_exception());
   }
 }
 
