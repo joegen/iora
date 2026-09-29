@@ -11,6 +11,8 @@
 #include "dns_types.hpp"
 #include "iora/core/string_utils.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cassert>
 #include <cctype>
 #include <functional>
 #include <memory>
@@ -375,6 +377,10 @@ public:
                                  const std::vector<ServiceType> &preferredTransports = {},
                                  bool secure = false)
   {
+    // Deliver AT MOST ONCE across every path below (cache-hit, fresh, and any TS-M2
+    // re-delivery on a throwing callback) -- tracker 2026-09-25-5 steps-4-8 H-1.
+    callback = makeSingleFire(std::move(callback));
+
     // Check cache first
     if (_cache)
     {
@@ -383,17 +389,14 @@ public:
       if (_cache->get(naptrQuestion, naptrResult))
       {
         iora::core::Logger::debug("DNS async service resolution cache hit for domain: " + domain);
+        ServiceResolutionResult cachedResult(domain);
+        bool cachedOk = false;
         try
         {
-          ServiceResolutionResult result(domain);
-          result.fromCache = true;
-          processCachedServiceResolution(result, naptrResult, preferredTransports, secure);
-          if (result.isSuccess())
-          {
-            callback(result, nullptr);
-            return;
-          }
-          else
+          cachedResult.fromCache = true;
+          processCachedServiceResolution(cachedResult, naptrResult, preferredTransports, secure);
+          cachedOk = cachedResult.isSuccess();
+          if (!cachedOk)
           {
             iora::core::Logger::debug(
               "DNS cached async service resolution incomplete for domain: " + domain);
@@ -403,7 +406,15 @@ public:
         {
           iora::core::Logger::debug("DNS cached async service resolution error for domain: " +
                                     domain);
-          // Fall through to fresh resolution
+          // Fall through to fresh resolution (only the cache PROCESSING failed).
+        }
+        if (cachedOk)
+        {
+          // Deliver OUTSIDE the try: a throwing USER callback must not be conflated with a
+          // cache-processing failure and trigger a wasted fresh resolution (steps-4-8
+          // thread-safety L-1). The single-fire gate keeps delivery at-most-once regardless.
+          callback(cachedResult, nullptr);
+          return;
         }
       }
       else
@@ -503,30 +514,39 @@ public:
       }
     }
 
-    // Perform async query
+    // Perform async query. Entry-site TS-C1 (tracker 2026-09-25-5): a synchronous
+    // queryAsync throw at this single-shot issue delivers via the callback (uniform
+    // deliver-via-callback contract, human decision 2026-09-29), not to the caller.
     auto self = shared_from_this();
-    _transport->queryAsync(
-      question,
-      [self, question, callback](const DnsResult &result, const std::exception_ptr &ex)
-      {
-        if (ex)
+    try
+    {
+      _transport->queryAsync(
+        question,
+        [self, question, callback](const DnsResult &result, const std::exception_ptr &ex)
         {
-          callback(result, ex);
-          return;
-        }
+          if (ex)
+          {
+            callback(result, ex);
+            return;
+          }
 
-        self->cacheQueryResult(question, result);
+          self->cacheQueryResult(question, result);
 
-        if (!result.isSuccess())
-        {
-          auto dns_ex = std::make_exception_ptr(
-            DnsResolutionFailedException(question.qname, result.header.rcode));
-          callback(result, dns_ex);
-          return;
-        }
+          if (!result.isSuccess())
+          {
+            auto dns_ex = std::make_exception_ptr(
+              DnsResolutionFailedException(question.qname, result.header.rcode));
+            callback(result, dns_ex);
+            return;
+          }
 
-        callback(result, nullptr);
-      });
+          callback(result, nullptr);
+        });
+    }
+    catch (...)
+    {
+      callback(DnsResult{}, std::current_exception());
+    }
   }
 
   /// \brief Resolve hostname to IP addresses
@@ -758,6 +778,10 @@ public:
       std::nullopt,
     bool secure = false)
   {
+    // Deliver AT MOST ONCE (this is a public entry; double-wrapping when reached via
+    // performServiceResolutionAsync is harmless) -- tracker 2026-09-25-5 steps-4-8 H-1.
+    callback = makeSingleFire(std::move(callback));
+
     auto actualSrvQueries = buildOrderedSrvQueries(domain, srvQueries, preferredTransports, secure);
 
     auto result = std::make_shared<ServiceResolutionResult>(domain);
@@ -781,44 +805,22 @@ public:
     // is suppressed per-service (not domain-wide), mirroring the sync path.
     auto deniedServices = std::make_shared<std::vector<ServiceType>>();
 
-    // The query's index in the preference-ordered actualSrvQueries is the per-set transport
-    // rank; snapshot it per-iteration and capture BY VALUE so each completion lambda stamps its
-    // own set's rank (2026-09-25-4 fix A — mirrors the NAPTR-async by-value idiom).
-    for (std::size_t rank = 0; rank < actualSrvQueries.size(); ++rank)
-    {
-      const auto &srvName = actualSrvQueries[rank].first;
-      const auto service = actualSrvQueries[rank].second;
-      const auto transportRank = static_cast<std::uint16_t>(rank);
-      DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
+    auto self = shared_from_this();
 
-      auto self = shared_from_this();
-      _transport->queryAsync(
-        srvQuestion,
-        [self, result, service, transportRank, remainingQueries, callbackFired, resultMutex,
-         deniedServices, callback, domain, preferredTransports, secure](
-          const DnsResult &srvResult, const std::exception_ptr &srvError)
+    // Shared completer: the last query to decrement to zero runs the join. acq_rel
+    // publishes every prior callback's locked writes (targets/deniedServices) to this
+    // thread. Invoked from each SRV callback AND from a synchronous issue-throw catch
+    // (TS-C1); callbackFired makes it single-fire regardless. The continuation is
+    // wrapped so a prelude throw (e.g. bad_alloc) delivers via the callback instead of
+    // unwinding into the DNS worker (tracker 2026-09-25-5 TS-M2).
+    auto runCompleter = std::make_shared<std::function<void()>>(
+      [self, result, remainingQueries, callbackFired, callback, domain, preferredTransports,
+       deniedServices, secure]()
+      {
+        if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+            !callbackFired->exchange(true))
         {
-          if (!srvError)
-          {
-            try
-            {
-              std::lock_guard<std::mutex> lock(*resultMutex);
-              if (self->processSrvRecords(srvResult.srv_records, service, *result, transportRank))
-              {
-                deniedServices->push_back(service);
-              }
-            }
-            catch (...)
-            {
-              // Ignore individual SRV processing errors
-            }
-          }
-
-          // Completion: the last query to decrement to zero runs the join. acq_rel
-          // publishes every prior callback's locked writes (targets/deniedServices)
-          // to this thread (concurrency.md HR-1: minimal sufficient ordering).
-          if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
-              !callbackFired->exchange(true))
+          try
           {
             if (!result->targets.empty())
             {
@@ -834,14 +836,64 @@ public:
                                                    *deniedServices, secure);
             }
           }
-        });
+          catch (...)
+          {
+            callback(*result, std::current_exception());
+          }
+        }
+      });
+
+    // The query's index in the preference-ordered actualSrvQueries is the per-set transport
+    // rank; snapshot it per-iteration and capture BY VALUE so each completion lambda stamps its
+    // own set's rank (2026-09-25-4 fix A — mirrors the NAPTR-async by-value idiom).
+    for (std::size_t rank = 0; rank < actualSrvQueries.size(); ++rank)
+    {
+      try
+      {
+        // Pre-issue statements inside the try (TS-C1 wrap boundary = top of loop body).
+        const auto &srvName = actualSrvQueries[rank].first;
+        const auto service = actualSrvQueries[rank].second;
+        const auto transportRank = static_cast<std::uint16_t>(rank);
+        DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
+
+        _transport->queryAsync(
+          srvQuestion,
+          [self, result, service, transportRank, resultMutex, deniedServices, runCompleter](
+            const DnsResult &srvResult, const std::exception_ptr &srvError)
+          {
+            if (!srvError)
+            {
+              try
+              {
+                std::lock_guard<std::mutex> lock(*resultMutex);
+                if (self->processSrvRecords(srvResult.srv_records, service, *result, transportRank))
+                {
+                  deniedServices->push_back(service);
+                }
+              }
+              catch (...)
+              {
+                // Ignore individual SRV processing errors
+              }
+            }
+            (*runCompleter)();
+          });
+      }
+      catch (...)
+      {
+        (*runCompleter)(); // TS-C1: synchronous issue throw -> decrement once + complete-if-last
+      }
     }
   }
 
 private:
   std::shared_ptr<DnsTransport> _transport; ///< DNS transport layer
   std::shared_ptr<DnsCache> _cache;         ///< DNS cache (optional)
-  DnsConfig _config;                        ///< DNS configuration
+  // const: set once at construction, read lock-free from concurrent worker/caller
+  // callbacks (addressResolutionPolicy). Compiler-enforced immutability is the basis
+  // of the lock-free read (tracker 2026-09-25-5 ts-L1). DnsResolver is already
+  // non-copyable/non-movable via _rngMutex, so const adds no assignability constraint.
+  const DnsConfig _config;                  ///< DNS configuration (immutable after ctor)
 
   /// \brief Centralized random number generator for deterministic testing
   mutable std::mt19937 _rng;    ///< Weighted SRV selection RNG (guarded by _rngMutex)
@@ -1185,109 +1237,154 @@ private:
                                      const std::vector<ServiceType> &preferredTransports,
                                      bool secure = false)
   {
-    // Step 1: Start with async NAPTR query
-    DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
-
     auto self = shared_from_this();
-    _transport->queryAsync(
-      naptrQuestion,
-      [self, domain, callback, preferredTransports, secure](const DnsResult &naptrResult,
-                                                            const std::exception_ptr &naptrError)
-      {
-        if (naptrError)
+
+    // Entry-site TS-C1: a synchronous queryAsync throw at the initial NAPTR issue
+    // delivers via the callback (uniform deliver-via-callback contract, human decision
+    // 2026-09-29), never propagating to the caller's thread.
+    try
+    {
+      DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
+      _transport->queryAsync(
+        naptrQuestion,
+        [self, domain, callback, preferredTransports, secure](const DnsResult &naptrResult,
+                                                              const std::exception_ptr &naptrError)
         {
-          // No NAPTR records, try direct SRV resolution
-          self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt,
-                                                secure);
-          return;
-        }
-
-        // Process NAPTR records to get SRV and direct-A targets
-        std::vector<NaptrSrvTarget> srvTargets;
-        std::vector<NaptrDirectTarget> aTargets;
-        try
-        {
-          self->processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets,
-                                    preferredTransports, secure);
-        }
-        catch (const std::exception &e)
-        {
-          callback(ServiceResolutionResult(domain), std::make_exception_ptr(e));
-          return;
-        }
-
-        if (srvTargets.empty() && aTargets.empty())
-        {
-          // No valid targets, try direct SRV resolution
-          self->performDirectSrvResolutionAsync(domain, callback, preferredTransports, std::nullopt,
-                                                secure);
-          return;
-        }
-
-        // Chain SRV queries asynchronously
-        auto result = std::make_shared<ServiceResolutionResult>(domain);
-
-        // Add 'A' flag targets directly (no SRV query needed)
-        for (const auto &aTarget : aTargets)
-        {
-          ServiceTarget target;
-          target.hostname = aTarget.hostname;
-          target.port = self->getDefaultServicePort(aTarget.service);
-          target.transport = aTarget.service;
-          target.priority = 0;
-          target.weight = 0;
-          target.naptrPreference = aTarget.preference;
-          result->targets.push_back(target);
-        }
-
-        if (srvTargets.empty())
-        {
-          // Only A-flag targets — resolve addresses and return
-          self->resolveTargetAddressesAsync(result, callback, secure);
-          return;
-        }
-
-        auto remainingQueries = std::make_shared<std::atomic<size_t>>(srvTargets.size());
-        // callbackFired ensures the completion callback is invoked exactly once
-        auto callbackFired = std::make_shared<std::atomic<bool>>(false);
-        // Mutex protects concurrent writes to result->targets from parallel SRV callbacks
-        auto resultMutex = std::make_shared<std::mutex>();
-
-        for (const auto &srvTarget : srvTargets)
-        {
-          DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
-          auto service = srvTarget.service;
-          auto naptrPref = srvTarget.naptrPreference;
-
-          self->_transport->queryAsync(
-            srvQuestion,
-            [self, result, service, naptrPref, remainingQueries, callbackFired, resultMutex,
-             callback, secure](const DnsResult &srvResult, const std::exception_ptr &srvError)
+          // TS-M2: a continuation invoked from this worker-thread callback can throw in
+          // its prelude (e.g. bad_alloc before its first wrapped queryAsync); deliver via
+          // the callback rather than unwinding into the worker. Guards the whole body;
+          // the paths below fire the callback and return before reaching the end, so this
+          // catch only fires on a prelude throw (no callback yet) — never a double-fire.
+          try
+          {
+            if (naptrError)
             {
-              if (!srvError)
-              {
-                try
-                {
-                  std::lock_guard<std::mutex> lock(*resultMutex);
-                  self->processSrvRecords(srvResult.srv_records, service, *result, naptrPref);
-                }
-                catch (...)
-                {
-                  // Ignore individual SRV processing errors
-                }
-              }
+              // No NAPTR records, try direct SRV resolution
+              self->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
+                                                    std::nullopt, secure);
+              return;
+            }
 
-              // Check if all SRV queries are complete (acq_rel publishes each
-              // callback's locked target writes to the joining thread).
-              if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
-                  !callbackFired->exchange(true))
+            // Process NAPTR records to get SRV and direct-A targets
+            std::vector<NaptrSrvTarget> srvTargets;
+            std::vector<NaptrDirectTarget> aTargets;
+            try
+            {
+              self->processNaptrRecords(naptrResult.naptr_records, srvTargets, aTargets,
+                                        preferredTransports, secure);
+            }
+            catch (const std::exception &e)
+            {
+              callback(ServiceResolutionResult(domain), std::make_exception_ptr(e));
+              return;
+            }
+
+            if (srvTargets.empty() && aTargets.empty())
+            {
+              // No valid targets, try direct SRV resolution
+              self->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
+                                                    std::nullopt, secure);
+              return;
+            }
+
+            // Chain SRV queries asynchronously
+            auto result = std::make_shared<ServiceResolutionResult>(domain);
+
+            // Add 'A' flag targets directly (no SRV query needed)
+            for (const auto &aTarget : aTargets)
+            {
+              ServiceTarget target;
+              target.hostname = aTarget.hostname;
+              target.port = self->getDefaultServicePort(aTarget.service);
+              target.transport = aTarget.service;
+              target.priority = 0;
+              target.weight = 0;
+              target.naptrPreference = aTarget.preference;
+              result->targets.push_back(target);
+            }
+
+            if (srvTargets.empty())
+            {
+              // Only A-flag targets — resolve addresses and return
+              self->resolveTargetAddressesAsync(result, callback, secure);
+              return;
+            }
+
+            auto remainingQueries = std::make_shared<std::atomic<size_t>>(srvTargets.size());
+            // callbackFired ensures the completion callback is invoked exactly once
+            auto callbackFired = std::make_shared<std::atomic<bool>>(false);
+            // Mutex protects concurrent writes to result->targets from parallel SRV callbacks
+            auto resultMutex = std::make_shared<std::mutex>();
+
+            // Shared completer: last SRV query runs the join; the TS-C1 issue-throw catch
+            // reuses it (callbackFired keeps it single-fire); the continuation is wrapped
+            // so a prelude throw delivers via the callback, not into the worker (TS-M2).
+            auto runCompleter = std::make_shared<std::function<void()>>(
+              [self, result, remainingQueries, callbackFired, callback, secure]()
               {
-                // All SRV queries done, now resolve hostnames asynchronously
-                self->resolveTargetAddressesAsync(result, callback, secure);
+                if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+                    !callbackFired->exchange(true))
+                {
+                  try
+                  {
+                    self->resolveTargetAddressesAsync(result, callback, secure);
+                  }
+                  catch (...)
+                  {
+                    callback(*result, std::current_exception());
+                  }
+                }
+              });
+
+            for (const auto &srvTarget : srvTargets)
+            {
+              try
+              {
+                // Pre-issue statements inside the try (TS-C1 wrap boundary = top of body).
+                DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
+                auto service = srvTarget.service;
+                auto naptrPref = srvTarget.naptrPreference;
+
+                self->_transport->queryAsync(
+                  srvQuestion,
+                  [self, result, service, naptrPref, resultMutex, runCompleter](
+                    const DnsResult &srvResult, const std::exception_ptr &srvError)
+                  {
+                    if (!srvError)
+                    {
+                      try
+                      {
+                        std::lock_guard<std::mutex> lock(*resultMutex);
+                        self->processSrvRecords(srvResult.srv_records, service, *result, naptrPref);
+                      }
+                      catch (...)
+                      {
+                        // Ignore individual SRV processing errors
+                      }
+                    }
+                    (*runCompleter)();
+                  });
               }
-            });
-        }
-      });
+              catch (...)
+              {
+                (*runCompleter)(); // TS-C1: synchronous SRV issue throw -> decrement once + complete-if-last
+              }
+            }
+          }
+          catch (...)
+          {
+            // TS-M2: a continuation prelude throw (e.g. bad_alloc in the setup of
+            // performDirectSrvResolutionAsync / resolveTargetAddressesAsync) must not
+            // unwind into the worker; deliver via the callback exactly once.
+            callback(ServiceResolutionResult(domain), std::current_exception());
+          }
+        });
+    }
+    catch (...)
+    {
+      // Entry-site TS-C1: a synchronous NAPTR issue throw delivers via the callback.
+      callback(ServiceResolutionResult(domain), std::current_exception());
+    }
   }
 
   /// \brief Process cached SIP resolution from NAPTR result
@@ -1338,7 +1435,11 @@ private:
       }
     }
 
-    // Step 3: Try to resolve hostnames from cache
+    // Step 3: Resolve hostnames from cache, honoring addressResolutionPolicy
+    // (family selection + order identical to the sync resolveHostname). Fully
+    // synchronous cache reads -- no latch, no mutex (tracker 2026-09-25-5 site 3).
+    // For the "First" policies BOTH families are read (not AAAA-only-if-A-empty).
+    const std::vector<DnsType> families = familiesInOrder(_config.addressResolutionPolicy);
     for (auto &target : result.targets)
     {
       if (!_cache)
@@ -1346,28 +1447,13 @@ private:
         continue;
       }
 
-      // Try A records first
-      DnsQuestion aQuestion(target.hostname, DnsType::A, DnsClass::IN);
-      DnsResult aResult;
-      if (_cache->get(aQuestion, aResult))
+      for (DnsType family : families)
       {
-        for (const auto &record : aResult.a_records)
+        DnsQuestion q(target.hostname, family, DnsClass::IN);
+        DnsResult cached;
+        if (_cache->get(q, cached))
         {
-          target.addresses.push_back(record.address);
-        }
-      }
-
-      // Try AAAA records if no A records found or if we want both
-      if (target.addresses.empty())
-      {
-        DnsQuestion aaaaQuestion(target.hostname, DnsType::AAAA, DnsClass::IN);
-        DnsResult aaaaResult;
-        if (_cache->get(aaaaQuestion, aaaaResult))
-        {
-          for (const auto &record : aaaaResult.aaaa_records)
-          {
-            target.addresses.push_back(record.address);
-          }
+          appendFamilyAddresses(target.addresses, cached, family);
         }
       }
     }
@@ -1972,6 +2058,187 @@ private:
     }
   }
 
+  // ===========================================================================
+  // Address-family policy helpers (tracker 2026-09-25-5)
+  //
+  // The async/cached A/AAAA sites honor _config.addressResolutionPolicy with
+  // family selection + ordering IDENTICAL to the sync resolveHostname (design (i)):
+  // For the "First" policies BOTH families are always queried (never gated on the
+  // first being empty — that fallback shortcut discards RFC 3263 sec 4.3 failover
+  // candidates); for the "Only" policies exactly one family is queried. The two
+  // families are issued STRICTLY SEQUENTIALLY per target/domain (the second from
+  // inside the first's callback), which preserves the fan-out completion-latch
+  // invariants with zero new synchronization and reproduces the sync concatenation
+  // order for free (append order == policy order).
+  // ===========================================================================
+
+  /// \brief Address families to query, in policy issue order (design (i)).
+  static std::vector<DnsType> familiesInOrder(AddressResolutionPolicy policy)
+  {
+    switch (policy)
+    {
+    case AddressResolutionPolicy::IPv4Only:
+      return {DnsType::A};
+    case AddressResolutionPolicy::IPv6Only:
+      return {DnsType::AAAA};
+    case AddressResolutionPolicy::IPv6First:
+      return {DnsType::AAAA, DnsType::A};
+    case AddressResolutionPolicy::IPv4First:
+    default:
+      return {DnsType::A, DnsType::AAAA};
+    }
+  }
+
+  /// \brief Append one family's addresses from a DnsResult to \p out (in record order).
+  static void appendFamilyAddresses(std::vector<std::string> &out, const DnsResult &r, DnsType family)
+  {
+    // Only A and AAAA reach here (the policy family lists contain no other types).
+    assert(family == DnsType::A || family == DnsType::AAAA);
+    if (family == DnsType::A)
+    {
+      for (const auto &rec : r.a_records)
+      {
+        out.push_back(rec.address);
+      }
+    }
+    else // DnsType::AAAA
+    {
+      for (const auto &rec : r.aaaa_records)
+      {
+        out.push_back(rec.address);
+      }
+    }
+  }
+
+  /// \brief Wrap a ServiceResolutionCallback so it is delivered AT MOST ONCE.
+  ///
+  /// The async resolution machinery has several delivery points that a THROWING user
+  /// callback could otherwise re-enter (a continuation invoked inside a TS-M2 catch
+  /// re-delivers on the exception; the transport wraps every leaf callback in catch(...),
+  /// so throwing callbacks are a handled condition in this codebase). Routing every
+  /// delivery through this single-fire gate makes re-entry idempotent (tracker
+  /// 2026-09-25-5 steps-4-8 thread-safety H-1). Applied once at each public async entry;
+  /// double-wrapping across nested entries is harmless (each gate fires once).
+  static ServiceResolutionCallback makeSingleFire(ServiceResolutionCallback cb)
+  {
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    return [fired, cb = std::move(cb)](const ServiceResolutionResult &r,
+                                       const std::exception_ptr &e)
+    {
+      if (!fired->exchange(true))
+      {
+        cb(r, e);
+      }
+    };
+  }
+
+  /// \brief Issue the A/AAAA queries for ONE fan-out target, sequentially in policy
+  ///        order, invoking \p finishTarget EXACTLY ONCE when the target is fully
+  ///        resolved OR an issue throws synchronously.
+  ///
+  /// TS-C1 (tracker 2026-09-25-5): DnsTransport::queryAsync can throw synchronously
+  /// BEFORE arming its callback (fire-callback XOR synchronous-throw). Each issue is
+  /// wrapped so a synchronous throw yields exactly the target's one \p finishTarget
+  /// (== "produced no records") and never unwinds into the DNS worker loop. The wrap
+  /// begins at the top of the body so a DnsQuestion construction throw is covered too.
+  /// Writes only result->targets[targetIndex].addresses (disjoint per target, no lock).
+  void issueTargetFamily(const std::shared_ptr<ServiceResolutionResult> &result,
+                         std::size_t targetIndex, const std::string &hostname,
+                         const std::shared_ptr<std::vector<DnsType>> &families, std::size_t famIdx,
+                         const std::shared_ptr<std::function<void()>> &finishTarget)
+  {
+    // The whole body (shared_from_this + DnsQuestion construction + queryAsync issue) is
+    // inside the try, so ANY synchronous throw yields exactly one finishTarget (TS-C1).
+    try
+    {
+      auto self = shared_from_this();
+      DnsQuestion q(hostname, (*families)[famIdx], DnsClass::IN);
+      _transport->queryAsync(
+        q, [self, result, targetIndex, hostname, families, famIdx, finishTarget](
+             const DnsResult &r, const std::exception_ptr &err)
+        {
+          // Guard the append so a throwing push_back (bad_alloc) still reaches the
+          // chain/decrement below -- otherwise the throw is swallowed by the transport's
+          // leaf catch(...) and this target's finishTarget never runs -> latch-loss hang
+          // (the TS-C1 issue-path guard does not cover the callback body). Steps-4-8 M1.
+          try
+          {
+            if (!err && targetIndex < result->targets.size())
+            {
+              appendFamilyAddresses(result->targets[targetIndex].addresses, r, (*families)[famIdx]);
+            }
+          }
+          catch (...)
+          {
+            // Partial addresses (if any) are kept; proceed so the decrement always runs.
+          }
+          if (famIdx + 1 < families->size())
+          {
+            // Chain the next family (sequential per target). issueTargetFamily is
+            // itself TS-C1-guarded, so a synchronous throw there cannot escape.
+            self->issueTargetFamily(result, targetIndex, hostname, families, famIdx + 1, finishTarget);
+          }
+          else
+          {
+            (*finishTarget)(); // terminal leaf: exactly-one decrement (acq_rel) + completer-if-last
+          }
+        });
+    }
+    catch (...)
+    {
+      (*finishTarget)(); // TS-C1: synchronous issue throw -> finish this target exactly once
+    }
+  }
+
+  /// \brief Issue the A/AAAA queries for the single-domain fallback chain,
+  ///        sequentially in policy order, invoking \p finish EXACTLY ONCE.
+  ///
+  /// Single domain, no fan-out latch: \p finish appends the fallback targets with the
+  /// collected (policy-ordered) addresses and fires the user callback exactly once.
+  /// TS-C1: a synchronous issue throw still fires \p finish once (no caller/worker unwind).
+  void issueFallbackFamily(const std::string &domain,
+                           const std::shared_ptr<std::vector<DnsType>> &families, std::size_t famIdx,
+                           const std::shared_ptr<std::vector<std::string>> &addresses,
+                           const std::shared_ptr<std::function<void()>> &finish)
+  {
+    // Whole body inside the try so any synchronous throw yields exactly one finish (TS-C1).
+    try
+    {
+      auto self = shared_from_this();
+      DnsQuestion q(domain, (*families)[famIdx], DnsClass::IN);
+      _transport->queryAsync(
+        q, [self, domain, families, famIdx, addresses, finish](const DnsResult &r,
+                                                               const std::exception_ptr &err)
+        {
+          // Guard the append (bad_alloc) so the chain/finish below always runs -- else the
+          // throw is swallowed by the transport leaf catch(...) and the user callback never
+          // fires (no latch here, but the same lost-completion class). Steps-4-8 M1.
+          try
+          {
+            if (!err)
+            {
+              appendFamilyAddresses(*addresses, r, (*families)[famIdx]);
+            }
+          }
+          catch (...)
+          {
+          }
+          if (famIdx + 1 < families->size())
+          {
+            self->issueFallbackFamily(domain, families, famIdx + 1, addresses, finish);
+          }
+          else
+          {
+            (*finish)();
+          }
+        });
+    }
+    catch (...)
+    {
+      (*finish)();
+    }
+  }
+
   /// \brief Perform fallback resolution asynchronously
   /// \param domain Domain to resolve
   /// \param result Shared result to populate
@@ -1995,58 +2262,39 @@ private:
       return;
     }
 
-    DnsQuestion aQuestion(domain, DnsType::A, DnsClass::IN);
-
+    // Honor addressResolutionPolicy: query the policy's families sequentially (both
+    // for the "First" policies -- not AAAA-only-if-A-empty, which would drop the
+    // dual-stack failover set), collecting addresses in policy order, then append the
+    // fallback targets and fire the callback EXACTLY ONCE (tracker 2026-09-25-5 site 2).
+    // Single-domain chain: no fan-out latch.
     auto self = shared_from_this();
-    _transport->queryAsync(
-      aQuestion,
-      [self, domain, result, callback, transportsToUse](const DnsResult &aResult,
-                                                        const std::exception_ptr &aError)
+    auto families =
+      std::make_shared<std::vector<DnsType>>(familiesInOrder(_config.addressResolutionPolicy));
+    auto addresses = std::make_shared<std::vector<std::string>>();
+
+    // finish: append fallback targets with the collected addresses and fire the callback.
+    // Single-fire (fired-guard): invoked from the last family's callback OR from a
+    // synchronous issue-throw catch (TS-C1), and a throwing callback must not re-enter it
+    // (steps-4-8 H-1) -- so appendFallbackTargets and the delivery each run at most once.
+    // Empty-guard: when nothing resolves under the policy, emit NO target (mirror the sync
+    // resolveHostname DnsNoRecords semantics; never a fallback target with empty addresses
+    // that would make isSuccess() falsely true) -- steps-4-8 sip-voip H-1.
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    auto finish = std::make_shared<std::function<void()>>(
+      [self, result, domain, transportsToUse, addresses, callback, fired]()
       {
-        std::vector<std::string> addresses;
-
-        if (!aError)
+        if (fired->exchange(true))
         {
-          for (const auto &record : aResult.a_records)
-          {
-            addresses.push_back(record.address);
-          }
+          return;
         }
-
-        if (addresses.empty())
+        if (!addresses->empty())
         {
-          // Try AAAA if A failed
-          DnsQuestion aaaaQuestion(domain, DnsType::AAAA, DnsClass::IN);
-
-          self->_transport->queryAsync(aaaaQuestion,
-                                 [self, result, callback, domain, transportsToUse, addresses](
-                                   const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
-                                 {
-                                   std::vector<std::string> finalAddresses = addresses;
-
-                                   if (!aaaaError)
-                                   {
-                                     for (const auto &record : aaaaResult.aaaa_records)
-                                     {
-                                       finalAddresses.push_back(record.address);
-                                     }
-                                   }
-
-                                   // Create fallback targets
-                                   self->appendFallbackTargets(*result, domain, transportsToUse,
-                                                               finalAddresses);
-
-                                   callback(*result, nullptr);
-                                 });
+          self->appendFallbackTargets(*result, domain, transportsToUse, *addresses);
         }
-        else
-        {
-          // Create fallback targets with A records
-          self->appendFallbackTargets(*result, domain, transportsToUse, addresses);
-
-          callback(*result, nullptr);
-        }
+        callback(*result, nullptr);
       });
+
+    issueFallbackFamily(domain, families, 0, addresses, finish);
   }
 
   /// \brief Resolve target addresses asynchronously
@@ -2061,87 +2309,56 @@ private:
       return;
     }
 
-    // Store initial target count to avoid race conditions during async operations
+    // remainingTargets starts at N and needs N decrements, so it can only reach 0
+    // AFTER every target has been issued -- the completer's erase therefore never
+    // races a live per-target index read (tracker 2026-09-25-5 site 1).
     const std::size_t initialTargetCount = result->targets.size();
     auto remainingTargets = std::make_shared<std::atomic<size_t>>(initialTargetCount);
 
-    // Keep the resolver alive across the async A/AAAA callbacks: the caller's
-    // strong reference is released when its own callback returns, so the callbacks
-    // this method queues must own a strong ref (fire-and-forget resolution).
+    // Keep the resolver alive across the async A/AAAA callbacks (fire-and-forget).
     auto self = shared_from_this();
 
-    // Process targets by index with bounds safety
-    for (size_t targetIndex = 0; targetIndex < initialTargetCount; ++targetIndex)
-    {
-      std::string hostname = result->targets[targetIndex].hostname;
-      DnsQuestion aQuestion(hostname, DnsType::A, DnsClass::IN);
+    // Families to query per addressResolutionPolicy, in issue order (design (i)):
+    // BOTH families for the "First" policies (never AAAA-only-if-A-empty, which drops
+    // the dual-stack failover set), one for the "Only" policies. _config is const and
+    // read lock-free here (immutable after ctor).
+    auto families =
+      std::make_shared<std::vector<DnsType>>(familiesInOrder(_config.addressResolutionPolicy));
 
-      _transport->queryAsync(
-        aQuestion,
-        [self, targetIndex, initialTargetCount, remainingTargets, result, callback, hostname,
-         secure](const DnsResult &aResult, const std::exception_ptr &aError)
+    // Terminal completer: EXACTLY ONE decrement per target, at the LAST family issued
+    // for the policy. The last decrement (acq_rel forms a release-sequence publishing
+    // every target's disjoint address writes to this thread) erases empty targets,
+    // orders the failover list, and fires the callback once. NOTE: this latch has no
+    // callbackFired backstop -- exactly-one-decrement-per-target (guaranteed by
+    // issueTargetFamily's fire-callback-XOR-synchronous-throw wrap) is load-bearing for
+    // single-fire safety; do not weaken that invariant.
+    auto finishTarget = std::make_shared<std::function<void()>>(
+      [self, remainingTargets, result, callback, secure]()
+      {
+        if (remainingTargets->fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
-          // Safe bounds check using initial count (targets vector won't be modified until all
-          // complete)
-          if (!aError && targetIndex < initialTargetCount)
-          {
-            for (const auto &record : aResult.a_records)
-            {
-              result->targets[targetIndex].addresses.push_back(record.address);
-            }
-          }
+          result->targets.erase(
+            std::remove_if(result->targets.begin(), result->targets.end(),
+                           [](const ServiceTarget &t) { return t.addresses.empty(); }),
+            result->targets.end());
+          self->sortTargetsByPriority(*result, secure);
+          callback(*result, nullptr);
+        }
+      });
 
-          // Try AAAA if no A records found
-          if (targetIndex < initialTargetCount && result->targets[targetIndex].addresses.empty())
-          {
-            DnsQuestion aaaaQuestion(hostname, DnsType::AAAA, DnsClass::IN);
-
-            self->_transport->queryAsync(
-              aaaaQuestion,
-              [self, targetIndex, initialTargetCount, remainingTargets, result, callback,
-               secure](const DnsResult &aaaaResult, const std::exception_ptr &aaaaError)
-              {
-                if (!aaaaError && targetIndex < initialTargetCount)
-                {
-                  for (const auto &record : aaaaResult.aaaa_records)
-                  {
-                    result->targets[targetIndex].addresses.push_back(record.address);
-                  }
-                }
-
-                // Check if all targets are resolved (acq_rel publishes each
-                // target's writes to the joining thread; see the SRV completer).
-                if (remainingTargets->fetch_sub(1, std::memory_order_acq_rel) == 1)
-                {
-                  // Remove targets with no addresses and sort
-                  result->targets.erase(
-                    std::remove_if(result->targets.begin(), result->targets.end(),
-                                   [](const ServiceTarget &t) { return t.addresses.empty(); }),
-                    result->targets.end());
-
-                  self->sortTargetsByPriority(*result, secure);
-
-                  callback(*result, nullptr);
-                }
-              });
-          }
-          else
-          {
-            // Check if all targets are resolved
-            if (remainingTargets->fetch_sub(1, std::memory_order_acq_rel) == 1)
-            {
-              // Remove targets with no addresses and sort
-              result->targets.erase(std::remove_if(result->targets.begin(), result->targets.end(),
-                                                   [](const ServiceTarget &t)
-                                                   { return t.addresses.empty(); }),
-                                    result->targets.end());
-
-              self->sortTargetsByPriority(*result, secure);
-
-              callback(*result, nullptr);
-            }
-          }
-        });
+    for (std::size_t targetIndex = 0; targetIndex < initialTargetCount; ++targetIndex)
+    {
+      try
+      {
+        // Pre-issue statements inside the try (TS-C1 wrap boundary = top of loop body):
+        // a bad_alloc / DnsQuestion construction throw must still finish the target once.
+        std::string hostname = result->targets[targetIndex].hostname;
+        issueTargetFamily(result, targetIndex, hostname, families, 0, finishTarget);
+      }
+      catch (...)
+      {
+        (*finishTarget)(); // TS-C1: exactly-one decrement even on a mid-loop issue throw
+      }
     }
   }
 };

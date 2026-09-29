@@ -121,8 +121,14 @@ public:
   /// \param callback Response callback
   /// \param server DNS server address (empty = use configured servers)
   /// \param port DNS server port (0 = use configured port)
-  void queryAsync(const DnsQuestion &question, QueryCallback callback,
-                  const std::string &server = "", std::uint16_t port = 0);
+  /// \note virtual to allow a test-only DnsTransport double to intercept async
+  ///       issues (fault injection for the exception-safe completion-latch tests,
+  ///       tracker 2026-09-25-5). A subclass override MUST NOT restate the default
+  ///       arguments (default args bind statically to this base declaration) and
+  ///       must be owned via shared_ptr (the dtor is non-virtual; shared_ptr's
+  ///       type-erased deleter destroys the derived object correctly).
+  virtual void queryAsync(const DnsQuestion &question, QueryCallback callback,
+                          const std::string &server = "", std::uint16_t port = 0);
 
   /// \brief Send multiple questions in one query (synchronous)
   /// \param questions DNS questions to resolve

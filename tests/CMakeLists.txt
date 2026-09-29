@@ -72,6 +72,7 @@ set(NETWORK_TESTS
     network/iora_test_dns_async
     network/iora_test_dns_client_exactly_once
     network/iora_test_dns_comprehensive
+    network/iora_test_dns_address_policy
     network/iora_test_dns_transport_sid_keying
     network/iora_test_dns_transport_callback_deadlock
     network/iora_test_dns_transport_lifecycle_restructure
