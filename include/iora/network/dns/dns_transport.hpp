@@ -454,6 +454,10 @@ private:
   /// \brief Calculate total maximum wait time for synchronous queries including retries
   /// \return Maximum possible duration including initial timeout and all retry delays with jitter
   std::chrono::milliseconds calculateMaxSyncWaitTime() const;
+  /// \brief Overload computing the budget from a CALLER-PINNED config snapshot, so the sync wait
+  ///        and the query it bounds come from the SAME immutable config a concurrent updateConfig()
+  ///        cannot tear (INV-2 — tracker 2026-09-30-4 F-13).
+  std::chrono::milliseconds calculateMaxSyncWaitTime(const DnsConfig &cfg) const;
 
   /// \brief Generate unique query ID for server:port combination
   /// \param server Target server
@@ -1091,9 +1095,10 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
       sendUdpQuery(query);
     }
 
-    // Wait for response with proper retry window calculation
+    // Wait for response with proper retry window calculation. Compute the budget from the SAME
+    // pinned cfg snapshot as this query (INV-2 — tracker 2026-09-30-4 F-13), not a fresh load.
     auto future = query->promise.get_future();
-    auto maxWaitTime = calculateMaxSyncWaitTime();
+    auto maxWaitTime = calculateMaxSyncWaitTime(*cfg);
     iora::core::Logger::debug(
       "DNS sync query max wait time: " + std::to_string(maxWaitTime.count()) + "ms " +
       "(timeout=" + std::to_string(cfg->timeout.count()) + "ms, " +
@@ -1103,10 +1108,11 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
     if (status == std::future_status::timeout)
     {
       // Count the timeout, then throw -- the single catch(...) below owns removal + timer
-      // cancellation (simplification L1/L2: no separate erase here, no double-erase).
+      // cancellation (simplification L1/L2: no separate erase here, no double-erase). Report the
+      // full budget actually waited, not the per-attempt timeout (tracker 2026-09-30-4 L-5).
       _stats.timeouts.fetch_add(1, std::memory_order_relaxed);
-      throw DnsTimeoutException("Query timeout after " + std::to_string(cfg->timeout.count()) +
-                                "ms");
+      throw DnsTimeoutException("Query timeout after " + std::to_string(maxWaitTime.count()) +
+                                "ms (max sync wait)");
     }
 
     return future.get();
@@ -1777,32 +1783,54 @@ inline void DnsTransport::processResponse(const std::uint8_t *data, std::size_t 
         "DNS response truncated (TC=1) for query ID=" + std::to_string(result.header.id) +
         " from " + sourceServer + ":" + std::to_string(sourcePort));
 
-      // Find and retry with TCP if configured
-      if (loadConfig()->transportMode == DnsTransportMode::Both)
+      // Find and retry with TCP if the QUERY was issued in Both mode. Use the query's PINNED
+      // transportMode, not a fresh loadConfig() a concurrent updateConfig() could have flipped
+      // mid-flight (tracker 2026-09-30-4 L-3).
+      bool foundUdpOnly = false;
       {
         std::lock_guard<std::mutex> lock(_queriesMutex);
         auto it = _pendingQueries.find(key);
-        if (it != _pendingQueries.end() && it->second->retryClaimed)
+        if (it == _pendingQueries.end())
         {
-          // Retry-wins-first race (2026-09-24-31): a UDP retransmission was just CLAIMED for this
-          // query, so this truncated datagram is a stale response to the superseded attempt. Drop
-          // it (drop-and-wait) rather than starting a competing TCP fallback -- the retry's own
-          // answer or truncation drives completion/fallback, so UDP retry and TCP fallback never
-          // both act on one query.
+          // No pending query for this id/server:port — a stale, duplicate, or spoofed truncated
+          // datagram (the real query already completed/reaped). Drop it with a DEBUG line only; a
+          // WARNING here would be a per-packet log amplifier on the attacker-reachable path (L-10).
           return;
         }
-        if (it != _pendingQueries.end() && !it->second->tcpFallback)
+        if (it->second->transportMode == DnsTransportMode::Both)
         {
+          if (it->second->retryClaimed)
+          {
+            // Retry-wins-first race (2026-09-24-31): a UDP retransmission was just CLAIMED for this
+            // query, so this truncated datagram is a stale response to the superseded attempt. Drop
+            // it (drop-and-wait) rather than starting a competing TCP fallback -- the retry's own
+            // answer or truncation drives completion/fallback, so UDP retry and TCP fallback never
+            // both act on one query.
+            return;
+          }
+          if (it->second->tcpFallback)
+          {
+            // M-3a: a TCP fallback is already IN FLIGHT for this query, so this is a duplicate or
+            // reordered truncated UDP datagram. Drop it and wait for the TCP answer -- never
+            // complete a query with a truncated result (RFC 2181 §9 — tracker 2026-09-30-4 M-3a).
+            return;
+          }
           iora::core::Logger::debug("Initiating TCP fallback for truncated response, query ID=" +
                                     std::to_string(result.header.id));
           it->second->tcpFallback = true;
           sendTcpQuery(it->second);
           return; // Don't complete the query yet
         }
+        foundUdpOnly = true; // a real pending query, issued UDP-only -> no TCP fallback available
       }
-      else
+      if (foundUdpOnly)
       {
-        iora::core::Logger::warning("DNS response truncated but TCP fallback not enabled");
+        // UDP-only query (no TCP fallback): the truncated response is completed below with what we
+        // have. A truncated POSITIVE partial-RRset is refined separately (tracker M-3b / 2026-09-30
+        // follow-up); the truncated-EMPTY case is classified server-local by the resolver gate.
+        iora::core::Logger::warning("DNS response truncated but TCP fallback not enabled (UDP-only) "
+                                    "for query ID=" +
+                                    std::to_string(result.header.id));
       }
     }
 
@@ -2160,35 +2188,46 @@ inline std::chrono::milliseconds DnsTransport::calculateMaxSyncWaitTime() const
 {
   // INV-2 (L-1): pin ONE config snapshot — this reads six config fields, which must all
   // come from the same immutable config a concurrent updateConfig() cannot tear.
-  auto cfg = loadConfig();
+  return calculateMaxSyncWaitTime(*loadConfig());
+}
 
-  // Calculate maximum total wait time for synchronous queries
-  // Base timeout for initial attempt
-  auto totalWait = cfg->timeout;
+inline std::chrono::milliseconds
+DnsTransport::calculateMaxSyncWaitTime(const DnsConfig &cfg) const
+{
+  // Calculate maximum total wait time for synchronous queries.
+  // The retransmit schedule makes retryCount+1 attempts (initial + retryCount retries), and EACH
+  // attempt must be allowed to wait a full `timeout` for its response before the next is sent
+  // (tracker 2026-09-30-4 H-2). Budgeting only ONE `timeout` here made queryMultiple's wait_for
+  // abandon the query after ~2 sends, so DnsConfig.retryCount was NOT honored on the sync path.
+  // Sum the per-attempt timeouts, then add the inter-attempt backoff+jitter and the safety margin.
+  // (The wall-clock consequence of the longer worst-case wait, and the RFC 1035 7.2 per-round
+  // ordering that would bound it, are tracked in 2026-09-30-3, whose per-resolution deadline caps
+  // the serial NAPTR->SRV->A->AAAA product against SIP Timer B.)
+  // Clamp the unvalidated int retryCount to [0, kMaxSyncRetries]: the lower bound guards a
+  // misconfigured negative value, which would otherwise collapse the budget below one `timeout` and
+  // abandon even the first attempt (M-2); the upper bound guards signed-overflow / an absurd
+  // per-query wait at pathological values (tracker 2026-09-30-4 L-4). The multiply is on
+  // milliseconds::rep (int64), so a clamped retries can never overflow it.
+  constexpr int kMaxSyncRetries = 100;
+  const int retries = std::min(std::max(cfg.retryCount, 0), kMaxSyncRetries);
+  auto totalWait = cfg.timeout * (retries + 1);
 
   // Retry delays with exponential backoff and accurate per-retry jitter. Use the shared
   // backoffDelayForAttempt helper so the sync-wait budget matches the delay retryQuery actually
   // schedules, tier for tier (S-M1) -- previously two independent formulas that could diverge.
-  std::chrono::milliseconds totalJitter{0};
-
-  for (int retry = 0; retry < cfg->retryCount; ++retry)
+  for (int retry = 0; retry < retries; ++retry)
   {
-    auto delay = backoffDelayForAttempt(cfg->initialRetryDelay, retry, cfg->retryMultiplier,
-                                        cfg->maxRetryDelay);
+    auto delay = backoffDelayForAttempt(cfg.initialRetryDelay, retry, cfg.retryMultiplier,
+                                        cfg.maxRetryDelay);
     totalWait += delay;
 
-    // Calculate jitter for this specific retry delay (more accurate than using maxRetryDelay)
-    if (cfg->jitterFactor > 0.0)
+    // Worst case: this retry gets maximum positive jitter based on the actual (capped) delay.
+    if (cfg.jitterFactor > 0.0)
     {
-      // Worst case: this retry gets maximum positive jitter based on actual (capped) delay.
-      auto jitterForThisRetry = std::chrono::milliseconds(
-        static_cast<std::chrono::milliseconds::rep>(delay.count() * cfg->jitterFactor));
-      totalJitter += jitterForThisRetry;
+      totalWait += std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(delay.count() * cfg.jitterFactor));
     }
   }
-
-  // Add the accurately calculated jitter
-  totalWait += totalJitter;
 
   // Add safety margin for processing delays
   totalWait += std::chrono::milliseconds(2000); // 2 second margin

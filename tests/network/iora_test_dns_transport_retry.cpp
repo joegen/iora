@@ -729,7 +729,8 @@ TEST_CASE("dns retry: total latency is bounded by the computed sync-wait budget"
   REQUIRE(waitFor(fut, milliseconds(5000)));
   auto elapsed = std::chrono::duration_cast<milliseconds>(Clock::now() - t0).count();
 
-  // calculateMaxSyncWaitTime() = timeout + sum(backoff tiers) + jitter + margin. The async terminal
+  // calculateMaxSyncWaitTime() = (retryCount+1)*timeout + sum(backoff tiers) + jitter + margin
+  // (tracker 2026-09-30-4 H-2). The async terminal
   // must land within that same budget (it is what the sync path's wait_for uses). Assert against the
   // transport's OWN computed budget via the seam (C-L2) rather than re-deriving the formula here,
   // which would silently drift if the formula changes.
@@ -1046,6 +1047,13 @@ TEST_CASE("dns retry: a truncated response is dropped when a retry is already cl
   constexpr std::uint16_t PORT = 5388;
   constexpr SessionId SID = 1;
 
+  // The query must be registered in BOTH mode (the truncation handler now reads the query's PINNED
+  // transportMode, not the live config -- tracker 2026-09-30-4 L-3/M-B). registerPending's mode arg
+  // is the last parameter, so the intermediate defaults are spelled out.
+  using ms = std::chrono::milliseconds;
+  auto registerBoth = [&](DnsTransport &t)
+  { Access::registerPending(t, ID, LOOP, PORT, {}, 0, ms(5000), ms(0), DnsTransportMode::Both); };
+
   SECTION("retry already claimed -> truncated datagram dropped, no TCP fallback, no burned retry")
   {
     DnsConfig cfg;
@@ -1054,7 +1062,7 @@ TEST_CASE("dns retry: a truncated response is dropped when a retry is already cl
     auto t = std::make_shared<DnsTransport>(cfg);
     Access::setRunning(*t, true);
     Access::putSession(*t, /*isTcp=*/false, SID, LOOP, PORT); // maps sid -> (server,port)
-    Access::registerPending(*t, ID, LOOP, PORT);
+    registerBoth(*t);
     Access::setRetryClaimed(*t, ID, LOOP, PORT, true);
 
     Access::feedUdp(*t, SID, truncatedResponse(ID));
@@ -1076,19 +1084,55 @@ TEST_CASE("dns retry: a truncated response is dropped when a retry is already cl
     Access::setRunning(*t, true);
     Access::installTcpTransport(*t); // sendTcpQuery has a handle to act on
     Access::putSession(*t, /*isTcp=*/false, SID, LOOP, PORT);
-    Access::registerPending(*t, ID, LOOP, PORT);
-    // retryClaimed defaults to false -> the fallback path is taken.
+    registerBoth(*t);
+    // retryClaimed defaults to false -> the fallback path is taken (tcpFallback set).
 
     Access::feedUdp(*t, SID, truncatedResponse(ID));
 
     CHECK(t->getStatistics().truncatedResponses == 1);
-    // The path did NOT drop: either a fallback was initiated (tcpFallback set) or the query was
-    // completed by a fallback-send error. Both differ from the retry-wins-first drop above, which
-    // left the query pending with tcpFallback==false.
-    bool dropped = Access::hasPending(*t, ID, LOOP, PORT) &&
-                   !Access::tcpFallbackOf(*t, ID, LOOP, PORT);
-    CHECK_FALSE(dropped);
+    // Non-vacuous: the fallback path ran, so tcpFallback is now set (distinguishing it from the
+    // retry-wins-first drop above, which left tcpFallback==false).
+    CHECK(Access::tcpFallbackOf(*t, ID, LOOP, PORT));
 
     t->stop();
+  }
+
+  // M-3(a): a duplicate/reordered truncated datagram arriving AFTER a TCP fallback is already in
+  // flight (tcpFallback==true) must be DROPPED, not completed with the truncated result (RFC 2181
+  // §9 — tracker 2026-09-30-4 M-3a).
+  SECTION("tcpFallback already in flight -> a second truncated datagram is dropped")
+  {
+    DnsConfig cfg;
+    cfg.transportMode = DnsTransportMode::Both;
+    cfg.retryCount = 3;
+    auto t = std::make_shared<DnsTransport>(cfg);
+    Access::setRunning(*t, true);
+    Access::putSession(*t, /*isTcp=*/false, SID, LOOP, PORT);
+    registerBoth(*t);
+    Access::setTcpFallback(*t, ID, LOOP, PORT, true); // model an in-flight TCP fallback
+
+    Access::feedUdp(*t, SID, truncatedResponse(ID));
+
+    CHECK(t->getStatistics().truncatedResponses == 1);
+    CHECK(Access::hasPending(*t, ID, LOOP, PORT));       // dropped: still pending, waiting for TCP
+    CHECK(Access::tcpFallbackOf(*t, ID, LOOP, PORT));    // unchanged
+  }
+
+  // L-3: the handler keys off the query's PINNED mode, not the live config. A query pinned UDP-only
+  // under a Both live config must NOT start a TCP fallback (it completes with the truncated result).
+  SECTION("query pinned UDP-only under a Both live config -> no TCP fallback (L-3 pinning)")
+  {
+    DnsConfig cfg;
+    cfg.transportMode = DnsTransportMode::Both; // live config says Both ...
+    cfg.retryCount = 3;
+    auto t = std::make_shared<DnsTransport>(cfg);
+    Access::setRunning(*t, true);
+    Access::putSession(*t, /*isTcp=*/false, SID, LOOP, PORT);
+    Access::registerPending(*t, ID, LOOP, PORT); // ... but the query is pinned UDP (default)
+
+    Access::feedUdp(*t, SID, truncatedResponse(ID));
+
+    CHECK(t->getStatistics().truncatedResponses == 1);
+    CHECK_FALSE(Access::tcpFallbackOf(*t, ID, LOOP, PORT)); // pinned UDP -> no fallback started
   }
 }

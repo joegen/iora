@@ -141,7 +141,8 @@ struct NaptrDirectTarget
 /// leaf, one resolveHostname, or one direct-SRV — sets its own outcome at its terminal:
 ///   - targets non-empty                                   => Resolved
 ///   - all servers rotated, still server-local/timeout      => TransientFailure
-///   - authoritative negative (NXDOMAIN / NODATA-with-SOA)  => PermanentNoService
+///   - authoritative negative (NXDOMAIN / authoritative NODATA:
+///     SOA present OR no NS, RFC 2308 §2.2.1)                => PermanentNoService
 /// The CROSS-STEP combination across the RFC 3263 NAPTR→SRV→A/AAAA fall-forward chain
 /// (deepest-avenue-supersedes) is a SEPARATE slice (tracker 2026-09-30-1). Interim: a
 /// multi-step resolveServiceDomain carries the TERMINAL avenue's per-avenue outcome.
@@ -156,8 +157,9 @@ enum class ResolutionOutcome
 {
   Resolved,          ///< Targets were produced (isSuccess()==true).
   TransientFailure,  ///< Server-local/timeout exhausted across all servers — RETRYABLE.
-  PermanentNoService ///< Authoritative negative (NXDOMAIN / NODATA-with-SOA), or a terminal
-                     ///< transport-lifecycle fault (see LIFECYCLE FAULT MAPPING above) — no service.
+  PermanentNoService ///< Authoritative negative (NXDOMAIN / authoritative NODATA — SOA present or
+                     ///< no NS, RFC 2308 §2.2.1), or a terminal transport-lifecycle fault (see
+                     ///< LIFECYCLE FAULT MAPPING above) — no service.
 };
 
 /// \brief Service resolution result with prioritized targets
@@ -294,12 +296,13 @@ private:
 };
 
 /// \brief Thrown by query()'s next-server failover loop when ALL configured servers are
-///        exhausted on SERVER-LOCAL conditions (SERVFAIL/REFUSED/FORMERR/NOTIMP/
-///        NODATA-without-SOA/timeout/network fault) without ever reaching an authoritative
-///        response or a success (tracker 2026-09-25-8).
+///        exhausted on SERVER-LOCAL conditions (SERVFAIL/REFUSED/FORMERR/NOTIMP/ a referral
+///        (NS, no SOA) / a truncated (TC=1) / a lame (RA=0,AA=0) empty answer / timeout / network
+///        fault) without ever reaching an authoritative response or a success (tracker 2026-09-25-8).
 ///
 /// Distinct TYPE from DnsResolutionFailedException / DnsNoRecordsException (which mark an
-/// AUTHORITATIVE negative — NXDOMAIN / NODATA-with-SOA). It derives from DnsResolverException
+/// AUTHORITATIVE negative — NXDOMAIN / authoritative NODATA, SOA present or no NS per RFC 2308
+/// §2.2.1). It derives from DnsResolverException
 /// so every existing `catch (const DnsResolverException&)` (including the RFC 3263 step-fallback
 /// handlers) still catches it; resolveHostname catches it FIRST to preserve the transient
 /// (retryable) vs permanent (no-service) distinction across its throwing return channel.
@@ -497,27 +500,36 @@ public:
     auto startTime =
       std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
 
+    // Single-fire the LOG only (tracker 2026-09-30-4 thread-safety LOW-1): a throwing user callback
+    // unwinds back into performServiceResolutionAsync's TS-M2 catch, which re-invokes this wrapper.
+    // `callback` is already single-fire (installed above), so re-entry cannot double-DELIVER; without
+    // this guard it would only emit a spurious second (usually "failed") log line for one resolution.
+    auto logged = std::make_shared<std::atomic<bool>>(false);
     performServiceResolutionAsync(
       domain,
-      [domain, startTime, callback](const ServiceResolutionResult &result, std::exception_ptr error)
+      [domain, startTime, callback, logged](const ServiceResolutionResult &result,
+                                            std::exception_ptr error)
       {
         // (secure is applied inside performServiceResolutionAsync; this logging wrapper
         // does not re-filter.)
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - *startTime)
-                          .count();
+        if (!logged->exchange(true))
+        {
+          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - *startTime)
+                            .count();
 
-        if (error)
-        {
-          iora::core::Logger::info("DNS async fresh service resolution failed for domain: " +
-                                   domain + " duration=" + std::to_string(duration) + "ms");
-        }
-        else
-        {
-          iora::core::Logger::info("DNS async fresh service resolution completed for domain: " +
-                                   domain + " duration=" + std::to_string(duration) + "ms" +
-                                   " targets=" + std::to_string(result.targets.size()) +
-                                   " success=" + (result.isSuccess() ? "true" : "false"));
+          if (error)
+          {
+            iora::core::Logger::info("DNS async fresh service resolution failed for domain: " +
+                                     domain + " duration=" + std::to_string(duration) + "ms");
+          }
+          else
+          {
+            iora::core::Logger::info("DNS async fresh service resolution completed for domain: " +
+                                     domain + " duration=" + std::to_string(duration) + "ms" +
+                                     " targets=" + std::to_string(result.targets.size()) +
+                                     " success=" + (result.isSuccess() ? "true" : "false"));
+          }
         }
 
         callback(result, error);
@@ -527,12 +539,17 @@ public:
 
   /// \brief Perform standard DNS query, with RFC 1035 §7.2 next-server failover.
   ///
-  /// A recursive-resolver SERVER-LOCAL failure — an rcode-bearing negative
-  /// (SERVFAIL/REFUSED/FORMERR/NOTIMP/NODATA-without-SOA/other error rcode) OR a thrown
-  /// transport fault (timeout, connect/send failure, per-server query-ID exhaustion) — is
-  /// retried on the NEXT configured server (excluding tried), until a success, an
-  /// AUTHORITATIVE negative (NXDOMAIN / NODATA-with-SOA — which STOPS rotation), or all
-  /// servers are exhausted. Server selection is OWNED here (never getNextServer()): one
+  /// Every delivered response is classified by classifyDelivered() into Positive / Authoritative /
+  /// ServerLocal (the single gate shared with the async path). SERVER-LOCAL (rotate to the NEXT
+  /// configured server, excluding tried) covers: an rcode-bearing negative
+  /// (SERVFAIL/REFUSED/FORMERR/NOTIMP/other error rcode); a referral (NOERROR/empty, NS, no SOA); a
+  /// truncated (TC=1) non-positive answer; a lame empty answer (RA=0 AND AA=0, no SOA/NS); a
+  /// CNAME-only answer without an SOA; and a thrown transport fault (timeout, connect/send failure,
+  /// per-server query-ID exhaustion). AUTHORITATIVE (STOP rotation) covers: NXDOMAIN with RA or AA;
+  /// an authoritative NODATA (SOA present, or type-3 empty-authority with RA or AA, RFC 2308 §2.2.1);
+  /// and a CNAME-only answer WITH an SOA. Rotation continues until a Positive answer, an
+  /// Authoritative negative, or all servers are exhausted. Server selection is OWNED here (never
+  /// getNextServer()): one
   /// getConfig() snapshot pins the server list, and a resolver-owned rotating cursor picks
   /// the starting server (tracker 2026-09-25-8).
   ///
@@ -552,7 +569,9 @@ public:
       DnsResult cached;
       if (_cache->get(question, cached))
       {
-        if (!cached.isSuccess())
+        // isPositiveAnswer, not isSuccess(): a negatively-cached CNAME-only NODATA is stored with
+        // its original ANCOUNT (so isSuccess() is true) but is NOT a positive answer (H-1).
+        if (!isPositiveAnswer(question, cached))
         {
           throw DnsResolutionFailedException(question.qname, cached.header.rcode);
         }
@@ -584,37 +603,35 @@ public:
       {
         DnsResult result = _transport->query(question, srv.address, srv.port);
 
-        if (result.isSuccess())
+        switch (classifyDelivered(question, result))
         {
+        case DeliveredClass::Positive:
           cacheQueryResult(question, result); // terminal (positive) — cache once
           return result;
-        }
 
-        // Non-success rcode-bearing negative: classify by the detection gate.
-        if (isAuthoritativeNegative(result))
-        {
-          // NXDOMAIN / NODATA-with-SOA -> permanent. STOP rotation; cache the authoritative
-          // negative (RFC 2308) and throw the authoritative exception.
+        case DeliveredClass::Authoritative:
+          // NXDOMAIN / authoritative NODATA / CNAME-only-with-SOA -> permanent. STOP rotation; cache
+          // the authoritative negative (cacheQueryResult stores only the SOA-bearing subset per
+          // RFC 2308 §5, and never a positive CNAME-only entry — H-1) and throw.
           cacheQueryResult(question, result);
           throw DnsResolutionFailedException(question.qname, result.header.rcode);
-        }
 
-        // Q5 (human decision 2026-09-30): a NAPTR query answered NOTIMP/FORMERR means the
-        // server does not implement NAPTR — the other configured servers are likely the same
-        // infrastructure, so do NOT rotate all servers. Fall STRAIGHT to direct-SRV: throw the
-        // dedicated DnsNaptrUnsupportedException (a DnsResolverException) after this single NAPTR
-        // query so the NAPTR path's step-fallback catch triggers direct-SRV — distinct from the
-        // transient type so the sync outcome handler never reads it as a retryable outage. (NAPTR
-        // still rotates on SERVFAIL/REFUSED/timeout — real server-local faults, not "unsupported".)
-        if (isNaptrUnsupported(question, result))
-        {
-          throw DnsNaptrUnsupportedException(question.qname, result.header.rcode);
+        case DeliveredClass::ServerLocal:
+          // Q5 (human decision 2026-09-30): a NAPTR query answered NOTIMP/FORMERR means the server
+          // does not implement NAPTR — the other configured servers are likely the same
+          // infrastructure, so do NOT rotate all servers. Fall STRAIGHT to direct-SRV: throw the
+          // dedicated DnsNaptrUnsupportedException (a DnsResolverException) after this single NAPTR
+          // query so the NAPTR path's step-fallback catch triggers direct-SRV — distinct from the
+          // transient type. (NAPTR still rotates on SERVFAIL/REFUSED/timeout — real server-local.)
+          if (isNaptrUnsupported(question, result))
+          {
+            throw DnsNaptrUnsupportedException(question.qname, result.header.rcode);
+          }
+          // SERVFAIL / REFUSED / FORMERR / NOTIMP / other error rcode / a REFERRAL (NS, no SOA) /
+          // TC=1 / lame (RA=0,AA=0) / CNAME-only-without-SOA -> rotate. Never cached.
+          lastServerLocalRcode = result.header.rcode;
+          break; // break out of the switch; the for-loop rotates to the next server
         }
-
-        // SERVFAIL / REFUSED / FORMERR / NOTIMP / other error rcode / NODATA-without-SOA ->
-        // SERVER-LOCAL: rotate to the next server. Never cached (no SOA / not authoritative).
-        lastServerLocalRcode = result.header.rcode;
-        // fall through to next iteration
       }
       catch (const DnsTimeoutException &)
       {
@@ -648,21 +665,49 @@ private:
   // ===========================================================================
 
   /// \brief Detection gate: is a non-success DnsResult an AUTHORITATIVE negative
-  ///        (NXDOMAIN / NODATA-with-SOA) that must STOP next-server rotation, versus a
-  ///        SERVER-LOCAL negative (SERVFAIL/REFUSED/FORMERR/NOTIMP/other error rcode /
-  ///        NODATA-without-SOA) that must rotate? (tracker 2026-09-25-8).
-  /// \pre result.isSuccess() == false (a rcode-bearing negative response).
+  ///        (NXDOMAIN / authoritative NODATA) that must STOP next-server rotation, versus a
+  ///        SERVER-LOCAL negative (SERVFAIL/REFUSED/FORMERR/NOTIMP/other error rcode / a
+  ///        referral) that must rotate? (tracker 2026-09-25-8, gate corrected 2026-09-30-4 H-1).
+  /// \pre not a positive answer for the queried type (isPositiveAnswer(question,result) == false).
+  ///      Reached only from classifyDelivered's non-positive, non-CNAME-only branch, where
+  ///      result.isSuccess() == false (tracker 2026-09-30-4 LOW-2).
   static bool isAuthoritativeNegative(const DnsResult &result)
   {
+    // A truncated response (TC=1) is NEVER evidence of absence (RFC 2181 §9): its sections may be
+    // incomplete. Treat it as server-local so the failover rotates (or, in Both/TCP mode, the TCP
+    // retry runs) — never authoritative (tracker 2026-09-30-4 F-3). cacheQueryResult likewise
+    // refuses to cache a truncated response.
+    if (result.header.tc)
+    {
+      return false;
+    }
     const DnsResponseCode rc = result.header.rcode;
     if (rc == DnsResponseCode::NXDOMAIN)
     {
-      return true; // the name authoritatively does not exist
+      // An NXDOMAIN is trustworthy only from a server that recursed (RA) or is authoritative (AA):
+      // a LAME reply (RA=0 AND AA=0) is not proof the name does not exist -> rotate to a working
+      // server (tracker 2026-09-30-4 M-2). The mock/real recursive NXDOMAIN sets RA=1, so it stops.
+      return result.header.ra || result.header.aa;
     }
     if (rc == DnsResponseCode::NOERROR)
     {
-      // NODATA (NOERROR + no answers): authoritative iff it carries an SOA (RFC 2308 §5).
-      return negativeResponseHasSoa(result);
+      // NODATA (NOERROR + no answers). RFC 2308 §2.2.1: an authoritative NODATA is distinguished
+      // from a referral by the "presence of an SOA record ... OR the absence of NS records". So a
+      // type-3 NODATA (empty authority: no SOA and no NS) IS authoritative — the name exists but
+      // has no records of this type, and rotating to other recursive servers cannot change that.
+      // A referral (NS present, no SOA) is NOT authoritative here — treat it server-local so the
+      // failover rotates. SOA-gating is a CACHING concern only (cacheQueryResult / RFC 2308 §5),
+      // NOT the authority test — the pre-fix SOA-only gate mis-classified the common
+      // dnsmasq/GSLB NOERROR/empty/no-SOA (typical for AAAA/SRV/NAPTR) as a retryable outage.
+      if (negativeResponseHasSoa(result))
+      {
+        return true;
+      }
+      // The type-3 (empty-authority) heuristic presumes a server that actually recursed or is
+      // authoritative. A LAME reply (RA=0 AND AA=0) with empty authority is not trustworthy
+      // evidence of absence — treat it server-local so the failover reaches a working server
+      // (tracker 2026-09-30-4 F-4). The dnsmasq/GSLB case H-1 targets sets RA=1, so it still stops.
+      return !authorityHasNs(result) && (result.header.ra || result.header.aa);
     }
     // SERVFAIL, REFUSED, FORMERR, NOTIMP, and any other error rcode are server-local.
     return false;
@@ -722,7 +767,7 @@ private:
   enum class AsyncFailoverVerdict
   {
     Terminal,        ///< success / authoritative-negative / lifecycle fault / Q5 -> deliver as-is
-    ServerLocalRetry ///< SERVFAIL/REFUSED/FORMERR/NOTIMP/NODATA-no-SOA/timeout/network -> rotate
+    ServerLocalRetry ///< SERVFAIL/REFUSED/FORMERR/NOTIMP/referral/TC=1/lame/timeout/network -> rotate
   };
   static AsyncFailoverVerdict classifyAsyncCompletion(const DnsQuestion &question,
                                                       const DnsResult &result,
@@ -749,20 +794,22 @@ private:
         return AsyncFailoverVerdict::Terminal;
       }
     }
-    // A delivered result (no error).
-    if (result.isSuccess() || isAuthoritativeNegative(result))
+    // A delivered result (no error) — classified by the SAME gate as the sync leaf so the two
+    // cannot drift (tracker 2026-09-30-4 H-1/M-1).
+    switch (classifyDelivered(question, result))
     {
+    case DeliveredClass::Positive:
+    case DeliveredClass::Authoritative:
       return AsyncFailoverVerdict::Terminal;
+    case DeliveredClass::ServerLocal:
+      // Q5: a NAPTR answered NOTIMP/FORMERR means "NAPTR unsupported" — deliver as-is so the NAPTR
+      // completer falls straight to direct-SRV, WITHOUT rotating all servers (they are likely the
+      // same infra). Everything else server-local (SERVFAIL/REFUSED/FORMERR/referral/TC=1/lame/
+      // CNAME-only-without-SOA) rotates.
+      return isNaptrUnsupported(question, result) ? AsyncFailoverVerdict::Terminal
+                                                  : AsyncFailoverVerdict::ServerLocalRetry;
     }
-    // Q5: a NAPTR answered NOTIMP/FORMERR means "NAPTR unsupported" — deliver as-is so the NAPTR
-    // completer falls straight to direct-SRV, WITHOUT rotating all servers (they are likely the
-    // same infra). NAPTR still rotates on SERVFAIL/REFUSED/timeout (below).
-    if (isNaptrUnsupported(question, result))
-    {
-      return AsyncFailoverVerdict::Terminal;
-    }
-    // SERVFAIL / REFUSED / FORMERR / other error rcode / NODATA-without-SOA -> rotate.
-    return AsyncFailoverVerdict::ServerLocalRetry;
+    return AsyncFailoverVerdict::ServerLocalRetry; // unreachable (all enum cases handled)
   }
 
   /// \brief True iff \p error is a DnsTransientResolutionException (all-server exhaustion on
@@ -794,6 +841,57 @@ private:
   static ResolutionOutcome noServiceOutcome(bool anyTransient)
   {
     return anyTransient ? ResolutionOutcome::TransientFailure : ResolutionOutcome::PermanentNoService;
+  }
+
+  /// \brief One SYNC policy for an SRV avenue that produced NO targets (tracker 2026-09-30-4 H-A):
+  ///        if any SRV set exhausted server-local, carry TransientFailure and SUPPRESS the
+  ///        RFC 3263 §4.2 apex fallback (a transient is not proof of absence — M-4); otherwise do
+  ///        the §4.2 A/AAAA fallback of the domain on \p transports (NAPTR-chosen or the direct-SRV
+  ///        preferred set), honoring RFC 2782 "." suppression via \p denied. Shared by the
+  ///        direct-SRV and NAPTR-S paths so the two cannot drift (the drift that caused F-5). The
+  ///        fallback targets are LEFT in \p transports order (already preference-ordered) and NOT
+  ///        re-sorted — a later sortTargetsByPriority would reorder them by ServiceType enum value
+  ///        and discard NAPTR preference, diverging from the async path (F-5).
+  void resolveEmptySrvAvenue(const std::string &domain, ServiceResolutionResult &result,
+                             bool anySrvTransient, const std::vector<ServiceType> &transports,
+                             const std::vector<ServiceType> &denied, bool secure)
+  {
+    if (anySrvTransient)
+    {
+      result.outcome = ResolutionOutcome::TransientFailure;
+    }
+    else
+    {
+      performFallbackResolution(domain, result, transports, denied, secure);
+    }
+  }
+
+  /// \brief ASYNC completer for an SRV join (tracker 2026-09-30-4 H-A): the async twin of
+  ///        resolveEmptySrvAvenue plus the non-empty branch. Fires \p callback EXACTLY once via
+  ///        the delivery path each branch selects. Shared by the direct-SRV and NAPTR-S completers
+  ///        so their empty-result policy cannot drift. Precedence: targets → transient → §4.2
+  ///        authoritative fallback. Neither delivery path re-sorts, so the fallback keeps
+  ///        \p transports (preference) order — matching the sync path (F-5 parity).
+  void completeSrvJoinAsync(const std::string &domain, std::shared_ptr<ServiceResolutionResult> result,
+                            ServiceResolutionCallback callback, bool anySrvTransient,
+                            const std::vector<ServiceType> &transports,
+                            const std::vector<ServiceType> &denied, bool secure)
+  {
+    if (!result->targets.empty())
+    {
+      resolveTargetAddressesAsync(result, callback, secure);
+    }
+    else if (anySrvTransient)
+    {
+      // Suppress the §4.2 fallback and carry TransientFailure; resolveTargetAddressesAsync-over-empty
+      // preserves the non-Resolved outcome and fires the callback exactly once (M-4).
+      result->outcome = ResolutionOutcome::TransientFailure;
+      resolveTargetAddressesAsync(result, callback, secure);
+    }
+    else
+    {
+      performFallbackResolutionAsync(domain, result, callback, transports, denied, secure);
+    }
   }
 
   /// \brief Async next-server failover (RFC 1035 §7.2): the drop-in replacement for a direct
@@ -998,8 +1096,9 @@ public:
       DnsResult result;
       if (_cache->get(question, result))
       {
-        // For negative cache hits, still need to pass the appropriate exception
-        if (!result.isSuccess())
+        // isPositiveAnswer, not isSuccess(): parity with the sync cache-hit path (H-1) — a
+        // negatively-cached CNAME-only NODATA reports isSuccess() but must deliver the exception.
+        if (!isPositiveAnswer(question, result))
         {
           auto dns_ex = std::make_exception_ptr(
             DnsResolutionFailedException(question.qname, result.header.rcode));
@@ -1033,7 +1132,9 @@ public:
 
           self->cacheQueryResult(question, result);
 
-          if (!result.isSuccess())
+          // isPositiveAnswer, not isSuccess(): a CNAME-only NODATA delivered as Terminal by
+          // classifyAsyncCompletion must be delivered as an ERROR, matching the sync leaf (H-1).
+          if (!isPositiveAnswer(question, result))
           {
             // Parity with the sync leaf (LOW-1): a NAPTR NOTIMP/FORMERR is "NAPTR unsupported",
             // not an authoritative negative — deliver the dedicated type so an async caller can
@@ -1110,7 +1211,7 @@ public:
       }
       catch (const DnsResolverException &)
       {
-        // IPv4 query hit an AUTHORITATIVE negative (NXDOMAIN / NODATA-with-SOA), continue.
+        // IPv4 query hit an AUTHORITATIVE negative (NXDOMAIN / authoritative NODATA), continue.
       }
       catch (const DnsTransportException &)
       {
@@ -1120,11 +1221,11 @@ public:
       }
       catch (const DnsParseException &)
       {
-        // Defensive / currently unreachable: the transport drops-and-waits on a
-        // malformed datagram (dns_transport.hpp:1804-1823), so a parse failure
-        // surfaces to the resolver as a timeout, not a DnsParseException. This
-        // clause is kept per the enumerate-the-three-types decision. Continue to
-        // AAAA (keep partial results) if it ever does fire.
+        // Reachable for an UNENCODABLE query name: DnsMessage::encodeName throws
+        // DnsParseException before any send (e.g. a name in the 254-255 char window
+        // that passes validateHostname but exceeds encodeName's 253-octet bound, or a
+        // label > 63 bytes). Not a server-local fault -> does not rotate; absorb it as
+        // a per-family failure, keep any partial results and continue to AAAA.
       }
     }
 
@@ -1159,8 +1260,9 @@ public:
       }
       catch (const DnsParseException &)
       {
-        // Defensive / currently unreachable (see the IPv4 note above): keep the
-        // A results already collected and continue.
+        // Reachable for an unencodable query name (encodeName throws before send; see the
+        // IPv4 note above). Not a server-local fault; keep the A results already collected
+        // and continue.
       }
     }
 
@@ -1249,6 +1351,11 @@ public:
     // Query SRV records. Track which services returned an RFC 2782 "." abort so the
     // A/AAAA fallback is suppressed per-service (not domain-wide).
     std::vector<ServiceType> deniedServices;
+    // Track whether ANY SRV set exhausted all servers on server-local conditions (transient).
+    // A transient SRV outage is NOT proof the SRV records are absent, so the bare-domain A/AAAA
+    // fallback MUST be suppressed and the outcome carried as TransientFailure — RFC 3263 §4.2
+    // fallback is conditioned on ABSENCE, not on SERVFAIL (tracker 2026-09-30-4 M-4).
+    bool anySrvTransient = false;
     // The query's index in the preference-ordered actualSrvQueries is the per-set transport
     // rank, stamped as naptrPreference so sortTargetsByPriority sequences transports per set
     // and never cross-compares SRV priority across owner names (2026-09-25-4 fix A).
@@ -1265,9 +1372,17 @@ public:
           deniedServices.push_back(service);
         }
       }
+      catch (const DnsTransientResolutionException &)
+      {
+        // This SRV set exhausted all servers on server-local conditions (transient). Skip the set
+        // (RFC 3263 §4.3) but remember it so an empty result carries TransientFailure and the
+        // bare-domain A/AAAA fallback is suppressed (tracker 2026-09-30-4 M-4).
+        anySrvTransient = true;
+        continue;
+      }
       catch (const DnsResolverException &)
       {
-        // Skip failed queries
+        // Skip failed queries (authoritative negative / other resolver failure)
         continue;
       }
       catch (const DnsTransportException &)
@@ -1278,8 +1393,8 @@ public:
       }
       catch (const DnsParseException &)
       {
-        // Defensive / currently unreachable (transport drop-and-waits on malformed
-        // datagrams, dns_transport.hpp:1804-1823): skip this SRV set, keep the others.
+        // Reachable for an unencodable SRV query name (encodeName throws before send). Not a
+        // server-local fault; skip this SRV set, keep the others (RFC 3263 §4.3).
         continue;
       }
     }
@@ -1291,9 +1406,11 @@ public:
     }
     else
     {
-      // No SRV targets: fall back to A/AAAA on the domain for the transports that
-      // were NOT explicitly declared unavailable by an SRV "." (RFC 2782).
-      performFallbackResolution(domain, result, preferredTransports, deniedServices, secure);
+      // No SRV targets: carry TransientFailure on a transient exhaustion, else the RFC 3263 §4.2
+      // A/AAAA domain fallback (RFC 2782 "." honored) — one shared policy with the NAPTR-S path
+      // (tracker 2026-09-30-4 M-4/H-A). The fallback keeps preferred-transport order (not re-sorted).
+      resolveEmptySrvAvenue(domain, result, anySrvTransient, preferredTransports, deniedServices,
+                            secure);
     }
 
     return result;
@@ -1340,6 +1457,9 @@ public:
     // Services whose SRV query returned an RFC 2782 "." abort; the A/AAAA fallback
     // is suppressed per-service (not domain-wide), mirroring the sync path.
     auto deniedServices = std::make_shared<std::vector<ServiceType>>();
+    // Async twin of the sync anySrvTransient (tracker 2026-09-30-4 M-4): set when a set exhausts
+    // all servers server-local. Written from parallel SRV callbacks, read once in the completer.
+    auto anySrvTransient = std::make_shared<std::atomic<bool>>(false);
 
     auto self = shared_from_this();
 
@@ -1351,26 +1471,18 @@ public:
     // unwinding into the DNS worker (tracker 2026-09-25-5 TS-M2).
     auto runCompleter = std::make_shared<std::function<void()>>(
       [self, result, remainingQueries, callbackFired, callback, domain, preferredTransports,
-       deniedServices, secure]()
+       deniedServices, anySrvTransient, secure]()
       {
         if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
             !callbackFired->exchange(true))
         {
           try
           {
-            if (!result->targets.empty())
-            {
-              self->resolveTargetAddressesAsync(result, callback, secure);
-            }
-            else
-            {
-              // No SRV targets: fall back to A/AAAA for the transports NOT declared
-              // unavailable by an SRV "." (RFC 2782). If every fallback transport is
-              // denied, performFallbackResolutionAsync yields an empty result and
-              // still fires the callback exactly once.
-              self->performFallbackResolutionAsync(domain, result, callback, preferredTransports,
-                                                   *deniedServices, secure);
-            }
+            // One shared empty-avenue policy (targets → transient → §4.2 fallback), identical to
+            // the NAPTR-S completer so the two cannot drift (tracker 2026-09-30-4 M-4/H-A).
+            self->completeSrvJoinAsync(domain, result, callback,
+                                       anySrvTransient->load(std::memory_order_acquire),
+                                       preferredTransports, *deniedServices, secure);
           }
           catch (...)
           {
@@ -1396,8 +1508,8 @@ public:
 
         queryAsyncWithFailover(
           srvQuestion, chain,
-          [self, result, service, transportRank, resultMutex, deniedServices, runCompleter](
-            const DnsResult &srvResult, const std::exception_ptr &srvError)
+          [self, result, service, transportRank, resultMutex, deniedServices, anySrvTransient,
+           runCompleter](const DnsResult &srvResult, const std::exception_ptr &srvError)
           {
             // srvError set (incl. DnsTransientResolutionException on all-server exhaustion) ->
             // this SRV set contributed nothing; the fan-out continues with the other sets.
@@ -1415,6 +1527,11 @@ public:
               {
                 // Ignore individual SRV processing errors
               }
+            }
+            else if (isTransientError(srvError))
+            {
+              // All servers exhausted server-local for this set (tracker 2026-09-30-4 M-4).
+              anySrvTransient->store(true, std::memory_order_release);
             }
             (*runCompleter)();
           });
@@ -1704,8 +1821,8 @@ private:
     }
     catch (const DnsParseException &)
     {
-      // Defensive / currently unreachable (transport drop-and-waits on malformed
-      // datagrams -> timeout, dns_transport.hpp:1804-1823): fall back to direct SRV.
+      // Reachable for an unencodable NAPTR query name (encodeName throws before send). Not a
+      // server-local fault; fall back to direct SRV (RFC 3263 §4.1).
       return fallbackToDirectSrv();
     }
 
@@ -1727,17 +1844,30 @@ private:
       return fallbackToDirectSrv();
     }
 
-    // Step 3: Query SRV records for 'S' flag targets. NAPTR-S selects SRV with NO A/AAAA fallback
-    // (RFC 3263 §4.1), so this SRV step is the TERMINAL avenue: track whether any SRV query
-    // exhausted server-local so an empty result carries TransientFailure, not PermanentNoService
-    // (steps-4-8 HIGH-A).
+    // Step 3: Query SRV records for 'S' flag targets. Track whether any SRV query exhausted
+    // server-local so an empty result carries TransientFailure, not PermanentNoService
+    // (steps-4-8 HIGH-A). Also collect the NAPTR-chosen transport set and any RFC 2782 "."
+    // suppressions so an all-authoritative failure can fall back to an A/AAAA lookup of the
+    // domain on those transports (RFC 3263 §4.2 — tracker 2026-09-30-4 H-3).
     bool anySrvTransient = false;
+    std::vector<ServiceType> naptrTransports;
+    std::vector<ServiceType> naptrDeniedServices;
     for (const auto &srvTarget : srvTargets)
     {
+      // The NAPTR-chosen transport(s), deduped in preference order — the §4.2 fallback set.
+      if (std::find(naptrTransports.begin(), naptrTransports.end(), srvTarget.service) ==
+          naptrTransports.end())
+      {
+        naptrTransports.push_back(srvTarget.service);
+      }
       try
       {
         DnsResult srvResult = query(DnsQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN));
-        processSrvRecords(srvResult.srv_records, srvTarget.service, result, srvTarget.naptrPreference);
+        if (processSrvRecords(srvResult.srv_records, srvTarget.service, result,
+                              srvTarget.naptrPreference))
+        {
+          naptrDeniedServices.push_back(srvTarget.service);
+        }
       }
       catch (const DnsTransientResolutionException &)
       {
@@ -1759,8 +1889,8 @@ private:
       }
       catch (const DnsParseException &)
       {
-        // Defensive / currently unreachable (transport drop-and-waits on malformed
-        // datagrams, dns_transport.hpp:1804-1823): skip this target, keep the others.
+        // Reachable for an unencodable SRV query name (encodeName throws before send). Not a
+        // server-local fault; skip this target, keep the others (RFC 3263 §4.3).
         continue;
       }
     }
@@ -1786,18 +1916,25 @@ private:
     // CROSS-STEP (deferred to tracker 2026-09-30-1); Slice A keeps sync == async here.
     const bool noTargetsBeforeAddr = result.targets.empty();
 
-    // Step 4: Resolve hostnames to IP addresses
-    resolveTargetAddresses(result);
-
-    if (noTargetsBeforeAddr && anySrvTransient &&
-        result.outcome != ResolutionOutcome::TransientFailure)
+    if (noTargetsBeforeAddr)
     {
-      result.outcome = ResolutionOutcome::TransientFailure;
+      // M-4/H-3: transient SRV exhaustion -> TransientFailure (no apex fallback); else the RFC 3263
+      // §4.2 A/AAAA fallback of the domain on the NAPTR-chosen transport(s), honoring RFC 2782 "."
+      // (RFC 3263 §4.2 is the application-defined terminal step; RFC 3403 §8 discourages backing up
+      // to OTHER NAPTR rewrite paths, which this is not). Shared with the direct-SRV path. The
+      // fallback targets are NOT re-sorted, so they keep NAPTR-preference order and match the async
+      // path (tracker 2026-09-30-4 H-3/M-4/H-A).
+      resolveEmptySrvAvenue(domain, result, anySrvTransient, naptrTransports, naptrDeniedServices,
+                            secure);
     }
-
-    // Step 5: Sort targets by priority (and, when secure, discard any non-SIPS-SIP
-    // target as belt-and-suspenders — the primary NAPTR/SRV filters already excluded them).
-    sortTargetsByPriority(result, secure);
+    else
+    {
+      // Step 4: Resolve hostnames to IP addresses, then sort by priority (and, when secure, discard
+      // any non-SIPS-SIP target as belt-and-suspenders). The §4.2 fallback branch above must NOT be
+      // sorted here — that would reorder its targets by ServiceType enum and drop NAPTR preference.
+      resolveTargetAddresses(result);
+      sortTargetsByPriority(result, secure);
+    }
 
     return result;
   }
@@ -1890,30 +2027,45 @@ private:
             auto callbackFired = std::make_shared<std::atomic<bool>>(false);
             // Mutex protects concurrent writes to result->targets from parallel SRV callbacks
             auto resultMutex = std::make_shared<std::mutex>();
-            // Per-avenue transient for the NAPTR-S SRV step (steps-4-8 HIGH-A): NAPTR-S selects SRV
-            // with NO A/AAAA fallback (RFC 3263 §4.1), so SRV is the TERMINAL avenue. If every SRV
-            // query exhausts server-local, the empty result must be TransientFailure, not the
-            // PermanentNoService that resolveTargetAddressesAsync-over-empty would otherwise report.
+            // Per-avenue transient for the NAPTR-S SRV step (steps-4-8 HIGH-A): when every SRV set
+            // exhausts server-local, the empty result must be TransientFailure (the §4.2 fallback is
+            // suppressed, M-4); when they fail AUTHORITATIVELY, the empty result takes the RFC 3263
+            // §4.2 A/AAAA domain fallback below (H-3). Either way the fallback vs transient decision
+            // is made in completeSrvJoinAsync, shared with the direct-SRV + sync paths.
             auto anySrvTransient = std::make_shared<std::atomic<bool>>(false);
+            // NAPTR-chosen transport set (deduped in preference order) + RFC 2782 "." suppressions,
+            // for the H-3 §4.2 A/AAAA fallback when every NAPTR-S SRV set fails authoritatively
+            // (tracker 2026-09-30-4 H-3). naptrDenied is written under resultMutex from the SRV
+            // callbacks (parity with the direct-SRV async deniedServices).
+            std::vector<ServiceType> naptrTransports;
+            for (const auto &st : srvTargets)
+            {
+              if (std::find(naptrTransports.begin(), naptrTransports.end(), st.service) ==
+                  naptrTransports.end())
+              {
+                naptrTransports.push_back(st.service);
+              }
+            }
+            auto naptrDenied = std::make_shared<std::vector<ServiceType>>();
 
             // Shared completer: last SRV query runs the join; the TS-C1 issue-throw catch
             // reuses it (callbackFired keeps it single-fire); the continuation is wrapped
             // so a prelude throw delivers via the callback, not into the worker (TS-M2).
             auto runCompleter = std::make_shared<std::function<void()>>(
-              [self, result, remainingQueries, callbackFired, callback, secure, anySrvTransient]()
+              [self, result, remainingQueries, callbackFired, callback, secure, anySrvTransient,
+               domain, naptrTransports, naptrDenied]()
               {
                 if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
                     !callbackFired->exchange(true))
                 {
-                  // Carry the SRV-step transient forward when it produced no targets (HIGH-A);
-                  // resolveTargetAddressesAsync-over-empty preserves a non-Resolved outcome.
-                  if (result->targets.empty() && anySrvTransient->load(std::memory_order_acquire))
-                  {
-                    result->outcome = ResolutionOutcome::TransientFailure;
-                  }
                   try
                   {
-                    self->resolveTargetAddressesAsync(result, callback, secure);
+                    // One shared empty-avenue policy (targets → transient → RFC 3263 §4.2 fallback),
+                    // identical to the direct-SRV completer and the sync NAPTR-S path so none can
+                    // drift (tracker 2026-09-30-4 M-4/H-3/H-A).
+                    self->completeSrvJoinAsync(domain, result, callback,
+                                               anySrvTransient->load(std::memory_order_acquire),
+                                               naptrTransports, *naptrDenied, secure);
                   }
                   catch (...)
                   {
@@ -1935,8 +2087,8 @@ private:
 
                 self->queryAsyncWithFailover(
                   srvQuestion, chain,
-                  [self, result, service, naptrPref, resultMutex, runCompleter, anySrvTransient](
-                    const DnsResult &srvResult, const std::exception_ptr &srvError)
+                  [self, result, service, naptrPref, resultMutex, runCompleter, anySrvTransient,
+                   naptrDenied](const DnsResult &srvResult, const std::exception_ptr &srvError)
                   {
                     // srvError set (incl. transient exhaustion) -> this SRV set contributed
                     // nothing; the fan-out continues with the other sets.
@@ -1945,7 +2097,12 @@ private:
                       try
                       {
                         std::lock_guard<std::mutex> lock(*resultMutex);
-                        self->processSrvRecords(srvResult.srv_records, service, *result, naptrPref);
+                        if (self->processSrvRecords(srvResult.srv_records, service, *result,
+                                                    naptrPref))
+                        {
+                          // RFC 2782 "." -> suppress this service from the H-3 §4.2 fallback.
+                          naptrDenied->push_back(service);
+                        }
                       }
                       catch (...)
                       {
@@ -2090,11 +2247,12 @@ private:
                 return a.preference < b.preference;
               });
 
-    // RFC 3403 §4.1 (records are processed lowest ORDER first) and §8 (a NAPTR
-    // processor advances to the next ORDER value only when the current one
-    // yields no usable target). Records are already sorted by (order,
-    // preference); walk them tier by tier and stop as soon as a completed ORDER
-    // tier has produced at least one target.
+    // RFC 3403 §4.1/§8 (the ORDER field: records MUST be processed lowest ORDER first) + the RFC 3402
+    // DDDS algorithm (advance to the next ORDER only when the current tier yields no usable target).
+    // Records are already sorted by (order, preference); walk them tier by tier and stop as soon as a
+    // completed ORDER tier has produced at least one target. (Note: RFC 3403 §8's "report a failure
+    // rather than back up to OTHER rewrite paths" is a DIFFERENT rule from this tier walk — tracker
+    // 2026-09-30-4 L-5/L-8.)
     std::uint16_t currentOrder = sortedRecords.front().order;
 
     // Process records to extract targets
@@ -2358,10 +2516,11 @@ private:
 
   /// \brief Apply the cache-write policy for a completed query result.
   ///
-  /// Positive results are cached; NXDOMAIN and NODATA (NOERROR with no answer
-  /// records) are negatively cached per RFC 2308 — but ONLY when the response
-  /// carries an SOA record (RFC 2308 §5: a negative response without an SOA
-  /// SHOULD NOT be cached, as there is no authoritative TTL to bound it).
+  /// Positive answers are cached positively; NXDOMAIN, NODATA (NOERROR with no
+  /// record of the queried type — including a CNAME-only answer, H-1), are negatively
+  /// cached per RFC 2308 — but ONLY when the response carries an SOA record (RFC 2308
+  /// §5: a negative response without an SOA SHOULD NOT be cached, as there is no
+  /// authoritative TTL to bound it).
   void cacheQueryResult(const DnsQuestion &question, const DnsResult &result)
   {
     if (!_cache)
@@ -2369,7 +2528,17 @@ private:
       return;
     }
 
-    if (result.isSuccess())
+    // A truncated response (TC=1) is incomplete and must never be cached — neither its partial
+    // answers nor an "absence" it does not actually prove (RFC 2181 §9 — tracker 2026-09-30-4 F-3).
+    if (result.header.tc)
+    {
+      return;
+    }
+
+    // isPositiveAnswer, not isSuccess(): a CNAME-only NODATA has ANCOUNT>0 (so isSuccess() is true)
+    // but must be cached NEGATIVELY with the SOA-minimum TTL, never positively with the CNAME TTL
+    // (tracker 2026-09-30-4 H-1).
+    if (isPositiveAnswer(question, result))
     {
       _cache->put(question, result);
       return;
@@ -2410,6 +2579,89 @@ private:
       }
     }
     return false;
+  }
+
+  /// \brief True if a response carries an NS record in the authority section — the marker of a
+  ///        REFERRAL (RFC 2308 §2.2.1). A NOERROR/empty response with NS-but-no-SOA is a referral
+  ///        (server-local: rotate to follow it); one with neither SOA nor NS is a type-3
+  ///        authoritative NODATA. Used only by isAuthoritativeNegative (tracker 2026-09-30-4 H-1).
+  static bool authorityHasNs(const DnsResult &result)
+  {
+    for (const auto &rr : result.authority)
+    {
+      if (rr.type == DnsType::NS)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// \brief A NOERROR answer that carries a CNAME chain but NO record of the queried type is a
+  ///        NODATA (RFC 2308 §2.2), NOT a positive result — returning/caching it as success pins an
+  ///        empty answer for the (often long) CNAME TTL instead of the SOA-minimum negative TTL
+  ///        (tracker 2026-09-30-4 F-7). Generic across qtypes (L-2): a genuinely-chased
+  ///        CNAME->target answer keeps a target RR of the queried type in its answer section and is
+  ///        correctly still a success.
+  static bool isCnameOnlyNodata(const DnsResult &result, DnsType qtype)
+  {
+    if (result.header.rcode != DnsResponseCode::NOERROR || result.cname_records.empty())
+    {
+      return false;
+    }
+    // Meta-qtypes (ANY/AXFR/MAILA/MAILB) never match a concrete answer RR type, so the none_of below
+    // would falsely flag a legitimate CNAME answer as NODATA. A CNAME IS the valid answer to an ANY
+    // query on an alias (RFC 1034 §3.6.2) — exempt them (tracker 2026-09-30-4 round-3 M-C).
+    if (qtype == DnsType::ANY || qtype == DnsType::AXFR || qtype == DnsType::MAILA ||
+        qtype == DnsType::MAILB)
+    {
+      return false;
+    }
+    // NODATA iff NO answer-section RR matches the queried type (only CNAMEs / other non-qtype RRs).
+    return std::none_of(result.answers.begin(), result.answers.end(),
+                        [qtype](const DnsResourceRecord &rr) { return rr.type == qtype; });
+  }
+
+  /// \brief A usable POSITIVE answer for the queried type: a success that is NOT a CNAME-only
+  ///        NODATA. The ONE predicate every success-vs-negative decision uses — the failover gate,
+  ///        the cache write, the cache-hit read, and every async delivery — so sync and async can
+  ///        never diverge and the answer never depends on cache state (tracker 2026-09-30-4 H-1).
+  static bool isPositiveAnswer(const DnsQuestion &question, const DnsResult &result)
+  {
+    return result.isSuccess() && !isCnameOnlyNodata(result, question.qtype);
+  }
+
+  /// \brief Classification of a DELIVERED (no-error) DnsResult, shared by the sync query() leaf and
+  ///        the async classifyAsyncCompletion so the two cannot drift (tracker 2026-09-30-4 H-1/M-1).
+  enum class DeliveredClass
+  {
+    Positive,      ///< a usable positive answer -> return/deliver, cache positive.
+    Authoritative, ///< an authoritative negative -> STOP rotation, cache-negative (SOA-gated), throw.
+    ServerLocal    ///< retryable -> rotate (referral / lame / TC=1 / CNAME-only-without-SOA / error).
+  };
+  static DeliveredClass classifyDelivered(const DnsQuestion &question, const DnsResult &result)
+  {
+    if (isPositiveAnswer(question, result))
+    {
+      return DeliveredClass::Positive;
+    }
+    // A non-positive truncated (TC=1) response is NEVER evidence of absence (RFC 2181 §9): guard it
+    // here — ahead of the CNAME-only and authoritative branches — so NO negative shape (empty,
+    // CNAME-only-with-SOA, ...) can be classified authoritative while truncated (tracker
+    // 2026-09-30-4 round-3 M-A). isAuthoritativeNegative keeps the same guard as defense-in-depth.
+    if (result.header.tc)
+    {
+      return DeliveredClass::ServerLocal;
+    }
+    // A CNAME-only NODATA is authoritative ONLY with an SOA: an empty-authority CNAME means the
+    // target was not resolved (RFC 1034 §3.6.2), which is not proof of absence -> rotate (M-1).
+    if (isCnameOnlyNodata(result, question.qtype))
+    {
+      return negativeResponseHasSoa(result) ? DeliveredClass::Authoritative
+                                            : DeliveredClass::ServerLocal;
+    }
+    return isAuthoritativeNegative(result) ? DeliveredClass::Authoritative
+                                           : DeliveredClass::ServerLocal;
   }
 
   /// \param naptrPref NAPTR preference for this SRV group (0 if not from NAPTR)

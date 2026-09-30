@@ -102,6 +102,33 @@ public:
     bool shouldRefuse{false};            // REFUSED (rcode 5) — server-local, triggers failover
     bool shouldReturnNotimp{false};      // NOTIMP (rcode 4) — server-local (NAPTR->direct-SRV Q5)
     bool shouldReturnFormerr{false};     // FORMERR (rcode 1) — server-local
+    bool shouldReturnReferral{false};    // NOERROR, 0 answers, NS-in-authority, NO SOA (RFC 2308
+                                         // §2.2.1 referral — server-local, triggers failover)
+    bool shouldReturnTruncatedEmpty{false}; // NOERROR, 0 answers, TC=1 (RFC 2181 §9: never
+                                            // authoritative, never cached — server-local)
+    bool shouldReturnLameEmpty{false};   // NOERROR, 0 answers, no SOA/NS, RA=0 AND AA=0 (lame /
+                                         // non-recursive — server-local, must rotate)
+    std::string cnameOnlyTarget;         // if non-empty: NOERROR answer = ONE CNAME to this target,
+                                         // no RR of the queried type (CNAME-chain NODATA, RFC 2308
+                                         // §2.2); cnameOnlyIncludeSoa controls the authority SOA
+    bool cnameOnlyIncludeSoa{true};      // false -> CNAME-only with EMPTY authority (no SOA) -> the
+                                         // target was not resolved, so the resolver must rotate (M-1)
+    std::string cnameThenATarget;        // if non-empty: NOERROR answer = CNAME(qname->target) AND
+    std::string cnameThenAAddr;          // A(target->this addr) — a chased CNAME, still a success
+    bool shouldReturnNodataNsAndSoa{false}; // NOERROR/0-answers with BOTH NS and SOA in authority
+                                            // (RFC 2308 §2.2.1 type-1 NODATA -> authoritative, stops)
+    bool shouldReturnLameNxdomain{false};   // NXDOMAIN with RA=0 AND AA=0 (lame / non-recursive) —
+                                            // not trustworthy absence, resolver must rotate (M-2)
+    bool cnameOnlyTruncated{false};         // set TC=1 on the cnameOnly response (M-A: a truncated
+                                            // CNAME-only+SOA must rotate, never be authoritative)
+    bool shouldReturnNodataSoaInAdditional{false}; // NOERROR/0-answers, SOA in the ADDITIONAL section
+                                            // only (RFC 2308 §3 violation) -> must NOT negatively
+                                            // cache nor be authoritative (L-1)
+    std::string answerAddrWithGlue;      // if non-empty: NOERROR answer = A(qname -> this addr),
+                                         // authority NS, and ADDITIONAL glue A(glueOwner -> glueAddr)
+                                         // — models a server that returns nameserver glue (F-1).
+    std::string glueOwner;               // owner name of the additional-section glue A record
+    std::string glueAddr;                // IPv4 of the additional-section glue A record
     std::string errorMessage;            // Custom error message
   };
 
@@ -774,6 +801,85 @@ private:
         return generateNodataResponse(queryId, questionName, queryType, /*includeSoa=*/false);
       }
 
+      // REFERRAL (RFC 2308 §2.2.1): NOERROR, 0 answers, an NS record in authority, no SOA. The
+      // resolver's failover gate must treat this as SERVER-LOCAL (rotate to follow the referral),
+      // distinct from a type-3 NODATA (empty authority) which is authoritative (tracker 2026-09-30-4 H-1).
+      if (queryConfig.shouldReturnReferral)
+      {
+        return generateReferralResponse(queryId, questionName, queryType);
+      }
+
+      // TRUNCATED (TC=1) empty NOERROR — never authoritative, never cached (RFC 2181 §9 / F-3).
+      if (queryConfig.shouldReturnTruncatedEmpty)
+      {
+        auto r = generateNegativeResponse(queryId, questionName, queryType, 0x80, /*includeSoa=*/false);
+        r[2] |= 0x02; // set TC in flags byte 3 (QR|RD already set)
+        return r;
+      }
+
+      // LAME / non-recursive empty NOERROR: no SOA, no NS, RA=0 AND AA=0 — not trustworthy evidence
+      // of absence, so the resolver must rotate (tracker 2026-09-30-4 F-4).
+      if (queryConfig.shouldReturnLameEmpty)
+      {
+        auto r = generateNegativeResponse(queryId, questionName, queryType, 0x00 /*rcode 0, RA=0*/,
+                                          /*includeSoa=*/false);
+        return r;
+      }
+
+      // CNAME-only NODATA (RFC 2308 §2.2): one CNAME in the answer, no RR of the queried type, plus
+      // an authoritative SOA — a positive-looking response the resolver must classify as NODATA
+      // (tracker 2026-09-30-4 F-7).
+      if (!queryConfig.cnameOnlyTarget.empty())
+      {
+        auto r = generateCnameOnlyResponse(queryId, questionName, queryType,
+                                           queryConfig.cnameOnlyTarget,
+                                           queryConfig.cnameOnlyIncludeSoa);
+        if (queryConfig.cnameOnlyTruncated)
+        {
+          r[2] |= 0x02; // set TC (M-A)
+        }
+        return r;
+      }
+
+      // NOERROR/0-answers with an SOA in the ADDITIONAL section only (never authority) — an RFC 2308
+      // §3 violation the resolver must NOT treat as negative-cache evidence (L-1).
+      if (queryConfig.shouldReturnNodataSoaInAdditional)
+      {
+        std::vector<std::uint8_t> r;
+        appendHeaderAndQuestion(r, queryId, questionName, queryType, /*an=*/0, /*ns=*/0);
+        r[11] = 1; // ARCOUNT=1
+        appendSoaAuthority(r, questionName); // same SOA RR bytes, but counted in ADDITIONAL
+        return r;
+      }
+
+      // CNAME chased to an A in the SAME answer -> a real positive answer (F-7 control).
+      if (!queryConfig.cnameThenATarget.empty())
+      {
+        return generateCnameThenAResponse(queryId, questionName, queryConfig.cnameThenATarget,
+                                          queryConfig.cnameThenAAddr);
+      }
+
+      // RFC 2308 §2.2.1 type-1 NODATA: NOERROR/0-answers with NS AND SOA in authority -> authoritative.
+      if (queryConfig.shouldReturnNodataNsAndSoa)
+      {
+        return generateNodataNsAndSoaResponse(queryId, questionName, queryType);
+      }
+
+      // Lame NXDOMAIN: rcode 3 with RA=0 AND AA=0 -> not trustworthy absence, resolver rotates (M-2).
+      if (queryConfig.shouldReturnLameNxdomain)
+      {
+        return generateNegativeResponse(queryId, questionName, queryType, 0x03 /*NXDOMAIN, RA=0*/,
+                                        /*includeSoa=*/false);
+      }
+
+      // Answer A + authority NS + ADDITIONAL glue A (a different owner) — the resolver must return
+      // ONLY the answer address, never the glue (RFC 2181 §5.4.1 / tracker 2026-09-30-4 F-1).
+      if (!queryConfig.answerAddrWithGlue.empty())
+      {
+        return generateAnswerWithGlueResponse(queryId, questionName, queryConfig.answerAddrWithGlue,
+                                              queryConfig.glueOwner, queryConfig.glueAddr);
+      }
+
       // Apply delay only for successful responses
       if (queryConfig.delay.count() > 0)
       {
@@ -947,6 +1053,283 @@ private:
   {
     // SERVFAIL: 0x82 = RA | rcode 2, no authority section (RFC 1035 §4.1.1).
     return generateNegativeResponse(queryId, questionName, queryType, 0x82, /*includeSoa=*/false);
+  }
+
+  /// \brief REFERRAL: NOERROR, 0 answers, ONE NS record in the authority section, NO SOA
+  ///        (RFC 2308 §2.2.1). Distinct from a type-3 NODATA (empty authority): the resolver
+  ///        must treat a referral as server-local and rotate (tracker 2026-09-30-4 H-1).
+  std::vector<std::uint8_t> generateReferralResponse(std::uint16_t queryId,
+                                                     const std::string &questionName,
+                                                     std::uint16_t queryType = 1)
+  {
+    std::vector<std::uint8_t> response;
+    response.resize(12);
+    response[0] = static_cast<std::uint8_t>(queryId >> 8);
+    response[1] = static_cast<std::uint8_t>(queryId & 0xFF);
+    response[2] = 0x81; // QR=1, RD=1
+    response[3] = 0x80; // RA, rcode 0 (NOERROR)
+
+    // QDCOUNT=1, ANCOUNT=0, NSCOUNT=1 (the NS referral), ARCOUNT=0
+    response[4] = 0;
+    response[5] = 1;
+    response[6] = 0;
+    response[7] = 0;
+    response[8] = 0;
+    response[9] = 1;
+    response[10] = 0;
+    response[11] = 0;
+
+    // Question echo
+    encodeQuestionName(response, questionName);
+    response.push_back((queryType >> 8) & 0xFF);
+    response.push_back(queryType & 0xFF);
+    response.push_back(0);
+    response.push_back(1); // CLASS IN
+
+    // Authority NS record: NAME + TYPE(NS=2) + CLASS(IN=1) + TTL + RDLENGTH + RDATA(ns name).
+    encodeQuestionName(response, questionName);
+    response.push_back(0x00);
+    response.push_back(0x02); // TYPE NS
+    response.push_back(0x00);
+    response.push_back(0x01); // CLASS IN
+    response.push_back(0x00);
+    response.push_back(0x00);
+    response.push_back(0x0E);
+    response.push_back(0x10); // TTL 3600
+    std::size_t rdlengthPos = response.size();
+    response.push_back(0x00);
+    response.push_back(0x00); // RDLENGTH placeholder
+    std::size_t rdataStart = response.size();
+    encodeQuestionName(response, "ns1." + questionName); // NSDNAME
+    std::size_t rdataLength = response.size() - rdataStart;
+    response[rdlengthPos] = (rdataLength >> 8) & 0xFF;
+    response[rdlengthPos + 1] = rdataLength & 0xFF;
+
+    return response;
+  }
+
+  /// \brief CNAME-only NODATA (RFC 2308 §2.2): NOERROR, one CNAME answer to \p target, no RR of the
+  ///        queried type, plus an authoritative SOA. isSuccess() is true (ANCOUNT>0) but the queried
+  ///        type is absent — the resolver must classify this as NODATA (tracker 2026-09-30-4 F-7).
+  // ---- shared wire-append helpers for the negative/edge builders (F-1/F-7/M-1 tests) ----
+
+  /// \brief Append a domain-name RR (NAME + TYPE + IN + TTL 3600 + RDLENGTH-wrapped name rdata).
+  void appendNameRr(std::vector<std::uint8_t> &r, const std::string &owner, std::uint8_t typeLo,
+                    const std::string &rdataName)
+  {
+    encodeQuestionName(r, owner);
+    r.push_back(0x00);
+    r.push_back(typeLo);
+    r.push_back(0x00);
+    r.push_back(0x01); // CLASS IN
+    r.push_back(0x00);
+    r.push_back(0x00);
+    r.push_back(0x0E);
+    r.push_back(0x10); // TTL 3600
+    std::size_t rdlenPos = r.size();
+    r.push_back(0x00);
+    r.push_back(0x00);
+    std::size_t rdataStart = r.size();
+    encodeQuestionName(r, rdataName);
+    std::size_t rdlen = r.size() - rdataStart;
+    r[rdlenPos] = (rdlen >> 8) & 0xFF;
+    r[rdlenPos + 1] = rdlen & 0xFF;
+  }
+  void appendNsRr(std::vector<std::uint8_t> &r, const std::string &owner)
+  {
+    appendNameRr(r, owner, 0x02 /*NS*/, "ns1." + owner);
+  }
+  void appendCnameRr(std::vector<std::uint8_t> &r, const std::string &owner, const std::string &target)
+  {
+    appendNameRr(r, owner, 0x05 /*CNAME*/, target);
+  }
+  void appendSoaAuthority(std::vector<std::uint8_t> &r, const std::string &name)
+  {
+    DnsRecord soaRecord;
+    soaRecord.type = "SOA";
+    soaRecord.name = name;
+    soaRecord.mname = "ns1.example.com";
+    soaRecord.rname = "admin.example.com";
+    soaRecord.minimum = 300;
+    auto soaData = generateSoaResponse(name, soaRecord);
+    r.insert(r.end(), soaData.begin() + 12, soaData.end()); // skip the 12-byte header
+  }
+  /// \brief Fill the 12-byte header + echo the question. Returns nothing; counts passed in.
+  void appendHeaderAndQuestion(std::vector<std::uint8_t> &r, std::uint16_t queryId,
+                               const std::string &questionName, std::uint16_t queryType,
+                               std::uint16_t an, std::uint16_t ns)
+  {
+    r.resize(12);
+    r[0] = static_cast<std::uint8_t>(queryId >> 8);
+    r[1] = static_cast<std::uint8_t>(queryId & 0xFF);
+    r[2] = 0x81; // QR=1, RD=1
+    r[3] = 0x80; // RA, NOERROR
+    r[4] = 0;
+    r[5] = 1; // QDCOUNT=1
+    r[6] = (an >> 8) & 0xFF;
+    r[7] = an & 0xFF;
+    r[8] = (ns >> 8) & 0xFF;
+    r[9] = ns & 0xFF;
+    r[10] = 0;
+    r[11] = 0;
+    encodeQuestionName(r, questionName);
+    r.push_back((queryType >> 8) & 0xFF);
+    r.push_back(queryType & 0xFF);
+    r.push_back(0);
+    r.push_back(1); // CLASS IN
+  }
+
+  std::vector<std::uint8_t> generateCnameOnlyResponse(std::uint16_t queryId,
+                                                      const std::string &questionName,
+                                                      std::uint16_t queryType,
+                                                      const std::string &target, bool includeSoa)
+  {
+    std::vector<std::uint8_t> response;
+    appendHeaderAndQuestion(response, queryId, questionName, queryType, /*an=*/1,
+                            /*ns=*/includeSoa ? 1 : 0);
+    appendCnameRr(response, questionName, target);
+    if (includeSoa)
+    {
+      // SOA -> authoritative CNAME-chain NODATA + RFC 2308 §5 negative TTL. Without it, the CNAME
+      // target was not resolved (empty authority) -> the resolver must rotate (M-1).
+      appendSoaAuthority(response, questionName);
+    }
+    return response;
+  }
+
+  /// \brief NOERROR: CNAME(questionName->target) AND A(target->addr) in the SAME answer — a chased
+  ///        CNAME that IS a positive answer (F-7 control: must still resolve).
+  std::vector<std::uint8_t> generateCnameThenAResponse(std::uint16_t queryId,
+                                                       const std::string &questionName,
+                                                       const std::string &target,
+                                                       const std::string &addr)
+  {
+    std::vector<std::uint8_t> response;
+    appendHeaderAndQuestion(response, queryId, questionName, /*A*/ 1, /*an=*/2, /*ns=*/0);
+    appendCnameRr(response, questionName, target);
+    appendARecordRr(response, target, addr);
+    return response;
+  }
+
+  /// \brief RFC 2308 §2.2.1 type-1 NODATA: NOERROR/0-answers with BOTH NS and SOA in authority —
+  ///        authoritative (the SOA is the deciding marker), so the resolver must NOT rotate.
+  std::vector<std::uint8_t> generateNodataNsAndSoaResponse(std::uint16_t queryId,
+                                                           const std::string &questionName,
+                                                           std::uint16_t queryType)
+  {
+    std::vector<std::uint8_t> response;
+    appendHeaderAndQuestion(response, queryId, questionName, queryType, /*an=*/0, /*ns=*/2);
+    appendNsRr(response, questionName);
+    appendSoaAuthority(response, questionName);
+    return response;
+  }
+
+  /// \brief Append an A-record RR (NAME + A/IN + TTL + 4-byte rdata) to \p response.
+  static void appendARecordRr(std::vector<std::uint8_t> &response, const std::string &owner,
+                              const std::string &ipv4)
+  {
+    // NAME
+    {
+      std::istringstream iss(owner);
+      std::string label;
+      while (std::getline(iss, label, '.'))
+      {
+        if (label.empty())
+        {
+          continue;
+        }
+        response.push_back(static_cast<std::uint8_t>(label.size()));
+        response.insert(response.end(), label.begin(), label.end());
+      }
+      response.push_back(0);
+    }
+    response.push_back(0x00);
+    response.push_back(0x01); // TYPE A
+    response.push_back(0x00);
+    response.push_back(0x01); // CLASS IN
+    response.push_back(0x00);
+    response.push_back(0x00);
+    response.push_back(0x0E);
+    response.push_back(0x10); // TTL 3600
+    response.push_back(0x00);
+    response.push_back(0x04); // RDLENGTH 4
+    // RDATA: 4 octets of the dotted-quad
+    std::istringstream iss(ipv4);
+    std::string octet;
+    int n = 0;
+    while (std::getline(iss, octet, '.') && n < 4)
+    {
+      response.push_back(static_cast<std::uint8_t>(std::stoi(octet)));
+      ++n;
+    }
+    while (n++ < 4)
+    {
+      response.push_back(0);
+    }
+  }
+
+  /// \brief NOERROR: answer A(questionName->answerIp), authority NS, additional glue A(glueOwner->
+  ///        glueIp). Models a recursive server that returns nameserver glue in the additional
+  ///        section — which must NEVER be returned as the queried host's address (RFC 2181 §5.4.1 /
+  ///        tracker 2026-09-30-4 F-1).
+  std::vector<std::uint8_t> generateAnswerWithGlueResponse(std::uint16_t queryId,
+                                                           const std::string &questionName,
+                                                           const std::string &answerIp,
+                                                           const std::string &glueOwner,
+                                                           const std::string &glueIp)
+  {
+    const bool hasGlue = !glueOwner.empty() && !glueIp.empty();
+    std::vector<std::uint8_t> response;
+    response.resize(12);
+    response[0] = static_cast<std::uint8_t>(queryId >> 8);
+    response[1] = static_cast<std::uint8_t>(queryId & 0xFF);
+    response[2] = 0x81; // QR=1, RD=1
+    response[3] = 0x80; // RA, NOERROR
+    response[4] = 0;
+    response[5] = 1; // QDCOUNT=1
+    response[6] = 0;
+    response[7] = 1; // ANCOUNT=1 (the answer A)
+    response[8] = 0;
+    response[9] = 1; // NSCOUNT=1 (authority NS)
+    response[10] = 0;
+    response[11] = hasGlue ? 1 : 0; // ARCOUNT (glue A)
+
+    // Question echo
+    encodeQuestionName(response, questionName);
+    response.push_back((1 >> 8) & 0xFF);
+    response.push_back(1 & 0xFF); // QTYPE A
+    response.push_back(0);
+    response.push_back(1); // CLASS IN
+
+    // Answer: the real A record for the queried name.
+    appendARecordRr(response, questionName, answerIp);
+
+    // Authority: an NS record (owner=questionName -> ns1.questionName).
+    encodeQuestionName(response, questionName);
+    response.push_back(0x00);
+    response.push_back(0x02); // TYPE NS
+    response.push_back(0x00);
+    response.push_back(0x01); // CLASS IN
+    response.push_back(0x00);
+    response.push_back(0x00);
+    response.push_back(0x0E);
+    response.push_back(0x10); // TTL
+    std::size_t nsRdlenPos = response.size();
+    response.push_back(0x00);
+    response.push_back(0x00);
+    std::size_t nsRdataStart = response.size();
+    encodeQuestionName(response, "ns1." + questionName);
+    std::size_t nsRdlen = response.size() - nsRdataStart;
+    response[nsRdlenPos] = (nsRdlen >> 8) & 0xFF;
+    response[nsRdlenPos + 1] = nsRdlen & 0xFF;
+
+    // Additional: glue A for a DIFFERENT owner (the nameserver) — must not become the answer.
+    if (hasGlue)
+    {
+      appendARecordRr(response, glueOwner, glueIp);
+    }
+
+    return response;
   }
 
   void encodeQuestionName(std::vector<std::uint8_t> &buffer, const std::string &name)

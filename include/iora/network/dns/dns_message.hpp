@@ -138,10 +138,27 @@ private:
                                          std::size_t size, DnsResourceRecord &rr,
                                          std::size_t &rdataOffset);
 
-  /// \brief Parse specific record types from resource record data
+  /// \brief Which message section a resource record came from (tracker 2026-09-30-4 F-1/L-1).
+  enum class RrSection
+  {
+    Answer,     ///< full typed parsing into a_records/srv_records/... (the queried host's data).
+    Authority,  ///< ONLY an SOA is promoted (RFC 2308 §3/§5 negative-cache TTL source); NS etc. raw.
+    Additional  ///< NOTHING is promoted — glue A/AAAA and the like are advisory only (RFC 2181 §5.4.1).
+  };
+
+  /// \brief Parse specific record types from resource record data into the typed vectors.
+  /// \param section the section \p rr came from. The ANSWER section promotes all address/service RRs
+  ///        into the answer-typed vectors; AUTHORITY promotes only an SOA; ADDITIONAL promotes
+  ///        nothing. This stops authority NS / additional glue from being returned as the queried
+  ///        host's answers (RFC 2181 §5.4.1 — F-1) and stops an ADDITIONAL-section SOA from feeding
+  ///        the negative cache (RFC 2308 §3 — L-1). NOTE: an ANSWER-section SOA is still promoted
+  ///        into soa_records (e.g. a direct SOA query), so a nonstandard negative that puts its SOA
+  ///        in the ANSWER section would still count — a stricter answer-SOA gate is a tracked
+  ///        follow-up (2026-09-30-4 round-3 L-7/LOW-2). The raw records remain in
+  ///        result.authority / result.additional for callers that need them (e.g. authorityHasNs).
   static void parseTypedRecord(const DnsResourceRecord &rr, DnsResult &result,
                                const std::uint8_t *messageData, std::size_t messageSize,
-                               std::size_t rdataOffset);
+                               std::size_t rdataOffset, RrSection section = RrSection::Answer);
 
   /// \brief Parse A record data
   static ARecord parseARecord(const DnsResourceRecord &rr);
@@ -422,8 +439,9 @@ inline DnsResult DnsMessage::parse(const std::uint8_t *data, std::size_t size)
     std::size_t rdataOffset;
     offset = parseResourceRecord(data, offset, size, rr, rdataOffset);
     result.authority.push_back(rr);
-    // Parse authority records into typed records (essential for SOA negative caching per RFC 2308)
-    parseTypedRecord(rr, result, data, size, rdataOffset);
+    // Authority section: promote ONLY an SOA (RFC 2308 §3/§5 negative-cache TTL). NS/other authority
+    // records stay raw in result.authority; they are never answers (RFC 2181 §5.4.1 / F-1/L-1).
+    parseTypedRecord(rr, result, data, size, rdataOffset, RrSection::Authority);
   }
 
   // Parse additional records
@@ -435,8 +453,10 @@ inline DnsResult DnsMessage::parse(const std::uint8_t *data, std::size_t size)
     std::size_t rdataOffset;
     offset = parseResourceRecord(data, offset, size, rr, rdataOffset);
     result.additional.push_back(rr);
-    // Parse additional records into typed records as they often contain useful data
-    parseTypedRecord(rr, result, data, size, rdataOffset);
+    // Additional section: glue A/AAAA and the like are advisory only and must NEVER be returned as
+    // the queried host's addresses, nor an SOA here used for negative caching (RFC 2181 §5.4.1 /
+    // RFC 2308 §3 / tracker 2026-09-30-4 F-1/L-1). Keep them raw in result.additional; promote none.
+    parseTypedRecord(rr, result, data, size, rdataOffset, RrSection::Additional);
   }
 
   return result;
@@ -774,10 +794,22 @@ inline std::size_t DnsMessage::decodeNameFromRdata(const std::uint8_t *messageDa
 
 inline void DnsMessage::parseTypedRecord(const DnsResourceRecord &rr, DnsResult &result,
                                          const std::uint8_t *messageData, std::size_t messageSize,
-                                         std::size_t rdataOffset)
+                                         std::size_t rdataOffset, RrSection section)
 {
   try
   {
+    // ANSWER promotes everything; AUTHORITY promotes ONLY an SOA (RFC 2308 §3 negative-cache TTL);
+    // ADDITIONAL promotes nothing. Authority NS and additional glue A/AAAA/SRV stay in the raw
+    // authority/additional vectors and must NEVER become an answer (RFC 2181 §5.4.1 — tracker
+    // 2026-09-30-4 F-1/L-1). Consumers that need the raw records read result.authority/additional.
+    if (section == RrSection::Additional)
+    {
+      return;
+    }
+    if (section == RrSection::Authority && rr.type != DnsType::SOA)
+    {
+      return;
+    }
     switch (rr.type)
     {
     case DnsType::A:
@@ -816,7 +848,8 @@ inline void DnsMessage::parseTypedRecord(const DnsResourceRecord &rr, DnsResult 
   {
     // Log parsing error but don't fail entire message
     iora::core::Logger::warning("DNS record parsing error for " + rr.name + " type=" +
-                                std::to_string(static_cast<uint16_t>(rr.type)) + ": " + e.what());
+                                std::to_string(static_cast<std::uint16_t>(rr.type)) + ": " +
+                                e.what());
   }
 }
 
@@ -862,7 +895,9 @@ inline AAAARecord DnsMessage::parseAAAARecord(const DnsResourceRecord &rr)
     for (int i = 0; i < 8; ++i)
     {
       if (i > 0)
+      {
         oss << ":";
+      }
       std::uint16_t segment = (rr.rdata[i * 2] << 8) | rr.rdata[i * 2 + 1];
       oss << std::hex << std::setw(4) << std::setfill('0') << segment;
     }

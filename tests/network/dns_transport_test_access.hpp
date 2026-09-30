@@ -161,18 +161,35 @@ struct DnsTransportTestAccess
   static void registerPending(T &t, std::uint16_t id, const std::string &server,
                               std::uint16_t port, T::QueryCallback cb = {}, int retryCount = 0,
                               std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
-                              std::chrono::milliseconds startTimeOffset = std::chrono::milliseconds(0))
+                              std::chrono::milliseconds startTimeOffset = std::chrono::milliseconds(0),
+                              DnsTransportMode mode = DnsTransportMode::UDP)
   {
     auto q = std::make_shared<T::PendingQuery>(id, timeout, server, port,
                                                std::vector<std::uint8_t>{});
     q->callback = std::move(cb);
     q->retryCount.store(retryCount);
+    // Pin the transport mode as production does (queryMultiple/queryAsync set query->transportMode
+    // from the config). White-box tests of the truncation handler MUST set this to Both, or the
+    // handler's pinned-mode read (tracker 2026-09-30-4 L-3) sees the UDP default (2026-09-30-4 M-B).
+    q->transportMode = mode;
     if (startTimeOffset.count() != 0)
     {
       q->startTime.store(std::chrono::steady_clock::now() - startTimeOffset);
     }
     std::lock_guard<std::mutex> l(t._queriesMutex);
     t._pendingQueries.emplace(T::QueryKey(id, server, port), q);
+  }
+  /// Set the tcpFallback flag on a registered query (2026-09-30-4 M-3a test): models a TCP fallback
+  /// already in flight, so a subsequently-fed truncated UDP datagram must be dropped, not completed.
+  static void setTcpFallback(T &t, std::uint16_t id, const std::string &server, std::uint16_t port,
+                             bool v)
+  {
+    std::lock_guard<std::mutex> l(t._queriesMutex);
+    auto it = t._pendingQueries.find(T::QueryKey(id, server, port));
+    if (it != t._pendingQueries.end())
+    {
+      it->second->tcpFallback = v;
+    }
   }
   static bool hasPending(T &t, std::uint16_t id, const std::string &server, std::uint16_t port)
   {
