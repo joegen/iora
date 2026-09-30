@@ -16,9 +16,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -289,13 +291,28 @@ public:
   ///        services incl. HTTPS are discarded; A/AAAA fallback defaults to TLS/5061).
   ///        NOT generic transport security. Defaulted false; the SIP layer drives it true
   ///        for a sips: URI.
+  /// \param deadlineOverride Optional per-call resolution deadline (F-2): nullopt = use
+  ///        DnsConfig::maxResolutionTime; a value overrides it (0ms disables for this call). NOTE
+  ///        (cpp17 M-7 / sip-voip MEDIUM-1): this bounds THIS one call. A consumer that drives the
+  ///        RFC 3263 chain one record at a time (resolveHostname/query per step) gets the bound PER
+  ///        STEP, not across the whole chain — size the budget from asyncAttemptBudget() accordingly.
+  /// \note The same trailing `deadlineOverride` (same semantics) is available on every
+  ///       resolution forwarder: query / queryAsync / resolveHostname / resolveSRV / resolveNAPTR /
+  ///       resolveCustomServiceDomain(Async) / resolveServiceDomainAsync.
   dns::ServiceResolutionResult
   resolveServiceDomain(const std::string &domain,
                        const std::vector<dns::ServiceType> &preferredTransports = {},
-                       bool secure = false)
+                       bool secure = false,
+                       std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
-    return _resolver->resolveServiceDomain(domain, preferredTransports, secure);
+    return _resolver->resolveServiceDomain(domain, preferredTransports, secure, deadlineOverride);
   }
+
+  /// \brief Worst-case wall-clock of the one async issue the per-resolution deadline gate cannot
+  ///        abort in flight (F-2). A consumer sizes its deadline D from this so the async overhang
+  ///        (worst case = D + this value) fits under SIP Timer B/F. Passthrough to
+  ///        dns::DnsResolver::asyncAttemptBudget().
+  std::chrono::milliseconds asyncAttemptBudget() const { return _resolver->asyncAttemptBudget(); }
 
   /// \brief Seed the resolver's RNG for deterministic RFC 2782 weighted SRV ordering.
   ///
@@ -317,10 +334,12 @@ public:
   dns::ServiceResolutionResult resolveCustomServiceDomain(
     const std::string &domain,
     const std::vector<std::pair<std::string, dns::ServiceType>> &srvQueries,
-    const std::vector<dns::ServiceType> &preferredTransports = {}, bool secure = false)
+    const std::vector<dns::ServiceType> &preferredTransports = {}, bool secure = false,
+    std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
     return _resolver->performDirectSrvResolution(domain, preferredTransports,
-                                                 std::make_optional(srvQueries), secure);
+                                                 std::make_optional(srvQueries), secure,
+                                                 deadlineOverride);
   }
 
   /// \brief Resolve service domain asynchronously
@@ -331,9 +350,12 @@ public:
   void resolveServiceDomainAsync(const std::string &domain,
                                  dns::DnsResolver::ServiceResolutionCallback callback,
                                  const std::vector<dns::ServiceType> &preferredTransports = {},
-                                 bool secure = false)
+                                 bool secure = false,
+                                 std::optional<std::chrono::milliseconds> deadlineOverride =
+                                   std::nullopt)
   {
-    _resolver->resolveServiceDomainAsync(domain, callback, preferredTransports, secure);
+    _resolver->resolveServiceDomainAsync(domain, callback, preferredTransports, secure,
+                                         deadlineOverride);
   }
 
   /// \brief Resolve custom service domain asynchronously
@@ -347,10 +369,12 @@ public:
     const std::string &domain,
     const std::vector<std::pair<std::string, dns::ServiceType>> &srvQueries,
     dns::DnsResolver::ServiceResolutionCallback callback,
-    const std::vector<dns::ServiceType> &preferredTransports = {}, bool secure = false)
+    const std::vector<dns::ServiceType> &preferredTransports = {}, bool secure = false,
+    std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
     _resolver->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
-                                               std::make_optional(srvQueries), secure);
+                                               std::make_optional(srvQueries), secure,
+                                               deadlineOverride);
   }
 
   /// \brief Resolve service domain and return future
@@ -432,15 +456,20 @@ public:
   /// \param question DNS question to resolve
   /// \return DNS query result
   /// \throws dns::DnsResolverException on query failure
-  dns::DnsResult query(const dns::DnsQuestion &question) { return _resolver->query(question); }
+  dns::DnsResult query(const dns::DnsQuestion &question,
+                       std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
+  {
+    return _resolver->query(question, deadlineOverride);
+  }
 
   /// \brief Perform DNS query asynchronously
   /// \param question DNS question to resolve
   /// \param callback Callback function for result notification
   void queryAsync(const dns::DnsQuestion &question,
-                  std::function<void(const dns::DnsResult &, const std::exception_ptr &)> callback)
+                  std::function<void(const dns::DnsResult &, const std::exception_ptr &)> callback,
+                  std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
-    _resolver->queryAsync(question, callback);
+    _resolver->queryAsync(question, callback, deadlineOverride);
   }
 
   /// \brief Resolve A records synchronously (IPv4 addresses)
@@ -548,18 +577,23 @@ public:
   /// \param prefer_ipv6 Prefer IPv6 addresses if available
   /// \return Vector of IP address strings
   /// \throws dns::DnsResolverException on resolution failure
-  std::vector<std::string> resolveHostname(const std::string &hostname, bool prefer_ipv6 = false)
+  std::vector<std::string>
+  resolveHostname(const std::string &hostname, bool prefer_ipv6 = false,
+                  std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
-    return _resolver->resolveHostname(hostname, prefer_ipv6);
+    return _resolver->resolveHostname(hostname, prefer_ipv6, deadlineOverride);
   }
 
   /// \brief Resolve SRV records
   /// \param service Service name (e.g., "_sip._tcp.example.com")
   /// \return Vector of SRV records
   /// \throws dns::DnsResolverException on resolution failure
-  std::vector<dns::SrvRecord> resolveSRV(const std::string &service)
+  std::vector<dns::SrvRecord>
+  resolveSRV(const std::string &service,
+             std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
-    dns::DnsResult result = query(dns::DnsQuestion(service, dns::DnsType::SRV, dns::DnsClass::IN));
+    dns::DnsResult result =
+      query(dns::DnsQuestion(service, dns::DnsType::SRV, dns::DnsClass::IN), deadlineOverride);
 
     if (result.srv_records.empty())
     {
@@ -573,9 +607,12 @@ public:
   /// \param domain Domain name to query
   /// \return Vector of NAPTR records
   /// \throws dns::DnsResolverException on resolution failure
-  std::vector<dns::NaptrRecord> resolveNAPTR(const std::string &domain)
+  std::vector<dns::NaptrRecord>
+  resolveNAPTR(const std::string &domain,
+               std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
-    dns::DnsResult result = query(dns::DnsQuestion(domain, dns::DnsType::NAPTR, dns::DnsClass::IN));
+    dns::DnsResult result =
+      query(dns::DnsQuestion(domain, dns::DnsType::NAPTR, dns::DnsClass::IN), deadlineOverride);
 
     if (result.naptr_records.empty())
     {

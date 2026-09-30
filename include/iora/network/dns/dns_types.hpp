@@ -660,6 +660,32 @@ struct DnsConfig
   /// Note: SRV records always take precedence over this policy
   AddressResolutionPolicy addressResolutionPolicy{AddressResolutionPolicy::IPv4First};
 
+  // =============================================================================
+  // Resolution Deadline Configuration (tracker 2026-09-30-3, F-2)
+  // =============================================================================
+
+  /// \brief Maximum total wall-clock time for one RFC 3263 resolution
+  ///        (NAPTR→SRV→A/AAAA chain), bounding it under the SIP transaction
+  ///        ceiling (Timer B/F = 64*T1 = 32s, RFC 3261 §17.1.1.2/§17.1.2.2).
+  /// Default: 0 (DISABLED) — byte-for-byte today's behavior (no deadline gate).
+  /// When > 0, an absolute steady_clock deadline is computed ONCE at the public
+  /// entry and threaded down the chain: SYNC is hard-bounded (each internal step
+  /// re-checks the deadline and caps the in-flight transport wait via maxWait);
+  /// ASYNC is soft-bounded (it stops issuing further servers/families past the
+  /// deadline but does not abort the one in-flight query — worst-case async
+  /// overhang = deadline + <= one DnsTransport::asyncAttemptBudget()).
+  /// On expiry the outcome is ALWAYS TransientFailure, never PermanentNoService.
+  /// A per-call std::optional<milliseconds> override on the public entries takes
+  /// precedence over this config value (nullopt = use config; an explicit 0ms
+  /// disables the deadline for that one call).
+  /// The SIP adapter (iora_sip 2026-09-25-2) opts in with a value sized from
+  /// DnsResolver::asyncAttemptBudget() and its transaction budget.
+  /// NOTE (L-7): the resolver reads this from the TRANSPORT's live config snapshot
+  /// (DnsTransport::getConfig(), honored across updateConfig()), same source as the server list —
+  /// NOT from the DnsConfig passed to the DnsResolver ctor. Configure it on the transport's config
+  /// (DnsClient passes one config to both, so they agree).
+  std::chrono::milliseconds maxResolutionTime{0};
+
   /// \brief Default constructor - uses system DNS servers with fallback
   DnsConfig()
   {

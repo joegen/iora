@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
@@ -128,10 +129,17 @@ public:
   /// \param question DNS question to resolve
   /// \param server DNS server address (empty = use configured servers)
   /// \param port DNS server port (0 = use configured port)
+  /// \param maxWait Optional per-call hard cap on the in-flight sync wait (tracker
+  ///        2026-09-30-3, F-2). 0 (default) = use the full config-derived budget
+  ///        (calculateMaxSyncWaitTime) = today's behavior. When > 0, the effective wait is
+  ///        min(full budget, maxWait) — the DnsResolver passes the remaining time until its
+  ///        per-resolution deadline so a blackholed server cannot exceed it. Non-virtual, so
+  ///        the queryAsync-only test doubles are untouched.
   /// \return DNS query result
   /// \throws DnsTransportException, DnsTimeoutException, DnsServerException
   DnsResult query(const DnsQuestion &question, const std::string &server = "",
-                  std::uint16_t port = 0);
+                  std::uint16_t port = 0,
+                  std::chrono::milliseconds maxWait = std::chrono::milliseconds::zero());
 
   /// \brief Send asynchronous DNS query
   /// \param question DNS question to resolve
@@ -151,9 +159,13 @@ public:
   /// \param questions DNS questions to resolve
   /// \param server DNS server address (empty = use configured servers)
   /// \param port DNS server port (0 = use configured port)
+  /// \param maxWait Optional per-call hard cap on the in-flight sync wait (tracker
+  ///        2026-09-30-3, F-2). 0 (default) = full config-derived budget; > 0 =
+  ///        min(full budget, maxWait). See query() above.
   /// \return DNS query result
   DnsResult queryMultiple(const std::vector<DnsQuestion> &questions, const std::string &server = "",
-                          std::uint16_t port = 0);
+                          std::uint16_t port = 0,
+                          std::chrono::milliseconds maxWait = std::chrono::milliseconds::zero());
 
   /// \brief Update configuration
   void updateConfig(const DnsConfig &config);
@@ -181,6 +193,33 @@ public:
 
   Statistics getStatistics() const;
   void resetStatistics();
+
+  /// \brief Worst-case wall-clock budget of ONE async issue that the resolver's async deadline
+  ///        gate cannot abort in flight (tracker 2026-09-30-3, F-2).
+  ///
+  /// The async failover gate stops issuing further servers/families once the per-resolution
+  /// deadline passes, but it does NOT cancel the one query already on the wire; so the async
+  /// worst-case wall-clock = deadline + <= this value. Returned as a conservative UPPER BOUND
+  /// (the async retransmit path may schedule slightly less; over-estimation is the safe
+  /// direction for a consumer sizing its deadline). The UDP retransmit portion is the sync
+  /// budget MINUS the sync-only safety margin (kSyncSafetyMargin) — computed via the shared
+  /// backoffDelayForAttempt helper, never a re-derived formula (round-2 cpp17 MEDIUM-A drift
+  /// guard). In BOTH mode it ALSO adds `timeout + _cleanupInterval` for the TC=1 -> TCP fallback leg:
+  /// sendTcpQuery arms a FRESH query->timeout timer from the moment TC=1 arrives (which a slow server
+  /// can defer to ~the whole UDP budget), and the orphan sweep only reaps after that fresh timer
+  /// fires plus up to one sweep interval (cpp17 round-3 H-1). Omitting it would make the "upper
+  /// bound" a lie in the DEFAULT Both mode (sip-voip HIGH-2). TCP-only mode adds nothing (its own
+  /// timer is already counted). The SIP adapter (iora_sip 2026-09-25-2) sizes its deadline D from
+  /// this: e.g. D_safe <= Timer_B/F - asyncAttemptBudget() - margin. NOTE: at the DEFAULT config this
+  /// exceeds Timer B (64*T1=32s), so no D fits — reduce DnsConfig.timeout/retryCount (see
+  /// docs/network/dns_client.md).
+  std::chrono::milliseconds asyncAttemptBudget(const DnsConfig &cfg) const;
+
+  /// \brief The pure UDP-retransmit worst case (asyncAttemptBudget minus any TCP-fallback leg) =
+  ///        one server's BLACKHOLE cost. The resolver compares a deadline against THIS (not
+  ///        asyncAttemptBudget) to decide whether a small deadline defeats next-server failover (a
+  ///        blackholed server never sends TC=1 — sip-voip MEDIUM-1).
+  std::chrono::milliseconds udpAttemptBudget(const DnsConfig &cfg) const;
 
 private:
   // Shared white-box test seam: the DnsTransport regression tests drive the private
@@ -450,6 +489,12 @@ private:
   /// \brief Prepare query data
   std::vector<std::uint8_t> prepareQuery(const std::vector<DnsQuestion> &questions,
                                          std::uint16_t queryId);
+
+  /// \brief Safety margin added to the SYNC wait budget only (processing/scheduling slack).
+  /// Named so calculateMaxSyncWaitTime() and asyncAttemptBudget() share ONE definition rather
+  /// than a magic 2000 in two places that could silently desync (round-3 cpp17 L-1). The async
+  /// per-issue budget deliberately EXCLUDES it (asyncAttemptBudget = sync budget - this margin).
+  static constexpr std::chrono::milliseconds kSyncSafetyMargin{2000};
 
   /// \brief Calculate total maximum wait time for synchronous queries including retries
   /// \return Maximum possible duration including initial timeout and all retry delays with jitter
@@ -1026,13 +1071,14 @@ inline bool DnsTransport::isRunning() const
 }
 
 inline DnsResult DnsTransport::query(const DnsQuestion &question, const std::string &server,
-                                     std::uint16_t port)
+                                     std::uint16_t port, std::chrono::milliseconds maxWait)
 {
-  return queryMultiple({question}, server, port);
+  return queryMultiple({question}, server, port, maxWait);
 }
 
 inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &questions,
-                                             const std::string &server, std::uint16_t port)
+                                             const std::string &server, std::uint16_t port,
+                                             std::chrono::milliseconds maxWait)
 {
   if (!isRunning())
   {
@@ -1098,11 +1144,19 @@ inline DnsResult DnsTransport::queryMultiple(const std::vector<DnsQuestion> &que
     // Wait for response with proper retry window calculation. Compute the budget from the SAME
     // pinned cfg snapshot as this query (INV-2 — tracker 2026-09-30-4 F-13), not a fresh load.
     auto future = query->promise.get_future();
-    auto maxWaitTime = calculateMaxSyncWaitTime(*cfg);
+    auto fullBudget = calculateMaxSyncWaitTime(*cfg);
+    // Per-call deadline hard-cap (tracker 2026-09-30-3, F-2): when the resolver passes a
+    // positive maxWait (time remaining until its per-resolution deadline), never wait longer
+    // than that; when 0 (deadline disabled), use the full config-derived budget = today's
+    // behavior byte-for-byte.
+    auto maxWaitTime = (maxWait > std::chrono::milliseconds::zero())
+                         ? std::min(fullBudget, maxWait)
+                         : fullBudget;
     iora::core::Logger::debug(
       "DNS sync query max wait time: " + std::to_string(maxWaitTime.count()) + "ms " +
       "(timeout=" + std::to_string(cfg->timeout.count()) + "ms, " +
-      "retries=" + std::to_string(cfg->retryCount) + ")");
+      "retries=" + std::to_string(cfg->retryCount) +
+      ", maxWait=" + std::to_string(maxWait.count()) + ")");
     auto status = future.wait_for(maxWaitTime);
 
     if (status == std::future_status::timeout)
@@ -2200,16 +2254,16 @@ DnsTransport::calculateMaxSyncWaitTime(const DnsConfig &cfg) const
   // (tracker 2026-09-30-4 H-2). Budgeting only ONE `timeout` here made queryMultiple's wait_for
   // abandon the query after ~2 sends, so DnsConfig.retryCount was NOT honored on the sync path.
   // Sum the per-attempt timeouts, then add the inter-attempt backoff+jitter and the safety margin.
-  // (The wall-clock consequence of the longer worst-case wait, and the RFC 1035 7.2 per-round
-  // ordering that would bound it, are tracked in 2026-09-30-3, whose per-resolution deadline caps
-  // the serial NAPTR->SRV->A->AAAA product against SIP Timer B.)
+  // (The per-resolution DEADLINE that caps the serial NAPTR->SRV->A->AAAA product against SIP
+  // Timer B landed in tracker 2026-09-30-3; the RFC 1035 §7.2 one-per-round ordering that would let
+  // failover happen WITHIN a small deadline is tracked in 2026-09-30-5.)
   // Clamp the unvalidated int retryCount to [0, kMaxSyncRetries]: the lower bound guards a
   // misconfigured negative value, which would otherwise collapse the budget below one `timeout` and
   // abandon even the first attempt (M-2); the upper bound guards signed-overflow / an absurd
   // per-query wait at pathological values (tracker 2026-09-30-4 L-4). The multiply is on
   // milliseconds::rep (int64), so a clamped retries can never overflow it.
   constexpr int kMaxSyncRetries = 100;
-  const int retries = std::min(std::max(cfg.retryCount, 0), kMaxSyncRetries);
+  const int retries = std::clamp(cfg.retryCount, 0, kMaxSyncRetries);
   auto totalWait = cfg.timeout * (retries + 1);
 
   // Retry delays with exponential backoff and accurate per-retry jitter. Use the shared
@@ -2229,10 +2283,45 @@ DnsTransport::calculateMaxSyncWaitTime(const DnsConfig &cfg) const
     }
   }
 
-  // Add safety margin for processing delays
-  totalWait += std::chrono::milliseconds(2000); // 2 second margin
+  // Add safety margin for processing delays. Shared named constant so asyncAttemptBudget()
+  // can subtract exactly this amount without a magic 2000 in two places (round-3 cpp17 L-1).
+  totalWait += kSyncSafetyMargin;
 
   return totalWait;
+}
+
+inline std::chrono::milliseconds
+DnsTransport::udpAttemptBudget(const DnsConfig &cfg) const
+{
+  // The pure UDP-retransmit worst case for one in-flight issue: the sync budget MINUS the sync-only
+  // safety margin (the async path has no wait_for slack to protect). Reused verbatim so the two can
+  // never drift (round-2 cpp17 MEDIUM-A). This is ALSO the per-server BLACKHOLE cost (a blackholed
+  // server never sends TC=1), which the resolver's failover-defeat warning compares against.
+  return calculateMaxSyncWaitTime(cfg) - kSyncSafetyMargin;
+}
+
+inline std::chrono::milliseconds
+DnsTransport::asyncAttemptBudget(const DnsConfig &cfg) const
+{
+  auto budget = udpAttemptBudget(cfg);
+
+  // TC=1 -> TCP fallback leg (sip-voip HIGH-2), ONLY in Both mode — TCP-only mode issues TCP from the
+  // start with its own per-query timer (already counted) and never does a UDP->TCP fallback, so it
+  // needs no extra (cpp17 round-3 L-1). In Both mode a truncated UDP answer triggers sendTcpQuery,
+  // which ARMS A FRESH query->timeout timer (scheduleQueryTimeout, dns_transport.hpp:2732) from the
+  // moment TC=1 arrives (t_TC); the orphan sweep only reaps once that fresh timer has fired (it
+  // clears activeTimerId) AND now-startTime>timeout (:2845). A SLOW server can return TC=1 as late as
+  // ~the last UDP attempt's timeout, so t_TC can be ~the whole UDP budget, and the reap lands at
+  // t_TC + timeout + <= _cleanupInterval. So the leg adds timeout + _cleanupInterval beyond the UDP
+  // budget (NOT just _cleanupInterval — the fresh TCP timer's `timeout` is NOT already counted; that
+  // was the cpp17 round-3 H-1 correction of a wrong round-2 tighten). Conservative upper bound the
+  // SIP adapter sizes its deadline from. (The TCP-fallback timer identity is owned by 2026-09-25-2;
+  // when it lands with a tighter reap, revise this + its unit test — sip-voip round-3 LOW-5.)
+  if (cfg.transportMode == DnsTransportMode::Both)
+  {
+    budget += cfg.timeout + _cleanupInterval;
+  }
+  return budget;
 }
 
 inline std::uint16_t DnsTransport::generateUniqueQueryId(const std::string &server,

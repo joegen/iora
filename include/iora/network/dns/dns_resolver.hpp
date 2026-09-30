@@ -14,9 +14,11 @@
 #include <atomic>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -314,6 +316,48 @@ public:
       : DnsResolverException("Transient DNS failure (all servers exhausted) for: " + domain, code)
   {
   }
+
+protected:
+  /// \brief Tag selecting the pre-built-message forwarding ctor (round-3 cpp17 M-1).
+  /// DnsResolverException::_message is private and the public ctor above hardcodes the
+  /// "all servers exhausted" prefix, so a subclass (DnsDeadlineException) that needs a
+  /// DISTINCT message while remaining IS-A DnsTransientResolutionException forwards its
+  /// full pre-built message + code through here. Tag-dispatched to stay distinct from the
+  /// public (domain, code) ctor.
+  struct FullMessageTag
+  {
+  };
+  DnsTransientResolutionException(FullMessageTag, const std::string &fullMessage,
+                                  DnsResponseCode code)
+      : DnsResolverException(fullMessage, code)
+  {
+  }
+};
+
+/// \brief Thrown when a per-resolution DEADLINE (DnsConfig::maxResolutionTime or a per-call
+///        override) is exceeded, bounding the RFC 3263 NAPTR→SRV→A/AAAA chain under the SIP
+///        transaction ceiling (Timer B/F = 64*T1 = 32s). Tracker 2026-09-30-3 (F-2).
+///
+/// IS-A DnsTransientResolutionException BY DESIGN, so it needs NO new catch site: every
+/// fall-forward `catch (const DnsResolverException&)` unwinds it; every OUTCOME-SETTING
+/// `catch (const DnsTransientResolutionException&)` (ordered before the DnsResolverException
+/// handler) maps it to ResolutionOutcome::TransientFailure; isTransientError() is true for it;
+/// resolveHostname folds it into anyTransient. A deadline is thus NEVER PermanentNoService,
+/// sync == async.
+///
+/// Delivered ONLY for the actual deadline sub-case. The all-server EXHAUSTION terminal keeps
+/// its OWN DnsTransientResolutionException(qname, lastServerLocalRcode) — do NOT convert
+/// exhaustion into a deadline exception (that would break the deadline-OFF path, the per-server
+/// rcode fidelity, and sync/async parity — round-2 cpp17 HIGH-A).
+class DnsDeadlineException : public DnsTransientResolutionException
+{
+public:
+  explicit DnsDeadlineException(const std::string &domain,
+                                DnsResponseCode code = DnsResponseCode::SERVFAIL)
+      : DnsTransientResolutionException(FullMessageTag{},
+                                        "DNS resolution deadline exceeded for: " + domain, code)
+  {
+  }
 };
 
 /// \brief Thrown by the SYNC query() leaf when a NAPTR query is answered NOTIMP/FORMERR (RFC 3263
@@ -372,6 +416,19 @@ public:
     _rng.seed(seed);
   }
 
+  /// \brief Worst-case wall-clock of the ONE async issue the per-resolution deadline gate cannot
+  ///        abort in flight (tracker 2026-09-30-3, F-2). Delegates to
+  ///        DnsTransport::asyncAttemptBudget on the pinned live config snapshot (never a re-derived
+  ///        formula — round-2 cpp17 MEDIUM-A). A SIP consumer sizes its deadline D from this so the
+  ///        async overhang (worst case = D + this value) still fits under SIP Timer B/F; see
+  ///        docs/network/dns_client.md. Returns 0 only when no config snapshot is available (an
+  ///        empty server list still yields the full per-issue budget — L-3).
+  std::chrono::milliseconds asyncAttemptBudget() const
+  {
+    auto cfg = _transport->getConfig();
+    return cfg ? _transport->asyncAttemptBudget(*cfg) : std::chrono::milliseconds::zero();
+  }
+
   /// \brief Resolve service domain using RFC 3263 NAPTR→SRV→A/AAAA procedure
   /// \param domain Service domain to resolve (e.g., "example.com", "sip.example.com")
   /// \param preferredTransports Preferred transport types in order of preference
@@ -385,13 +442,18 @@ public:
   ServiceResolutionResult
   resolveServiceDomain(const std::string &domain,
                        const std::vector<ServiceType> &preferredTransports = {},
-                       bool secure = false)
+                       bool secure = false,
+                       std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
     // Validate input domain
     if (!validateHostname(domain))
     {
       throw DnsResolverException("Invalid hostname: " + sanitizeInput(domain, 100));
     }
+
+    // Compute the absolute per-resolution deadline ONCE (F-2, tracker 2026-09-30-3) and thread it
+    // down the RFC 3263 chain. Cache hits below are served regardless of the deadline.
+    const auto deadline = computeResolutionDeadline(deadlineOverride);
 
     // Check cache first
     if (_cache)
@@ -424,7 +486,7 @@ public:
     iora::core::Logger::debug("DNS starting fresh service resolution for domain: " + domain);
     auto startTime = std::chrono::steady_clock::now();
 
-    auto result = performServiceResolution(domain, preferredTransports, secure);
+    auto result = performServiceResolution(domain, preferredTransports, secure, deadline);
 
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - startTime)
@@ -447,11 +509,17 @@ public:
   ///        transport security. Defaulted false; the SIP layer drives it true for sips:.
   void resolveServiceDomainAsync(const std::string &domain, ServiceResolutionCallback callback,
                                  const std::vector<ServiceType> &preferredTransports = {},
-                                 bool secure = false)
+                                 bool secure = false,
+                                 std::optional<std::chrono::milliseconds> deadlineOverride =
+                                   std::nullopt)
   {
     // Deliver AT MOST ONCE across every path below (cache-hit, fresh, and any TS-M2
     // re-delivery on a throwing callback) -- tracker 2026-09-25-5 steps-4-8 H-1.
     callback = makeSingleFire(std::move(callback));
+
+    // Compute the absolute per-resolution deadline ONCE (F-2) and thread it into the async chain.
+    // Cache hits below are served regardless of the deadline.
+    const auto deadline = computeResolutionDeadline(deadlineOverride);
 
     // Check cache first
     if (_cache)
@@ -534,7 +602,7 @@ public:
 
         callback(result, error);
       },
-      preferredTransports, secure);
+      preferredTransports, secure, deadline);
   }
 
   /// \brief Perform standard DNS query, with RFC 1035 §7.2 next-server failover.
@@ -559,7 +627,21 @@ public:
   /// \throws DnsTransientResolutionException when all servers are exhausted on server-local
   ///         conditions (transient, retryable — preserves the transient signal)
   /// \throws DnsTransportException on a TERMINAL lifecycle fault (transport stopped, etc.)
-  DnsResult query(const DnsQuestion &question)
+  /// \param deadlineOverride Optional per-call resolution deadline (F-2): nullopt = use
+  ///        DnsConfig::maxResolutionTime; an explicit value overrides it (0ms disables for this
+  ///        call). Computed to an absolute deadline ONCE here and threaded into queryImpl.
+  DnsResult query(const DnsQuestion &question,
+                  std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
+  {
+    return queryImpl(question, computeResolutionDeadline(deadlineOverride));
+  }
+
+private:
+  /// \brief Internal failover-loop impl bounded by an absolute \p deadline (F-2, tracker
+  ///        2026-09-30-3). \p deadline is REQUIRED (never defaulted) so a missed threading hop is a
+  ///        COMPILE error, not a silent fail-open unbounded query (round-2 cpp17 MEDIUM-1/2). It is
+  ///        never recomputed below. Reached via query() (public) or an internal threaded caller.
+  DnsResult queryImpl(const DnsQuestion &question, std::chrono::steady_clock::time_point deadline)
   {
     // Cache check ONCE before the failover loop. A negative cache entry is only ever an
     // AUTHORITATIVE negative (cacheQueryResult never caches a no-SOA negative, RFC 2308 §5),
@@ -596,12 +678,26 @@ public:
 
     for (std::size_t i = 0; i < serverCount; ++i)
     {
+      // Deadline gate (F-2, tracker 2026-09-30-3): before issuing to THIS server — which covers
+      // "before the loop" on i==0 and "before each issue" thereafter — stop if the deadline has
+      // passed and throw DnsDeadlineException (IS-A DnsTransientResolutionException -> the RFC 3263
+      // chain unwinds to TransientFailure with ZERO further wire queries). Disabled sentinel max()
+      // => never fires (byte-for-byte today's behavior). NOT converted from the exhaustion terminal
+      // below, which keeps its own DnsTransientResolutionException(qname, lastServerLocalRcode).
+      if (deadlineExpired(deadline))
+      {
+        throw DnsDeadlineException(question.qname);
+      }
       // Explicit per-server iteration excluding tried — never getNextServer() (a blind shared
       // round-robin with no failover memory). Each server is contacted at most once.
       const DnsServer &srv = cfg->servers[(start + i) % serverCount];
       try
       {
-        DnsResult result = _transport->query(question, srv.address, srv.port);
+        // Hard-cap the in-flight wait at the time remaining to the deadline (F-2): a blackholed
+        // server cannot make this single wait outlast the deadline. 0 when disabled -> the
+        // transport uses its full config-derived budget = today's behavior.
+        DnsResult result =
+          _transport->query(question, srv.address, srv.port, remainingSyncWait(deadline));
 
         switch (classifyDelivered(question, result))
         {
@@ -746,16 +842,174 @@ private:
     /// exhaustion on the same hop / a later hop — ordered by the same acq_rel CAS that publishes
     /// `attempts`, so no atomic needed.
     DnsResponseCode lastServerLocalRcode{DnsResponseCode::SERVFAIL};
+    /// Absolute per-resolution deadline (F-2, tracker 2026-09-30-3). Write-once at
+    /// makeFailoverChain (construction happens-before every read via the shared_ptr capture /
+    /// register->complete acq_rel edge), so no atomic is needed. Default max() = disabled = the
+    /// async gate's deadline branch never fires. Read at the queryAsyncWithFailover loop top.
+    std::chrono::steady_clock::time_point deadline{
+      (std::chrono::steady_clock::time_point::max)()};
   };
+
+  // ===========================================================================
+  // Per-resolution DEADLINE helpers (tracker 2026-09-30-3, F-2)
+  //
+  // The absolute deadline is computed ONCE at each PUBLIC entry (from a per-call override or
+  // DnsConfig::maxResolutionTime) and threaded DOWN as a required by-value time_point through
+  // every internal impl (sync) / FailoverChainState (async). A budget of 0 (the default) yields
+  // the DISABLED sentinel time_point::max(), so every gate below is a no-op and behavior is
+  // byte-for-byte unchanged. Steady clock ONLY (monotonic; no wall-clock jumps). By value, never
+  // a resolver member: the resolver is long-lived and shared, so a member time_point would tear
+  // across concurrent resolutions.
+  // ===========================================================================
+
+  /// \brief The DISABLED sentinel: deadline == max() means "no deadline" (gates never fire).
+  static constexpr std::chrono::steady_clock::time_point noDeadline()
+  {
+    return (std::chrono::steady_clock::time_point::max)();
+  }
+
+  /// \brief Emit a deadline-MISCONFIGURATION WARNING at most once (per \p latch). FULLY NO-THROW
+  ///        (cpp17 round-3 L-1): the \p latch is claimed FIRST, then the detail string is BUILT AND
+  ///        logged INSIDE the try — the string concatenation (a bad_alloc source) must not escape,
+  ///        because computeResolutionDeadline runs at the top of the async public entries whose
+  ///        deliver-via-callback contract a throw would break. \p buildDetail is invoked only on the
+  ///        once-per-latch path (no wasted allocation after the latch fires).
+  template <class BuildDetail>
+  void warnDeadlineMisconfigOnce(std::atomic<bool> &latch, BuildDetail buildDetail) const
+  {
+    if (latch.exchange(true, std::memory_order_relaxed))
+    {
+      return; // already warned once through this latch
+    }
+    try
+    {
+      iora::core::Logger::warning("DNS per-resolution deadline " + buildDetail());
+    }
+    catch (...)
+    {
+    }
+  }
+
+  /// \brief Compute the absolute deadline for one resolution. A per-call \p deadlineOverride wins
+  ///        over the live config's maxResolutionTime (nullopt => use config). Reads ONE live
+  ///        transport config snapshot (INV-2), same source as the server list / async budget.
+  ///
+  /// Budget semantics:
+  /// - == 0  => DISABLED (noDeadline(), the default) — byte-for-byte today's behavior.
+  /// - <  0  => a MISCONFIGURATION (HIGH-A). Most commonly a consumer computed
+  ///            D = Timer_B/F - asyncAttemptBudget() - margin and it UNDERFLOWED negative — note the
+  ///            DEFAULT config's asyncAttemptBudget() EXCEEDS Timer B (64*T1=32s), so no D fits at
+  ///            defaults; reduce DnsConfig.timeout/retryCount (see docs/network/dns_client.md). A
+  ///            negative budget FAILS CLOSED to an already-expired deadline: the resolution returns
+  ///            TransientFailure (retryable), NEVER an unbounded resolution past Timer B. The SIP
+  ///            response mapping is the adapter's job (iora_sip 2026-09-25-2), NOT this layer's: a
+  ///            UAC maps a transport/DNS failure to a local 503 (RFC 3261 §8.1.3.1); a PROXY should
+  ///            NOT forward a blanket 503 upstream for one failed target (RFC 3261 §16.7 step 6 — an
+  ///            upstream RFC 3263 §4.3 client would blacklist the whole proxy) and should use 500/504
+  ///            (§21.5.5) instead. Reserve 503 upstream for a condition affecting every request.
+  /// - >  0  => now() + budget, SATURATING to disabled if it would overflow the steady_clock ns rep
+  ///            (H-1: now()+ms::max() is signed-overflow UB wrapping into the past).
+  std::chrono::steady_clock::time_point
+  computeResolutionDeadline(std::optional<std::chrono::milliseconds> deadlineOverride) const
+  {
+    const auto cfg = _transport->getConfig(); // ONE snapshot (INV-2)
+    const std::chrono::milliseconds budget =
+      deadlineOverride ? *deadlineOverride
+                       : (cfg ? cfg->maxResolutionTime : std::chrono::milliseconds::zero());
+
+    if (budget == std::chrono::milliseconds::zero())
+    {
+      return noDeadline(); // explicit 0 = disabled
+    }
+    if (budget < std::chrono::milliseconds::zero())
+    {
+      // Fail CLOSED (HIGH-A): return an already-expired deadline -> the first server-loop / async
+      // gate throws DnsDeadlineException -> TransientFailure, never an unbounded resolution.
+      warnDeadlineMisconfigOnce(_negativeDeadlineWarned, [budget]
+                                {
+                                  return "is negative (" + std::to_string(budget.count()) +
+                                         "ms): failing closed, every non-cached resolution returns "
+                                         "TransientFailure until DnsConfig.maxResolutionTime / the "
+                                         "per-call override is corrected (the default config cannot "
+                                         "meet SIP Timer B; reduce DnsConfig.timeout/retryCount).";
+                                });
+      return std::chrono::steady_clock::now(); // now => deadlineExpired() true at the first gate
+    }
+
+    // budget > 0. Is the deadline below one server's BLACKHOLE cost (the UDP-retransmit budget, NOT
+    // asyncAttemptBudget(cfg) which includes the TC=1->TCP-fallback leg — a blackholed server never
+    // sends TC=1, sip-voip MEDIUM-1)? Below it, a dead server exhausts the deadline before the next
+    // server is tried -> RFC 1035 §7.2 failover is defeated (per-server sub-budget -> 2026-09-30-5).
+    // The check runs each budget>0 resolution UNTIL it warns once, so a later smaller override or an
+    // updateConfig() shrink is still caught (cpp17 M-2); once warned, the cost stops (cpp17 L-2b).
+    if (cfg && !_subBudgetWarned.load(std::memory_order_relaxed))
+    {
+      const auto perServerBudget = _transport->udpAttemptBudget(*cfg);
+      if (budget < perServerBudget)
+      {
+        warnDeadlineMisconfigOnce(
+          _subBudgetWarned, [budget, perServerBudget]
+          {
+            return "(" + std::to_string(budget.count()) +
+                   "ms) is below one server's UDP-retransmit budget (" +
+                   std::to_string(perServerBudget.count()) +
+                   "ms): a dead server exhausts the deadline before the next server is tried, so "
+                   "next-server failover (RFC 1035 §7.2) may be defeated. Reduce "
+                   "DnsConfig.timeout/retryCount, or track per-server sub-budgeting (2026-09-30-5).";
+          });
+      }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    // Headroom to the sentinel, as milliseconds; if the budget meets/exceeds it, saturate to
+    // "disabled" instead of overflowing (max() - now() cannot overflow — max() is the largest rep).
+    const auto headroom =
+      std::chrono::duration_cast<std::chrono::milliseconds>(noDeadline() - now);
+    return (budget >= headroom) ? noDeadline() : now + budget;
+  }
+
+  /// \brief True iff the deadline has passed (always false for the disabled sentinel, since
+  ///        now() >= max() is never true — no special-case needed).
+  static bool deadlineExpired(std::chrono::steady_clock::time_point deadline)
+  {
+    return std::chrono::steady_clock::now() >= deadline;
+  }
+
+  /// \brief The per-call maxWait to hand DnsTransport::query so an in-flight sync wait cannot
+  ///        overrun the deadline. 0 when disabled (transport uses its full config budget). The
+  ///        max()-guard MUST precede the subtraction: max() - now() overflows the duration rep
+  ///        (UB). Callers gate with deadlineExpired() first, so remaining is > 0 here; clamp to
+  ///        >= 1ms defensively so a just-at-deadline call still passes a positive cap.
+  ///
+  /// Rounds UP with std::chrono::ceil, NOT duration_cast (M-1): truncation would hand the transport
+  /// a wait ending a sub-millisecond BEFORE the deadline, so the next step's deadlineExpired() gate
+  /// would miss and one extra wire query would be issued past the deadline. Ceiling makes wait_for
+  /// end at or after the deadline, so the gate always fires — the "zero further wire queries after
+  /// expiry" contract becomes deterministic.
+  static std::chrono::milliseconds remainingSyncWait(std::chrono::steady_clock::time_point deadline)
+  {
+    if (deadline == noDeadline())
+    {
+      return std::chrono::milliseconds::zero();
+    }
+    auto remaining =
+      std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+    return (remaining > std::chrono::milliseconds::zero()) ? remaining
+                                                           : std::chrono::milliseconds{1};
+  }
 
   /// \brief Build a fresh failover chain: pin one getConfig() snapshot and pick a rotating
   ///        starting server from the resolver-owned cursor. An empty/absent snapshot yields a
   ///        chain that is immediately exhausted (attempts 0 >= size 0) -> the helper funnels a
-  ///        terminal transient (never a silent empty).
-  std::shared_ptr<FailoverChainState> makeFailoverChain()
+  ///        terminal transient (never a silent empty). \p deadline (F-2) is a REQUIRED by-value
+  ///        param (never defaulted) so the compiler forces every async carrier to thread it into
+  ///        the chain's write-once deadline field.
+  std::shared_ptr<FailoverChainState>
+  makeFailoverChain(std::chrono::steady_clock::time_point deadline)
   {
     auto chain = std::make_shared<FailoverChainState>();
     chain->snapshot = _transport->getConfig();
+    chain->deadline = deadline;
     const std::size_t n = (chain->snapshot ? chain->snapshot->servers.size() : 0);
     chain->startIndex =
       (n > 0 ? (_serverRotation.fetch_add(1, std::memory_order_relaxed) % n) : 0);
@@ -854,7 +1108,8 @@ private:
   ///        and discard NAPTR preference, diverging from the async path (F-5).
   void resolveEmptySrvAvenue(const std::string &domain, ServiceResolutionResult &result,
                              bool anySrvTransient, const std::vector<ServiceType> &transports,
-                             const std::vector<ServiceType> &denied, bool secure)
+                             const std::vector<ServiceType> &denied, bool secure,
+                             std::chrono::steady_clock::time_point deadline)
   {
     if (anySrvTransient)
     {
@@ -862,7 +1117,7 @@ private:
     }
     else
     {
-      performFallbackResolution(domain, result, transports, denied, secure);
+      performFallbackResolution(domain, result, transports, denied, secure, deadline);
     }
   }
 
@@ -875,22 +1130,23 @@ private:
   void completeSrvJoinAsync(const std::string &domain, std::shared_ptr<ServiceResolutionResult> result,
                             ServiceResolutionCallback callback, bool anySrvTransient,
                             const std::vector<ServiceType> &transports,
-                            const std::vector<ServiceType> &denied, bool secure)
+                            const std::vector<ServiceType> &denied, bool secure,
+                            std::chrono::steady_clock::time_point deadline)
   {
     if (!result->targets.empty())
     {
-      resolveTargetAddressesAsync(result, callback, secure);
+      resolveTargetAddressesAsync(result, callback, secure, deadline);
     }
     else if (anySrvTransient)
     {
       // Suppress the §4.2 fallback and carry TransientFailure; resolveTargetAddressesAsync-over-empty
       // preserves the non-Resolved outcome and fires the callback exactly once (M-4).
       result->outcome = ResolutionOutcome::TransientFailure;
-      resolveTargetAddressesAsync(result, callback, secure);
+      resolveTargetAddressesAsync(result, callback, secure, deadline);
     }
     else
     {
-      performFallbackResolutionAsync(domain, result, callback, transports, denied, secure);
+      performFallbackResolutionAsync(domain, result, callback, transports, denied, secure, deadline);
     }
   }
 
@@ -950,6 +1206,11 @@ private:
     };
     while (true)
     {
+      // Branch precedence (L-1): exhaustion is checked BEFORE the deadline. When both would trip on
+      // the same loop turn (the last server tried AND the deadline passed), exhaustion wins so the
+      // terminal carries the faithful per-server lastServerLocalRcode rather than the generic
+      // deadline SERVFAIL — richer diagnostics, and both deliver TransientFailure so the SIP-visible
+      // outcome is identical either way.
       const std::size_t n = (chain->snapshot ? chain->snapshot->servers.size() : 0);
       if (chain->attempts >= n)
       {
@@ -969,6 +1230,33 @@ private:
           transientEx = std::current_exception();
         }
         deliver(DnsResult{}, transientEx);
+        return;
+      }
+
+      // Deadline gate (F-2, tracker 2026-09-30-3): a SEPARATE branch from exhaustion above, sharing
+      // the guarded deliver() funnel but NOT merged with it (round-2 cpp17 HIGH-A — merging would
+      // deliver a DnsDeadlineException for pure exhaustion too, breaking the deadline-OFF path, the
+      // per-server rcode fidelity, and sync/async parity). Once the deadline has passed, stop issuing
+      // further servers/families WITHOUT a wire query and deliver a terminal DnsDeadlineException
+      // (IS-A transient -> outcome TransientFailure, never Permanent). This is how "cut both A and
+      // AAAA" is realized: the next family chains through queryAsyncWithFailover, hits this branch,
+      // and its error-channel callback marks the target transient (issues zero wire queries). It does
+      // NOT abort the one query already in flight (soft async bound; worst-case overhang = deadline +
+      // asyncAttemptBudget()). Disabled sentinel max() => deadlineExpired() is always false => no-op.
+      // Its own guarded make_exception_ptr (this branch returns, so it cannot share the exhaustion
+      // branch's try block — round-3 cpp17 L-3): an OOM here still yields exactly one terminal.
+      if (deadlineExpired(chain->deadline))
+      {
+        std::exception_ptr deadlineEx;
+        try
+        {
+          deadlineEx = std::make_exception_ptr(DnsDeadlineException(question.qname));
+        }
+        catch (...)
+        {
+          deadlineEx = std::current_exception();
+        }
+        deliver(DnsResult{}, deadlineEx);
         return;
       }
 
@@ -1088,8 +1376,12 @@ public:
   /// \brief Perform DNS query asynchronously
   /// \param question DNS question to resolve
   /// \param callback Callback function for result
-  void queryAsync(const DnsQuestion &question, QueryCallback callback)
+  void queryAsync(const DnsQuestion &question, QueryCallback callback,
+                  std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
+    // Compute the absolute per-resolution deadline ONCE (F-2); cache hits are served regardless.
+    const auto deadline = computeResolutionDeadline(deadlineOverride);
+
     // Check cache first
     if (_cache)
     {
@@ -1117,7 +1409,7 @@ public:
     auto self = shared_from_this();
     try
     {
-      auto chain = makeFailoverChain();
+      auto chain = makeFailoverChain(deadline);
       queryAsyncWithFailover(
         question, chain,
         [self, question, callback](const DnsResult &result, const std::exception_ptr &ex)
@@ -1162,7 +1454,20 @@ public:
   /// \param prefer_ipv6 Prefer IPv6 addresses if available
   /// \return Vector of IP address strings
   /// \throws DnsResolverException on resolution failure
-  std::vector<std::string> resolveHostname(const std::string &hostname, bool prefer_ipv6 = false)
+  std::vector<std::string>
+  resolveHostname(const std::string &hostname, bool prefer_ipv6 = false,
+                  std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
+  {
+    return resolveHostnameImpl(hostname, prefer_ipv6, computeResolutionDeadline(deadlineOverride));
+  }
+
+private:
+  /// \brief Internal resolveHostname impl bounded by an absolute \p deadline (F-2, tracker
+  ///        2026-09-30-3). \p deadline is REQUIRED (never defaulted) so a missed threading hop is a
+  ///        COMPILE error, not a silent fail-open (round-2 cpp17 LOW-A). Reached via resolveHostname()
+  ///        (public) or an internal threaded caller (resolveTargetAddresses / performFallbackResolution).
+  std::vector<std::string> resolveHostnameImpl(const std::string &hostname, bool prefer_ipv6,
+                                               std::chrono::steady_clock::time_point deadline)
   {
     // Validate input hostname
     if (!validateHostname(hostname))
@@ -1196,7 +1501,7 @@ public:
     {
       try
       {
-        DnsResult ipv4Result = query(DnsQuestion(hostname, DnsType::A, DnsClass::IN));
+        DnsResult ipv4Result = queryImpl(DnsQuestion(hostname, DnsType::A, DnsClass::IN), deadline);
         for (const auto &record : ipv4Result.a_records)
         {
           ipv4Addresses.push_back(record.address);
@@ -1236,7 +1541,8 @@ public:
     {
       try
       {
-        DnsResult ipv6Result = query(DnsQuestion(hostname, DnsType::AAAA, DnsClass::IN));
+        DnsResult ipv6Result =
+          queryImpl(DnsQuestion(hostname, DnsType::AAAA, DnsClass::IN), deadline);
         for (const auto &record : ipv6Result.aaaa_records)
         {
           ipv6Addresses.push_back(record.address);
@@ -1315,6 +1621,7 @@ public:
     return addresses;
   }
 
+public:
   /// \brief Get the preferred (head) target of an RFC-2782-ordered resolution result.
   ///
   /// The weighted-random ordering is applied once, at resolution time, inside
@@ -1340,9 +1647,27 @@ public:
   /// \return Service resolution result
   ServiceResolutionResult performDirectSrvResolution(
     const std::string &domain, const std::vector<ServiceType> &preferredTransports,
-    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries =
-      std::nullopt,
-    bool secure = false)
+    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries = std::nullopt,
+    bool secure = false,
+    std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
+  {
+    // PUBLIC entry (reached directly by DnsClient::resolveCustomServiceDomain): compute the
+    // absolute deadline ONCE (F-2) and delegate to the deadline-threading impl. Internal callers
+    // that already hold a threaded deadline (e.g. the NAPTR direct-SRV fallback) call the Impl
+    // directly so the clock is NOT reset mid-chain.
+    return performDirectSrvResolutionImpl(domain, preferredTransports, srvQueries, secure,
+                                          computeResolutionDeadline(deadlineOverride));
+  }
+
+private:
+  /// \brief Deadline-threading impl for direct-SRV resolution (F-2). \p deadline REQUIRED
+  ///        (never defaulted) so a missed hop is a compile error, not a fail-open. PRIVATE: only
+  ///        the public entry (which computes the deadline once) and internal threaded callers reach
+  ///        it (cpp17 M-2 / simpl LOW-7 — external code must not pass a raw time_point{} = epoch).
+  ServiceResolutionResult performDirectSrvResolutionImpl(
+    const std::string &domain, const std::vector<ServiceType> &preferredTransports,
+    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries,
+    bool secure, std::chrono::steady_clock::time_point deadline)
   {
     ServiceResolutionResult result(domain);
 
@@ -1365,7 +1690,7 @@ public:
       const auto service = actualSrvQueries[rank].second;
       try
       {
-        DnsResult srvResult = query(DnsQuestion(srvName, DnsType::SRV, DnsClass::IN));
+        DnsResult srvResult = queryImpl(DnsQuestion(srvName, DnsType::SRV, DnsClass::IN), deadline);
         if (processSrvRecords(srvResult.srv_records, service, result,
                               static_cast<std::uint16_t>(rank)))
         {
@@ -1401,7 +1726,7 @@ public:
 
     if (!result.targets.empty())
     {
-      resolveTargetAddresses(result);
+      resolveTargetAddresses(result, deadline);
       sortTargetsByPriority(result, secure);
     }
     else
@@ -1410,12 +1735,13 @@ public:
       // A/AAAA domain fallback (RFC 2782 "." honored) — one shared policy with the NAPTR-S path
       // (tracker 2026-09-30-4 M-4/H-A). The fallback keeps preferred-transport order (not re-sorted).
       resolveEmptySrvAvenue(domain, result, anySrvTransient, preferredTransports, deniedServices,
-                            secure);
+                            secure, deadline);
     }
 
     return result;
   }
 
+public:
   /// \brief Perform direct SRV resolution asynchronously (generic version)
   /// \param domain Domain to resolve
   /// \param callback Result callback
@@ -1427,11 +1753,27 @@ public:
   void performDirectSrvResolutionAsync(
     const std::string &domain, ServiceResolutionCallback callback,
     const std::vector<ServiceType> &preferredTransports,
-    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries =
-      std::nullopt,
-    bool secure = false)
+    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries = std::nullopt,
+    bool secure = false,
+    std::optional<std::chrono::milliseconds> deadlineOverride = std::nullopt)
   {
-    // Deliver AT MOST ONCE (this is a public entry; double-wrapping when reached via
+    // PUBLIC entry (reached directly by DnsClient::resolveCustomServiceDomainAsync): compute the
+    // absolute deadline ONCE (F-2) and delegate to the deadline-threading impl. Internal callers
+    // holding a threaded deadline call the Impl directly (no mid-chain clock reset).
+    performDirectSrvResolutionAsyncImpl(domain, std::move(callback), preferredTransports, srvQueries,
+                                        secure, computeResolutionDeadline(deadlineOverride));
+  }
+
+private:
+  /// \brief Deadline-threading impl for async direct-SRV resolution (F-2). \p deadline REQUIRED.
+  ///        PRIVATE (cpp17 M-2 / simpl LOW-7): only the public entry + internal threaded callers.
+  void performDirectSrvResolutionAsyncImpl(
+    const std::string &domain, ServiceResolutionCallback callback,
+    const std::vector<ServiceType> &preferredTransports,
+    const std::optional<std::vector<std::pair<std::string, ServiceType>>> &srvQueries, bool secure,
+    std::chrono::steady_clock::time_point deadline)
+  {
+    // Deliver AT MOST ONCE (double-wrapping when reached via the public entry or
     // performServiceResolutionAsync is harmless) -- tracker 2026-09-25-5 steps-4-8 H-1.
     callback = makeSingleFire(std::move(callback));
 
@@ -1444,7 +1786,8 @@ public:
     // the sync path and fall back directly.
     if (actualSrvQueries.empty())
     {
-      performFallbackResolutionAsync(domain, result, callback, preferredTransports, {}, secure);
+      performFallbackResolutionAsync(domain, result, callback, preferredTransports, {}, secure,
+                                     deadline);
       return;
     }
 
@@ -1471,7 +1814,7 @@ public:
     // unwinding into the DNS worker (tracker 2026-09-25-5 TS-M2).
     auto runCompleter = std::make_shared<std::function<void()>>(
       [self, result, remainingQueries, callbackFired, callback, domain, preferredTransports,
-       deniedServices, anySrvTransient, secure]()
+       deniedServices, anySrvTransient, secure, deadline]()
       {
         if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
             !callbackFired->exchange(true))
@@ -1482,7 +1825,7 @@ public:
             // the NAPTR-S completer so the two cannot drift (tracker 2026-09-30-4 M-4/H-A).
             self->completeSrvJoinAsync(domain, result, callback,
                                        anySrvTransient->load(std::memory_order_acquire),
-                                       preferredTransports, *deniedServices, secure);
+                                       preferredTransports, *deniedServices, secure, deadline);
           }
           catch (...)
           {
@@ -1504,7 +1847,7 @@ public:
         const auto service = actualSrvQueries[rank].second;
         const auto transportRank = static_cast<std::uint16_t>(rank);
         DnsQuestion srvQuestion(srvName, DnsType::SRV, DnsClass::IN);
-        auto chain = makeFailoverChain();
+        auto chain = makeFailoverChain(deadline);
 
         queryAsyncWithFailover(
           srvQuestion, chain,
@@ -1563,6 +1906,20 @@ private:
   /// the remainder explicitly, excluding tried servers — so getNextServer() is never called in
   /// the loop.
   mutable std::atomic<std::size_t> _serverRotation{0};
+
+  /// SEPARATE once-latches per deadline-MISCONFIGURATION warning (cpp17 round-3 M-1 / sip-voip
+  /// LOW-1): a shared latch let a benign sub-budget warning permanently MASK the severe
+  /// negative-budget (fail-closed = total outage) warning, or vice-versa. One latch each so the
+  /// most severe state is never hidden.
+  /// - _negativeDeadlineWarned: a negative budget failed closed (every non-cached resolution ->
+  ///   TransientFailure until corrected). The most severe misconfiguration.
+  /// - _subBudgetWarned: a positive deadline below one server's UDP-retransmit budget defeats
+  ///   RFC 1035 §7.2 next-server failover (per-server sub-budget -> 2026-09-30-5). It ALSO gates the
+  ///   one-time sub-budget CHECK: the check runs on each budget>0 resolution UNTIL it fires once,
+  ///   so a later smaller override / an updateConfig() shrink is still caught (cpp17 M-2), then the
+  ///   cost stops (cpp17 L-2b).
+  mutable std::atomic<bool> _negativeDeadlineWarned{false};
+  mutable std::atomic<bool> _subBudgetWarned{false};
 
   // =============================================================================
   // Input Validation Functions (RFC Compliance & Security)
@@ -1792,20 +2149,22 @@ private:
   /// \return Service resolution result
   ServiceResolutionResult
   performServiceResolution(const std::string &domain,
-                           const std::vector<ServiceType> &preferredTransports, bool secure = false)
+                           const std::vector<ServiceType> &preferredTransports, bool secure,
+                           std::chrono::steady_clock::time_point deadline)
   {
     ServiceResolutionResult result(domain);
 
     // Every NAPTR-failure and no-usable-NAPTR path converges on the same RFC 3263
-    // §4.1 direct-SRV fallback, so name it once (review L-f).
+    // §4.1 direct-SRV fallback, so name it once (review L-f). The deadline (F-2) threads through.
     auto fallbackToDirectSrv = [&]()
-    { return performDirectSrvResolution(domain, preferredTransports, std::nullopt, secure); };
+    { return performDirectSrvResolutionImpl(domain, preferredTransports, std::nullopt, secure,
+                                            deadline); };
 
     // Step 1: Query NAPTR records
     std::vector<NaptrRecord> naptrRecords;
     try
     {
-      DnsResult naptrResult = query(DnsQuestion(domain, DnsType::NAPTR, DnsClass::IN));
+      DnsResult naptrResult = queryImpl(DnsQuestion(domain, DnsType::NAPTR, DnsClass::IN), deadline);
       naptrRecords = naptrResult.naptr_records;
     }
     catch (const DnsResolverException &)
@@ -1862,7 +2221,8 @@ private:
       }
       try
       {
-        DnsResult srvResult = query(DnsQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN));
+        DnsResult srvResult =
+          queryImpl(DnsQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN), deadline);
         if (processSrvRecords(srvResult.srv_records, srvTarget.service, result,
                               srvTarget.naptrPreference))
         {
@@ -1925,14 +2285,14 @@ private:
       // fallback targets are NOT re-sorted, so they keep NAPTR-preference order and match the async
       // path (tracker 2026-09-30-4 H-3/M-4/H-A).
       resolveEmptySrvAvenue(domain, result, anySrvTransient, naptrTransports, naptrDeniedServices,
-                            secure);
+                            secure, deadline);
     }
     else
     {
       // Step 4: Resolve hostnames to IP addresses, then sort by priority (and, when secure, discard
       // any non-SIPS-SIP target as belt-and-suspenders). The §4.2 fallback branch above must NOT be
       // sorted here — that would reorder its targets by ServiceType enum and drop NAPTR preference.
-      resolveTargetAddresses(result);
+      resolveTargetAddresses(result, deadline);
       sortTargetsByPriority(result, secure);
     }
 
@@ -1945,7 +2305,7 @@ private:
   /// \param preferredTransports Preferred transport types
   void performServiceResolutionAsync(const std::string &domain, ServiceResolutionCallback callback,
                                      const std::vector<ServiceType> &preferredTransports,
-                                     bool secure = false)
+                                     bool secure, std::chrono::steady_clock::time_point deadline)
   {
     auto self = shared_from_this();
 
@@ -1956,11 +2316,11 @@ private:
     try
     {
       DnsQuestion naptrQuestion(domain, DnsType::NAPTR, DnsClass::IN);
-      auto chain = makeFailoverChain();
+      auto chain = makeFailoverChain(deadline);
       queryAsyncWithFailover(
         naptrQuestion, chain,
-        [self, domain, callback, preferredTransports, secure](const DnsResult &naptrResult,
-                                                              const std::exception_ptr &naptrError)
+        [self, domain, callback, preferredTransports, secure, deadline](
+          const DnsResult &naptrResult, const std::exception_ptr &naptrError)
         {
           // TS-M2: a continuation invoked from this worker-thread callback can throw in
           // its prelude (e.g. bad_alloc before its first wrapped queryAsync); deliver via
@@ -1972,8 +2332,8 @@ private:
             if (naptrError)
             {
               // No NAPTR records, try direct SRV resolution
-              self->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
-                                                    std::nullopt, secure);
+              self->performDirectSrvResolutionAsyncImpl(domain, callback, preferredTransports,
+                                                        std::nullopt, secure, deadline);
               return;
             }
 
@@ -1994,8 +2354,8 @@ private:
             if (srvTargets.empty() && aTargets.empty())
             {
               // No valid targets, try direct SRV resolution
-              self->performDirectSrvResolutionAsync(domain, callback, preferredTransports,
-                                                    std::nullopt, secure);
+              self->performDirectSrvResolutionAsyncImpl(domain, callback, preferredTransports,
+                                                        std::nullopt, secure, deadline);
               return;
             }
 
@@ -2018,7 +2378,7 @@ private:
             if (srvTargets.empty())
             {
               // Only A-flag targets — resolve addresses and return
-              self->resolveTargetAddressesAsync(result, callback, secure);
+              self->resolveTargetAddressesAsync(result, callback, secure, deadline);
               return;
             }
 
@@ -2053,7 +2413,7 @@ private:
             // so a prelude throw delivers via the callback, not into the worker (TS-M2).
             auto runCompleter = std::make_shared<std::function<void()>>(
               [self, result, remainingQueries, callbackFired, callback, secure, anySrvTransient,
-               domain, naptrTransports, naptrDenied]()
+               domain, naptrTransports, naptrDenied, deadline]()
               {
                 if (remainingQueries->fetch_sub(1, std::memory_order_acq_rel) == 1 &&
                     !callbackFired->exchange(true))
@@ -2065,7 +2425,7 @@ private:
                     // drift (tracker 2026-09-30-4 M-4/H-3/H-A).
                     self->completeSrvJoinAsync(domain, result, callback,
                                                anySrvTransient->load(std::memory_order_acquire),
-                                               naptrTransports, *naptrDenied, secure);
+                                               naptrTransports, *naptrDenied, secure, deadline);
                   }
                   catch (...)
                   {
@@ -2083,7 +2443,7 @@ private:
                 DnsQuestion srvQuestion(srvTarget.srvName, DnsType::SRV, DnsClass::IN);
                 auto service = srvTarget.service;
                 auto naptrPref = srvTarget.naptrPreference;
-                auto chain = self->makeFailoverChain();
+                auto chain = self->makeFailoverChain(deadline);
 
                 self->queryAsyncWithFailover(
                   srvQuestion, chain,
@@ -2707,8 +3067,22 @@ private:
 
   /// \brief Resolve IP addresses for all targets
   /// \param result Result containing targets to resolve
-  void resolveTargetAddresses(ServiceResolutionResult &result)
+  void resolveTargetAddresses(ServiceResolutionResult &result,
+                              std::chrono::steady_clock::time_point deadline)
   {
+    // Resolve in RFC 2782 PRIORITY order, not DNS wire order (sip-voip HIGH-3): the SRV RRs arrive
+    // in whatever cyclic/random rrset order the recursive resolver chose, so without this a slow
+    // LOWER-priority (higher-number) backup listed first on the wire could consume the whole
+    // deadline and cut a healthy HIGHER-priority target listed later — a priority inversion. Order
+    // the resolution by the SAME shared comparator sortTargetsByPriority uses (targetOrderLess:
+    // naptrPreference, transport, priority) so the deadline, when it bites, drops the least-preferred
+    // targets. The post-loop sortTargetsByPriority still applies RFC 2782 weight ordering among
+    // survivors; with the deadline OFF every target is resolved regardless of order, so this is a
+    // no-op there. (RFC 2782 WEIGHT ordering within an equal-priority group is NOT applied here — a
+    // deadline cutting inside such a group skews the weighted share by wire order; tracked on
+    // 2026-09-30-5.)
+    std::stable_sort(result.targets.begin(), result.targets.end(), targetOrderLess);
+
     // Per-avenue outcome (tracker 2026-09-25-8, H4): this is the terminal avenue when SRV/NAPTR
     // produced targets. A target whose A/AAAA exhausted all servers on server-local conditions
     // surfaces from resolveHostname as DnsTransientResolutionException (caught FIRST, before the
@@ -2719,7 +3093,7 @@ private:
     {
       try
       {
-        target.addresses = resolveHostname(target.hostname, false);
+        target.addresses = resolveHostnameImpl(target.hostname, false, deadline);
       }
       catch (const DnsTransientResolutionException &)
       {
@@ -2783,6 +3157,24 @@ private:
                          result.targets.end());
   }
 
+  /// \brief The canonical RFC-2782/3263 target ordering key: (naptrPreference, transport, priority),
+  ///        all ascending (lower = more preferred). ONE definition shared by sortTargetsByPriority
+  ///        (the final ordering) and resolveTargetAddresses' deadline pre-sort so the two cannot
+  ///        drift (cpp17 L-4 / simpl M-1 — a prose "must match" comment was the only prior guard).
+  ///        Weight is applied separately by applyWeightedOrdering within each equal-key run.
+  static bool targetOrderLess(const ServiceTarget &a, const ServiceTarget &b)
+  {
+    if (a.naptrPreference != b.naptrPreference)
+    {
+      return a.naptrPreference < b.naptrPreference;
+    }
+    if (a.transport != b.transport)
+    {
+      return a.transport < b.transport;
+    }
+    return a.priority < b.priority;
+  }
+
   void sortTargetsByPriority(ServiceResolutionResult &result, bool secure = false)
   {
     discardInsecure(result, secure);
@@ -2793,19 +3185,7 @@ private:
     {
       result.outcome = ResolutionOutcome::PermanentNoService;
     }
-    std::stable_sort(result.targets.begin(), result.targets.end(),
-                     [](const ServiceTarget &a, const ServiceTarget &b)
-                     {
-                       if (a.naptrPreference != b.naptrPreference)
-                       {
-                         return a.naptrPreference < b.naptrPreference;
-                       }
-                       if (a.transport != b.transport)
-                       {
-                         return a.transport < b.transport;
-                       }
-                       return a.priority < b.priority;
-                     });
+    std::stable_sort(result.targets.begin(), result.targets.end(), targetOrderLess);
 
     // Nothing to weight-order with fewer than two targets — skip the RNG draw so master-stream
     // consumption tracks actual ordering work, not call count.
@@ -2907,8 +3287,8 @@ private:
   ///        plaintext. NOT generic transport security.
   void performFallbackResolution(const std::string &domain, ServiceResolutionResult &result,
                                  const std::vector<ServiceType> &preferredTransports,
-                                 const std::vector<ServiceType> &deniedServices = {},
-                                 bool secure = false)
+                                 const std::vector<ServiceType> &deniedServices, bool secure,
+                                 std::chrono::steady_clock::time_point deadline)
   {
     try
     {
@@ -2927,7 +3307,7 @@ private:
         return;
       }
 
-      auto addresses = resolveHostname(domain, false);
+      auto addresses = resolveHostnameImpl(domain, false, deadline);
 
       appendFallbackTargets(result, domain, transports, addresses);
       result.outcome = ResolutionOutcome::Resolved;
@@ -3038,7 +3418,8 @@ private:
                          std::size_t targetIndex, const std::string &hostname,
                          const std::shared_ptr<std::vector<DnsType>> &families, std::size_t famIdx,
                          const std::shared_ptr<std::function<void()>> &finishTarget,
-                         const std::shared_ptr<std::vector<char>> &targetTransient)
+                         const std::shared_ptr<std::vector<char>> &targetTransient,
+                         std::chrono::steady_clock::time_point deadline)
   {
     // Pre-call statements (shared_from_this + DnsQuestion ctor + makeFailoverChain) are inside
     // the try, so a synchronous PRE-CALL throw yields exactly one finishTarget (TS-C1). The
@@ -3050,10 +3431,10 @@ private:
     {
       auto self = shared_from_this();
       DnsQuestion q(hostname, (*families)[famIdx], DnsClass::IN);
-      auto chain = self->makeFailoverChain();
+      auto chain = self->makeFailoverChain(deadline);
       self->queryAsyncWithFailover(
         q, chain, [self, result, targetIndex, hostname, families, famIdx, finishTarget,
-                   targetTransient](const DnsResult &r, const std::exception_ptr &err)
+                   targetTransient, deadline](const DnsResult &r, const std::exception_ptr &err)
         {
           // Guard the append so a throwing push_back (bad_alloc) still reaches the
           // chain/decrement below -- otherwise the throw is swallowed by the transport's
@@ -3082,7 +3463,7 @@ private:
             // Chain the next family (sequential per target). issueTargetFamily is
             // itself TS-C1-guarded, so a synchronous throw there cannot escape.
             self->issueTargetFamily(result, targetIndex, hostname, families, famIdx + 1, finishTarget,
-                                    targetTransient);
+                                    targetTransient, deadline);
           }
           else
           {
@@ -3106,7 +3487,8 @@ private:
                            const std::shared_ptr<std::vector<DnsType>> &families, std::size_t famIdx,
                            const std::shared_ptr<std::vector<std::string>> &addresses,
                            const std::shared_ptr<std::function<void()>> &finish,
-                           const std::shared_ptr<bool> &anyTransient)
+                           const std::shared_ptr<bool> &anyTransient,
+                           std::chrono::steady_clock::time_point deadline)
   {
     // Pre-call statements inside the try so a synchronous PRE-CALL throw yields exactly one
     // finish (TS-C1); the failover helper is no-throw and funnels a synchronous issue-throw into
@@ -3116,10 +3498,10 @@ private:
     {
       auto self = shared_from_this();
       DnsQuestion q(domain, (*families)[famIdx], DnsClass::IN);
-      auto chain = self->makeFailoverChain();
+      auto chain = self->makeFailoverChain(deadline);
       self->queryAsyncWithFailover(
         q, chain,
-        [self, domain, families, famIdx, addresses, finish, anyTransient](
+        [self, domain, families, famIdx, addresses, finish, anyTransient, deadline](
           const DnsResult &r, const std::exception_ptr &err)
         {
           // Guard the append (bad_alloc) so the chain/finish below always runs -- else the
@@ -3143,7 +3525,8 @@ private:
           }
           if (famIdx + 1 < families->size())
           {
-            self->issueFallbackFamily(domain, families, famIdx + 1, addresses, finish, anyTransient);
+            self->issueFallbackFamily(domain, families, famIdx + 1, addresses, finish, anyTransient,
+                                      deadline);
           }
           else
           {
@@ -3166,8 +3549,8 @@ private:
                                       std::shared_ptr<ServiceResolutionResult> result,
                                       ServiceResolutionCallback callback,
                                       const std::vector<ServiceType> &preferredTransports,
-                                      const std::vector<ServiceType> &deniedServices = {},
-                                      bool secure = false)
+                                      const std::vector<ServiceType> &deniedServices, bool secure,
+                                      std::chrono::steady_clock::time_point deadline)
   {
     // Transports to build fallback targets for, minus any SRV-"." denied service.
     // When secure, fallbackTransports yields only SIPS transports (TLS/5061 default),
@@ -3229,14 +3612,15 @@ private:
         callback(*result, nullptr);
       });
 
-    issueFallbackFamily(domain, families, 0, addresses, finish, anyTransient);
+    issueFallbackFamily(domain, families, 0, addresses, finish, anyTransient, deadline);
   }
 
   /// \brief Resolve target addresses asynchronously
   /// \param result Result containing targets to resolve (must be shared_ptr for async safety)
   /// \param callback Result callback
   void resolveTargetAddressesAsync(std::shared_ptr<ServiceResolutionResult> result,
-                                   ServiceResolutionCallback callback, bool secure = false)
+                                   ServiceResolutionCallback callback, bool secure,
+                                   std::chrono::steady_clock::time_point deadline)
   {
     if (result->targets.empty())
     {
@@ -3317,7 +3701,8 @@ private:
         // Pre-issue statements inside the try (TS-C1 wrap boundary = top of loop body):
         // a bad_alloc / DnsQuestion construction throw must still finish the target once.
         std::string hostname = result->targets[targetIndex].hostname;
-        issueTargetFamily(result, targetIndex, hostname, families, 0, finishTarget, targetTransient);
+        issueTargetFamily(result, targetIndex, hostname, families, 0, finishTarget, targetTransient,
+                          deadline);
       }
       catch (...)
       {
