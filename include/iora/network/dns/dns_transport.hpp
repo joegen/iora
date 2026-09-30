@@ -2856,13 +2856,15 @@ inline void DnsTransport::retryQuery(std::shared_ptr<PendingQuery> query, int pr
         }
         self->_stats.retries.fetch_add(1, std::memory_order_relaxed);
       }
-      catch (const std::exception &e)
+      catch (...)
       {
-        auto error =
-          std::make_exception_ptr(DnsTransportException("Retry failed: " + std::string(e.what())));
+        // Preserve the ORIGINAL exception type (tracker 2026-09-25-8 steps-4-8 HIGH-B): a retransmit
+        // send-failure throws DnsNetworkException (sendUdp/TcpQuery) — the resolver's failover gate
+        // must see the derived type to rotate. Re-wrapping as base DnsTransportException (the sibling
+        // of the H1 initial-send bug) sliced it and turned a route loss into a terminal PermanentNoService.
         // Identity-checked completion (T2R-1): fail ONLY this query instance, never a new query that
         // reused the 16-bit id at the same server:port between the lock release above and here.
-        self->completeQueryIfSame(query, error);
+        self->completeQueryIfSame(query, std::current_exception());
       }
     });
 
