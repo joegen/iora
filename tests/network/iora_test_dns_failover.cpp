@@ -98,18 +98,27 @@ struct MockNode
 };
 
 // A NAPTR 'S'-flag record for `domain` pointing at `replacement` (an SRV owner name).
-MockDnsServer::DnsRecord naptrS(const std::string &domain, const std::string &replacement)
+// A NAPTR 'S'-flag record with an explicit service field (e.g. "SIP+D2U", "SIPS+D2T") pointing at
+// an SRV owner name.
+MockDnsServer::DnsRecord naptrSvc(const std::string &domain, const std::string &service,
+                                  const std::string &replacement, std::uint16_t order = 10,
+                                  std::uint16_t pref = 10)
 {
   MockDnsServer::DnsRecord rec;
   rec.name = domain;
   rec.type = "NAPTR";
   rec.ttl = 3600;
-  rec.naptrOrder = 10;
-  rec.naptrPreference = 10;
+  rec.naptrOrder = order;
+  rec.naptrPreference = pref;
   rec.naptrFlags = "S";
-  rec.naptrService = "SIP+D2U";
+  rec.naptrService = service;
   rec.naptrReplacement = replacement;
   return rec;
+}
+
+MockDnsServer::DnsRecord naptrS(const std::string &domain, const std::string &replacement)
+{
+  return naptrSvc(domain, "SIP+D2U", replacement);
 }
 
 /// \brief Build a real DnsResolver over a started DnsTransport pointed at the given ports,
@@ -1124,6 +1133,7 @@ TEST_CASE("ASYNC secure resolution failover preserves the SIPS filter (no plaint
   auto r = makeResolver({PORT_A, PORT_B});
 
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIPS_TLS}, /*secure=*/true);
+  REQUIRE(res.isSuccess()); // non-vacuous: failover to B produced the secure direct-SRV target
   // Every produced target must be a secure SIP service after failover (RFC 3263 §4.1); a plaintext
   // target would be a b2-filter regression across the failover boundary.
   for (const auto &tgt : res.targets)
@@ -1271,15 +1281,17 @@ TEST_CASE("ASYNC synchronous throw on the SECOND issue -> exactly one terminal, 
   REQUIRE(out.error);
 }
 
-TEST_CASE("ASYNC throwing user callback does not double-fire the twin (M-1)",
+TEST_CASE("ASYNC throwing user callback on the ISSUER-thread deliver does not double-fire (M-1)",
           "[dns][failover][async][exactly-once]")
 {
-  // The helper must swallow a throwing terminal user callback so it cannot escape to the twin's
-  // site catch(...) and be re-delivered. We count invocations; a double-fire would make it 2.
-  auto t = makeDouble({"10.0.0.1:53"});
-  t->asyncDispatch = false;
-  t->rcodeByServer["10.0.0.1"] = DnsResponseCode::NOERROR;
-  t->aByServer["10.0.0.1"] = {"192.0.2.101"};
+  // The throw must reach the HELPER's own issuer-thread `deliver` guard, not the double's inline
+  // callback wrap (MEDIUM-2 fix: the prior single-NOERROR-server version was vacuous — the double's
+  // try/catch swallowed the throw before the helper saw it). Here BOTH servers SERVFAIL with inline
+  // dispatch, so the terminal transient is delivered from the issuer-thread exhaustion path
+  // (helper `deliver`). If the helper did NOT guard it, the throw would escape to the twin's site
+  // catch(...) and re-deliver -> count == 2. Mutation intent: remove the deliver guard -> this fails.
+  auto t = makeDouble({"10.0.0.1:53", "10.0.0.2:53"});
+  t->asyncDispatch = false; // all inline -> exhaustion delivered on the issuer thread
   auto r = resolverOver(t);
 
   auto count = std::make_shared<std::atomic<int>>(0);
@@ -1403,19 +1415,22 @@ TEST_CASE("ASYNC NAPTR NOTIMP -> straight to direct-SRV, B not asked for NAPTR (
 
 // --- L-6: strengthened SIPS/secure failover (non-vacuous: isSuccess + plaintext bait) ---
 
-TEST_CASE("SIPS/secure failover: only SIPS targets survive, plaintext discarded, resolved via B",
-          "[dns][failover][async][secure]")
+TEST_CASE("SIPS/secure failover exercises the NAPTR §4.1 filter: plaintext NAPTR discarded (LOW-4)",
+          "[dns][failover][async][secure][naptr]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
   const std::string domain = "secure.example.net";
   const std::string sipsSrv = "_sips._tcp." + domain;
   const std::string sipTcpSrv = "_sip._tcp." + domain;
-  a->configureQuery(domain, "NAPTR", servfail()); // A fails NAPTR -> failover to B
+  // A SERVFAILs the NAPTR -> the NAPTR query fails over to B. B publishes BOTH a SIPS+D2T NAPTR
+  // (secure) and a SIP+D2T NAPTR (plaintext bait). The secure resolution's RFC 3263 §4.1
+  // service-field filter must discard the plaintext NAPTR outright, so the plaintext SRV/target is
+  // never even queried. A filter regression across the failover boundary would surface plain1.
+  a->configureQuery(domain, "NAPTR", servfail());
   for (auto *n : {&a, &b})
   {
-    // Both a SIPS and a plaintext NAPTR/SRV exist; the secure resolution must keep only SIPS.
-    (*n)->addRecord(naptrS(domain, sipsSrv)); // (naptrS builds a SIP+D2U record; the secure filter
-                                              //  keys on the resolved target's transport)
+    (*n)->addRecord(naptrSvc(domain, "SIPS+D2T", sipsSrv, /*order=*/10));
+    (*n)->addRecord(naptrSvc(domain, "SIP+D2T", sipTcpSrv, /*order=*/20)); // plaintext bait
     (*n)->addRecord({sipsSrv, "SRV", "sips1." + domain, 3600, 10, 0, 5061});
     (*n)->addRecord({sipTcpSrv, "SRV", "plain1." + domain, 3600, 10, 0, 5060});
     (*n)->addRecord({"sips1." + domain, "A", "192.0.2.104", 3600});
@@ -1424,10 +1439,150 @@ TEST_CASE("SIPS/secure failover: only SIPS targets survive, plaintext discarded,
   auto r = makeResolver({PORT_A, PORT_B});
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIPS_TLS}, /*secure=*/true);
 
-  REQUIRE(res.isSuccess()); // failover to B produced targets (non-vacuous)
+  REQUIRE(res.isSuccess());        // non-vacuous: the secure chain resolved
+  REQUIRE(a.countType(35) == 1);   // NAPTR failed over: A asked once (SERVFAIL) ...
+  REQUIRE(b.countType(35) >= 1);   // ... then B answered the NAPTR (proves failover happened)
   for (const auto &tgt : res.targets)
   {
     REQUIRE(isSecureSipService(tgt.transport)); // no plaintext target leaked across failover
     REQUIRE(tgt.hostname != "plain1." + domain);
   }
+}
+
+// =============================================================================
+// STEPS 4-8 ROUND-3 FIXES — added test coverage
+// =============================================================================
+
+namespace
+{
+// Two NAPTR-S records (two SRV owner names) so a NAPTR-S fan-out has SIBLING SRV sets. They share
+// the SAME NAPTR order (both selected in one tier) with distinct preference, so BOTH SRV owner
+// names are queried in the fan-out (a lower-order + higher-order pair would select only the lower).
+void addTwoNaptrSets(MockNode &n, const std::string &domain, const std::string &udpSrv,
+                     const std::string &tcpSrv)
+{
+  n->addRecord(naptrSvc(domain, "SIP+D2U", udpSrv, /*order=*/10, /*pref=*/10));
+  n->addRecord(naptrSvc(domain, "SIP+D2T", tcpSrv, /*order=*/10, /*pref=*/20));
+}
+} // namespace
+
+// --- MEDIUM-3: NAPTR-S partial success is not overwritten by a transient sibling ---
+
+TEST_CASE("NAPTR-S partial success (one SRV set transient, other resolves) -> Resolved (sync+async)",
+          "[dns][failover][outcome][naptr]")
+{
+  const std::string domain = "example.net";
+  const std::string udpSrv = "_sip._udp." + domain;
+  const std::string tcpSrv = "_sip._tcp." + domain;
+  const std::vector<ServiceType> pref{ServiceType::SIP_UDP, ServiceType::SIP_TCP};
+
+  auto configure = [&](MockNode &a, MockNode &b)
+  {
+    for (auto *n : {&a, &b})
+    {
+      addTwoNaptrSets(*n, domain, udpSrv, tcpSrv);
+      (*n)->configureQuery(udpSrv, "SRV", servfail());                          // set 1 transient
+      (*n)->addRecord({tcpSrv, "SRV", "sip2." + domain, 3600, 10, 0, 5060});    // set 2 resolves
+      (*n)->addRecord({"sip2." + domain, "A", "192.0.2.110", 3600});
+    }
+  };
+
+  SECTION("sync")
+  {
+    MockNode a(PORT_A), b(PORT_B);
+    configure(a, b);
+    auto r = makeResolver({PORT_A, PORT_B});
+    ServiceResolutionResult res = r->resolveServiceDomain(domain, pref);
+    REQUIRE(res.isSuccess());
+    REQUIRE(res.outcome == ResolutionOutcome::Resolved);
+  }
+  SECTION("async")
+  {
+    MockNode a(PORT_A), b(PORT_B);
+    configure(a, b);
+    auto r = makeResolver({PORT_A, PORT_B});
+    ServiceResolutionResult res = driveServiceAsync(r, domain, pref);
+    REQUIRE(res.isSuccess());
+    REQUIRE(res.outcome == ResolutionOutcome::Resolved);
+  }
+}
+
+TEST_CASE("NAPTR-S all-SRV-authoritative-negative -> PermanentNoService (sync+async)",
+          "[dns][failover][outcome][naptr]")
+{
+  const std::string domain = "example.net";
+  const std::string udpSrv = "_sip._udp." + domain;
+  const std::string tcpSrv = "_sip._tcp." + domain;
+  const std::vector<ServiceType> pref{ServiceType::SIP_UDP, ServiceType::SIP_TCP};
+
+  // Both SRV owner names have NO SRV record -> authoritative NXDOMAIN (not transient).
+  auto configure = [&](MockNode &a, MockNode &b)
+  {
+    for (auto *n : {&a, &b})
+    {
+      addTwoNaptrSets(*n, domain, udpSrv, tcpSrv);
+    }
+  };
+
+  SECTION("sync")
+  {
+    MockNode a(PORT_A), b(PORT_B);
+    configure(a, b);
+    auto r = makeResolver({PORT_A, PORT_B});
+    ServiceResolutionResult res = r->resolveServiceDomain(domain, pref);
+    REQUIRE_FALSE(res.isSuccess());
+    REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
+  }
+  SECTION("async")
+  {
+    MockNode a(PORT_A), b(PORT_B);
+    configure(a, b);
+    auto r = makeResolver({PORT_A, PORT_B});
+    ServiceResolutionResult res = driveServiceAsync(r, domain, pref);
+    REQUIRE_FALSE(res.isSuccess());
+    REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
+  }
+}
+
+// --- MEDIUM-1: sync and async agree on the mixed NAPTR-S case (SRV target wiped by A/AAAA) ---
+
+TEST_CASE("NAPTR-S mixed (transient SRV sibling + resolved-then-NXDOMAIN target): sync == async",
+          "[dns][failover][outcome][naptr][parity]")
+{
+  const std::string domain = "example.net";
+  const std::string udpSrv = "_sip._udp." + domain;
+  const std::string tcpSrv = "_sip._tcp." + domain;
+  const std::vector<ServiceType> pref{ServiceType::SIP_UDP, ServiceType::SIP_TCP};
+
+  // set 1 (_sip._udp) SERVFAILs on all servers (transient). set 2 (_sip._tcp) resolves to sip2, but
+  // sip2 has NO A/AAAA anywhere (authoritative NXDOMAIN) -> sip2 wiped. SRV DID produce a target, so
+  // the terminal avenue is the A/AAAA resolution (authoritative) -> PermanentNoService. Combining the
+  // transient SRV sibling with the permanent A/AAAA branch is CROSS-STEP (tracker 2026-09-30-1); Slice
+  // A must give the SAME answer sync and async (the round-2 fold made them disagree — MEDIUM-1).
+  auto configure = [&](MockNode &a, MockNode &b)
+  {
+    for (auto *n : {&a, &b})
+    {
+      addTwoNaptrSets(*n, domain, udpSrv, tcpSrv);
+      (*n)->configureQuery(udpSrv, "SRV", servfail());
+      (*n)->addRecord({tcpSrv, "SRV", "sip2." + domain, 3600, 10, 0, 5060});
+      // sip2: no A/AAAA -> NXDOMAIN
+    }
+  };
+
+  ResolutionOutcome syncOutcome, asyncOutcome;
+  {
+    MockNode a(PORT_A), b(PORT_B);
+    configure(a, b);
+    auto r = makeResolver({PORT_A, PORT_B});
+    syncOutcome = r->resolveServiceDomain(domain, pref).outcome;
+  }
+  {
+    MockNode a(PORT_A), b(PORT_B);
+    configure(a, b);
+    auto r = makeResolver({PORT_A, PORT_B});
+    asyncOutcome = driveServiceAsync(r, domain, pref).outcome;
+  }
+  REQUIRE(syncOutcome == asyncOutcome);                         // parity is the invariant under test
+  REQUIRE(syncOutcome == ResolutionOutcome::PermanentNoService); // Slice-A terminal-avenue answer
 }

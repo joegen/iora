@@ -788,6 +788,14 @@ private:
     }
   }
 
+  /// \brief The outcome for an avenue that produced NO usable target: TransientFailure (retryable)
+  ///        if any server-local exhaustion occurred, else PermanentNoService (authoritative). One
+  ///        named policy so the several empty-result sites cannot drift (steps-4-8 L-A).
+  static ResolutionOutcome noServiceOutcome(bool anyTransient)
+  {
+    return anyTransient ? ResolutionOutcome::TransientFailure : ResolutionOutcome::PermanentNoService;
+  }
+
   /// \brief Async next-server failover (RFC 1035 §7.2): the drop-in replacement for a direct
   ///        _transport->queryAsync(question, wrappedCallback) at every resolver async issue site.
   ///
@@ -848,10 +856,21 @@ private:
       if (chain->attempts >= n)
       {
         // Empty snapshot (n==0) OR all servers exhausted on server-local conditions -> terminal
-        // transient (retryable), delivered EXACTLY ONCE. Never a silent empty (ts-LOW-1).
-        deliver(DnsResult{},
-                std::make_exception_ptr(DnsTransientResolutionException(question.qname,
-                                                                       chain->lastServerLocalRcode)));
+        // transient (retryable), delivered EXACTLY ONCE. Never a silent empty (ts-LOW-1). The
+        // exception construction (string concat) is guarded too (LOW-1): a bad_alloc here on an
+        // async re-entry would otherwise be swallowed by the transport leaf catch and hang the
+        // no-backstop latch — so an OOM still yields exactly one terminal delivery.
+        std::exception_ptr transientEx;
+        try
+        {
+          transientEx = std::make_exception_ptr(
+            DnsTransientResolutionException(question.qname, chain->lastServerLocalRcode));
+        }
+        catch (...)
+        {
+          transientEx = std::current_exception();
+        }
+        deliver(DnsResult{}, transientEx);
         return;
       }
 
@@ -881,11 +900,10 @@ private:
             {
               // Record the last server-local rcode for a faithful terminal transient (L-2).
               // Written before this hop's CAS; read at exhaustion on the same/next hop — ordered by
-              // the acq_rel CAS handoff (same as `attempts`), so no atomic needed.
-              if (error == nullptr)
-              {
-                chain->lastServerLocalRcode = result.header.rcode;
-              }
+              // the acq_rel CAS handoff (same as `attempts`), so no atomic needed. An error-channel
+              // server-local (timeout/network, no rcode) records SERVFAIL, mirroring the sync leaf.
+              chain->lastServerLocalRcode =
+                (error == nullptr) ? result.header.rcode : DnsResponseCode::SERVFAIL;
               int expected = HANDOFF_PENDING;
               if (issued->compare_exchange_strong(expected, HANDOFF_CB_ADVANCE,
                                                   std::memory_order_acq_rel))
@@ -897,7 +915,23 @@ private:
               {
                 // expected == HANDOFF_ISSUER_DONE: the issuer already returned from the issue call
                 // (asynchronous completion) -> WE own the advance. Re-enter to the next server.
-                self->queryAsyncWithFailover(question, chain, wrappedCallback);
+                // Guard the re-entry (LOW-1): a bad_alloc copying wrappedCallback on this worker
+                // thread would otherwise be swallowed by the transport leaf catch and hang the
+                // no-backstop latch; deliver exactly one terminal instead.
+                try
+                {
+                  self->queryAsyncWithFailover(question, chain, wrappedCallback);
+                }
+                catch (...)
+                {
+                  try
+                  {
+                    wrappedCallback(DnsResult{}, std::current_exception());
+                  }
+                  catch (...)
+                  {
+                  }
+                }
               }
             }
             else
@@ -919,10 +953,12 @@ private:
       }
       catch (const DnsTimeoutException &)
       {
+        chain->lastServerLocalRcode = DnsResponseCode::SERVFAIL; // L-2 parity with the sync leaf
         continue; // synchronous server-local issue-throw (callback never armed) -> advance
       }
       catch (const DnsNetworkException &)
       {
+        chain->lastServerLocalRcode = DnsResponseCode::SERVFAIL; // L-2 parity with the sync leaf
         continue; // synchronous per-server network issue-throw (e.g. query-ID exhaustion) -> advance
       }
       catch (...)
@@ -946,7 +982,7 @@ private:
       {
         return;
       }
-      continue; // expected == 1: synchronous server-local completion asked to advance
+      continue; // expected == HANDOFF_CB_ADVANCE: synchronous server-local completion asked to advance
     }
   }
 
@@ -1742,12 +1778,18 @@ private:
       result.targets.push_back(target);
     }
 
+    // HIGH-A / MEDIUM-1: capture emptiness BEFORE address resolution, matching the async path
+    // (which decides the SRV-transient carry in runCompleter, before resolveTargetAddressesAsync).
+    // The SRV step is carried as the terminal avenue ONLY when it produced NO targets at all; if
+    // it produced targets that A/AAAA then wiped out, the terminal avenue is the A/AAAA resolution
+    // and its outcome stands. Combining a transient SRV sibling with a permanent A/AAAA branch is
+    // CROSS-STEP (deferred to tracker 2026-09-30-1); Slice A keeps sync == async here.
+    const bool noTargetsBeforeAddr = result.targets.empty();
+
     // Step 4: Resolve hostnames to IP addresses
     resolveTargetAddresses(result);
 
-    // HIGH-A: carry the SRV-step transient when NAPTR-S produced no usable target (SRV is terminal
-    // for NAPTR-S; resolveTargetAddresses over zero/failed targets would otherwise say Permanent).
-    if (result.targets.empty() && anySrvTransient &&
+    if (noTargetsBeforeAddr && anySrvTransient &&
         result.outcome != ResolutionOutcome::TransientFailure)
     {
       result.outcome = ResolutionOutcome::TransientFailure;
@@ -2451,8 +2493,7 @@ private:
     }
     else
     {
-      result.outcome =
-        anyTransient ? ResolutionOutcome::TransientFailure : ResolutionOutcome::PermanentNoService;
+      result.outcome = noServiceOutcome(anyTransient);
     }
   }
 
@@ -2931,8 +2972,7 @@ private:
         }
         else
         {
-          result->outcome =
-            *anyTransient ? ResolutionOutcome::TransientFailure : ResolutionOutcome::PermanentNoService;
+          result->outcome = noServiceOutcome(*anyTransient);
         }
         callback(*result, nullptr);
       });
@@ -3012,8 +3052,7 @@ private:
             const bool anyTransient =
               std::any_of(targetTransient->begin(), targetTransient->end(),
                           [](char c) { return c != 0; });
-            result->outcome = anyTransient ? ResolutionOutcome::TransientFailure
-                                           : ResolutionOutcome::PermanentNoService;
+            result->outcome = noServiceOutcome(anyTransient);
           }
           callback(*result, nullptr);
         }
