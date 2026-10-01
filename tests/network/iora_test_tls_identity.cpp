@@ -92,8 +92,9 @@ static void addExt(X509 *cert, X509V3_CTX *ctx, int nid, const std::string &valu
 
 /// Build a certificate. \p sanEntries are OpenSSL SAN tokens, e.g. "DNS:example.com",
 /// "IP:127.0.0.1", "DNS:*.example.com". notBefore/notAfter are offsets in seconds
-/// from now (negative notAfter => already expired). \p issuerCert/\p issuerKey ==
-/// self for a CA.
+/// from now (negative notAfter => already expired). Pass issuerCert == nullptr
+/// (and issuerKey == subjectKey) for a self-signed root CA; pass a non-null issuer
+/// to sign an intermediate CA (isCa=true) or a leaf (isCa=false) by that issuer.
 static X509Ptr makeCert(EVP_PKEY *subjectKey, X509 *issuerCert, EVP_PKEY *issuerKey,
                         const std::string &cn, const std::vector<std::string> &sanEntries,
                         bool isCa, long notBeforeSec, long notAfterSec)
@@ -110,11 +111,11 @@ static X509Ptr makeCert(EVP_PKEY *subjectKey, X509 *issuerCert, EVP_PKEY *issuer
   X509_NAME *sn = ::X509_get_subject_name(x);
   ::X509_NAME_add_entry_by_txt(sn, "CN", MBSTRING_ASC,
                                reinterpret_cast<const unsigned char *>(cn.c_str()), -1, -1, 0);
-  ::X509_set_issuer_name(x, isCa ? sn : ::X509_get_subject_name(issuerCert));
+  ::X509_set_issuer_name(x, issuerCert ? ::X509_get_subject_name(issuerCert) : sn);
 
   X509V3_CTX ctx;
   X509V3_set_ctx_nodb(&ctx); // macro: (ctx)->db = NULL — no :: prefix
-  ::X509V3_set_ctx(&ctx, isCa ? x : issuerCert, x, nullptr, nullptr, 0);
+  ::X509V3_set_ctx(&ctx, issuerCert ? issuerCert : x, x, nullptr, nullptr, 0);
   if (isCa)
   {
     addExt(x, &ctx, NID_basic_constraints, "critical,CA:TRUE");
@@ -218,6 +219,20 @@ struct TestPki
     lf->keyFile = std::make_unique<TempPem>(toPemKey(lf->key.get()), "key");
     return lf;
   }
+
+  // An intermediate CA signed BY this root (not self-signed) — for chain tests.
+  struct Ca
+  {
+    PkeyPtr key;
+    X509Ptr cert;
+  };
+  Ca intermediate(const std::string &cn)
+  {
+    auto k = genKey();
+    auto c = makeCert(k.get(), caCert.get(), caKey.get(), cn, {}, /*isCa=*/true, -3600,
+                      3600 * 24 * 365);
+    return Ca{std::move(k), std::move(c)};
+  }
 };
 
 // ── Bare-OpenSSL TLS server: accepts one connection, captures SNI, records the
@@ -318,7 +333,9 @@ struct BareTlsServer
 };
 
 // Build an iora client Transport with the given TLS client settings.
-static std::shared_ptr<Transport> makeClient(const std::string &caFile, bool verifyPeer)
+static std::shared_ptr<Transport> makeClient(const std::string &caFile, bool verifyPeer,
+                                             const std::string &clientCertFile = "",
+                                             const std::string &clientKeyFile = "")
 {
   TransportConfig cfg;
   cfg.protocol = Protocol::TCP;
@@ -326,6 +343,11 @@ static std::shared_ptr<Transport> makeClient(const std::string &caFile, bool ver
   cfg.clientTls.defaultMode = TlsMode::Client;
   cfg.clientTls.verifyPeer = verifyPeer;
   cfg.clientTls.caFile = caFile;
+  if (!clientCertFile.empty())
+  {
+    cfg.clientTls.certFile = clientCertFile; // present a client cert (mTLS)
+    cfg.clientTls.keyFile = clientKeyFile;
+  }
   auto client = Transport::tcp(std::move(cfg));
   REQUIRE(client->start().isOk());
   return client;
@@ -744,6 +766,79 @@ TEST_CASE("client-role guard: dual-role server accepts inbound TLS", "[tls][iden
   ::close(fd);
   ::SSL_CTX_free(cctx);
   server->stop();
+}
+
+// cert-chain presentation (SERVER): an iora LISTENER whose cert file holds
+// leaf+intermediate must PRESENT the intermediate so a client trusting ONLY the
+// root can build leaf->intermediate->root. This is RED on a leaf-only cert load
+// (SSL_CTX_use_certificate_file reads only the first PEM cert) and GREEN once the
+// engine uses SSL_CTX_use_certificate_chain_file. Teams requires the full chain.
+TEST_CASE("cert chain: server presents intermediate; root-only client verifies",
+          "[tls][identity][chain]")
+{
+  TestPki pki; // self-signed root CA
+  auto inter = pki.intermediate("iora-test-intermediate"); // intermediate CA signed by root
+  // server leaf signed by the INTERMEDIATE
+  auto leaf = pki.leaf("iora-server", {"DNS:iora-server", "IP:127.0.0.1"}, -3600,
+                       3600 * 24 * 365, inter.cert.get(), inter.key.get());
+  // the server cert file is the CHAIN: leaf first, then the intermediate
+  TempPem chain(toPemCert(leaf->cert.get()) + toPemCert(inter.cert.get()), "srvchain");
+
+  auto port = testnet::getFreePortTCP();
+  TransportConfig serverCfg;
+  serverCfg.protocol = Protocol::TCP;
+  serverCfg.serverTls.enabled = true;
+  serverCfg.serverTls.defaultMode = TlsMode::Server;
+  serverCfg.serverTls.certFile = chain.path; // leaf + intermediate
+  serverCfg.serverTls.keyFile = leaf->keyFile->path;
+  auto server = Transport::tcp(std::move(serverCfg));
+  std::atomic<int> acceptCount{0};
+  server->onAccept([&](SessionId, const TransportAddress &) { acceptCount++; });
+  REQUIRE(server->start().isOk());
+  REQUIRE(server->addListener("127.0.0.1", port, TlsMode::Server).isOk());
+
+  // iora client trusts ONLY the root; it can only succeed if the server sends the
+  // intermediate (otherwise there is no local issuer for the leaf).
+  auto client = makeClient(pki.caFile->path, /*verifyPeer=*/true);
+  auto r = client->connectSync("127.0.0.1", port, TlsMode::Client, httpsOpts("iora-server"),
+                               5000ms);
+  INFO("connect result: " << (r.isOk() ? "ok" : r.error().message));
+  REQUIRE(r.isOk());
+  REQUIRE(waitFor([&] { return acceptCount.load() > 0; }, 3000ms));
+  client->stop();
+  server->stop();
+}
+
+// cert-chain presentation (CLIENT / mTLS): an iora CLIENT whose client-cert file
+// holds leaf+intermediate must PRESENT the intermediate so a server that requires
+// a client cert and trusts ONLY the root can verify it. RED on a leaf-only load,
+// GREEN with SSL_CTX_use_certificate_chain_file on the client ctx.
+TEST_CASE("cert chain: client presents intermediate; root-only server verifies (mTLS)",
+          "[tls][identity][chain]")
+{
+  TestPki pki; // root CA == trust anchor on BOTH sides
+  // server leaf signed DIRECTLY by the root so the iora client (trusting root) accepts it
+  auto srvLeaf = pki.leaf("bare-server", {"DNS:bare-server", "IP:127.0.0.1"});
+  // intermediate CA signed by root; client leaf signed by the intermediate
+  auto inter = pki.intermediate("iora-client-intermediate");
+  auto cliLeaf = pki.leaf("iora-client", {"DNS:iora-client"}, -3600, 3600 * 24 * 365,
+                          inter.cert.get(), inter.key.get());
+  TempPem cliChain(toPemCert(cliLeaf->cert.get()) + toPemCert(inter.cert.get()), "clichain");
+
+  // bare server REQUIRES + verifies a client cert against ONLY the root
+  BareTlsServer server(srvLeaf->certFile->path, srvLeaf->keyFile->path, /*httpMode=*/false,
+                       /*clientCaPath=*/pki.caFile->path);
+  server.start();
+
+  // iora client presents the client CHAIN (leaf+intermediate); trusts root for the server cert
+  auto client = makeClient(pki.caFile->path, /*verifyPeer=*/true, cliChain.path,
+                           cliLeaf->keyFile->path);
+  auto r = client->connectSync("127.0.0.1", server.port, TlsMode::Client,
+                               httpsOpts("bare-server"), 5000ms);
+  INFO("connect result: " << (r.isOk() ? "ok" : r.error().message));
+  REQUIRE(r.isOk());
+  REQUIRE(waitFor([&] { return server.handshakeOk.load(); }, 3000ms));
+  client->stop();
 }
 
 namespace

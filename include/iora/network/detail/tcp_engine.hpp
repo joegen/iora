@@ -3984,8 +3984,12 @@ private:
           err(TransportError::Config, "server key not readable: " + _config.serverTls.keyFile);
           return false;
         }
-        if (::SSL_CTX_use_certificate_file(_sslSrv, _config.serverTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
-              1 ||
+        // Load the full chain (leaf + any intermediates in the PEM), not just the
+        // leaf: SSL_CTX_use_certificate_file reads only the first cert, so a peer
+        // trusting only the root CA cannot build a path and rejects the handshake
+        // (e.g. MS Teams Direct Routing requires the full chain). The chain variant
+        // is PEM-only and is equivalent to the leaf-only load for a single-cert file.
+        if (::SSL_CTX_use_certificate_chain_file(_sslSrv, _config.serverTls.certFile.c_str()) != 1 ||
             ::SSL_CTX_use_PrivateKey_file(_sslSrv, _config.serverTls.keyFile.c_str(), SSL_FILETYPE_PEM) != 1)
         {
           setLastFatal(IoResult::failure(TransportError::Config, "load server cert/key failed"));
@@ -4113,8 +4117,10 @@ private:
           err(TransportError::Config, "client cert not readable: " + _config.clientTls.certFile);
           return false;
         }
-        if (::SSL_CTX_use_certificate_file(_sslCli, _config.clientTls.certFile.c_str(), SSL_FILETYPE_PEM) !=
-            1)
+        // Load the full chain (leaf + intermediates) — see the server-ctx note
+        // above. Required for mutual TLS to a peer that trusts only the root
+        // (e.g. MS Teams).
+        if (::SSL_CTX_use_certificate_chain_file(_sslCli, _config.clientTls.certFile.c_str()) != 1)
         {
           setLastFatal(IoResult::failure(TransportError::Config, "client load cert failed"));
           err(TransportError::Config, "client load cert");
