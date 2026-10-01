@@ -59,6 +59,11 @@ struct TcpFixture
   SessionId serverSid{0};
   SessionId clientSid{0};
   std::string lastErrMsg;
+  // Peer host recorded at the FIRST onConnect/onAccept (guarded by callbackMutex) so a
+  // test can assert WHICH family a named-host connect actually used — a dual-bound
+  // listener accepts on both, so echo alone cannot prove ::1 was used (dualbind guard).
+  std::string connectPeerHost;
+  std::string acceptPeerHost;
 
   TcpFixture()
   {
@@ -69,6 +74,8 @@ struct TcpFixture
       acceptedSessions.push_back(sid);
       if (serverSid == 0)
         serverSid = sid;
+      if (acceptPeerHost.empty())
+        acceptPeerHost = addr.host;
       acceptCount++;
     };
     cbs.onConnect = [&](SessionId sid, const TransportAddress &addr)
@@ -77,6 +84,8 @@ struct TcpFixture
       connectedSessions.push_back(sid);
       if (clientSid == 0)
         clientSid = sid;
+      if (connectPeerHost.empty())
+        connectPeerHost = addr.host;
       connectCount++;
     };
     cbs.onData = [&](SessionId sid, iora::core::BufferView data,
@@ -158,6 +167,20 @@ struct TcpFixture
     sessionData.clear();
     errorMessages.clear();
     lastErrMsg.clear();
+    connectPeerHost.clear();
+    acceptPeerHost.clear();
+  }
+
+  // Locked snapshots of the first recorded peer host (empty if no connect/accept yet).
+  std::string connectPeer()
+  {
+    std::lock_guard<std::mutex> lock(callbackMutex);
+    return connectPeerHost;
+  }
+  std::string acceptPeer()
+  {
+    std::lock_guard<std::mutex> lock(callbackMutex);
+    return acceptPeerHost;
   }
 
   // Delegates to the shared iora::test::waitFor poll helper (same predicate-poll-until-
@@ -248,12 +271,14 @@ TEST_CASE("TCP loopback echo", "[tcp][echo]")
 TEST_CASE("TCP named-host connect (event-driven resolve)", "[tcp][resolve]")
 {
   // Connect by NAME (not an IP literal) so doConnect takes the off-thread
-  // resolve -> resumeConnect path (phase-2). "localhost" resolves via
-  // /etc/hosts, no network dependency.
+  // resolve -> resumeConnect path (phase-2). "localhost" resolves via getaddrinfo,
+  // which returns ::1 first whenever the host holds a global IPv6 address (glibc
+  // does not count the loopback address as a configured address for AI_ADDRCONFIG), so
+  // bind BOTH loopback families — otherwise the
+  // connect targets a family with no listener (tracker 2026-09-25-15).
   TcpFixture f;
   REQUIRE(f.tx.start().isOk());
-  auto port = testnet::getFreePortTCP();
-  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto port = testnet::addLoopbackListeners(f.tx, SOCK_STREAM, TlsMode::None);
 
   auto cr = f.tx.connect("localhost", port, TlsMode::None);
   REQUIRE(cr.isOk());
@@ -283,8 +308,8 @@ TEST_CASE("TCP named-host connect after restart (fresh post gate)", "[tcp][resol
   REQUIRE(f.tx.start().isOk()); // restart — fresh gate must be installed
   f.reset();
 
-  auto port = testnet::getFreePortTCP();
-  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  // Bind both loopback families (see the [tcp][resolve] case; tracker 2026-09-25-15).
+  auto port = testnet::addLoopbackListeners(f.tx, SOCK_STREAM, TlsMode::None);
 
   auto cr = f.tx.connect("localhost", port, TlsMode::None);
   REQUIRE(cr.isOk());
@@ -294,6 +319,126 @@ TEST_CASE("TCP named-host connect after restart (fresh post gate)", "[tcp][resol
   REQUIRE(f.closeCount == 0); // no spurious onClose(Resolve) after restart
 
   f.tx.stop();
+}
+
+TEST_CASE("addLoopbackListeners binds BOTH loopback families (dual-bind regression guard)",
+          "[tcp][resolve][dualbind]")
+{
+  // DETERMINISTIC guard (tracker 2026-09-25-15): the dual-bind helper must make the
+  // listener reachable at 127.0.0.1 AND ::1 on one port, so a named-host ("localhost")
+  // connect lands whichever family getaddrinfo returns first. Prove it with a raw
+  // blocking connect to each family — independent of the host's resolve order.
+  // v6Bound reflects the host: a ::1-capable host always gets a ::1 listener (the helper
+  // FAILs rather than degrade — that FAIL is what catches a ::1-path regression, in ANY
+  // caller), so here we simply test the ::1 path when v6Bound, and skip honestly when not.
+  TcpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  bool v6Bound = false;
+  auto port = testnet::addLoopbackListeners(f.tx, SOCK_STREAM, TlsMode::None, &v6Bound);
+
+  // 127.0.0.1 is always bound.
+  testnet::ScopedFd c4{::socket(AF_INET, SOCK_STREAM, 0)};
+  REQUIRE(c4.get() >= 0);
+  sockaddr_in a4{};
+  a4.sin_family = AF_INET;
+  a4.sin_port = htons(port);
+  a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  CHECK(::connect(c4.get(), reinterpret_cast<sockaddr *>(&a4), sizeof(a4)) == 0);
+
+  // ::1 is reachable iff a ::1 listener is up (honest skip only when the host lacks ::1).
+  if (v6Bound)
+  {
+    testnet::ScopedFd c6{::socket(AF_INET6, SOCK_STREAM, 0)};
+    REQUIRE(c6.get() >= 0);
+    sockaddr_in6 a6{};
+    a6.sin6_family = AF_INET6;
+    a6.sin6_port = htons(port);
+    a6.sin6_addr = in6addr_loopback;
+    CHECK(::connect(c6.get(), reinterpret_cast<sockaddr *>(&a6), sizeof(a6)) == 0);
+  }
+  else
+  {
+    WARN("::1 unavailable on loopback — dual-bind guard verified 127.0.0.1 only");
+  }
+
+  f.tx.stop();
+}
+
+TEST_CASE("named-host connect lands on the ::1 listener when ::1 resolves first (host-conditional)",
+          "[tcp][resolve][dualbind]")
+{
+  // Host-CONDITIONAL guard (tracker 2026-09-25-15, M-A): gate on the EXACT precondition
+  // — localhost resolving ::1-FIRST — using firstResolvedFamily (NOT ipv6OnlyNameAvailable,
+  // which is false for dual-family localhost and would skip on every host). The dual-bound
+  // listener accepts on BOTH families, so echo ALONE does not prove ::1 was used (review
+  // H1); assert the RECORDED peer host is ::1. Elsewhere the case skips honestly.
+  if (testnet::firstResolvedFamily("localhost", SOCK_STREAM) != AF_INET6)
+  {
+    WARN("localhost does not resolve ::1-first on this host; skipping ::1-first assertion");
+    SUCCEED();
+    return;
+  }
+  TcpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  bool v6Bound = false;
+  auto port = testnet::addLoopbackListeners(f.tx, SOCK_STREAM, TlsMode::None, &v6Bound);
+  REQUIRE(v6Bound); // localhost resolves ::1-first, so a ::1 listener must be up
+
+  auto cr = f.tx.connect("localhost", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
+  REQUIRE(f.waitForCondition([&]() { return f.connectCount > 0 && f.acceptCount > 0; }, 3000ms));
+
+  // Prove the connect actually used ::1 (the first-resolved family), not 127.0.0.1 —
+  // the echo below would pass either way, so the peer-family assertion is the real check.
+  REQUIRE(f.connectPeer() == "::1");
+  REQUIRE(f.acceptPeer() == "::1");
+
+  const char *msg = "v6-first";
+  REQUIRE(f.tx.send(cs, msg, std::strlen(msg)));
+  REQUIRE(f.waitForCondition([&]() { return f.dataFor(cs) == "v6-first"; }));
+
+  f.tx.stop();
+}
+
+TEST_CASE("DualRefusingEndpoint refuses on BOTH loopback families (dual-bind regression guard)",
+          "[tcp][resolve][dualbind]")
+{
+  // M2: a named-host refusal case must refuse whichever family resolves first. Prove the
+  // DualRefusingEndpoint RSTs a raw connect on each bound family (ECONNREFUSED), so the
+  // :246 terminal case and sid_surfacing refuse for the intended reason, deterministically.
+  testnet::DualRefusingEndpoint refuser;
+
+  // errno is captured into a local BEFORE the CHECK — Catch2's assertion machinery runs
+  // library code that may clobber errno between the connect and a later CHECK.
+  testnet::ScopedFd c4{::socket(AF_INET, SOCK_STREAM, 0)};
+  REQUIRE(c4.get() >= 0);
+  sockaddr_in a4{};
+  a4.sin_family = AF_INET;
+  a4.sin_port = htons(refuser.port());
+  a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int rc4 = ::connect(c4.get(), reinterpret_cast<sockaddr *>(&a4), sizeof(a4));
+  int e4 = errno;
+  CHECK(rc4 != 0);
+  CHECK(e4 == ECONNREFUSED);
+
+  if (refuser.v6Bound())
+  {
+    testnet::ScopedFd c6{::socket(AF_INET6, SOCK_STREAM, 0)};
+    REQUIRE(c6.get() >= 0);
+    sockaddr_in6 a6{};
+    a6.sin6_family = AF_INET6;
+    a6.sin6_port = htons(refuser.port());
+    a6.sin6_addr = in6addr_loopback;
+    int rc6 = ::connect(c6.get(), reinterpret_cast<sockaddr *>(&a6), sizeof(a6));
+    int e6 = errno;
+    CHECK(rc6 != 0);
+    CHECK(e6 == ECONNREFUSED);
+  }
+  else
+  {
+    WARN("::1 unavailable on loopback — DualRefusingEndpoint guard verified 127.0.0.1 only");
+  }
 }
 
 TEST_CASE("TCP stats verification", "[tcp][stats]")
@@ -753,7 +898,8 @@ TEST_CASE("TCP transport restart with existing sessions", "[tcp][restart]")
 // would have passed the entire suite identically.
 //
 // NOTE these build their OWN engine rather than using TcpFixture. TcpEngine takes
-// a COPY of the config in its constructor (tcp_engine.hpp:2793), and the fixture
+// a COPY of the config in its constructor (TcpEngine's `_config(config)` member init),
+// and the fixture
 // constructs `TcpEngine tx{cfg}` as a member initializer — so mutating f.cfg in a
 // test body never reaches the engine. A first version of this test did exactly
 // that and was VACUOUS; it passed with the cap set to 2 and four live sessions.

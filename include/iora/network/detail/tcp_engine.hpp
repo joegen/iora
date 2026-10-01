@@ -2424,9 +2424,12 @@ private:
     // AI_ADDRCONFIG: on an IPv4-only host, do NOT return AAAA for a dual-stack
     // FQDN — otherwise RFC 6724 orders the AAAA first and the single-address,
     // terminal-on-failure connect hits ENETUNREACH (a terminal fast-fail) without
-    // ever trying the reachable A record (sip-voip M-1). Loopback is exempt in
-    // glibc, so localhost/ip6-localhost resolution is unaffected. Resolution-time
-    // filtering, orthogonal to F2 multi-address failover.
+    // ever trying the reachable A record (sip-voip M-1). NOTE: glibc does NOT count
+    // the loopback address toward AI_ADDRCONFIG, so once the host holds a GLOBAL IPv6
+    // address, "localhost"/"ip6-localhost" DO return ::1 (sorted first) — a named-host
+    // connect then targets ::1, which only reaches a listener bound on that family
+    // (F2 owns the production failover; tests dual-bind — tracker 2026-09-25-15).
+    // Resolution-time filtering, orthogonal to F2 multi-address failover.
     hints.ai_flags = AI_ADDRCONFIG;
 
     PendingConnect &pc = _pendingConnects[cr.sid];

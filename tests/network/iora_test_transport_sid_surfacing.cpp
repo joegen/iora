@@ -170,14 +170,16 @@ TEST_CASE("TCP connectWith to a NAMED host (resumeConnect async path) delivers t
   // DP-SS8 / Phase 3.1 requires the named-host async-resolve path, distinct from the
   // literal-IP synchronous path: doConnect posts the resolve to the blockingIoPool, the
   // continuation posts runOnIoThread back, and the terminal fires from the I/O thread via
-  // the gate->m -> _cmdMutex edge. "localhost" resolves locally (no network DNS) and the
-  // dead port makes the post-resolve connect fail deterministically (ECONNREFUSED).
+  // the gate->m -> _cmdMutex edge. A DualRefusingEndpoint binds-not-listens on BOTH
+  // loopback families, so the post-resolve connect fails with ECONNREFUSED whichever
+  // family "localhost" resolves to first (::1 on a host with a global IPv6 address) —
+  // a bare dead port would black-hole the ::1 SYN on WSL2 instead. Tracker 2026-09-25-15.
   Client client(false);
   REQUIRE(client.tx->start().isOk());
-  const std::uint16_t deadPort = testnet::getFreePortTCP();
+  testnet::DualRefusingEndpoint refuser;
 
   SessionId sid = client.tx->allocateSid(); // onClose already registered (before connectWith)
-  auto cr = client.tx->connectWith(sid, "localhost", deadPort, TlsMode::None, {});
+  auto cr = client.tx->connectWith(sid, "localhost", refuser.port(), TlsMode::None, {});
   REQUIRE(cr.isOk());
   REQUIRE(cr.value() == sid);
 

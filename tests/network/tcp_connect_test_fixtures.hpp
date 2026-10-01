@@ -227,8 +227,12 @@ struct SinkServer
     };
     tx->setCallbacks(cbs);
     REQUIRE(tx->start().isOk());
-    port = testnet::getFreePortTCP();
-    REQUIRE(tx->addListener("127.0.0.1", port, tls ? TlsMode::Server : TlsMode::None).isOk());
+    // Bind BOTH loopback families so a named-host ("localhost") connect lands whichever
+    // family getaddrinfo returns first (::1 is first on a host with a global IPv6
+    // address — glibc does not count the loopback address as a configured address for
+    // AI_ADDRCONFIG; tracker 2026-09-25-15).
+    port = testnet::addLoopbackListeners(*tx, SOCK_STREAM,
+                                         tls ? TlsMode::Server : TlsMode::None);
   }
 
   ~SinkServer()

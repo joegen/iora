@@ -243,15 +243,20 @@ TEST_CASE("TCP literal single-address connect failure is terminal (unchanged)",
   f.tx->stop();
 }
 
-TEST_CASE("TCP named-host connect failure is terminal (single-address)",
+TEST_CASE("TCP named-host connect failure is terminal (first-address refused)",
           "[tcp][resolve][isolated]")
 {
-  // Resolve succeeds (localhost) then the single resolved address is refused:
-  // terminal, matching today's single-address behavior (no retry/failover here).
+  // Resolve succeeds (localhost -> possibly TWO addresses on a dual-stack host) then the
+  // FIRST resolved address is refused: terminal, matching today's try-only-the-first
+  // behavior (no retry/failover here — that is F2, 2026-09-06-3). DualRefusingEndpoint
+  // binds-not-listens on BOTH loopback families, so the connect is refused for the
+  // INTENDED reason (a bound endpoint RSTs) whichever family getaddrinfo returns first —
+  // not merely because nothing listens on ::1 (which on WSL2 would black-hole rather than
+  // refuse). Tracker 2026-09-25-15.
   ResolveFixture f{5000ms};
   REQUIRE(f.tx->start().isOk());
 
-  testnet::RefusingEndpoint refuser;
+  testnet::DualRefusingEndpoint refuser;
   auto cr = f.tx->connect("localhost", refuser.port(), TlsMode::None);
   REQUIRE(cr.isOk());
 
@@ -260,7 +265,9 @@ TEST_CASE("TCP named-host connect failure is terminal (single-address)",
   CHECK(f.closeCount == 1);
   {
     std::lock_guard<std::mutex> lock(f.m);
-    CHECK(f.lastCloseCode != TransportError::Resolve); // resolve succeeded; the connect failed
+    // Prove the INTENDED reason: the resolve succeeded and the connect was REFUSED
+    // (Connect), not that resolution failed (mirrors sid_surfacing).
+    CHECK(f.lastCloseCode == TransportError::Connect);
   }
 
   f.tx->stop();
@@ -278,8 +285,11 @@ TEST_CASE("TCP named-host TLS connect reaches SSL setup with the host (F1-no-reg
   // default 30s — the terminal is a TLS-layer failure, not a resolve failure.
   ResolveFixture f{5000ms, /*enableClientTls=*/true, /*handshakeTimeout=*/500ms};
   REQUIRE(f.tx->start().isOk());
-  auto port = testnet::getFreePortTCP();
-  REQUIRE(f.tx->addListener("127.0.0.1", port, TlsMode::None).isOk()); // plain server
+  // Plain server on BOTH loopback families: otherwise a ::1-first host refuses the
+  // connect before any TLS, and the test would pass without SSL setup ever running
+  // (it only checks != Resolve/None). Dual-bind makes the handshake actually reach —
+  // and fail at — the TLS layer against the plain peer. Tracker 2026-09-25-15.
+  auto port = testnet::addLoopbackListeners(*f.tx, SOCK_STREAM, TlsMode::None);
 
   auto cr = f.tx->connect("localhost", port, TlsMode::Client);
   REQUIRE(cr.isOk());
@@ -298,10 +308,12 @@ TEST_CASE("TCP named-host TLS connect reaches SSL setup with the host (F1-no-reg
     3000ms));
   {
     std::lock_guard<std::mutex> lock(f.m);
-    // The client terminal is a TLS-layer failure, NOT a resolve failure — the
-    // resolved path reached SSL setup with the host in scope.
-    CHECK(f.closeCodeBySid[clientSid] != TransportError::Resolve);
-    CHECK(f.closeCodeBySid[clientSid] != TransportError::None);
+    // The client terminal must be a TLS-LAYER failure (SSL setup ran on the resolved
+    // path, then the handshake timed out against the silent plain-TCP peer) — NOT a
+    // connect refusal. Asserting the exact code (not just != Resolve/None) is what
+    // makes this prove SSL setup ran: a refused ::1 would give Connect, which the old
+    // != Resolve/None check wrongly accepted.
+    CHECK(f.closeCodeBySid[clientSid] == TransportError::TLSHandshake);
   }
   CHECK(f.connectCount == 0); // handshake never completed against a non-TLS peer
 

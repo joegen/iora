@@ -96,37 +96,6 @@ struct ResolveFixture
   }
 };
 
-/// \brief True iff \p name resolves (via the production hints: AF_UNSPEC UDP +
-/// AI_ADDRCONFIG) to an IPv6-only address chain — the precondition for the
-/// AF-mismatch case against an IPv4 listener. Guards against hosts whose
-/// /etc/hosts lacks the ip6-localhost alias (ts-aside test-determinism).
-bool ipv6OnlyNameAvailable(const char *name)
-{
-  ::addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
-  hints.ai_protocol = IPPROTO_UDP;
-  hints.ai_flags = AI_ADDRCONFIG;
-  ::addrinfo *res = nullptr;
-  if (::getaddrinfo(name, "5060", &hints, &res) != 0 || res == nullptr)
-  {
-    return false;
-  }
-  bool hasV4 = false, hasV6 = false;
-  for (::addrinfo *ai = res; ai != nullptr; ai = ai->ai_next)
-  {
-    if (ai->ai_family == AF_INET)
-    {
-      hasV4 = true;
-    }
-    else if (ai->ai_family == AF_INET6)
-    {
-      hasV6 = true;
-    }
-  }
-  ::freeaddrinfo(res);
-  return hasV6 && !hasV4;
-}
 } // namespace
 
 // ── connect-site: resolve-timeout / teardown / close ────────────────────────
@@ -295,7 +264,7 @@ TEST_CASE("UDP named-host via-listener with a bogus listener id fires onClose(Co
 TEST_CASE("UDP named-host via-listener AF mismatch fires onClose(Config)",
           "[udp][via][resolve][isolated]")
 {
-  if (!ipv6OnlyNameAvailable("ip6-localhost"))
+  if (!testnet::ipv6OnlyNameAvailable("ip6-localhost", SOCK_DGRAM))
   {
     WARN("ip6-localhost is not IPv6-only-resolvable on this host; skipping AF-mismatch case");
     SUCCEED();

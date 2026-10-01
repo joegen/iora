@@ -287,8 +287,8 @@ TEST_CASE("UDP named-host pending buffering: sends during the resolve window flu
 {
   CtsFixture f{[] { TransportConfig c; c.resolveTimeout = 30000ms; return c; }()};
   REQUIRE(f.tx->start().isOk());
-  auto port = testnet::getFreePortUDP();
-  REQUIRE(f.tx->addListener("127.0.0.1", port, TlsMode::None).isOk());
+  // Bind both loopback families for the named-host connect (tracker 2026-09-25-15).
+  auto port = testnet::addLoopbackListeners(*f.tx, SOCK_DGRAM, TlsMode::None);
 
   resolvetest::PoolStall stall;
   stall.occupyWorkers();
@@ -321,8 +321,8 @@ TEST_CASE("UDP pending-buffer overflow drops OLDEST but keeps >=1 (floor-at-1)",
                  return c;
                }()};
   REQUIRE(f.tx->start().isOk());
-  auto port = testnet::getFreePortUDP();
-  REQUIRE(f.tx->addListener("127.0.0.1", port, TlsMode::None).isOk());
+  // Bind both loopback families for the named-host connect (tracker 2026-09-25-15).
+  auto port = testnet::addLoopbackListeners(*f.tx, SOCK_DGRAM, TlsMode::None);
 
   resolvetest::PoolStall stall;
   stall.occupyWorkers();
@@ -356,8 +356,8 @@ TEST_CASE("UDP multi-transaction burst to one next-hop preserves >=1 deliverable
                  return c;
                }()};
   REQUIRE(f.tx->start().isOk());
-  auto port = testnet::getFreePortUDP();
-  REQUIRE(f.tx->addListener("127.0.0.1", port, TlsMode::None).isOk());
+  // Bind both loopback families for the named-host connect (tracker 2026-09-25-15).
+  auto port = testnet::addLoopbackListeners(*f.tx, SOCK_DGRAM, TlsMode::None);
 
   resolvetest::PoolStall stall;
   stall.occupyWorkers();
@@ -471,8 +471,8 @@ TEST_CASE("UDP multi-transaction overflow evicts the oldest distinct request; ne
                  return c;
                }()};
   REQUIRE(f.tx->start().isOk());
-  auto port = testnet::getFreePortUDP();
-  REQUIRE(f.tx->addListener("127.0.0.1", port, TlsMode::None).isOk());
+  // Bind both loopback families for the named-host connect (tracker 2026-09-25-15).
+  auto port = testnet::addLoopbackListeners(*f.tx, SOCK_DGRAM, TlsMode::None);
 
   resolvetest::PoolStall stall;
   stall.occupyWorkers();

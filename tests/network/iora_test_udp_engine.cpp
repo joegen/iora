@@ -19,7 +19,7 @@ namespace
 struct UdpFixture
 {
   // `cfg` is a CONSTRUCTION-TIME SNAPSHOT: UdpEngine copies it BY VALUE at
-  // construction (udp_engine.hpp:58 `_config(config)`), so mutate cfg ONLY before
+  // construction (UdpEngine's `_config(config)` member init), so mutate cfg ONLY before
   // it reaches the engine. Build a TransportConfig, set fields, and pass it via
   // `UdpFixture f{cfg}`. A post-construction `f.cfg.X = ...` write is a SILENT
   // NO-OP — it never reaches the already-copied _config (this is the very defect
@@ -249,11 +249,13 @@ TEST_CASE("UDP loopback echo", "[udp][echo]")
 TEST_CASE("UDP named-host connect (event-driven resolve)", "[udp][resolve]")
 {
   // Connect by NAME so connectDo takes the off-thread resolve -> resumeConnect
-  // path (phase-4). "localhost" resolves via /etc/hosts, no network dependency.
+  // path (phase-4). "localhost" resolves via getaddrinfo, which returns ::1 first on
+  // a host with a global IPv6 address (glibc does not count the loopback address as a
+  // configured address for AI_ADDRCONFIG); bind
+  // BOTH loopback families so the connected UDP echo arrives (tracker 2026-09-25-15).
   UdpFixture f;
   REQUIRE(f.tx.start().isOk());
-  auto port = testnet::getFreePortUDP();
-  REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto port = testnet::addLoopbackListeners(f.tx, SOCK_DGRAM, TlsMode::None);
 
   auto cr = f.tx.connect("localhost", port, TlsMode::None);
   REQUIRE(cr.isOk());
@@ -267,6 +269,65 @@ TEST_CASE("UDP named-host connect (event-driven resolve)", "[udp][resolve]")
   REQUIRE(f.waitFor(f.clientGotEcho, 2000));
   REQUIRE_FALSE(f.sendFailed); // server-side echo send succeeded (recorded off-thread)
   REQUIRE(f.lastData == "udp named");
+
+  f.tx.stop();
+}
+
+TEST_CASE("addLoopbackListeners binds BOTH loopback families for UDP (dual-bind regression guard)",
+          "[udp][resolve][dualbind]")
+{
+  // M2: the UDP dual-bind hardening is PERMANENT (a connected UDP socket to a dead ::1
+  // cannot fail over — the datagram is silently lost). Prove the listener actually
+  // RECEIVES a datagram on 127.0.0.1 AND ::1. A ::1-capable host always gets a ::1
+  // listener (the helper FAILs rather than degrade), so v6Bound reflects the host.
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  bool v6Bound = false;
+  auto port = testnet::addLoopbackListeners(f.tx, SOCK_DGRAM, TlsMode::None, &v6Bound);
+
+  auto rawSendTo = [&](int family, const char *text)
+  {
+    testnet::ScopedFd s{::socket(family, SOCK_DGRAM, 0)};
+    REQUIRE(s.get() >= 0);
+    auto len = static_cast<ssize_t>(std::strlen(text));
+    if (family == AF_INET)
+    {
+      sockaddr_in a{};
+      a.sin_family = AF_INET;
+      a.sin_port = htons(port);
+      a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      CHECK(::sendto(s.get(), text, std::strlen(text), 0, reinterpret_cast<sockaddr *>(&a),
+                     sizeof(a)) == len);
+    }
+    else
+    {
+      sockaddr_in6 a{};
+      a.sin6_family = AF_INET6;
+      a.sin6_port = htons(port);
+      a.sin6_addr = in6addr_loopback;
+      CHECK(::sendto(s.get(), text, std::strlen(text), 0, reinterpret_cast<sockaddr *>(&a),
+                     sizeof(a)) == len);
+    }
+  };
+
+  auto received = [&](const char *text)
+  {
+    std::lock_guard<std::mutex> g(f.dataMutex);
+    return std::find(f.receivedData.begin(), f.receivedData.end(), text) !=
+           f.receivedData.end();
+  };
+
+  rawSendTo(AF_INET, "v4-dgram");
+  if (v6Bound)
+  {
+    rawSendTo(AF_INET6, "v6-dgram");
+  }
+
+  // Wait on the asserted PROPERTY (receivedData contents), not on dataCount — the fixture
+  // bumps dataCount before pushing to receivedData, so a dataCount wait could read the
+  // vector before the push.
+  REQUIRE(iora::test::waitFor(
+    [&] { return received("v4-dgram") && (!v6Bound || received("v6-dgram")); }, 3000ms));
 
   f.tx.stop();
 }
@@ -645,9 +706,9 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
   // Config now reaches the engine (tracker 2026-09-13-6). Drive deterministic
   // backpressure: a non-echoing peer + a shrunk client soSndBuf (4096, host-
   // independent EAGAIN) + a large-volume burst forces the client ::send to EAGAIN,
-  // growing the write queue past maxWriteQueue -> backpressureCloses++ (udp_engine
-  // .hpp:1930-1935). closeOnBackpressure then decides the ACTION: close the session
-  // (true, :1935) or drop the oldest queued datagram and keep it open (false, :1940).
+  // growing the write queue past maxWriteQueue -> backpressureCloses++ (in UdpEngine's
+  // send/queue path). closeOnBackpressure then decides the ACTION: close the session
+  // (true) or drop the oldest queued datagram and keep it open (false).
   //
   // NOTE on non-vacuity: backpressureCloses>=1 is VOLUME-driven — it fires under any
   // config given this burst — so it verifies only that the mechanism ran, NOT that
@@ -687,7 +748,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
 
   SECTION("closeOnBackpressure=true closes the session")
   {
-    // Covers the close action (udp_engine.hpp:1935). NOT config-discriminating on its
+    // Covers the close action (UdpEngine backpressure path). NOT config-discriminating on its
     // own (true == default), but exercises the close path under real backpressure.
     TransportConfig cfg;
     cfg.maxWriteQueue = 5;
@@ -701,7 +762,7 @@ TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
 
   SECTION("closeOnBackpressure=false keeps the session (drop-oldest)")
   {
-    // NON-default value -> drop-oldest path (udp_engine.hpp:1940); the session must
+    // NON-default value -> drop-oldest path (UdpEngine backpressure path); the session must
     // SURVIVE backpressure. This is the CONFIG-DISCRIMINATING assertion: reverting
     // closeOnBackpressure to the default (true) closes the session -> REQUIRE_FALSE
     // below fails. Also covers the previously-untested drop-oldest branch (cpp17-L4).

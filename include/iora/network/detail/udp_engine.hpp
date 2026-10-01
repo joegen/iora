@@ -1880,8 +1880,12 @@ private:
   /// \brief Named-host resolve hints (AF_UNSPEC UDP). AI_ADDRCONFIG: on an
   /// IPv4-only host, do NOT return AAAA for a dual-stack FQDN, otherwise the
   /// single-address terminal-on-failure connect hits ENETUNREACH on the AAAA
-  /// without trying the reachable A record (sip-voip M-1). Loopback is exempt in
-  /// glibc, so localhost/ip6-localhost resolution is unaffected.
+  /// without trying the reachable A record (sip-voip M-1). NOTE: glibc does NOT
+  /// count the loopback address toward AI_ADDRCONFIG, so on a host with a GLOBAL
+  /// IPv6 address "localhost"/"ip6-localhost" DO resolve to ::1 first — a connected
+  /// UDP socket to a dead ::1 even "connects"; the kernel later surfaces ICMP
+  /// port-unreachable as ECONNREFUSED on send/recv, but this engine does not handle it,
+  /// so the datagram's loss goes unreported (tracker 2026-09-25-15).
   static addrinfo namedResolveHints()
   {
     addrinfo hints{};
