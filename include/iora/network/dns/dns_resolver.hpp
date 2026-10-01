@@ -144,7 +144,7 @@ struct NaptrDirectTarget
 ///   - targets non-empty                                   => Resolved
 ///   - all servers rotated, still server-local/timeout      => TransientFailure
 ///   - authoritative negative (NXDOMAIN / authoritative NODATA:
-///     SOA present OR no NS, RFC 2308 §2.2.1)                => PermanentNoService
+///     SOA present OR no NS, RFC 2308 §2.2)                => PermanentNoService
 /// The CROSS-STEP combination across the RFC 3263 NAPTR→SRV→A/AAAA fall-forward chain
 /// (deepest-avenue-supersedes) is a SEPARATE slice (tracker 2026-09-30-1). Interim: a
 /// multi-step resolveServiceDomain carries the TERMINAL avenue's per-avenue outcome.
@@ -160,7 +160,7 @@ enum class ResolutionOutcome
   Resolved,          ///< Targets were produced (isSuccess()==true).
   TransientFailure,  ///< Server-local/timeout exhausted across all servers — RETRYABLE.
   PermanentNoService ///< Authoritative negative (NXDOMAIN / authoritative NODATA — SOA present or
-                     ///< no NS, RFC 2308 §2.2.1), or a terminal transport-lifecycle fault (see
+                     ///< no NS, RFC 2308 §2.2), or a terminal transport-lifecycle fault (see
                      ///< LIFECYCLE FAULT MAPPING above) — no service.
 };
 
@@ -304,7 +304,7 @@ private:
 ///
 /// Distinct TYPE from DnsResolutionFailedException / DnsNoRecordsException (which mark an
 /// AUTHORITATIVE negative — NXDOMAIN / authoritative NODATA, SOA present or no NS per RFC 2308
-/// §2.2.1). It derives from DnsResolverException
+/// §2.2). It derives from DnsResolverException
 /// so every existing `catch (const DnsResolverException&)` (including the RFC 3263 step-fallback
 /// handlers) still catches it; resolveHostname catches it FIRST to preserve the transient
 /// (retryable) vs permanent (no-service) distinction across its throwing return channel.
@@ -614,7 +614,7 @@ public:
   /// truncated (TC=1) non-positive answer; a lame empty answer (RA=0 AND AA=0, no SOA/NS); a
   /// CNAME-only answer without an SOA; and a thrown transport fault (timeout, connect/send failure,
   /// per-server query-ID exhaustion). AUTHORITATIVE (STOP rotation) covers: NXDOMAIN with RA or AA;
-  /// an authoritative NODATA (SOA present, or type-3 empty-authority with RA or AA, RFC 2308 §2.2.1);
+  /// an authoritative NODATA (SOA present, or type-3 empty-authority with RA or AA, RFC 2308 §2.2);
   /// and a CNAME-only answer WITH an SOA. Rotation continues until a Positive answer, an
   /// Authoritative negative, or all servers are exhausted. Server selection is OWNED here (never
   /// getNextServer()): one
@@ -787,7 +787,7 @@ private:
     }
     if (rc == DnsResponseCode::NOERROR)
     {
-      // NODATA (NOERROR + no answers). RFC 2308 §2.2.1: an authoritative NODATA is distinguished
+      // NODATA (NOERROR + no answers). RFC 2308 §2.2: an authoritative NODATA is distinguished
       // from a referral by the "presence of an SOA record ... OR the absence of NS records". So a
       // type-3 NODATA (empty authority: no SOA and no NS) IS authoritative — the name exists but
       // has no records of this type, and rotating to other recursive servers cannot change that.
@@ -2942,7 +2942,7 @@ private:
   }
 
   /// \brief True if a response carries an NS record in the authority section — the marker of a
-  ///        REFERRAL (RFC 2308 §2.2.1). A NOERROR/empty response with NS-but-no-SOA is a referral
+  ///        REFERRAL (RFC 2308 §2.2). A NOERROR/empty response with NS-but-no-SOA is a referral
   ///        (server-local: rotate to follow it); one with neither SOA nor NS is a type-3
   ///        authoritative NODATA. Used only by isAuthoritativeNegative (tracker 2026-09-30-4 H-1).
   static bool authorityHasNs(const DnsResult &result)
