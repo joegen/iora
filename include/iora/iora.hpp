@@ -1735,19 +1735,71 @@ protected:
       IORA_LOG_INFO("applyConfig: JsonFileStore disabled via features.jsonFileStore=false");
     }
 
+    // TLS configuration intent (fail-closed; see tracker 2026-09-24-11).
+    // An empty string counts as unset (matches the jsonrpcClient TLS convention).
+    // TLS is "requested" when any cert/key/ca path is set, or client-cert auth is
+    // explicitly turned on. requireClientCert contributes only when TRUE: an
+    // explicit requireClientCert=false alone must remain "not requested" so a
+    // stock plaintext config is never forced to fail. TLS is "complete" when both
+    // certFile and keyFile are present; caFile is required only for mTLS and that
+    // rule is enforced by WebhookServer::enableTls, not duplicated here.
+    auto tlsIsSet = [](const std::optional<std::string> &o)
+    { return o.has_value() && !o->empty(); };
+    const bool tlsRequested = tlsIsSet(_config.server.tls.certFile) ||
+                              tlsIsSet(_config.server.tls.keyFile) ||
+                              tlsIsSet(_config.server.tls.caFile) ||
+                              _config.server.tls.requireClientCert.value_or(false);
+    const bool tlsComplete = tlsIsSet(_config.server.tls.certFile) &&
+                             tlsIsSet(_config.server.tls.keyFile);
+
     // Webhook Server — gated by features.server
     if (_config.features.server.value_or(true))
     {
+      // Fail closed BEFORE constructing the server: a partially configured TLS
+      // listener must abort startup loudly, never silently downgrade to plaintext.
+      if (tlsRequested && !tlsComplete)
+      {
+        std::string present;
+        auto addPresent = [&present](bool on, const char *name)
+        {
+          if (on)
+          {
+            present.append(name).append(" ");
+          }
+        };
+        addPresent(tlsIsSet(_config.server.tls.certFile), "certFile");
+        addPresent(tlsIsSet(_config.server.tls.keyFile), "keyFile");
+        addPresent(tlsIsSet(_config.server.tls.caFile), "caFile");
+        addPresent(_config.server.tls.requireClientCert.value_or(false), "requireClientCert");
+        std::string missing;
+        if (!tlsIsSet(_config.server.tls.certFile))
+        {
+          missing.append("certFile ");
+        }
+        if (!tlsIsSet(_config.server.tls.keyFile))
+        {
+          missing.append("keyFile ");
+        }
+        const std::string msg =
+          "applyConfig: server.tls is partially configured and cannot enable TLS; "
+          "requested by [" +
+          present + "] but missing required field(s): [" + missing +
+          "] (certFile and keyFile are both required to enable TLS; caFile is required "
+          "only for mutual TLS / requireClientCert). Refusing to start in plaintext.";
+        IORA_LOG_ERROR(msg);
+        throw std::runtime_error(msg);
+      }
+
       std::string bindAddress = _config.server.bindAddress.value_or("0.0.0.0");
       auto port = _config.server.port.value_or(DEFAULT_PORT);
       _webhookServer = std::make_unique<network::WebhookServer>(bindAddress, port);
       IORA_LOG_INFO("applyConfig: Setting webhook server to bind on " << bindAddress << ":" << port);
 
-      // TLS
-      bool hasTls = _config.server.tls.certFile.has_value() &&
-                    _config.server.tls.keyFile.has_value() &&
-                    _config.server.tls.caFile.has_value();
-      if (hasTls)
+      // TLS — enabled when complete (cert+key). Any requested-but-incomplete config
+      // already threw above, so reaching here with tlsComplete means TLS was asked
+      // for. caFile is required only for mTLS; enableTls enforces that and validates
+      // every file.
+      if (tlsComplete)
       {
         IORA_LOG_INFO("applyConfig: TLS is enabled");
         network::WebhookServer::TlsConfig tlsCfg;
@@ -1758,7 +1810,25 @@ protected:
         IORA_LOG_INFO("applyConfig: Enabling TLS with certFile=" + tlsCfg.certFile +
                       ", keyFile=" + tlsCfg.keyFile + ", caFile=" + tlsCfg.caFile +
                       ", requireClientCert=" + (tlsCfg.requireClientCert ? "true" : "false"));
-        _webhookServer->enableTls(tlsCfg);
+        try
+        {
+          _webhookServer->enableTls(tlsCfg);
+        }
+        catch (const std::exception &e)
+        {
+          IORA_LOG_ERROR("applyConfig: server.tls: " << e.what());
+          _webhookServer.reset();
+          throw;
+        }
+        // Client-certificate enforcement is not yet wired in the transport
+        // (see tracker 2026-09-12-8); surface the gap so an operator who asked
+        // for mTLS is not misled into believing clients are authenticated.
+        if (tlsCfg.requireClientCert)
+        {
+          IORA_LOG_WARN("applyConfig: server.tls: client-certificate enforcement is not "
+                        "yet active (pending 2026-09-12-8); TLS listener provides server "
+                        "authentication only");
+        }
       }
       else
       {
@@ -1774,11 +1844,17 @@ protected:
       catch (const std::exception &e)
       {
         IORA_LOG_ERROR("applyConfig: Failed to start webhook server: " << e.what());
+        _webhookServer.reset();
         throw;
       }
     }
     else
     {
+      if (tlsRequested)
+      {
+        IORA_LOG_WARN("applyConfig: features.server is disabled; server.tls.* settings "
+                      "are ignored");
+      }
       IORA_LOG_INFO("applyConfig: WebhookServer disabled via features.server=false");
     }
 

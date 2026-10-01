@@ -216,6 +216,7 @@ set(SERVICE_TESTS
     service/iora_test_plugin_dependencies
     service/iora_test_plugin_isolation
     service/iora_test_features_config
+    service/iora_test_service_tls_config
     service/iora_test_api_module_reverse_map
     service/iora_test_callexportedapi_gating
     service/iora_test_loadfailure_teardown
