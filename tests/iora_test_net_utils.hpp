@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +23,27 @@
 
 namespace testnet
 {
+
+/// \brief Ignore SIGPIPE for the whole test PROCESS (sigaction, SIG_IGN).
+///
+/// A test binary that runs raw OpenSSL (SSL_write/SSL_shutdown) on its OWN threads is
+/// exposed to a process-killing SIGPIPE when a peer closes mid-write: the iora engine
+/// blocks SIGPIPE only on ITS I/O thread (pthread_sigmask), which does not cover the
+/// harness's bare-OpenSSL threads. A test binary owns its process, so ignoring the
+/// disposition here is legitimate (this is NOT done in library code).
+///
+/// Disposition (process-global, covers every thread regardless of when created) is used
+/// rather than a pthread_sigmask (per-thread, inherited only by later-created threads,
+/// and it would slip past a SIG_DFL-at-entry assertion). Call ONCE before any harness
+/// thread is spawned (e.g. a Catch2 testRunStarting listener). Must NOT be a static
+/// initializer: that would silently install it in every TU that includes this header,
+/// including the engine-guard lock binary that needs SIGPIPE at SIG_DFL.
+inline void ignoreSigpipeForTestProcess()
+{
+  struct sigaction sa{};
+  sa.sa_handler = SIG_IGN;
+  ::sigaction(SIGPIPE, &sa, nullptr);
+}
 
 /// \brief An RAII file descriptor: closes on scope exit, so a REQUIRE that throws
 /// mid-setup cannot leak the socket. Moving transfers ownership (source left empty).

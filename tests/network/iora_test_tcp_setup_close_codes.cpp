@@ -831,6 +831,26 @@ TEST_CASE("handshakeFailureErrno / sslFailureMessage / drainSslErrors classify t
   REQUIRE_FALSE(sslMsg.empty());
   REQUIRE(sslMsg.find("lib(0)") == std::string::npos);
 
+#ifdef ERR_SYSTEM_ERROR
+  // Write-side SSL_ERROR_SYSCALL on OpenSSL 3.x carries an ERR_LIB_SYS entry (not an empty
+  // queue). The message must still report the syscall errno: the captured errno wins, else
+  // the ERR_GET_REASON fallback recovers it (tracker 2026-09-25-17 H-alpha).
+  ::ERR_clear_error();
+  ERR_raise(ERR_LIB_SYS, EPIPE);
+  const unsigned long sysE = ::ERR_get_error();
+  REQUIRE(ERR_SYSTEM_ERROR(sysE));
+  REQUIRE(TA::sslFailureMessage(SSL_ERROR_SYSCALL, sysE, 0) == iora::core::errnoMessage(EPIPE));
+  REQUIRE(TA::sslFailureMessage(SSL_ERROR_SYSCALL, sysE, ECONNRESET) ==
+          iora::core::errnoMessage(ECONNRESET));
+  // sslFailureErrno is the single source of truth closeTlsIo uses for the reported
+  // sysErrno; it must agree with the message above (tracker 2026-09-25-17).
+  REQUIRE(TA::sslFailureErrno(SSL_ERROR_SYSCALL, sysE, 0) == EPIPE);          // recovered from the code
+  REQUIRE(TA::sslFailureErrno(SSL_ERROR_SYSCALL, sysE, ECONNRESET) == ECONNRESET); // captured errno wins
+  REQUIRE(TA::sslFailureErrno(SSL_ERROR_SSL, sysE, 0) == 0);                  // non-SYSCALL -> 0
+#endif
+  REQUIRE(TA::sslFailureErrno(SSL_ERROR_SYSCALL, 0, 0) == 0);                 // no errno, empty queue
+  REQUIRE(TA::sslFailureErrno(SSL_ERROR_SYSCALL, 0, ECONNRESET) == ECONNRESET);
+
   ::ERR_clear_error();
   ERR_raise(ERR_LIB_SSL, SSL_R_CERTIFICATE_VERIFY_FAILED);
   ERR_raise(ERR_LIB_SSL, SSL_R_UNEXPECTED_EOF_WHILE_READING);

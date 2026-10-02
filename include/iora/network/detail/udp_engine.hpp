@@ -160,6 +160,13 @@ public:
     }
     _loop = std::thread([this]
     {
+      // Block SIGPIPE on this I/O thread, as the FIRST action before any dispatch.
+      // Defense-in-depth parity with TcpEngine: all sends here already pass MSG_NOSIGNAL
+      // and UDP has no TLS/SSL write path, so there is no current SIGPIPE source -- but a
+      // thread-directed SIGPIPE blocked here stays pending, is never unblocked/drained,
+      // and is discarded at thread exit (library-safe, no process-wide disposition
+      // change). A thread/child process created from an I/O-thread callback inherits this
+      // blocked mask (survives exec), so reset SIGPIPE in a fork+exec child. (2026-09-25-17)
       sigset_t sigpipeSet;
       sigemptyset(&sigpipeSet);
       sigaddset(&sigpipeSet, SIGPIPE);

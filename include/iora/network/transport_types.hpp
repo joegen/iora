@@ -272,6 +272,9 @@ struct TransportAddress
 /// carry an OpenSSL ERR_get_error() code, an X509 verify result
 /// (X509_V_ERR_*), or an injected test code -- and the SSL_get_error() values
 /// SSL_ERROR_SYSCALL/SSL_ERROR_ZERO_RETURN (5/6) collide with X509_V_ERR 5/6.
+/// On OpenSSL 3.x it may also be NEGATIVE: a system-library error carries
+/// ERR_SYSTEM_FLAG (bit 31), and (int)code narrows to the low 32 bits and is
+/// negative because bit 31 is set; cast back to (unsigned) to recover the raw code.
 ///
 /// \c sysErrno is the discriminator. TcpEngine sets it from the errno captured
 /// immediately after the failing syscall, from getsockopt(SO_ERROR) for an

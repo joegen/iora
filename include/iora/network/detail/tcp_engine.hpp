@@ -272,9 +272,16 @@ public:
     {
       _loop = std::thread([this]
       {
-        // Block SIGPIPE on this I/O thread only. SSL_write uses the underlying
-        // send() without MSG_NOSIGNAL, so writing to a closed peer can deliver
-        // SIGPIPE. Blocking it per-thread avoids process-wide side effects.
+        // Block SIGPIPE on this I/O thread, as the FIRST action before any dispatch.
+        // SSL_do_handshake/SSL_write/SSL_shutdown write through BIO_s_socket's write(2)
+        // (no MSG_NOSIGNAL), so writing to a closed peer would deliver a process-killing
+        // SIGPIPE. SIGPIPE is thread-directed; blocked here it stays pending on this
+        // thread, is never unblocked/drained/sigwait'ed, and is discarded at thread exit
+        // -- library-safe, no process-wide disposition change. A per-thread block does
+        // NOT cover other threads (e.g. a test harness's bare-OpenSSL thread); those must
+        // guard SIGPIPE themselves. Side effect: a thread or child process created from an
+        // I/O-thread user callback inherits this blocked mask (it survives exec), so a
+        // fork+exec from such a callback should reset SIGPIPE in the child. (2026-09-25-17)
         sigset_t sigpipeSet;
         sigemptyset(&sigpipeSet);
         sigaddset(&sigpipeSet, SIGPIPE);
@@ -1795,13 +1802,9 @@ private:
       // it, so on restart a reused fd number would keep the stale tag (emplace does not
       // overwrite) and handleFdEvent would dereference the freed Session (UAF).
       _fdTags.erase(s->fd); // erase-by-key: no-op if absent (matches the UDP _tags.erase idiom)
-      // SSL_shutdown before close(fd) — same ordering as closeNow (still on the live fd)
-      if (s->ssl)
-      {
-        ::SSL_shutdown(s->ssl);
-        ::SSL_free(s->ssl);
-        s->ssl = nullptr;
-      }
+      // Teardown before close(fd) — same ordering/hygiene as closeNow (2026-09-25-17).
+      sslTeardown(s->ssl);
+      s->ssl = nullptr;
       fdsToClose.emplace_back(s->fd, &_preCloseHook); // ::close after _sessions.clear()
       _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
       _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
@@ -3222,19 +3225,53 @@ private:
     bool unexpectedEof = false;
     const unsigned long e = drainSslErrors(unexpectedEof);
     failHandshake(s, sslFailureMessage(errc, e, hsErrno),
-                  handshakeFailureErrno(errc, hsErrno, e, unexpectedEof), (int)e);
+                  handshakeFailureErrno(errc, hsErrno, e, unexpectedEof), static_cast<int>(e));
     return false;
   }
 
-  /// \brief Close message for a failed SSL call. SSL_ERROR_SYSCALL leaves the
-  /// OpenSSL error queue empty (ERR_error_string would read
-  /// "error:00000000:lib(0)::reason(0)"), so it reports the syscall errno text, or
-  /// "unexpected EOF" when errno is 0; otherwise the queued OpenSSL error string.
+  /// \brief Close message for a failed SSL call. On SSL_ERROR_SYSCALL the error queue
+  /// MAY be empty (read-side errors) OR carry an ERR_LIB_SYS entry (write-side failures
+  /// on OpenSSL 3.x -- tls_retry_write_records raises ERR_LIB_SYS); either way the useful
+  /// text is the syscall errno, or "unexpected EOF" when there is no errno. For other
+  /// SSL errors it is the queued OpenSSL error string. (tracker 2026-09-25-17)
+  /// \brief The syscall errno for a failed SSL_read/SSL_write (SSL_get_error \p sslError,
+  /// drained first code \p errCode, captured \p sysErrno): 0 for a non-SYSCALL error;
+  /// otherwise the captured errno, else (OpenSSL 3.x write-side) the errno carried in a
+  /// system-library error code, else 0. Single source of truth so closeTlsIo's reported
+  /// sysErrno and sslFailureMessage agree (tracker 2026-09-25-17).
+  static int sslFailureErrno(int sslError, unsigned long errCode, int sysErrno)
+  {
+    if (sslError != SSL_ERROR_SYSCALL)
+    {
+      return 0;
+    }
+    if (sysErrno != 0)
+    {
+      return sysErrno;
+    }
+#ifdef ERR_SYSTEM_ERROR
+    if (errCode != 0 && ERR_SYSTEM_ERROR(errCode))
+    {
+      return static_cast<int>(ERR_GET_REASON(errCode));
+    }
+#endif
+    return 0;
+  }
+
   static std::string sslFailureMessage(int sslError, unsigned long errCode, int sysErrno)
   {
-    if (sslError == SSL_ERROR_SYSCALL && errCode == 0)
+    if (sslError == SSL_ERROR_SYSCALL)
     {
-      return sysErrno != 0 ? iora::core::errnoMessage(sysErrno) : std::string("unexpected EOF");
+#ifdef ERR_SYSTEM_ERROR
+      const bool sysEntry = (errCode == 0) || ERR_SYSTEM_ERROR(errCode);
+#else
+      const bool sysEntry = (errCode == 0);
+#endif
+      if (sysEntry)
+      {
+        const int en = sslFailureErrno(sslError, errCode, sysErrno);
+        return en != 0 ? iora::core::errnoMessage(en) : std::string("unexpected EOF");
+      }
     }
     char msg[256];
     ::ERR_error_string_n(errCode, msg, sizeof(msg));
@@ -3286,13 +3323,51 @@ private:
     return 0;
   }
 
+  /// \brief Tear down an SSL* with the hygiene a shared I/O thread needs (tracker
+  /// 2026-09-25-17): SSL_shutdown is skipped while the session is still in handshake
+  /// (SSL_get_error(3) forbids it then; it would only push SSL_R_SHUTDOWN_WHILE_IN_INIT);
+  /// on a fatal close the caller first sets SSL_set_quiet_shutdown, so SSL_shutdown does
+  /// no I/O and pushes no error; then the per-thread error queue is cleared so no residue
+  /// reaches the user onClose callback that runs next on this thread.
+  static void sslTeardown(SSL *ssl)
+  {
+    if (ssl == nullptr)
+    {
+      return;
+    }
+    if (::SSL_is_init_finished(ssl))
+    {
+      // On a clean close this sends close_notify. On a fatal close, closeTlsIo has already
+      // set SSL_set_quiet_shutdown, so per SSL_CTX_set_quiet_shutdown(3) this is a
+      // flags-only no-op (no alert, no I/O, no error pushed) -- the deliberate, inert way
+      // to honor "no SSL_shutdown I/O after SSL_ERROR_SYSCALL/SSL_ERROR_SSL".
+      ::SSL_shutdown(ssl);
+    }
+    ::SSL_free(ssl);
+    ::ERR_clear_error();
+  }
+
   /// \brief Close \p s with TLSIO for a failed SSL_read/SSL_write (\p sslError from
   /// SSL_get_error, \p sysErrno the errno captured right after the call).
   void closeTlsIo(Session *s, int sslError, int sysErrno)
   {
-    const unsigned long e = ::ERR_get_error();
+    // Full-drain the per-thread error queue (keep the FIRST/earliest code -- the one
+    // SSL_get_error peeked); a single ERR_get_error() would leave residue that
+    // misclassifies the NEXT session's SSL op on this I/O thread (2026-09-25-17).
+    bool unexpectedEof = false;
+    const unsigned long e = drainSslErrors(unexpectedEof);
+    // SSL_get_error(3): after SSL_ERROR_SYSCALL/SSL_ERROR_SSL no further I/O may run and
+    // SSL_shutdown must not be called. Quiet-shutdown so sslTeardown's SSL_shutdown (on an
+    // init-finished session) does no I/O and pushes no error (M-theta).
+    if (s->ssl != nullptr && (sslError == SSL_ERROR_SYSCALL || sslError == SSL_ERROR_SSL))
+    {
+      ::SSL_set_quiet_shutdown(s->ssl, 1);
+    }
+    // Reported sysErrno is recovered by the same rule as the message (sslFailureErrno), so
+    // TransportErrorInfo.sysErrno and the message agree on a 3.x write-side SYSCALL where the
+    // errno lives only in the drained ERR_LIB_SYS code.
     closeNow(s, TransportError::TLSIO, sslFailureMessage(sslError, e, sysErrno),
-             sslError == SSL_ERROR_SYSCALL ? sysErrno : 0, (int)e);
+             sslFailureErrno(sslError, e, sysErrno), static_cast<int>(e));
   }
 
   void readAvail(Session *s)
@@ -3310,6 +3385,10 @@ private:
           return;
         }
 
+        // Clear the per-thread OpenSSL error queue before the op (after the B6 hook) so
+        // SSL_get_error classifies reliably and no residue from a prior session's failure
+        // on this I/O thread leaks into this one (tracker 2026-09-25-17, H-alpha).
+        ::ERR_clear_error();
         errno = 0;
         n = ::SSL_read(s->ssl, buf.data(), (int)buf.size());
         const int readErrno = errno;
@@ -3395,6 +3474,10 @@ private:
           return;
         }
 
+        // Clear the per-thread OpenSSL error queue before the op (after the B6 hook) so
+        // SSL_get_error classifies reliably and no residue leaks across sessions on this
+        // I/O thread (tracker 2026-09-25-17, H-alpha).
+        ::ERR_clear_error();
         errno = 0;
         n = ::SSL_write(s->ssl, d.data(), (int)d.size());
         const int writeErrno = errno;
@@ -3603,6 +3686,10 @@ private:
         }
 
         IORA_LOG_DEBUG("[IO-THREAD] About to call SSL_write for sid=" << sr.sid << ", size=" << sr.payload.size());
+        // Clear the per-thread OpenSSL error queue before the op (after the B6 hook) so
+        // SSL_get_error classifies reliably and no residue leaks across sessions on this
+        // I/O thread (tracker 2026-09-25-17, H-alpha).
+        ::ERR_clear_error();
         errno = 0;
         n = ::SSL_write(s->ssl, sr.payload.data(), (int)sr.payload.size());
         const int writeErrno = errno;
@@ -3735,13 +3822,12 @@ private:
     }
     // s is now dangling — use only saved locals below
 
-    // SSL_shutdown BEFORE close(fd) — send close_notify on the live fd.
-    // After ::close(fd), the fd number may be reused by another connection.
-    if (ssl)
-    {
-      ::SSL_shutdown(ssl);
-      ::SSL_free(ssl);
-    }
+    // Teardown BEFORE close(fd) — any close_notify goes out on the live fd (after
+    // ::close the fd number may be reused). sslTeardown skips SSL_shutdown for an
+    // in-handshake session and does no I/O after a fatal error (quiet-shutdown set in
+    // closeTlsIo), and clears the error queue so no residue reaches onClose on this
+    // thread (tracker 2026-09-25-17).
+    sslTeardown(ssl);
 
     // A scoped detail::FdCloser runs the pre-close seam + ::close here (fd-reuse fix,
     // tracker 2026-09-15-3) — the single close primitive shared with shutdownDrain.

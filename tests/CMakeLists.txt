@@ -115,6 +115,7 @@ set(NETWORK_TESTS
     network/iora_test_transport_sid_surfacing
     network/iora_test_transport_sync_dscp_fixes
     network/iora_test_tls_identity
+    network/iora_test_tcp_engine_sigpipe_guard
     network/iora_test_engine_introspection
     network/iora_test_tcp_setup_close_codes
     # Event-driven DNS-resolve tests (tracker 2026-09-06-4). The three below

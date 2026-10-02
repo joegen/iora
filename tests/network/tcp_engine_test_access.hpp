@@ -145,12 +145,29 @@ struct TcpEngineTestAccess
     return TcpEngine::sslFailureMessage(sslError, errCode, sysErrno);
   }
 
+  static int sslFailureErrno(int sslError, unsigned long errCode, int sysErrno)
+  {
+    return TcpEngine::sslFailureErrno(sslError, errCode, sysErrno);
+  }
+
   static unsigned long drainSslErrors(bool &unexpectedEof)
   {
     return TcpEngine::drainSslErrors(unexpectedEof);
   }
 
   static bool isLocalResourceErrno(int e) { return TcpEngine::isLocalResourceErrno(e); }
+
+  /// I/O thread ONLY: the live socket fd for \p sid, or -1 if the session is gone.
+  /// Lock-free _sessions lookup (same discipline as cancelConnectTimerKeepId): the
+  /// I/O thread is the sole writer of _sessions, so a reader on that thread needs no
+  /// _sessionRwMutex. Used by a beforeSslWrite hook to ::shutdown(fd, SHUT_WR) the
+  /// session's OWN socket, forcing a deterministic write-after-close EPIPE/SIGPIPE.
+  static int sessionFd(TcpEngine &e, SessionId sid)
+  {
+    assert(e.isOnIoThread() && "sessionFd must be called on the I/O thread");
+    auto it = e._sessions.find(sid);
+    return it == e._sessions.end() ? -1 : it->second->fd;
+  }
 };
 
 } // namespace network

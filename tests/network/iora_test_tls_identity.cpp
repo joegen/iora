@@ -56,6 +56,25 @@
 using namespace iora::network;
 using namespace std::chrono_literals;
 
+// SIGPIPE guard for THIS test process. The bare-OpenSSL harness servers/clients below
+// run SSL_write/SSL_shutdown on their OWN threads (not the engine's SIGPIPE-blocked I/O
+// thread); a peer that closes mid-write would otherwise raise a process-killing SIGPIPE
+// (exit 141). The test binary owns its process, so ignoring SIGPIPE here is legitimate
+// (NOT done in library code). Installed in testRunStarting, before any TEST_CASE spawns
+// a harness thread. (tracker 2026-09-25-17)
+namespace
+{
+struct SigpipeIgnoreListener : Catch::TestEventListenerBase
+{
+  using TestEventListenerBase::TestEventListenerBase;
+  void testRunStarting(Catch::TestRunInfo const &) override
+  {
+    testnet::ignoreSigpipeForTestProcess();
+  }
+};
+} // namespace
+CATCH_REGISTER_LISTENER(SigpipeIgnoreListener)
+
 namespace
 {
 using namespace std::chrono_literals;
