@@ -496,6 +496,12 @@ struct TransportConfig
   // is an aggregate-budget violation — see the iora_sip budget assert, tracker
   // 2026-09-06-4 task-5.2). See architecture/iora/transport_dns_resolve.json C6.
   std::chrono::milliseconds resolveTimeout{5000};
+  /// \brief GC safety-net: close a session that has made no write progress for this long
+  /// while it still has queued data. count()==0 disables it (the default). UDP ServerPeers
+  /// share one per-listener write queue, so on a listener stall this reclaims the owner of
+  /// the FRONT (oldest) queued datagram, one per writeStallTimeout. NOTE: a shared-socket
+  /// EAGAIN is socket-wide (SO_SNDBUF/qdisc), so this is a VICTIM policy that bounds queued-
+  /// datagram retention — it does not identify or unwedge the stalled socket.
   std::chrono::milliseconds writeStallTimeout{0};
   std::chrono::seconds gcInterval{5};
 
@@ -516,6 +522,12 @@ struct TransportConfig
   /// session (WriteBackpressure); false drops the OLDEST queued datagram and keeps
   /// the new one. TcpEngine ignores it: TCP/TLS sessions always close on overflow
   /// (see maxWriteQueue).
+  /// Shared-queue victim policy (ServerPeer sessions share one per-listener write
+  /// queue): on OVERFLOW the event is attributed to the session whose send tipped the
+  /// queue over — in close mode THAT session is closed (its own queued datagrams purged
+  /// by sid); in drop-oldest mode the global front is dropped, which may be a DIFFERENT
+  /// peer's oldest datagram. (The separate writeStallTimeout GC backstop instead reclaims
+  /// the owner of the front datagram on a sustained listener stall — see writeStallTimeout.)
   bool closeOnBackpressure{true};
   bool useEdgeTriggered{true};
 
@@ -666,6 +678,9 @@ struct TransportStats
   std::uint64_t gcRuns{0};
   std::uint64_t gcClosedIdle{0};
   std::uint64_t gcClosedAged{0};
+  /// \brief Count of write-queue OVERFLOW events, in BOTH modes — a session closed on
+  /// overflow (closeOnBackpressure=true) AND an oldest-datagram drop (=false) — NOT a
+  /// count of closes. (A separate backpressureDrops split is tracked in 2026-05-12-2.)
   std::uint64_t backpressureCloses{0};
   std::size_t sessionsCurrent{0};
   std::size_t sessionsPeak{0};

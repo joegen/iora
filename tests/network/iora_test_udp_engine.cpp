@@ -1,8 +1,11 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 #include "iora/network/detail/udp_engine.hpp"
+#include "udp_engine_test_access.hpp"
 #include "iora_test_net_utils.hpp"
 #include "test_helpers.hpp"
+
+#include <cstdio>
 
 using namespace std::chrono_literals;
 using UdpEngine = iora::network::UdpEngine;
@@ -191,6 +194,13 @@ struct UdpFixture
   template <typename Pred> bool waitForStats(Pred pred, int ms = 5000)
   {
     return pollUntil([&] { return pred(tx.getStats()); }, ms);
+  }
+
+  // Generic bounded poll of an arbitrary predicate (not a stats predicate) — e.g. waiting
+  // for a RecordingPeer to receive N datagrams (simpl L-7).
+  template <typename Pred> bool waitUntil(Pred pred, int ms = 2000)
+  {
+    return pollUntil(pred, ms);
   }
 
 private:
@@ -701,81 +711,491 @@ TEST_CASE("UDP max connection age", "[udp][gc][age]")
   f.tx.stop();
 }
 
-TEST_CASE("UDP backpressure handling", "[udp][backpressure]")
+// A small payload recorder: a separate UDP engine whose onData appends every datagram it
+// receives, so drop-oldest ORDER can be verified after the drain.
+namespace
 {
-  // Config now reaches the engine (tracker 2026-09-13-6). Drive deterministic
-  // backpressure: a non-echoing peer + a shrunk client soSndBuf (4096, host-
-  // independent EAGAIN) + a large-volume burst forces the client ::send to EAGAIN,
-  // growing the write queue past maxWriteQueue -> backpressureCloses++ (in UdpEngine's
-  // send/queue path). closeOnBackpressure then decides the ACTION: close the session
-  // (true) or drop the oldest queued datagram and keep it open (false).
-  //
-  // NOTE on non-vacuity: backpressureCloses>=1 is VOLUME-driven — it fires under any
-  // config given this burst — so it verifies only that the mechanism ran, NOT that
-  // config reached the engine. The config-DISCRIMINATING observable is the ACTION
-  // (anyClosed): the closeOnBackpressure=false section below asserts the session
-  // SURVIVES, which fails if the value is reverted to the default (true). soSndBuf
-  // and maxWriteQueue are determinism aids, not discriminators (loopback backpressure
-  // is inherently volume-driven; cpp17-F6/L1).
-
-  // Shared driver: stand up a non-echoing server, connect the fixture's client to it,
-  // burst datagrams, and confirm the backpressure mechanism fired. tx2's callbacks
-  // capture nothing, so its teardown (stop()+join here) is order-independent.
-  auto drive = [](UdpFixture &f)
+struct RecordingPeer
+{
+  TransportConfig cfg{};
+  UdpEngine tx{cfg};
+  std::mutex mu;
+  std::vector<std::string> got;
+  RecordingPeer()
   {
-    REQUIRE(f.tx.start().isOk());
-    TransportConfig cfg2{};
-    UdpEngine tx2{cfg2};
-    iora::network::detail::EngineBase::Callbacks cbs2{};
-    cbs2.onData = [](SessionId, iora::core::BufferView,
-                     std::chrono::steady_clock::time_point) { /* receive, don't echo */ };
-    tx2.setCallbacks(std::move(cbs2));
-    REQUIRE(tx2.start().isOk());
-    auto port2 = testnet::getFreePortUDP();
-    (void)tx2.addListener("127.0.0.1", port2, TlsMode::None);
-
-    SessionId cs = f.tx.connect("127.0.0.1", port2, TlsMode::None).value();
-    REQUIRE(f.waitFor(f.connected));
-
-    std::string bigMsg(4000, 'X');
-    for (int i = 0; i < 2000; ++i)
+    iora::network::detail::EngineBase::Callbacks cbs{};
+    cbs.onData = [this](SessionId, iora::core::BufferView bv,
+                        std::chrono::steady_clock::time_point)
     {
-      f.tx.send(cs, bigMsg.data(), bigMsg.size());
+      std::lock_guard<std::mutex> g(mu);
+      got.emplace_back(reinterpret_cast<const char *>(bv.data()), bv.size());
+    };
+    tx.setCallbacks(std::move(cbs));
+  }
+  ~RecordingPeer() noexcept
+  {
+    try
+    {
+      tx.stop();
     }
-    REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 3000));
-    tx2.stop(); // join tx2's I/O thread before it leaves scope
-  };
-
-  SECTION("closeOnBackpressure=true closes the session")
+    catch (...)
+    {
+    }
+  }
+  std::vector<std::string> snapshot()
   {
-    // Covers the close action (UdpEngine backpressure path). NOT config-discriminating on its
-    // own (true == default), but exercises the close path under real backpressure.
+    std::lock_guard<std::mutex> g(mu);
+    return got;
+  }
+};
+
+// Distinct 4-char tag per datagram ("D000".."D999"), so order/content is checkable.
+// (No `inline`: internal linkage already applies in this anonymous namespace — simpl L-8.)
+std::string bpTag(int i)
+{
+  char b[8];
+  std::snprintf(b, sizeof(b), "D%03d", i);
+  return std::string(b);
+}
+
+// --- Shared setup helpers (simpl L-5/L-6); REQUIREs inside free helpers throw correctly. ---
+
+// Start f.tx + a RecordingPeer, connect a client session from f to the peer; return the sid.
+SessionId connectToPeer(UdpFixture &f, RecordingPeer &peer)
+{
+  REQUIRE(f.tx.start().isOk());
+  REQUIRE(peer.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  REQUIRE(peer.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  SessionId cs = cr.value();
+  REQUIRE(f.waitFor(f.connected));
+  return cs;
+}
+
+struct ListenerRig
+{
+  ListenerId lid;
+  std::uint16_t port;
+};
+// Start f.tx and add a listener on a free port; return {lid, port}.
+ListenerRig startWithListener(UdpFixture &f)
+{
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  return {lr.value(), port};
+}
+
+// Two via-sessions from f's listener to one peer port; return {ss1, ss2} (ss1 is indexed).
+std::pair<SessionId, SessionId> twinVias(UdpFixture &f, ListenerId lid, std::uint16_t peerPort)
+{
+  auto r1 = f.tx.connectViaListener(lid, "127.0.0.1", peerPort);
+  auto r2 = f.tx.connectViaListener(lid, "127.0.0.1", peerPort);
+  REQUIRE(r1.isOk());
+  REQUIRE(r2.isOk());
+  return {r1.value(), r2.value()};
+}
+
+struct ServerPeerRig
+{
+  ListenerId lid;
+  SessionId ss;
+};
+// Stand up f.tx as server with a listener; an external client `cli` pokes it so it accepts a
+// ServerPeer; return {lid, ss}. `cli` must outlive use of the rig (it owns the poke socket).
+ServerPeerRig makeServerPeer(UdpFixture &f, UdpEngine &cli)
+{
+  auto rig = startWithListener(f);
+  iora::network::detail::EngineBase::Callbacks ccbs{}; // client discards
+  cli.setCallbacks(std::move(ccbs));
+  REQUIRE(cli.start().isOk());
+  auto ccr = cli.connect("127.0.0.1", rig.port, TlsMode::None);
+  REQUIRE(ccr.isOk());
+  SessionId ccs = ccr.value();
+  const char *poke = "hi";
+  (void)cli.send(ccs, poke, 2); // buffered through _connecting if needed (A3.1b)
+  REQUIRE(f.waitFor(f.accepted));
+  return {rig.lid, f.serverSid}; // serverSid published via the `accepted` atomic (one accept)
+}
+} // namespace
+
+// Backpressure is driven DETERMINISTICALLY and host-independently by the per-session
+// forced-EAGAIN seam (tracker 2026-09-25-16). Native-Linux loopback UDP never EAGAINs
+// (loopback_xmit skb_orphan()s the skb, releasing SO_SNDBUF accounting in-syscall), so the
+// old soSndBuf+volume approach was structurally unreachable here. The seam holds a chosen
+// session's datagrams at EVERY send site (sendDo client/listener + the EPOLLOUT drain), so
+// the write queue grows past maxWriteQueue -> backpressureCloses++; closeOnBackpressure
+// decides close (true) vs drop-oldest (false). backpressureCloses counts OVERFLOW EVENTS in
+// BOTH modes (not closes); the config-discriminating observable is the ACTION.
+TEST_CASE("UDP backpressure handling (client path)", "[udp][backpressure]")
+{
+  using iora::network::UdpEngineTestAccess;
+  constexpr std::size_t kMaxQ = 5;
+  const int kSends = static_cast<int>(kMaxQ) + 3; // overflow by 3
+
+  SECTION("closeOnBackpressure=true closes the session with WriteBackpressure")
+  {
     TransportConfig cfg;
-    cfg.maxWriteQueue = 5;
+    cfg.maxWriteQueue = kMaxQ;
     cfg.closeOnBackpressure = true;
-    cfg.soSndBuf = 4096;
     UdpFixture f{cfg};
-    drive(f);
-    REQUIRE(f.waitFor(f.anyClosed)); // backpressure closed the session
+    RecordingPeer peer;
+    SessionId cs = connectToPeer(f, peer);
+
+    UdpEngineTestAccess::armForceEagain(f.tx, cs); // hold this session's sends
+    for (int i = 0; i < kSends; ++i)
+    {
+      auto t = bpTag(i);
+      bool ok = f.tx.send(cs, t.data(), t.size());
+      if (i == 0)
+      {
+        REQUIRE(ok); // first send is definitely accepted (session open)
+      }
+      // later sends race the ASYNC overflow close (processed on the I/O thread), so their
+      // true/false result is not deterministic from the test thread -> not asserted.
+    }
+
+    REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 2000));
+    REQUIRE(f.waitFor(f.anyClosed)); // close action fired
+    REQUIRE(f.lastClose().first == TransportError::WriteBackpressure); // intended reason
     f.tx.stop();
   }
 
-  SECTION("closeOnBackpressure=false keeps the session (drop-oldest)")
+  SECTION("closeOnBackpressure=false keeps the session, drops oldest, newest kept in order")
   {
-    // NON-default value -> drop-oldest path (UdpEngine backpressure path); the session must
-    // SURVIVE backpressure. This is the CONFIG-DISCRIMINATING assertion: reverting
-    // closeOnBackpressure to the default (true) closes the session -> REQUIRE_FALSE
-    // below fails. Also covers the previously-untested drop-oldest branch (cpp17-L4).
     TransportConfig cfg;
-    cfg.maxWriteQueue = 5;
+    cfg.maxWriteQueue = kMaxQ;
     cfg.closeOnBackpressure = false;
-    cfg.soSndBuf = 4096;
     UdpFixture f{cfg};
-    drive(f);
-    std::this_thread::sleep_for(100ms); // allow any (erroneous) close to surface
-    REQUIRE_FALSE(f.anyClosed);         // drop-oldest kept the session open
+    RecordingPeer peer;
+    SessionId cs = connectToPeer(f, peer);
+
+    UdpEngineTestAccess::armForceEagain(f.tx, cs);
+    for (int i = 0; i < kSends; ++i)
+    {
+      auto t = bpTag(i);
+      REQUIRE(f.tx.send(cs, t.data(), t.size())); // survives -> all accepted
+    }
+
+    REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 2000));
+    // Queue bounded to maxWriteQueue (drop-oldest), via an I/O-thread snapshot.
+    REQUIRE(UdpEngineTestAccess::sessionQueueSize(f.tx, cs) == kMaxQ);
+    // I/O barrier, then the CONFIG-DISCRIMINATING assertion: the session SURVIVED
+    // (reverting closeOnBackpressure to the default true closes it -> this fails).
+    UdpEngineTestAccess::ioBarrier(f.tx);
+    REQUIRE_FALSE(f.anyClosed);
+
+    // Release the hold; the kept datagrams drain to the peer on the next EPOLLOUT.
+    UdpEngineTestAccess::disarmForceEagain(f.tx);
+    UdpEngineTestAccess::ioBarrier(f.tx); // formal ordering edge for the drain reads (L-3)
+    REQUIRE(f.waitUntil([&] { return peer.snapshot().size() >= kMaxQ; }, 2000));
+    auto got = peer.snapshot();
+    REQUIRE(got.size() == kMaxQ);
+    for (std::size_t i = 0; i < kMaxQ; ++i)
+    {
+      // newest kMaxQ, in order: tags [kSends-kMaxQ .. kSends)
+      REQUIRE(got[i] == bpTag(static_cast<int>(kSends - kMaxQ + i)));
+    }
     f.tx.stop();
   }
+}
+
+// ServerPeer (listener) send path: datagrams live in the SHARED listener write queue, so a
+// backpressure close MUST purge only the closed session's datagrams (by sid, not peer
+// address) and never leave them to be sent post-close (tracker 2026-09-25-16 H-2/M-2).
+TEST_CASE("UDP backpressure handling (ServerPeer listener path)", "[udp][backpressure]")
+{
+  using iora::network::UdpEngineTestAccess;
+  constexpr std::size_t kMaxQ = 5;
+  const int kSends = static_cast<int>(kMaxQ) + 3;
+
+  SECTION("close mode purges the closed session's datagrams from the shared queue")
+  {
+    TransportConfig cfg;
+    cfg.maxWriteQueue = kMaxQ;
+    cfg.closeOnBackpressure = true;
+    UdpFixture f{cfg};
+    TransportConfig ccfg{};
+    UdpEngine cli{ccfg};
+    auto rig = makeServerPeer(f, cli);
+    ListenerId lid = rig.lid;
+    SessionId ss = rig.ss;
+
+    UdpEngineTestAccess::armForceEagain(f.tx, ss);
+    for (int i = 0; i < kSends; ++i)
+    {
+      auto t = bpTag(i);
+      (void)f.tx.send(ss, t.data(), t.size());
+    }
+
+    REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 2000));
+    REQUIRE(f.waitFor(f.anyClosed));
+    REQUIRE(f.lastClose().first == TransportError::WriteBackpressure);
+    // Purge-by-sid: the closed session has NOTHING left in the shared queue, and (since it
+    // was the only sender) the whole shared queue is empty -> bounded.
+    REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss) == 0);
+    REQUIRE(UdpEngineTestAccess::listenerQueueSize(f.tx, lid) == 0);
+    cli.stop();
+    f.tx.stop();
+  }
+
+  SECTION("drop-oldest mode keeps the session and bounds the shared queue")
+  {
+    TransportConfig cfg;
+    cfg.maxWriteQueue = kMaxQ;
+    cfg.closeOnBackpressure = false;
+    UdpFixture f{cfg};
+    TransportConfig ccfg{};
+    UdpEngine cli{ccfg};
+    auto rig = makeServerPeer(f, cli);
+    ListenerId lid = rig.lid;
+    SessionId ss = rig.ss;
+
+    UdpEngineTestAccess::armForceEagain(f.tx, ss);
+    for (int i = 0; i < kSends; ++i)
+    {
+      auto t = bpTag(i);
+      REQUIRE(f.tx.send(ss, t.data(), t.size()));
+    }
+
+    REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 2000));
+    REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss) == kMaxQ);
+    REQUIRE(UdpEngineTestAccess::listenerQueueSize(f.tx, lid) == kMaxQ); // bounded (F-5)
+    UdpEngineTestAccess::ioBarrier(f.tx);
+    REQUIRE_FALSE(f.anyClosed);
+    UdpEngineTestAccess::disarmForceEagain(f.tx); // end the armed EPOLLOUT spin (L-7)
+    cli.stop();
+    f.tx.stop();
+  }
+}
+
+// H-2 (tracker 2026-09-25-16): the purge is keyed by owning SID, not peer address, so
+// closing one of two sibling sessions to the SAME peer must not drop the sibling's queued
+// datagrams. Two via-sessions to one peer address share pkey but have distinct sids.
+TEST_CASE("UDP listener backpressure purge spares a sibling session to the same peer",
+          "[udp][backpressure][sibling]")
+{
+  using iora::network::UdpEngineTestAccess;
+  constexpr std::size_t kMaxQ = 5;
+
+  TransportConfig cfg;
+  cfg.maxWriteQueue = kMaxQ;
+  cfg.closeOnBackpressure = true;
+  UdpFixture f{cfg};
+  ListenerId lid = startWithListener(f).lid;
+  auto peerPort = testnet::getFreePortUDP(); // black-hole peer (nothing drains — see below)
+  auto twins = twinVias(f, lid, peerPort);
+  SessionId ss1 = twins.first;
+  SessionId ss2 = twins.second;
+
+  // Arm ss2 so ITS datagram sits at the FRONT of the shared queue and the seam holds the
+  // whole queue at the drain (flushListener stops at the held front) — this removes any
+  // EPOLLOUT drain race. ss1's datagrams queue behind (M-5). Then close ss1 EXPLICITLY:
+  // closeNow purges ss1 by sid on EVERY close path (M-2), and ss2's datagram must survive.
+  UdpEngineTestAccess::armForceEagain(f.tx, ss2);
+  auto front = bpTag(200);
+  REQUIRE(f.tx.send(ss2, front.data(), front.size())); // -> queued (ss2, front, held)
+  for (int i = 0; i < 2; ++i)
+  {
+    auto t = bpTag(i);
+    REQUIRE(f.tx.send(ss1, t.data(), t.size())); // -> queued behind (ss1)
+  }
+  // Snapshot BEFORE the close: both sets present in the shared queue.
+  REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss1) == 2);
+  REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss2) == 1);
+
+  REQUIRE(f.tx.close(ss1)); // explicit close -> purge ss1 by sid
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss1));
+  REQUIRE(UdpEngineTestAccess::hasSession(f.tx, ss2));
+  REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss1) == 0); // purged
+  REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss2) == 1); // sibling intact
+  UdpEngineTestAccess::disarmForceEagain(f.tx);
+  f.tx.stop();
+}
+
+// H-3 (tracker 2026-09-25-16): closing a via-TWIN (second session to an already-indexed
+// peer) must not evict the live sibling's _peerIndex entry (ownership-guarded erase).
+TEST_CASE("UDP closing a peer twin preserves the sibling's peer-index entry",
+          "[udp][backpressure][peerindex]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f{};
+  ListenerId lid = startWithListener(f).lid;
+  auto peerPort = testnet::getFreePortUDP();
+  auto twins = twinVias(f, lid, peerPort); // ss1 indexed, ss2 twin (not indexed)
+  SessionId ss1 = twins.first;
+  SessionId ss2 = twins.second;
+
+  REQUIRE(UdpEngineTestAccess::peerIndexHasSid(f.tx, ss1)); // sibling indexed
+  REQUIRE(f.tx.close(ss2));                                 // close the twin
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss2));
+  REQUIRE(UdpEngineTestAccess::peerIndexHasSid(f.tx, ss1)); // sibling STILL indexed
+  f.tx.stop();
+}
+
+// L-8 (tracker 2026-09-25-16): the GC write-stall safety net must reclaim a wedged
+// ServerPeer whose datagrams are stuck in the SHARED listener queue (it has no s->wq).
+TEST_CASE("UDP GC write-stall reclaims a stalled ServerPeer", "[udp][backpressure][gc]")
+{
+  using iora::network::UdpEngineTestAccess;
+  TransportConfig cfg;
+  cfg.maxWriteQueue = 100;                          // don't close via backpressure
+  cfg.closeOnBackpressure = false;
+  cfg.writeStallTimeout = std::chrono::seconds(1);  // reclaim a stuck writer
+  cfg.gcInterval = std::chrono::seconds(1);
+  cfg.idleTimeout = std::chrono::seconds(0);        // isolate the write-stall path
+  UdpFixture f{cfg};
+  ListenerId lid = startWithListener(f).lid;
+  auto peerPort = testnet::getFreePortUDP();
+  auto r1 = f.tx.connectViaListener(lid, "127.0.0.1", peerPort);
+  REQUIRE(r1.isOk());
+  SessionId ss = r1.value();
+
+  UdpEngineTestAccess::armForceEagain(f.tx, ss); // wedge: datagrams stick in lst->wq
+  for (int i = 0; i < 3; ++i)
+  {
+    auto t = bpTag(i);
+    REQUIRE(f.tx.send(ss, t.data(), t.size()));
+  }
+  REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss) >= 1);
+  // The write-stall GC should close the wedged ServerPeer within a couple of gc cycles.
+  REQUIRE(f.waitFor(f.anyClosed, 6000));
+  REQUIRE(f.lastClose().first == TransportError::GCClosed); // intended reason (F-10)
+  REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss));
+  UdpEngineTestAccess::disarmForceEagain(f.tx);
+  f.tx.stop();
+}
+
+// M-1 (tracker 2026-09-25-16, steps-4-8 round 2): the L-8 redesign must reclaim ONLY the
+// owner of the front datagram, never a healthy peer queued behind it. Two via sessions share
+// the listener queue: ss1 is wedged at the front (seam), ss2 is queued behind (M-5). The GC
+// must close ss1 only; ss2 survives and, once ss1 is purged, drains. The OLD per-peer scan
+// would close BOTH, so this test discriminates the redesign.
+TEST_CASE("UDP GC write-stall reclaims only the front owner, not a peer behind it",
+          "[udp][backpressure][gc]")
+{
+  using iora::network::UdpEngineTestAccess;
+  TransportConfig cfg;
+  cfg.maxWriteQueue = 100; // don't close via backpressure
+  cfg.closeOnBackpressure = false;
+  cfg.writeStallTimeout = std::chrono::seconds(1);
+  cfg.gcInterval = std::chrono::seconds(1);
+  cfg.idleTimeout = std::chrono::seconds(0);
+  UdpFixture f{cfg};
+  ListenerId lid = startWithListener(f).lid;
+  RecordingPeer peer;
+  REQUIRE(peer.tx.start().isOk());
+  auto peerPort = testnet::getFreePortUDP();
+  REQUIRE(peer.tx.addListener("127.0.0.1", peerPort, TlsMode::None).isOk());
+  auto twins = twinVias(f, lid, peerPort);
+  SessionId ss1 = twins.first;
+  SessionId ss2 = twins.second;
+
+  UdpEngineTestAccess::armForceEagain(f.tx, ss1); // ss1 wedged at the front
+  auto s1 = bpTag(1);
+  REQUIRE(f.tx.send(ss1, s1.data(), s1.size())); // front, held
+  auto s2 = bpTag(2);
+  REQUIRE(f.tx.send(ss2, s2.data(), s2.size())); // queued behind (M-5), NOT armed
+  REQUIRE(UdpEngineTestAccess::listenerQueuedForSid(f.tx, lid, ss2) == 1);
+
+  // GC reclaims the FRONT owner (ss1) only. The old per-peer scan would close ss2 too.
+  REQUIRE(f.waitFor(f.anyClosed, 6000));
+  REQUIRE(f.lastClose().first == TransportError::GCClosed);
+  REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss1));
+  // ss2 survives and its datagram drains (ss1 purged -> ss2 at front, unheld).
+  REQUIRE(f.waitUntil([&] { return !peer.snapshot().empty(); }, 3000));
+  REQUIRE(UdpEngineTestAccess::hasSession(f.tx, ss2));
+  auto got = peer.snapshot();
+  REQUIRE(std::find(got.begin(), got.end(), s2) != got.end()); // ss2 delivered
+  REQUIRE(std::find(got.begin(), got.end(), s1) == got.end()); // ss1 never sent (purged)
+  UdpEngineTestAccess::disarmForceEagain(f.tx);
+  f.tx.stop();
+}
+
+// F-2 (tracker 2026-09-25-16): the client-path M-5 "queue behind a non-empty queue" rule is
+// discriminating. Arm the seam and queue A,B; then disarm and send C in ONE I/O-thread step
+// (no EPOLLOUT drain between), so C must land behind A,B. Without M-5, C's direct ::send
+// overtakes the still-queued A,B and the peer sees C,A,B.
+TEST_CASE("UDP client send preserves FIFO past a non-empty queue (M-5)",
+          "[udp][backpressure][ordering]")
+{
+  using iora::network::UdpEngineTestAccess;
+  TransportConfig cfg;
+  cfg.maxWriteQueue = 100; // no overflow; this is an ordering test
+  cfg.closeOnBackpressure = false;
+  UdpFixture f{cfg};
+  RecordingPeer peer;
+  SessionId cs = connectToPeer(f, peer);
+
+  UdpEngineTestAccess::armForceEagain(f.tx, cs);
+  auto a = bpTag(1);
+  auto b = bpTag(2);
+  REQUIRE(f.tx.send(cs, a.data(), a.size())); // queued (held), front
+  REQUIRE(f.tx.send(cs, b.data(), b.size())); // queued behind
+  REQUIRE(UdpEngineTestAccess::sessionQueueSize(f.tx, cs) == 2);
+
+  auto c = bpTag(3);
+  UdpEngineTestAccess::disarmThenSend(f.tx, cs, c); // disarm + send C atomically on the I/O thread
+
+  REQUIRE(f.waitUntil([&] { return peer.snapshot().size() >= 3; }, 2000));
+  auto got = peer.snapshot();
+  REQUIRE(got.size() == 3);
+  REQUIRE(got[0] == a);
+  REQUIRE(got[1] == b);
+  REQUIRE(got[2] == c);
+  f.tx.stop();
+}
+
+// F-3 (tracker 2026-09-25-16): the OVERFLOW-close variant of the sibling case. Overflow and
+// close ss1 via backpressure; its sibling ss2 (same peer address) must survive AND remain
+// deliverable (routability), verified by positive delivery to a RecordingPeer (no drain race:
+// ss1's held front blocks the queue until the close purges ss1, after which ss2 drains).
+TEST_CASE("UDP listener backpressure overflow close spares and still delivers a sibling",
+          "[udp][backpressure][sibling]")
+{
+  using iora::network::UdpEngineTestAccess;
+  constexpr std::size_t kMaxQ = 5;
+  TransportConfig cfg;
+  cfg.maxWriteQueue = kMaxQ;
+  cfg.closeOnBackpressure = true;
+  UdpFixture f{cfg};
+  ListenerId lid = startWithListener(f).lid;
+  RecordingPeer peer; // real receiver so ss2 delivery is observable
+  REQUIRE(peer.tx.start().isOk());
+  auto peerPort = testnet::getFreePortUDP();
+  REQUIRE(peer.tx.addListener("127.0.0.1", peerPort, TlsMode::None).isOk());
+  auto twins = twinVias(f, lid, peerPort);
+  SessionId ss1 = twins.first;
+  SessionId ss2 = twins.second;
+
+  UdpEngineTestAccess::armForceEagain(f.tx, ss1); // ss1 held at the front -> no drain race
+  auto s1front = bpTag(10);
+  REQUIRE(f.tx.send(ss1, s1front.data(), s1front.size())); // queued (ss1, front, held)
+  auto s2tag = bpTag(20);
+  REQUIRE(f.tx.send(ss2, s2tag.data(), s2tag.size())); // queued behind (ss2)
+  for (int i = 0; i < static_cast<int>(kMaxQ); ++i)
+  {
+    auto t = bpTag(11 + i);
+    (void)f.tx.send(ss1, t.data(), t.size()); // pushes the shared queue over -> close ss1
+  }
+
+  REQUIRE(f.waitForStats([](const auto &s) { return s.backpressureCloses >= 1; }, 2000));
+  REQUIRE(f.waitFor(f.anyClosed));
+  REQUIRE(f.lastClose().first == TransportError::WriteBackpressure);
+  REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss1)); // ss1 closed
+  REQUIRE(UdpEngineTestAccess::hasSession(f.tx, ss2));       // ss2 survives
+  // ss2's datagram, queued behind ss1's purged front, now drains and reaches the peer;
+  // none of ss1's datagrams were ever sent (held then purged on close).
+  REQUIRE(f.waitUntil([&] { return !peer.snapshot().empty(); }, 2000));
+  auto got = peer.snapshot();
+  REQUIRE(std::find(got.begin(), got.end(), s2tag) != got.end()); // ss2 delivered (routable)
+  REQUIRE(std::find(got.begin(), got.end(), s1front) == got.end()); // ss1 never sent
+  f.tx.stop();
 }
 
 TEST_CASE("UDP IPv6 support", "[udp][ipv6]")

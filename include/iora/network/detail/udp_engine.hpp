@@ -17,6 +17,7 @@
 #include "iora/network/event_batch_processor.hpp"
 #include "iora/network/sockaddr_utils.hpp"
 #include "iora/network/transport_types.hpp"
+#include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
@@ -838,6 +839,31 @@ private:
   std::atomic<ConnectThrowPoint> _testConnectThrowPoint{ConnectThrowPoint::NONE};
   std::atomic<bool> _testEnqueueFailure{false};
 
+  /// Test seam (tracker 2026-09-25-16): when set to a session id, that session's send
+  /// path simulates EAGAIN at EVERY send site (sendDo client/listener, writeClient,
+  /// flushListener) WITHOUT a syscall, so a deterministic write-queue overflow can be
+  /// driven host-independently (native-Linux loopback UDP never EAGAINs: loopback_xmit
+  /// skb_orphan()s the skb, releasing the sender's SO_SNDBUF accounting in-syscall).
+  /// Arm it BEFORE the test-thread send burst (the enqueue()/_qmx -> process()/_qmx edge
+  /// publishes it to the I/O thread), so relaxed is sufficient; 0 == disarmed. Session-
+  /// scoped (not engine-wide) so the fixture's auto-echo on other sessions is unaffected.
+  std::atomic<SessionId> _testForceEagainSid{0};
+
+  /// \brief Test seam: true iff \p sid is the armed forced-EAGAIN session; sets errno=EAGAIN.
+  /// The caller MUST use this to REPLACE the ::send/::sendto (never after it) — otherwise
+  /// the datagram would be both sent AND queued (double delivery).
+  bool testForceEagain(SessionId sid)
+  {
+    // sid != 0 guard: 0 is the disarmed sentinel AND the default OutDg/Session sid, so an
+    // untagged datagram must never be held (would hang in production under a stale arm).
+    if (sid != 0 && _testForceEagainSid.load(std::memory_order_relaxed) == sid)
+    {
+      errno = EAGAIN;
+      return true;
+    }
+    return false;
+  }
+
   /// \brief Test seam: throw ONCE if the armed point matches (then disarm).
   void testMaybeThrowAt(ConnectThrowPoint point)
   {
@@ -1106,6 +1132,11 @@ private:
     sockaddr_storage to{};
     socklen_t toLen{0};
     ByteBuffer payload;
+    // Owning session (tracker 2026-09-25-16 H-2): the SHARED listener queue holds
+    // datagrams from every ServerPeer on the listener, so purge-on-close and the
+    // per-session forced-EAGAIN seam key on the owner sid, NOT the peer address
+    // (several logical sessions may share one peer address).
+    SessionId sid{};
   };
   struct Listener
   {
@@ -1114,6 +1145,12 @@ private:
     std::string bind;
     std::deque<OutDg> wq;
     bool wantWrite{false};
+    // Last successful ::sendto on this listener's shared fd (L-8, tracker 2026-09-25-16).
+    // The shared write queue stalls as a UNIT, so the write-stall backstop keys on this
+    // per-listener clock (not per-session), and reclaims the owner of the front (blocking)
+    // datagram. Seeded at creation so a never-draining listener is reclaimed after one
+    // writeStallTimeout, not immediately.
+    MonoTime lastWriteProgress{};
   };
   struct Session
   {
@@ -1138,6 +1175,9 @@ private:
     // NEW: safety-net tracking
     bool connectPending{false};
     MonoTime connectStart{};
+    // ClientConnected-only write-stall clock (drives the runGc per-session write-stall check
+    // against s->wq). A ServerPeer's pending datagrams live in the SHARED listener queue, so
+    // its stall clock is Listener::lastWriteProgress, NOT this field (simpl L-1).
     MonoTime lastWriteProgress{};
   };
   struct Tag
@@ -1249,7 +1289,13 @@ private:
       }
       else
       {
-        _peerIndex.erase(s->pkey); // ServerPeer: aliases the listener fd -- never close here
+        // ServerPeer: aliases the listener fd -- never close here. Ownership-guarded erase
+        // for consistency with closeNow (H-3): don't evict a twin's shared entry.
+        auto pi = _peerIndex.find(s->pkey);
+        if (pi != _peerIndex.end() && pi->second == s->id)
+        {
+          _peerIndex.erase(pi);
+        }
       }
       _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
       _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
@@ -1649,6 +1695,7 @@ private:
     lst->id = lc.id;
     lst->fd = sfd;
     lst->bind = lc.addr + ":" + std::to_string(lc.port);
+    lst->lastWriteProgress = MonoClock::now(); // seed the write-stall clock (L-8)
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
     {
@@ -1760,11 +1807,17 @@ private:
     while (!lst->wq.empty())
     {
       auto &d = lst->wq.front();
-      int n = ::sendto(lst->fd, d.payload.data(), (int)d.payload.size(), MSG_NOSIGNAL,
-                       reinterpret_cast<sockaddr *>(&d.to), d.toLen);
+      // Seam (tracker 2026-09-25-16): a held datagram at the FRONT stalls the whole shared
+      // queue (head-of-line), exactly as a real listener-socket EAGAIN would; datagrams
+      // behind it drain only once it is gone.
+      int n = testForceEagain(d.sid)
+                ? -1
+                : ::sendto(lst->fd, d.payload.data(), (int)d.payload.size(), MSG_NOSIGNAL,
+                           reinterpret_cast<sockaddr *>(&d.to), d.toLen);
       if (n >= 0)
       {
         _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
+        lst->lastWriteProgress = MonoClock::now(); // per-listener write-stall clock (L-8)
         lst->wq.pop_front();
         continue;
       }
@@ -2313,7 +2366,11 @@ private:
     while (!s->wq.empty())
     {
       ByteBuffer &d = s->wq.front();
-      int n = ::send(s->fd, d.data(), (int)d.size(), MSG_NOSIGNAL);
+      // Seam (tracker 2026-09-25-16): hold the drain too while this session is armed,
+      // so a forced overflow is not silently emptied by the EPOLLOUT flush.
+      int n = testForceEagain(s->id)
+                ? -1
+                : ::send(s->fd, d.data(), (int)d.size(), MSG_NOSIGNAL);
       if (n >= 0)
       {
         _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
@@ -2350,6 +2407,29 @@ private:
     modEpoll(s->fd, ev);
   }
 
+  // Overflow accounting shared by the client (s->wq) and listener (lst->wq) send paths.
+  // Returns true if the session was CLOSED by overflow (caller must then return at once —
+  // s is dangling). The backpressureCloses OVERFLOW counter is incremented ahead of the
+  // close/drop choice in BOTH modes (stat_contract). In drop-oldest mode the front is
+  // popped; on a SHARED listener queue that may be a DIFFERENT peer's oldest datagram
+  // (documented victim policy, TransportConfig::closeOnBackpressure). In close mode there
+  // is NO extra pop here — closeNow purges this session's datagrams by sid (M-1).
+  template <typename Q> bool closedOnOverflow(Session *s, Q &q, const char *why)
+  {
+    if (q.size() <= _config.maxWriteQueue)
+    {
+      return false;
+    }
+    _atomicStats.backpressureCloses.fetch_add(1, std::memory_order_relaxed);
+    if (_config.closeOnBackpressure)
+    {
+      closeNow(s, TransportError::WriteBackpressure, why, 0);
+      return true;
+    }
+    q.pop_front();
+    return false;
+  }
+
   void sendDo(SendReq &&sr)
   {
     auto it = _sessions.find(sr.sid);
@@ -2384,38 +2464,45 @@ private:
     }
     Session *s = it->second.get();
     if (s->closed.load(std::memory_order_relaxed))
+    {
       return;
+    }
     if (s->role == Role::ClientConnected)
     {
-      int n = ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL);
-      if (n >= 0)
+      // M-5 (tracker 2026-09-25-16): send directly ONLY when nothing is queued ahead; a
+      // direct ::send past a non-empty queue would overtake datagrams still awaiting the
+      // EPOLLOUT drain. Otherwise fall through to enqueue (FIFO). testForceEagain is the
+      // per-session seam; it REPLACES the syscall (never follows it), so no double send.
+      if (s->wq.empty())
       {
-        _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
-        s->lastActivity = MonoClock::now();
-        s->lastWriteProgress = MonoClock::now();
-        return;
-      }
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-      {
-        s->wq.emplace_back(std::move(sr.payload));
-        if (s->wq.size() > _config.maxWriteQueue)
+        int n = testForceEagain(s->id)
+                  ? -1
+                  : ::send(s->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL);
+        if (n >= 0)
         {
-          _atomicStats.backpressureCloses.fetch_add(1, std::memory_order_relaxed);
-          if (_config.closeOnBackpressure)
-          {
-            closeNow(s, TransportError::WriteBackpressure, "client write queue overflow", 0);
-            return;
-          }
-          else
-          {
-            s->wq.pop_front();
-          }
+          const auto now = MonoClock::now();
+          _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
+          s->lastActivity = now;
+          s->lastWriteProgress = now;
+          return;
         }
-        s->wantWrite = true;
-        updateClient(s);
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+          closeNow(s, TransportError::Socket, lastErr(), 0);
+          return;
+        }
+        // EAGAIN, empty->blocked: seed the stall clock NOW so an idle-then-blocked session
+        // gets a full writeStallTimeout window rather than a reclaim at the next GC tick
+        // (M-2/MEDIUM-1 A). The window measures time-since-blocked, not time-since-last-send.
+        s->lastWriteProgress = MonoClock::now();
+      }
+      s->wq.emplace_back(std::move(sr.payload));
+      if (closedOnOverflow(s, s->wq, "client write queue overflow"))
+      {
         return;
       }
-      closeNow(s, TransportError::Socket, lastErr(), 0);
+      s->wantWrite = true;
+      updateClient(s);
       return;
     }
     auto lit = _listeners.find(s->owner);
@@ -2425,45 +2512,54 @@ private:
       return;
     }
     Listener *lst = lit->second.get();
-    int n = ::sendto(lst->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL,
-                     reinterpret_cast<sockaddr *>(&s->peer), s->plen);
-    if (n >= 0)
+    // M-5: same FIFO rule on the SHARED listener queue — direct sendto only when empty.
+    if (lst->wq.empty())
     {
-      _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
-      s->lastActivity = MonoClock::now();
-      s->lastWriteProgress = MonoClock::now();
-      return;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK)
-    {
-      OutDg d{};
-      std::memcpy(&d.to, &s->peer, s->plen);
-      d.toLen = s->plen;
-      d.payload = std::move(sr.payload);
-      lst->wq.emplace_back(std::move(d));
-      if (lst->wq.size() > _config.maxWriteQueue)
+      int n = testForceEagain(s->id)
+                ? -1
+                : ::sendto(lst->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL,
+                           reinterpret_cast<sockaddr *>(&s->peer), s->plen);
+      if (n >= 0)
       {
-        _atomicStats.backpressureCloses.fetch_add(1, std::memory_order_relaxed);
-        if (_config.closeOnBackpressure)
-        {
-          closeNow(s, TransportError::WriteBackpressure, "listener write queue overflow", 0);
-        }
-        else
-        {
-          lst->wq.pop_front();
-        }
+        const auto now = MonoClock::now();
+        _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
+        s->lastActivity = now;
+        // ServerPeers use the per-listener stall clock, NOT s->lastWriteProgress (simpl
+        // L-1: that field is the ClientConnected-only stall clock and is never read here).
+        lst->lastWriteProgress = now; // per-listener write-stall clock (L-8)
+        return;
       }
-      lst->wantWrite = true;
-      updateListener(lst);
+      if (errno != EAGAIN && errno != EWOULDBLOCK)
+      {
+        closeNow(s, TransportError::Socket, lastErr(), 0);
+        return;
+      }
+      // EAGAIN, empty->blocked: seed the per-listener stall clock NOW (M-2/MEDIUM-1 A).
+      lst->lastWriteProgress = MonoClock::now();
+    }
+    OutDg d{};
+    std::memcpy(&d.to, &s->peer, s->plen);
+    d.toLen = s->plen;
+    d.payload = std::move(sr.payload);
+    d.sid = s->id; // H-2: tag the owner for purge-by-sid on close
+    lst->wq.emplace_back(std::move(d));
+    // On a close-mode overflow closeNow purges this session's datagrams by sid (bounds the
+    // shared queue; M-1 — no extra pop). The listener keeps EPOLLOUT armed from the prior
+    // queued sends, so other peers still drain.
+    if (closedOnOverflow(s, lst->wq, "listener write queue overflow"))
+    {
       return;
     }
-    closeNow(s, TransportError::Socket, lastErr(), 0);
+    lst->wantWrite = true;
+    updateListener(lst);
   }
 
   void closeNow(Session *s, TransportError why, const std::string &m, int)
   {
     if (!s || s->closed.load(std::memory_order_relaxed))
+    {
       return;
+    }
     // Save errno before system calls clobber it
     int savedErrno = errno;
     s->closed.store(true, std::memory_order_relaxed);
@@ -2473,6 +2569,7 @@ private:
     int fd = s->fd;
     Role role = s->role;
     std::string pkey = s->pkey;
+    ListenerId owner = s->owner;
 
     int fdToClose = -1;
     if (role == Role::ClientConnected)
@@ -2483,7 +2580,36 @@ private:
     }
     else
     {
-      _peerIndex.erase(pkey); // ServerPeer: aliases the listener fd -- never close here
+      // ServerPeer: aliases the listener fd -- never close here.
+      // H-3 (tracker 2026-09-25-16): only evict OUR OWN peer-index entry. A via-twin to
+      // an already-indexed peer shares pkey; an unconditional erase would orphan the live
+      // sibling's entry (its next inbound datagram -> spurious onAccept + a new sid).
+      auto pi = _peerIndex.find(pkey);
+      if (pi != _peerIndex.end() && pi->second == sid)
+      {
+        _peerIndex.erase(pi);
+      }
+      // H-2/M-2 (tracker 2026-09-25-16): purge THIS session's datagrams from the SHARED
+      // listener write queue BEFORE the session is erased — on EVERY ServerPeer close
+      // path (backpressure/GC/explicit/socket), so nothing is sent to a closed session
+      // and the shared queue stays bounded. Keyed by sid (NOT peer address) so sibling
+      // sessions to the same peer are untouched. I/O-thread-only: lst->wq needs no lock.
+      auto lit = _listeners.find(owner);
+      if (lit != _listeners.end())
+      {
+        Listener *lst = lit->second.get();
+        auto &wq = lst->wq;
+        wq.erase(std::remove_if(wq.begin(), wq.end(),
+                                [sid](const OutDg &dg) { return dg.sid == sid; }),
+                 wq.end());
+        // F-8: if the purge emptied the queue, disarm EPOLLOUT so we don't take one
+        // spurious writable wake on a now-idle listener fd.
+        if (wq.empty() && lst->wantWrite)
+        {
+          lst->wantWrite = false;
+          updateListener(lst);
+        }
+      }
     }
 
     _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
@@ -2541,7 +2667,9 @@ private:
         to.push_back(s->id);
         continue;
       }
-      // NEW: safety-net write stall (applies to client-connected sessions)
+      // NEW: safety-net write stall (ClientConnected only: it owns s->wq, stamped on drain
+      // by writeClient). ServerPeers share the per-listener queue and are handled by the
+      // per-listener sweep below (L-8, tracker 2026-09-25-16).
       if (_config.writeStallTimeout.count() > 0 && !s->wq.empty() &&
           (now - s->lastWriteProgress) > _config.writeStallTimeout)
       {
@@ -2549,11 +2677,35 @@ private:
         continue;
       }
     }
+    // L-8 (tracker 2026-09-25-16): the SHARED listener write queue stalls as a UNIT. If a
+    // listener has made no write progress for writeStallTimeout while its queue is
+    // non-empty, reclaim the owner of the FRONT datagram — NOT every peer with a queued
+    // datagram (that would false-close healthy sessions draining behind the front). NOTE:
+    // on a real shared-socket EAGAIN the stall is socket-wide (SO_SNDBUF/qdisc), so this is
+    // a VICTIM policy (reclaim the oldest-queued session), not culprit-finding — closing it
+    // frees its queued datagrams but does not unwedge the socket. Re-seed the clock after a
+    // reclaim so the NEXT head gets a full writeStallTimeout window, bounding closes to one
+    // per writeStallTimeout rather than one per gcInterval (M-2/MEDIUM-1 B).
+    if (_config.writeStallTimeout.count() > 0)
+    {
+      for (auto &lkv : _listeners)
+      {
+        Listener *lst = lkv.second.get();
+        if (!lst->wq.empty() &&
+            (now - lst->lastWriteProgress) > _config.writeStallTimeout)
+        {
+          to.push_back(lst->wq.front().sid);
+          lst->lastWriteProgress = now; // re-arm the window for the next head (M-2 B)
+        }
+      }
+    }
     for (auto sid : to)
     {
       auto it = _sessions.find(sid);
       if (it != _sessions.end())
+      {
         closeNow(it->second.get(), TransportError::GCClosed, "GC safety-net timeout", 0);
+      }
     }
 
     // Resolve-deadline scan (task-4.2): UDP has no TimerService, so a named-host
