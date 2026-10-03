@@ -152,8 +152,13 @@ struct UdpEngineTestAccess
   /// key through the production UdpEngine::peerKey (friend access) rather than by hand, so the
   /// key format lives in ONE place and a future shape change (e.g. the 2026-10-03-1 local-addr
   /// extension) cannot silently diverge the test from production.
+  /// \p localSeg is the wildcard-bind local segment (tracker 2026-10-03-1): nullptr for a specific
+  /// bind (key lid|host:port, unchanged), the captured local text for a wildcard PINNED session, ""
+  /// for a non-unicast arrival (lid||host:port), or UdpEngine::VIA_LOCAL_SENTINEL for an unadopted
+  /// wildcard via. Passes it through the production peerKey so test + prod cannot diverge.
   static std::vector<SessionId> peerIndexLookup(UdpEngine &e, ListenerId lid,
-                                                const std::string &host, std::uint16_t port)
+                                                const std::string &host, std::uint16_t port,
+                                                const char *localSeg = nullptr)
   {
     sockaddr_storage ss{};
     if (host.find(':') != std::string::npos)
@@ -170,7 +175,7 @@ struct UdpEngineTestAccess
       a4->sin_port = htons(port);
       ::inet_pton(AF_INET, host.c_str(), &a4->sin_addr);
     }
-    std::string k = UdpEngine::peerKey(lid, ss);
+    std::string k = UdpEngine::peerKey(lid, ss, localSeg);
     return onIo(e,
                 [&e, k]() -> std::vector<SessionId>
                 {
@@ -183,6 +188,43 @@ struct UdpEngineTestAccess
   /// commands (incl. a synchronous backpressure close inside sendDo) have completed.
   /// Use instead of a sleep before a negative assertion (a stat read gives no ordering).
   static void ioBarrier(UdpEngine &e) { onIo(e, [] {}); }
+
+  // --- RFC 3581 §4 wildcard source-IP seams (tracker 2026-10-03-1) ---
+
+  /// Expose the PURE cmsg→local classifier + its verdict for unit testing with synthesized
+  /// msghdrs (M-5 — multicast/broadcast/link-local cannot be driven over loopback root-free).
+  using LocalSrcVerdict = UdpEngine::LocalSrcVerdict;
+  using LocalSrcResult = UdpEngine::LocalSrcResult;
+  /// The wildcard-via sentinel local segment (private in UdpEngine; re-exported via friend access).
+  static constexpr const char *VIA_LOCAL_SENTINEL = UdpEngine::VIA_LOCAL_SENTINEL;
+  static LocalSrcResult classifyLocalSrc(int sockFamily, msghdr &msg)
+  {
+    return UdpEngine::classifyLocalSrc(sockFamily, msg);
+  }
+
+  /// Set a ServerPeer session's captured local source to a v4 literal (I/O thread) — the T8
+  /// source-not-local seam: point it at a non-local address (e.g. 192.0.2.1) so the next send's
+  /// sendmsg fails and DD7 closes the session. The write is on the I/O thread (DD10).
+  static bool setLocalSrcV4(UdpEngine &e, SessionId sid, const char *ip)
+  {
+    return onIo(e,
+                [&e, sid, ip]() -> bool
+                {
+                  auto it = e._sessions.find(sid);
+                  if (it == e._sessions.end())
+                  {
+                    return false;
+                  }
+                  UdpEngine::LocalSrc ls;
+                  ls.family = AF_INET;
+                  if (::inet_pton(AF_INET, ip, &ls.addr.v4) != 1)
+                  {
+                    return false;
+                  }
+                  it->second->localSrc = ls;
+                  return true;
+                });
+  }
 
 private:
   /// Run \p fn on the engine I/O thread and return its result (bounded, exception-safe).

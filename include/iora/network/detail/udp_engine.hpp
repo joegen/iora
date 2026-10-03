@@ -731,17 +731,21 @@ private:
     its.it_value.tv_sec = s.count();
     ::timerfd_settime(_timerFd, 0, &its, nullptr);
   }
-  /// Composite peer-index key (tracker 2026-10-02-3): "<lid>|<host:port>". The _peerIndex is
-  /// keyed by (ListenerId, peerAddr) so the SAME peer source ip:port reaching two of our
-  /// listeners does NOT collapse to one session (cross-listener misrouting + wrong reply
-  /// source port). '|' never appears in numeric host:port output (IPv6 included), so the key
-  /// is unambiguous. Builds directly into one buffer (no intermediate string on the inbound
+  /// Composite peer-index key: "<lid>|<host:port>" for a specific bind (tracker 2026-10-02-3), or
+  /// "<lid>|<local>|<host:port>" for a wildcard bind (tracker 2026-10-03-1 — <local> is the captured
+  /// local dest, "" for a non-unicast arrival, or the "<via>" sentinel for an unadopted via). Keyed
+  /// by (ListenerId, [localAddr,] peerAddr) so the SAME peer source ip:port reaching two of our
+  /// listeners — or two of our local addresses on one wildcard listener — does NOT collapse to one
+  /// session (cross-listener misrouting + wrong reply source port/IP). '|' never appears in numeric
+  /// host:port output (IPv6 included), so the key is unambiguous. Builds directly into one buffer
+  /// (no intermediate string on the inbound
   /// hot path). Returns EMPTY when getnameinfo fails, so callers test a single value and never
   /// index a degenerate "<lid>|" bucket that would collapse unrelated peers — with
   /// NI_NUMERICHOST|NI_NUMERICSERV on a valid AF_INET/AF_INET6 sockaddr this failure is
   /// effectively unreachable, so the empty-key drop/reject paths are DEFENSIVE (L-8 accepted
   /// as defensive 2026-10-03, no fault-injection seam).
-  static std::string peerKey(ListenerId lid, const sockaddr_storage &ss)
+  static std::string peerKey(ListenerId lid, const sockaddr_storage &ss,
+                             const char *localSeg = nullptr)
   {
     char h[NI_MAXHOST]{}, sv[NI_MAXSERV]{};
     socklen_t sl = (ss.ss_family == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
@@ -752,10 +756,228 @@ private:
     }
     std::string k = std::to_string(lid);
     k.push_back('|');
+    // Wildcard binds (tracker 2026-10-03-1) carry the captured local-dest segment between the two
+    // '|' so the SAME peer reaching two of our local IPs does not collapse: lid|<local>|host:port.
+    // A nullptr localSeg (specific bind) keeps the original lid|host:port byte-for-byte. An EMPTY
+    // localSeg (a non-unicast arrival on a wildcard bind) yields lid||host:port — distinct from
+    // both the specific-bind key and the via sentinel, and never a via-adopt target. '<'/'>' and
+    // '|' never appear in inet_ntop numeric output, so the via sentinel cannot collide.
+    if (localSeg != nullptr)
+    {
+      k.append(localSeg);
+      k.push_back('|');
+    }
     k.append(h);
     k.push_back(':');
     k.append(sv);
     return k;
+  }
+
+  /// Sentinel local segment for a connectViaListener session on a WILDCARD bind that has not yet
+  /// received a datagram (tracker 2026-10-03-1 DD5): its local dest is unknown until the first
+  /// inbound adopts it. '<'/'>' cannot appear in inet_ntop output, so the key is collision-free.
+  static constexpr const char *VIA_LOCAL_SENTINEL = "<via>";
+
+  /// Captured local destination address for wildcard-bind reply-source selection (RFC 3581 §4,
+  /// tracker 2026-10-03-1). family == AF_UNSPEC means "send unpinned" (specific bind, multicast/
+  /// broadcast dest, unadopted via, or no/truncated cmsg). Trivially copyable so it rides in OutDg
+  /// and the purge-by-sid remove_if without special handling.
+  // NOTE: in_pktinfo / in6_pktinfo (used by classifyLocalSrc / udpSendTo below) require _GNU_SOURCE
+  // in glibc; g++ predefines it, and this engine is already Linux-only (epoll/timerfd), so no #ifdef.
+  struct LocalSrc
+  {
+    sa_family_t family{AF_UNSPEC};
+    union
+    {
+      in_addr v4;
+      in6_addr v6; // native v6 OR v4-mapped (::ffff:a.b.c.d) on a dual-stack socket
+    } addr{};
+  };
+  // DD2 + the purge-by-sid remove_if (OutDg carries a LocalSrc) depend on trivial copyability.
+  static_assert(std::is_trivially_copyable<LocalSrc>::value, "LocalSrc must be trivially copyable");
+
+  /// Three-valued classifier verdict (tracker 2026-10-03-1 DD3/M-A): a DROP (absent/truncated
+  /// cmsg) must NOT be confused with a valid-but-unpinned non-unicast arrival.
+  enum class LocalSrcVerdict
+  {
+    PINNED,
+    UNPINNED_NON_UNICAST,
+    DROP
+  };
+  struct LocalSrcResult
+  {
+    LocalSrcVerdict verdict{LocalSrcVerdict::DROP};
+    LocalSrc src{};
+  };
+
+  /// A v4 arrival is non-unicast (no valid reply source) if the header dest is multicast or the
+  /// limited broadcast, OR differs from ipi_spec_dst — the last clause catches subnet-directed
+  /// broadcast, since the kernel sets ipi_spec_dst == ipi_addr only for a local-unicast delivery
+  /// (fib_compute_spec_dst / RTCF_LOCAL). Byte-order-correct (tracker 2026-10-03-1 LOW-1).
+  static bool isNonUnicastV4(const in_pktinfo &pi)
+  {
+    return IN_MULTICAST(ntohl(pi.ipi_addr.s_addr)) ||
+           pi.ipi_addr.s_addr == htonl(INADDR_BROADCAST) ||
+           pi.ipi_addr.s_addr != pi.ipi_spec_dst.s_addr;
+  }
+
+  static in6_addr v4MappedV6(in_addr v4)
+  {
+    in6_addr out{};
+    out.s6_addr[10] = 0xff;
+    out.s6_addr[11] = 0xff;
+    std::memcpy(&out.s6_addr[12], &v4.s_addr, sizeof(v4.s_addr));
+    return out;
+  }
+
+  /// Numeric text of a captured local for the peer-index key, written into \p out (inet_ntop only —
+  /// never getnameinfo; never emits '<'/'>'/'|'). A stack buffer, NOT a std::string, so the inbound
+  /// hot path makes no heap allocation per datagram (a v4-mapped/v6 literal exceeds SSO). Empty on
+  /// AF_UNSPEC. CANONICAL FORM (tracker 2026-10-03-1 DD4): a v4-mapped local renders as
+  /// "::ffff:a.b.c.d" — this exact spelling is the key form that sibling 2026-10-03-2 (dual-stack
+  /// ::→IPv4 origination) MUST match so the two tasks' keys interoperate.
+  static void localToText(const LocalSrc &ls, char (&out)[INET6_ADDRSTRLEN])
+  {
+    out[0] = '\0';
+    if (ls.family == AF_INET)
+    {
+      ::inet_ntop(AF_INET, &ls.addr.v4, out, INET6_ADDRSTRLEN);
+    }
+    else if (ls.family == AF_INET6)
+    {
+      ::inet_ntop(AF_INET6, &ls.addr.v6, out, INET6_ADDRSTRLEN);
+    }
+  }
+
+  /// PURE classification of a received datagram's local destination from its control messages
+  /// (tracker 2026-10-03-1 DD3; static + msghdr-driven so it is unit-testable with synthesized
+  /// cmsgs). sockFamily is the LISTENER socket family. DROP when the required pktinfo cmsg is
+  /// absent/truncated (never route such a datagram); UNPINNED_NON_UNICAST for a multicast/
+  /// broadcast dest; PINNED with the local unicast source otherwise. On a dual-stack AF_INET6
+  /// socket a v4 arrival is sourced from IP_PKTINFO.ipi_spec_dst (stored v4-mapped) — NEVER from
+  /// IPV6_PKTINFO.ipi6_addr (that is the mapped HEADER dest a directed broadcast would poison); a
+  /// v4-mapped IPV6_PKTINFO with no IP_PKTINFO is therefore a DROP, not a fallback (LOW-2).
+  static LocalSrcResult classifyLocalSrc(int sockFamily, msghdr &msg)
+  {
+    if ((msg.msg_flags & MSG_CTRUNC) != 0)
+    {
+      return {LocalSrcVerdict::DROP, {}};
+    }
+    bool have4 = false, have6 = false;
+    in_pktinfo pi4{};
+    in6_pktinfo pi6{};
+    for (cmsghdr *c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c))
+    {
+      if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO)
+      {
+        std::memcpy(&pi4, CMSG_DATA(c), sizeof(pi4));
+        have4 = true;
+      }
+      else if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_PKTINFO)
+      {
+        std::memcpy(&pi6, CMSG_DATA(c), sizeof(pi6));
+        have6 = true;
+      }
+    }
+    if (sockFamily == AF_INET)
+    {
+      if (!have4)
+      {
+        return {LocalSrcVerdict::DROP, {}};
+      }
+      if (isNonUnicastV4(pi4))
+      {
+        return {LocalSrcVerdict::UNPINNED_NON_UNICAST, {}};
+      }
+      LocalSrc s;
+      s.family = AF_INET;
+      s.addr.v4 = pi4.ipi_spec_dst;
+      return {LocalSrcVerdict::PINNED, s};
+    }
+    // AF_INET6 listener (possibly dual-stack): a v4 arrival is identified by an IP_PKTINFO cmsg.
+    if (have4)
+    {
+      if (isNonUnicastV4(pi4))
+      {
+        return {LocalSrcVerdict::UNPINNED_NON_UNICAST, {}};
+      }
+      LocalSrc s;
+      s.family = AF_INET6;
+      s.addr.v6 = v4MappedV6(pi4.ipi_spec_dst);
+      return {LocalSrcVerdict::PINNED, s};
+    }
+    if (!have6)
+    {
+      return {LocalSrcVerdict::DROP, {}};
+    }
+    if (IN6_IS_ADDR_V4MAPPED(&pi6.ipi6_addr))
+    {
+      // v4 arrival but IP_PKTINFO absent: ipi6_addr is the mapped HEADER dest, not a trustworthy
+      // local source — DROP rather than fall back (LOW-2; unreachable once addListenerDo's checked
+      // IP_PKTINFO setsockopt succeeds on a dual-stack socket).
+      return {LocalSrcVerdict::DROP, {}};
+    }
+    if (IN6_IS_ADDR_MULTICAST(&pi6.ipi6_addr))
+    {
+      return {LocalSrcVerdict::UNPINNED_NON_UNICAST, {}};
+    }
+    LocalSrc s;
+    s.family = AF_INET6;
+    s.addr.v6 = pi6.ipi6_addr;
+    return {LocalSrcVerdict::PINNED, s};
+  }
+
+  /// Send on an unconnected UDP fd, selecting the reply SOURCE address when \p ls is pinned
+  /// (tracker 2026-10-03-1 DD6). ifindex is left 0 (L-D: echoing the received ifindex pins egress
+  /// and breaks policy routing; the dest's sin6_scope_id still supplies the oif for a link-local
+  /// peer). AF_UNSPEC → plain ::sendto (specific binds / non-unicast / unadopted via).
+  static ssize_t udpSendTo(int fd, const void *data, std::size_t len, const sockaddr *to,
+                           socklen_t tolen, const LocalSrc &ls)
+  {
+    if (ls.family == AF_UNSPEC)
+    {
+      return ::sendto(fd, data, len, MSG_NOSIGNAL, to, tolen);
+    }
+    msghdr msg{};
+    iovec iov{};
+    iov.iov_base = const_cast<void *>(data);
+    iov.iov_len = len;
+    msg.msg_name = const_cast<sockaddr *>(to);
+    msg.msg_namelen = tolen;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    union
+    {
+      cmsghdr align;
+      std::uint8_t buf[CMSG_SPACE(sizeof(in6_pktinfo))];
+    } control;
+    // Zero the WHOLE control buffer (value-init of a union only inits the first member, leaving the
+    // CMSG_SPACE padding uninitialized → valgrind flags sendmsg; cpp17 L3). memset covers all bytes.
+    std::memset(&control, 0, sizeof(control));
+    msg.msg_control = control.buf;
+    if (ls.family == AF_INET)
+    {
+      msg.msg_controllen = CMSG_SPACE(sizeof(in_pktinfo));
+      cmsghdr *c = CMSG_FIRSTHDR(&msg);
+      c->cmsg_level = IPPROTO_IP;
+      c->cmsg_type = IP_PKTINFO;
+      c->cmsg_len = CMSG_LEN(sizeof(in_pktinfo));
+      in_pktinfo pi{};
+      pi.ipi_spec_dst = ls.addr.v4; // ipi_ifindex = 0
+      std::memcpy(CMSG_DATA(c), &pi, sizeof(pi));
+    }
+    else
+    {
+      msg.msg_controllen = CMSG_SPACE(sizeof(in6_pktinfo));
+      cmsghdr *c = CMSG_FIRSTHDR(&msg);
+      c->cmsg_level = IPPROTO_IPV6;
+      c->cmsg_type = IPV6_PKTINFO;
+      c->cmsg_len = CMSG_LEN(sizeof(in6_pktinfo));
+      in6_pktinfo pi{};
+      pi.ipi6_addr = ls.addr.v6; // ipi6_ifindex = 0
+      std::memcpy(CMSG_DATA(c), &pi, sizeof(pi));
+    }
+    return ::sendmsg(fd, &msg, MSG_NOSIGNAL);
   }
 
   /// Forwards to the shared iora::network::addressFromSockaddr. This was a
@@ -764,14 +986,6 @@ private:
   static TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
   {
     return iora::network::addressFromSockaddr(ss);
-  }
-  int sockAf(int fd)
-  {
-    sockaddr_storage ss{};
-    socklen_t sl = sizeof(ss);
-    if (::getsockname(fd, reinterpret_cast<sockaddr *>(&ss), &sl) == 0)
-      return ss.ss_family;
-    return AF_UNSPEC;
   }
   void error(TransportError e, const std::string &m)
   {
@@ -1149,6 +1363,10 @@ private:
     // per-session forced-EAGAIN seam key on the owner sid, NOT the peer address
     // (several logical sessions may share one peer address).
     SessionId sid{};
+    // Reply source for a wildcard-bind send (tracker 2026-10-03-1 DD2): SNAPSHOTTED from the
+    // session at enqueue (not looked up by sid at flush) because an adopt can change the session's
+    // local between enqueue and flush, and it avoids an _sessions lookup per flushed datagram.
+    LocalSrc localSrc{};
   };
   struct Listener
   {
@@ -1157,6 +1375,11 @@ private:
     std::string bind;
     std::deque<OutDg> wq;
     bool wantWrite{false};
+    // Wildcard bind (0.0.0.0 / ::) → IP_PKTINFO capture is on and the peer-index key carries the
+    // captured local segment (tracker 2026-10-03-1 DD1). sockFamily is the listener socket's AF
+    // (AF_INET / AF_INET6), used by classifyLocalSrc to pick the pktinfo field.
+    bool wildcard{false};
+    int sockFamily{AF_UNSPEC};
     // Last successful ::sendto on this listener's shared fd (L-8, tracker 2026-09-25-16).
     // The shared write queue stalls as a UNIT, so the write-stall backstop keys on this
     // per-listener clock (not per-session), and reclaims the owner of the front (blocking)
@@ -1173,6 +1396,9 @@ private:
     sockaddr_storage peer{};
     socklen_t plen{0};
     std::string pkey;
+    // Captured local destination for wildcard-bind reply-source selection (tracker 2026-10-03-1).
+    // Set at inbound capture and at via-adopt; AF_UNSPEC = send unpinned. I/O-thread-only (DD10).
+    LocalSrc localSrc{};
     std::deque<ByteBuffer> wq;
     bool wantWrite{false};
     // Cross-thread liveness flag (tracker 2026-09-15-3): read lock-free on the CALLER
@@ -1646,9 +1872,14 @@ private:
     int sfd = -1;
     sockaddr_storage ss{};
     socklen_t sl = 0;
+    bool wildcard = false; // 0.0.0.0 / :: / ::ffff:0.0.0.0 — drives pktinfo capture (DD1)
+    int sockFamily = AF_UNSPEC;
     in6_addr t6{};
     if (::inet_pton(AF_INET6, lc.addr.c_str(), &t6) == 1)
     {
+      sockFamily = AF_INET6;
+      wildcard = IN6_IS_ADDR_UNSPECIFIED(&t6) ||
+                 (IN6_IS_ADDR_V4MAPPED(&t6) && std::memcmp(&t6.s6_addr[12], "\0\0\0\0", 4) == 0);
       sfd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
       if (sfd < 0)
       {
@@ -1656,7 +1887,14 @@ private:
         return false;
       }
       int v6only = 0;
-      ::setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+      // LOW-4 (tracker 2026-10-03-1): a silent V6ONLY=0 failure disables dual-stack (v4 never
+      // reaches the listener), which also breaks v4-mapped source capture — fail the listener.
+      if (::setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) < 0)
+      {
+        error(TransportError::Socket, "setsockopt IPV6_V6ONLY: " + lastErr());
+        ::close(sfd);
+        return false;
+      }
       sockaddr_in6 sa6{};
       sa6.sin6_family = AF_INET6;
       sa6.sin6_port = htons(lc.port);
@@ -1672,6 +1910,8 @@ private:
         error(TransportError::Bind, "inet_pton failed");
         return false;
       }
+      sockFamily = AF_INET;
+      wildcard = (t4.s_addr == htonl(INADDR_ANY));
       sfd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
       if (sfd < 0)
       {
@@ -1703,10 +1943,38 @@ private:
       ::close(sfd);
       return false;
     }
+    // RFC 3581 §4 address-half (tracker 2026-10-03-1 DD1): on a WILDCARD bind, enable per-datagram
+    // local-destination delivery so replies can egress from the address the request arrived on. A
+    // specific bind sets nothing (its source is already pinned by the bind). The setsockopt calls
+    // are CHECKED — a silent failure plus the drop-on-missing-cmsg rule would black-hole the
+    // listener (M-4). On a dual-stack v6 socket IP_PKTINFO is also set so IPv4 arrivals deliver an
+    // IP_PKTINFO cmsg (classifyLocalSrc prefers it over the mapped IPV6_PKTINFO header dest).
+    if (wildcard)
+    {
+      int on = 1;
+      bool ok = true;
+      if (sockFamily == AF_INET6)
+      {
+        ok = ::setsockopt(sfd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on)) == 0 &&
+             ::setsockopt(sfd, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on)) == 0;
+      }
+      else
+      {
+        ok = ::setsockopt(sfd, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on)) == 0;
+      }
+      if (!ok)
+      {
+        error(TransportError::Socket, "setsockopt PKTINFO: " + lastErr());
+        ::close(sfd);
+        return false;
+      }
+    }
     auto lst = std::make_unique<Listener>();
     lst->id = lc.id;
     lst->fd = sfd;
     lst->bind = lc.addr + ":" + std::to_string(lc.port);
+    lst->wildcard = wildcard;
+    lst->sockFamily = sockFamily;
     lst->lastWriteProgress = MonoClock::now(); // seed the write-stall clock (L-8)
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
@@ -1738,18 +2006,106 @@ private:
     }
   }
 
+  /// Adopt a wildcard connectViaListener session onto the (listener,local,peer) key the first
+  /// UNICAST inbound arrived on (tracker 2026-10-03-1 DD5). A via on a wildcard bind is inserted
+  /// under the sentinel key lid|<via>|peer because its local dest is unknown until inbound. On an
+  /// exact-key miss, if that sentinel bucket exists and is NON-EMPTY, move the WHOLE twin list onto
+  /// \p newKey (preserving the twins-share-one-key contract), rewrite each twin's pkey + localSrc,
+  /// and return its front() in \p outFront. Returns false (→ fresh accept) when there is nothing to
+  /// adopt. EXCEPTION-SAFE: all allocation happens in step 1 before any mutation; steps after the
+  /// operator[] rehash are noexcept (vector/string swap, map erase, trivially-copyable assign).
+  /// Rewriting pkey is MANDATORY — closeNow erases _peerIndex by s->pkey, so a stale back-key would
+  /// leave a dead sid at front() and black-hole the peer. I/O-thread-only (DD10).
+  bool adoptWildcardVia(ListenerId lid, const sockaddr_storage &peer, const std::string &newKey,
+                        const LocalSrc &local, SessionId &outFront)
+  {
+    std::string sentinelKey = peerKey(lid, peer, VIA_LOCAL_SENTINEL);
+    if (sentinelKey.empty())
+    {
+      return false;
+    }
+    auto sit = _peerIndex.find(sentinelKey);
+    if (sit == _peerIndex.end() || sit->second.empty())
+    {
+      return false;
+    }
+    // Step 1 (may throw; NOTHING mutated yet): collect the twin Session*s and pre-build one pkey
+    // string per twin so the noexcept step below only swaps.
+    std::vector<Session *> sessions;
+    std::vector<std::string> keyCopies;
+    sessions.reserve(sit->second.size());
+    keyCopies.reserve(sit->second.size());
+    for (SessionId id : sit->second)
+    {
+      auto s = _sessions.find(id);
+      if (s != _sessions.end())
+      {
+        sessions.push_back(s->second.get());
+        keyCopies.push_back(newKey);
+      }
+    }
+    // Step 2: create the destination bucket (may rehash — invalidates ITERATORS, not references).
+    auto &dst = _peerIndex[newKey];
+    // Step 3: re-find the sentinel bucket after the operator[] rehash.
+    sit = _peerIndex.find(sentinelKey);
+    if (sit == _peerIndex.end())
+    {
+      return false; // defensive: cannot happen (we just confirmed it)
+    }
+    // Step 4 (NOEXCEPT): on an exact miss dst is empty, so swap moves the twin list wholesale.
+    dst.swap(sit->second);
+    _peerIndex.erase(sit);
+    for (std::size_t i = 0; i < sessions.size(); ++i)
+    {
+      sessions[i]->pkey.swap(keyCopies[i]);
+      sessions[i]->localSrc = local;
+    }
+    // cpp17 L-1: step 1 only rewrote pkey for LIVE sids; drop any stale sid the swap carried over so
+    // front() is always a live session (closeNow keeps _peerIndex↔_sessions consistent, so this is
+    // defensive — but it makes the dst.empty() guard below genuinely reachable). remove_if is
+    // noexcept here (no allocation); _sessions.find is a const lookup.
+    dst.erase(std::remove_if(dst.begin(), dst.end(),
+                             [this](SessionId id) { return _sessions.find(id) == _sessions.end(); }),
+              dst.end());
+    if (dst.empty())
+    {
+      _peerIndex.erase(newKey);
+      return false;
+    }
+    outFront = dst.front();
+    return true;
+  }
+
   void readFromListener(Listener *lst)
   {
     // Hot path (tracker 2026-10-02-3 M-D): allocate the receive buffer ONCE per call, not per
-    // datagram. recvfrom overwrites it each iteration and onData's BufferView is valid only for
+    // datagram. recvmsg overwrites it each iteration and onData's BufferView is valid only for
     // the synchronous callback, so reuse is safe (mirrors tcp_engine).
     std::vector<std::uint8_t> buf(_config.ioReadChunk);
+    // Hoist the recvmsg scaffolding beside buf (tracker 2026-10-03-1 DD8-9): on a wildcard bind we
+    // read IP_PKTINFO/IPV6_PKTINFO (the local destination) alongside the datagram so the reply can
+    // egress from it (RFC 3581 §4 address-half). The control buffer is aligned for cmsghdr and
+    // sized for both pktinfo flavours (a dual-stack socket may deliver either).
+    msghdr msg{};
+    iovec iov{};
+    union
+    {
+      cmsghdr align;
+      std::uint8_t b[CMSG_SPACE(sizeof(in6_pktinfo)) + CMSG_SPACE(sizeof(in_pktinfo))];
+    } control{};
     for (;;)
     {
       sockaddr_storage from{};
-      socklen_t fl = sizeof(from);
-      int n = ::recvfrom(lst->fd, buf.data(), (int)buf.size(), 0,
-                         reinterpret_cast<sockaddr *>(&from), &fl);
+      iov.iov_base = buf.data();
+      iov.iov_len = buf.size();
+      msg.msg_name = &from;
+      msg.msg_namelen = sizeof(from);         // RESET per iteration (recvmsg overwrites it)
+      msg.msg_iov = &iov;
+      msg.msg_iovlen = 1;
+      msg.msg_control = control.b;
+      msg.msg_controllen = sizeof(control.b); // RESET per iteration
+      msg.msg_flags = 0;
+      ssize_t n = ::recvmsg(lst->fd, &msg, 0);
       if (n > 0)
       {
         // M-A (tracker 2026-10-02-3): a bad_alloc on the per-datagram create path must NOT
@@ -1761,14 +2117,48 @@ private:
         try
         {
           _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
-          std::string k = peerKey(lst->id, from);
+          // On a WILDCARD bind, capture the local destination so the reply egresses from it; a
+          // specific bind has no pktinfo and keys/sends byte-identical to before (DD1/DD3/DD4).
+          LocalSrc localSrc{};
+          const char *localSeg = nullptr;
+          char localBuf[INET6_ADDRSTRLEN]; // outlives localSeg's use below (peerKey + adopt)
+          if (lst->wildcard)
+          {
+            LocalSrcResult lr = classifyLocalSrc(lst->sockFamily, msg);
+            if (lr.verdict == LocalSrcVerdict::DROP)
+            {
+              continue; // absent/truncated pktinfo on a wildcard socket -> drop (defensive)
+            }
+            if (lr.verdict == LocalSrcVerdict::PINNED)
+            {
+              localSrc = lr.src;
+              localToText(localSrc, localBuf);
+              localSeg = localBuf; // wildcard PINNED -> lid|<local>|host:port
+            }
+            else
+            {
+              localSeg = ""; // UNPINNED_NON_UNICAST -> lid||host:port (unpinned reply, never adopts)
+            }
+          }
+          std::string k = peerKey(lst->id, from, localSeg);
           if (k.empty())
           {
             continue; // unkeyable source (getnameinfo failed) -> drop (defensive; NI_NUMERIC*)
           }
           SessionId sid = 0;
           auto it = _peerIndex.find(k);
-          if (it == _peerIndex.end() || it->second.empty())
+          if (it != _peerIndex.end() && !it->second.empty())
+          {
+            sid = it->second.front(); // exact (listener,local,peer) hit -> oldest surviving twin
+          }
+          else if (lst->wildcard && localSrc.family != AF_UNSPEC &&
+                   adoptWildcardVia(lst->id, from, k, localSrc, sid))
+          {
+            // A wildcard via to this peer had no local yet; the first UNICAST inbound adopts the
+            // whole twin list onto this (listener,local,peer) key (DD5) -> sid is the promoted
+            // front, each twin's pkey + localSrc rewritten. Dispatch below.
+          }
+          else
           {
             if (sessionCapReached())
             {
@@ -1780,9 +2170,10 @@ private:
             s->role = Role::ServerPeer;
             s->fd = lst->fd;
             s->owner = lst->id;
-            std::memcpy(&s->peer, &from, fl);
-            s->plen = fl;
+            std::memcpy(&s->peer, &from, msg.msg_namelen);
+            s->plen = msg.msg_namelen;
             s->pkey = k;
+            s->localSrc = localSrc;
             s->created = MonoClock::now();
             s->lastActivity = s->created;
             s->lastWriteProgress = s->created;
@@ -1808,10 +2199,6 @@ private:
             invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid,
                                addressFromSockaddr(from));
           }
-          else
-          {
-            sid = it->second.front(); // dispatch to the oldest-by-insertion surviving twin
-          }
           // steps-4-8 R3 (cpp17/TS LOW): use const find() (not non-const operator[]) on the
           // I/O thread — operator[] would be a formal data race vs caller-thread shared_lock
           // readers (the sid always pre-exists here, so find never misses).
@@ -1835,7 +2222,7 @@ private:
       {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
           break;
-        error(TransportError::Socket, "recvfrom: " + lastErr());
+        error(TransportError::Socket, "recvmsg: " + lastErr());
         break;
       }
       // n==0 acceptable
@@ -1849,15 +2236,24 @@ private:
       auto &d = lst->wq.front();
       // Seam (tracker 2026-09-25-16): a held datagram at the FRONT stalls the whole shared
       // queue (head-of-line), exactly as a real listener-socket EAGAIN would; datagrams
-      // behind it drain only once it is gone.
-      int n = testForceEagain(d.sid)
-                ? -1
-                : ::sendto(lst->fd, d.payload.data(), (int)d.payload.size(), MSG_NOSIGNAL,
-                           reinterpret_cast<sockaddr *>(&d.to), d.toLen);
+      // behind it drain only once it is gone. udpSendTo selects d.localSrc as the reply source on
+      // a wildcard bind (RFC 3581 §4, tracker 2026-10-03-1 DD6); AF_UNSPEC → plain ::sendto.
+      ssize_t n = testForceEagain(d.sid)
+                    ? -1
+                    : udpSendTo(lst->fd, d.payload.data(), d.payload.size(),
+                                reinterpret_cast<sockaddr *>(&d.to), d.toLen, d.localSrc);
       if (n >= 0)
       {
+        const auto now = MonoClock::now();
         _atomicStats.bytesOut.fetch_add(n, std::memory_order_relaxed);
-        lst->lastWriteProgress = MonoClock::now(); // per-listener write-stall clock (L-8)
+        lst->lastWriteProgress = now; // per-listener write-stall clock (L-8)
+        // Mirror the direct path (sip LOW-2): refresh the owning session's activity clock so a
+        // backpressure-drained ServerPeer is not idle-reaped sooner than one that sent directly.
+        auto sit = _sessions.find(d.sid);
+        if (sit != _sessions.end())
+        {
+          sit->second->lastActivity = now;
+        }
         lst->wq.pop_front();
         continue;
       }
@@ -1867,8 +2263,29 @@ private:
         updateListener(lst);
         break;
       }
-      error(TransportError::Socket, "sendto: " + lastErr());
+      // DD7 (tracker 2026-10-03-1): a PINNED-source send that fails (the source is no longer local —
+      // VIP failover / addr removal) must CLOSE that session, not silently fall back to the kernel
+      // source (which would recreate the asymmetry this task removes). Close on ANY non-EAGAIN error
+      // from a pinned send — matching the direct path's close-on-non-EAGAIN (sip LOW-4 / cpp17 L4),
+      // rather than enumerating errnos (EINVAL/EADDRNOTAVAIL for non-local; EHOSTUNREACH/EPERM also
+      // possible). An UNPINNED send keeps the pre-existing error()+drop behavior. Copy sid + errno
+      // BEFORE pop_front (which destroys d) — closeNow takes a Session* and purges that sid's other
+      // datagrams by remove_if (invalidating deque refs), so nothing may touch d afterwards (M-1).
+      int err = errno;
+      SessionId sid = d.sid;
+      bool pinned = d.localSrc.family != AF_UNSPEC;
       lst->wq.pop_front();
+      errno = err;
+      if (pinned)
+      {
+        auto sit = _sessions.find(sid);
+        if (sit != _sessions.end())
+        {
+          closeNow(sit->second.get(), TransportError::Socket, lastErr(), 0);
+        }
+        continue;
+      }
+      error(TransportError::Socket, "sendto: " + lastErr());
     }
     if (lst->wq.empty())
     {
@@ -2278,7 +2695,9 @@ private:
       return false;
     }
     Listener *lst = lit->second.get();
-    int af = sockAf(lst->fd);
+    // Use the cached listener family (set at addListenerDo) instead of a per-via getsockname
+    // (simpl L-2): ListenerId↔fd is 1:1, so lst->sockFamily is authoritative.
+    int af = lst->sockFamily;
     if (af != AF_INET && af != AF_INET6)
     {
       preInsertTerminal(sid,
@@ -2315,7 +2734,12 @@ private:
       tl = sizeof(sockaddr_in);
     }
     // NO ::freeaddrinfo — caller owns res (#6).
-    std::string k = peerKey(lst->id, to);
+    // On a WILDCARD bind the via's local dest is unknown until the first inbound adopts it, so key
+    // it under the sentinel segment (tracker 2026-10-03-1 DD5); a specific bind keeps lid|host:port.
+    // The via session's localSrc stays AF_UNSPEC (origination sends use the kernel source until
+    // adoption — the HE follow-up pins originated requests).
+    const char *viaLocalSeg = lst->wildcard ? VIA_LOCAL_SENTINEL : nullptr;
+    std::string k = peerKey(lst->id, to, viaLocalSeg);
     if (k.empty())
     {
       // Unkeyable destination (getnameinfo failed): reject BEFORE the cap check, while
@@ -2323,8 +2747,8 @@ private:
       preInsertTerminal(sid, TransportErrorInfo{TransportError::Config, "unkeyable peer address"});
       return false;
     }
-    // _peerIndex is keyed by (listener, peer) and holds the twin SessionIds sharing that key
-    // in insertion order; front() is the inbound-dispatch target. We still create a Session
+    // _peerIndex is keyed by (listener, [local,] peer) and holds the twin SessionIds sharing that
+    // key in insertion order; front() is the inbound-dispatch target. We still create a Session
     // for every SessionId (self-loopback + multiple logical sessions to one peer); a via to a
     // peer already indexed on ANOTHER listener now gets its OWN (listener,peer) entry rather
     // than silently sharing the first listener's (tracker 2026-10-02-3). Apps demultiplex.
@@ -2565,13 +2989,16 @@ private:
       return;
     }
     Listener *lst = lit->second.get();
-    // M-5: same FIFO rule on the SHARED listener queue — direct sendto only when empty.
+    // M-5: same FIFO rule on the SHARED listener queue — direct send only when empty. On a wildcard
+    // bind udpSendTo selects the captured local as the reply source (RFC 3581 §4); AF_UNSPEC → plain
+    // ::sendto (tracker 2026-10-03-1 DD6). A source-not-local error is a non-EAGAIN error, so the
+    // existing close-on-non-EAGAIN branch already closes the session (DD7).
     if (lst->wq.empty())
     {
-      int n = testForceEagain(s->id)
-                ? -1
-                : ::sendto(lst->fd, sr.payload.data(), (int)sr.payload.size(), MSG_NOSIGNAL,
-                           reinterpret_cast<sockaddr *>(&s->peer), s->plen);
+      ssize_t n = testForceEagain(s->id)
+                    ? -1
+                    : udpSendTo(lst->fd, sr.payload.data(), sr.payload.size(),
+                                reinterpret_cast<sockaddr *>(&s->peer), s->plen, s->localSrc);
       if (n >= 0)
       {
         const auto now = MonoClock::now();
@@ -2594,7 +3021,8 @@ private:
     std::memcpy(&d.to, &s->peer, s->plen);
     d.toLen = s->plen;
     d.payload = std::move(sr.payload);
-    d.sid = s->id; // H-2: tag the owner for purge-by-sid on close
+    d.sid = s->id;          // H-2: tag the owner for purge-by-sid on close
+    d.localSrc = s->localSrc; // DD2/DD6: snapshot the reply source for the flush path
     lst->wq.emplace_back(std::move(d));
     // On a close-mode overflow closeNow purges this session's datagrams by sid (bounds the
     // shared queue; M-1 — no extra pop). The listener keeps EPOLLOUT armed from the prior
