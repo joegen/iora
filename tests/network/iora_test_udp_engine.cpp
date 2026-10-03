@@ -65,6 +65,30 @@ struct UdpFixture
   std::mutex dataMutex;
   std::vector<std::string> receivedData;
 
+  // Per-onData (sid,payload) record (tracker 2026-10-02-3, Phase 0): lets a test assert
+  // WHICH session a datagram was dispatched to — the behavioural discriminator for the
+  // cross-listener / per-listener-key fix. Written under dataMutex on the I/O thread
+  // (same publication rule as receivedData), read via sidForPayload() on the test thread.
+  std::vector<std::pair<SessionId, std::string>> dataBySid;
+  // Gate the server-side echo (default on). A self-origination test (datagrams whose
+  // source IS one of our own listeners) would otherwise cascade echoes across listeners;
+  // such a test sets this false and asserts on acceptCount + the dispatched sid instead.
+  std::atomic<bool> echoEnabled{true};
+
+  // The sid the FIRST onData carrying \p payload was dispatched to, or 0 if none yet.
+  SessionId sidForPayload(const std::string &payload)
+  {
+    std::lock_guard<std::mutex> g(dataMutex);
+    for (const auto &kv : dataBySid)
+    {
+      if (kv.second == payload)
+      {
+        return kv.first;
+      }
+    }
+    return 0;
+  }
+
   // Close-terminal capture (tracker 2026-09-14-1, cpp17-M3). onClose runs on the
   // engine I/O thread; the test thread reads these via lastClose(). Guarded by the
   // existing dataMutex (one mutex per fixture, matching TcpFixture/ResolveFixture)
@@ -112,8 +136,9 @@ struct UdpFixture
       // Echo on server; detect on client. This runs on the engine I/O thread —
       // no Catch2 macro here (issue #99): record a failed send for the main
       // thread to assert.
-      if (std::find(acceptedSessions.begin(), acceptedSessions.end(), sid) !=
-          acceptedSessions.end())
+      if (echoEnabled.load() &&
+          std::find(acceptedSessions.begin(), acceptedSessions.end(), sid) !=
+            acceptedSessions.end())
       {
         if (!tx.send(sid, data, n))
         {
@@ -130,7 +155,9 @@ struct UdpFixture
       }
       {
         std::lock_guard<std::mutex> lock(dataMutex);
-        receivedData.push_back(std::string(reinterpret_cast<const char *>(data), n));
+        std::string payload(reinterpret_cast<const char *>(data), n);
+        receivedData.push_back(payload);
+        dataBySid.emplace_back(sid, std::move(payload));
       }
     };
     cbs.onClose = [&](SessionId, const TransportErrorInfo &info)
@@ -789,7 +816,8 @@ ListenerRig startWithListener(UdpFixture &f)
   return {lr.value(), port};
 }
 
-// Two via-sessions from f's listener to one peer port; return {ss1, ss2} (ss1 is indexed).
+// Two via-sessions from f's listener to one peer port; return {ss1, ss2} (both are twins in the
+// one (listener,peer) index list in insertion order; ss1 is the front / dispatch target).
 std::pair<SessionId, SessionId> twinVias(UdpFixture &f, ListenerId lid, std::uint16_t peerPort)
 {
   auto r1 = f.tx.connectViaListener(lid, "127.0.0.1", peerPort);
@@ -797,6 +825,17 @@ std::pair<SessionId, SessionId> twinVias(UdpFixture &f, ListenerId lid, std::uin
   REQUIRE(r1.isOk());
   REQUIRE(r2.isOk());
   return {r1.value(), r2.value()};
+}
+
+// Send one datagram from a raw loopback-v4 fd to 127.0.0.1:port (tracker 2026-10-02-3 L-5 DRY).
+void sendLoopbackV4(int fd, std::uint16_t port, const std::string &msg)
+{
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(port);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  REQUIRE(::sendto(fd, msg.data(), msg.size(), 0, reinterpret_cast<sockaddr *>(&a), sizeof(a)) ==
+          static_cast<ssize_t>(msg.size()));
 }
 
 struct ServerPeerRig
@@ -1026,15 +1065,302 @@ TEST_CASE("UDP closing a peer twin preserves the sibling's peer-index entry",
   UdpFixture f{};
   ListenerId lid = startWithListener(f).lid;
   auto peerPort = testnet::getFreePortUDP();
-  auto twins = twinVias(f, lid, peerPort); // ss1 indexed, ss2 twin (not indexed)
+  auto twins = twinVias(f, lid, peerPort); // both twins in one (lid,peer) list; ss1 at front
   SessionId ss1 = twins.first;
   SessionId ss2 = twins.second;
 
-  REQUIRE(UdpEngineTestAccess::peerIndexHasSid(f.tx, ss1)); // sibling indexed
-  REQUIRE(f.tx.close(ss2));                                 // close the twin
+  // Task 1.5 (tracker 2026-10-02-3): assert the exact index state via peerIndexLookup (the
+  // per-listener key shape), not just any-bucket membership. Both twins present in insertion
+  // order; ss1 is the front / dispatch target.
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "127.0.0.1", peerPort) ==
+          std::vector<SessionId>{ss1, ss2});
+  REQUIRE(f.tx.close(ss2)); // close the (non-front) twin
   UdpEngineTestAccess::ioBarrier(f.tx);
   REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss2));
-  REQUIRE(UdpEngineTestAccess::peerIndexHasSid(f.tx, ss1)); // sibling STILL indexed
+  // ss1 survives at the front; ss2 removed (H-3: closing a twin does not evict the sibling).
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "127.0.0.1", peerPort) ==
+          std::vector<SessionId>{ss1});
+  f.tx.stop();
+}
+
+// === tracker 2026-10-02-3: _peerIndex cross-listener misrouting ===
+// Red-before-green discriminators. Each test leads with BLACK-BOX observables (acceptCount, the
+// dispatched sid via sidForPayload(), and the on-wire source port) that FAIL on the pre-fix
+// engine; the structural peerIndexLookup() assertions (the post-fix per-listener key shape) are
+// added AFTER those, per Phase 1.5, and only pin the green (REQUIRE stops at the first failure,
+// so they never run pre-fix). helpers: sendLoopbackV4 (raw-fd send), twinVias (two via twins).
+
+TEST_CASE("UDP _peerIndex one peer source to two listeners dispatches per-listener (a)",
+          "[udp][peerindex][multi-listener]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto portA = testnet::getFreePortUDP();
+  auto portB = testnet::getFreePortUDP();
+  auto lrA = f.tx.addListener("127.0.0.1", portA, TlsMode::None);
+  auto lrB = f.tx.addListener("127.0.0.1", portB, TlsMode::None);
+  REQUIRE(lrA.isOk());
+  REQUIRE(lrB.isOk());
+  ListenerId lidA = lrA.value();
+  ListenerId lidB = lrB.value();
+
+  // ONE raw peer socket => one source ip:port reaching BOTH our listeners.
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = testnet::bindLoopbackV4Ephemeral(SOCK_DGRAM, pPort);
+  timeval tv{2, 0};
+  ::setsockopt(peer.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  sendLoopbackV4(peer.get(), portA, "toA");
+  sendLoopbackV4(peer.get(), portB, "toB");
+
+  // Fixed: two distinct sessions accepted (one per listener). Pre-fix: the second datagram
+  // collides on the address-only key and is dispatched to the first session -> only ONE
+  // accept ever fires -> this wait times out (RED).
+  REQUIRE(f.waitForCount(f.acceptCount, 2));
+
+  // The server echoes each datagram back from the listener it was dispatched on. Read the
+  // source port off the wire. Pre-fix both echoes leave from portA; fixed, "toB" from portB.
+  std::uint16_t fromToA = 0, fromToB = 0;
+  for (int i = 0; i < 6 && (fromToA == 0 || fromToB == 0); ++i)
+  {
+    char buf[64];
+    sockaddr_in src{};
+    socklen_t sl = sizeof(src);
+    ssize_t r = ::recvfrom(peer.get(), buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&src),
+                           &sl);
+    if (r <= 0)
+    {
+      break;
+    }
+    std::string p(buf, static_cast<std::size_t>(r));
+    if (p == "toA")
+    {
+      fromToA = ntohs(src.sin_port);
+    }
+    else if (p == "toB")
+    {
+      fromToB = ntohs(src.sin_port);
+    }
+  }
+  REQUIRE(fromToA == portA);
+  REQUIRE(fromToB == portB); // RED pre-fix (the "toB" echo leaves from portA)
+
+  // Two distinct sessions, one per listener (the B-arrival is not the A-session).
+  SessionId sA = f.sidForPayload("toA");
+  SessionId sB = f.sidForPayload("toB");
+  REQUIRE(sA != 0);
+  REQUIRE(sB != 0);
+  REQUIRE(sA != sB);
+  // Structural (post-fix shape): each listener owns its own single-session (listener,peer) list.
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lidA, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{sA});
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lidB, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{sB});
+  f.tx.stop();
+}
+
+TEST_CASE("UDP _peerIndex via on a second listener to an already-indexed peer dispatches per-listener (b)",
+          "[udp][peerindex][via][multi-listener]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto portA = testnet::getFreePortUDP();
+  auto portB = testnet::getFreePortUDP();
+  auto lrA = f.tx.addListener("127.0.0.1", portA, TlsMode::None);
+  auto lrB = f.tx.addListener("127.0.0.1", portB, TlsMode::None);
+  REQUIRE(lrA.isOk());
+  REQUIRE(lrB.isOk());
+  ListenerId lidA = lrA.value();
+  ListenerId lidB = lrB.value();
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = testnet::bindLoopbackV4Ephemeral(SOCK_DGRAM, pPort);
+  timeval tv{2, 0};
+  ::setsockopt(peer.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  // Two vias to the SAME peer, one per listener. Pre-fix viaB is NOT indexed (the global
+  // peerExists check), so a datagram from the peer to listener B is dispatched to viaA.
+  auto rA = f.tx.connectViaListener(lidA, "127.0.0.1", pPort);
+  auto rB = f.tx.connectViaListener(lidB, "127.0.0.1", pPort);
+  REQUIRE(rA.isOk());
+  REQUIRE(rB.isOk());
+  SessionId viaA = rA.value();
+  SessionId viaB = rB.value();
+  REQUIRE(f.waitForCount(f.connectCount, 2));
+
+  // Outbound half (sip-voip L-2): each via's request must EGRESS its own listener's port, so a
+  // real peer replying per Via sent-by/rport (RFC 3581 §4 / RFC 3261 §18.2.2) reaches the right
+  // session. Observe the source port on the wire from the raw peer.
+  REQUIRE(f.tx.send(viaB, "reqB", 4));
+  REQUIRE(f.tx.send(viaA, "reqA", 4));
+  std::uint16_t fromReqA = 0, fromReqB = 0;
+  for (int i = 0; i < 6 && (fromReqA == 0 || fromReqB == 0); ++i)
+  {
+    char buf[64];
+    sockaddr_in src{};
+    socklen_t sl = sizeof(src);
+    ssize_t r = ::recvfrom(peer.get(), buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&src),
+                           &sl);
+    if (r <= 0)
+    {
+      break;
+    }
+    std::string p(buf, static_cast<std::size_t>(r));
+    if (p == "reqA")
+    {
+      fromReqA = ntohs(src.sin_port);
+    }
+    else if (p == "reqB")
+    {
+      fromReqB = ntohs(src.sin_port);
+    }
+  }
+  REQUIRE(fromReqA == portA);
+  REQUIRE(fromReqB == portB);
+
+  // Inbound half: the peer's datagram to listener B dispatches to viaB (not viaA).
+  sendLoopbackV4(peer.get(), portB, "fromP");
+  REQUIRE(f.waitForCount(f.dataCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.acceptCount.load() == 0);          // an index entry exists -> no spurious accept
+  REQUIRE(f.sidForPayload("fromP") == viaB);   // RED pre-fix (dispatched to viaA)
+  // Structural (post-fix shape): each listener owns its OWN (listener,peer) twin list.
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lidA, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{viaA});
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lidB, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{viaB});
+  f.tx.stop();
+}
+
+TEST_CASE("UDP _peerIndex closing the indexed original re-points to a surviving twin (c, F-6)",
+          "[udp][peerindex][via]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  auto rig = startWithListener(f);
+  ListenerId lid = rig.lid;
+  std::uint16_t ourPort = rig.port;
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = testnet::bindLoopbackV4Ephemeral(SOCK_DGRAM, pPort);
+
+  // Two twins (same listener, same peer). ss1 is inserted first => front / indexed original.
+  auto twins = twinVias(f, lid, pPort);
+  SessionId ss1 = twins.first;
+  SessionId ss2 = twins.second;
+  REQUIRE(f.waitForCount(f.connectCount, 2));
+
+  REQUIRE(f.tx.close(ss1)); // close the indexed original
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE_FALSE(UdpEngineTestAccess::hasSession(f.tx, ss1));
+
+  // Inject an inbound datagram from the peer's source port to our listener.
+  sendLoopbackV4(peer.get(), ourPort, "reinject");
+
+  REQUIRE(f.waitForCount(f.dataCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  // Fixed: promoted to ss2, no new accept. Pre-fix: the entry was erased -> a spurious accept
+  // + a new sid (RED on both assertions).
+  REQUIRE(f.acceptCount.load() == 0);
+  REQUIRE(f.sidForPayload("reinject") == ss2);
+  // Structural (post-fix shape): ss1 removed, ss2 promoted to the front / sole twin.
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{ss2});
+  f.tx.stop();
+}
+
+TEST_CASE("UDP _peerIndex closing the last twin removes the entry; next inbound is a fresh accept (e)",
+          "[udp][peerindex][via]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  auto rig = startWithListener(f);
+  ListenerId lid = rig.lid;
+  std::uint16_t ourPort = rig.port;
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = testnet::bindLoopbackV4Ephemeral(SOCK_DGRAM, pPort);
+
+  auto twins = twinVias(f, lid, pPort);
+  SessionId ss1 = twins.first;
+  SessionId ss2 = twins.second;
+  REQUIRE(f.waitForCount(f.connectCount, 2));
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{ss1, ss2});
+
+  // Close BOTH twins -> the (listener,peer) entry is erased (closeNow erase-on-empty branch).
+  REQUIRE(f.tx.close(ss1));
+  REQUIRE(f.tx.close(ss2));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "127.0.0.1", pPort).empty());
+
+  // The next inbound datagram from that peer must now be a FRESH accept with a new sid.
+  sendLoopbackV4(peer.get(), ourPort, "revive");
+  REQUIRE(f.waitForCount(f.acceptCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  SessionId revived = f.sidForPayload("revive");
+  REQUIRE(revived != 0);
+  REQUIRE(revived != ss1);
+  REQUIRE(revived != ss2);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "127.0.0.1", pPort) ==
+          std::vector<SessionId>{revived});
+  f.tx.stop();
+}
+
+TEST_CASE("UDP _peerIndex self-origination to another listener is not misrouted (d, self-loop collision)",
+          "[udp][peerindex][multi-listener][loopback]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  // Self-origination datagrams carry our OWN listener as their source; with echo on they would
+  // cascade across listeners. Assert on acceptCount + the dispatched sid instead.
+  f.echoEnabled.store(false);
+  REQUIRE(f.tx.start().isOk());
+  auto portA = testnet::getFreePortUDP();
+  auto portB = testnet::getFreePortUDP();
+  auto lrA = f.tx.addListener("127.0.0.1", portA, TlsMode::None);
+  auto lrB = f.tx.addListener("127.0.0.1", portB, TlsMode::None);
+  REQUIRE(lrA.isOk());
+  REQUIRE(lrB.isOk());
+  ListenerId lidA = lrA.value();
+  ListenerId lidB = lrB.value();
+
+  // 1) Self-loop via on A: send to listener A's own address. selfVia is itself indexed under
+  // (A, 127.0.0.1:portA); the looped-back datagram arrives on A from that same source, so it is
+  // dispatched to selfVia itself — NO new accept (the existing "self-loopback via" test relies
+  // on the same behaviour). So inboundOnA == selfVia and acceptsAfterSelf == 0.
+  SessionId selfVia = f.tx.connectViaListener(lidA, "127.0.0.1", portA).value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  REQUIRE(f.tx.send(selfVia, "self", 4));
+  REQUIRE(f.waitForCount(f.dataCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  SessionId inboundOnA = f.sidForPayload("self");
+  REQUIRE(inboundOnA == selfVia);                    // self-loop dispatches to the via itself
+  const int acceptsAfterSelf = f.acceptCount.load();
+  REQUIRE(acceptsAfterSelf == 0);                    // no ServerPeer accepted for a self-loop
+
+  // 2) Via A -> B: egresses listener A's fd (source 127.0.0.1:portA) to listener B, so the
+  // datagram arrives on B with the SAME source (127.0.0.1:portA) as the self-loop on A.
+  SessionId viaAtoB = f.tx.connectViaListener(lidA, "127.0.0.1", portB).value();
+  REQUIRE(f.waitForCount(f.connectCount, 2));
+  REQUIRE(f.tx.send(viaAtoB, "toB2", 4));
+  REQUIRE(f.waitForCount(f.dataCount, 2));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+
+  // Fixed: key (B, 127.0.0.1:portA) misses -> a NEW ServerPeer accepted on B; "toB2" goes to
+  // it, distinct from the A-side self-loop session. Pre-fix: the address-only key collides with
+  // selfVia's entry -> "toB2" misrouted to selfVia, no new accept (RED on both).
+  REQUIRE(f.acceptCount.load() == acceptsAfterSelf + 1);
+  SessionId sidToB2 = f.sidForPayload("toB2");
+  REQUIRE(sidToB2 != inboundOnA);
+  // Structural (post-fix shape): listener B owns a fresh (B, 127.0.0.1:portA) entry distinct
+  // from A's self-loop entry.
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lidA, "127.0.0.1", portA) ==
+          std::vector<SessionId>{selfVia});
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lidB, "127.0.0.1", portA) ==
+          std::vector<SessionId>{sidToB2});
   f.tx.stop();
 }
 

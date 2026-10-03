@@ -13,16 +13,22 @@
 
 #include "iora/network/detail/udp_engine.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace iora
 {
@@ -141,15 +147,35 @@ struct UdpEngineTestAccess
                 });
   }
 
-  /// True iff some _peerIndex entry maps to \p sid (I/O-thread). After closing a
-  /// via-TWIN, the originally-indexed sibling MUST still be present (H-3 ownership guard).
-  static bool peerIndexHasSid(UdpEngine &e, SessionId sid)
+  /// The twin list under the (listener,peer) key — the post-fix per-listener key shape
+  /// (tracker 2026-10-02-3). Empty if no such entry; front() is the dispatch target. Builds the
+  /// key through the production UdpEngine::peerKey (friend access) rather than by hand, so the
+  /// key format lives in ONE place and a future shape change (e.g. the 2026-10-03-1 local-addr
+  /// extension) cannot silently diverge the test from production.
+  static std::vector<SessionId> peerIndexLookup(UdpEngine &e, ListenerId lid,
+                                                const std::string &host, std::uint16_t port)
   {
+    sockaddr_storage ss{};
+    if (host.find(':') != std::string::npos)
+    {
+      auto *a6 = reinterpret_cast<sockaddr_in6 *>(&ss);
+      a6->sin6_family = AF_INET6;
+      a6->sin6_port = htons(port);
+      ::inet_pton(AF_INET6, host.c_str(), &a6->sin6_addr);
+    }
+    else
+    {
+      auto *a4 = reinterpret_cast<sockaddr_in *>(&ss);
+      a4->sin_family = AF_INET;
+      a4->sin_port = htons(port);
+      ::inet_pton(AF_INET, host.c_str(), &a4->sin_addr);
+    }
+    std::string k = UdpEngine::peerKey(lid, ss);
     return onIo(e,
-                [&e, sid]() -> bool
+                [&e, k]() -> std::vector<SessionId>
                 {
-                  return std::any_of(e._peerIndex.begin(), e._peerIndex.end(),
-                                     [sid](const auto &kv) { return kv.second == sid; });
+                  auto it = e._peerIndex.find(k);
+                  return it == e._peerIndex.end() ? std::vector<SessionId>{} : it->second;
                 });
   }
 

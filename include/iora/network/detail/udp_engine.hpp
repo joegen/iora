@@ -731,19 +731,31 @@ private:
     its.it_value.tv_sec = s.count();
     ::timerfd_settime(_timerFd, 0, &its, nullptr);
   }
-  static std::string key(const sockaddr_storage &ss)
+  /// Composite peer-index key (tracker 2026-10-02-3): "<lid>|<host:port>". The _peerIndex is
+  /// keyed by (ListenerId, peerAddr) so the SAME peer source ip:port reaching two of our
+  /// listeners does NOT collapse to one session (cross-listener misrouting + wrong reply
+  /// source port). '|' never appears in numeric host:port output (IPv6 included), so the key
+  /// is unambiguous. Builds directly into one buffer (no intermediate string on the inbound
+  /// hot path). Returns EMPTY when getnameinfo fails, so callers test a single value and never
+  /// index a degenerate "<lid>|" bucket that would collapse unrelated peers — with
+  /// NI_NUMERICHOST|NI_NUMERICSERV on a valid AF_INET/AF_INET6 sockaddr this failure is
+  /// effectively unreachable, so the empty-key drop/reject paths are DEFENSIVE (L-8 accepted
+  /// as defensive 2026-10-03, no fault-injection seam).
+  static std::string peerKey(ListenerId lid, const sockaddr_storage &ss)
   {
     char h[NI_MAXHOST]{}, sv[NI_MAXSERV]{};
     socklen_t sl = (ss.ss_family == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6);
     if (getnameinfo(reinterpret_cast<const sockaddr *>(&ss), sl, h, sizeof(h), sv, sizeof(sv),
-                    NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+                    NI_NUMERICHOST | NI_NUMERICSERV) != 0)
     {
-      std::string o(h);
-      o.push_back(':');
-      o.append(sv);
-      return o;
+      return {};
     }
-    return {};
+    std::string k = std::to_string(lid);
+    k.push_back('|');
+    k.append(h);
+    k.push_back(':');
+    k.append(sv);
+    return k;
   }
 
   /// Forwards to the shared iora::network::addressFromSockaddr. This was a
@@ -1289,13 +1301,10 @@ private:
       }
       else
       {
-        // ServerPeer: aliases the listener fd -- never close here. Ownership-guarded erase
-        // for consistency with closeNow (H-3): don't evict a twin's shared entry.
-        auto pi = _peerIndex.find(s->pkey);
-        if (pi != _peerIndex.end() && pi->second == s->id)
-        {
-          _peerIndex.erase(pi);
-        }
+        // ServerPeer: aliases the listener fd -- never close here. No per-session peer-index
+        // erase here: shutdownDrain closes EVERY session, so _peerIndex is cleared wholesale
+        // after the loop (below) -- correct and avoids an O(N^2) per-session twin-list scan
+        // during teardown (tracker 2026-10-02-3).
       }
       _atomicStats.closed.fetch_add(1, std::memory_order_relaxed);
       _atomicStats.sessionsCurrent.fetch_sub(1, std::memory_order_relaxed);
@@ -1310,6 +1319,9 @@ private:
       std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
       _sessions.clear();
     }
+    // All sessions are now closed; drop the peer index wholesale (tracker 2026-10-02-3).
+    // _peerIndex is I/O-thread-only state, so it needs no lock here.
+    _peerIndex.clear();
 
     // Detach listeners (delEpoll + tag-erase + collect fd), then clear _listeners under
     // the write lock, then close (fdsToClose destructor). Do NOT deref lst->fd after the
@@ -1728,68 +1740,96 @@ private:
 
   void readFromListener(Listener *lst)
   {
+    // Hot path (tracker 2026-10-02-3 M-D): allocate the receive buffer ONCE per call, not per
+    // datagram. recvfrom overwrites it each iteration and onData's BufferView is valid only for
+    // the synchronous callback, so reuse is safe (mirrors tcp_engine).
+    std::vector<std::uint8_t> buf(_config.ioReadChunk);
     for (;;)
     {
-      std::vector<std::uint8_t> buf;
-      buf.resize(_config.ioReadChunk);
       sockaddr_storage from{};
       socklen_t fl = sizeof(from);
       int n = ::recvfrom(lst->fd, buf.data(), (int)buf.size(), 0,
                          reinterpret_cast<sockaddr *>(&from), &fl);
       if (n > 0)
       {
-        _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
-        std::string k = key(from);
-        SessionId sid = 0;
-        auto it = _peerIndex.find(k);
-        if (it == _peerIndex.end())
+        // M-A (tracker 2026-10-02-3): a bad_alloc on the per-datagram create path must NOT
+        // escape readFromListener. loopUnbatched has no try, so an escaped throw exits the I/O
+        // loop WITHOUT running shutdownDrain -> the engine goes silently dead (no onClose).
+        // State stays consistent (reserve-before-publish below), and an empty index slot left
+        // by a mid-create throw is reclaimed lazily (the next datagram from this peer treats an
+        // empty vector as a miss and reuses it), so dropping this datagram is safe.
+        try
         {
-          if (sessionCapReached())
+          _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
+          std::string k = peerKey(lst->id, from);
+          if (k.empty())
           {
-            continue; // no SessionId yet -> silent drop (peer retransmits)
+            continue; // unkeyable source (getnameinfo failed) -> drop (defensive; NI_NUMERIC*)
           }
-          sid = _nextSessionId++;
-          auto s = std::make_unique<Session>();
-          s->id = sid;
-          s->role = Role::ServerPeer;
-          s->fd = lst->fd;
-          s->owner = lst->id;
-          std::memcpy(&s->peer, &from, fl);
-          s->plen = fl;
-          s->pkey = k;
-          s->created = MonoClock::now();
-          s->lastActivity = s->created;
-          s->lastWriteProgress = s->created;
+          SessionId sid = 0;
+          auto it = _peerIndex.find(k);
+          if (it == _peerIndex.end() || it->second.empty())
           {
-            std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
-            _sessions.emplace(sid, std::move(s));
+            if (sessionCapReached())
+            {
+              continue; // no SessionId yet -> silent drop (peer retransmits)
+            }
+            sid = _nextSessionId++;
+            auto s = std::make_unique<Session>();
+            s->id = sid;
+            s->role = Role::ServerPeer;
+            s->fd = lst->fd;
+            s->owner = lst->id;
+            std::memcpy(&s->peer, &from, fl);
+            s->plen = fl;
+            s->pkey = k;
+            s->created = MonoClock::now();
+            s->lastActivity = s->created;
+            s->lastWriteProgress = s->created;
+            // Exception-safety (tracker 2026-10-02-3): take the (listener,peer) twin list and
+            // reserve BEFORE publishing the session + bumping the counter, so the push_back
+            // after the bump cannot throw (a throwing insert after the bump would, on the
+            // closeNow unwind, fetch_sub an un-incremented sessionsCurrent and wrap it -> the
+            // cap trips forever). Grow geometrically (L-6) so k twins cost O(k), not O(k^2).
+            auto &vec = _peerIndex[k];
+            if (vec.size() == vec.capacity())
+            {
+              vec.reserve(std::max<std::size_t>(4, vec.capacity() * 2));
+            }
+            {
+              std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+              _sessions.emplace(sid, std::move(s));
+            }
+            bumpSess();
+            vec.push_back(sid); // noexcept: spare capacity ensured above
+            _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
+            // steps-4-8 R2 (simp/cpp17): route onAccept through invokeUserCallback so a
+            // throwing user handler cannot unwind the I/O loop (mirror tcp_engine).
+            invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid,
+                               addressFromSockaddr(from));
           }
-          _peerIndex.emplace(k, sid);
-          _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
-          bumpSess();
-          // steps-4-8 R2 (simp/cpp17): route onAccept through invokeUserCallback so a
-          // throwing user handler cannot unwind the I/O loop (mirror tcp_engine).
-          invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid,
-                             addressFromSockaddr(from));
+          else
+          {
+            sid = it->second.front(); // dispatch to the oldest-by-insertion surviving twin
+          }
+          // steps-4-8 R3 (cpp17/TS LOW): use const find() (not non-const operator[]) on the
+          // I/O thread — operator[] would be a formal data race vs caller-thread shared_lock
+          // readers (the sid always pre-exists here, so find never misses).
+          auto sit = _sessions.find(sid);
+          if (sit == _sessions.end())
+          {
+            continue; // defensive: never expected (sid just inserted / in _peerIndex)
+          }
+          sit->second->lastActivity = MonoClock::now();
+          invokeUserCallback(copyCallback(_cbMutex, _cbs.onData), sid,
+                             iora::core::BufferView{buf.data(), static_cast<std::size_t>(n)},
+                             std::chrono::steady_clock::now());
+          continue;
         }
-        else
+        catch (...)
         {
-          sid = it->second;
+          continue; // drop this datagram, keep the I/O loop alive (see M-A comment above)
         }
-        // steps-4-8 R3 (cpp17/TS LOW): use const find() (not non-const operator[])
-        // on the I/O thread — operator[] is a non-const member and would be a formal
-        // data race against caller-thread sessionSendable/isSessionLive readers holding
-        // a shared_lock (the sid always pre-exists here, so find never misses).
-        auto sit = _sessions.find(sid);
-        if (sit == _sessions.end())
-        {
-          continue; // defensive: never expected (sid just inserted / in _peerIndex)
-        }
-        sit->second->lastActivity = MonoClock::now();
-        invokeUserCallback(copyCallback(_cbMutex, _cbs.onData), sid,
-                           iora::core::BufferView{buf.data(), static_cast<std::size_t>(n)},
-                           std::chrono::steady_clock::now());
-        continue;
       }
       if (n < 0)
       {
@@ -2275,13 +2315,19 @@ private:
       tl = sizeof(sockaddr_in);
     }
     // NO ::freeaddrinfo — caller owns res (#6).
-    std::string k = key(to);
-    auto pit = _peerIndex.find(k);
-    bool peerExists = (pit != _peerIndex.end());
-    // Note: Even if peer exists, we must create a Session for the new SessionId.
-    // This enables self-loopback (same address as listener) and multiple logical
-    // connections to the same remote peer. The _peerIndex maps peer address to
-    // ONE SessionId for incoming data dispatch; applications must demultiplex.
+    std::string k = peerKey(lst->id, to);
+    if (k.empty())
+    {
+      // Unkeyable destination (getnameinfo failed): reject BEFORE the cap check, while
+      // _connecting still holds this sid for the terminal (tracker 2026-10-02-3).
+      preInsertTerminal(sid, TransportErrorInfo{TransportError::Config, "unkeyable peer address"});
+      return false;
+    }
+    // _peerIndex is keyed by (listener, peer) and holds the twin SessionIds sharing that key
+    // in insertion order; front() is the inbound-dispatch target. We still create a Session
+    // for every SessionId (self-loopback + multiple logical sessions to one peer); a via to a
+    // peer already indexed on ANOTHER listener now gets its OWN (listener,peer) entry rather
+    // than silently sharing the first listener's (tracker 2026-10-02-3). Apps demultiplex.
     if (rejectAtSessionCap(sid))
     {
       return false;
@@ -2298,6 +2344,14 @@ private:
     s->lastActivity = s->created;
     s->lastWriteProgress = s->created;
     s->connectPending = false;
+    // Exception-safety (tracker 2026-10-02-3): reserve the twin-list slot BEFORE publishing +
+    // bumping, so the push_back after the bump cannot throw (see readFromListener). Grow
+    // geometrically (L-6) so k twins to one peer cost O(k), not O(k^2).
+    auto &vec = _peerIndex[k];
+    if (vec.size() == vec.capacity())
+    {
+      vec.reserve(std::max<std::size_t>(4, vec.capacity() * 2));
+    }
     {
       // A3.1a: erase _connecting WITH the _sessions insert in ONE unique-lock
       // section (atomic connecting -> live transition; see connectFromAddrs). ORDER
@@ -2307,11 +2361,8 @@ private:
       _sessions.emplace(s->id, std::move(s));
       _connecting.erase(sid);
     }
-    if (!peerExists)
-    {
-      _peerIndex.emplace(k, sid);
-    }
     bumpSess();
+    vec.push_back(sid); // noexcept: capacity reserved above
     // steps-4-8 R2: onConnect via invokeUserCallback (see connectFromAddrs).
     invokeUserCallback(copyCallback(_cbMutex, _cbs.onConnect), sid, addressFromSockaddr(to));
     // A3.1b: replay datagrams buffered during the resolve window, in order (ServerPeer
@@ -2324,10 +2375,12 @@ private:
   {
     if (events & EPOLLIN)
     {
+      // Hot path (tracker 2026-10-02-3 M-D): allocate the receive buffer ONCE per call, not per
+      // datagram (the BufferView is valid only during the synchronous onData, so reuse is safe;
+      // mirrors readFromListener / tcp_engine).
+      std::vector<std::uint8_t> buf(_config.ioReadChunk);
       for (;;)
       {
-        std::vector<std::uint8_t> buf;
-        buf.resize(_config.ioReadChunk);
         int n = ::recv(s->fd, buf.data(), (int)buf.size(), 0);
         if (n > 0)
         {
@@ -2581,13 +2634,24 @@ private:
     else
     {
       // ServerPeer: aliases the listener fd -- never close here.
-      // H-3 (tracker 2026-09-25-16): only evict OUR OWN peer-index entry. A via-twin to
-      // an already-indexed peer shares pkey; an unconditional erase would orphan the live
-      // sibling's entry (its next inbound datagram -> spurious onAccept + a new sid).
+      // Remove THIS sid from its (listener,peer) twin list; drop the whole entry when the list
+      // empties (tracker 2026-10-02-3, F-6/L-5 — mirror of H-3). Erasing a non-front twin
+      // leaves front() (the dispatch target) intact; erasing front() promotes the next-oldest
+      // surviving twin with NO scan and NO spurious onAccept. Erase the map entry whenever the
+      // vector is empty after the remove, whether or not sid was found (defensive/idempotent).
+      // NOTE: a slot reserved-then-abandoned by a mid-create throw (readFromListener's catch /
+      // viaFromAddrs via withConnectGuard) is NOT cleaned here (closeNow only runs for a
+      // published session); it is reclaimed lazily — the next inbound datagram for that key
+      // treats the empty vector as a miss and reuses it — or wholesale at shutdownDrain.
       auto pi = _peerIndex.find(pkey);
-      if (pi != _peerIndex.end() && pi->second == sid)
+      if (pi != _peerIndex.end())
       {
-        _peerIndex.erase(pi);
+        auto &vec = pi->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), sid), vec.end());
+        if (vec.empty())
+        {
+          _peerIndex.erase(pi);
+        }
       }
       // H-2/M-2 (tracker 2026-09-25-16): purge THIS session's datagrams from the SHARED
       // listener write queue BEFORE the session is erased — on EVERY ServerPeer close
@@ -2879,7 +2943,9 @@ private:
   bool _qClosed{false};
   std::unordered_map<ListenerId, std::unique_ptr<Listener>> _listeners;
   std::unordered_map<SessionId, std::unique_ptr<Session>> _sessions;
-  std::unordered_map<std::string, SessionId> _peerIndex;
+  // Keyed by peerKey(listener,peer); value is the twin SessionIds sharing that (listener,peer)
+  // in insertion order, front() = the inbound-dispatch target (tracker 2026-10-02-3).
+  std::unordered_map<std::string, std::vector<SessionId>> _peerIndex;
   std::unordered_map<int, std::unique_ptr<Tag>> _tags;
   // TEST-ONLY seam (tracker 2026-09-15-3): see testSetPreCloseHook. Empty in production;
   // installed before start(), then read-only on the I/O thread (no locking needed).
