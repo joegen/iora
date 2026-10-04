@@ -6,6 +6,7 @@
 #include "test_helpers.hpp"
 
 #include <cstdio>
+#include <thread>
 
 using namespace std::chrono_literals;
 using UdpEngine = iora::network::UdpEngine;
@@ -75,6 +76,13 @@ struct UdpFixture
   // such a test sets this false and asserts on acceptCount + the dispatched sid instead.
   std::atomic<bool> echoEnabled{true};
 
+  // Optional hook invoked FIRST in onData on the engine I/O thread (tracker 2026-10-04-2 (g)):
+  // lets a test read getLocalAddress(sid) at request receipt — the DP4 consumer pattern — from the
+  // I/O thread (re-entering _sessionRwMutex shared inside a user callback, which must not deadlock;
+  // the engine fires onData AFTER releasing the lock). A test setting this MUST declare the state it
+  // captures BEFORE the fixture so the I/O thread is joined (in ~UdpFixture) before that state dies.
+  std::function<void(SessionId)> onDataHook;
+
   // The sid the FIRST onData carrying \p payload was dispatched to, or 0 if none yet.
   SessionId sidForPayload(const std::string &payload)
   {
@@ -130,6 +138,10 @@ struct UdpFixture
     cbs.onData = [&](SessionId sid, iora::core::BufferView bv,
                      std::chrono::steady_clock::time_point)
     {
+      if (onDataHook)
+      {
+        onDataHook(sid);
+      }
       dataCount++;
       auto *data = bv.data();
       auto n = bv.size();
@@ -887,6 +899,37 @@ testnet::ScopedFd bindV4Source(const char *srcIp, std::uint16_t &port, int rcvTi
   socklen_t sl = sizeof(a);
   REQUIRE(::getsockname(fd.get(), reinterpret_cast<sockaddr *>(&a), &sl) == 0);
   port = ntohs(a.sin_port);
+  timeval tv{rcvTimeoutMs / 1000, (rcvTimeoutMs % 1000) * 1000};
+  ::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  return fd;
+}
+
+// v6 twins of sendV4ToDest / bindV4Source for the native-IPv6 getLocalAddress presentation test
+// (tracker 2026-10-04-2 test (b)): a bare v6 literal must come back WITHOUT brackets.
+void sendV6ToDest(int fd, const char *destIp, std::uint16_t port, const std::string &msg)
+{
+  sockaddr_in6 a{};
+  a.sin6_family = AF_INET6;
+  a.sin6_port = htons(port);
+  REQUIRE(::inet_pton(AF_INET6, destIp, &a.sin6_addr) == 1);
+  REQUIRE(::sendto(fd, msg.data(), msg.size(), 0, reinterpret_cast<sockaddr *>(&a), sizeof(a)) ==
+          static_cast<ssize_t>(msg.size()));
+}
+
+testnet::ScopedFd bindV6Source(const char *srcIp, std::uint16_t &port, int rcvTimeoutMs = 1500)
+{
+  testnet::ScopedFd fd{::socket(AF_INET6, SOCK_DGRAM, 0)};
+  REQUIRE(fd.get() >= 0);
+  int reuse = 1;
+  ::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  sockaddr_in6 a{};
+  a.sin6_family = AF_INET6;
+  a.sin6_port = 0;
+  REQUIRE(::inet_pton(AF_INET6, srcIp, &a.sin6_addr) == 1);
+  REQUIRE(::bind(fd.get(), reinterpret_cast<sockaddr *>(&a), sizeof(a)) == 0);
+  socklen_t sl = sizeof(a);
+  REQUIRE(::getsockname(fd.get(), reinterpret_cast<sockaddr *>(&a), &sl) == 0);
+  port = ntohs(a.sin6_port);
   timeval tv{rcvTimeoutMs / 1000, (rcvTimeoutMs % 1000) * 1000};
   ::setsockopt(fd.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   return fd;
@@ -1917,6 +1960,318 @@ TEST_CASE("UDP wildcard idle-reap reopens a response on the kernel source (T9 ch
   f.tx.stop();
 }
 
+// ── getLocalAddress captured-local presentation (tracker 2026-10-04-2) ──────────────────────────
+// getLocalAddress(sid) must report the per-session CAPTURED local (2026-10-03-1), UNMAPPED, on a
+// wildcard bind — not the wildcard getsockname result.
+
+TEST_CASE("UDP getLocalAddress reports each ServerPeer's captured local on a wildcard bind (GLA1, "
+          "multi-local discriminating)",
+          "[udp][wildcard][srcip][getlocal]")
+{
+  using iora::network::UdpEngineTestAccess;
+  // Run on BOTH a v4 wildcard (0.0.0.0) and a dual-stack wildcard (::): the dual-stack path is the
+  // one whose captured local is v4-mapped and must be unmapped bare (sip L-3).
+  const char *bind = GENERATE("0.0.0.0", "::");
+  UdpFixture f;
+  f.echoEnabled.store(false);
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener(bind, port, TlsMode::None);
+  REQUIRE(lr.isOk());
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "g2");
+  sendV4ToDest(peer.get(), "127.0.0.3", port, "g3");
+  REQUIRE(f.waitForCount(f.acceptCount, 2));
+  REQUIRE(f.waitForCount(f.dataCount, 2));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  SessionId s2 = f.sidForPayload("g2");
+  SessionId s3 = f.sidForPayload("g3");
+  REQUIRE(s2 != 0);
+  REQUIRE(s3 != 0);
+
+  // Each session reports its OWN captured local (not the wildcard, not the other session's local),
+  // with the bound listener port, UNMAPPED (bare v4 even on the dual-stack bind). A single-local
+  // case could not catch first/last-wins.
+  auto a2 = f.tx.getLocalAddress(s2);
+  auto a3 = f.tx.getLocalAddress(s3);
+  REQUIRE(a2.host == "127.0.0.2");
+  REQUIRE(a2.port == port);
+  REQUIRE(a3.host == "127.0.0.3");
+  REQUIRE(a3.port == port);
+  f.tx.stop();
+}
+
+TEST_CASE("UDP getLocalAddress presents a dual-stack v4-mapped captured local as BARE IPv4 (GLA2, "
+          "+ key-form round-trip)",
+          "[udp][wildcard][srcip][getlocal][dualstack]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None); // V6ONLY=0 dual-stack
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort); // v4 arrival → v4-mapped capture
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "gm");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+
+  // Outward presentation is BARE IPv4 — never ::ffff:127.0.0.2, never the wildcard ::.
+  auto a = f.tx.getLocalAddress(f.serverSid);
+  REQUIRE(a.host == "127.0.0.2");
+  REQUIRE(a.port == port);
+
+  // Round-trip (H-1): the INTERNAL key form stays v4-mapped. RE-MAP the getter's unmapped output
+  // (a.host, proven bare v4 above) back to the v4-mapped spelling and require it equals the captured
+  // localSrc's canonical key form byte-for-byte — this exercises the re-map rather than asserting a
+  // constant. The peer-index key uses that same mapped form.
+  REQUIRE(UdpEngineTestAccess::localSrcText(f.tx, f.serverSid) == "::ffff:" + a.host);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
+                                               "::ffff:127.0.0.2") ==
+          std::vector<SessionId>{f.serverSid});
+  f.tx.stop();
+}
+
+TEST_CASE("UDP getLocalAddress presents a native IPv6 captured local bare, no brackets (GLA3)",
+          "[udp][wildcard][srcip][getlocal][dualstack]")
+{
+  using iora::network::UdpEngineTestAccess;
+  // Skip (not fail) on a host/container with IPv6 loopback disabled (disable_ipv6=1): a ::1 bind is
+  // unavailable there though AF_INET6 :: sockets still work (cpp17 L-6 / sip L-5).
+  {
+    testnet::ScopedFd probe{::socket(AF_INET6, SOCK_DGRAM, 0)};
+    sockaddr_in6 a{};
+    a.sin6_family = AF_INET6;
+    REQUIRE(::inet_pton(AF_INET6, "::1", &a.sin6_addr) == 1);
+    if (probe.get() < 0 || ::bind(probe.get(), reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0)
+    {
+      WARN("IPv6 loopback (::1) unavailable on this host — skipping native-v6 getLocalAddress test");
+      return;
+    }
+  }
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV6Source("::1", pPort);
+  sendV6ToDest(peer.get(), "::1", port, "g6");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+
+  auto a = f.tx.getLocalAddress(f.serverSid);
+  REQUIRE(a.host == "::1"); // bare, NO brackets (bracketing is the SIP serializer's job)
+  REQUIRE(a.port == port);
+  f.tx.stop();
+}
+
+TEST_CASE("UDP getLocalAddress/getListenerAddress unmap a v4-mapped specific bind; wildcard falls "
+          "back (GLA4)",
+          "[udp][wildcard][srcip][getlocal]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+
+  // A MAPPED specific bind (loopback-resolvable): getListenerAddress presents it bare.
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::ffff:127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+  REQUIRE(f.tx.getListenerAddress(lid).host == "127.0.0.1");
+
+  // A specific bind leaves localSrc AF_UNSPEC (no capture), so getLocalAddress falls back to the
+  // (unmapped) getsockname result — bare 127.0.0.1, with the bound port.
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  sendV4ToDest(peer.get(), "127.0.0.1", port, "gsp");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  auto a = f.tx.getLocalAddress(f.serverSid);
+  REQUIRE(a.host == "127.0.0.1");
+  REQUIRE(a.port == port);
+  f.tx.stop();
+
+  // ::ffff:0.0.0.0 is treated as a wildcard bind (engine) → getListenerAddress returns bare 0.0.0.0.
+  // (An unadopted-via getLocalAddress on this mapped-wildcard would also return 0.0.0.0, but creating
+  // that via needs connectViaListener-to-v4 on a dual-stack socket — the UNFIXED 2026-10-03-2 path;
+  // the unadopted-via → wildcard fallback itself is covered by GLA5 on 0.0.0.0.)
+  UdpFixture f2;
+  REQUIRE(f2.tx.start().isOk());
+  auto port2 = testnet::getFreePortUDP();
+  auto lr2 = f2.tx.addListener("::ffff:0.0.0.0", port2, TlsMode::None);
+  REQUIRE(lr2.isOk());
+  REQUIRE(f2.tx.getListenerAddress(lr2.value()).host == "0.0.0.0");
+  f2.tx.stop();
+}
+
+TEST_CASE("UDP getLocalAddress: unadopted via → wildcard, then captured local after adopt; unknown "
+          "sid → empty (GLA5)",
+          "[udp][wildcard][srcip][getlocal][via]")
+{
+  using iora::network::UdpEngineTestAccess;
+  // 0.0.0.0 only: the via-adopt path uses connectViaListener to a v4 peer, and originating to a v4
+  // peer on a dual-stack :: listener is the separate UNFIXED limitation iora 2026-10-03-2
+  // (viaFromAddrs rejects the AF mismatch). The dual-stack CAPTURE-presents-bare half is covered by
+  // GLA2 (inbound v4-mapped); the dual-stack via-adopt presentation becomes testable once
+  // 2026-10-03-2 lands.
+  const char *bind = "0.0.0.0";
+  const std::string wildcardHost = "0.0.0.0";
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener(bind, port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  auto rv = f.tx.connectViaListener(lid, "127.0.0.1", pPort);
+  REQUIRE(rv.isOk());
+  SessionId via = rv.value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+
+  // Unadopted via: localSrc AF_UNSPEC → fallback to the wildcard (DP5: no pinned local). The
+  // WILDCARD round-trip (sip M-B): a wildcard getter result re-maps to NO seed — localSrcText is
+  // empty because localSrc stays AF_UNSPEC.
+  REQUIRE(f.tx.getLocalAddress(via).host == wildcardHost);
+  REQUIRE(UdpEngineTestAccess::localSrcText(f.tx, via).empty());
+
+  // First unicast inbound adopts the via onto the (listener,local,peer) key → captured local,
+  // presented bare even on the dual-stack bind.
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "adopt");
+  REQUIRE(f.waitForCount(f.dataCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.sidForPayload("adopt") == via);
+  auto a = f.tx.getLocalAddress(via);
+  REQUIRE(a.host == "127.0.0.2");
+  REQUIRE(a.port == port);
+
+  // An unknown/reaped sid returns {} (empty host) — DP4 reaped-sid behavior.
+  REQUIRE(f.tx.getLocalAddress(999999).host.empty());
+  f.tx.stop();
+}
+
+TEST_CASE("UDP getLocalAddress is race-free vs adopt-time localSrc publication (GLA6, TSan)",
+          "[udp][wildcard][srcip][getlocal][tsan]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("0.0.0.0", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  auto rv = f.tx.connectViaListener(lid, "127.0.0.1", pPort);
+  REQUIRE(rv.isOk());
+  SessionId via = rv.value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+
+  // A caller thread spins getLocalAddress(via) (bounded deadline + yield — never raise the deadline
+  // to mask a failure; the yield avoids the reader-preferring shared_mutex starving the adopt
+  // unique_lock) while the I/O thread adopts the via on the first inbound. MUTATION CHECK: removing
+  // the unique_lock in adoptWildcardVia makes this a localSrc read/write data race TSan reports.
+  std::atomic<bool> sawCaptured{false};
+  std::atomic<bool> stop{false};
+  std::thread reader(
+    [&]()
+    {
+      auto deadline = std::chrono::steady_clock::now() + 3s;
+      while (!stop.load(std::memory_order_relaxed) &&
+             std::chrono::steady_clock::now() < deadline)
+      {
+        if (f.tx.getLocalAddress(via).host == "127.0.0.2")
+        {
+          sawCaptured.store(true, std::memory_order_relaxed);
+          break;
+        }
+        std::this_thread::yield();
+      }
+    });
+
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "radopt");
+  // Join on EVERY path BEFORE any REQUIRE that can throw: a throwing REQUIRE while `reader` is still
+  // joinable would run ~thread() on a joinable thread → std::terminate, aborting the whole binary and
+  // losing every other case's result. Capture the wait result, stop + join, THEN assert.
+  const bool gotData = f.waitForCount(f.dataCount, 1);
+  stop.store(true);
+  reader.join();
+  REQUIRE(gotData);
+  REQUIRE(sawCaptured.load());
+  f.tx.stop();
+}
+
+TEST_CASE("UDP getLocalAddress: value read in onData survives an idle reap; reaped sid → {} (GLA7, "
+          "DP4)",
+          "[udp][wildcard][srcip][getlocal][gc]")
+{
+  using iora::network::UdpEngineTestAccess;
+  // Capture state declared BEFORE the fixture so the I/O thread (joined in ~UdpFixture) stops before
+  // this state dies, even on a throwing-REQUIRE unwind path.
+  std::mutex m;
+  std::string capturedHost;
+  std::uint16_t capturedPort = 0;
+  std::atomic<bool> captured{false};
+
+  TransportConfig cfg;
+  cfg.idleTimeout = std::chrono::seconds(1);
+  cfg.gcInterval = std::chrono::seconds(1);
+  UdpFixture f{cfg};
+  auto port = testnet::getFreePortUDP();
+  // onDataHook runs on the I/O thread at request receipt: read getLocalAddress(sid) (shared_lock, no
+  // deadlock — the engine fired onData after releasing _sessionRwMutex) and store a VALUE copy. DP4:
+  // consumers capture HERE, not at response time.
+  f.onDataHook = [&](SessionId sid)
+  {
+    auto a = f.tx.getLocalAddress(sid);
+    std::lock_guard<std::mutex> g(m);
+    capturedHost = a.host;
+    capturedPort = a.port;
+    captured.store(true);
+  };
+  REQUIRE(f.tx.start().isOk());
+  auto lr = f.tx.addListener("0.0.0.0", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort, 3000);
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "live");
+  REQUIRE(f.waitFor(f.accepted));
+  (void)recvV4Src(peer.get()); // drain the echo
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  SessionId ss = f.serverSid;
+  REQUIRE(captured.load());
+
+  // The value read in onData is the captured local, bare and with the bound port.
+  {
+    std::lock_guard<std::mutex> g(m);
+    REQUIRE(capturedHost == "127.0.0.2");
+    REQUIRE(capturedPort == port);
+  }
+
+  // After the ServerPeer is idle-reaped, the reaped sid returns {} (DP4) — but the value captured in
+  // onData still pins 127.0.0.2 (it is an independent copy, not a reference into the session).
+  REQUIRE(f.waitForCount(f.closeCount, 1, 6000));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.tx.getLocalAddress(ss).host.empty());
+  {
+    std::lock_guard<std::mutex> g(m);
+    REQUIRE(capturedHost == "127.0.0.2");
+  }
+  f.tx.stop();
+}
+
 TEST_CASE("UDP classifyLocalSrc verdict table (synthesized cmsgs)", "[udp][wildcard][srcip][unit]")
 {
   using iora::network::UdpEngineTestAccess;
@@ -1988,8 +2343,11 @@ TEST_CASE("UDP classifyLocalSrc verdict table (synthesized cmsgs)", "[udp][wildc
   {
     CmsgRig r;
     r.addV4("224.0.1.75", "224.0.1.75");
-    REQUIRE(UdpEngineTestAccess::classifyLocalSrc(AF_INET, r.msg).verdict ==
-            Verdict::UNPINNED_NON_UNICAST);
+    // test_matrix (j): an UNPINNED verdict also carries src.family == AF_UNSPEC — that is exactly
+    // what routes getLocalAddress to the wildcard fallback (DP5) for a non-unicast arrival.
+    auto res = UdpEngineTestAccess::classifyLocalSrc(AF_INET, r.msg);
+    REQUIRE(res.verdict == Verdict::UNPINNED_NON_UNICAST);
+    REQUIRE(res.src.family == AF_UNSPEC);
   }
   SECTION("v4 socket, no cmsg → DROP")
   {
@@ -2063,8 +2421,10 @@ TEST_CASE("UDP classifyLocalSrc verdict table (synthesized cmsgs)", "[udp][wildc
   {
     CmsgRig r;
     r.addV6("ff02::1");
-    REQUIRE(UdpEngineTestAccess::classifyLocalSrc(AF_INET6, r.msg).verdict ==
-            Verdict::UNPINNED_NON_UNICAST);
+    // test_matrix (j): UNPINNED ⇒ src.family AF_UNSPEC ⇒ getLocalAddress wildcard fallback (DP5).
+    auto res = UdpEngineTestAccess::classifyLocalSrc(AF_INET6, r.msg);
+    REQUIRE(res.verdict == Verdict::UNPINNED_NON_UNICAST);
+    REQUIRE(res.src.family == AF_UNSPEC);
   }
   // MUTATION-CHECK (1.12): swapping the v4-mapped PINNED branch to use ipi6_addr instead of
   // ipi_spec_dst makes the "BOTH present" and "directed-broadcast" sections fail — verified manually.

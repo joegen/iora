@@ -67,6 +67,38 @@ inline TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
   return addr;
 }
 
+/// \brief Like addressFromSockaddr, but presents an IPv4-mapped IPv6 address
+/// (::ffff:a.b.c.d) as BARE IPv4 (keeping the port) for OUTWARD use — e.g. a SIP
+/// Via/Contact/Record-Route identity, which must not carry a host-internal
+/// socket-API spelling (RFC 4291 §2.5.5.2) that breaks §19.1.4 URI comparison and
+/// is unroutable from a v4-only peer. Detection is the IN6_IS_ADDR_V4MAPPED
+/// predicate, NEVER a textual "::ffff:" strip (which would mis-handle SIIT
+/// ::ffff:0:a.b.c.d, and must leave v4-compatible ::a.b.c.d and NAT64 64:ff9b::/96
+/// alone). Native IPv6 is returned bare (no brackets — bracketing is the SIP
+/// serializer's job). A caller that keeps a v4-MAPPED internal key form (e.g. a
+/// peer-index key) renders that separately; this is the presentation form only.
+/// Shared by every outward LOCAL getter so the presentation is uniform across
+/// engines (origin: tracker 2026-10-04-2; the TcpEngine twins + remote getters
+/// follow in 2026-10-04-3).
+inline TransportAddress unmappedAddressFromSockaddr(const sockaddr_storage &ss)
+{
+  if (ss.ss_family == AF_INET6)
+  {
+    const auto *sa6 = reinterpret_cast<const sockaddr_in6 *>(&ss);
+    if (IN6_IS_ADDR_V4MAPPED(&sa6->sin6_addr))
+    {
+      sockaddr_storage out{};
+      auto *sa4 = reinterpret_cast<sockaddr_in *>(&out);
+      sa4->sin_family = AF_INET;
+      sa4->sin_port = sa6->sin6_port; // network order, kept as-is
+      std::memcpy(&sa4->sin_addr.s_addr, &sa6->sin6_addr.s6_addr[12],
+                  sizeof(sa4->sin_addr.s_addr));
+      return addressFromSockaddr(out);
+    }
+  }
+  return addressFromSockaddr(ss);
+}
+
 /// \brief Build a sockaddr_storage from a TransportAddress.
 ///
 /// Uses the ALREADY-PARSED value held by IpAddress rather than re-rendering it

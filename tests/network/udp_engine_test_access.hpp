@@ -204,7 +204,9 @@ struct UdpEngineTestAccess
 
   /// Set a ServerPeer session's captured local source to a v4 literal (I/O thread) — the T8
   /// source-not-local seam: point it at a non-local address (e.g. 192.0.2.1) so the next send's
-  /// sendmsg fails and DD7 closes the session. The write is on the I/O thread (DD10).
+  /// sendmsg fails and DD7 closes the session. Runs on the I/O thread; the write to a PUBLISHED
+  /// session's localSrc holds _sessionRwMutex unique (tracker 2026-10-04-2 DP6 — getLocalAddress
+  /// now reads localSrc off-thread under shared).
   static bool setLocalSrcV4(UdpEngine &e, SessionId sid, const char *ip)
   {
     return onIo(e,
@@ -221,8 +223,29 @@ struct UdpEngineTestAccess
                   {
                     return false;
                   }
+                  std::unique_lock<std::shared_mutex> wl(e._sessionRwMutex);
                   it->second->localSrc = ls;
                   return true;
+                });
+  }
+
+  /// The captured local source rendered in its CANONICAL key spelling (localToText / DD4 — a
+  /// v4-mapped local stays "::ffff:a.b.c.d"), for the tracker 2026-10-04-2 round-trip test (h):
+  /// re-mapping getLocalAddress's unmapped output must reproduce this byte-for-byte. Empty when the
+  /// session is unknown or localSrc is AF_UNSPEC. I/O thread (reads localSrc lock-free there).
+  static std::string localSrcText(UdpEngine &e, SessionId sid)
+  {
+    return onIo(e,
+                [&e, sid]() -> std::string
+                {
+                  auto it = e._sessions.find(sid);
+                  if (it == e._sessions.end())
+                  {
+                    return {};
+                  }
+                  char buf[INET6_ADDRSTRLEN]{};
+                  UdpEngine::localToText(it->second->localSrc, buf);
+                  return std::string(buf);
                 });
   }
 

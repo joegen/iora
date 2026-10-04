@@ -510,7 +510,8 @@ public:
     {
       return {};
     }
-    return addressFromSockaddr(ss);
+    // Outward presentation: unmap a v4-mapped listener bind (tracker 2026-10-04-2 DP1).
+    return iora::network::unmappedAddressFromSockaddr(ss);
   }
 
   TransportAddress getLocalAddress(SessionId sid) const override
@@ -533,7 +534,24 @@ public:
     {
       return {};
     }
-    return addressFromSockaddr(ss);
+    // Wildcard-bind reply-source (tracker 2026-10-04-2): on a 0.0.0.0/:: bind getsockname
+    // returns the wildcard, but 2026-10-03-1 captured the real per-session local in
+    // Session::localSrc. Report it (with the bound port from getsockname), presented UNMAPPED.
+    // The localSrc read is well-defined under this shared_lock: the only published-session
+    // writer (adoptWildcardVia) publishes it under _sessionRwMutex unique_lock (DP6). Read
+    // localSrc and the port in this ONE lock scope (no second acquisition — fd-reuse hazard,
+    // tracker 2026-09-15-3). AF_UNSPEC (specific bind / unadopted via / non-unicast) falls through
+    // to the (also unmapped) getsockname result, i.e. the wildcard = no pinned local (DP5). An
+    // unknown/reaped sid returned {} above (not in _sessions, or backing fd gone).
+    if (s->localSrc.family != AF_UNSPEC)
+    {
+      const std::uint16_t portNbo =
+        (ss.ss_family == AF_INET6)
+          ? reinterpret_cast<const sockaddr_in6 *>(&ss)->sin6_port
+          : reinterpret_cast<const sockaddr_in *>(&ss)->sin_port;
+      return iora::network::unmappedAddressFromSockaddr(sockaddrFromLocalSrc(s->localSrc, portNbo));
+    }
+    return iora::network::unmappedAddressFromSockaddr(ss);
   }
 
   TransportAddress getRemoteAddress(SessionId sid) const override
@@ -987,6 +1005,33 @@ private:
   {
     return iora::network::addressFromSockaddr(ss);
   }
+
+  /// Build a sockaddr_storage from a captured LocalSrc plus a network-order port, for the
+  /// getLocalAddress captured-local branch (tracker 2026-10-04-2). A v4-mapped LocalSrc (a
+  /// dual-stack v4 arrival, classifyLocalSrc) stays mapped here and is unmapped for
+  /// presentation by iora::network::unmappedAddressFromSockaddr (sockaddr_utils.hpp — the
+  /// shared outward-presentation helper). AF_UNSPEC yields a zeroed storage (unused — the
+  /// caller only reaches this when family != AF_UNSPEC).
+  static sockaddr_storage sockaddrFromLocalSrc(const LocalSrc &ls, std::uint16_t portNbo)
+  {
+    sockaddr_storage ss{};
+    if (ls.family == AF_INET)
+    {
+      auto *sa4 = reinterpret_cast<sockaddr_in *>(&ss);
+      sa4->sin_family = AF_INET;
+      sa4->sin_port = portNbo;
+      sa4->sin_addr = ls.addr.v4;
+    }
+    else if (ls.family == AF_INET6)
+    {
+      auto *sa6 = reinterpret_cast<sockaddr_in6 *>(&ss);
+      sa6->sin6_family = AF_INET6;
+      sa6->sin6_port = portNbo;
+      sa6->sin6_addr = ls.addr.v6;
+    }
+    return ss;
+  }
+
   void error(TransportError e, const std::string &m)
   {
     _atomicStats.errors.fetch_add(1, std::memory_order_relaxed);
@@ -1397,7 +1442,13 @@ private:
     socklen_t plen{0};
     std::string pkey;
     // Captured local destination for wildcard-bind reply-source selection (tracker 2026-10-03-1).
-    // Set at inbound capture and at via-adopt; AF_UNSPEC = send unpinned. I/O-thread-only (DD10).
+    // Set at inbound capture and at via-adopt; AF_UNSPEC = send unpinned.
+    // THREAD-SAFETY (tracker 2026-10-04-2 DP6): single writer = the I/O thread. A write to a
+    // PUBLISHED session (present in _sessions) MUST hold _sessionRwMutex unique (adoptWildcardVia);
+    // a pre-publish write (the fresh-ServerPeer path below, before the publishing emplace) needs no
+    // lock; I/O-thread reads are lock-free; an OFF-THREAD read (getLocalAddress) holds
+    // _sessionRwMutex shared. (Was "I/O-thread-only (DD10)" until getLocalAddress gained a
+    // caller-thread read.)
     LocalSrc localSrc{};
     std::deque<ByteBuffer> wq;
     bool wantWrite{false};
@@ -2012,10 +2063,15 @@ private:
   /// exact-key miss, if that sentinel bucket exists and is NON-EMPTY, move the WHOLE twin list onto
   /// \p newKey (preserving the twins-share-one-key contract), rewrite each twin's pkey + localSrc,
   /// and return its front() in \p outFront. Returns false (→ fresh accept) when there is nothing to
-  /// adopt. EXCEPTION-SAFE: all allocation happens in step 1 before any mutation; steps after the
-  /// operator[] rehash are noexcept (vector/string swap, map erase, trivially-copyable assign).
+  /// adopt. EXCEPTION-SAFE: all allocation happens in step 1 before any mutation; after the
+  /// operator[] rehash the ONLY throwing step is the _sessionRwMutex unique_lock acquisition, taken
+  /// BEFORE dst.swap (tracker 2026-10-04-2 / TS L-1) — if lock() throws, only Step 2's empty dst
+  /// bucket exists (the lazily-reclaimed "empty vector = miss" state); everything inside the locked
+  /// section is noexcept (vector/string swap, map erase, trivially-copyable assign).
   /// Rewriting pkey is MANDATORY — closeNow erases _peerIndex by s->pkey, so a stale back-key would
-  /// leave a dead sid at front() and black-hole the peer. I/O-thread-only (DD10).
+  /// leave a dead sid at front() and black-hole the peer. The per-twin localSrc write is published
+  /// under _sessionRwMutex unique_lock for the caller-thread getLocalAddress reader (DP6); all other
+  /// adopt state (_peerIndex, the pkey back-key) is I/O-thread-only.
   bool adoptWildcardVia(ListenerId lid, const sockaddr_storage &peer, const std::string &newKey,
                         const LocalSrc &local, SessionId &outFront)
   {
@@ -2052,13 +2108,21 @@ private:
     {
       return false; // defensive: cannot happen (we just confirmed it)
     }
-    // Step 4 (NOEXCEPT): on an exact miss dst is empty, so swap moves the twin list wholesale.
-    dst.swap(sit->second);
-    _peerIndex.erase(sit);
-    for (std::size_t i = 0; i < sessions.size(); ++i)
+    // Step 4: publish the twin rewrites under _sessionRwMutex unique_lock so the caller-thread
+    // getLocalAddress shared_lock read of localSrc is well-defined (tracker 2026-10-04-2 DP6).
+    // Acquired BEFORE dst.swap (TS L-1): lock() is the last throwing step, and if it throws nothing
+    // past Step 2 has mutated. Inside the lock everything is noexcept — on an exact miss dst is empty
+    // so swap moves the twin list wholesale. _peerIndex mutation rides along under the leaf lock
+    // (harmless; _peerIndex is otherwise I/O-thread-only). No callback runs under the lock.
     {
-      sessions[i]->pkey.swap(keyCopies[i]);
-      sessions[i]->localSrc = local;
+      std::unique_lock<std::shared_mutex> wl(_sessionRwMutex);
+      dst.swap(sit->second);
+      _peerIndex.erase(sit);
+      for (std::size_t i = 0; i < sessions.size(); ++i)
+      {
+        sessions[i]->pkey.swap(keyCopies[i]);
+        sessions[i]->localSrc = local;
+      }
     }
     // cpp17 L-1: step 1 only rewrote pkey for LIVE sids; drop any stale sid the swap carried over so
     // front() is always a live session (closeNow keeps _peerIndex↔_sessions consistent, so this is
@@ -3327,7 +3391,15 @@ private:
   // - _cbMutex protects callback copies (copy-then-invoke: acquired/released
   //   before any callback fires and before any _sessionRwMutex use).
   // - _sessionRwMutex protects session/listener maps AND the _connecting
-  //   connecting-sid registry (shared for reads, unique for mutations).
+  //   connecting-sid registry (shared for reads, unique for mutations), AND
+  //   Session::localSrc as a cross-thread field (tracker 2026-10-04-2 DP6): the
+  //   I/O thread publishes a PUBLISHED session's localSrc under unique (adoptWildcardVia),
+  //   the off-thread getLocalAddress reads it under shared. Reader sections are bounded
+  //   to O(1) map work plus at most one getsockname syscall and run NO blocking/callback
+  //   under the lock; the shared_mutex is reader-preferring on glibc, so adding a hot
+  //   caller-thread getter (iora_sip may call getLocalAddress per message) widens the
+  //   reader population the I/O thread's adopt unique_lock contends with — accepted risk
+  //   given the bounded reader sections (TS L-3).
   // - _qmx protects the command queue (_q) AND serializes the _eventFd wakeup-
   //   write (enqueue) against the _eventFd close (shutdownDrain), plus the
   //   _qClosed teardown flag. process() swaps _q out under _qmx then RELEASES
