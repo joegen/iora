@@ -247,6 +247,38 @@ TEST_CASE("TCP connectViaListener returns err(Config)", "[transport][tcp][connec
   t->stop();
 }
 
+// (prefsrc-o, tracker 2026-10-04-1): the 4-arg connectViaListener facade threads the preferred-source
+// through to the engine. TCP returns Config for both an empty and a non-empty hint; UDP forwards (a
+// valid hint originates, a malformed hint errs synchronously).
+TEST_CASE("connectViaListener 4-arg preferred-source facade (prefsrc-o)",
+          "[transport][connection][prefsrc]")
+{
+  auto tcp = Transport::tcp();
+  REQUIRE(tcp->start().isOk());
+  REQUIRE(tcp->connectViaListener(1, "127.0.0.1", 5060, "").error().code == TransportError::Config);
+  REQUIRE(tcp->connectViaListener(1, "127.0.0.1", 5060, "127.0.0.1").error().code ==
+          TransportError::Config);
+  tcp->stop();
+
+  auto udp = Transport::udp();
+  REQUIRE(udp->start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = udp->addListener("0.0.0.0", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  // A valid hint forwards and originates (engine accepts).
+  REQUIRE(udp->connectViaListener(lr.value(), "127.0.0.1", port, "127.0.0.2").isOk());
+  // A malformed hint errs synchronously through the facade.
+  REQUIRE(udp->connectViaListener(lr.value(), "127.0.0.1", port, "nope").isErr());
+  // The ITransport DEFAULT 4-arg body (reached via a qualified call that bypasses Transport's own
+  // override): an empty hint forwards to the 3-arg (originates); a non-empty hint returns Config
+  // "not supported" — the behaviour an out-of-tree ITransport implementor inherits.
+  REQUIRE(udp->ITransport::connectViaListener(lr.value(), "127.0.0.1", port, "").isOk());
+  REQUIRE(udp->ITransport::connectViaListener(lr.value(), "127.0.0.1", port, "127.0.0.2")
+            .error()
+            .code == TransportError::Config);
+  udp->stop();
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // task-6.3: TCP data operations
 // ══════════════════════════════════════════════════════════════════════════════

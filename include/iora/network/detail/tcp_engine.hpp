@@ -524,7 +524,9 @@ public:
     return TransportErrorInfo{fatal.code, fatal.message, fatal.sysErrno, fatal.tlsError};
   }
 
-  ConnectResult connectViaListener(ListenerId, const std::string &, std::uint16_t) override
+  using detail::EngineBase::connectViaListener; // keep the 3-arg forwarder visible (no hiding)
+  ConnectResult connectViaListener(ListenerId, const std::string &, std::uint16_t,
+                                   const std::string &) override
   {
     return ConnectResult::err(
       TransportErrorInfo{TransportError::Config, "connectViaListener not supported on TCP/TLS"});

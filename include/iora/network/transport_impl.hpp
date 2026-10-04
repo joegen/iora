@@ -902,6 +902,13 @@ inline ConnectResult Transport::connectViaListener(ListenerId lid, const std::st
   return _impl->engine->connectViaListener(lid, host, port);
 }
 
+inline ConnectResult Transport::connectViaListener(ListenerId lid, const std::string &host,
+                                                   std::uint16_t port,
+                                                   const std::string &preferredSourceIp)
+{
+  return _impl->engine->connectViaListener(lid, host, port, preferredSourceIp);
+}
+
 inline SessionId Transport::allocateSid()
 {
   return _impl->engine->allocateSid();

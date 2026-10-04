@@ -97,14 +97,25 @@ public:
   virtual ConnectResult connect(const std::string &host, std::uint16_t port,
                                 TlsMode tlsMode, const TlsClientOptions &opts) = 0;
 
-  /// \brief Legacy 3-arg connect — non-pure default delegating to the primitive
-  /// with empty options (so no implementor is forced to reimplement it).
+  /// \brief Convenience 3-arg connect (no TLS identity options) — non-pure default delegating to
+  /// the primitive with empty options (so no implementor is forced to reimplement it).
   ConnectResult connect(const std::string &host, std::uint16_t port, TlsMode tlsMode)
   {
     return connect(host, port, tlsMode, TlsClientOptions{});
   }
+  /// \brief Via-listener connect with an optional preferred SOURCE address — the PRIMITIVE.
+  /// \param preferredSourceIp a numeric IP literal to pin the egress source on a wildcard
+  ///   bind (RFC 3581 §4 / §3; iora tracker 2026-10-04-1); "" = no hint (adopt-on-first-inbound).
   virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,
-                                           std::uint16_t port) = 0;
+                                           std::uint16_t port,
+                                           const std::string &preferredSourceIp) = 0;
+
+  /// \brief Convenience 3-arg connectViaListener (no source hint) — non-pure forwarder passing ""
+  /// (so no implementor reimplements it; mirrors the 3-arg connect forwarder above).
+  ConnectResult connectViaListener(ListenerId lid, const std::string &host, std::uint16_t port)
+  {
+    return connectViaListener(lid, host, port, std::string{});
+  }
 
   /// \brief DP-SS1 (register-before-connect): mint a session id WITHOUT publishing
   /// anything engine-discoverable — no connecting-registry insert, no command

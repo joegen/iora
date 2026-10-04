@@ -81,6 +81,22 @@ public:
   virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,
                                            std::uint16_t port) = 0;
 
+  /// \brief Via-listener connect with an optional preferred SOURCE address (a numeric IP
+  /// literal to pin the egress source on a wildcard bind; "" = no hint). Non-pure default:
+  /// forward an empty hint to the 3-arg overload, so a generic ITransport implementor keeps
+  /// working; a non-empty hint is unsupported unless the implementor overrides this.
+  /// (iora tracker 2026-10-04-1 DP1.)
+  virtual ConnectResult connectViaListener(ListenerId lid, const std::string &host,
+                                           std::uint16_t port, const std::string &preferredSourceIp)
+  {
+    if (preferredSourceIp.empty())
+    {
+      return connectViaListener(lid, host, port);
+    }
+    return ConnectResult::err(TransportErrorInfo{
+      TransportError::Config, "connectViaListener preferred-source not supported"});
+  }
+
   /// \brief DP-SS1/DP-SS5 (register-before-connect): mint a session id WITHOUT
   /// enqueuing a connect. Pair with connectWith(): a caller obtains the sid, registers
   /// state against it, then flushes the connect — so a connect failure is delivered to
@@ -194,16 +210,17 @@ public:
   /// \brief The captured per-session LOCAL address (reply source), UNMAPPED (UDP).
   /// CONTRACT (tracker 2026-10-04-2):
   /// - DP3 (inward re-map): an API that accepts this address BACK as a source hint
-  ///   (e.g. a future connectViaListener preferred-source, iora/2026-10-04-1) must
-  ///   re-map bare IPv4 -> v4-mapped on an AF_INET6 listener and reject a family the
-  ///   socket cannot source; a wildcard (0.0.0.0 / ::) means NO hint. Do NOT infer the
-  ///   listener family from this unmapped string — the engine owns the socket family.
-  /// - DP4 (read timing): for a `connectViaListener` session on a wildcard bind the
-  ///   value is wildcard until the first inbound adopts it, then the captured local,
-  ///   and nothing signals the change; an inbound-created ServerPeer has its captured
-  ///   local from creation; a non-unicast-arrival session stays wildcard; a reaped /
-  ///   unknown sid returns {}. Read it at request receipt (in onData, on the I/O
-  ///   thread) and store it; never cache the pre-adoption value.
+  ///   (the connectViaListener preferred-source 4-arg overload, iora/2026-10-04-1) re-maps
+  ///   bare IPv4 -> v4-mapped on an AF_INET6 listener and rejects a family the socket cannot
+  ///   source; a wildcard (0.0.0.0 / ::) means NO hint. Do NOT infer the listener family from
+  ///   this unmapped string — the engine owns the socket family.
+  /// - DP4 (read timing): for an UNSEEDED `connectViaListener` session on a wildcard bind the
+  ///   value is wildcard until the first inbound adopts it, then the captured local, and nothing
+  ///   signals the change; a SEEDED preferred-source via returns its seed from creation and never
+  ///   changes (iora/2026-10-04-1 DP13); an inbound-created ServerPeer has its captured local from
+  ///   creation; a non-unicast-arrival session stays wildcard; a reaped / unknown sid returns {}.
+  ///   Read it at request receipt (in onData, on the I/O thread) and store it; never cache the
+  ///   pre-adoption value of an unseeded via.
   /// - DP5: a wildcard result means NO pinned local — never place it in a SIP header;
   ///   substitute the configured advertised address (RFC 3261 §18.1.1).
   /// - DP7 (scope): the UDP LOCAL getters are unmapped; getRemoteAddress (all engines)
@@ -300,6 +317,9 @@ public:
   using ITransport::connect; // keep both connect overloads visible (no hiding)
   ConnectResult connectViaListener(ListenerId lid, const std::string &host,
                                    std::uint16_t port) override;
+  ConnectResult connectViaListener(ListenerId lid, const std::string &host, std::uint16_t port,
+                                   const std::string &preferredSourceIp) override;
+  using ITransport::connectViaListener; // keep both overloads visible (no hiding)
   SessionId allocateSid() override;
   ConnectResult connectWith(SessionId sid, const std::string &host, std::uint16_t port,
                             TlsMode tls, const TlsClientOptions &opts) override;

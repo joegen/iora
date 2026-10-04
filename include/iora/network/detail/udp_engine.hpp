@@ -284,13 +284,40 @@ public:
       sid, [&] { return Cmd::connect(ConnectReq{sid, host, port}); },
       "connect: transport shutting down");
   }
-  ConnectResult connectViaListener(ListenerId lid, const std::string &host, std::uint16_t port) override
+  using detail::EngineBase::connectViaListener; // keep the 3-arg forwarder visible (no hiding)
+  ConnectResult connectViaListener(ListenerId lid, const std::string &host, std::uint16_t port,
+                                   const std::string &preferredSourceIp) override
   {
+    // DP2 (tracker 2026-10-04-1): parse + run the LISTENER-INDEPENDENT hint checks on the
+    // CALLER thread BEFORE minting a sid, so a bad hint returns err synchronously and mints
+    // nothing. "" = no hint. Wildcard (0.0.0.0 / :: / ::ffff:0.0.0.0) = no hint (DP5). The
+    // family/listener-dependent checks + the family-class destination selection happen on the
+    // I/O thread in viaFromAddrs against the re-looked-up listener.
+    LocalSrc hint{};
+    if (!preferredSourceIp.empty())
+    {
+      auto parsed = parseIpLiteral(preferredSourceIp);
+      if (!parsed)
+      {
+        return ConnectResult::err(TransportErrorInfo{
+          TransportError::Config, "connectViaListener: preferred-source not an IP literal"});
+      }
+      if (!isUnspecified(*parsed)) // a wildcard hint means NO hint (DP5)
+      {
+        if (isNonUnicastHint(*parsed) || isLinkLocalHint(*parsed)) // DP10 (hint-only checks)
+        {
+          return ConnectResult::err(TransportErrorInfo{
+            TransportError::Config,
+            "connectViaListener: preferred-source must be a unicast, non-link-local address"});
+        }
+        hint = *parsed;
+      }
+    }
     SessionId sid = _nextSessionId++;
     // UDP-specific: unlike TCP (a not-supported stub), connectViaListener genuinely
     // enqueues here; same A3.1a ordering via the shared helper.
     return insertConnectingAndEnqueue(
-      sid, [&] { return Cmd::via(ViaReq{sid, lid, host, port}); },
+      sid, [&] { return Cmd::via(ViaReq{sid, lid, host, port, hint}); },
       "connectViaListener: transport shutting down");
   }
 
@@ -538,11 +565,12 @@ public:
     // returns the wildcard, but 2026-10-03-1 captured the real per-session local in
     // Session::localSrc. Report it (with the bound port from getsockname), presented UNMAPPED.
     // The localSrc read is well-defined under this shared_lock: the only published-session
-    // writer (adoptWildcardVia) publishes it under _sessionRwMutex unique_lock (DP6). Read
-    // localSrc and the port in this ONE lock scope (no second acquisition — fd-reuse hazard,
-    // tracker 2026-09-15-3). AF_UNSPEC (specific bind / unadopted via / non-unicast) falls through
-    // to the (also unmapped) getsockname result, i.e. the wildcard = no pinned local (DP5). An
-    // unknown/reaped sid returned {} above (not in _sessions, or backing fd gone).
+    // writer (adoptWildcardVia) publishes it under _sessionRwMutex unique_lock (DP6); a SEEDED
+    // preferred-source via (tracker 2026-10-04-1 DP13) carries its seed from publication and is never
+    // adopted, so it reports the seed, UNMAPPED, from creation. Read localSrc and the port in this ONE
+    // lock scope (no second acquisition — fd-reuse hazard, tracker 2026-09-15-3). AF_UNSPEC (specific
+    // bind / unadopted UNSEEDED via / non-unicast) falls through to the (also unmapped) getsockname
+    // result, i.e. the wildcard = no pinned local (DP5). An unknown/reaped sid returned {} above.
     if (s->localSrc.family != AF_UNSPEC)
     {
       const std::uint16_t portNbo =
@@ -865,6 +893,165 @@ private:
     {
       ::inet_ntop(AF_INET6, &ls.addr.v6, out, INET6_ADDRSTRLEN);
     }
+  }
+
+  /// \brief The ONE numeric-IP-literal parser for this engine (tracker 2026-10-04-1 DP-util).
+  /// PURE + REENTRANT (no static/scratch state; result via the return value). IPv6 first, then
+  /// IPv4. A v4-mapped literal ("::ffff:a.b.c.d") parses as AF_INET6 (IN6_IS_ADDR_V4MAPPED).
+  /// Reused by the preferred-source hint path, the DP7 bound compare, addListenerDo, and
+  /// isIpLiteral — never a textual v4-mapped detection (DP1 of 2026-10-04-2).
+  static std::optional<LocalSrc> parseIpLiteral(const std::string &s)
+  {
+    // inet_pton reads to the first NUL, so an embedded NUL ("1.2.3.4\0junk") would parse as the
+    // prefix; reject it so a hint is exactly its full string (cpp17 L-3).
+    if (s.find('\0') != std::string::npos)
+    {
+      return std::nullopt;
+    }
+    LocalSrc ls{};
+    in6_addr a6{};
+    if (::inet_pton(AF_INET6, s.c_str(), &a6) == 1)
+    {
+      ls.family = AF_INET6;
+      ls.addr.v6 = a6;
+      return ls;
+    }
+    in_addr a4{};
+    if (::inet_pton(AF_INET, s.c_str(), &a4) == 1)
+    {
+      ls.family = AF_INET;
+      ls.addr.v4 = a4;
+      return ls;
+    }
+    return std::nullopt;
+  }
+
+  /// \brief True for 0.0.0.0 / :: / ::ffff:0.0.0.0 (a wildcard "hint" means NO hint, DP5).
+  static bool isUnspecified(const LocalSrc &ls)
+  {
+    if (ls.family == AF_INET)
+    {
+      return ls.addr.v4.s_addr == htonl(INADDR_ANY);
+    }
+    if (ls.family == AF_INET6)
+    {
+      return IN6_IS_ADDR_UNSPECIFIED(&ls.addr.v6) ||
+             (IN6_IS_ADDR_V4MAPPED(&ls.addr.v6) &&
+              std::memcmp(&ls.addr.v6.s6_addr[12], "\0\0\0\0", 4) == 0);
+    }
+    return true; // AF_UNSPEC
+  }
+
+  /// \brief A LocalSrc is "v4-class" if it is AF_INET or a v4-mapped AF_INET6 (DP6 — class by
+  /// ADDRESS, not ai_family: a dual-stack IPV6_PKTINFO source is valid only toward a v4-mapped
+  /// destination).
+  static bool isV4ClassLocal(const LocalSrc &ls)
+  {
+    return ls.family == AF_INET ||
+           (ls.family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&ls.addr.v6));
+  }
+
+  /// \brief The embedded/native IPv4 of a v4-class LocalSrc (AF_INET, or a v4-mapped AF_INET6);
+  /// nullopt for native v6 (optional-return, not bool+out — cpp17.md:600).
+  static std::optional<in_addr> embeddedV4(const LocalSrc &ls)
+  {
+    if (ls.family == AF_INET)
+    {
+      return ls.addr.v4;
+    }
+    if (ls.family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&ls.addr.v6))
+    {
+      in_addr v4{};
+      std::memcpy(&v4.s_addr, &ls.addr.v6.s6_addr[12], sizeof(v4.s_addr));
+      return v4;
+    }
+    return std::nullopt;
+  }
+
+  /// \brief DP10: a hint is non-unicast if (its embedded v4 is) multicast / limited broadcast,
+  /// or a native-v6 multicast. Classify on the ADDRESS (unmap a mapped hint first).
+  static bool isNonUnicastHint(const LocalSrc &ls)
+  {
+    if (auto v4 = embeddedV4(ls))
+    {
+      return IN_MULTICAST(ntohl(v4->s_addr)) || v4->s_addr == htonl(INADDR_BROADCAST);
+    }
+    return ls.family == AF_INET6 && IN6_IS_ADDR_MULTICAST(&ls.addr.v6);
+  }
+
+  /// \brief DP10: reject a native IPv6 link-local hint (fe80::/10 — no zone/scope id, SIP text
+  /// cannot carry an RFC 6874 zone). A v4-mapped address can never be fe80::/10, and IPv4 169.254/16
+  /// is NOT rejected on this ground.
+  static bool isLinkLocalHint(const LocalSrc &ls)
+  {
+    return ls.family == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&ls.addr.v6);
+  }
+
+  /// \brief Binary equality of two LocalSrc (family + address bytes). NEVER a text compare (DP7).
+  static bool localSrcEqual(const LocalSrc &a, const LocalSrc &b)
+  {
+    if (a.family != b.family)
+    {
+      return false;
+    }
+    if (a.family == AF_INET)
+    {
+      return a.addr.v4.s_addr == b.addr.v4.s_addr;
+    }
+    if (a.family == AF_INET6)
+    {
+      return std::memcmp(&a.addr.v6, &b.addr.v6, sizeof(in6_addr)) == 0;
+    }
+    return true; // both AF_UNSPEC
+  }
+
+  /// \brief DP4: normalise a parsed hint to the LISTENER socket family so udpSendTo picks the
+  /// right cmsg level. AF_INET6 listener: bare-v4 -> v4-mapped (both OK on dual-stack). AF_INET
+  /// listener: v4-mapped -> bare v4; a native-v6 hint -> false (cannot source, caller rejects).
+  static bool normaliseHintToListener(LocalSrc &ls, int sockFamily)
+  {
+    if (ls.family == AF_UNSPEC)
+    {
+      return true; // no hint
+    }
+    if (sockFamily == AF_INET6)
+    {
+      if (ls.family == AF_INET)
+      {
+        in6_addr mapped = v4MappedV6(ls.addr.v4);
+        ls.addr = {};
+        ls.addr.v6 = mapped;
+        ls.family = AF_INET6;
+      }
+      return true;
+    }
+    // sockFamily == AF_INET: accept a bare v4 (keep) or a v4-mapped hint (unmap); reject native v6.
+    auto v4 = embeddedV4(ls);
+    if (!v4)
+    {
+      return false; // native-v6 hint on an AF_INET listener
+    }
+    ls.addr = {};
+    ls.addr.v4 = *v4;
+    ls.family = AF_INET;
+    return true;
+  }
+
+  /// \brief Is this resolved addrinfo "v4-class" (AF_INET, or a v4-mapped AF_INET6)? Classifies the
+  /// DESTINATION by the same ADDRESS rule as isV4ClassLocal does the seed (DP6), so the selection
+  /// needs no per-listener-family special case.
+  static bool addrinfoIsV4Class(const addrinfo *ai)
+  {
+    if (!ai)
+    {
+      return false;
+    }
+    if (ai->ai_family == AF_INET)
+    {
+      return true;
+    }
+    return ai->ai_family == AF_INET6 &&
+           IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<const sockaddr_in6 *>(ai->ai_addr)->sin6_addr);
   }
 
   /// PURE classification of a received datagram's local destination from its control messages
@@ -1210,6 +1397,9 @@ private:
     ListenerId lid{};
     std::string host;
     std::uint16_t port{};
+    // Preferred egress SOURCE (tracker 2026-10-04-1). AF_UNSPEC = no hint. Parsed+hint-validated
+    // on the caller thread (DP2); carried by value across the _qmx edge (trivially copyable).
+    LocalSrc preferredSource{};
   };
   /// \brief I/O-thread-only record of a named-host connect/via awaiting
   /// off-thread resolution. Single-owner one-shot terminal event for that sid;
@@ -1425,6 +1615,11 @@ private:
     // (AF_INET / AF_INET6), used by classifyLocalSrc to pick the pktinfo field.
     bool wildcard{false};
     int sockFamily{AF_UNSPEC};
+    // Parsed bound address (tracker 2026-10-04-1 DP7): set in addListenerDo from the SAME
+    // parseIpLiteral result, BEFORE the _listeners emplace, immutable after (I/O-thread-read-only).
+    // Used for the specific-bind preferred-source equality compare (binary, never re-parsing the
+    // "addr:port" text — a v6 bind text re-parses to a different literal).
+    LocalSrc bound{};
     // Last successful ::sendto on this listener's shared fd (L-8, tracker 2026-09-25-16).
     // The shared write queue stalls as a UNIT, so the write-stall backstop keys on this
     // per-listener clock (not per-session), and reclaims the owner of the front (blocking)
@@ -1441,14 +1636,16 @@ private:
     sockaddr_storage peer{};
     socklen_t plen{0};
     std::string pkey;
-    // Captured local destination for wildcard-bind reply-source selection (tracker 2026-10-03-1).
-    // Set at inbound capture and at via-adopt; AF_UNSPEC = send unpinned.
+    // Captured/pinned local destination for wildcard-bind reply-source selection (tracker
+    // 2026-10-03-1). Set at inbound capture, at via-adopt, and — for a connectViaListener
+    // preferred-source via — pre-published as the SEED in viaFromAddrs (tracker 2026-10-04-1 DP8).
+    // A SEEDED via is final-from-publication and is never adopted (DP3). AF_UNSPEC = send unpinned.
     // THREAD-SAFETY (tracker 2026-10-04-2 DP6): single writer = the I/O thread. A write to a
     // PUBLISHED session (present in _sessions) MUST hold _sessionRwMutex unique (adoptWildcardVia);
-    // a pre-publish write (the fresh-ServerPeer path below, before the publishing emplace) needs no
-    // lock; I/O-thread reads are lock-free; an OFF-THREAD read (getLocalAddress) holds
-    // _sessionRwMutex shared. (Was "I/O-thread-only (DD10)" until getLocalAddress gained a
-    // caller-thread read.)
+    // a PRE-PUBLISH write (the fresh-ServerPeer path below AND the viaFromAddrs seed, both before the
+    // publishing emplace) needs no lock; I/O-thread reads are lock-free; an OFF-THREAD read
+    // (getLocalAddress) holds _sessionRwMutex shared. (Was "I/O-thread-only (DD10)" until
+    // getLocalAddress gained a caller-thread read.)
     LocalSrc localSrc{};
     std::deque<ByteBuffer> wq;
     bool wantWrite{false};
@@ -1920,23 +2117,26 @@ private:
 
   bool addListenerDo(const ListenerCfg &lc)
   {
-    int sfd = -1;
-    sockaddr_storage ss{};
-    socklen_t sl = 0;
-    bool wildcard = false; // 0.0.0.0 / :: / ::ffff:0.0.0.0 — drives pktinfo capture (DD1)
-    int sockFamily = AF_UNSPEC;
-    in6_addr t6{};
-    if (::inet_pton(AF_INET6, lc.addr.c_str(), &t6) == 1)
+    // DP-util (tracker 2026-10-04-1): ONE parser for the bind literal; derive family, the wildcard
+    // predicate (isUnspecified), the cached bound address, and the bind sockaddr (sockaddrFromLocalSrc)
+    // all from the single parse result — no inline inet_pton cascade or duplicated wildcard check.
+    auto parsed = parseIpLiteral(lc.addr);
+    if (!parsed)
     {
-      sockFamily = AF_INET6;
-      wildcard = IN6_IS_ADDR_UNSPECIFIED(&t6) ||
-                 (IN6_IS_ADDR_V4MAPPED(&t6) && std::memcmp(&t6.s6_addr[12], "\0\0\0\0", 4) == 0);
-      sfd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-      if (sfd < 0)
-      {
-        error(TransportError::Socket, "socket v6: " + lastErr());
-        return false;
-      }
+      error(TransportError::Bind, "inet_pton failed");
+      return false;
+    }
+    const int sockFamily = parsed->family;
+    const bool wildcard = isUnspecified(*parsed); // 0.0.0.0 / :: / ::ffff:0.0.0.0 — drives pktinfo (DD1)
+    int sfd = ::socket(sockFamily, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (sfd < 0)
+    {
+      error(TransportError::Socket,
+            std::string(sockFamily == AF_INET6 ? "socket v6: " : "socket v4: ") + lastErr());
+      return false;
+    }
+    if (sockFamily == AF_INET6)
+    {
       int v6only = 0;
       // LOW-4 (tracker 2026-10-03-1): a silent V6ONLY=0 failure disables dual-stack (v4 never
       // reaches the listener), which also breaks v4-mapped source capture — fail the listener.
@@ -1946,36 +2146,9 @@ private:
         ::close(sfd);
         return false;
       }
-      sockaddr_in6 sa6{};
-      sa6.sin6_family = AF_INET6;
-      sa6.sin6_port = htons(lc.port);
-      sa6.sin6_addr = t6;
-      std::memcpy(&ss, &sa6, sizeof(sa6));
-      sl = sizeof(sa6);
     }
-    else
-    {
-      in_addr t4{};
-      if (::inet_pton(AF_INET, lc.addr.c_str(), &t4) != 1)
-      {
-        error(TransportError::Bind, "inet_pton failed");
-        return false;
-      }
-      sockFamily = AF_INET;
-      wildcard = (t4.s_addr == htonl(INADDR_ANY));
-      sfd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-      if (sfd < 0)
-      {
-        error(TransportError::Socket, "socket v4: " + lastErr());
-        return false;
-      }
-      sockaddr_in sa4{};
-      sa4.sin_family = AF_INET;
-      sa4.sin_port = htons(lc.port);
-      sa4.sin_addr = t4;
-      std::memcpy(&ss, &sa4, sizeof(sa4));
-      sl = sizeof(sa4);
-    }
+    sockaddr_storage ss = sockaddrFromLocalSrc(*parsed, htons(lc.port));
+    socklen_t sl = (sockFamily == AF_INET6) ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
     if (_config.soRcvBuf > 0)
       ::setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &_config.soRcvBuf, sizeof(int));
     if (_config.soSndBuf > 0)
@@ -2026,6 +2199,9 @@ private:
     lst->bind = lc.addr + ":" + std::to_string(lc.port);
     lst->wildcard = wildcard;
     lst->sockFamily = sockFamily;
+    // DP7 (tracker 2026-10-04-1): cache the parsed bound address (the SAME parseIpLiteral result)
+    // for the specific-bind preferred-source compare (binary, not a re-parse of the "addr:port" text).
+    lst->bound = *parsed;
     lst->lastWriteProgress = MonoClock::now(); // seed the write-stall clock (L-8)
     std::uint32_t ev = EPOLLIN;
     if (_config.useEdgeTriggered)
@@ -2372,14 +2548,9 @@ private:
     modEpoll(lst->fd, ev);
   }
 
-  /// \brief True iff host is a numeric IPv4/IPv6 literal (no DNS needed).
-  static bool isIpLiteral(const std::string &host)
-  {
-    struct in_addr a4;
-    struct in6_addr a6;
-    return ::inet_pton(AF_INET, host.c_str(), &a4) == 1 ||
-           ::inet_pton(AF_INET6, host.c_str(), &a6) == 1;
-  }
+  /// \brief True iff host is a numeric IPv4/IPv6 literal (no DNS needed). Reuses the one parser
+  /// (tracker 2026-10-04-1 DP-util).
+  static bool isIpLiteral(const std::string &host) { return parseIpLiteral(host).has_value(); }
 
   /// \brief Build the resolver continuation (runs on a blockingIoPool thread).
   /// Captures a shared_ptr copy of the post gate + the sid's resume action; it
@@ -2691,7 +2862,7 @@ private:
       {
         return false;
       }
-      return viaFromAddrs(vr.sid, vr.lid, owned.get());
+      return viaFromAddrs(vr.sid, vr.lid, vr.preferredSource, owned.get());
     }
 
     // Named host: resolve OFF the I/O thread, reusing the connect-site
@@ -2707,16 +2878,17 @@ private:
 
     const SessionId sid = vr.sid;
     const ListenerId lid = vr.lid;
+    const LocalSrc pref = vr.preferredSource; // carried by value into the resume closure (DP8)
     resolveHostAsync(vr.host, ps, hints,
                      makeResolveContinuation(
-                       [this, sid, lid](std::shared_ptr<iora::network::OwnedAddrInfo> addrs, int gai)
-                       { resumeVia(sid, lid, addrs, gai); }));
+                       [this, sid, lid, pref](std::shared_ptr<iora::network::OwnedAddrInfo> addrs,
+                                              int gai) { resumeVia(sid, lid, pref, addrs, gai); }));
     return true;
   }
 
   /// \brief RESUME a named-host via-listener connect (I/O thread). Single-owner
   /// one-shot: build the session ONLY if this call erased the pending entry.
-  void resumeVia(SessionId sid, ListenerId lid,
+  void resumeVia(SessionId sid, ListenerId lid, LocalSrc preferredSource,
                  std::shared_ptr<iora::network::OwnedAddrInfo> addrs, int gai)
   {
     auto it = _pendingConnects.find(sid);
@@ -2736,7 +2908,7 @@ private:
                      [&]()
                      {
                        testMaybeThrowAt(ConnectThrowPoint::BEFORE_INSERT_RESUME);
-                       viaFromAddrs(sid, lid, addrs->get(), std::move(pendingWq));
+                       viaFromAddrs(sid, lid, preferredSource, addrs->get(), std::move(pendingWq));
                      });
   }
 
@@ -2747,7 +2919,7 @@ private:
   /// owns res (#6). Every post-resolution terminal is a one-shot eraser-fire:
   /// listener-gone / AF-mismatch / session-cap -> onClose(Config); success ->
   /// onConnect. Runs on the I/O thread.
-  bool viaFromAddrs(SessionId sid, ListenerId lid, addrinfo *res,
+  bool viaFromAddrs(SessionId sid, ListenerId lid, LocalSrc seed, addrinfo *res,
                     std::deque<ByteBuffer> pendingWq = {})
   {
     auto lit = _listeners.find(lid);
@@ -2768,10 +2940,53 @@ private:
                         TransportErrorInfo{TransportError::Config, "listener AF unknown/unsupported"});
       return false;
     }
+    // === Preferred-source seed (tracker 2026-10-04-1). `seed` arrives by value (AF_UNSPEC = no hint),
+    // already hint-validated on the caller thread (DP2/DP10); here we run the LISTENER-dependent
+    // checks on the I/O thread against the re-looked-up listener. ===
+    if (seed.family != AF_UNSPEC)
+    {
+      // DP4: normalise to the listener socket family (a native-v6 hint on an AF_INET listener
+      // cannot source → reject).
+      if (!normaliseHintToListener(seed, af))
+      {
+        preInsertTerminal(sid, TransportErrorInfo{
+                                 TransportError::Config,
+                                 "preferred-source: IPv6 address cannot source on an IPv4 listener"});
+        return false;
+      }
+      // DP7 specific-bind policy: equal to the bound address → NO-OP (clear the seed, keep the
+      // byte-identical key + plain sendto); any different hint → reject.
+      if (!lst->wildcard)
+      {
+        if (!localSrcEqual(seed, lst->bound))
+        {
+          preInsertTerminal(sid,
+                            TransportErrorInfo{TransportError::Config,
+                                               "preferred-source: a specific bind can only source "
+                                               "its bound address"});
+          return false;
+        }
+        seed = LocalSrc{};
+      }
+    }
+    // DP6: choose the destination ADDRESS-CLASS-consistent with the seed (class by address, via
+    // isV4ClassLocal / addrinfoIsV4Class — NOT ai_family; a dual-stack IPV6_PKTINFO source is valid
+    // only toward a v4-mapped destination). With no seed the selection is unchanged. Also note whether
+    // a bare-AF_INET candidate existed, to tell the scoped-out (2026-10-03-2) case apart from a plain
+    // family mismatch in the reject diagnostic.
     const addrinfo *chosen = nullptr;
+    bool sawBareV4 = false;
     for (const addrinfo *ai = res; ai; ai = ai->ai_next)
     {
-      if (ai->ai_family == af && ai->ai_socktype == SOCK_DGRAM)
+      if (ai->ai_family == AF_INET && ai->ai_socktype == SOCK_DGRAM)
+      {
+        sawBareV4 = true;
+      }
+      if (ai->ai_family != af || ai->ai_socktype != SOCK_DGRAM)
+      {
+        continue;
+      }
+      if (seed.family == AF_UNSPEC || isV4ClassLocal(seed) == addrinfoIsV4Class(ai))
       {
         chosen = ai;
         break;
@@ -2780,29 +2995,47 @@ private:
     if (!chosen)
     {
       // NO ::freeaddrinfo — caller owns res (#6).
-      std::string m = (af == AF_INET) ? "AF mismatch: listener IPv4, remote IPv6 only"
-                                      : "AF mismatch: listener IPv6, remote IPv4 only";
+      std::string m;
+      if (seed.family != AF_UNSPEC && af == AF_INET6 && isV4ClassLocal(seed))
+      {
+        // v4-class seed on a dual-stack listener with no v4-mapped candidate. A bare-AF_INET
+        // candidate means this needs the v4→::ffff: DESTINATION mapping owned by tracker 2026-10-03-2
+        // (scoped out of this task); otherwise the IPv4 source simply cannot reach an IPv6-only peer.
+        m = sawBareV4 ? "preferred-source: IPv4 origination to a bare-IPv4 destination on a "
+                        "dual-stack listener is unsupported"
+                      : "preferred-source: an IPv4 source cannot reach an IPv6-only destination";
+      }
+      else if (seed.family != AF_UNSPEC && af == AF_INET6)
+      {
+        m = "preferred-source: a native-IPv6 source cannot reach a v4-mapped destination";
+      }
+      else
+      {
+        m = (af == AF_INET) ? "AF mismatch: listener IPv4, remote IPv6 only"
+                            : "AF mismatch: listener IPv6, remote IPv4 only";
+      }
       preInsertTerminal(sid, TransportErrorInfo{TransportError::Config, m});
       return false;
     }
     sockaddr_storage to{};
-    socklen_t tl = 0;
-    if (chosen->ai_family == AF_INET6)
-    {
-      std::memcpy(&to, chosen->ai_addr, sizeof(sockaddr_in6));
-      tl = sizeof(sockaddr_in6);
-    }
-    else
-    {
-      std::memcpy(&to, chosen->ai_addr, sizeof(sockaddr_in));
-      tl = sizeof(sockaddr_in);
-    }
+    socklen_t tl = static_cast<socklen_t>(chosen->ai_addrlen); // getaddrinfo/resolveLiteralSync set it
+    std::memcpy(&to, chosen->ai_addr, chosen->ai_addrlen);
     // NO ::freeaddrinfo — caller owns res (#6).
-    // On a WILDCARD bind the via's local dest is unknown until the first inbound adopts it, so key
-    // it under the sentinel segment (tracker 2026-10-03-1 DD5); a specific bind keeps lid|host:port.
-    // The via session's localSrc stays AF_UNSPEC (origination sends use the kernel source until
-    // adoption — the HE follow-up pins originated requests).
-    const char *viaLocalSeg = lst->wildcard ? VIA_LOCAL_SENTINEL : nullptr;
+    // KEY (tracker 2026-10-04-1 DP3): a SEEDED via is keyed EXACTLY under lid|localToText(seed)|P
+    // (the DD4 canonical v4-mapped form) so adoptWildcardVia never touches it and it is final from
+    // publication. An unseeded wildcard via keeps the sentinel segment (tracker 2026-10-03-1 DD5);
+    // a specific bind keeps lid|host:port.
+    char seedText[INET6_ADDRSTRLEN];
+    const char *viaLocalSeg = nullptr;
+    if (seed.family != AF_UNSPEC)
+    {
+      localToText(seed, seedText);
+      viaLocalSeg = seedText;
+    }
+    else if (lst->wildcard)
+    {
+      viaLocalSeg = VIA_LOCAL_SENTINEL;
+    }
     std::string k = peerKey(lst->id, to, viaLocalSeg);
     if (k.empty())
     {
@@ -2828,6 +3061,12 @@ private:
     std::memcpy(&s->peer, &to, tl);
     s->plen = tl;
     s->pkey = k;
+    // DP8 (tracker 2026-10-04-1): seed the pinned source PRE-PUBLISH (this write precedes the
+    // _sessions emplace below, so it is ordered by the publishing unique-lock and needs no lock;
+    // single writer = the I/O thread). A seeded via is final-from-publication and is never reached
+    // by adoptWildcardVia (it is exact-keyed, not under VIA_LOCAL_SENTINEL — DP3). An unseeded via
+    // leaves localSrc AF_UNSPEC (kernel source until adopt-on-first-inbound).
+    s->localSrc = seed;
     s->created = MonoClock::now();
     s->lastActivity = s->created;
     s->lastWriteProgress = s->created;
