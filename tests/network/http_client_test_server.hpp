@@ -29,8 +29,9 @@ namespace httpsrv
 {
 
 /// \brief Create a non-blocking listening socket bound to 127.0.0.1:port
-/// (SO_REUSEADDR, backlog 16). Returns the fd, or -1 on any failure.
-inline int makeListener(std::uint16_t port)
+/// (SO_REUSEADDR, backlog 16). Pass 0 (the default) to let the OS choose a free
+/// port, then read it back with listenerPort(). Returns the fd, or -1 on any failure.
+inline int makeListener(std::uint16_t port = 0)
 {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0)
@@ -56,6 +57,19 @@ inline int makeListener(std::uint16_t port)
   int flags = ::fcntl(fd, F_GETFL, 0);
   ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   return fd;
+}
+
+/// \brief The local port a listening socket from makeListener() is bound to,
+/// or 0 if it cannot be read.
+inline std::uint16_t listenerPort(int fd)
+{
+  sockaddr_in addr{};
+  socklen_t len = sizeof(addr);
+  if (fd < 0 || ::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len) < 0)
+  {
+    return 0;
+  }
+  return ntohs(addr.sin_port);
 }
 
 /// \brief Send the whole buffer, stopping on the first short/failed write.

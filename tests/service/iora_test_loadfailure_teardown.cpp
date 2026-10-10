@@ -465,7 +465,7 @@ int main(int argc, char *argv[])
   initializeTestLogging();
 
   iora::IoraService::Config config;
-  config.server.port = 8137;
+  config.server.port = 0;
   config.state.file = "ioraservice_loadfailure_teardown_state.json";
   config.log.file = "ioraservice_loadfailure_teardown_log";
   config.modules.autoLoad = false;

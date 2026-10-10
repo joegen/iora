@@ -68,9 +68,9 @@ using RawHandler = std::function<void(int)>;
 class RawServer
 {
 public:
-  bool start(std::uint16_t port, RawHandler handler)
+  bool start(RawHandler handler)
   {
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -79,6 +79,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~RawServer() { shutdown(); }
 
@@ -165,10 +167,10 @@ std::string urlFor(std::uint16_t port) { return "http://127.0.0.1:" + std::to_st
 TEST_CASE("response: duplicate Content-Encoding combines in arrival order",
           "[http][response][defect_8]")
 {
-  const std::uint16_t port = 19310;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
                                "Content-Encoding: identity\r\nContent-Length: 2\r\n\r\nhi")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   auto r = client.get(urlFor(port));
@@ -184,10 +186,10 @@ TEST_CASE("response: duplicate Content-Encoding combines in arrival order",
 TEST_CASE("response: conflicting duplicate Content-Length still throws",
           "[http][response][defect_8]")
 {
-  const std::uint16_t port = 19311;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
                                "Content-Length: 7\r\n\r\nhello")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   CHECK_THROWS_AS(client.get(urlFor(port)), iora::network::HttpFramingError);
@@ -199,10 +201,10 @@ TEST_CASE("response: conflicting duplicate Content-Length still throws",
 TEST_CASE("response: identical duplicate Content-Length is accepted",
           "[http][response][defect_8]")
 {
-  const std::uint16_t port = 19312;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
                                "Content-Length: 2\r\n\r\nhi")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   auto r = client.get(urlFor(port));
@@ -216,10 +218,10 @@ TEST_CASE("response: identical duplicate Content-Length is accepted",
 TEST_CASE("response: two Transfer-Encoding field-lines throw a framing error",
           "[http][response][defect_18]")
 {
-  const std::uint16_t port = 19313;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
                                "Transfer-Encoding: gzip\r\n\r\n0\r\n\r\n")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   CHECK_THROWS_AS(client.get(urlFor(port)), iora::network::HttpFramingError);
@@ -231,10 +233,10 @@ TEST_CASE("response: two Transfer-Encoding field-lines throw a framing error",
 TEST_CASE("response: identical duplicate Transfer-Encoding lines throw",
           "[http][response][defect_18]")
 {
-  const std::uint16_t port = 19314;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
                                "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   CHECK_THROWS_AS(client.get(urlFor(port)), iora::network::HttpFramingError);
@@ -246,10 +248,10 @@ TEST_CASE("response: identical duplicate Transfer-Encoding lines throw",
 TEST_CASE("response: a single comma-list Transfer-Encoding line frames normally",
           "[http][response][defect_18]")
 {
-  const std::uint16_t port = 19315;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n"
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n"
                                "\r\n2\r\nhi\r\n0\r\n\r\n")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   auto r = client.get(urlFor(port));
@@ -262,9 +264,9 @@ TEST_CASE("response: a single comma-list Transfer-Encoding line frames normally"
 TEST_CASE("response: whitespace before the colon is accepted and the name trimmed",
           "[http][response][defect_10]")
 {
-  const std::uint16_t port = 19316;
   RawServer raw;
-  REQUIRE(raw.start(port, once("HTTP/1.1 200 OK\r\nX-Foo : bar\r\nContent-Length: 2\r\n\r\nhi")));
+  REQUIRE(raw.start(once("HTTP/1.1 200 OK\r\nX-Foo : bar\r\nContent-Length: 2\r\n\r\nhi")));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   auto r = client.get(urlFor(port));
@@ -281,10 +283,10 @@ TEST_CASE("request: empty-body POST emits Content-Length: 0, GET emits none",
           "[http][request][defect_13]")
 {
   {
-    const std::uint16_t port = 19317;
     auto captured = std::make_shared<std::string>();
     RawServer raw;
-    REQUIRE(raw.start(port, recordRequest(captured)));
+    REQUIRE(raw.start(recordRequest(captured)));
+    const std::uint16_t port = raw.port();
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     HttpClient client(cfg());
     auto r = client.post(urlFor(port), "");
@@ -293,10 +295,10 @@ TEST_CASE("request: empty-body POST emits Content-Length: 0, GET emits none",
     CHECK(captured->find("Content-Length: 0\r\n") != std::string::npos);
   }
   {
-    const std::uint16_t port = 19318;
     auto captured = std::make_shared<std::string>();
     RawServer raw;
-    REQUIRE(raw.start(port, recordRequest(captured)));
+    REQUIRE(raw.start(recordRequest(captured)));
+    const std::uint16_t port = raw.port();
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
     HttpClient client(cfg());
     auto r = client.get(urlFor(port));

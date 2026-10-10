@@ -30,6 +30,7 @@
 #include <thread>
 #include <unistd.h>
 
+
 using namespace iora::network;
 
 namespace
@@ -41,9 +42,9 @@ using iora::test::httpsrv::makeListener;
 class CapturingServer
 {
 public:
-  bool start(std::uint16_t port)
+  bool start()
   {
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -51,6 +52,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~CapturingServer() { shutdown(); }
 
@@ -199,9 +202,9 @@ TEST_CASE("formatHostHeaderField omits the default port and keeps a non-default 
 TEST_CASE("HttpClient emits Host with the port for a non-default port",
           "[http][host][defect_11]")
 {
-  const std::uint16_t port = 18190;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
@@ -219,19 +222,28 @@ TEST_CASE("HttpClient emits Host with the port for a non-default port",
   CHECK(req.find("Host: 127.0.0.1\r\n") == std::string::npos);
 }
 
-// A second distinct non-default port, to guard against a hard-coded port value.
+// Two servers on two OS-chosen ports, one client: each Host line carries its own
+// request's port and not the other's, so a stale or hard-coded port fails.
 TEST_CASE("HttpClient Host port tracks the URL port", "[http][host][defect_11]")
 {
-  const std::uint16_t port = 18191;
-  CapturingServer server;
-  REQUIRE(server.start(port));
+  CapturingServer first;
+  REQUIRE(first.start());
+  CapturingServer second;
+  REQUIRE(second.start());
+  const std::uint16_t firstPort = first.port();
+  const std::uint16_t secondPort = second.port();
+  REQUIRE(firstPort != secondPort);
 
   HttpClient client(cfg());
-  auto resp = client.get("http://127.0.0.1:" + std::to_string(port) + "/x");
-  REQUIRE(resp.statusCode == 200);
+  REQUIRE(client.get("http://127.0.0.1:" + std::to_string(firstPort) + "/x").statusCode == 200);
+  REQUIRE(client.get("http://127.0.0.1:" + std::to_string(secondPort) + "/x").statusCode == 200);
 
-  server.shutdown();
-  const std::string req = server.capturedRequest();
-  CHECK(req.find("Host: 127.0.0.1:18191\r\n") != std::string::npos);
-  CHECK(req.find(":18190") == std::string::npos);
+  first.shutdown();
+  second.shutdown();
+  const std::string firstReq = first.capturedRequest();
+  const std::string secondReq = second.capturedRequest();
+  CHECK(firstReq.find("Host: 127.0.0.1:" + std::to_string(firstPort) + "\r\n") != std::string::npos);
+  CHECK(firstReq.find(":" + std::to_string(secondPort)) == std::string::npos);
+  CHECK(secondReq.find("Host: 127.0.0.1:" + std::to_string(secondPort) + "\r\n") != std::string::npos);
+  CHECK(secondReq.find(":" + std::to_string(firstPort)) == std::string::npos);
 }

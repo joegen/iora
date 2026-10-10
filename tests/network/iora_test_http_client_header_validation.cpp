@@ -45,9 +45,9 @@ using iora::test::httpsrv::makeListener;
 class CapturingServer
 {
 public:
-  bool start(std::uint16_t port)
+  bool start()
   {
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -55,6 +55,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~CapturingServer() { shutdown(); }
 
@@ -232,9 +234,9 @@ TEST_CASE("executeRequest throws before connect on a CRLF-injection value",
 // false-positive), and no spurious "X-Injected" line appears.
 TEST_CASE("A valid caller header flows to the wire", "[http][validation][defect_1]")
 {
-  const std::uint16_t port = 18194;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/rpc";

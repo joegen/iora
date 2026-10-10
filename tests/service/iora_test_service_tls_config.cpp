@@ -17,6 +17,7 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
 
 #include <arpa/inet.h>
 #include <chrono>
@@ -38,14 +39,6 @@ const std::string kCertFile =
   std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_cert.pem";
 const std::string kKeyFile =
   std::string(IORA_TEST_RESOURCE_DIR) + "/tls-certs/test_tls_key.pem";
-
-// A free port, guarded against the -1 exhaustion return of findAvailablePort.
-int pickPort(int start, int end)
-{
-  int p = findAvailablePort(start, end);
-  REQUIRE(p > 0);
-  return p;
-}
 
 // Minimal valid Config; each case picks its own port + state/log paths.
 iora::IoraService::Config baseConfig(int port, const std::string &stateFile,
@@ -237,7 +230,7 @@ TEST_CASE("TLS T1 server-auth-only brings up TLS and refuses plaintext",
   REQUIRE(std::filesystem::exists(kCertFile));
   REQUIRE(std::filesystem::exists(kKeyFile));
   TempDirManager tmp;
-  const int port = pickPort(8810, 8900);
+  const int port = testnet::getFreePortTCP();
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile;
   cfg.server.tls.keyFile = kKeyFile;
@@ -256,7 +249,7 @@ TEST_CASE("TLS T1 server-auth-only brings up TLS and refuses plaintext",
 TEST_CASE("TLS T2 cert+key+CA without mTLS brings up TLS", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  const int port = pickPort(8900, 8990);
+  const int port = testnet::getFreePortTCP();
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile;
   cfg.server.tls.keyFile = kKeyFile;
@@ -276,7 +269,7 @@ TEST_CASE("TLS T2 cert+key+CA without mTLS brings up TLS", "[iora][tls][config]"
 TEST_CASE("TLS T2b bad caFile path is ignored when mTLS is off", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  const int port = pickPort(8990, 9080);
+  const int port = testnet::getFreePortTCP();
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile;
   cfg.server.tls.keyFile = kKeyFile;
@@ -296,7 +289,7 @@ TEST_CASE("TLS T2b bad caFile path is ignored when mTLS is off", "[iora][tls][co
 TEST_CASE("TLS T3 requireClientCert without CA fails closed", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  const int port = pickPort(9080, 9100);
+  const int port = testnet::getFreePortTCP();
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile;
   cfg.server.tls.keyFile = kKeyFile;
@@ -312,7 +305,7 @@ TEST_CASE("TLS T3 requireClientCert without CA fails closed", "[iora][tls][confi
 TEST_CASE("TLS T4 cert only fails closed", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(pickPort(9100, 9120), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile; // no key
   AlwaysShutdown guard;
@@ -325,7 +318,7 @@ TEST_CASE("TLS T4 cert only fails closed", "[iora][tls][config]")
 TEST_CASE("TLS T5 key only fails closed", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(pickPort(9120, 9140), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.keyFile = kKeyFile; // no cert
   AlwaysShutdown guard;
@@ -338,7 +331,7 @@ TEST_CASE("TLS T5 key only fails closed", "[iora][tls][config]")
 TEST_CASE("TLS T6 caFile only fails closed", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(pickPort(9140, 9160), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.caFile = kCertFile; // no cert/key
   AlwaysShutdown guard;
@@ -350,7 +343,7 @@ TEST_CASE("TLS T6 caFile only fails closed", "[iora][tls][config]")
 TEST_CASE("TLS T7 requireClientCert only fails closed", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(pickPort(9160, 9180), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.requireClientCert = true; // no paths at all
   AlwaysShutdown guard;
@@ -365,7 +358,7 @@ TEST_CASE("TLS T8 no TLS requested serves plaintext (no throw)", "[iora][tls][co
   SECTION("nothing set")
   {
     TempDirManager tmp;
-    const int port = pickPort(9180, 9200);
+    const int port = testnet::getFreePortTCP();
     auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
     iora::IoraService::init(cfg);
     auto &svc = iora::IoraService::instanceRef();
@@ -377,7 +370,7 @@ TEST_CASE("TLS T8 no TLS requested serves plaintext (no throw)", "[iora][tls][co
   SECTION("requireClientCert=false alone stays not-requested")
   {
     TempDirManager tmp;
-    const int port = pickPort(9200, 9220);
+    const int port = testnet::getFreePortTCP();
     auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
     cfg.server.tls.requireClientCert = false; // must NOT force a fail-closed throw
     iora::IoraService::init(cfg);
@@ -394,7 +387,7 @@ TEST_CASE("TLS T9 non-PEM cert fails closed at enableTls", "[iora][tls][config]"
 {
   TempDirManager tmp;
   const std::string junkCert = writeTempFile(tmp, "junk_cert.pem", "not a pem file\n");
-  auto cfg = baseConfig(pickPort(9220, 9240), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.certFile = junkCert; // set + non-empty → complete, but invalid
   cfg.server.tls.keyFile = kKeyFile;
@@ -413,7 +406,7 @@ TEST_CASE("TLS T9b mismatched cert/key fails in start(), no half-built server",
           "[iora][tls][config]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(pickPort(9240, 9260), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.certFile = kKeyFile; // a key in the cert slot (valid PEM, wrong type)
   cfg.server.tls.keyFile = kCertFile; // a cert in the key slot
@@ -427,7 +420,7 @@ TEST_CASE("TLS T9c start() bind failure leaves no half-built server",
           "[iora][tls][config]")
 {
   TempDirManager tmp;
-  const int port = pickPort(9260, 9280);
+  const int port = testnet::getFreePortTCP();
   PortHolder hold(port); // occupy the port so the server bind/listen fails
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile;
@@ -445,7 +438,7 @@ TEST_CASE("TLS T9c start() bind failure leaves no half-built server",
 TEST_CASE("TLS T10 mTLS config brings the listener up", "[iora][tls][config]")
 {
   TempDirManager tmp;
-  const int port = pickPort(9280, 9320);
+  const int port = testnet::getFreePortTCP();
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile;
   cfg.server.tls.keyFile = kKeyFile;
@@ -466,7 +459,7 @@ TEST_CASE("TLS M1 empty strings are treated as unset", "[iora][tls][config]")
   SECTION("empty cert + set key is partial → fails closed")
   {
     TempDirManager tmp;
-    auto cfg = baseConfig(pickPort(9320, 9340), tmp.filePath("state.json"),
+    auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                           tmp.filePath("log"));
     cfg.server.tls.certFile = ""; // empty == unset
     cfg.server.tls.keyFile = kKeyFile;
@@ -479,7 +472,7 @@ TEST_CASE("TLS M1 empty strings are treated as unset", "[iora][tls][config]")
   SECTION("all-empty TLS block is not-requested → plaintext, no throw")
   {
     TempDirManager tmp;
-    const int port = pickPort(9340, 9360);
+    const int port = testnet::getFreePortTCP();
     auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
     cfg.server.tls.certFile = "";
     cfg.server.tls.keyFile = "";
@@ -498,7 +491,7 @@ TEST_CASE("TLS L4 server disabled with TLS set warns and does not throw",
           "[iora][tls][config]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(pickPort(9360, 9380), tmp.filePath("state.json"),
+  auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.log.level = "warn";
   cfg.features.server = false;
@@ -516,7 +509,7 @@ TEST_CASE("TLS mTLS-pending WARN is emitted for requireClientCert",
           "[iora][tls][config]")
 {
   TempDirManager tmp;
-  const int port = pickPort(9380, 9400);
+  const int port = testnet::getFreePortTCP();
   auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
   cfg.log.level = "warn";
   cfg.server.tls.certFile = kCertFile;

@@ -11,6 +11,7 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
 
 using namespace iora::test;
 
@@ -68,7 +69,7 @@ TEST_CASE("FeaturesConfig default-all-unset preserves legacy behavior",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(8600, 8700),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   // No features.* fields set → every flag resolves to true via value_or(true).
@@ -93,7 +94,7 @@ TEST_CASE("FeaturesConfig disables jsonFileStore in isolation",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(8700, 8800),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.jsonFileStore = false;
@@ -113,7 +114,7 @@ TEST_CASE("FeaturesConfig disables stateStore in isolation",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(8800, 8900),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.stateStore = false;
@@ -133,7 +134,7 @@ TEST_CASE("FeaturesConfig disables expiringCache in isolation",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(8900, 9000),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.expiringCache = false;
@@ -163,7 +164,7 @@ TEST_CASE("FeaturesConfig disables modules in isolation",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(9000, 9100),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.modules = false;
@@ -185,7 +186,7 @@ TEST_CASE("FeaturesConfig disables server in isolation",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(9100, 9200),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.server = false;
@@ -205,7 +206,7 @@ TEST_CASE("FeaturesConfig edge_proxy profile constructs only WebhookServer",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(9200, 9300),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.server = true;
@@ -230,7 +231,7 @@ TEST_CASE("FeaturesConfig on() throws when server=false",
           "[iora][FeaturesConfig]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(9300, 9400),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.server = false;
@@ -308,7 +309,7 @@ TEST_CASE("FeaturesConfig jsonFileStore=false does not abort with asserts enable
           "[iora][FeaturesConfig][regression]")
 {
   TempDirManager tmp;
-  auto cfg = baseConfig(findAvailablePort(9400, 9500),
+  auto cfg = baseConfig(testnet::getFreePortTCP(),
                         tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.features.jsonFileStore = false;

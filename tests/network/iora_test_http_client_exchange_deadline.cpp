@@ -46,10 +46,10 @@ enum class Mode { Trickle, Flood1xx, Fast };
 class SlowServer
 {
 public:
-  bool start(std::uint16_t port, Mode mode)
+  bool start(Mode mode)
   {
     _mode = mode;
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -57,6 +57,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~SlowServer() { shutdown(); }
 
@@ -185,9 +187,9 @@ TEST_CASE("HttpExchangeDeadlineError is a non-retryable HttpFramingError",
 TEST_CASE("A trickle peer trips the exchange deadline, not the per-iteration timeout",
           "[http][deadline][defect_14]")
 {
-  const std::uint16_t port = 19360;
   SlowServer server;
-  REQUIRE(server.start(port, Mode::Trickle));
+  REQUIRE(server.start(Mode::Trickle));
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg(std::chrono::milliseconds(600)));
@@ -205,9 +207,9 @@ TEST_CASE("A trickle peer trips the exchange deadline, not the per-iteration tim
 TEST_CASE("An interim-1xx flood is bounded by the exchange deadline",
           "[http][deadline][defect_14]")
 {
-  const std::uint16_t port = 19361;
   SlowServer server;
-  REQUIRE(server.start(port, Mode::Flood1xx));
+  REQUIRE(server.start(Mode::Flood1xx));
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg(std::chrono::milliseconds(600)));
@@ -224,9 +226,9 @@ TEST_CASE("An interim-1xx flood is bounded by the exchange deadline",
 TEST_CASE("The exchange deadline is not retried on an idempotent method",
           "[http][deadline][defect_14]")
 {
-  const std::uint16_t port = 19362;
   SlowServer server;
-  REQUIRE(server.start(port, Mode::Trickle));
+  REQUIRE(server.start(Mode::Trickle));
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg(std::chrono::milliseconds(500)));
@@ -244,9 +246,9 @@ TEST_CASE("The exchange deadline is not retried on an idempotent method",
 TEST_CASE("A fast response succeeds with a deadline configured",
           "[http][deadline][defect_14]")
 {
-  const std::uint16_t port = 19363;
   SlowServer server;
-  REQUIRE(server.start(port, Mode::Fast));
+  REQUIRE(server.start(Mode::Fast));
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg(std::chrono::milliseconds(1000)));
@@ -262,9 +264,9 @@ TEST_CASE("A fast response succeeds with a deadline configured",
 TEST_CASE("A zero deadline disables the bound without perturbing a normal request",
           "[http][deadline][defect_14]")
 {
-  const std::uint16_t port = 19364;
   SlowServer server;
-  REQUIRE(server.start(port, Mode::Fast));
+  REQUIRE(server.start(Mode::Fast));
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg(std::chrono::milliseconds(0)));

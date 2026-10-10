@@ -138,8 +138,8 @@ public:
   /// \brief Mock DNS server configuration
   struct Config
   {
-    std::uint16_t udpPort{5353};                  // UDP server port
-    std::uint16_t tcpPort{5353};                  // TCP server port
+    std::uint16_t udpPort{0};                     // UDP server port
+    std::uint16_t tcpPort{0};                     // TCP server port
     std::chrono::milliseconds defaultDelay{10};   // Default query delay
     std::chrono::milliseconds queryTimeout{5000}; // Query timeout
     bool enableLogging{false};                    // Enable query logging

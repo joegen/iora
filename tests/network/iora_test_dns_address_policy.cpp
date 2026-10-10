@@ -22,6 +22,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "iora/network/dns/dns_cache.hpp"
 #include "iora/network/dns/dns_resolver.hpp"
 #include "iora/network/dns/dns_transport.hpp"
@@ -43,7 +44,6 @@ using iora::network::DnsClient;
 
 namespace
 {
-constexpr std::uint16_t TEST_UDP_PORT = 15453; // distinct from other DNS suites
 constexpr std::chrono::seconds BOUNDED_WAIT{5};
 
 bool isIPv6(const std::string &a) { return a.find(':') != std::string::npos; }
@@ -55,11 +55,11 @@ bool isIPv4(const std::string &a) { return !isIPv6(a); }
 class PolicyWireFixture
 {
 public:
-  PolicyWireFixture()
+  PolicyWireFixture() : port_(testnet::getFreePortUdpTcp())
   {
     MockDnsServer::Config cfg;
-    cfg.udpPort = TEST_UDP_PORT;
-    cfg.tcpPort = TEST_UDP_PORT;
+    cfg.udpPort = port_;
+    cfg.tcpPort = port_;
     cfg.enableLogging = false;
     server_ = std::make_unique<MockDnsServer>(cfg);
   }
@@ -78,6 +78,7 @@ public:
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
 
+  std::uint16_t port() const { return port_; }
   MockDnsServer &server() { return *server_; }
 
   // A short-timeout, no-retry, no-cache client honoring `policy`.
@@ -85,7 +86,7 @@ public:
                                         std::chrono::milliseconds timeout = std::chrono::milliseconds(400))
   {
     DnsConfig cfg;
-    cfg.setServers({"127.0.0.1:" + std::to_string(TEST_UDP_PORT)});
+    cfg.setServers({"127.0.0.1:" + std::to_string(port_)});
     cfg.timeout = timeout;
     cfg.retryCount = 0;
     cfg.transportMode = DnsTransportMode::UDP;
@@ -95,6 +96,7 @@ public:
   }
 
 private:
+  std::uint16_t port_;
   std::unique_ptr<MockDnsServer> server_;
 };
 

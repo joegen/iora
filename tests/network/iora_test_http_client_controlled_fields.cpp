@@ -46,9 +46,9 @@ using iora::test::httpsrv::makeListener;
 class CapturingServer
 {
 public:
-  bool start(std::uint16_t port)
+  bool start()
   {
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -56,6 +56,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~CapturingServer() { shutdown(); }
 
@@ -253,9 +255,9 @@ TEST_CASE("A controlled caller header throws before connect",
 TEST_CASE("Content-Encoding is NOT rejected and reaches the wire",
           "[http][controlled][flag1]")
 {
-  const std::uint16_t port = 18211;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
@@ -275,9 +277,9 @@ TEST_CASE("Content-Encoding is NOT rejected and reaches the wire",
 TEST_CASE("The wire carries exactly one Host, Connection and Content-Length",
           "[http][controlled][defect_2]")
 {
-  const std::uint16_t port = 18212;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
@@ -303,9 +305,9 @@ TEST_CASE("The wire carries exactly one Host, Connection and Content-Length",
 TEST_CASE("A caller User-Agent overrides the library default (one line)",
           "[http][controlled][user-agent]")
 {
-  const std::uint16_t port = 18213;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
@@ -326,9 +328,9 @@ TEST_CASE("A caller User-Agent overrides the library default (one line)",
 TEST_CASE("A mixed-case caller User-Agent still overrides",
           "[http][controlled][user-agent]")
 {
-  const std::uint16_t port = 18214;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/rpc";

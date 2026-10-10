@@ -13,9 +13,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
-#include <netinet/in.h>
 #include <random>
-#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 
@@ -84,32 +82,6 @@ inline iora::IoraService &initServiceFromArgs(int argc, const char *args[])
 inline void initServiceFromConfig(const iora::IoraService::Config &config)
 {
   iora::IoraService::init(config);
-}
-
-/// \brief Helper to create a basic test IoraService configuration
-inline iora::IoraService::Config createTestConfig(int port = 8080, const std::string &logFile = "",
-                                                  const std::string &stateFile = "",
-                                                  const std::string &logLevel = "debug")
-{
-  iora::IoraService::Config config;
-  config.server.port = port;
-  config.log.level = logLevel;
-
-  if (!logFile.empty())
-  {
-    config.log.file = logFile;
-  }
-  else
-  {
-    config.log.file = "test_" + std::to_string(port);
-  }
-
-  if (!stateFile.empty())
-  {
-    config.state.file = stateFile;
-  }
-
-  return config;
 }
 
 /// \brief RAII helper for temporary test files
@@ -190,36 +162,6 @@ inline std::string generateRandomString(size_t length = 10)
     result += charset[dis(gen)];
   }
   return result;
-}
-
-/// \brief Helper to check if a port is available
-inline bool isPortAvailable(int port)
-{
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0)
-    return false;
-
-  struct sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
-
-  int result = bind(sock, (struct sockaddr *)&addr, sizeof(addr));
-  close(sock);
-  return result == 0;
-}
-
-/// \brief Find an available port in a range
-inline int findAvailablePort(int start = 8000, int end = 9000)
-{
-  for (int port = start; port < end; ++port)
-  {
-    if (isPortAvailable(port))
-    {
-      return port;
-    }
-  }
-  return -1; // No available port found
 }
 
 } // namespace iora::test

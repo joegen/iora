@@ -33,6 +33,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include "iora_test_net_utils.hpp"
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -52,9 +53,6 @@ using Response = HttpServer::Response;
 namespace
 {
 
-// Distinct port per server instance to avoid TIME_WAIT collisions (ctest -j1).
-std::atomic<int> g_nextPort{18080};
-int nextPort() { return g_nextPort.fetch_add(1); }
 
 std::string lower(std::string s)
 {
@@ -375,7 +373,7 @@ public:
 // listener is ready before clients connect.
 int startOn(HttpServer &srv)
 {
-  int port = nextPort();
+  int port = testnet::getFreePortTCP();
   srv.setPort(port);
   srv.start();
   std::this_thread::sleep_for(std::chrono::milliseconds(300));

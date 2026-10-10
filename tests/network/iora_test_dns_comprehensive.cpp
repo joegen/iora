@@ -15,6 +15,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "iora/network/dns/dns_cache.hpp"
 #include "iora/network/dns/dns_resolver.hpp"
 #include "iora/network/dns/dns_transport.hpp"
@@ -36,8 +37,6 @@ namespace
 {
 
 /// \brief Test configuration constants
-constexpr std::uint16_t TEST_UDP_PORT = 15353; // Non-standard port for testing
-constexpr std::uint16_t TEST_TCP_PORT = 15353;
 constexpr std::chrono::milliseconds ASYNC_TIMEOUT{2000};
 constexpr std::chrono::milliseconds SERVER_STARTUP_DELAY{200};
 
@@ -45,12 +44,12 @@ constexpr std::chrono::milliseconds SERVER_STARTUP_DELAY{200};
 class DnsTestFixture
 {
 public:
-  DnsTestFixture()
+  DnsTestFixture() : port_(testnet::getFreePortUdpTcp())
   {
     // Configure mock server for comprehensive testing
     MockDnsServer::Config serverConfig;
-    serverConfig.udpPort = TEST_UDP_PORT;
-    serverConfig.tcpPort = TEST_TCP_PORT;
+    serverConfig.udpPort = port_;
+    serverConfig.tcpPort = port_;
     serverConfig.enableLogging = true;
     serverConfig.maxUdpSize = 512;        // Standard DNS UDP size limit
     serverConfig.maxTcpFragmentSize = 64; // Small fragments for testing
@@ -59,7 +58,7 @@ public:
 
     // Configure DNS client to use test server
     DnsConfig clientConfig;
-    std::vector<std::string> testServers = {"127.0.0.1:" + std::to_string(TEST_UDP_PORT)};
+    std::vector<std::string> testServers = {"127.0.0.1:" + std::to_string(port_)};
     clientConfig.setServers(testServers);
     clientConfig.timeout = std::chrono::milliseconds(1000);
     clientConfig.retryCount = 2;
@@ -93,10 +92,12 @@ public:
     std::this_thread::sleep_for(SERVER_STARTUP_DELAY);
   }
 
+  std::uint16_t port() const { return port_; }
   MockDnsServer &server() { return *mockServer_; }
   DnsClient &client() { return *dnsClient_; }
 
 private:
+  std::uint16_t port_;
   std::unique_ptr<MockDnsServer> mockServer_;
   std::unique_ptr<DnsClient> dnsClient_;
 };
@@ -226,10 +227,11 @@ namespace
 /// Shared by the catch-scope regression tests and the "Very short timeout"
 /// error-handling section (review L-g).
 std::unique_ptr<DnsClient>
-makeFastTimeoutClient(std::chrono::milliseconds timeout = std::chrono::milliseconds(150))
+makeFastTimeoutClient(std::uint16_t port,
+                      std::chrono::milliseconds timeout = std::chrono::milliseconds(150))
 {
   DnsConfig cfg;
-  cfg.setServers({"127.0.0.1:" + std::to_string(TEST_UDP_PORT)});
+  cfg.setServers({"127.0.0.1:" + std::to_string(port)});
   cfg.timeout = timeout;
   cfg.retryCount = 0;
   cfg.transportMode = DnsTransportMode::UDP;
@@ -249,7 +251,7 @@ TEST_CASE_METHOD(DnsTestFixture,
   aaaaTimeout.shouldTimeout = true;
   server().configureQuery("dual.example.com", "AAAA", aaaaTimeout);
 
-  auto fast = makeFastTimeoutClient();
+  auto fast = makeFastTimeoutClient(port());
   // IPv4First (default): before the fix the AAAA DnsTimeoutException escaped
   // resolveHostname and discarded the already-collected A result -> this threw.
   // After the fix the A result is retained and returned.
@@ -272,7 +274,7 @@ TEST_CASE_METHOD(DnsTestFixture,
     {"_sip._udp.srvfallback.example.com", "SRV", "sip1.srvfallback.example.com", 3600, 10, 5, 5060});
   server().addRecord({"sip1.srvfallback.example.com", "A", "192.0.2.20", 3600});
 
-  auto fast = makeFastTimeoutClient();
+  auto fast = makeFastTimeoutClient(port());
   // Before the fix the NAPTR DnsTimeoutException escaped the NAPTR catch and
   // aborted resolution. After the fix it falls back to direct SRV (RFC 3263 4.1).
   auto result = fast->resolveServiceDomain("srvfallback.example.com");
@@ -303,7 +305,7 @@ TEST_CASE_METHOD(DnsTestFixture,
     {"_sip._udp.sibling.example.com", "SRV", "u.sibling.example.com", 3600, 10, 5, 5060});
   server().addRecord({"u.sibling.example.com", "A", "192.0.2.30", 3600});
 
-  auto fast = makeFastTimeoutClient();
+  auto fast = makeFastTimeoutClient(port());
   auto result = fast->resolveServiceDomain("sibling.example.com");
   REQUIRE(result.isSuccess());
   bool foundUdp = false;
@@ -1613,7 +1615,7 @@ TEST_CASE_METHOD(DnsTestFixture, "DNS Error Handling", "[dns][error-handling]")
   {
     // Create a client with very short timeout to test transport layer timeout
     // precision (shared short-timeout builder — review L-g).
-    auto shortTimeoutClientPtr = makeFastTimeoutClient(std::chrono::milliseconds(50));
+    auto shortTimeoutClientPtr = makeFastTimeoutClient(port(), std::chrono::milliseconds(50));
     DnsClient &shortTimeoutClient = *shortTimeoutClientPtr;
 
     // Configure mock server to delay response longer than timeout

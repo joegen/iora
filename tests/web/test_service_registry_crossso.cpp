@@ -14,19 +14,39 @@
 
 #include <iora/core/service_registry.hpp>
 
+#include "iora_test_net_utils.hpp"
 #include "web/registry_cross_so_iface.hpp"
 
 #include <filesystem>
 
 using namespace iora::test;
 
-static iora::IoraService *globalSvc = nullptr;
+namespace
+{
+struct ServiceGuard
+{
+  ~ServiceGuard()
+  {
+    iora::IoraService::instanceRef().shutdown();
+    iora::util::removeFilesContainingAny(
+      {"ioraservice_crossso_log", "ioraservice_crossso_state.json"});
+  }
+};
+} // namespace
 
 TEST_CASE("ServiceRegistry cross-.so: plugin registers, core retrieves + virtual-dispatches "
           "(C-4/C-5)",
           "[service_registry][crossso]")
 {
-  iora::IoraService &svc = *globalSvc;
+  iora::IoraService::Config config;
+  config.server.port = testnet::getFreePortTCP();
+  config.state.file = "ioraservice_crossso_state.json";
+  config.log.file = "ioraservice_crossso_log";
+  config.modules.autoLoad = false;
+
+  iora::IoraService::init(config);
+  ServiceGuard guard;
+  iora::IoraService &svc = iora::IoraService::instanceRef();
 
   const auto pluginPath =
     iora::util::getExecutableDir() + "/web_plugins/web_test_registry_plugin.so";
@@ -60,23 +80,5 @@ int main(int argc, char *argv[])
 
   initializeTestLogging();
 
-  iora::IoraService::Config config;
-  // Distinct, high port to avoid colliding with other service tests' fixed ports
-  // (e.g. the plugin-isolation test uses 8140). Web tests run -j1, so only this
-  // process binds it at a time.
-  config.server.port = 18141;
-  config.state.file = "ioraservice_crossso_state.json";
-  config.log.file = "ioraservice_crossso_log";
-  config.modules.autoLoad = false;
-
-  iora::IoraService::init(config);
-  globalSvc = &iora::IoraService::instanceRef();
-
-  int result = session.run(argc, argv);
-
-  globalSvc->shutdown();
-  iora::util::removeFilesContainingAny(
-    {"ioraservice_crossso_log", "ioraservice_crossso_state.json"});
-
-  return result;
+  return session.run(argc, argv);
 }

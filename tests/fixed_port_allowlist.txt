@@ -1,0 +1,34 @@
+# Lines that check_no_fixed_ports.sh flags but that bind no fixed port.
+# Format: <path relative to tests/>|<text fragment on the flagged line>|<reason>
+core/iora_test_config_loader_get_table_array.cpp|"port = 8080\n"|TOML parse input
+core/iora_test_config_loader_get_table_array.cpp|"port = 9090\n"|TOML parse input
+parsers/iora_test_minimal_toml_parser_malformed.cpp|port = 8080\nhost|TOML parse input
+parsers/iora_test_http_header_combining.cpp|localhost:8135|origin-normalization input
+parsers/iora_test_http_header_combining.cpp|[::1]:8080/rpc|origin-normalization input
+MockDnsServer.hpp|port{5060}|SRV record data
+network/iora_test_dns_deadline.cpp|cfg.setServers({"127.0.0.1:5353"});|config only; no server is started
+network/iora_test_dns_failover.cpp|setServers({"127.0.0.1:5399"});|config only (budget calculation); no server is started
+network/iora_test_dns_transport_lifecycle_restructure.cpp|127.0.0.1:53535|config only; no server is started
+network/iora_test_dns_transport_lifecycle_restructure.cpp|PORT_A = 5311;|white-box session/pending map key; nothing binds it
+network/iora_test_dns_transport_callback_deadlock.cpp|PORT_A = 5311;|white-box session/pending map key; nothing binds it
+network/iora_test_dns_transport_sid_keying.cpp|PORT_A = 5301;|white-box session/pending map key; nothing binds it
+network/iora_test_dns_transport_sid_keying.cpp|PORT_B = 5302;|white-box session/pending map key; nothing binds it
+network/iora_test_dns_transport_close_robustness.cpp|PORT = 53;|white-box session/pending map key; nothing binds it
+network/iora_test_http_client_parseurl.cpp|[::1]:8080|URL / Host-format input; the client rejects it before any connect
+network/iora_test_http_client_parseurl.cpp|formatHostHeaderField("127.0.0.1", 8080|Host-format unit input
+network/iora_test_http_client_parseurl.cpp|127.0.0.1:0/rpc|invalid-port parse input
+network/iora_test_http_client_parseurl.cpp|127.0.0.1:99999/rpc|invalid-port parse input
+network/iora_test_http_client_parseurl.cpp|port = 65535;|port value under test (65535 boundary)
+network/iora_test_http_client_parseurl.cpp|Host: 127.0.0.1:65535|port value under test (65535 boundary)
+network/iora_test_transport.cpp|"127.0.0.1", port + 1);|connect target next to a bound port; nothing binds it
+network/iora_test_transport_improvements.cpp|"127.0.0.1:8080"|ListenerResult string data
+rpc/iora_test_jsonrpc_client_pool.cpp|"http://[::1]:8080/rpc",|URL parse input
+network/iora_test_http_client_parseurl.cpp|formatHostHeaderField("::1", 80, false)|Host-format unit input
+network/iora_test_sockaddr_utils.cpp|TransportAddress{"127.0.0.1", 5060}|address value under test; nothing binds it
+network/iora_test_sockaddr_utils.cpp|TransportAddress{"::1", 5061}|address value under test; nothing binds it
+network/iora_test_tcp_engine_teardown_race.cpp|tx.connect("127.0.0.1", 19997|connect on a stopped/restarted engine; the port is never reached
+network/iora_test_udp_engine_teardown_race.cpp|tx.connect("127.0.0.1", 19998|connect on a stopped/restarted engine; the port is never reached
+network/iora_test_transport.cpp|connectSyncCancellable("127.0.0.1", 9999|cancellation test connect target; nothing binds it
+network/iora_test_transport.cpp|"127.0.0.1", 5060|connectViaListener error-path target (bad listener id or config); nothing binds it
+network/iora_test_transport_sid_surfacing.cpp|connectWith(sid, "127.0.0.1", 5060|connect target for a session-id surfacing probe; nothing binds it
+network/iora_test_udp_engine.cpp|connectViaListener(fakeLid, "127.0.0.1", 1234)|connect via a fake listener id; nothing binds it

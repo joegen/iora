@@ -40,6 +40,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "dns_transport_test_access.hpp" // shared white-box seam (SM-M1)
 
 #include "iora/network/dns/dns_message.hpp"
@@ -363,14 +364,11 @@ TEST_CASE("dns callback-deadlock: item10+item5 cleanup thread as last owner tear
 TEST_CASE("dns callback-deadlock: item6 stop() from the transport I/O thread tears down cleanly",
           "[dns][callback-deadlock][running]")
 {
-  // Fixed port (L1 / cpp17-LOW): safe only under the mandatory same-repo `ctest -j1`
-  // serialization (no dynamic free-port probe here). If the deferred findFreeTcpPort env
-  // window lands, route this through it rather than hardcoding another fixed port.
-  constexpr std::uint16_t MOCK_UDP_PORT = 15399;
+  const std::uint16_t mockUdpPort = testnet::getFreePortUdpTcp();
 
   MockDnsServer::Config scfg;
-  scfg.udpPort = MOCK_UDP_PORT;
-  scfg.tcpPort = MOCK_UDP_PORT; // unused (TCP disabled)
+  scfg.udpPort = mockUdpPort;
+  scfg.tcpPort = mockUdpPort; // unused (TCP disabled)
   scfg.enableTcp = false;
   scfg.enableUdp = true;
   scfg.defaultDelay = std::chrono::milliseconds(0);
@@ -380,7 +378,7 @@ TEST_CASE("dns callback-deadlock: item6 stop() from the transport I/O thread tea
   std::this_thread::sleep_for(std::chrono::milliseconds(100)); // startup settle
 
   DnsConfig cfg;
-  cfg.setServers({std::string("127.0.0.1:") + std::to_string(MOCK_UDP_PORT)});
+  cfg.setServers({std::string("127.0.0.1:") + std::to_string(mockUdpPort)});
   cfg.transportMode = DnsTransportMode::UDP; // single transport -> single I/O-thread arm
   cfg.timeout = std::chrono::milliseconds(2000);
   cfg.retryCount = 0;
@@ -411,7 +409,7 @@ TEST_CASE("dns callback-deadlock: item6 stop() from the transport I/O thread tea
                   }
                   done->set_value();
                 },
-                "127.0.0.1", MOCK_UDP_PORT);
+                "127.0.0.1", mockUdpPort);
 
   // Localhost + 0 delay -> the response wins the 2 s timeout deterministically (a timeout would
   // fire the callback on the TIMER thread instead, failing onIoThread -- surfaced, not masked).
@@ -507,15 +505,15 @@ TEST_CASE("dns callback-deadlock: F-2 cross-thread ABBA (callback fired outside 
 // sweep so retry lambdas fire and re-send -- also exercising the M1 async re-send path) and
 // calls stop() from an EXTERNAL thread while queries are in-flight. Under a normal build it
 // guards against teardown crashes/hangs/deadlocks; under TSan (setarch -R) a reset-vs-deref
-// race from a reverted ordering trips here. Fixed port -> safe only under `ctest -j1`.
+// race from a reverted ordering trips here. Port is OS-assigned per run.
 TEST_CASE("dns callback-deadlock: C1 external stop() mid-flight tears down cleanly (TSan guard)",
           "[dns][callback-deadlock][running]")
 {
-  constexpr std::uint16_t XSTOP_PORT = 15401; // -j1-serialized, like item6
+  const std::uint16_t xstopPort = testnet::getFreePortUdpTcp();
 
   MockDnsServer::Config scfg;
-  scfg.udpPort = XSTOP_PORT;
-  scfg.tcpPort = XSTOP_PORT; // unused (TCP disabled)
+  scfg.udpPort = xstopPort;
+  scfg.tcpPort = xstopPort; // unused (TCP disabled)
   scfg.enableTcp = false;
   scfg.enableUdp = true;
   scfg.defaultDelay = std::chrono::milliseconds(60); // > query timeout -> forces timeouts+retries
@@ -527,7 +525,7 @@ TEST_CASE("dns callback-deadlock: C1 external stop() mid-flight tears down clean
   for (int iter = 0; iter < 20; ++iter)
   {
     DnsConfig cfg;
-    cfg.setServers({std::string("127.0.0.1:") + std::to_string(XSTOP_PORT)});
+    cfg.setServers({std::string("127.0.0.1:") + std::to_string(xstopPort)});
     cfg.transportMode = DnsTransportMode::UDP;
     cfg.timeout = std::chrono::milliseconds(40); // < server delay -> queries expire -> retries
     cfg.retryCount = 3;
@@ -540,7 +538,7 @@ TEST_CASE("dns callback-deadlock: C1 external stop() mid-flight tears down clean
     for (int q = 0; q < 8; ++q)
     {
       t->queryAsync(DnsQuestion("xstop.example.test", DnsType::A, DnsClass::IN),
-                    [](const DnsResult &, const std::exception_ptr &) {}, "127.0.0.1", XSTOP_PORT);
+                    [](const DnsResult &, const std::exception_ptr &) {}, "127.0.0.1", xstopPort);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(15)); // let retries/timeouts arm + fire
 

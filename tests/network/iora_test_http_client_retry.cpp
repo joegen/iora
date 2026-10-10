@@ -20,13 +20,11 @@
 #include <catch2/catch.hpp>
 
 #include "iora_test_net_utils.hpp"
+#include "network/http_client_test_server.hpp"
 #include <iora/network/http_client.hpp>
 
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
-#include <cstring>
-#include <fcntl.h>
 #include <functional>
 #include <netinet/in.h>
 #include <string>
@@ -45,47 +43,7 @@ namespace
 // respond) and COUNT how many requests reached the wire — the core mechanism
 // for proving a request was or was not retried.
 
-int makeListener(std::uint16_t port)
-{
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-  {
-    return -1;
-  }
-  int opt = 1;
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
-  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
-  {
-    ::close(fd);
-    return -1;
-  }
-  if (::listen(fd, 16) < 0)
-  {
-    ::close(fd);
-    return -1;
-  }
-  int flags = ::fcntl(fd, F_GETFL, 0);
-  ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  return fd;
-}
-
-void writeAll(int fd, const std::string &data)
-{
-  std::size_t off = 0;
-  while (off < data.size())
-  {
-    ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-    if (n <= 0)
-    {
-      break;
-    }
-    off += static_cast<std::size_t>(n);
-  }
-}
+using iora::test::httpsrv::writeAll;
 
 // Read one request's header block (clientSock has a recv timeout). Returns true
 // if a full "\r\n\r\n"-terminated request header block arrived.
@@ -118,9 +76,9 @@ using RawHandler = std::function<void(int, int)>;
 class RawServer
 {
 public:
-  bool start(std::uint16_t port, RawHandler handler)
+  bool start(RawHandler handler)
   {
-    _listenFd = makeListener(port);
+    _listenFd = iora::test::httpsrv::makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -129,6 +87,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~RawServer() { shutdown(); }
 
@@ -320,9 +280,9 @@ static_assert(std::is_base_of<std::runtime_error, HttpResponseTimeoutError>::val
 
 TEST_CASE("POST not retried after request sent (no double-submit)", "[http_client_retry][post]")
 {
-  const std::uint16_t port = 18801;
   RawServer server;
-  REQUIRE(server.start(port, closeAfterReadHandler()));
+  REQUIRE(server.start(closeAfterReadHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -355,9 +315,9 @@ TEST_CASE("POST not retried after request sent (no double-submit)", "[http_clien
 
 TEST_CASE("GET retried after request sent (idempotent)", "[http_client_retry][get]")
 {
-  const std::uint16_t port = 18802;
   RawServer server;
-  REQUIRE(server.start(port, closeAfterReadHandler()));
+  REQUIRE(server.start(closeAfterReadHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -374,9 +334,9 @@ TEST_CASE("GET retried after request sent (idempotent)", "[http_client_retry][ge
 
 TEST_CASE("DELETE retried after request sent (idempotent, non-GET)", "[http_client_retry][delete]")
 {
-  const std::uint16_t port = 18803;
   RawServer server;
-  REQUIRE(server.start(port, closeAfterReadHandler()));
+  REQUIRE(server.start(closeAfterReadHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -392,9 +352,9 @@ TEST_CASE("DELETE retried after request sent (idempotent, non-GET)", "[http_clie
 TEST_CASE("POST not retried when server sends a partial response then closes",
           "[http_client_retry][post][partial]")
 {
-  const std::uint16_t port = 18805;
   RawServer server;
-  REQUIRE(server.start(port, partialResponseHandler()));
+  REQUIRE(server.start(partialResponseHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -405,9 +365,9 @@ TEST_CASE("POST not retried when server sends a partial response then closes",
 TEST_CASE("GET retried when server sends a partial response then closes",
           "[http_client_retry][get][partial]")
 {
-  const std::uint16_t port = 18806;
   RawServer server;
-  REQUIRE(server.start(port, partialResponseHandler()));
+  REQUIRE(server.start(partialResponseHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -422,9 +382,9 @@ TEST_CASE("GET retried when server sends a partial response then closes",
 
 TEST_CASE("POST not retried on response timeout", "[http_client_retry][post][timeout]")
 {
-  const std::uint16_t port = 18807;
   RawServer server;
-  REQUIRE(server.start(port, timeoutHandler()));
+  REQUIRE(server.start(timeoutHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -440,9 +400,9 @@ TEST_CASE("POST not retried on response timeout", "[http_client_retry][post][tim
 // unconditionally non-retryable.
 TEST_CASE("GET retried on response timeout (idempotent)", "[http_client_retry][get][timeout]")
 {
-  const std::uint16_t port = 18808;
   RawServer server;
-  REQUIRE(server.start(port, timeoutHandler()));
+  REQUIRE(server.start(timeoutHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 
@@ -512,17 +472,17 @@ TEST_CASE("default retries=0 makes a single attempt for POST and GET",
           "[http_client_retry][default]")
 {
   {
-    const std::uint16_t port = 18809;
     RawServer server;
-    REQUIRE(server.start(port, closeAfterReadHandler()));
+    REQUIRE(server.start(closeAfterReadHandler()));
+    const std::uint16_t port = server.port();
     HttpClient client = makeClient();
     CHECK_THROWS(client.post(url(port, "/x"), "payload", {}, /*retries=*/0));
     CHECK(server.requestsReceived() == 1);
   }
   {
-    const std::uint16_t port = 18810;
     RawServer server;
-    REQUIRE(server.start(port, closeAfterReadHandler()));
+    REQUIRE(server.start(closeAfterReadHandler()));
+    const std::uint16_t port = server.port();
     HttpClient client = makeClient();
     CHECK_THROWS(client.get(url(port, "/x"), {}, /*retries=*/0));
     CHECK(server.requestsReceived() == 1);
@@ -553,9 +513,9 @@ TEST_CASE("default retries=0 makes a single attempt for POST and GET",
 TEST_CASE("successful POST with retries>0 sends once and returns 200",
           "[http_client_retry][post][success]")
 {
-  const std::uint16_t port = 18812;
   RawServer server;
-  REQUIRE(server.start(port, okHandler()));
+  REQUIRE(server.start(okHandler()));
+  const std::uint16_t port = server.port();
 
   HttpClient client = makeClient();
 

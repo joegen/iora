@@ -6,6 +6,8 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 
+#include "iora_test_net_utils.hpp"
+
 #include <iora/network/websocket_server.hpp>
 #include <iora/network/websocket_client.hpp>
 
@@ -19,14 +21,6 @@
 
 using namespace iora::network;
 using namespace std::chrono_literals;
-
-// Use random port base to avoid TIME_WAIT conflicts between test runs
-static std::uint16_t nextPort()
-{
-  static std::atomic<std::uint16_t> base{static_cast<std::uint16_t>(
-    9200 + (std::chrono::steady_clock::now().time_since_epoch().count() % 1000))};
-  return base.fetch_add(1);
-}
 
 // Helper: wait for a condition with timeout
 template<typename Pred>
@@ -47,7 +41,7 @@ bool waitFor(Pred pred, std::chrono::milliseconds timeout = 5000ms)
 
 TEST_CASE("WS Integration: client connects and upgrades", "[ws][integration]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   std::atomic<bool> serverGotConnect{false};
 
@@ -81,7 +75,7 @@ TEST_CASE("WS Integration: client connects and upgrades", "[ws][integration]")
 
 TEST_CASE("WS Integration: text echo", "[ws][integration]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
 
   // Server echoes text messages back
@@ -125,7 +119,7 @@ TEST_CASE("WS Integration: text echo", "[ws][integration]")
 
 TEST_CASE("WS Integration: binary echo", "[ws][integration]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
 
   server.setOnBinaryMessage([&](SessionId sid, const std::vector<std::uint8_t>& data)
@@ -169,7 +163,7 @@ TEST_CASE("WS Integration: binary echo", "[ws][integration]")
 
 TEST_CASE("WS Integration: close handshake", "[ws][integration]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   std::atomic<bool> serverGotClose{false};
   std::atomic<uint16_t> closeCode{0};
@@ -207,7 +201,7 @@ TEST_CASE("WS Integration: close handshake", "[ws][integration]")
 TEST_CASE("WS Integration: server _onClose fires exactly once on client close",
           "[ws][integration][close]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   std::atomic<int> serverCloseCount{0};
   std::atomic<std::uint16_t> serverCloseCode{0};
@@ -246,7 +240,7 @@ TEST_CASE("WS Integration: server _onClose fires exactly once on client close",
 TEST_CASE("WS Integration: abrupt client disconnect fires server _onClose(1006) once and prunes session",
           "[ws][integration][close][abrupt]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   std::atomic<int> serverCloseCount{0};
   std::atomic<std::uint16_t> serverCloseCode{0};
@@ -298,7 +292,7 @@ TEST_CASE("WS Integration: abrupt client disconnect fires server _onClose(1006) 
 TEST_CASE("WS Integration: server shutdown fires _onClose(1001 going away) for an open session",
           "[ws][integration][close][shutdown]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   std::atomic<int> serverCloseCount{0};
   std::atomic<std::uint16_t> serverCloseCode{0};
@@ -340,7 +334,7 @@ TEST_CASE("WS Integration: server shutdown fires _onClose(1001 going away) for a
 TEST_CASE("WS Integration: oversized frame closes 1009 and tears the session down",
           "[ws][integration][toolarge]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   server.setMaxFrameSize(1024); // small cap so a modest frame trips it
 
@@ -396,7 +390,7 @@ TEST_CASE("WS Integration: oversized frame closes 1009 and tears the session dow
 TEST_CASE("WS Integration: client rejects invalid-UTF-8 TEXT with 1007 and no delivery",
           "[ws][integration][utf8]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
 
   std::atomic<bool> gotSid{false};
@@ -461,7 +455,7 @@ TEST_CASE("WS Integration: client rejects invalid-UTF-8 TEXT with 1007 and no de
 
 TEST_CASE("WS Integration: subprotocol negotiation", "[ws][integration]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
 
   server.setSubprotocolCallback([](const std::vector<std::string>& requested)
@@ -508,7 +502,7 @@ TEST_CASE("WS Integration: subprotocol negotiation", "[ws][integration]")
 
 TEST_CASE("WS Integration: multiple concurrent clients", "[ws][integration]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   WebSocketServer server("127.0.0.1", port);
   std::atomic<int> messageCount{0};
 

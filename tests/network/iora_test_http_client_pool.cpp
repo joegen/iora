@@ -7,6 +7,7 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
 
 #include <iora/network/http_client_pool.hpp>
 #include <iora/network/webhook_server.hpp>
@@ -26,9 +27,9 @@ using namespace iora::network;
 class HttpClientPoolTestFixture
 {
 public:
-  HttpClientPoolTestFixture()
+  HttpClientPoolTestFixture() : port(testnet::getFreePortTCP())
   {
-    server.setPort(8082);
+    server.setPort(port);
 
     // Simple GET endpoint
     server.onGet("/test-get",
@@ -73,6 +74,12 @@ public:
     server.stop();
   }
 
+  std::string url(const std::string &path) const
+  {
+    return "http://localhost:" + std::to_string(port) + path;
+  }
+
+  const std::uint16_t port;
   WebhookServer server;
   std::atomic<int> requestCounter{0};
 };
@@ -108,7 +115,7 @@ TEST_CASE("HttpClientPool basic operations", "[http_client_pool][basic]")
     REQUIRE(pool.available() == 4);
     REQUIRE(pool.inUse() == 1);
 
-    auto response = client.get("http://localhost:8082/test-get");
+    auto response = client.get(fixture.url("/test-get"));
     REQUIRE(response.success());
     REQUIRE(response.statusCode == 200);
   }
@@ -135,9 +142,9 @@ TEST_CASE("HttpClientPool basic operations", "[http_client_pool][basic]")
     REQUIRE(pool.available() == 2);
 
     // All clients work independently
-    auto res1 = client1.get("http://localhost:8082/test-get");
-    auto res2 = client2.get("http://localhost:8082/test-get");
-    auto res3 = client3.get("http://localhost:8082/test-get");
+    auto res1 = client1.get(fixture.url("/test-get"));
+    auto res2 = client2.get(fixture.url("/test-get"));
+    auto res3 = client3.get(fixture.url("/test-get"));
 
     REQUIRE(res1.success());
     REQUIRE(res2.success());
@@ -194,10 +201,10 @@ TEST_CASE("HttpClientPool RAII behavior", "[http_client_pool][raii]")
   {
     auto client = pool.get();
 
-    auto res1 = client.get("http://localhost:8082/test-get");
+    auto res1 = client.get(fixture.url("/test-get"));
     REQUIRE(res1.success());
 
-    auto res2 = client.post("http://localhost:8082/test-post", "{\"data\":\"test\"}");
+    auto res2 = client.post(fixture.url("/test-post"), "{\"data\":\"test\"}");
     REQUIRE(res2.success());
 
     // Client still in use
@@ -316,7 +323,7 @@ TEST_CASE("HttpClientPool concurrent access", "[http_client_pool][concurrent]")
             try
             {
               auto client = pool.get();
-              auto response = client.post("http://localhost:8082/test-counter",
+              auto response = client.post(fixture.url("/test-counter"),
                                           std::to_string(i * requestsPerThread + j));
               if (response.success())
               {
@@ -562,7 +569,7 @@ TEST_CASE("HttpClientPool close behavior", "[http_client_pool][close]")
     pool.close();
 
     // Client can still be used
-    auto response = client.get("http://localhost:8082/test-get");
+    auto response = client.get(fixture.url("/test-get"));
     REQUIRE(response.success());
   }
 }
@@ -582,7 +589,7 @@ TEST_CASE("HttpClientPool HTTP operations", "[http_client_pool][http]")
   SECTION("GET request through pooled client")
   {
     auto client = pool.get();
-    auto response = client.get("http://localhost:8082/test-get");
+    auto response = client.get(fixture.url("/test-get"));
 
     REQUIRE(response.success());
     REQUIRE(response.statusCode == 200);
@@ -593,7 +600,7 @@ TEST_CASE("HttpClientPool HTTP operations", "[http_client_pool][http]")
   {
     auto client = pool.get();
     std::string body = "{\"test\":\"data\"}";
-    auto response = client.post("http://localhost:8082/test-post", body);
+    auto response = client.post(fixture.url("/test-post"), body);
 
     REQUIRE(response.success());
     REQUIRE(response.body == body);
@@ -605,7 +612,7 @@ TEST_CASE("HttpClientPool HTTP operations", "[http_client_pool][http]")
     auto payload = iora::parsers::Json::object();
     payload["message"] = "hello";
 
-    auto response = client.postJson("http://localhost:8082/test-post", payload);
+    auto response = client.postJson(fixture.url("/test-post"), payload);
     REQUIRE(response.success());
 
     auto json = HttpClient::parseJsonOrThrow(response);
@@ -616,13 +623,13 @@ TEST_CASE("HttpClientPool HTTP operations", "[http_client_pool][http]")
   {
     auto client = pool.get();
 
-    auto res1 = client.get("http://localhost:8082/test-get");
+    auto res1 = client.get(fixture.url("/test-get"));
     REQUIRE(res1.success());
 
-    auto res2 = client.post("http://localhost:8082/test-post", "test");
+    auto res2 = client.post(fixture.url("/test-post"), "test");
     REQUIRE(res2.success());
 
-    auto res3 = client.get("http://localhost:8082/test-get");
+    auto res3 = client.get(fixture.url("/test-get"));
     REQUIRE(res3.success());
   }
 }
@@ -682,7 +689,7 @@ TEST_CASE("HttpClientPool edge cases", "[http_client_pool][edge]")
     auto client = pool.get();
     REQUIRE(pool.empty());
 
-    auto response = client.get("http://localhost:8082/test-get");
+    auto response = client.get(fixture.url("/test-get"));
     REQUIRE(response.success());
   }
 
@@ -777,7 +784,7 @@ TEST_CASE("HttpClientPool 1000 concurrent connections with 200 OK", "[http_clien
                   break;
                 }
 
-                auto response = client.get("http://localhost:8082/test-get");
+                auto response = client.get(fixture.url("/test-get"));
 
                 if (response.success())
                 {

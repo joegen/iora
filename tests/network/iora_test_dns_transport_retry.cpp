@@ -38,6 +38,7 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 
+#include "iora_test_net_utils.hpp"
 #include "dns_transport_test_access.hpp"    // shared white-box seam (SM-M1)
 
 #include "iora/network/dns/dns_message.hpp"
@@ -1011,7 +1012,7 @@ TEST_CASE("dns retry: a racing sweep skips a query the retry claim just reset (n
           "[dns][retry][whitebox]")
 {
   constexpr std::uint16_t ID = 0x5151;
-  constexpr std::uint16_t PORT = 5399;
+  const std::uint16_t PORT = testnet::getFreePortUdpTcp();
 
   DnsConfig cfg;
   cfg.retryCount = 3;
@@ -1044,7 +1045,7 @@ TEST_CASE("dns retry: a truncated response is dropped when a retry is already cl
           "[dns][retry][whitebox]")
 {
   constexpr std::uint16_t ID = 0x6262;
-  constexpr std::uint16_t PORT = 5388;
+  const std::uint16_t PORT = testnet::getFreePortUdpTcp();
   constexpr SessionId SID = 1;
 
   // The query must be registered in BOTH mode (the truncation handler now reads the query's PINNED

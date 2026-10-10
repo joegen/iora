@@ -1,6 +1,7 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
 #include <chrono>
 #include <thread>
 
@@ -11,7 +12,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   SECTION("Server starts and stops cleanly")
   {
     iora::network::WebhookServer server;
-    server.setPort(8082);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     REQUIRE_NOTHROW(server.start());
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -21,7 +23,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   SECTION("Server handles multiple simultaneous connections")
   {
     iora::network::WebhookServer server;
-    server.setPort(8083);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     std::atomic<int> requestCount{0};
     server.onGet("/count",
@@ -42,10 +45,10 @@ TEST_CASE("WebhookServer transport-specific tests")
     for (int i = 0; i < numThreads; ++i)
     {
       threads.emplace_back(
-        [i, numThreads]()
+        [i, numThreads, port]()
         {
           iora::network::HttpClient client;
-          auto res = client.get("http://localhost:8083/count");
+          auto res = client.get("http://localhost:" + std::to_string(port) + "/count");
           REQUIRE(res.success());
           // Each response should contain a different count
           int responseCount = std::stoi(res.body);
@@ -67,7 +70,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   SECTION("Server handles large request body")
   {
     iora::network::WebhookServer server;
-    server.setPort(8084);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     server.onPost(
       "/large", [](const iora::network::WebhookServer::Request &req,
@@ -82,7 +86,8 @@ TEST_CASE("WebhookServer transport-specific tests")
 
     iora::network::HttpClient client;
     auto res =
-      client.post("http://localhost:8084/large", largeBody, {{"Content-Type", "text/plain"}});
+      client.post("http://localhost:" + std::to_string(port) + "/large", largeBody,
+                  {{"Content-Type", "text/plain"}});
 
     REQUIRE(res.success());
     REQUIRE(res.body == "Received 65536 bytes");
@@ -93,7 +98,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   SECTION("Server properly parses query parameters")
   {
     iora::network::WebhookServer server;
-    server.setPort(8085);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     server.onGet("/params",
                  [](const iora::network::WebhookServer::Request &req,
@@ -111,7 +117,8 @@ TEST_CASE("WebhookServer transport-specific tests")
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     iora::network::HttpClient client;
-    auto res = client.get("http://localhost:8085/params?foo=bar&test=123&empty=");
+    auto res =
+      client.get("http://localhost:" + std::to_string(port) + "/params?foo=bar&test=123&empty=");
 
     REQUIRE(res.success());
     auto json = iora::parsers::Json::parseString(res.body);
@@ -125,7 +132,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   SECTION("Server handles keep-alive connections")
   {
     iora::network::WebhookServer server;
-    server.setPort(8086);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     std::atomic<int> connectionCount{0};
     server.onGet("/ping",
@@ -142,9 +150,9 @@ TEST_CASE("WebhookServer transport-specific tests")
     iora::network::HttpClient client;
 
     // Make multiple requests - should reuse connection
-    auto res1 = client.get("http://localhost:8086/ping");
-    auto res2 = client.get("http://localhost:8086/ping");
-    auto res3 = client.get("http://localhost:8086/ping");
+    auto res1 = client.get("http://localhost:" + std::to_string(port) + "/ping");
+    auto res2 = client.get("http://localhost:" + std::to_string(port) + "/ping");
+    auto res3 = client.get("http://localhost:" + std::to_string(port) + "/ping");
 
     REQUIRE(res1.success());
     REQUIRE(res2.success());
@@ -157,7 +165,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   SECTION("Server sends proper HTTP headers")
   {
     iora::network::WebhookServer server;
-    server.setPort(8087);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     server.onGet(
       "/headers",
@@ -171,7 +180,7 @@ TEST_CASE("WebhookServer transport-specific tests")
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     iora::network::HttpClient client;
-    auto res = client.get("http://localhost:8087/headers");
+    auto res = client.get("http://localhost:" + std::to_string(port) + "/headers");
 
     REQUIRE(res.success());
 
@@ -201,7 +210,8 @@ TEST_CASE("WebhookServer transport-specific tests")
   {
     // Create a WebhookServer with very small thread pool for testing backpressure
     iora::network::WebhookServer server;
-    server.setPort(8088);
+    const std::uint16_t port = testnet::getFreePortTCP();
+    server.setPort(port);
 
     std::atomic<int> requestsProcessed{0};
     std::atomic<bool> allowProcessing{false};
@@ -237,12 +247,12 @@ TEST_CASE("WebhookServer transport-specific tests")
     {
       responseStatuses.push_back(std::make_unique<std::atomic<int>>(0));
       requestThreads.emplace_back(
-        [i, &responseStatuses]()
+        [i, port, &responseStatuses]()
         {
           try
           {
             iora::network::HttpClient client;
-            auto res = client.post("http://localhost:8088/slow", "test data",
+            auto res = client.post("http://localhost:" + std::to_string(port) + "/slow", "test data",
                                    {{"Content-Type", "text/plain"}});
             responseStatuses[i]->store(res.statusCode);
           }

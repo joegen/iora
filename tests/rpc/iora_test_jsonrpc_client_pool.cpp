@@ -35,6 +35,7 @@
 // connect-refusal discriminator test (tracker 2026-09-03-3). Included after
 // catch2/catch.hpp because the helper uses REQUIRE at construction.
 #include "iora_test_net_utils.hpp"
+#include "network/http_client_test_server.hpp"
 // Shared testrpc::requestId (Slice-B review L9/S-4). The LIGHT id header (only
 // json + gzip) — client_pool uses only requestId, not the server-composition
 // fixture, so it must not transitively compile JsonRpcHttpEndpoint/JsonRpcServer.
@@ -804,18 +805,19 @@ struct RawResponsePolicy
 class RawCaptureServer
 {
 public:
-  explicit RawCaptureServer(std::uint16_t port, RawResponsePolicy policy = {})
-      : _policy(std::move(policy))
+  explicit RawCaptureServer(RawResponsePolicy policy = {}) : _policy(std::move(policy))
   {
-    _listenFd = makeListener(port);
+    _listenFd = iora::test::httpsrv::makeListener();
     if (_listenFd < 0)
     {
-      throw std::runtime_error("RawCaptureServer: cannot listen on port " + std::to_string(port));
+      throw std::runtime_error("RawCaptureServer: cannot listen on an ephemeral port");
     }
     _thread = std::thread([this] { run(); });
   }
 
   ~RawCaptureServer() { stop(); }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
   RawCaptureServer(const RawCaptureServer &) = delete;
   RawCaptureServer &operator=(const RawCaptureServer &) = delete;
 
@@ -895,43 +897,6 @@ public:
   }
 
 private:
-  static int makeListener(std::uint16_t port)
-  {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
-    {
-      return -1;
-    }
-    int opt = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    addr.sin_port = htons(port);
-    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
-    {
-      ::close(fd);
-      return -1;
-    }
-    if (::listen(fd, 16) < 0)
-    {
-      ::close(fd);
-      return -1;
-    }
-    // Non-blocking LISTEN socket so the accept loop can poll _stop and exit
-    // promptly on teardown. This is the SOLE teardown wakeup, so a failed fcntl
-    // must fail construction (ts R2-L1) — a blocking accept() with no timeout
-    // would make stop()/join() hang unboundedly. The accepted socket stays
-    // blocking with a recv timeout (set in run()).
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
-    {
-      ::close(fd);
-      return -1;
-    }
-    return fd;
-  }
-
   /// \brief Send `data` fully; returns false if a send failed before completion.
   static bool writeAll(int fd, const std::string &data)
   {
@@ -1350,7 +1315,7 @@ TEST_CASE("fixture: latched HTTP server holds a request until released",
 {
   iora::core::ThreadPool pool(/*initial*/ 2, /*max*/ 2, std::chrono::seconds(1));
 
-  const std::uint16_t serverPort = 18150;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort);
 
   Config cfg; // real (non-stub) factory so the client talks to the fixture
@@ -1830,7 +1795,7 @@ TEST_CASE("task-5.1 CR-2: acquire_ recovers an idle-expired pool in place, not b
 {
   iora::core::ThreadPool pool(1, 1, std::chrono::seconds(1));
 
-  const std::uint16_t serverPort = 18154;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort);
   server.release(); // one-shot OPEN: every request passes straight through
 
@@ -2368,7 +2333,7 @@ TEST_CASE("phase3: destructor cancels and waits for an in-flight synchronous cal
           "[jsonrpc][pool][phase3][latched]")
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  const std::uint16_t serverPort = 18151;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort); // parks the handler until released
 
   Config cfg; // real factory so the client actually connects to the fixture
@@ -2426,7 +2391,7 @@ TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
           "[jsonrpc][pool][phase3][latched]")
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  const std::uint16_t serverPort = 18152;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort);
   server.release(); // pass requests straight through
 
@@ -2473,7 +2438,7 @@ TEST_CASE("phase3: callback callAsync delivers a result to onSuccess",
           "[jsonrpc][pool][phase3][latched]")
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  const std::uint16_t serverPort = 18153;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort);
   server.release(); // pass requests straight through
 
@@ -4113,7 +4078,7 @@ TEST_CASE("task-6.4b(h): a synchronous call unwinding under a concurrent destruc
           "[jsonrpc][pool][phase3][phase6][quiesce][latched]")
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  const std::uint16_t serverPort = 18155;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort); // parks the handler: the call wedges
 
   Config cfg;
@@ -4269,7 +4234,7 @@ TEST_CASE("task-6.4b(z): a batch send fast-fails on a reused connection once clo
   using iora::rpc::ClientShutdownError;
 
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  const std::uint16_t serverPort = 18156;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort); // SILENT: the handler parks for 5 s
 
   Config cfg;
@@ -4321,8 +4286,8 @@ TEST_CASE("task-7.0a: raw-capture server records a request's exact field lines",
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18160;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
 
   Config cfg; // real (non-stub) factory so the client talks to the raw server
   cfg.maxRetries = 0;
@@ -4350,8 +4315,8 @@ TEST_CASE("task-7.0a: the keep-alive loop serves two requests on one accepted co
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18161;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -4376,12 +4341,12 @@ TEST_CASE("task-7.0a: the scripted response policy (delay + extra header + close
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18162;
   RawResponsePolicy policy;
   policy.delayBeforeResponse = std::chrono::milliseconds(40); // well under the 3 s default
   policy.extraResponseHeaders = {"Content-Encoding: identity"};
   policy.closeAfterResponse = true; // server sends "Connection: close" and drops the socket
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -4481,8 +4446,8 @@ TEST_CASE("task-7.1a: a sub-second socketIdleTimeout still permits reuse (defaul
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18165;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -4509,8 +4474,8 @@ TEST_CASE("task-7.1a: enableKeepAlive=false opens a fresh socket per call (defau
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18163;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -4536,10 +4501,10 @@ TEST_CASE("task-7.1a: requestTimeout reaches HttpClient (below the response dela
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18164;
   RawResponsePolicy policy;
   policy.delayBeforeResponse = std::chrono::milliseconds(600);
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -4638,10 +4603,10 @@ TEST_CASE("task-7.6: Config defaults — socketIdleTimeout 3 s, idleTimeout 30 s
 TEST_CASE("task-7.6: closeAfterIdleMs closes an idle keep-alive socket (fixture self-test)",
           "[jsonrpc][pool][phase7][raw]")
 {
-  const std::uint16_t port = 18166;
   RawResponsePolicy policy;
   policy.closeAfterIdleMs = std::chrono::milliseconds(600); // server drops an idle socket at ~0.6-1.0 s
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   REQUIRE(fd >= 0);
@@ -4704,10 +4669,10 @@ TEST_CASE("task-7.6: socketIdleTimeout below the server keep-alive floor recycle
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18167;
   RawResponsePolicy policy;
   policy.closeAfterIdleMs = std::chrono::milliseconds(1200); // server closes idle socket at ~1.2-1.6 s
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;                              // no retry can mask a dead-socket reuse
@@ -4764,10 +4729,10 @@ TEST_CASE("task-7.6: a reused socket the server already closed is retried on a f
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18168;
   RawResponsePolicy policy;
   policy.closeAfterIdleMs = std::chrono::milliseconds(700); // server closes idle socket at ~0.8 s
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3;                              // recovery budget (the default)
@@ -4802,7 +4767,7 @@ TEST_CASE("task-7.6: a reused socket the server already closed is retried on a f
 // maxRetries=3 and asserts EXACTLY ONE server-side receipt (requestCount()==1) and
 // ONE connection (acceptedConnectionCount()==1): no retry, no double-submit. The
 // server records the request BEFORE the failure, so a regression to blanket-retry
-// would push requestCount() to 2+. Complements 18168 (the provably-not-sent
+// would push requestCount() to 2+. Complements the test above (the provably-not-sent
 // reused-dead-socket case, which SHOULD recover on a fresh socket).
 // =========================================================================
 TEST_CASE("2026-09-03-2: a POST whose server read it then dropped before replying is NOT retried",
@@ -4810,10 +4775,10 @@ TEST_CASE("2026-09-03-2: a POST whose server read it then dropped before replyin
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18192;
   RawResponsePolicy policy;
   policy.closeAfterRequestNoReply = true; // read the full request, then drop before replying
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3; // retries ENABLED — the guard must still not retry a possibly-applied POST
@@ -4833,10 +4798,10 @@ TEST_CASE("2026-09-03-2: a POST that times out on the response read is NOT retri
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18193;
   RawResponsePolicy policy;
   policy.holdOpenNoReply = true; // read the request, then hold the socket open and silent
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3;
@@ -4859,12 +4824,12 @@ TEST_CASE("2026-09-03-2: a POST answered with a malformed (unframable) response 
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18194;
   RawResponsePolicy policy;
   // A status line with a non-numeric status code — a deterministic framing
   // violation (HttpFramingError), which HttpClient never retries.
   policy.rawResponseOverride = "HTTP/1.1 XX Bad\r\nContent-Length: 0\r\n\r\n";
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3;
@@ -4884,13 +4849,13 @@ TEST_CASE("2026-09-03-2: a POST whose response has an undecodable Content-Encodi
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18195;
   RawResponsePolicy policy;
   // Content-Encoding: gzip over the default (plain-JSON) body: the server processed
   // the POST, the reply merely fails to inflate. decodeResponseContentEncoding_
   // throws (malformed) — a possibly-sent failure, so it is NOT retried.
   policy.extraResponseHeaders = {"Content-Encoding: gzip"};
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3;
@@ -4910,15 +4875,15 @@ TEST_CASE("2026-09-03-2: a POST answered with a well-framed but unparseable-JSON
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18196;
   RawResponsePolicy policy;
   // A correctly-framed HTTP 200 (valid Content-Length) whose body is not JSON: the
   // server processed the POST, the reply merely fails parseJsonOrThrow. Distinct
-  // from the Content-Encoding case (port 18195), which throws in
+  // from the Content-Encoding case above, which throws in
   // decodeResponseContentEncoding_ BEFORE the parser is reached.
   policy.rawResponseOverride =
     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\nnotjson";
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3;
@@ -4938,10 +4903,10 @@ TEST_CASE("2026-09-03-2: the BATCH path does not retry a possibly-applied failur
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18197;
   RawResponsePolicy policy;
   policy.closeAfterRequestNoReply = true; // read the batch, drop before replying
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 3;
@@ -4981,8 +4946,8 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
 
   SECTION("default (advertiseAcceptEncoding=true): gzip, twice (keep-alive reuse)")
   {
-    const std::uint16_t port = 18170;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     JsonRpcClient client(pool, cfg);
@@ -5004,8 +4969,8 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
 
   SECTION("advertiseAcceptEncoding=false: exactly one Accept-Encoding: identity")
   {
-    const std::uint16_t port = 18169;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     cfg.advertiseAcceptEncoding = false;
@@ -5026,8 +4991,8 @@ TEST_CASE("task-7.2b/2.1: every request carries exactly one Accept-Encoding line
     // Accept-Encoding is on the per-call reject set: the client owns the sole
     // Accept-Encoding line, so a caller may not supply one — mergeHeaders_ throws
     // before anything reaches the wire, regardless of advertiseAcceptEncoding.
-    const std::uint16_t port = 18168;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     JsonRpcClient client(pool, cfg);
@@ -5060,40 +5025,40 @@ TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  auto runCall = [&](std::uint16_t port, std::vector<std::string> extraResponseHeaders)
+  auto runCall = [&](std::vector<std::string> extraResponseHeaders)
   {
     RawResponsePolicy policy;
     policy.extraResponseHeaders = std::move(extraResponseHeaders);
-    RawCaptureServer server(port, policy);
+    RawCaptureServer server(policy);
     Config cfg;
     cfg.maxRetries = 0;
     JsonRpcClient client(pool, cfg);
-    const std::string ep = "http://127.0.0.1:" + std::to_string(port) + "/rpc";
+    const std::string ep = "http://127.0.0.1:" + std::to_string(server.port()) + "/rpc";
     return client.call(ep, "ping");
   };
 
   SECTION("no Content-Encoding header -> succeeds (absent == identity)")
   {
-    REQUIRE(runCall(18171, {}).is_object());
+    REQUIRE(runCall({}).is_object());
   }
   SECTION("Content-Encoding: identity -> succeeds (no-op)")
   {
-    REQUIRE(runCall(18172, {"Content-Encoding: identity"}).is_object());
+    REQUIRE(runCall({"Content-Encoding: identity"}).is_object());
   }
   SECTION("Content-Encoding: IDENTITY (mixed case) -> succeeds (no-op)")
   {
-    REQUIRE(runCall(18173, {"Content-Encoding: IDENTITY"}).is_object());
+    REQUIRE(runCall({"Content-Encoding: IDENTITY"}).is_object());
   }
   SECTION("Content-Encoding: gzip over a non-gzip body -> throws (malformed inflate)")
   {
-    REQUIRE_THROWS_AS(runCall(18174, {"Content-Encoding: gzip"}),
+    REQUIRE_THROWS_AS(runCall({"Content-Encoding: gzip"}),
                       iora::rpc::JsonRpcError);
   }
   SECTION("Content-Encoding: br (unknown coding) -> throws (unsupported coding)")
   {
     // An unknown coding must throw BEFORE any decode attempt (fail loudly), never
     // feed undecoded octets to the parser.
-    REQUIRE_THROWS_AS(runCall(18175, {"Content-Encoding: br"}),
+    REQUIRE_THROWS_AS(runCall({"Content-Encoding: br"}),
                       iora::rpc::JsonRpcError);
   }
   SECTION("lowercase response header NAME 'content-encoding: br' -> throws (web W-1)")
@@ -5102,7 +5067,7 @@ TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
     // lowercase field name. If the lookup were case-sensitive it would silently
     // miss this and feed the undecoded body to the parser. Mutation-proof:
     // comparing the lookup key case-sensitively fails it.
-    REQUIRE_THROWS_AS(runCall(18178, {"content-encoding: br"}),
+    REQUIRE_THROWS_AS(runCall({"content-encoding: br"}),
                       iora::rpc::JsonRpcError);
   }
   SECTION("Content-Encoding value with OWS '\\tidentity ' -> succeeds (web W-2)")
@@ -5110,7 +5075,7 @@ TEST_CASE("task-7.2c/2.2: response Content-Encoding decode-error handling",
     // An OWS-padded identity is trimmed to a no-op and accepted. The OWS is stripped
     // UPSTREAM by HttpClient::parseHeaderBlock before decodeResponseContentEncoding_
     // sees the value (belt-and-braces trim in the split path guards a direct caller).
-    REQUIRE(runCall(18179, {"Content-Encoding: \tidentity "}).is_object());
+    REQUIRE(runCall({"Content-Encoding: \tidentity "}).is_object());
   }
 }
 
@@ -5135,8 +5100,8 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
   SECTION("a default client emits exactly one Content-Type and one Connection line")
   {
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-    const std::uint16_t port = 18176;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
 
     Config cfg;
     cfg.maxRetries = 0; // enableKeepAlive defaults true -> reuseConnections true
@@ -5157,8 +5122,8 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
   SECTION("enableKeepAlive=false yields exactly one Connection: close line")
   {
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-    const std::uint16_t port = 18177;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
 
     Config cfg;
     cfg.maxRetries = 0;
@@ -5182,8 +5147,8 @@ TEST_CASE("task-7.2d: the constructor contributes no default headers; the wire i
     // defaultHeaders still yields exactly ONE wire line. If postJson ever stopped
     // overriding, this would flip to TWO and fail loudly.
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-    const std::uint16_t port = 18180;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
 
     Config cfg;
     cfg.maxRetries = 0;
@@ -5331,8 +5296,8 @@ TEST_CASE("task-7.3c: User-Agent is consumed from defaultHeaders and rejected pe
   SECTION("dual-case User-Agent in defaultHeaders -> one wire line, none left in config()")
   {
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-    const std::uint16_t port = 18181;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
 
     Config cfg;
     cfg.maxRetries = 0;
@@ -5376,8 +5341,8 @@ TEST_CASE("task-7.3d: defaultHeaders is validated once at construction",
   SECTION("the README configuration (User-Agent + Accept) constructs and sends one UA line")
   {
     iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-    const std::uint16_t port = 18182;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
 
     Config cfg;
     cfg.maxRetries = 0;
@@ -5407,8 +5372,8 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
 
   SECTION("a lowercase content-type in defaultHeaders yields exactly one Content-Type line")
   {
-    const std::uint16_t port = 18183;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"content-type", "application/json"}};
@@ -5427,8 +5392,8 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
 
   SECTION("both 'Accept' and 'accept' in defaultHeaders yield exactly one Accept line")
   {
-    const std::uint16_t port = 18184;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"Accept", "application/json"}, {"accept", "text/plain"}};
@@ -5449,8 +5414,8 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
     // 'content-type' spelling, it and postJson's 'Content-Type' become two
     // case-sensitive map keys -> two wire lines. Mutation-test: dropping the
     // per-call canonicalisation in mergeHeaders_ makes this count 2.
-    const std::uint16_t port = 18185;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     JsonRpcClient client(pool, cfg);
@@ -5475,8 +5440,8 @@ TEST_CASE("task-7.4: Content-Type canonicalisation and defaultHeaders self-dedup
   {
     // Exercises the upsertLastWins_ OVERWRITE branch of the Content-Type arm (the
     // per-call header matches the canonical seed entry rather than appending).
-    const std::uint16_t port = 18187;
-    RawCaptureServer server(port);
+    RawCaptureServer server;
+    const std::uint16_t port = server.port();
     Config cfg;
     cfg.maxRetries = 0;
     cfg.defaultHeaders = {{"Content-Type", "application/xml"}};
@@ -5506,8 +5471,8 @@ TEST_CASE("task-7.3b: obs-text and empty header values pass through to the wire"
           "[jsonrpc][pool][phase7][raw]")
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  const std::uint16_t port = 18186;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
   Config cfg;
   cfg.maxRetries = 0;
   JsonRpcClient client(pool, cfg);
@@ -5540,8 +5505,8 @@ TEST_CASE("task-7.5c: two paths on one origin share one pool and one socket",
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18190;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -5586,8 +5551,8 @@ TEST_CASE("task-7.5c: factory and configurer receive the origin, the send the fu
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18191;
-  RawCaptureServer server(port);
+  RawCaptureServer server;
+  const std::uint16_t port = server.port();
 
   std::string factorySaw;
   std::string configurerSaw;
@@ -5698,11 +5663,14 @@ TEST_CASE("M-12: a JSON-RPC error envelope increments failedRequests only, not s
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   // ---- error envelope: parseResponseOrThrow_ throws RemoteError AFTER the send ----
-  const std::uint16_t errPort = 18170;
   RawResponsePolicy errPolicy;
   errPolicy.body =
     R"({"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1})";
-  RawCaptureServer errServer(errPort, errPolicy);
+  RawCaptureServer errServer(errPolicy);
+  const std::uint16_t errPort = errServer.port();
+  RawCaptureServer okServer; // default success body
+  const std::uint16_t okPort = okServer.port();
+  REQUIRE(errPort != okPort);
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -5721,8 +5689,6 @@ TEST_CASE("M-12: a JSON-RPC error envelope increments failedRequests only, not s
   errServer.stop();
 
   // ---- a genuine success still increments successfulRequests (unchanged path) ----
-  const std::uint16_t okPort = 18171;
-  RawCaptureServer okServer(okPort); // default success body
   const std::string okEp = "http://127.0.0.1:" + std::to_string(okPort) + "/rpc";
 
   const auto r = client.call(okEp, "ping");
@@ -5758,13 +5724,13 @@ TEST_CASE("M-12 (batch): an error item in a batch increments failedRequests only
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18172;
   RawResponsePolicy policy;
   // ids match the caller-supplied BatchItem ids below so parseBatchResponseOrThrow_
   // pairs them: id 1 -> result, id 2 -> error envelope.
   policy.body = R"([{"jsonrpc":"2.0","result":{},"id":1},)"
                 R"({"jsonrpc":"2.0","error":{"code":-32000,"message":"boom"},"id":2}])";
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -5801,10 +5767,10 @@ TEST_CASE("task-7.8: a response-read timeout increments timeoutRequests (typed p
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18173;
   RawResponsePolicy policy;
   policy.delayBeforeResponse = std::chrono::milliseconds(700); // exceeds requestTimeout below
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -5832,10 +5798,10 @@ TEST_CASE("task-7.8 (M2): a batch-path response timeout increments timeoutReques
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18174;
   RawResponsePolicy policy;
   policy.delayBeforeResponse = std::chrono::milliseconds(700); // exceeds requestTimeout below
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -5872,10 +5838,10 @@ TEST_CASE("task-7.8 (R2-1): a batch RemoteError whose message contains 'timeout'
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18175;
   RawResponsePolicy policy;
   policy.body = R"([{"jsonrpc":"2.0","error":{"code":-32000,"message":"upstream gateway timeout"},"id":1}])";
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -5907,11 +5873,11 @@ TEST_CASE("task-7.8 (R3-L1): a single-call RemoteError whose message contains 't
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18176;
   RawResponsePolicy policy;
   policy.body =
     R"({"jsonrpc":"2.0","error":{"code":-32000,"message":"upstream gateway timeout"},"id":1})";
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -6077,10 +6043,10 @@ TEST_CASE("2026-09-03-3 (L1): a server 'Content-Encoding: x-timeout' is NOT coun
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18188;
   RawResponsePolicy policy;
   policy.extraResponseHeaders = {"Content-Encoding: x-timeout"}; // unsupported coding -> rejected
-  RawCaptureServer server(port, policy);
+  RawCaptureServer server(policy);
+  const std::uint16_t port = server.port();
 
   Config cfg;
   cfg.maxRetries = 0;
@@ -6182,8 +6148,8 @@ TEST_CASE("2026-09-03-3 (L-2): a successful call leaves timeoutRequests unchange
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t port = 18189;
-  RawCaptureServer server(port); // default policy: a JSON-RPC success body
+  RawCaptureServer server; // default policy: a JSON-RPC success body
+  const std::uint16_t port = server.port();
   Config cfg;
   cfg.maxRetries = 0;
   JsonRpcClient client(pool, cfg);
@@ -6377,7 +6343,7 @@ TEST_CASE("task-9.1: a latched in-flight call deterministically exhausts a cap-1
 {
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
-  const std::uint16_t serverPort = 18210;
+  const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort);
 
   Config cfg;                          // real factory: A actually sends and parks

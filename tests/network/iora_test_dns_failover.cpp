@@ -29,6 +29,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "dns_transport_test_access.hpp" // white-box seam: calcMaxSyncWait (H-2 budget test)
 #include "iora/network/dns/dns_cache.hpp"
 #include "iora/network/dns/dns_resolver.hpp"
@@ -49,12 +50,6 @@ using namespace iora::network::dns;
 
 namespace
 {
-// Distinct port block from the other DNS suites (comprehensive=15353, address_policy=15453).
-constexpr std::uint16_t PORT_A = 15553;
-constexpr std::uint16_t PORT_B = 15554;
-constexpr std::uint16_t PORT_C = 15555;
-constexpr std::uint16_t PORT_DEAD = 15559; // nothing binds here (connect-refused / timeout)
-
 constexpr std::chrono::milliseconds STARTUP_DELAY{150};
 constexpr std::chrono::milliseconds SHORT_TIMEOUT{400};
 
@@ -66,11 +61,11 @@ struct MockNode
   std::unique_ptr<MockDnsServer> server;
   std::uint16_t port;
 
-  explicit MockNode(std::uint16_t p, bool enableLogging = false) : port(p)
+  explicit MockNode(bool enableLogging = false) : port(testnet::getFreePortUdpTcp())
   {
     MockDnsServer::Config c;
-    c.udpPort = p;
-    c.tcpPort = p;
+    c.udpPort = port;
+    c.tcpPort = port;
     c.enableLogging = enableLogging; // needed for getQueryLog()-based per-type counting
     server = std::make_unique<MockDnsServer>(c);
     REQUIRE(server->start());
@@ -273,11 +268,11 @@ DnsQuestion anyQ(const std::string &name) { return DnsQuestion(name, DnsType::AN
 
 TEST_CASE("SYNC SERVFAIL on A -> failover to B; A not re-hit", "[dns][failover][sync]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", servfail());
   b->addRecord({"host.example.com", "A", "192.0.2.10", 3600});
 
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   DnsResult result = r->query(aQ("host.example.com"));
 
   REQUIRE(result.isSuccess());
@@ -293,10 +288,10 @@ TEST_CASE("SYNC REFUSED triggers failover; NXDOMAIN and NODATA+SOA do NOT",
 {
   SECTION("REFUSED -> failover to B")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", refused());
     b->addRecord({"host.example.com", "A", "192.0.2.11", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     DnsResult result = r->query(aQ("host.example.com"));
     REQUIRE(result.isSuccess());
     REQUIRE(a.udpQueries() == 1);
@@ -305,10 +300,10 @@ TEST_CASE("SYNC REFUSED triggers failover; NXDOMAIN and NODATA+SOA do NOT",
 
   SECTION("NXDOMAIN is authoritative -> NO failover, B untouched")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     // A has no record for the name -> authoritative NXDOMAIN from A.
     b->addRecord({"host.example.com", "A", "192.0.2.12", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
     REQUIRE(a.udpQueries() == 1);
     REQUIRE(b.udpQueries() == 0); // authoritative negative stops rotation
@@ -316,10 +311,10 @@ TEST_CASE("SYNC REFUSED triggers failover; NXDOMAIN and NODATA+SOA do NOT",
 
   SECTION("NODATA-with-SOA is authoritative -> NO failover, B untouched")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", nodataWithSoa());
     b->addRecord({"host.example.com", "A", "192.0.2.13", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
     REQUIRE(a.udpQueries() == 1);
     REQUIRE(b.udpQueries() == 0);
@@ -331,20 +326,20 @@ TEST_CASE("SYNC FORMERR/NOTIMP/referral failover; type-3 NODATA and NODATA-with-
 {
   SECTION("FORMERR on an A query -> failover")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", formerr());
     b->addRecord({"host.example.com", "A", "192.0.2.14", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE(r->query(aQ("host.example.com")).isSuccess());
     REQUIRE(b.udpQueries() == 1);
   }
 
   SECTION("NOTIMP on an A query -> failover (A-record NOTIMP is NOT the NAPTR Q5 case)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", notimp());
     b->addRecord({"host.example.com", "A", "192.0.2.15", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE(r->query(aQ("host.example.com")).isSuccess());
     REQUIRE(a.udpQueries() == 1);
     REQUIRE(b.udpQueries() == 1);
@@ -354,10 +349,10 @@ TEST_CASE("SYNC FORMERR/NOTIMP/referral failover; type-3 NODATA and NODATA-with-
   // server-local per RFC 2308 §2.2.1 -> the failover rotates to the next server.
   SECTION("referral (NS-only authority, no SOA) -> failover (RFC 2308 §2.2.1)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", referral());
     b->addRecord({"host.example.com", "A", "192.0.2.16", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE(r->query(aQ("host.example.com")).isSuccess());
     REQUIRE(a.udpQueries() == 1); // A returned the referral ...
     REQUIRE(b.udpQueries() == 1); // ... and the query failed over to B
@@ -368,10 +363,10 @@ TEST_CASE("SYNC FORMERR/NOTIMP/referral failover; type-3 NODATA and NODATA-with-
   // corrects the pre-fix behavior that mis-classified it as a retryable server-local outage.)
   SECTION("type-3 NODATA (empty authority, no SOA/no NS) is authoritative -> NO failover")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", nodataNoSoa());
     b->addRecord({"host.example.com", "A", "192.0.2.17", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
     REQUIRE(a.udpQueries() == 1); // authoritative negative stops rotation at A ...
     REQUIRE(b.udpQueries() == 0); // ... B is never contacted
@@ -380,10 +375,10 @@ TEST_CASE("SYNC FORMERR/NOTIMP/referral failover; type-3 NODATA and NODATA-with-
   // Unchanged control: NODATA-with-SOA is authoritative -> NO failover.
   SECTION("NODATA-with-SOA is authoritative -> NO failover")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", nodataWithSoa());
     b->addRecord({"host.example.com", "A", "192.0.2.18", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
     REQUIRE(a.udpQueries() == 1);
     REQUIRE(b.udpQueries() == 0);
@@ -393,10 +388,10 @@ TEST_CASE("SYNC FORMERR/NOTIMP/referral failover; type-3 NODATA and NODATA-with-
 TEST_CASE("SYNC TIMEOUT on primary (exception channel) -> failover to B; bounded",
           "[dns][failover][sync][timeout]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", timeoutCfg());
   b->addRecord({"host.example.com", "A", "192.0.2.17", 3600});
-  auto r = makeResolver({PORT_A, PORT_B}, SHORT_TIMEOUT, /*retryCount=*/0);
+  auto r = makeResolver({a.port, b.port}, SHORT_TIMEOUT, /*retryCount=*/0);
 
   auto start = std::chrono::steady_clock::now();
   DnsResult result = r->query(aQ("host.example.com"));
@@ -411,11 +406,11 @@ TEST_CASE("SYNC TIMEOUT on primary (exception channel) -> failover to B; bounded
 TEST_CASE("SYNC all-server SERVFAIL -> DnsTransientResolutionException, N attempts, terminal once",
           "[dns][failover][sync][transient]")
 {
-  MockNode a(PORT_A), b(PORT_B), c(PORT_C);
+  MockNode a, b, c;
   a->configureQuery("host.example.com", servfail());
   b->configureQuery("host.example.com", servfail());
   c->configureQuery("host.example.com", servfail());
-  auto r = makeResolver({PORT_A, PORT_B, PORT_C});
+  auto r = makeResolver({a.port, b.port, c.port});
 
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsTransientResolutionException);
   // Each of the N servers contacted exactly once (bounded by server count, tried excluded).
@@ -428,17 +423,17 @@ TEST_CASE("SYNC N=1 single-server failover no-op", "[dns][failover][sync]")
 {
   SECTION("single-server SERVFAIL -> transient")
   {
-    MockNode a(PORT_A);
+    MockNode a;
     a->configureQuery("host.example.com", servfail());
-    auto r = makeResolver({PORT_A});
+    auto r = makeResolver({a.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsTransientResolutionException);
     REQUIRE(a.udpQueries() == 1);
   }
   SECTION("single-server success")
   {
-    MockNode a(PORT_A);
+    MockNode a;
     a->addRecord({"host.example.com", "A", "192.0.2.18", 3600});
-    auto r = makeResolver({PORT_A});
+    auto r = makeResolver({a.port});
     REQUIRE(r->query(aQ("host.example.com")).isSuccess());
   }
 }
@@ -446,11 +441,11 @@ TEST_CASE("SYNC N=1 single-server failover no-op", "[dns][failover][sync]")
 TEST_CASE("SYNC SERVFAIL -> NXDOMAIN-on-B stops rotation at B's authoritative negative",
           "[dns][failover][sync][gate]")
 {
-  MockNode a(PORT_A), b(PORT_B), c(PORT_C);
+  MockNode a, b, c;
   a->configureQuery("host.example.com", servfail());
   // B has no record -> authoritative NXDOMAIN. C would succeed but must never be reached.
   c->addRecord({"host.example.com", "A", "192.0.2.19", 3600});
-  auto r = makeResolver({PORT_A, PORT_B, PORT_C});
+  auto r = makeResolver({a.port, b.port, c.port});
 
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
   REQUIRE(a.udpQueries() == 1);
@@ -461,11 +456,11 @@ TEST_CASE("SYNC SERVFAIL -> NXDOMAIN-on-B stops rotation at B's authoritative ne
 TEST_CASE("SYNC 3-server partial set: A SERVFAIL, B SERVFAIL, C NOERROR -> success on C",
           "[dns][failover][sync]")
 {
-  MockNode a(PORT_A), b(PORT_B), c(PORT_C);
+  MockNode a, b, c;
   a->configureQuery("host.example.com", servfail());
   b->configureQuery("host.example.com", servfail());
   c->addRecord({"host.example.com", "A", "192.0.2.20", 3600});
-  auto r = makeResolver({PORT_A, PORT_B, PORT_C});
+  auto r = makeResolver({a.port, b.port, c.port});
 
   DnsResult result = r->query(aQ("host.example.com"));
   REQUIRE(result.isSuccess());
@@ -478,14 +473,14 @@ TEST_CASE("SYNC 3-server partial set: A SERVFAIL, B SERVFAIL, C NOERROR -> succe
 TEST_CASE("SYNC TC=1 truncation from A -> SAME server A over TCP, B NOT contacted",
           "[dns][failover][sync][truncation]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   // A returns a truncated UDP response, then answers the TCP retry (same server).
   MockDnsServer::QueryConfig trunc;
   trunc.shouldTruncate = true;
   a->configureQuery("host.example.com", trunc);
   a->addRecord({"host.example.com", "A", "192.0.2.21", 3600});
   b->addRecord({"host.example.com", "A", "192.0.2.99", 3600});
-  auto r = makeResolver({PORT_A, PORT_B}, SHORT_TIMEOUT, /*retryCount=*/1,
+  auto r = makeResolver({a.port, b.port}, SHORT_TIMEOUT, /*retryCount=*/1,
                         DnsTransportMode::Both);
 
   DnsResult result = r->query(aQ("host.example.com"));
@@ -502,13 +497,13 @@ TEST_CASE("SYNC TC=1 truncation from A -> SAME server A over TCP, B NOT contacte
 TEST_CASE("resolveHostname all-server SERVFAIL -> transient throw, not DnsNoRecordsException",
           "[dns][failover][sync][resolvehostname]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   // Both families server-local on both servers.
   a->configureQuery("host.example.com", "A", servfail());
   a->configureQuery("host.example.com", "AAAA", servfail());
   b->configureQuery("host.example.com", "A", servfail());
   b->configureQuery("host.example.com", "AAAA", servfail());
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   REQUIRE_THROWS_AS(r->resolveHostname("host.example.com"), DnsTransientResolutionException);
 }
@@ -519,12 +514,12 @@ TEST_CASE("resolveHostname all-server SERVFAIL -> transient throw, not DnsNoReco
 TEST_CASE("resolveHostname all-server type-3 NODATA -> DnsNoRecordsException (authoritative)",
           "[dns][failover][sync][resolvehostname]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", "A", nodataNoSoa());
   a->configureQuery("host.example.com", "AAAA", nodataNoSoa());
   b->configureQuery("host.example.com", "A", nodataNoSoa());
   b->configureQuery("host.example.com", "AAAA", nodataNoSoa());
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   REQUIRE_THROWS_AS(r->resolveHostname("host.example.com"), DnsNoRecordsException);
 }
@@ -535,12 +530,12 @@ TEST_CASE("resolveHostname all-server type-3 NODATA -> DnsNoRecordsException (au
 TEST_CASE("resolveHostname all-server referral -> transient throw (RFC 2308 §2.2.1)",
           "[dns][failover][sync][resolvehostname]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", "A", referral());
   a->configureQuery("host.example.com", "AAAA", referral());
   b->configureQuery("host.example.com", "A", referral());
   b->configureQuery("host.example.com", "AAAA", referral());
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   REQUIRE_THROWS_AS(r->resolveHostname("host.example.com"), DnsTransientResolutionException);
 }
@@ -548,13 +543,13 @@ TEST_CASE("resolveHostname all-server referral -> transient throw (RFC 2308 §2.
 TEST_CASE("resolveHostname A transient but AAAA success -> returns AAAA, no throw",
           "[dns][failover][sync][resolvehostname]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   // A-family server-local on both servers; AAAA succeeds on the primary.
   a->configureQuery("host.example.com", "A", servfail());
   b->configureQuery("host.example.com", "A", servfail());
   a->addRecord({"host.example.com", "AAAA", "2001:db8::1", 3600});
   b->addRecord({"host.example.com", "AAAA", "2001:db8::1", 3600});
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   std::vector<std::string> addrs;
   REQUIRE_NOTHROW(addrs = r->resolveHostname("host.example.com"));
@@ -565,13 +560,13 @@ TEST_CASE("resolveHostname A transient but AAAA success -> returns AAAA, no thro
 TEST_CASE("resolveHostname all-authoritative-negative -> DnsNoRecordsException (permanent)",
           "[dns][failover][sync][resolvehostname]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   // No records anywhere -> both families NXDOMAIN (authoritative). Each family's query()
   // stops at its FIRST server's authoritative negative (no rotation), so neither family is
   // failed over — but the resolver's rotation cursor advances per query() call, so the two
   // families start on different servers. The invariant under test is the terminal exception
   // TYPE (permanent, not transient), not which server each family happened to hit.
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   REQUIRE_THROWS_AS(r->resolveHostname("nope.example.com"), DnsNoRecordsException);
   // No rotation on an authoritative negative: at most one query per family per server.
   REQUIRE(a.udpQueries() <= 1);
@@ -585,7 +580,7 @@ TEST_CASE("resolveHostname all-authoritative-negative -> DnsNoRecordsException (
 TEST_CASE("SYNC NAPTR SERVFAIL -> next-server retry of the SAME NAPTR before direct-SRV",
           "[dns][failover][sync][naptr]")
 {
-  MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+  MockNode a(/*log=*/true), b(/*log=*/true);
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
 
@@ -599,7 +594,7 @@ TEST_CASE("SYNC NAPTR SERVFAIL -> next-server retry of the SAME NAPTR before dir
     (*n)->addRecord({"sip1." + domain, "AAAA", "2001:db8::30", 3600});
   }
 
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
 
   REQUIRE(res.isSuccess());
@@ -613,7 +608,7 @@ TEST_CASE("SYNC NAPTR NOTIMP/FORMERR -> straight to direct-SRV WITHOUT exhaustin
 {
   auto runQ5 = [](MockDnsServer::QueryConfig naptrCfg)
   {
-    MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+    MockNode a(/*log=*/true), b(/*log=*/true);
     const std::string domain = "example.net";
     const std::string srvName = "_sip._udp." + domain;
 
@@ -627,7 +622,7 @@ TEST_CASE("SYNC NAPTR NOTIMP/FORMERR -> straight to direct-SRV WITHOUT exhaustin
       (*n)->addRecord({"sip1." + domain, "AAAA", "2001:db8::31", 3600});
     }
 
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
 
     REQUIRE(res.isSuccess());                 // fell forward to direct-SRV
@@ -646,12 +641,12 @@ TEST_CASE("SYNC NAPTR NOTIMP/FORMERR -> straight to direct-SRV WITHOUT exhaustin
 TEST_CASE("SYNC lifecycle 'Transport stopped' -> TERMINAL, no rotation, not transient",
           "[dns][failover][sync][terminal]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->addRecord({"host.example.com", "A", "192.0.2.40", 3600});
   b->addRecord({"host.example.com", "A", "192.0.2.41", 3600});
 
   DnsConfig cfg;
-  cfg.setServers({"127.0.0.1:" + std::to_string(PORT_A), "127.0.0.1:" + std::to_string(PORT_B)});
+  cfg.setServers({"127.0.0.1:" + std::to_string(a.port), "127.0.0.1:" + std::to_string(b.port)});
   cfg.timeout = SHORT_TIMEOUT;
   cfg.retryCount = 0;
   cfg.transportMode = DnsTransportMode::UDP;
@@ -685,11 +680,12 @@ TEST_CASE("SYNC lifecycle 'Transport stopped' -> TERMINAL, no rotation, not tran
 TEST_CASE("SYNC connect-refused on primary (TCP) -> failover to B",
           "[dns][failover][sync][network]")
 {
-  MockNode b(PORT_B); // real server on TCP (tcpPort == udpPort in MockNode)
+  testnet::RefusingEndpoint dead;
+  MockNode b; // real server on TCP (tcpPort == udpPort in MockNode)
   b->addRecord({"host.example.com", "A", "192.0.2.50", 3600});
 
   // Primary points at a dead port over TCP: connect is refused before any DNS exchange.
-  auto r = makeResolver({PORT_DEAD, PORT_B}, SHORT_TIMEOUT, /*retryCount=*/0,
+  auto r = makeResolver({dead.port(), b.port}, SHORT_TIMEOUT, /*retryCount=*/0,
                         DnsTransportMode::TCP);
   DnsResult result = r->query(aQ("host.example.com"));
 
@@ -701,8 +697,9 @@ TEST_CASE("SYNC connect-refused on primary (TCP) -> failover to B",
 TEST_CASE("Transport-level: refused TCP connect throws DnsNetworkException (type discriminates)",
           "[dns][failover][transport][network]")
 {
+  testnet::RefusingEndpoint dead;
   DnsConfig cfg;
-  cfg.setServers({"127.0.0.1:" + std::to_string(PORT_DEAD)});
+  cfg.setServers({"127.0.0.1:" + std::to_string(dead.port())});
   cfg.timeout = SHORT_TIMEOUT;
   cfg.retryCount = 0;
   cfg.transportMode = DnsTransportMode::TCP;
@@ -715,7 +712,7 @@ TEST_CASE("Transport-level: refused TCP connect throws DnsNetworkException (type
   bool wasNetwork = false;
   try
   {
-    transport->query(aQ("host.example.com"), "127.0.0.1", PORT_DEAD);
+    transport->query(aQ("host.example.com"), "127.0.0.1", dead.port());
   }
   catch (const DnsNetworkException &)
   {
@@ -1053,7 +1050,7 @@ TEST_CASE("ASYNC all-server exhaustion -> resolveServiceDomainAsync outcome=Tran
 TEST_CASE("ASYNC end-to-end: two real MockDnsServer, SERVFAIL on A -> resolveServiceDomainAsync via B",
           "[dns][failover][async][wire]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   // A SERVFAILs the NAPTR and SRV; B answers the full direct-SRV chain.
@@ -1065,7 +1062,7 @@ TEST_CASE("ASYNC end-to-end: two real MockDnsServer, SERVFAIL on A -> resolveSer
     (*n)->addRecord({"sip1." + domain, "A", "192.0.2.70", 3600});
     (*n)->addRecord({"sip1." + domain, "AAAA", "2001:db8::70", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   auto prom = std::make_shared<std::promise<ServiceResolutionResult>>();
   auto fut = prom->get_future();
@@ -1192,7 +1189,7 @@ ServiceResolutionResult driveServiceAsync(const std::shared_ptr<DnsResolver> &r,
 TEST_CASE("ASYNC A/AAAA fan-out failover: target host A SERVFAIL on one server, resolved via other",
           "[dns][failover][async][wire][aaaa]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1203,7 +1200,7 @@ TEST_CASE("ASYNC A/AAAA fan-out failover: target host A SERVFAIL on one server, 
   // The target host's A SERVFAILs on A but is present on B -> the A/AAAA fan-out must fail over.
   a->configureQuery("sip1." + domain, "A", servfail());
   b->addRecord({"sip1." + domain, "A", "192.0.2.90", 3600});
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
   REQUIRE(res.isSuccess());
@@ -1217,7 +1214,7 @@ TEST_CASE("ASYNC A/AAAA fan-out failover: target host A SERVFAIL on one server, 
 TEST_CASE("ASYNC SRV target with all-server-transient A/AAAA -> outcome=TransientFailure",
           "[dns][failover][async][outcome][aaaa]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1229,7 +1226,7 @@ TEST_CASE("ASYNC SRV target with all-server-transient A/AAAA -> outcome=Transien
     (*n)->configureQuery("sip1." + domain, "A", servfail());
     (*n)->configureQuery("sip1." + domain, "AAAA", servfail());
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
   REQUIRE_FALSE(res.isSuccess());
@@ -1241,7 +1238,7 @@ TEST_CASE("ASYNC SRV target with all-server-transient A/AAAA -> outcome=Transien
 TEST_CASE("ASYNC secure resolution failover preserves the SIPS filter (no plaintext target)",
           "[dns][failover][async][secure]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "secure.example.net";
   const std::string sipsSrv = "_sips._tcp." + domain;
   // A SERVFAILs the NAPTR and the SIPS SRV; B answers the secure chain.
@@ -1252,7 +1249,7 @@ TEST_CASE("ASYNC secure resolution failover preserves the SIPS filter (no plaint
   {
     (*n)->addRecord({"sips1." + domain, "A", "192.0.2.91", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIPS_TLS}, /*secure=*/true);
   REQUIRE(res.isSuccess()); // non-vacuous: failover to B produced the secure direct-SRV target
@@ -1268,7 +1265,7 @@ TEST_CASE("ASYNC secure resolution failover preserves the SIPS filter (no plaint
 
 TEST_CASE("SYNC NOTIMP on a direct-SRV query -> failover to B", "[dns][failover][sync][gate]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   // No NAPTR anywhere -> direct-SRV. The SRV query gets NOTIMP on A (server-local for a NON-NAPTR
@@ -1279,7 +1276,7 @@ TEST_CASE("SYNC NOTIMP on a direct-SRV query -> failover to B", "[dns][failover]
   {
     (*n)->addRecord({"sip1." + domain, "A", "192.0.2.92", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
 
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
   REQUIRE(res.isSuccess());
@@ -1290,9 +1287,9 @@ TEST_CASE("SYNC NOTIMP on a direct-SRV query -> failover to B", "[dns][failover]
 TEST_CASE("SYNC N=1 single-server timeout -> DnsTransientResolutionException",
           "[dns][failover][sync][timeout]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("host.example.com", timeoutCfg());
-  auto r = makeResolver({PORT_A}, SHORT_TIMEOUT, /*retryCount=*/0);
+  auto r = makeResolver({a.port}, SHORT_TIMEOUT, /*retryCount=*/0);
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsTransientResolutionException);
 }
 
@@ -1300,12 +1297,12 @@ TEST_CASE("SYNC N=1 single-server timeout -> DnsTransientResolutionException",
 
 TEST_CASE("resolveHostname all-server timeout -> transient throw", "[dns][failover][sync][resolvehostname]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", "A", timeoutCfg());
   a->configureQuery("host.example.com", "AAAA", timeoutCfg());
   b->configureQuery("host.example.com", "A", timeoutCfg());
   b->configureQuery("host.example.com", "AAAA", timeoutCfg());
-  auto r = makeResolver({PORT_A, PORT_B}, SHORT_TIMEOUT, /*retryCount=*/0);
+  auto r = makeResolver({a.port, b.port}, SHORT_TIMEOUT, /*retryCount=*/0);
   REQUIRE_THROWS_AS(r->resolveHostname("host.example.com"), DnsTransientResolutionException);
 }
 
@@ -1314,7 +1311,7 @@ TEST_CASE("resolveHostname all-server timeout -> transient throw", "[dns][failov
 TEST_CASE("SYNC resolveServiceDomain all-server-transient -> outcome=TransientFailure",
           "[dns][failover][sync][outcome]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1324,7 +1321,7 @@ TEST_CASE("SYNC resolveServiceDomain all-server-transient -> outcome=TransientFa
     (*n)->configureQuery("sip1." + domain, "A", servfail());
     (*n)->configureQuery("sip1." + domain, "AAAA", servfail());
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
   REQUIRE_FALSE(res.isSuccess());
   REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -1332,7 +1329,7 @@ TEST_CASE("SYNC resolveServiceDomain all-server-transient -> outcome=TransientFa
 
 TEST_CASE("SYNC resolveServiceDomain success -> outcome=Resolved", "[dns][failover][sync][outcome]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1341,7 +1338,7 @@ TEST_CASE("SYNC resolveServiceDomain success -> outcome=Resolved", "[dns][failov
     (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
     (*n)->addRecord({"sip1." + domain, "A", "192.0.2.93", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
   REQUIRE(res.isSuccess());
   REQUIRE(res.outcome == ResolutionOutcome::Resolved);
@@ -1432,9 +1429,10 @@ TEST_CASE("ASYNC throwing user callback on the ISSUER-thread deliver does not do
 TEST_CASE("ASYNC connect-refused on primary (TCP, real transport) -> failover to B",
           "[dns][failover][async][wire][network]")
 {
-  MockNode b(PORT_B);
+  testnet::RefusingEndpoint dead;
+  MockNode b;
   b->addRecord({"host.example.com", "A", "192.0.2.102", 3600});
-  auto r = makeResolver({PORT_DEAD, PORT_B}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::TCP);
+  auto r = makeResolver({dead.port(), b.port}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::TCP);
   auto out = driveQueryAsync(r, aQ("host.example.com"));
   REQUIRE(out.completed);
   REQUIRE(out.callbacks == 1);
@@ -1447,7 +1445,7 @@ TEST_CASE("ASYNC connect-refused on primary (TCP, real transport) -> failover to
 TEST_CASE("SYNC NAPTR-S all-SRV-transient -> outcome=TransientFailure (SRV is terminal)",
           "[dns][failover][sync][outcome][naptr]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1455,7 +1453,7 @@ TEST_CASE("SYNC NAPTR-S all-SRV-transient -> outcome=TransientFailure (SRV is te
     (*n)->addRecord(naptrS(domain, srvName));
     (*n)->configureQuery(srvName, "SRV", servfail()); // SRV exhausts server-local on both servers
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
   REQUIRE_FALSE(res.isSuccess());
   REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -1464,7 +1462,7 @@ TEST_CASE("SYNC NAPTR-S all-SRV-transient -> outcome=TransientFailure (SRV is te
 TEST_CASE("ASYNC NAPTR-S all-SRV-transient -> outcome=TransientFailure",
           "[dns][failover][async][outcome][naptr]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1472,7 +1470,7 @@ TEST_CASE("ASYNC NAPTR-S all-SRV-transient -> outcome=TransientFailure",
     (*n)->addRecord(naptrS(domain, srvName));
     (*n)->configureQuery(srvName, "SRV", servfail());
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
   REQUIRE_FALSE(res.isSuccess());
   REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -1482,7 +1480,7 @@ TEST_CASE("ASYNC NAPTR-S all-SRV-transient -> outcome=TransientFailure",
 
 TEST_CASE("SYNC target host all-NXDOMAIN -> outcome=PermanentNoService", "[dns][failover][sync][outcome]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1491,7 +1489,7 @@ TEST_CASE("SYNC target host all-NXDOMAIN -> outcome=PermanentNoService", "[dns][
     (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
     // sip1 has NO A/AAAA record anywhere -> authoritative NXDOMAIN -> permanent, not transient.
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
   REQUIRE_FALSE(res.isSuccess());
   REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
@@ -1499,7 +1497,7 @@ TEST_CASE("SYNC target host all-NXDOMAIN -> outcome=PermanentNoService", "[dns][
 
 TEST_CASE("ASYNC target host all-NXDOMAIN -> outcome=PermanentNoService", "[dns][failover][async][outcome]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   for (auto *n : {&a, &b})
@@ -1507,7 +1505,7 @@ TEST_CASE("ASYNC target host all-NXDOMAIN -> outcome=PermanentNoService", "[dns]
     (*n)->addRecord(naptrS(domain, srvName));
     (*n)->addRecord({srvName, "SRV", "sip1." + domain, 3600, 10, 0, 5060});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
   REQUIRE_FALSE(res.isSuccess());
   REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
@@ -1518,7 +1516,7 @@ TEST_CASE("ASYNC target host all-NXDOMAIN -> outcome=PermanentNoService", "[dns]
 TEST_CASE("ASYNC NAPTR NOTIMP -> straight to direct-SRV, B not asked for NAPTR (Q5)",
           "[dns][failover][async][naptr][q5]")
 {
-  MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+  MockNode a(/*log=*/true), b(/*log=*/true);
   const std::string domain = "example.net";
   const std::string srvName = "_sip._udp." + domain;
   a->configureQuery(domain, "NAPTR", notimp());
@@ -1528,7 +1526,7 @@ TEST_CASE("ASYNC NAPTR NOTIMP -> straight to direct-SRV, B not asked for NAPTR (
     (*n)->addRecord({"sip1." + domain, "A", "192.0.2.103", 3600});
     (*n)->addRecord({"sip1." + domain, "AAAA", "2001:db8::103", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
   REQUIRE(res.isSuccess());
   REQUIRE(a.countType(35) == 1); // exactly ONE NAPTR query
@@ -1540,7 +1538,7 @@ TEST_CASE("ASYNC NAPTR NOTIMP -> straight to direct-SRV, B not asked for NAPTR (
 TEST_CASE("SIPS/secure failover exercises the NAPTR §4.1 filter: plaintext NAPTR discarded (LOW-4)",
           "[dns][failover][async][secure][naptr]")
 {
-  MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+  MockNode a(/*log=*/true), b(/*log=*/true);
   const std::string domain = "secure.example.net";
   const std::string sipsSrv = "_sips._tcp." + domain;
   const std::string sipTcpSrv = "_sip._tcp." + domain;
@@ -1558,7 +1556,7 @@ TEST_CASE("SIPS/secure failover exercises the NAPTR §4.1 filter: plaintext NAPT
     (*n)->addRecord({"sips1." + domain, "A", "192.0.2.104", 3600});
     (*n)->addRecord({"plain1." + domain, "A", "192.0.2.105", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIPS_TLS}, /*secure=*/true);
 
   REQUIRE(res.isSuccess());        // non-vacuous: the secure chain resolved
@@ -1611,18 +1609,18 @@ TEST_CASE("NAPTR-S partial success (one SRV set transient, other resolves) -> Re
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, pref);
     REQUIRE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::Resolved);
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, pref);
     REQUIRE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::Resolved);
@@ -1648,18 +1646,18 @@ TEST_CASE("NAPTR-S all-SRV-authoritative-negative -> PermanentNoService (sync+as
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, pref);
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, pref);
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
@@ -1694,15 +1692,15 @@ TEST_CASE("NAPTR-S mixed (transient SRV sibling + resolved-then-NXDOMAIN target)
 
   ResolutionOutcome syncOutcome, asyncOutcome;
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     syncOutcome = r->resolveServiceDomain(domain, pref).outcome;
   }
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     asyncOutcome = driveServiceAsync(r, domain, pref).outcome;
   }
   REQUIRE(syncOutcome == asyncOutcome);                         // parity is the invariant under test
@@ -1753,10 +1751,10 @@ TEST_CASE("H-2: sync path issues retryCount+1 sends to a blackhole server before
   // retransmits before the sync wait gives up. timeout dominates the backoff so pre-H-2's
   // 1*timeout+backoff+2s budget cuts the schedule off before the 4th send (~3 sends), while the
   // H-2 4*timeout budget admits all 4. Mutation: revert H-2 -> udpQueries() drops below 4.
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("blackhole.example.com", timeoutCfg()); // never responds
   DnsConfig cfg;
-  cfg.setServers({"127.0.0.1:" + std::to_string(PORT_A)});
+  cfg.setServers({"127.0.0.1:" + std::to_string(a.port)});
   cfg.timeout = std::chrono::milliseconds(1200);
   cfg.retryCount = 3;
   cfg.initialRetryDelay = std::chrono::milliseconds(50);
@@ -1793,9 +1791,9 @@ TEST_CASE("H-3: NAPTR-S all-SRV-NXDOMAIN -> §4.2 A/AAAA fallback on the NAPTR t
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
     REQUIRE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::Resolved);
@@ -1806,9 +1804,9 @@ TEST_CASE("H-3: NAPTR-S all-SRV-NXDOMAIN -> §4.2 A/AAAA fallback on the NAPTR t
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
     REQUIRE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::Resolved);
@@ -1840,18 +1838,18 @@ TEST_CASE("H-3: NAPTR-S SRV '.' suppresses the §4.2 fallback for that service (
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::PermanentNoService);
@@ -1883,9 +1881,9 @@ TEST_CASE("M-4: direct-SRV all-server-SERVFAIL -> TransientFailure, NO apex A/AA
 
   SECTION("sync")
   {
-    MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+    MockNode a(/*log=*/true), b(/*log=*/true);
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -1894,9 +1892,9 @@ TEST_CASE("M-4: direct-SRV all-server-SERVFAIL -> TransientFailure, NO apex A/AA
   }
   SECTION("async")
   {
-    MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+    MockNode a(/*log=*/true), b(/*log=*/true);
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -1915,10 +1913,10 @@ TEST_CASE("M-4: direct-SRV all-server-SERVFAIL -> TransientFailure, NO apex A/AA
 TEST_CASE("F-3: truncated (TC=1) empty NOERROR is NOT authoritative -> failover (RFC 2181 §9)",
           "[dns][failover][sync][gate]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", truncatedEmpty()); // A: NOERROR/0/TC=1
   b->addRecord({"host.example.com", "A", "192.0.2.30", 3600});
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   // Pre-fix: TC=1 empty was classified as an authoritative type-3 NODATA -> query() would STOP at A
   // and throw. Post-fix: server-local -> rotate to B and resolve.
   REQUIRE(r->query(aQ("host.example.com")).isSuccess());
@@ -1932,19 +1930,19 @@ TEST_CASE("F-4: lame (RA=0/AA=0) empty NOERROR is server-local -> failover; RA=1
 {
   SECTION("lame empty (RA=0) rotates")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", lameEmpty());
     b->addRecord({"host.example.com", "A", "192.0.2.31", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE(r->query(aQ("host.example.com")).isSuccess());
     REQUIRE(b.udpQueries() >= 1);
   }
   SECTION("type-3 NODATA (RA=1, empty authority) is authoritative -> NO failover (control)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", nodataNoSoa()); // RA=1, no SOA/NS
     b->addRecord({"host.example.com", "A", "192.0.2.32", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
     REQUIRE(b.udpQueries() == 0);
   }
@@ -1957,10 +1955,10 @@ TEST_CASE("H-1 async: referral rotates, type-3 NODATA is terminal (classifyAsync
 {
   SECTION("referral -> failover to B (async)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", referral());
     b->addRecord({"host.example.com", "A", "192.0.2.33", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     auto out = driveQueryAsync(r, aQ("host.example.com"));
     REQUIRE(out.completed);
     REQUIRE(out.callbacks == 1);
@@ -1969,10 +1967,10 @@ TEST_CASE("H-1 async: referral rotates, type-3 NODATA is terminal (classifyAsync
   }
   SECTION("type-3 NODATA -> terminal, NO rotation (async)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", nodataNoSoa());
     b->addRecord({"host.example.com", "A", "192.0.2.34", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     auto out = driveQueryAsync(r, aQ("host.example.com"));
     REQUIRE(out.completed);
     REQUIRE(out.callbacks == 1);
@@ -1986,10 +1984,10 @@ TEST_CASE("H-1 async: referral rotates, type-3 NODATA is terminal (classifyAsync
 TEST_CASE("F-7: CNAME-only NOERROR is classified as NODATA, not returned as success (RFC 2308 §2.2)",
           "[dns][failover][sync][cname]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   // alias -> CNAME real.example.com, but NO A for alias in this answer + an authoritative SOA.
   a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com"));
-  auto r = makeResolver({PORT_A});
+  auto r = makeResolver({a.port});
   // Pre-fix: isSuccess() (ANCOUNT>0 for the CNAME) returned it as a success. Post-fix: recognized
   // as an authoritative NODATA and thrown, so it is not returned/cached as a positive result.
   REQUIRE_THROWS_AS(r->query(aQ("alias.example.com")), DnsResolutionFailedException);
@@ -2020,9 +2018,9 @@ TEST_CASE("F-5: NAPTR-S §4.2 fallback keeps NAPTR preference order (UDP<TCP), s
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, pref);
     REQUIRE(res.isSuccess());
     REQUIRE(res.targets.size() == 2);
@@ -2031,9 +2029,9 @@ TEST_CASE("F-5: NAPTR-S §4.2 fallback keeps NAPTR preference order (UDP<TCP), s
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, pref);
     REQUIRE(res.isSuccess());
     REQUIRE(res.targets.size() == 2);
@@ -2062,9 +2060,9 @@ TEST_CASE("H-3 secure: NAPTR-S SIPS all-SRV-NXDOMAIN -> §4.2 fallback SIPS/5061
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIPS_TLS}, true);
     REQUIRE(res.isSuccess());
     REQUIRE(res.targets.size() == 1);
@@ -2077,9 +2075,9 @@ TEST_CASE("H-3 secure: NAPTR-S SIPS all-SRV-NXDOMAIN -> §4.2 fallback SIPS/5061
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIPS_TLS}, true);
     REQUIRE(res.isSuccess());
     REQUIRE(res.targets.size() == 1);
@@ -2114,9 +2112,9 @@ TEST_CASE("H-3: per-service '.' suppression under NAPTR-S multi-service (only TC
 
   SECTION("sync")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, pref);
     REQUIRE(res.isSuccess());
     REQUIRE(res.targets.size() == 1);
@@ -2124,9 +2122,9 @@ TEST_CASE("H-3: per-service '.' suppression under NAPTR-S multi-service (only TC
   }
   SECTION("async")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, pref);
     REQUIRE(res.isSuccess());
     REQUIRE(res.targets.size() == 1);
@@ -2154,9 +2152,9 @@ TEST_CASE("M-4: NAPTR-S all-SRV-SERVFAIL -> TransientFailure, apex A NOT queried
 
   SECTION("sync")
   {
-    MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+    MockNode a(/*log=*/true), b(/*log=*/true);
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -2165,9 +2163,9 @@ TEST_CASE("M-4: NAPTR-S all-SRV-SERVFAIL -> TransientFailure, apex A NOT queried
   }
   SECTION("async")
   {
-    MockNode a(PORT_A, /*log=*/true), b(PORT_B, /*log=*/true);
+    MockNode a(/*log=*/true), b(/*log=*/true);
     configure(a, b);
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     ServiceResolutionResult res = driveServiceAsync(r, domain, {ServiceType::SIP_UDP});
     REQUIRE_FALSE(res.isSuccess());
     REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -2181,10 +2179,10 @@ TEST_CASE("M-4: NAPTR-S all-SRV-SERVFAIL -> TransientFailure, apex A NOT queried
 TEST_CASE("H-1: type-3 NODATA (no SOA) authoritative but NOT negatively cached (RFC 2308 §5)",
           "[dns][failover][sync][cache]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("host.example.com", "A", nodataNoSoa()); // RA=1, no SOA -> authoritative, no TTL
   auto cache = std::make_shared<DnsCache>();
-  auto r = makeResolver({PORT_A}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
+  auto r = makeResolver({a.port}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
   REQUIRE(a.udpQueries() == 2); // NOT cached (no SOA) -> the second query re-hits the network
@@ -2195,14 +2193,14 @@ TEST_CASE("H-1: type-3 NODATA (no SOA) authoritative but NOT negatively cached (
 TEST_CASE("F-1: additional-section glue is not returned as the host address (RFC 2181 §5.4.1)",
           "[dns][failover][sync][glue]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   // Answer A(host -> 192.0.2.1), authority NS, additional glue A(ns1.host -> 192.0.2.53).
   MockDnsServer::QueryConfig withGlue;
   withGlue.answerAddrWithGlue = "192.0.2.1";
   withGlue.glueOwner = "ns1.host.example.com";
   withGlue.glueAddr = "192.0.2.53";
   a->configureQuery("host.example.com", "A", withGlue);
-  auto r = makeResolver({PORT_A});
+  auto r = makeResolver({a.port});
   auto addrs = r->resolveHostname("host.example.com");
   // Pre-fix: the parser merged the additional-section glue into a_records, so 192.0.2.53 leaked in.
   REQUIRE(addrs.size() == 1);
@@ -2221,10 +2219,10 @@ TEST_CASE("F-1: additional-section glue is not returned as the host address (RFC
 TEST_CASE("H-1: CNAME-only NODATA is not cached positive; sync twice both throw (F-7 cache)",
           "[dns][failover][sync][cname][cache]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com")); // CNAME + SOA
   auto cache = std::make_shared<DnsCache>();
-  auto r = makeResolver({PORT_A}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
+  auto r = makeResolver({a.port}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
   REQUIRE_THROWS_AS(r->query(aQ("alias.example.com")), DnsResolutionFailedException);
   // It must be cached NEGATIVELY (SOA-min TTL), never positively with the CNAME TTL. Mutation: revert
   // cacheQueryResult to `isSuccess()` -> a positive insertion (insertions>=1, negative_insertions==0).
@@ -2238,9 +2236,9 @@ TEST_CASE("H-1: CNAME-only NODATA is not cached positive; sync twice both throw 
 TEST_CASE("H-1: queryAsync delivers CNAME-only NODATA as an ERROR, matching sync (F-7 async)",
           "[dns][failover][async][cname]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com"));
-  auto r = makeResolver({PORT_A});
+  auto r = makeResolver({a.port});
   auto out = driveQueryAsync(r, aQ("alias.example.com"));
   REQUIRE(out.completed);
   REQUIRE(out.callbacks == 1);
@@ -2252,9 +2250,9 @@ TEST_CASE("H-1: queryAsync delivers CNAME-only NODATA as an ERROR, matching sync
 TEST_CASE("F-7 control: CNAME chased to an A in the same answer resolves (not a NODATA)",
           "[dns][failover][sync][cname]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("alias.example.com", "A", cnameThenA("real.example.com", "192.0.2.77"));
-  auto r = makeResolver({PORT_A});
+  auto r = makeResolver({a.port});
   auto addrs = r->resolveHostname("alias.example.com");
   REQUIRE(addrs.size() == 1);
   REQUIRE(addrs[0] == "192.0.2.77"); // the chased target A is a real positive answer
@@ -2267,19 +2265,19 @@ TEST_CASE("M-1: CNAME-only without SOA (empty authority) rotates; with SOA is au
 {
   SECTION("no SOA -> server-local -> failover to B")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com", /*withSoa=*/false));
     b->addRecord({"alias.example.com", "A", "192.0.2.78", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE(r->query(aQ("alias.example.com")).isSuccess());
     REQUIRE(b.udpQueries() >= 1); // rotated: an unresolved CNAME target is not authoritative absence
   }
   SECTION("with SOA -> authoritative -> NO failover (control)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com", /*withSoa=*/true));
     b->addRecord({"alias.example.com", "A", "192.0.2.79", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("alias.example.com")), DnsResolutionFailedException);
     REQUIRE(b.udpQueries() == 0);
   }
@@ -2292,19 +2290,19 @@ TEST_CASE("M-2: lame NXDOMAIN (RA=0/AA=0) rotates; RA=1 NXDOMAIN stops (control)
 {
   SECTION("lame NXDOMAIN rotates to B")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", lameNxdomain());
     b->addRecord({"host.example.com", "A", "192.0.2.80", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE(r->query(aQ("host.example.com")).isSuccess());
     REQUIRE(b.udpQueries() >= 1);
   }
   SECTION("recursive NXDOMAIN (RA=1) stops at A -> B untouched (control)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     // A has no record for host.example.com -> the mock's default NXDOMAIN has RA=1 -> authoritative.
     b->addRecord({"host.example.com", "A", "192.0.2.81", 3600}); // present but must NOT be reached
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
     REQUIRE(b.udpQueries() == 0); // authoritative NXDOMAIN stopped rotation at A
   }
@@ -2317,10 +2315,10 @@ TEST_CASE("MED-2 async: TC=1-empty and lame-empty rotate through classifyAsyncCo
 {
   SECTION("TC=1 empty rotates (async)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", truncatedEmpty());
     b->addRecord({"host.example.com", "A", "192.0.2.82", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     auto out = driveQueryAsync(r, aQ("host.example.com"));
     REQUIRE(out.completed);
     REQUIRE(out.callbacks == 1);
@@ -2329,10 +2327,10 @@ TEST_CASE("MED-2 async: TC=1-empty and lame-empty rotate through classifyAsyncCo
   }
   SECTION("lame empty rotates (async)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", lameEmpty());
     b->addRecord({"host.example.com", "A", "192.0.2.83", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     auto out = driveQueryAsync(r, aQ("host.example.com"));
     REQUIRE(out.completed);
     REQUIRE(out.callbacks == 1);
@@ -2346,10 +2344,10 @@ TEST_CASE("MED-2 async: TC=1-empty and lame-empty rotate through classifyAsyncCo
 TEST_CASE("type-1 NODATA (NS + SOA in authority) is authoritative -> NO failover (RFC 2308 §2.2.1)",
           "[dns][failover][sync][gate]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", "A", nodataNsAndSoa()); // SOA present -> authoritative
   b->addRecord({"host.example.com", "A", "192.0.2.84", 3600});
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsResolutionFailedException);
   REQUIRE(b.udpQueries() == 0); // SOA is the deciding marker even with NS present
 }
@@ -2365,13 +2363,13 @@ TEST_CASE("LOW-8: §4.2 fallback follows NAPTR preference even when caller order
   // Caller lists TCP first, but NAPTR ranks UDP (pref 10) above TCP (pref 20). The fallback order
   // must follow NAPTR preference (UDP first), NOT the caller's preferredTransports order.
   const std::vector<ServiceType> reversedPref{ServiceType::SIP_TCP, ServiceType::SIP_UDP};
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   for (auto *n : {&a, &b})
   {
     addTwoNaptrSets(*n, domain, udpSrv, tcpSrv);
     (*n)->addRecord({domain, "A", "192.0.2.214", 3600});
   }
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   ServiceResolutionResult res = r->resolveServiceDomain(domain, reversedPref);
   REQUIRE(res.isSuccess());
   REQUIRE(res.targets.size() == 2);
@@ -2389,10 +2387,10 @@ TEST_CASE("LOW-8: §4.2 fallback follows NAPTR preference even when caller order
 TEST_CASE("M-A: truncated (TC=1) CNAME-only+SOA is server-local -> failover (RFC 2181 §9)",
           "[dns][failover][sync][cname][gate]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("alias.example.com", "A", cnameOnlyTruncated("real.example.com")); // CNAME+SOA+TC
   b->addRecord({"alias.example.com", "A", "192.0.2.90", 3600});
-  auto r = makeResolver({PORT_A, PORT_B});
+  auto r = makeResolver({a.port, b.port});
   // Pre-fix: the CNAME-only branch returned Authoritative before the TC guard -> stopped at A/threw.
   REQUIRE(r->query(aQ("alias.example.com")).isSuccess());
   REQUIRE(b.udpQueries() >= 1); // TC-truncated -> rotated to B
@@ -2403,10 +2401,10 @@ TEST_CASE("M-A: truncated (TC=1) CNAME-only+SOA is server-local -> failover (RFC
 TEST_CASE("M-C: ANY query on a CNAME-only answer resolves (meta-qtype not NODATA, RFC 1034 §3.6.2)",
           "[dns][failover][sync][cname][gate]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   // Name-level config (no type) so it also answers the ANY (type 255) query.
   a->configureQuery("alias.example.com", cnameOnly("real.example.com"));
-  auto r = makeResolver({PORT_A});
+  auto r = makeResolver({a.port});
   // Pre-fix: none_of(answers, type==ANY) was always true -> misclassified as NODATA and thrown.
   DnsResult res = r->query(anyQ("alias.example.com"));
   REQUIRE(res.isSuccess());              // the CNAME IS the valid answer to an ANY query on an alias
@@ -2418,10 +2416,10 @@ TEST_CASE("M-C: ANY query on a CNAME-only answer resolves (meta-qtype not NODATA
 TEST_CASE("L-1: an ADDITIONAL-section SOA is not used for negative caching (RFC 2308 §3)",
           "[dns][failover][sync][gate][cache]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("host.example.com", "A", nodataSoaInAdditional()); // SOA in ADDITIONAL only, RA=1
   auto cache = std::make_shared<DnsCache>();
-  auto r = makeResolver({PORT_A}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
+  auto r = makeResolver({a.port}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
   // The reply is an authoritative type-3 NODATA (empty AUTHORITY, RA=1) -> it throws. The L-1 point
   // is CACHING: the SOA sits in ADDITIONAL, not AUTHORITY, so there is no RFC 2308 §5 TTL and it must
   // NOT be negatively cached. Mutation: promote the additional SOA -> negative_insertions >= 1.
@@ -2434,10 +2432,10 @@ TEST_CASE("L-1: an ADDITIONAL-section SOA is not used for negative caching (RFC 
 TEST_CASE("M-D: queryAsync served from a negative cache entry delivers an error (async cache read)",
           "[dns][failover][async][cname][cache]")
 {
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com"));
   auto cache = std::make_shared<DnsCache>();
-  auto r = makeResolver({PORT_A}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
+  auto r = makeResolver({a.port}, SHORT_TIMEOUT, /*retryCount=*/0, DnsTransportMode::UDP, cache);
   auto first = driveQueryAsync(r, aQ("alias.example.com"));
   REQUIRE(first.completed);
   REQUIRE(first.error); // first fresh async resolution -> error (negative), cached negatively
@@ -2456,10 +2454,10 @@ TEST_CASE("LOW-7 async: CNAME-only-no-SOA and lame-NXDOMAIN rotate through the a
 {
   SECTION("CNAME-only without SOA rotates (async, M-1)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("alias.example.com", "A", cnameOnly("real.example.com", /*withSoa=*/false));
     b->addRecord({"alias.example.com", "A", "192.0.2.92", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     auto out = driveQueryAsync(r, aQ("alias.example.com"));
     REQUIRE(out.completed);
     REQUIRE(out.callbacks == 1);
@@ -2468,10 +2466,10 @@ TEST_CASE("LOW-7 async: CNAME-only-no-SOA and lame-NXDOMAIN rotate through the a
   }
   SECTION("lame NXDOMAIN rotates (async, M-2)")
   {
-    MockNode a(PORT_A), b(PORT_B);
+    MockNode a, b;
     a->configureQuery("host.example.com", lameNxdomain());
     b->addRecord({"host.example.com", "A", "192.0.2.93", 3600});
-    auto r = makeResolver({PORT_A, PORT_B});
+    auto r = makeResolver({a.port, b.port});
     auto out = driveQueryAsync(r, aQ("host.example.com"));
     REQUIRE(out.completed);
     REQUIRE(out.callbacks == 1);

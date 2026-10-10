@@ -17,6 +17,8 @@
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 
+#include "iora_test_net_utils.hpp"
+
 #include <iora/network/websocket_server.hpp>
 
 #include <arpa/inet.h>
@@ -35,13 +37,6 @@
 
 using namespace iora::network;
 using namespace std::chrono_literals;
-
-static std::uint16_t nextPort()
-{
-  static std::atomic<std::uint16_t> base{static_cast<std::uint16_t>(
-    9600 + (std::chrono::steady_clock::now().time_since_epoch().count() % 1000))};
-  return base.fetch_add(1);
-}
 
 template <typename Pred>
 static bool waitFor(Pred pred, std::chrono::milliseconds timeout = 5000ms)
@@ -224,7 +219,7 @@ static bool mapsEmpty(RaceServer &s)
 TEST_CASE("WS race: transport close during handshake window -> onConnect then one onClose(1006)",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -255,7 +250,7 @@ TEST_CASE("WS race: transport close during handshake window -> onConnect then on
 TEST_CASE("WS race: transport close at BeforeCommit -> onConnect then one onClose(1006)",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -285,7 +280,7 @@ TEST_CASE("WS race: transport close at BeforeCommit -> onConnect then one onClos
 TEST_CASE("WS race: transport close before mark -> upgrade aborted, no callbacks, no leak",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -311,7 +306,7 @@ TEST_CASE("WS race: transport close before mark -> upgrade aborted, no callbacks
 TEST_CASE("WS race: steady-state close after handshake -> onConnect then one onClose(1006)",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -341,7 +336,7 @@ TEST_CASE("WS race: steady-state close after handshake -> onConnect then one onC
 // ── RST (not FIN) still yields exactly-once onClose(1006) ───────────────────────
 TEST_CASE("WS race: RST after handshake -> one onClose(1006)", "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -368,7 +363,7 @@ TEST_CASE("WS race: RST after handshake -> one onClose(1006)", "[ws][race][core]
 TEST_CASE("WS race: concurrent double-upgrade on one sid -> exactly one session",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -413,7 +408,7 @@ TEST_CASE("WS race: concurrent double-upgrade on one sid -> exactly one session"
 TEST_CASE("WS race: throwing onConnect aborts cleanly, no leak, server survives",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   std::atomic<int> connectAttempts{0};
   std::atomic<int> closes{0};
@@ -449,7 +444,7 @@ TEST_CASE("WS race: throwing onConnect aborts cleanly, no leak, server survives"
 TEST_CASE("WS race: upgrade validation failure then close -> no WS onClose",
           "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);
@@ -472,7 +467,7 @@ TEST_CASE("WS race: upgrade validation failure then close -> no WS onClose",
 // ── soak: N upgrade+close cycles leave both maps empty (leak-growth guard) ───────
 TEST_CASE("WS race: soak N cycles -> no session/marker leak", "[ws][race][core]")
 {
-  auto port = nextPort();
+  auto port = testnet::getFreePortTCP();
   RaceServer server("127.0.0.1", port);
   CbLog log;
   wireLog(server, log);

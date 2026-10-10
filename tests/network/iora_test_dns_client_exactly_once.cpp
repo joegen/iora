@@ -17,6 +17,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "iora/network/dns/dns_resolver.hpp"
 #include "iora/network/dns/dns_types.hpp"
 #include "iora/network/dns_client.hpp"
@@ -37,12 +38,6 @@ using namespace iora::network::dns;
 
 namespace
 {
-// Distinct fixed ports from iora_test_dns_comprehensive (15353/15354): same-repo
-// ctest runs -j1 so serial reuse would be safe, but distinct ports avoid any
-// accidental overlap. Do NOT convert to a dynamic probe (fixed is the DNS-suite
-// convention here).
-constexpr std::uint16_t EO_UDP_PORT = 15373;
-constexpr std::uint16_t EO_TCP_PORT = 15374;
 constexpr std::chrono::milliseconds EO_STARTUP_DELAY{200};
 constexpr std::chrono::milliseconds EO_WAIT_BUDGET{3000};
 
@@ -75,16 +70,16 @@ private:
 class ExactlyOnceFixture
 {
 public:
-  ExactlyOnceFixture()
+  ExactlyOnceFixture() : port_(testnet::getFreePortUdpTcp())
   {
     MockDnsServer::Config serverConfig;
-    serverConfig.udpPort = EO_UDP_PORT;
-    serverConfig.tcpPort = EO_TCP_PORT;
+    serverConfig.udpPort = port_;
+    serverConfig.tcpPort = port_;
     serverConfig.enableLogging = false;
     mockServer_ = std::make_unique<MockDnsServer>(serverConfig);
 
     DnsConfig clientConfig;
-    clientConfig.setServers({"127.0.0.1:" + std::to_string(EO_UDP_PORT)});
+    clientConfig.setServers({"127.0.0.1:" + std::to_string(port_)});
     clientConfig.timeout = std::chrono::milliseconds(800);
     clientConfig.retryCount = 0; // bound timeout-branch tests to ~one timeout interval
     clientConfig.transportMode = DnsTransportMode::UDP;
@@ -107,10 +102,12 @@ public:
     std::this_thread::sleep_for(EO_STARTUP_DELAY);
   }
 
+  std::uint16_t port() const { return port_; }
   MockDnsServer &server() { return *mockServer_; }
   DnsClient &client() { return *dnsClient_; }
 
 private:
+  std::uint16_t port_;
   std::unique_ptr<MockDnsServer> mockServer_;
   std::unique_ptr<DnsClient> dnsClient_;
 };

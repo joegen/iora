@@ -72,11 +72,12 @@
 // rests on the _transportMutex copy-then-invoke discipline + the per-callback
 // weak.lock() gate + the onIo-gated teardown applied exactly.
 //
-// ctest runs -j1 (web tests bind fixed loopback ports).
+// ctest runs -j1.
 
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -96,6 +97,7 @@
 
 #include <iora/network/websocket_client.hpp>
 #include <iora/network/websocket_server.hpp>
+#include "iora_test_net_utils.hpp"
 
 using iora::network::SessionId;
 using iora::network::WebSocketClient;
@@ -118,9 +120,6 @@ static_assert(!std::is_move_constructible<WebSocketClient>::value,
 
 namespace
 {
-
-std::atomic<int> g_nextPort{19400};
-int nextPort() { return g_nextPort.fetch_add(1); }
 
 template <typename Pred> bool waitFor(Pred pred, int timeoutMs = 5000)
 {
@@ -407,7 +406,7 @@ WebSocketClient::Options autoReconnectOptions(int initialDelayMs = 20, int maxDe
 TEST_CASE("ws-reconnect: transport drop triggers a successful auto-reconnect (c)",
           "[ws][reconnect][integration][c]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -441,7 +440,7 @@ TEST_CASE("ws-reconnect: transport drop triggers a successful auto-reconnect (c)
 TEST_CASE("ws-reconnect: disconnect() invoked from the onClose callback does not hang (b)",
           "[ws][reconnect][integration][b][negative-baseline]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -489,7 +488,7 @@ TEST_CASE("ws-reconnect: disconnect() invoked from the onClose callback does not
 TEST_CASE("ws-reconnect: rapid drop/reconnect cycling never deadlocks (a F-1)",
           "[ws][reconnect][integration][a][f1][negative-baseline]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -528,7 +527,7 @@ TEST_CASE("ws-reconnect: rapid drop/reconnect cycling never deadlocks (a F-1)",
 TEST_CASE("ws-reconnect: concurrent send during repeated reconnect is race-clean (d M-5)",
           "[ws][reconnect][integration][d][stress]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -582,7 +581,7 @@ TEST_CASE("ws-reconnect: concurrent send during repeated reconnect is race-clean
 TEST_CASE("ws-reconnect: connect again after disconnect-from-callback still auto-reconnects (e)",
           "[ws][reconnect][integration][e][lifecycle]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -657,7 +656,7 @@ TEST_CASE("ws-reconnect: connect again after disconnect-from-callback still auto
 TEST_CASE("ws-reconnect: dropping the last client ref from onClose (I/O thread) is UAF-free (f)",
           "[ws][reconnect][integration][f][destroy-from-callback]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
   BodyOutcome outcome = completesWithin(
     [port, weakProbe](BodyResult &r)
@@ -722,7 +721,7 @@ TEST_CASE("ws-reconnect: dropping the last client ref from onClose (I/O thread) 
 TEST_CASE("ws-reconnect: dropping the last client ref from a worker callback (onStateChange) is UAF-free (f2)",
           "[ws][reconnect][integration][f2][destroy-from-callback]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
   // Brace-init the contained id to the "no thread" sentinel explicitly (the
   // trailing REQUIREs compare against std::thread::id{}); pre-C++20
@@ -809,7 +808,7 @@ TEST_CASE("ws-reconnect: dropping the last client ref from a worker callback (on
 TEST_CASE("ws-reconnect: weak-only callbacks leave no self-owning cycle (g leak)",
           "[ws][reconnect][integration][g][leak]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   auto weakProbe = std::make_shared<std::weak_ptr<WebSocketClient>>();
   BodyOutcome outcome = completesWithin(
     [port, weakProbe](BodyResult &r)
@@ -849,7 +848,7 @@ TEST_CASE("ws-reconnect: weak-only callbacks leave no self-owning cycle (g leak)
 TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (h)",
           "[ws][reconnect][integration][h][backoff]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -894,7 +893,7 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a long backoff sleep promptly (
 TEST_CASE("ws-reconnect: disconnect() interrupts a parked handshake-settle wait promptly (h2 H-3)",
           "[ws][reconnect][integration][h2][negative-baseline]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   BodyOutcome outcome = completesWithin(
     [port](BodyResult &r)
     {
@@ -942,12 +941,17 @@ TEST_CASE("ws-reconnect: disconnect() interrupts a parked handshake-settle wait 
 TEST_CASE("ws-reconnect: disconnect() racing settle-wait entry stays prompt across cycles (h3 H-3-R2)",
           "[ws][reconnect][integration][h3]")
 {
+  std::array<int, 8> ports{};
+  for (int &p : ports)
+  {
+    p = testnet::getFreePortTCP();
+  }
   BodyOutcome outcome = completesWithin(
-    [](BodyResult &r)
+    [ports](BodyResult &r)
     {
       for (int i = 0; i < 8; ++i)
       {
-        const int port = nextPort();
+        const int port = ports[i];
         auto client = WebSocketClient::create();
         {
           WsTestServer srv(port);

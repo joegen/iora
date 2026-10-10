@@ -276,7 +276,7 @@ int main(int argc, char *argv[])
   initializeTestLogging();
 
   iora::IoraService::Config config;
-  config.server.port = 8132;
+  config.server.port = 0;
   config.state.file = "ioraservice_api_module_reverse_map_state.json";
   config.log.file = "ioraservice_api_module_reverse_map_log";
   config.modules.autoLoad = false;

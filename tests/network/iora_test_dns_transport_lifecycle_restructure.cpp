@@ -39,6 +39,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "dns_transport_test_access.hpp" // shared white-box seam (SM-M1) + completesWithin
 
 #include "iora/network/dns/dns_message.hpp"
@@ -190,10 +191,10 @@ TEST_CASE("dns lifecycle: A timer-arm cross-thread re-entrant stop() is exempt (
 TEST_CASE("dns lifecycle: A IO-arm cross-thread re-entrant stop() is exempt (isOnIoThread)",
           "[dns][lifecycle][running]")
 {
-  constexpr std::uint16_t MOCK_PORT = 15412; // -j1-serialized (fixed port)
+  const std::uint16_t mockPort = testnet::getFreePortUdpTcp();
   MockDnsServer::Config scfg;
-  scfg.udpPort = MOCK_PORT;
-  scfg.tcpPort = MOCK_PORT;
+  scfg.udpPort = mockPort;
+  scfg.tcpPort = mockPort;
   scfg.enableTcp = false;
   scfg.enableUdp = true;
   scfg.defaultDelay = std::chrono::milliseconds(0);
@@ -203,7 +204,7 @@ TEST_CASE("dns lifecycle: A IO-arm cross-thread re-entrant stop() is exempt (isO
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   DnsConfig cfg;
-  cfg.setServers({std::string("127.0.0.1:") + std::to_string(MOCK_PORT)});
+  cfg.setServers({std::string("127.0.0.1:") + std::to_string(mockPort)});
   cfg.transportMode = DnsTransportMode::UDP; // single transport -> single I/O-thread arm
   cfg.timeout = std::chrono::milliseconds(3000);
   cfg.retryCount = 0;
@@ -227,7 +228,7 @@ TEST_CASE("dns lifecycle: A IO-arm cross-thread re-entrant stop() is exempt (isO
       t->stop();              // re-entrant stop() ON the transport I/O thread
       reentered.store(true);
     },
-    "127.0.0.1", MOCK_PORT);
+    "127.0.0.1", mockPort);
 
   REQUIRE(enteredFut.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
 
@@ -403,10 +404,10 @@ TEST_CASE("dns lifecycle: H-2 latch-released waiter observes completed callbacks
 TEST_CASE("dns lifecycle: C config/handle reads race stop()/updateConfig() cleanly (TSan)",
           "[dns][lifecycle][running]")
 {
-  constexpr std::uint16_t MOCK_PORT = 15414; // -j1-serialized
+  const std::uint16_t mockPort = testnet::getFreePortUdpTcp();
   MockDnsServer::Config scfg;
-  scfg.udpPort = MOCK_PORT;
-  scfg.tcpPort = MOCK_PORT;
+  scfg.udpPort = mockPort;
+  scfg.tcpPort = mockPort;
   scfg.enableTcp = false;
   scfg.enableUdp = true;
   scfg.defaultDelay = std::chrono::milliseconds(20);
@@ -418,7 +419,7 @@ TEST_CASE("dns lifecycle: C config/handle reads race stop()/updateConfig() clean
   for (int iter = 0; iter < 8; ++iter)
   {
     DnsConfig cfg;
-    cfg.setServers({std::string("127.0.0.1:") + std::to_string(MOCK_PORT)});
+    cfg.setServers({std::string("127.0.0.1:") + std::to_string(mockPort)});
     cfg.transportMode = DnsTransportMode::UDP;
     cfg.timeout = std::chrono::milliseconds(50);
     cfg.retryCount = 1;
@@ -446,7 +447,7 @@ TEST_CASE("dns lifecycle: C config/handle reads race stop()/updateConfig() clean
         });
     }
     std::thread cfgWriter(
-      [t, &go, MOCK_PORT]()
+      [t, &go, mockPort]()
       {
         while (!go.load())
         {
@@ -456,8 +457,8 @@ TEST_CASE("dns lifecycle: C config/handle reads race stop()/updateConfig() clean
         {
           DnsConfig c;
           c.transportMode = DnsTransportMode::UDP;
-          c.setServers({std::string("127.0.0.1:") + std::to_string(MOCK_PORT),
-                        std::string("127.0.0.2:") + std::to_string(MOCK_PORT)});
+          c.setServers({std::string("127.0.0.1:") + std::to_string(mockPort),
+                        std::string("127.0.0.2:") + std::to_string(mockPort)});
           c.timeout = std::chrono::milliseconds(50);
           t->updateConfig(c);
         }
@@ -483,10 +484,10 @@ TEST_CASE("dns lifecycle: C config/handle reads race stop()/updateConfig() clean
 TEST_CASE("dns lifecycle: C TCP handleTcpData _config reader races updateConfig cleanly (TSan)",
           "[dns][lifecycle][running]")
 {
-  constexpr std::uint16_t MOCK_PORT = 15416; // -j1-serialized
+  const std::uint16_t mockPort = testnet::getFreePortUdpTcp();
   MockDnsServer::Config scfg;
-  scfg.udpPort = MOCK_PORT;
-  scfg.tcpPort = MOCK_PORT;
+  scfg.udpPort = mockPort;
+  scfg.tcpPort = mockPort;
   scfg.enableTcp = true;
   scfg.enableUdp = false;
   scfg.defaultDelay = std::chrono::milliseconds(10);
@@ -498,7 +499,7 @@ TEST_CASE("dns lifecycle: C TCP handleTcpData _config reader races updateConfig 
   for (int iter = 0; iter < 4; ++iter)
   {
     DnsConfig cfg;
-    cfg.setServers({std::string("127.0.0.1:") + std::to_string(MOCK_PORT)});
+    cfg.setServers({std::string("127.0.0.1:") + std::to_string(mockPort)});
     cfg.transportMode = DnsTransportMode::TCP;
     cfg.timeout = std::chrono::milliseconds(100);
     cfg.retryCount = 0;
@@ -510,7 +511,7 @@ TEST_CASE("dns lifecycle: C TCP handleTcpData _config reader races updateConfig 
     for (int r = 0; r < 3; ++r)
     {
       readers.emplace_back(
-        [t, &go, MOCK_PORT]()
+        [t, &go, mockPort]()
         {
           while (!go.load())
           {
@@ -520,12 +521,12 @@ TEST_CASE("dns lifecycle: C TCP handleTcpData _config reader races updateConfig 
           {
             t->queryAsync(DnsQuestion("tcprace.example.test", DnsType::A, DnsClass::IN),
                           [](const DnsResult &, const std::exception_ptr &) {}, "127.0.0.1",
-                          MOCK_PORT);
+                          mockPort);
           }
         });
     }
     std::thread cfgWriter(
-      [t, &go, MOCK_PORT]()
+      [t, &go, mockPort]()
       {
         while (!go.load())
         {
@@ -535,7 +536,7 @@ TEST_CASE("dns lifecycle: C TCP handleTcpData _config reader races updateConfig 
         {
           DnsConfig c;
           c.transportMode = DnsTransportMode::TCP;
-          c.setServers({std::string("127.0.0.1:") + std::to_string(MOCK_PORT)});
+          c.setServers({std::string("127.0.0.1:") + std::to_string(mockPort)});
           c.timeout = std::chrono::milliseconds(100);
           c.maxTcpBufferSize = (u % 2) ? 4096u : 8192u; // the field handleTcpData reads
           t->updateConfig(c);

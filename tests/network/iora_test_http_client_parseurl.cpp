@@ -47,7 +47,7 @@ using iora::test::httpsrv::makeListener;
 class CapturingServer
 {
 public:
-  bool start(std::uint16_t port)
+  bool start(std::uint16_t port = 0)
   {
     _listenFd = makeListener(port);
     if (_listenFd < 0)
@@ -57,6 +57,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~CapturingServer() { shutdown(); }
 
@@ -330,9 +332,9 @@ TEST_CASE("parseUrl rejects malformed URLs but accepts an uppercase scheme",
     CHECK(std::string(e.what()).rfind("Invalid URL format: ", 0) == 0);
   }
 
-  const std::uint16_t port = 65534;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   const std::string url = "HTTP://127.0.0.1:" + std::to_string(port) + "/rpc";
   auto resp = client.get(url);
@@ -342,7 +344,7 @@ TEST_CASE("parseUrl rejects malformed URLs but accepts an uppercase scheme",
   const std::string req = server.capturedRequest();
   REQUIRE_FALSE(req.empty());
   // The canonicalized (lowercase) scheme still emits a correct Host line.
-  CHECK(req.find("Host: 127.0.0.1:65534\r\n") != std::string::npos);
+  CHECK(req.find("Host: 127.0.0.1:" + std::to_string(port) + "\r\n") != std::string::npos);
 }
 
 // A valid explicit port parses and the client connects to it — the fix does not

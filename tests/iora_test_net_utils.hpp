@@ -102,47 +102,74 @@ inline ScopedFd bindLoopbackV4Ephemeral(int sockType, std::uint16_t &port)
   return fd;
 }
 
-/// \brief Get a free port for `sockType` (SOCK_STREAM or SOCK_DGRAM). If minPort/maxPort
-/// are 0, the OS assigns one; otherwise the first bindable port in [minPort,maxPort] is
-/// returned. Shared core for getFreePortTCP/getFreePortUDP (tracker 2026-09-14-4).
-inline std::uint16_t getFreePort(int sockType, std::uint16_t minPort = 0,
-                                 std::uint16_t maxPort = 0)
+/// \brief Get a free port for `sockType` (SOCK_STREAM or SOCK_DGRAM), assigned by the OS.
+/// Shared core for getFreePortTCP/getFreePortUDP (tracker 2026-09-14-4).
+inline std::uint16_t getFreePort(int sockType)
 {
-  if (minPort > 0 && maxPort >= minPort)
-  {
-    ScopedFd fd{::socket(AF_INET, sockType, 0)};
-    REQUIRE(fd.get() >= 0);
-    int reuse = 1;
-    ::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    for (std::uint16_t p = minPort; p <= maxPort; ++p)
-    {
-      addr.sin_port = htons(p);
-      if (::bind(fd.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
-      {
-        return p; // fd closes on return (RAII)
-      }
-    }
-    REQUIRE(false); // No free port in range
-    return 0;
-  }
   std::uint16_t port = 0;
   ScopedFd fd = bindLoopbackV4Ephemeral(sockType, port); // closes on return
   return port;
 }
 
-/// \brief Get a free TCP port. If minPort/maxPort are 0, the OS assigns one.
-inline std::uint16_t getFreePortTCP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
+/// \brief Get a free TCP port, assigned by the OS.
+inline std::uint16_t getFreePortTCP()
 {
-  return getFreePort(SOCK_STREAM, minPort, maxPort);
+  return getFreePort(SOCK_STREAM);
 }
 
-/// \brief Get a free UDP port. If minPort/maxPort are 0, the OS assigns one.
-inline std::uint16_t getFreePortUDP(std::uint16_t minPort = 0, std::uint16_t maxPort = 0)
+/// \brief Get a free UDP port, assigned by the OS.
+inline std::uint16_t getFreePortUDP()
 {
-  return getFreePort(SOCK_DGRAM, minPort, maxPort);
+  return getFreePort(SOCK_DGRAM);
+}
+
+/// \brief Get a port that is free for BOTH UDP and TCP on INADDR_ANY, for a server
+/// that binds the same port on both protocols (MockDnsServer). Call it only inside a
+/// running test: it asserts.
+///
+/// Socket-option discipline: the UDP probe sets NO SO_REUSEADDR (two UDP sockets that
+/// both set it may share a port, so a probe with it cannot see a peer holder that also
+/// set it). The TCP probe sets SO_REUSEADDR, like MockDnsServer, so a TIME_WAIT port
+/// passes while a listening holder still conflicts. Both probes close before return,
+/// leaving the same accepted probe-then-bind gap as getFreePort.
+///
+/// errno discipline: retry only on EADDRINUSE at the TCP bind; any other errno fails
+/// loudly with strerror.
+inline std::uint16_t getFreePortUdpTcp()
+{
+  for (int attempt = 0; attempt < 50; ++attempt)
+  {
+    ScopedFd udp{::socket(AF_INET, SOCK_DGRAM, 0)};
+    REQUIRE(udp.get() >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = 0;
+    if (::bind(udp.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
+    {
+      FAIL("bind(UDP INADDR_ANY:0) failed: " << std::strerror(errno));
+    }
+    socklen_t len = sizeof(addr);
+    REQUIRE(::getsockname(udp.get(), reinterpret_cast<sockaddr *>(&addr), &len) == 0);
+    const std::uint16_t port = ntohs(addr.sin_port);
+
+    ScopedFd tcp{::socket(AF_INET, SOCK_STREAM, 0)};
+    REQUIRE(tcp.get() >= 0);
+    int reuse = 1;
+    ::setsockopt(tcp.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (::bind(tcp.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
+    {
+      return port; // udp and tcp close here
+    }
+    const int e = errno;
+    if (e != EADDRINUSE)
+    {
+      FAIL("bind(TCP INADDR_ANY) failed with an unexpected errno: " << std::strerror(e));
+    }
+    // EADDRINUSE on TCP: both close here; pick a fresh port, retry.
+  }
+  FAIL("no port free on both UDP and TCP after 50 attempts");
+  return 0;
 }
 
 // ── Dual-family loopback helpers (tracker 2026-09-25-15) ─────────────────────

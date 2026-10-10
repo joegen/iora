@@ -17,16 +17,14 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
+#include "network/http_client_test_server.hpp"
 
 #include <iora/network/http_client.hpp>
 #include <iora/network/webhook_server.hpp>
 
-#include <arpa/inet.h>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
-#include <cstring>
-#include <fcntl.h>
 #include <functional>
 #include <mutex>
 #include <netinet/in.h>
@@ -47,47 +45,7 @@ namespace
 // to emit a server-sent "Connection: close" (which WebhookServer overwrites) or
 // to close mid-exchange to force client failures.
 
-int makeListener(std::uint16_t port)
-{
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-  {
-    return -1;
-  }
-  int opt = 1;
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
-  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
-  {
-    ::close(fd);
-    return -1;
-  }
-  if (::listen(fd, 16) < 0)
-  {
-    ::close(fd);
-    return -1;
-  }
-  int flags = ::fcntl(fd, F_GETFL, 0);
-  ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  return fd;
-}
-
-void writeAll(int fd, const std::string &data)
-{
-  std::size_t off = 0;
-  while (off < data.size())
-  {
-    ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-    if (n <= 0)
-    {
-      break;
-    }
-    off += static_cast<std::size_t>(n);
-  }
-}
+using iora::test::httpsrv::writeAll;
 
 // Read one request's headers (clientSock has a recv timeout set). Returns true
 // if a full request header block arrived, false on timeout/close — lets a
@@ -122,9 +80,9 @@ using RawHandler = std::function<void(int, int)>;
 class RawServer
 {
 public:
-  bool start(std::uint16_t port, RawHandler handler)
+  bool start(RawHandler handler)
   {
-    _listenFd = makeListener(port);
+    _listenFd = iora::test::httpsrv::makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -133,6 +91,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~RawServer() { shutdown(); }
 
@@ -251,9 +211,9 @@ bool waitForFlag(const std::atomic<bool> &flag, std::chrono::milliseconds timeou
 class LeaseTestFixture
 {
 public:
-  explicit LeaseTestFixture(std::uint16_t port) : _port(port)
+  LeaseTestFixture() : _port(testnet::getFreePortTCP())
   {
-    server.setPort(port);
+    server.setPort(_port);
     server.onPost("/echo",
                   [](const WebhookServer::Request &req, WebhookServer::Response &res)
                   {
@@ -295,6 +255,8 @@ public:
     return "http://127.0.0.1:" + std::to_string(_port) + path;
   }
 
+  std::uint16_t port() const { return _port; }
+
   WebhookServer server;
   std::atomic<bool> holdEndpointEntered{false};
 
@@ -312,7 +274,7 @@ private:
 TEST_CASE("Shared HttpClient: concurrent same-host requests do not interleave",
           "[http_client_lease][concurrent]")
 {
-  LeaseTestFixture fixture(8087);
+  LeaseTestFixture fixture;
   HttpClient client; // shared across all threads; reuseConnections = true (default)
 
   const int numThreads = 8;
@@ -379,7 +341,7 @@ TEST_CASE("Shared HttpClient: concurrent same-host requests do not interleave",
 TEST_CASE("Shared HttpClient: drop-and-reconnect under contention is safe",
           "[http_client_lease][evict]")
 {
-  LeaseTestFixture fixture(8088);
+  LeaseTestFixture fixture;
   HttpClient::Config config;
   config.reuseConnections = false; // every exchange evicts the connection
   HttpClient client(config);
@@ -437,14 +399,13 @@ TEST_CASE("Shared HttpClient: drop-and-reconnect under contention is safe",
 TEST_CASE("Shared HttpClient: honors server-sent Connection: close (DD-A9)",
           "[http_client_lease][server_close]")
 {
-  const std::uint16_t port = 18950;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int /*idx*/)
+  REQUIRE(raw.start([](int clientSock, int /*idx*/)
                     {
                       readRequest(clientSock);
                       writeAll(clientSock, okResponse("hello", /*serverClose=*/true));
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -478,16 +439,15 @@ TEST_CASE("Shared HttpClient: honors server-sent Connection: close (DD-A9)",
 TEST_CASE("Shared HttpClient: honors lowercase 'connection: close' header name",
           "[http_client_lease][server_close][case_insensitive]")
 {
-  const std::uint16_t port = 18955;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int /*idx*/)
+  REQUIRE(raw.start([](int clientSock, int /*idx*/)
                     {
                       readRequest(clientSock);
                       // Lowercase field name + mixed-case value.
                       writeAll(clientSock,
                                customResponse("1.1", "hello", "connection: Close"));
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -512,10 +472,10 @@ TEST_CASE("Shared HttpClient: honors lowercase 'connection: close' header name",
 TEST_CASE("Shared HttpClient: multi-token Connection without a close token is reused",
           "[http_client_lease][server_close][tokenize]")
 {
-  const std::uint16_t port = 18956;
   RawServer raw;
-  REQUIRE(raw.start(port, keepAliveHandler(
+  REQUIRE(raw.start(keepAliveHandler(
                             customResponse("1.1", "kept", "Connection: keep-alive, X-Close-Hint"))));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -539,14 +499,13 @@ TEST_CASE("Shared HttpClient: multi-token Connection without a close token is re
 TEST_CASE("Shared HttpClient: HTTP/1.0 response without keep-alive evicts",
           "[http_client_lease][server_close][http10]")
 {
-  const std::uint16_t port = 18957;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int /*idx*/)
+  REQUIRE(raw.start([](int clientSock, int /*idx*/)
                     {
                       readRequest(clientSock);
                       writeAll(clientSock, customResponse("1.0", "v10", /*connectionLine=*/""));
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -564,10 +523,9 @@ TEST_CASE("Shared HttpClient: HTTP/1.0 response without keep-alive evicts",
 TEST_CASE("Shared HttpClient: HTTP/1.0 response with keep-alive is reused",
           "[http_client_lease][server_close][http10]")
 {
-  const std::uint16_t port = 18958;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    keepAliveHandler(customResponse("1.0", "v10ka", "Connection: keep-alive"))));
+  REQUIRE(raw.start(keepAliveHandler(customResponse("1.0", "v10ka", "Connection: keep-alive"))));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -586,15 +544,14 @@ TEST_CASE("Shared HttpClient: HTTP/1.0 response with keep-alive is reused",
 TEST_CASE("Shared HttpClient: 'keep-alive, close' token list evicts",
           "[http_client_lease][server_close][tokenize]")
 {
-  const std::uint16_t port = 18959;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int /*idx*/)
+  REQUIRE(raw.start([](int clientSock, int /*idx*/)
                     {
                       readRequest(clientSock);
                       writeAll(clientSock,
                                customResponse("1.1", "tl", "Connection: keep-alive, close"));
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -614,14 +571,13 @@ TEST_CASE("Shared HttpClient: 'keep-alive, close' token list evicts",
 TEST_CASE("Shared HttpClient: HTTP/1.0 response with explicit close evicts",
           "[http_client_lease][server_close][http10]")
 {
-  const std::uint16_t port = 18960;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int /*idx*/)
+  REQUIRE(raw.start([](int clientSock, int /*idx*/)
                     {
                       readRequest(clientSock);
                       writeAll(clientSock, customResponse("1.0", "v10c", "Connection: close"));
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -646,7 +602,7 @@ TEST_CASE("Shared HttpClient: HTTP/1.0 response with explicit close evicts",
 TEST_CASE("Shared HttpClient: large bodies do not interleave (no keep-alive)",
           "[http_client_lease][evict][large_body]")
 {
-  LeaseTestFixture fixture(8093);
+  LeaseTestFixture fixture;
   HttpClient::Config config;
   config.reuseConnections = false; // drop + reconnect every request
   config.requestTimeout = std::chrono::milliseconds(3000);
@@ -709,10 +665,8 @@ TEST_CASE("Shared HttpClient: large bodies do not interleave (no keep-alive)",
 TEST_CASE("Shared HttpClient: lease released when a request throws",
           "[http_client_lease][throw_release]")
 {
-  const std::uint16_t port = 18951;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int idx)
+  REQUIRE(raw.start([](int clientSock, int idx)
                     {
                       readRequest(clientSock);
                       if (idx == 0)
@@ -722,6 +676,7 @@ TEST_CASE("Shared HttpClient: lease released when a request throws",
                       }
                       writeAll(clientSock, okResponse("recovered", /*serverClose=*/false));
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -761,14 +716,13 @@ TEST_CASE("Shared HttpClient: lease released when a request throws",
 TEST_CASE("Shared HttpClient: retries under contention do not deadlock",
           "[http_client_lease][retry]")
 {
-  const std::uint16_t port = 18952;
   RawServer raw;
-  REQUIRE(raw.start(port,
-                    [](int clientSock, int /*idx*/)
+  REQUIRE(raw.start([](int clientSock, int /*idx*/)
                     {
                       readRequest(clientSock);
                       // Always close without a valid response -> client fails.
                     }));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   HttpClient::Config config;
@@ -814,7 +768,7 @@ TEST_CASE("Shared HttpClient: retries under contention do not deadlock",
 
 TEST_CASE("Shared HttpClient: bounded lease-acquire timeout", "[http_client_lease][lease_timeout]")
 {
-  LeaseTestFixture fixture(8089);
+  LeaseTestFixture fixture;
   HttpClient::Config config;
   config.requestTimeout = std::chrono::milliseconds(3000);
   config.leaseAcquireTimeout = std::chrono::milliseconds(150);
@@ -886,7 +840,7 @@ TEST_CASE("Shared HttpClient: bounded lease-acquire timeout", "[http_client_leas
 TEST_CASE("Shared HttpClient: cleanup wakes blocked lease waiter (DD-A8)",
           "[http_client_lease][shutdown]")
 {
-  LeaseTestFixture fixture(8090);
+  LeaseTestFixture fixture;
   HttpClient::Config config;
   config.requestTimeout = std::chrono::milliseconds(3000);
   config.leaseAcquireTimeout = std::chrono::milliseconds(0); // indefinite wait
@@ -939,8 +893,9 @@ TEST_CASE("Shared HttpClient: cleanup wakes blocked lease waiter (DD-A8)",
 TEST_CASE("Shared HttpClient: different hosts are not serialized",
           "[http_client_lease][concurrent_hosts]")
 {
-  LeaseTestFixture fixtureA(8091);
-  LeaseTestFixture fixtureB(8092);
+  LeaseTestFixture fixtureA;
+  LeaseTestFixture fixtureB;
+  REQUIRE(fixtureA.port() != fixtureB.port());
   HttpClient::Config config;
   config.requestTimeout = std::chrono::milliseconds(2000);
   HttpClient client(config);

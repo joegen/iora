@@ -447,7 +447,7 @@ int main(int argc, char *argv[])
 
   // Setup IoraService config - initialize once for all tests
   iora::IoraService::Config config;
-  config.server.port = 8130;
+  config.server.port = 0;
   config.state.file = "ioraservice_plugin_state.json";
   config.log.file = "ioraservice_plugin_log";
   config.modules.autoLoad = false;

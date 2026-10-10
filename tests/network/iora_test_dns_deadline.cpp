@@ -32,6 +32,7 @@
 #include <catch2/catch.hpp>
 
 #include "MockDnsServer.hpp"
+#include "iora_test_net_utils.hpp"
 #include "dns_transport_test_access.hpp" // white-box seam: calcMaxSyncWait
 #include "iora/network/dns_client.hpp"   // DnsClient forwarding smoke (M-C)
 #include "iora/network/dns/dns_cache.hpp"
@@ -55,11 +56,6 @@ using namespace std::chrono_literals;
 
 namespace
 {
-// Distinct port block from the other DNS suites (comprehensive=15353, address_policy=15453,
-// failover=15553). Deadline suite = PORT_A (15653) + small offsets, spanning ~15653..16003.
-constexpr std::uint16_t PORT_A = 15653;
-constexpr std::uint16_t PORT_B = 15654;
-
 constexpr std::chrono::milliseconds STARTUP_DELAY{150};
 constexpr std::chrono::seconds ASYNC_WAIT{6};
 
@@ -69,11 +65,11 @@ struct MockNode
   std::unique_ptr<MockDnsServer> server;
   std::uint16_t port;
 
-  explicit MockNode(std::uint16_t p, bool enableLogging = false) : port(p)
+  explicit MockNode(bool enableLogging = false) : port(testnet::getFreePortUdpTcp())
   {
     MockDnsServer::Config c;
-    c.udpPort = p;
-    c.tcpPort = p;
+    c.udpPort = port;
+    c.tcpPort = port;
     c.enableLogging = enableLogging; // needed for getQueryLog()-based per-type counting
     server = std::make_unique<MockDnsServer>(c);
     REQUIRE(server->start());
@@ -223,9 +219,9 @@ TEST_CASE("SYNC hard-cap bounds the in-flight wait far below the full budget",
   // One non-responding server, a LARGE config budget (timeout 5s => full budget >> 5s), and a
   // SMALL deadline. Without the cap query() would wait the full budget; the maxWait hard-cap must
   // bound the single in-flight wait to ~the deadline. (retryCount 0 so exactly one send.)
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("host.example.com", timeoutCfg());
-  auto r = makeResolver({PORT_A}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 400ms);
+  auto r = makeResolver({a.port}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 400ms);
 
   auto t0 = std::chrono::steady_clock::now();
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsTransientResolutionException);
@@ -245,10 +241,10 @@ TEST_CASE("SYNC query() deadline -> transient terminal, wall-clock bounded by ~d
   // DnsTransientResolutionException and the deadline-branch DnsDeadlineException are IS-A it, and
   // either is a correct terminal); the concrete DnsDeadlineException sub-type firing is asserted
   // deterministically in the IS-A test above (the ceil'd maxWait makes the gate fire on rotation).
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", timeoutCfg());
   b->configureQuery("host.example.com", timeoutCfg());
-  auto r = makeResolver({PORT_A, PORT_B}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 300ms);
+  auto r = makeResolver({a.port, b.port}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 300ms);
 
   auto t0 = std::chrono::steady_clock::now();
   REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsTransientResolutionException);
@@ -271,11 +267,11 @@ TEST_CASE("SYNC DnsDeadlineException is delivered and IS-A DnsTransientResolutio
   // branch -> a concrete DnsDeadlineException (not merely the base exhaustion transient). Verify
   // both the concrete type AND that it unwinds through the transient BASE handler + carries its
   // distinct message.
-  MockNode a(PORT_A + 100), b(PORT_A + 101);
+  MockNode a, b;
   a->configureQuery("h2.example.com", timeoutCfg());
   b->configureQuery("h2.example.com", timeoutCfg());
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 100),
-                         static_cast<std::uint16_t>(PORT_A + 101)},
+  auto r = makeResolver({a.port,
+                         b.port},
                         5000ms, 0, 250ms);
 
   // Concrete type (REQUIRE_THROWS_AS) + distinct message (REQUIRE_THROWS_WITH — fails if no throw,
@@ -293,10 +289,10 @@ TEST_CASE("SYNC deadline OFF (0) -> full failover; exhaustion terminal is "
   // Two servers, immediate responses (no waiting): A SERVFAIL, B REFUSED. With the deadline
   // disabled the loop visits BOTH and the terminal is the plain transient exhaustion type, NOT
   // DnsDeadlineException, and it carries the LAST server's rcode (REFUSED) faithfully (L-5).
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", servfail());
   b->configureQuery("host.example.com", refused());
-  auto r = makeResolver({PORT_A, PORT_B}, 400ms, 0, /*maxResolutionTime*/ 0ms);
+  auto r = makeResolver({a.port, b.port}, 400ms, 0, /*maxResolutionTime*/ 0ms);
 
   bool threwDeadline = false;
   bool threwTransient = false;
@@ -331,9 +327,9 @@ TEST_CASE("SYNC resolveServiceDomain deadline -> TransientFailure, whole chain b
   // result is TransientFailure, never PermanentNoService. (An exact wire-query COUNT is a boundary
   // tie — the maxWait cap makes elapsed converge to the deadline — so the deterministic properties
   // asserted here are the OUTCOME and the whole-chain WALL-CLOCK bound.)
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("example.com", "NAPTR", timeoutCfg());
-  auto r = makeResolver({PORT_A}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 300ms);
+  auto r = makeResolver({a.port}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 300ms);
 
   auto t0 = std::chrono::steady_clock::now();
   ServiceResolutionResult res = r->resolveServiceDomain("example.com", {ServiceType::SIP_UDP});
@@ -355,9 +351,9 @@ TEST_CASE("SYNC per-call override: enables when config is off, and overrides con
 {
   SECTION("override enables the deadline when config is disabled (0)")
   {
-    MockNode a(PORT_A);
+    MockNode a;
     a->configureQuery("host.example.com", timeoutCfg());
-    auto r = makeResolver({PORT_A}, 5000ms, 0, /*config*/ 0ms);
+    auto r = makeResolver({a.port}, 5000ms, 0, /*config*/ 0ms);
 
     auto t0 = std::chrono::steady_clock::now();
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com"), /*override*/ 350ms),
@@ -367,9 +363,9 @@ TEST_CASE("SYNC per-call override: enables when config is off, and overrides con
 
   SECTION("override beats a large config deadline")
   {
-    MockNode a(PORT_A + 1);
+    MockNode a;
     a->configureQuery("host.example.com", timeoutCfg());
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 1)}, 5000ms, 0, /*config*/ 5000ms);
+    auto r = makeResolver({a.port}, 5000ms, 0, /*config*/ 5000ms);
 
     auto t0 = std::chrono::steady_clock::now();
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com"), /*override*/ 350ms),
@@ -379,13 +375,13 @@ TEST_CASE("SYNC per-call override: enables when config is off, and overrides con
 
   SECTION("override == 0ms disables the deadline for this call (distinct from config)")
   {
-    MockNode a(PORT_A + 2);
+    MockNode a;
     a->configureQuery("host.example.com", timeoutCfg());
     // Config would bound to 250ms. With retries the un-bounded query lives across ~4 retransmits
     // (>> 250ms) before giving up; the per-call override 0ms DISABLES the deadline for this call,
     // so the full retry budget is spent -> wall-clock well above the 250ms config value. (With
     // the config deadline active it would instead cap at ~250ms.)
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 2)}, /*timeout*/ 250ms, /*retry*/ 4,
+    auto r = makeResolver({a.port}, /*timeout*/ 250ms, /*retry*/ 4,
                           /*config*/ 250ms);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -498,9 +494,9 @@ TEST_CASE("ASYNC mid-NAPTR-expiry fall-forward: TransientFailure, delivered once
   // non-responding server; the in-flight NAPTR runs to its natural (config) timeout (the async
   // bound is soft), then every later step (direct-SRV, A/AAAA) is deadline-gated -> TransientFailure,
   // delivered exactly once, and NO wire query is issued after expiry (only the one NAPTR hit).
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("carrier.example.com", "NAPTR", timeoutCfg());
-  auto r = makeResolver({PORT_A}, /*timeout*/ 200ms, /*retry*/ 0, /*maxResolutionTime*/ 60ms);
+  auto r = makeResolver({a.port}, /*timeout*/ 200ms, /*retry*/ 0, /*maxResolutionTime*/ 60ms);
 
   auto t0 = std::chrono::steady_clock::now();
   auto out = driveSvcAsyncCounted(r, "carrier.example.com", {ServiceType::SIP_UDP});
@@ -597,10 +593,10 @@ TEST_CASE("computeResolutionDeadline saturates a huge budget to 'disabled' (no o
   // A caller passing milliseconds::max() (meaning "effectively unbounded") must NOT overflow
   // now()+budget into a PAST deadline (which would make every resolution instantly expire). It is
   // treated as disabled, so a plain SERVFAIL exhausts normally (transient, not a deadline).
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", servfail());
   b->configureQuery("host.example.com", servfail());
-  auto r = makeResolver({PORT_A, PORT_B}, 300ms, 0, /*config*/ 0ms);
+  auto r = makeResolver({a.port, b.port}, 300ms, 0, /*config*/ 0ms);
 
   bool threwDeadline = false;
   try
@@ -628,14 +624,14 @@ TEST_CASE("A NEGATIVE deadline FAILS CLOSED to TransientFailure (HIGH-A), never 
   // any issue). Distinct from an explicit 0 (disabled, full failover — the overflow test above
   // shows the disabled path). A blackholed server would take ~2s+ if the deadline were disabled;
   // here it returns immediately.
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", timeoutCfg()); // would blackhole if the deadline were off
   a->configureQuery("host.example.com", "NAPTR", timeoutCfg());
   b->configureQuery("host.example.com", timeoutCfg());
 
   SECTION("sync query() via a per-call negative override -> DnsDeadlineException, zero wire")
   {
-    auto r = makeResolver({PORT_A, PORT_B}, 5000ms, 0, /*config*/ 0ms);
+    auto r = makeResolver({a.port, b.port}, 5000ms, 0, /*config*/ 0ms);
     auto t0 = std::chrono::steady_clock::now();
     // Concrete DnsDeadlineException (deterministic — the first gate fires on the already-expired now()).
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com"), /*override*/ std::chrono::milliseconds{-1}),
@@ -647,7 +643,7 @@ TEST_CASE("A NEGATIVE deadline FAILS CLOSED to TransientFailure (HIGH-A), never 
 
   SECTION("negative CONFIG maxResolutionTime (not just an override) also fails closed")
   {
-    auto r = makeResolver({PORT_A, PORT_B}, 5000ms, 0, /*config*/ std::chrono::milliseconds{-5});
+    auto r = makeResolver({a.port, b.port}, 5000ms, 0, /*config*/ std::chrono::milliseconds{-5});
     auto t0 = std::chrono::steady_clock::now();
     REQUIRE_THROWS_AS(r->query(aQ("host.example.com")), DnsDeadlineException);
     REQUIRE(elapsedMs(t0) < 500ms);
@@ -656,7 +652,7 @@ TEST_CASE("A NEGATIVE deadline FAILS CLOSED to TransientFailure (HIGH-A), never 
 
   SECTION("sync resolveServiceDomain negative -> outcome TransientFailure, zero wire")
   {
-    auto r = makeResolver({PORT_A, PORT_B}, 5000ms, 0, /*config*/ std::chrono::milliseconds{-1});
+    auto r = makeResolver({a.port, b.port}, 5000ms, 0, /*config*/ std::chrono::milliseconds{-1});
     auto t0 = std::chrono::steady_clock::now();
     auto res = r->resolveServiceDomain("host.example.com", {ServiceType::SIP_UDP});
     REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -666,7 +662,7 @@ TEST_CASE("A NEGATIVE deadline FAILS CLOSED to TransientFailure (HIGH-A), never 
 
   SECTION("async queryAsync negative (config) -> DnsDeadlineException, delivered once, zero wire")
   {
-    auto r = makeResolver({PORT_A, PORT_B}, 5000ms, 0, /*config*/ std::chrono::milliseconds{-1});
+    auto r = makeResolver({a.port, b.port}, 5000ms, 0, /*config*/ std::chrono::milliseconds{-1});
     auto t0 = std::chrono::steady_clock::now();
     auto out = driveQueryAsync(r, aQ("host.example.com"));
     REQUIRE(out.completed);
@@ -704,9 +700,9 @@ TEST_CASE("SYNC deadline unwinds with ZERO extra wire queries after NAPTR expiry
   // UP) re-throws DnsDeadlineException BEFORE issuing -> marks anySrvTransient, which SUPPRESSES the
   // RFC 3263 §4.2 apex A/AAAA fallback entirely (a transient is not proof of absence). Net: the
   // server sees EXACTLY the one NAPTR query.
-  MockNode a(PORT_A);
+  MockNode a;
   a->configureQuery("z.example.com", "NAPTR", timeoutCfg());
-  auto r = makeResolver({PORT_A}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 300ms);
+  auto r = makeResolver({a.port}, /*timeout*/ 5000ms, /*retry*/ 0, /*maxResolutionTime*/ 300ms);
 
   ServiceResolutionResult res = r->resolveServiceDomain("z.example.com", {ServiceType::SIP_UDP});
   REQUIRE(res.outcome == ResolutionOutcome::TransientFailure);
@@ -721,9 +717,9 @@ TEST_CASE("SYNC per-avenue wall-clock bounds: each avenue's timeout is capped by
 
   SECTION("NAPTR avenue timeout")
   {
-    MockNode a(PORT_A);
+    MockNode a;
     a->configureQuery("pa.example.com", "NAPTR", timeoutCfg());
-    auto r = makeResolver({PORT_A}, 5000ms, 0, D);
+    auto r = makeResolver({a.port}, 5000ms, 0, D);
     auto t0 = std::chrono::steady_clock::now();
     auto res = r->resolveServiceDomain("pa.example.com", {ServiceType::SIP_UDP});
     REQUIRE(elapsedMs(t0) < bound);
@@ -732,10 +728,10 @@ TEST_CASE("SYNC per-avenue wall-clock bounds: each avenue's timeout is capped by
 
   SECTION("direct-SRV avenue timeout (NAPTR authoritative-absent, SRV blackholes)")
   {
-    MockNode a(PORT_B);
+    MockNode a;
     // NAPTR unconfigured -> NXDOMAIN (authoritative) -> fall to direct SRV, which blackholes.
     a->configureQuery("_sip._udp.pb.example.com", "SRV", timeoutCfg());
-    auto r = makeResolver({PORT_B}, 5000ms, 0, D);
+    auto r = makeResolver({a.port}, 5000ms, 0, D);
     auto t0 = std::chrono::steady_clock::now();
     auto res = r->resolveServiceDomain("pb.example.com", {ServiceType::SIP_UDP});
     REQUIRE(elapsedMs(t0) < bound);
@@ -744,12 +740,12 @@ TEST_CASE("SYNC per-avenue wall-clock bounds: each avenue's timeout is capped by
 
   SECTION("A/AAAA avenue timeout (SRV resolves a target whose A blackholes)")
   {
-    MockNode a(static_cast<std::uint16_t>(PORT_A + 200));
+    MockNode a;
     const std::string domain = "pc.example.com";
     a->addRecord({"_sip._udp." + domain, "SRV", "t." + domain, 3600, 10, 0, 5060});
     a->configureQuery("t." + domain, "A", timeoutCfg());
     a->configureQuery("t." + domain, "AAAA", timeoutCfg());
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 200)}, 5000ms, 0, D);
+    auto r = makeResolver({a.port}, 5000ms, 0, D);
     auto t0 = std::chrono::steady_clock::now();
     auto res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
     REQUIRE(elapsedMs(t0) < bound);
@@ -758,12 +754,12 @@ TEST_CASE("SYNC per-avenue wall-clock bounds: each avenue's timeout is capped by
 
   SECTION("§4.2 apex fallback avenue timeout (NAPTR/SRV absent, apex A/AAAA blackhole)")
   {
-    MockNode a(static_cast<std::uint16_t>(PORT_A + 201));
+    MockNode a;
     const std::string domain = "pd.example.com";
     // NAPTR + SRV unconfigured -> authoritative NXDOMAIN -> RFC 3263 §4.2 apex A/AAAA fallback.
     a->configureQuery(domain, "A", timeoutCfg());
     a->configureQuery(domain, "AAAA", timeoutCfg());
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 201)}, 5000ms, 0, D);
+    auto r = makeResolver({a.port}, 5000ms, 0, D);
     auto t0 = std::chrono::steady_clock::now();
     auto res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
     REQUIRE(elapsedMs(t0) < bound);
@@ -786,7 +782,7 @@ TEST_CASE("SYNC partial-Resolved: preferred target blackholed, cached backup ret
   const std::string preferred = "primary." + domain;
   const std::string backup = "backup." + domain;
 
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 210));
+  MockNode a;
   // NAPTR unconfigured -> NXDOMAIN -> direct SRV. Two SRV targets at different priorities.
   a->addRecord({"_sip._udp." + domain, "SRV", preferred, 3600, /*prio*/ 10, /*weight*/ 0, 5060});
   a->addRecord({"_sip._udp." + domain, "SRV", backup, 3600, /*prio*/ 20, /*weight*/ 0, 5060});
@@ -796,7 +792,7 @@ TEST_CASE("SYNC partial-Resolved: preferred target blackholed, cached backup ret
   auto cache = std::make_shared<DnsCache>();
   putCachedA(cache, backup, "192.0.2.80"); // backup served from cache, past the deadline
 
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 210)}, 5000ms, 0,
+  auto r = makeResolver({a.port}, 5000ms, 0,
                         /*maxResolutionTime*/ 500ms, cache);
 
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
@@ -820,7 +816,7 @@ TEST_CASE("SYNC priority pre-sort defeats a wire-order inversion (HIGH-3): backu
   const std::string preferred = "primary." + domain; // priority 10, healthy
   const std::string backup = "backup." + domain;      // priority 20, blackholed
 
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 240));
+  MockNode a;
   // Insert the BACKUP (prio 20) FIRST, the PREFERRED (prio 10) SECOND (wire order = anti-priority).
   a->addRecord({"_sip._udp." + domain, "SRV", backup, 3600, /*prio*/ 20, /*weight*/ 0, 5060});
   a->addRecord({"_sip._udp." + domain, "SRV", preferred, 3600, /*prio*/ 10, /*weight*/ 0, 5060});
@@ -828,7 +824,7 @@ TEST_CASE("SYNC priority pre-sort defeats a wire-order inversion (HIGH-3): backu
   a->configureQuery(backup, "AAAA", timeoutCfg());
   a->addRecord({preferred, "A", "192.0.2.81", 3600}); // preferred resolves live
 
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 240)}, /*timeout*/ 5000ms, /*retry*/ 0,
+  auto r = makeResolver({a.port}, /*timeout*/ 5000ms, /*retry*/ 0,
                         /*maxResolutionTime*/ 500ms);
 
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
@@ -848,14 +844,13 @@ TEST_CASE("SYNC deadline LARGE enough for two servers still fails over (primary 
   // works: primary blackholed, secondary healthy -> Resolved via the secondary. (The DEFEAT case —
   // a deadline BELOW one server's budget — is a documented limitation warned about at config time;
   // the per-server sub-budget that would fix small-D failover is tracked on 2026-09-30-5.)
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 220)),
-    b(static_cast<std::uint16_t>(PORT_A + 221));
+  MockNode a, b;
   a->configureQuery("hb.example.com", timeoutCfg()); // primary blackholes (short per-server timeout)
   b->addRecord({"hb.example.com", "A", "192.0.2.90", 3600});
   // Short per-server timeout (300ms) so one blackholed server fits well inside a 3s deadline, then
   // failover to the healthy secondary happens WITHIN the deadline.
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 220),
-                         static_cast<std::uint16_t>(PORT_A + 221)},
+  auto r = makeResolver({a.port,
+                         b.port},
                         /*timeout*/ 300ms, /*retry*/ 0, /*maxResolutionTime*/ 3000ms);
 
   DnsResult res = r->query(aQ("hb.example.com"));
@@ -878,8 +873,7 @@ TEST_CASE("SYNC multi-step RFC 3263 chain fails over across two servers within a
   const std::string domain = "chain.example.com";
   const std::string srvName = "_sip._udp." + domain;
   const std::string target = "sip1." + domain;
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 250), /*enableLogging*/ true),
-    b(static_cast<std::uint16_t>(PORT_A + 251));
+  MockNode a(/*enableLogging*/ true), b;
   a->configureQuery(domain, "NAPTR", timeoutCfg()); // primary blackholes each name
   a->configureQuery(srvName, "SRV", timeoutCfg());
   a->configureQuery(target, "A", timeoutCfg());
@@ -887,8 +881,8 @@ TEST_CASE("SYNC multi-step RFC 3263 chain fails over across two servers within a
   // secondary: no NAPTR (NXDOMAIN -> direct SRV), a real SRV + A.
   b->addRecord({srvName, "SRV", target, 3600, 10, 0, 5060});
   b->addRecord({target, "A", "192.0.2.95", 3600});
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 250),
-                         static_cast<std::uint16_t>(PORT_A + 251)},
+  auto r = makeResolver({a.port,
+                         b.port},
                         /*timeout*/ 300ms, /*retry*/ 0, /*maxResolutionTime*/ 4000ms);
 
   ServiceResolutionResult res = r->resolveServiceDomain(domain, {ServiceType::SIP_UDP});
@@ -914,9 +908,9 @@ TEST_CASE("The sub-budget failover WARNING is emitted below the UDP-retransmit b
   SECTION("above the UDP budget (Both mode): NO failover warning")
   {
     LogCapture cap;
-    MockNode a(static_cast<std::uint16_t>(PORT_A + 260));
+    MockNode a;
     a->addRecord({host, "A", "192.0.2.96", 3600});
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 260)}, /*timeout*/ 5000ms,
+    auto r = makeResolver({a.port}, /*timeout*/ 5000ms,
                           /*retry*/ 0, /*maxResolutionTime*/ 6000ms, /*cache*/ nullptr,
                           DnsTransportMode::Both);
     (void)r->query(aQ(host));
@@ -926,9 +920,9 @@ TEST_CASE("The sub-budget failover WARNING is emitted below the UDP-retransmit b
   SECTION("below the UDP budget (Both mode): failover warning IS emitted")
   {
     LogCapture cap;
-    MockNode a(static_cast<std::uint16_t>(PORT_A + 261));
+    MockNode a;
     a->addRecord({host, "A", "192.0.2.96", 3600});
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 261)}, /*timeout*/ 5000ms,
+    auto r = makeResolver({a.port}, /*timeout*/ 5000ms,
                           /*retry*/ 0, /*maxResolutionTime*/ 500ms, /*cache*/ nullptr,
                           DnsTransportMode::Both);
     (void)r->query(aQ(host));
@@ -943,8 +937,9 @@ TEST_CASE("The sub-budget failover WARNING is emitted below the UDP-retransmit b
 TEST_CASE("DnsClient forwards asyncAttemptBudget() and the per-call deadline override",
           "[dns][deadline][dnsclient]")
 {
+  MockNode a;
   DnsConfig cfg;
-  cfg.setServers({"127.0.0.1:" + std::to_string(static_cast<int>(PORT_A + 230))});
+  cfg.setServers({"127.0.0.1:" + std::to_string(a.port)});
   cfg.timeout = 5000ms;
   cfg.retryCount = 0;
   auto client = std::make_shared<iora::network::DnsClient>(cfg);
@@ -955,7 +950,6 @@ TEST_CASE("DnsClient forwards asyncAttemptBudget() and the per-call deadline ove
   // Each forwarder that takes an override threads it through (a defaulted passthrough that was
   // dropped would compile clean but NOT bound the blackholed query — the fail-open the required-param
   // design guards against, cpp17 L-7). Assert a small override bounds each against a blackholed server.
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 230));
   a->configureQuery("dc.example.com", timeoutCfg());          // query()
   a->configureQuery("dc.example.com", "NAPTR", timeoutCfg()); // resolveServiceDomain / resolveNAPTR
   a->configureQuery("_sip._udp.dc.example.com", "SRV", timeoutCfg()); // resolveSRV
@@ -992,12 +986,12 @@ TEST_CASE("DnsClient forwards asyncAttemptBudget() and the per-call deadline ove
   // NAPTR->SRV->A/AAAA chain is deadline-gated after the first in-flight attempt (~one timeout);
   // dropped, the config deadline (0=off) lets every step run a full timeout (~4x), blowing the bound.
   {
+    MockNode an;
     DnsConfig acfg;
-    acfg.setServers({"127.0.0.1:" + std::to_string(static_cast<int>(PORT_A + 231))});
+    acfg.setServers({"127.0.0.1:" + std::to_string(an.port)});
     acfg.timeout = 300ms;
     acfg.retryCount = 0;
     auto aclient = std::make_shared<iora::network::DnsClient>(acfg);
-    MockNode an(static_cast<std::uint16_t>(PORT_A + 231));
     an->configureQuery("dcasync.example.com", "NAPTR", timeoutCfg());
     an->configureQuery("_sip._udp.dcasync.example.com", "SRV", timeoutCfg());
 
@@ -1035,15 +1029,14 @@ TEST_CASE("ASYNC deadline choke-point gate stops rotating past D on a MULTI-serv
   // in-flight query runs to its natural (soft) timeout ~150ms; by the loop-top re-entry the deadline
   // has passed, so the gate delivers a terminal DnsDeadlineException and servers 2 & 3 are NEVER
   // issued (the gate stops rotating). Exactly one delivery.
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 300)),
-    b(static_cast<std::uint16_t>(PORT_A + 301)), c(static_cast<std::uint16_t>(PORT_A + 302));
+  MockNode a, b, c;
   for (auto *n : {&a, &b, &c})
   {
     (*n)->configureQuery("g.example.com", timeoutCfg());
   }
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 300),
-                         static_cast<std::uint16_t>(PORT_A + 301),
-                         static_cast<std::uint16_t>(PORT_A + 302)},
+  auto r = makeResolver({a.port,
+                         b.port,
+                         c.port},
                         /*timeout*/ 150ms, /*retry*/ 0, /*maxResolutionTime*/ 50ms);
 
   auto out = driveQueryAsync(r, aQ("g.example.com"));
@@ -1059,10 +1052,10 @@ TEST_CASE("ASYNC deadline OFF (0): exhaustion terminal is transient with the las
           "delivered exactly once",
           "[dns][deadline][async][off]")
 {
-  MockNode a(PORT_A), b(PORT_B);
+  MockNode a, b;
   a->configureQuery("host.example.com", servfail());
   b->configureQuery("host.example.com", refused());
-  auto r = makeResolver({PORT_A, PORT_B}, 400ms, 0, /*maxResolutionTime*/ 0ms);
+  auto r = makeResolver({a.port, b.port}, 400ms, 0, /*maxResolutionTime*/ 0ms);
 
   auto out = driveQueryAsync(r, aQ("host.example.com"));
   REQUIRE(out.completed);
@@ -1097,13 +1090,13 @@ TEST_CASE("ASYNC 'cut A and AAAA': after the deadline, the AAAA family issues ZE
   // gate and issues NO wire query. Outcome TransientFailure (the cut family marks the target
   // transient). Wide margin (timeout 1000ms, D 400ms, pre-cut NAPTR/SRV hops « D) so the test is
   // robust under TSan's slowdown (cpp17 M-4).
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 310), /*enableLogging*/ true);
+  MockNode a(/*enableLogging*/ true);
   const std::string domain = "fam.example.com";
   a->addRecord({"_sip._udp." + domain, "SRV", "t." + domain, 3600, 10, 0, 5060});
   a->configureQuery("t." + domain, "A", timeoutCfg()); // A blackholes
   // AAAA intentionally left unconfigured; if it were ever issued it would be a fast NXDOMAIN — the
   // assertion is that it is NEVER issued at all (cut by the deadline).
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 310)}, /*timeout*/ 1000ms, /*retry*/ 0,
+  auto r = makeResolver({a.port}, /*timeout*/ 1000ms, /*retry*/ 0,
                         /*maxResolutionTime*/ 400ms);
 
   auto out = driveSvcAsyncCounted(r, domain, {ServiceType::SIP_UDP});
@@ -1123,12 +1116,12 @@ TEST_CASE("ASYNC A-AUTHORITATIVE-NEGATIVE then DEADLINE cuts AAAA -> TransientFa
   // the gate-cut failed to mark the target transient, the target would be A-NXDOMAIN (not transient)
   // + AAAA-cut (not marked) = PermanentNoService, and this test would FAIL. The delayed A (delay >
   // D) keeps it in flight past the deadline yet still authoritative-negative (not a timeout).
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 320), /*enableLogging*/ true);
+  MockNode a(/*enableLogging*/ true);
   const std::string domain = "pg.example.com";
   a->addRecord({"_sip._udp." + domain, "SRV", "t." + domain, 3600, 10, 0, 5060});
   // t.<domain> A: NXDOMAIN after 600ms (no record + delay); AAAA unconfigured (will be gate-cut).
   a->configureQuery("t." + domain, "A", delayCfg(600ms));
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 320)}, /*timeout*/ 2000ms, /*retry*/ 0,
+  auto r = makeResolver({a.port}, /*timeout*/ 2000ms, /*retry*/ 0,
                         /*maxResolutionTime*/ 250ms); // D < the 600ms A delay -> AAAA is gate-cut
 
   auto out = driveSvcAsyncCounted(r, domain, {ServiceType::SIP_UDP});
@@ -1145,7 +1138,7 @@ TEST_CASE("ASYNC ADVERSARIAL priority-cut: preferred blackholed, live backup ret
   // Async issues targets CONCURRENTLY, so a live lower-priority backup resolves while the preferred
   // blackholes — partial-Resolved needs NO cache here. Preferred (priority 10) A blackholes; backup
   // (priority 20) A resolves live. Result: Resolved with ONLY the backup; getPreferredTarget()==backup.
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 330));
+  MockNode a;
   const std::string domain = "aprio.example.com";
   const std::string preferred = "primary." + domain;
   const std::string backup = "backup." + domain;
@@ -1156,7 +1149,7 @@ TEST_CASE("ASYNC ADVERSARIAL priority-cut: preferred blackholed, live backup ret
   a->addRecord({backup, "A", "192.0.2.85", 3600});   // backup resolves live
   // Wide margin (timeout 1000ms, D 400ms) so the pre-cut NAPTR/SRV + the live backup resolve well
   // inside D even under TSan (cpp17 M-4).
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 330)}, /*timeout*/ 1000ms, /*retry*/ 0,
+  auto r = makeResolver({a.port}, /*timeout*/ 1000ms, /*retry*/ 0,
                         /*maxResolutionTime*/ 400ms);
 
   auto out = driveSvcAsyncCounted(r, domain, {ServiceType::SIP_UDP});
@@ -1175,12 +1168,11 @@ TEST_CASE("ASYNC overhang bound: worst case ~ deadline + ONE in-flight attempt (
   // 150ms, deadline 50ms. The soft bound = deadline + <= ONE in-flight attempt: the first server's
   // query runs to ~150ms, then the gate cuts the SECOND server (never issued). The resolution must
   // NOT run two full attempts.
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 340)),
-    b(static_cast<std::uint16_t>(PORT_A + 341));
+  MockNode a, b;
   a->configureQuery("oh.example.com", timeoutCfg());
   b->configureQuery("oh.example.com", timeoutCfg());
-  auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 340),
-                         static_cast<std::uint16_t>(PORT_A + 341)},
+  auto r = makeResolver({a.port,
+                         b.port},
                         /*timeout*/ 150ms, /*retry*/ 0, /*maxResolutionTime*/ 50ms);
 
   auto t0 = std::chrono::steady_clock::now();
@@ -1208,7 +1200,7 @@ TEST_CASE("ASYNC no-latch-corruption: concurrent multi-target with a deadline-cu
   // deliveries is behind makeSingleFire — thread-safety M-1.) The MockNode is hoisted (its records
   // don't mutate per query, L-7); only the resolver is fresh per iteration (fresh rotation). Wide
   // margin (timeout 600ms, D 300ms) keeps the pre-cut NAPTR/SRV + live-A inside D under TSan (M-4).
-  MockNode a(static_cast<std::uint16_t>(PORT_A + 350));
+  MockNode a;
   const std::string domain = "nl.example.com";
   const std::string dead = "dead." + domain;
   const std::string live = "live." + domain;
@@ -1220,7 +1212,7 @@ TEST_CASE("ASYNC no-latch-corruption: concurrent multi-target with a deadline-cu
 
   for (int iter = 0; iter < 10; ++iter)
   {
-    auto r = makeResolver({static_cast<std::uint16_t>(PORT_A + 350)}, /*timeout*/ 600ms, /*retry*/ 0,
+    auto r = makeResolver({a.port}, /*timeout*/ 600ms, /*retry*/ 0,
                           /*maxResolutionTime*/ 300ms);
 
     auto out = driveSvcAsyncCounted(r, domain, {ServiceType::SIP_UDP});

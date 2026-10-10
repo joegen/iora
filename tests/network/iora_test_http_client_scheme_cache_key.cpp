@@ -53,9 +53,9 @@ using iora::test::httpsrv::makeListener;
 class MultiServer
 {
 public:
-  bool start(std::uint16_t port)
+  bool start()
   {
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -63,6 +63,8 @@ public:
     _accept = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~MultiServer() { shutdown(); }
 
@@ -196,9 +198,9 @@ void configureTls(HttpClient &client)
 TEST_CASE("https does not reuse a plaintext connection to the same host:port",
           "[http][scheme_key][defect_12]")
 {
-  const std::uint16_t port = 19350;
   MultiServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg());
@@ -220,9 +222,9 @@ TEST_CASE("https does not reuse a plaintext connection to the same host:port",
 TEST_CASE("a failed https attempt does not evict the http cache entry",
           "[http][scheme_key][defect_12]")
 {
-  const std::uint16_t port = 19351;
   MultiServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg());
@@ -247,9 +249,9 @@ TEST_CASE("a failed https attempt does not evict the http cache entry",
 TEST_CASE("concurrent http + https to one authority is race-free",
           "[http][scheme_key][defect_12][tsan]")
 {
-  const std::uint16_t port = 19352;
   MultiServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
   HttpClient client(cfg());

@@ -441,6 +441,31 @@ TEST_CASE("DualRefusingEndpoint refuses on BOTH loopback families (dual-bind reg
   }
 }
 
+TEST_CASE("getFreePortUdpTcp returns a port both MockDnsServer binds accept", "[tcp][udp][freeport]")
+{
+  // The port must take a UDP bind and a TCP listen on INADDR_ANY with MockDnsServer's
+  // socket options (SO_REUSEADDR on both), right after the probe closed.
+  const std::uint16_t port = testnet::getFreePortUdpTcp();
+  REQUIRE(port != 0);
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(port);
+  int reuse = 1;
+
+  testnet::ScopedFd udp{::socket(AF_INET, SOCK_DGRAM, 0)};
+  REQUIRE(udp.get() >= 0);
+  ::setsockopt(udp.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  CHECK(::bind(udp.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+
+  testnet::ScopedFd tcp{::socket(AF_INET, SOCK_STREAM, 0)};
+  REQUIRE(tcp.get() >= 0);
+  ::setsockopt(tcp.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  CHECK(::bind(tcp.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0);
+  CHECK(::listen(tcp.get(), 4) == 0);
+}
+
 TEST_CASE("TCP stats verification", "[tcp][stats]")
 {
   TcpFixture f;

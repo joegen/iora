@@ -8,7 +8,7 @@
 // subscribe-then-publish no-deadlock guard, preamble correctness on the wire,
 // disconnect cleanup, CRLF normalization, single-space round-trip, heartbeat,
 // M-3 idle survival/reap, graceful-shutdown socket close, Last-Event-ID accept,
-// and auto-HEAD. ctest runs -j1 (web tests share ports).
+// and auto-HEAD. ctest runs -j1.
 
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
@@ -30,6 +30,7 @@
 #include <iora/network/websocket_client.hpp>
 #include <iora/network/websocket_server.hpp>
 #include <iora/web/channel.hpp>
+#include "iora_test_net_utils.hpp"
 
 using iora::network::HttpServer;
 using iora::network::SessionId;
@@ -42,8 +43,6 @@ using Response = HttpServer::Response;
 namespace
 {
 
-std::atomic<int> g_nextPort{19200};
-int nextPort() { return g_nextPort.fetch_add(1); }
 
 template <typename Pred>
 bool waitFor(Pred pred, int timeoutMs = 5000)
@@ -151,7 +150,7 @@ struct SseFixture
                       std::chrono::seconds gc = std::chrono::seconds(5))
       : manager(srv, timer,
                 std::chrono::milliseconds(heartbeatMs > 0 ? heartbeatMs : 15000)),
-        channel("updates"), port(nextPort())
+        channel("updates"), port(testnet::getFreePortTCP())
   {
     timer.start();
     srv.setPort(port);
@@ -421,7 +420,7 @@ TEST_CASE("integration: auto-HEAD to a GET SSE route yields a normal bodyless re
 TEST_CASE("integration: WebSocketServer drops sendText after sendClose (web-M7)",
           "[ws][integration][web-m7]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   iora::network::WebSocketServer server("127.0.0.1", port);
   std::atomic<SessionId> sid{0};
   server.setOnConnect([&](SessionId s, const std::string &) { sid.store(s); });
@@ -488,7 +487,7 @@ TEST_CASE("integration: WebSocketServer drops sendText after sendClose (web-M7)"
 TEST_CASE("integration: WsChannel publish skips a closed real WS session (web-M7)",
           "[ws][integration][web-m7]")
 {
-  const int port = nextPort();
+  const int port = testnet::getFreePortTCP();
   iora::network::WebSocketServer server("127.0.0.1", port);
   std::atomic<SessionId> sid{0};
   server.setOnConnect([&](SessionId s, const std::string &) { sid.store(s); });

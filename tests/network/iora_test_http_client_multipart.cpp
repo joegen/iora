@@ -48,9 +48,9 @@ using iora::test::httpsrv::makeListener;
 class CapturingServer
 {
 public:
-  bool start(std::uint16_t port)
+  bool start()
   {
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -58,6 +58,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~CapturingServer() { shutdown(); }
 
@@ -265,9 +267,9 @@ TEST_CASE("postFile uses a high-entropy, non-clock-derived boundary",
   const std::string path = writeTempFile("iora_mp_entropy.bin", "the file body");
   REQUIRE_FALSE(path.empty());
 
-  const std::uint16_t port = 18221;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/upload";
@@ -307,10 +309,11 @@ TEST_CASE("postFile boundaries differ across calls (not clock-derived)",
   const std::string path = writeTempFile("iora_mp_two.bin", "x");
   REQUIRE_FALSE(path.empty());
 
-  auto grabBoundary = [&](std::uint16_t port) -> std::string
+  auto grabBoundary = [&]() -> std::string
   {
     CapturingServer server;
-    REQUIRE(server.start(port));
+    REQUIRE(server.start());
+    const std::uint16_t port = server.port();
     HttpClient client(cfg());
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/upload";
     auto resp = client.postFile(url, "file", path);
@@ -321,8 +324,8 @@ TEST_CASE("postFile boundaries differ across calls (not clock-derived)",
 
   // Two uploads within the same wall-clock second: a clock-derived boundary
   // would be identical; a random one differs.
-  const std::string b1 = grabBoundary(18222);
-  const std::string b2 = grabBoundary(18223);
+  const std::string b1 = grabBoundary();
+  const std::string b2 = grabBoundary();
   REQUIRE_FALSE(b1.empty());
   REQUIRE_FALSE(b2.empty());
   CHECK(b1 != b2);
@@ -344,9 +347,9 @@ TEST_CASE("postFile ignores a caller-supplied Content-Type (boundary must match)
   const std::string path = writeTempFile("iora_mp_ct.bin", "payload");
   REQUIRE_FALSE(path.empty());
 
-  const std::uint16_t port = 18226;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/upload";
@@ -376,9 +379,9 @@ TEST_CASE("postFile ignores a mixed-case caller Content-Type (no duplicate line)
   const std::string path = writeTempFile("iora_mp_ct2.bin", "payload");
   REQUIRE_FALSE(path.empty());
 
-  const std::uint16_t port = 18227;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/upload";
@@ -415,9 +418,9 @@ TEST_CASE("postFile ignores a mixed-case caller Content-Type (no duplicate line)
 TEST_CASE("postStream sets Accept/Cache-Control defaults when the caller omits them",
           "[http][multipart][sse][defect_6]")
 {
-  const std::uint16_t port = 18224;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/sse";
@@ -434,9 +437,9 @@ TEST_CASE("postStream sets Accept/Cache-Control defaults when the caller omits t
 TEST_CASE("postStream lets a caller override Accept/Cache-Control",
           "[http][multipart][sse][defect_6]")
 {
-  const std::uint16_t port = 18225;
   CapturingServer server;
-  REQUIRE(server.start(port));
+  REQUIRE(server.start());
+  const std::uint16_t port = server.port();
 
   HttpClient client(cfg());
   const std::string url = "http://127.0.0.1:" + std::to_string(port) + "/sse";

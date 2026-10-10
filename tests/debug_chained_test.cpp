@@ -2,6 +2,7 @@
 #include "iora/iora.hpp"
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
 
 using AutoServiceShutdown = iora::IoraService::AutoServiceShutdown;
 
@@ -16,7 +17,7 @@ TEST_CASE("Debug chained dependencies only", "[debug]")
   {
     // Setup IoraService config for this test section
     iora::IoraService::Config config;
-    config.server.port = 8144;
+    config.server.port = testnet::getFreePortTCP();
     config.state.file = "plugin_deps_state5.json";
     config.log.file = "plugin_deps_log";
     config.modules.autoLoad = false; // Disable automatic module loading

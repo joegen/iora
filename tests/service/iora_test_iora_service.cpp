@@ -7,14 +7,16 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora_test_net_utils.hpp"
 
 using namespace iora::test;
 
 TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 {
   // Setup IoraService config
+  const std::uint16_t port = testnet::getFreePortTCP();
   iora::IoraService::Config config;
-  config.server.port = 8110;
+  config.server.port = port;
   config.state.file = "ioraservice_basic_state.json";
   config.log.file = "ioraservice_basic_log";
   config.log.level = "error";
@@ -68,7 +70,7 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   {
     auto client = svc.makeHttpClient();
-    auto res = client.get("http://localhost:8110/basic");
+    auto res = client.get("http://localhost:" + std::to_string(port) + "/basic");
     REQUIRE(res.success());
     auto json = iora::network::HttpClient::parseJsonOrThrow(res);
     REQUIRE(json["ok"] == true);
@@ -80,9 +82,10 @@ TEST_CASE("IoraService basic operations", "[iora][IoraService]")
 TEST_CASE("IoraService configuration file override", "[iora][IoraService][config]")
 {
   const std::string cfg = "ioraservice_cfg_override.toml";
+  const std::uint16_t port = testnet::getFreePortTCP();
   {
     std::ofstream out(cfg);
-    out << "[iora.server]\nport = 8111\n";
+    out << "[iora.server]\nport = " << port << "\n";
     out << "[iora.state]\nfile = 'ioraservice_cfg_state.json'\n";
     out << "[iora.log]\nlevel = 'debug'\nfile = 'ioraservice_cfg_log'\n";
     out << "async = false\nretention_days = 2\ntime_format = '%Y%m%d'\n";
@@ -128,7 +131,7 @@ TEST_CASE("IoraService configuration file override", "[iora][IoraService][config
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     auto client = svc.makeHttpClient();
-    auto res = client.get("http://localhost:8111/cfg");
+    auto res = client.get("http://localhost:" + std::to_string(port) + "/cfg");
     REQUIRE(res.success());
     auto json = iora::network::HttpClient::parseJsonOrThrow(res);
     REQUIRE(json["cfg"] == true);
@@ -149,16 +152,19 @@ TEST_CASE("IoraService configuration file override", "[iora][IoraService][config
 TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
 {
   const std::string cfg = "ioraservice_cli_precedence.toml";
+  const std::uint16_t tomlPort = testnet::getFreePortTCP();
+  const std::uint16_t cliPort = testnet::getFreePortTCP();
+  REQUIRE(tomlPort != cliPort);
   {
     std::ofstream out(cfg);
-    out << "[iora.server]\nport = 8112\n";
+    out << "[iora.server]\nport = " << tomlPort << "\n";
     out << "[iora.state]\nfile = 'ioraservice_cli_state.json'\n";
     out << "[iora.log]\nlevel = 'info'\nfile = 'ioraservice_cli_log'\n";
     out << "async = false\nretention_days = 1\ntime_format = '%Y%m%d'\n";
   }
   // Setup IoraService config with CLI overrides taking precedence
   iora::IoraService::Config config;
-  config.server.port = 8123;
+  config.server.port = cliPort;
   config.state.file = "ioraservice_cli_override_state.json";
   config.log.file = "ioraservice_cli_override_log";
   config.log.level = "error";
@@ -194,7 +200,7 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     auto client = svc.makeHttpClient();
-    auto res = client.get("http://localhost:8123/cli");
+    auto res = client.get("http://localhost:" + std::to_string(cliPort) + "/cli");
     REQUIRE(res.success());
     auto json = iora::network::HttpClient::parseJsonOrThrow(res);
     REQUIRE(json["cli"] == true);
@@ -222,8 +228,9 @@ TEST_CASE("IoraService CLI overrides precedence", "[iora][IoraService][cli]")
 TEST_CASE("IoraService concurrent HTTP clients", "[iora][IoraService][concurrency]")
 {
   // Setup IoraService config
+  const std::uint16_t port = testnet::getFreePortTCP();
   iora::IoraService::Config config;
-  config.server.port = 8113;
+  config.server.port = port;
   config.state.file = "ioraservice_concurrency_state.json";
   config.log.file = "ioraservice_concurrency_log";
   config.log.level = "error";
@@ -249,12 +256,12 @@ TEST_CASE("IoraService concurrent HTTP clients", "[iora][IoraService][concurrenc
   for (int i = 0; i < threadCount; ++i)
   {
     workers.emplace_back(
-      [&svc, &successCount]()
+      [&svc, &successCount, port]()
       {
         auto client = svc.makeHttpClient();
         try
         {
-          auto res = client.get("http://localhost:8113/ping");
+          auto res = client.get("http://localhost:" + std::to_string(port) + "/ping");
           if (res.success())
           {
             auto json = iora::network::HttpClient::parseJsonOrThrow(res);
@@ -284,7 +291,7 @@ TEST_CASE("IoraService fluent event handler registration by name and pattern",
 {
   // Setup IoraService config
   iora::IoraService::Config config;
-  config.server.port = 8120;
+  config.server.port = testnet::getFreePortTCP();
   config.state.file = "ioraservice_fluent_eventqueue_state.json";
   config.log.file = "ioraservice_fluent_eventqueue_log";
   config.log.level = "error";
@@ -337,7 +344,7 @@ TEST_CASE("IoraService integrates EventQueue", "[iora][IoraService][EventQueue]"
 {
   // Setup IoraService config
   iora::IoraService::Config config;
-  config.server.port = 8114;
+  config.server.port = testnet::getFreePortTCP();
   config.state.file = "ioraservice_eventqueue_state.json";
   config.log.file = "ioraservice_eventqueue_log";
 

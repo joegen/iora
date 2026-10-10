@@ -22,7 +22,7 @@ int main(int argc, char *argv[])
   initializeTestLogging();
 
   iora::IoraService::Config config;
-  config.server.port = 8140;
+  config.server.port = 0;
   config.state.file = "plugin_deps_state.json";
   config.log.file = "plugin_deps_log";
   config.modules.autoLoad = false;

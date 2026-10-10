@@ -42,10 +42,10 @@ using iora::test::httpsrv::writeAll;
 class RawServer
 {
 public:
-  bool start(std::uint16_t port, std::string response)
+  bool start(std::string response)
   {
     _response = std::move(response);
-    _listenFd = makeListener(port);
+    _listenFd = makeListener();
     if (_listenFd < 0)
     {
       return false;
@@ -53,6 +53,8 @@ public:
     _thread = std::thread([this] { run(); });
     return true;
   }
+
+  std::uint16_t port() const { return iora::test::httpsrv::listenerPort(_listenFd); }
 
   ~RawServer() { shutdown(); }
 
@@ -143,10 +145,10 @@ TEST_CASE("Config does not advertise redirect-following it never performs",
 TEST_CASE("An interim 1xx is discarded and the final 200 is framed",
           "[http][1xx][defect_16]")
 {
-  const std::uint16_t port = 19330;
   RawServer raw;
-  REQUIRE(raw.start(port, "HTTP/1.1 100 Continue\r\n\r\n"
-                          "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
+  REQUIRE(raw.start("HTTP/1.1 100 Continue\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   auto r = client.get(urlFor(port));
@@ -158,11 +160,11 @@ TEST_CASE("An interim 1xx is discarded and the final 200 is framed",
 // Two interim 1xx responses before the final one are both skipped.
 TEST_CASE("Multiple interim 1xx responses are all discarded", "[http][1xx][defect_16]")
 {
-  const std::uint16_t port = 19331;
   RawServer raw;
-  REQUIRE(raw.start(port, "HTTP/1.1 100 Continue\r\n\r\n"
-                          "HTTP/1.1 103 Early Hints\r\n\r\n"
-                          "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nyay"));
+  REQUIRE(raw.start("HTTP/1.1 100 Continue\r\n\r\n"
+                    "HTTP/1.1 103 Early Hints\r\n\r\n"
+                    "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nyay"));
+  const std::uint16_t port = raw.port();
   std::this_thread::sleep_for(std::chrono::milliseconds(80));
   HttpClient client(cfg());
   auto r = client.get(urlFor(port));

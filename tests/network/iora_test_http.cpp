@@ -14,8 +14,9 @@ using namespace iora::test;
 
 TEST_CASE("HttpClient and WebhookServer integration tests")
 {
+  const std::uint16_t port = testnet::getFreePortTCP();
   iora::network::WebhookServer server;
-  server.setPort(8081);
+  server.setPort(port);
 
   server.onJsonPost("/test-post-json",
                     [](const iora::parsers::Json &input) -> iora::parsers::Json
@@ -62,7 +63,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
   {
     try
     {
-      auto res = client.get("http://localhost:8081/test-get");
+      auto res = client.get("http://localhost:" + std::to_string(port) + "/test-get");
       REQUIRE(res.success());
       auto json = iora::network::HttpClient::parseJsonOrThrow(res);
       REQUIRE(json["status"] == "ok");
@@ -77,7 +78,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
   {
     auto payload = iora::parsers::Json::object();
     payload["message"] = "hello";
-    auto res = client.postJson("http://localhost:8081/test-post-json", payload);
+    auto res = client.postJson("http://localhost:" + std::to_string(port) + "/test-post-json", payload);
     REQUIRE(res.success());
     auto json = iora::network::HttpClient::parseJsonOrThrow(res);
     REQUIRE(json["echo"]["message"] == "hello");
@@ -96,7 +97,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
 
     auto payload = iora::parsers::Json::object();
     payload["async_test"] = 1;
-    auto postFuture = asyncClient.postJsonAsync("http://localhost:8081/test-async", payload);
+    auto postFuture = asyncClient.postJsonAsync("http://localhost:" + std::to_string(port) + "/test-async", payload);
     auto postRes = postFuture.get();
     REQUIRE(postRes.success());
     auto postJsonBody = iora::network::HttpClient::parseJsonOrThrow(postRes);
@@ -104,7 +105,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
     REQUIRE(postJsonBody["received"]["async_test"] == 1);
 
     // getAsync smoke (previously untested at runtime).
-    auto getFuture = asyncClient.getAsync("http://localhost:8081/test-get");
+    auto getFuture = asyncClient.getAsync("http://localhost:" + std::to_string(port) + "/test-get");
     auto getRes = getFuture.get();
     REQUIRE(getRes.success());
     auto getJsonBody = iora::network::HttpClient::parseJsonOrThrow(getRes);
@@ -114,7 +115,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
     // surfacing AsyncRejectedError through the future rather than admitting an
     // unbounded task onto the shared pool.
     iora::network::HttpClient unboundedClient;
-    auto rejectedFuture = unboundedClient.getAsync("http://localhost:8081/test-get");
+    auto rejectedFuture = unboundedClient.getAsync("http://localhost:" + std::to_string(port) + "/test-get");
     REQUIRE_THROWS_AS(rejectedFuture.get(), iora::core::AsyncRejectedError);
   }
 
@@ -122,7 +123,7 @@ TEST_CASE("HttpClient and WebhookServer integration tests")
   {
     auto payload = iora::parsers::Json::object();
     std::vector<std::string> chunks;
-    client.postStream("http://localhost:8081/test-stream", payload, {},
+    client.postStream("http://localhost:" + std::to_string(port) + "/test-stream", payload, {},
                       [&](const std::string &line)
                       {
                         if (!line.empty())
@@ -192,7 +193,7 @@ TEST_CASE("HTTP Client BSD Socket Timeout Tests", "[http][timeout][bsd]")
 
   SECTION("Test 1: Write timeout - accept but don't respond")
   {
-    uint16_t port = 18901;
+    const uint16_t port = testnet::getFreePortTCP();
     int listenSock = createListeningSocket(port);
 
     std::atomic<bool> shouldAccept{true};
@@ -256,7 +257,7 @@ TEST_CASE("HTTP Client BSD Socket Timeout Tests", "[http][timeout][bsd]")
 
   SECTION("Test 2: Instant disconnect - close on connect")
   {
-    uint16_t port = 18902;
+    const uint16_t port = testnet::getFreePortTCP();
     int listenSock = createListeningSocket(port);
 
     std::atomic<bool> shouldAccept{true};
@@ -430,7 +431,7 @@ TEST_CASE("HTTPS Client BSD Socket Timeout Tests with TLS", "[https][timeout][bs
 
   SECTION("TLS Test 1: Write timeout - accept TLS but don't respond")
   {
-    uint16_t port = 18911;
+    const uint16_t port = testnet::getFreePortTCP();
     auto [listenSock, sslCtx] = createTlsListeningSocket(port);
 
     std::atomic<bool> shouldAccept{true};
@@ -509,7 +510,7 @@ TEST_CASE("HTTPS Client BSD Socket Timeout Tests with TLS", "[https][timeout][bs
 
   SECTION("TLS Test 2: Instant disconnect - close after TLS handshake")
   {
-    uint16_t port = 18912;
+    const uint16_t port = testnet::getFreePortTCP();
     auto [listenSock, sslCtx] = createTlsListeningSocket(port);
 
     std::atomic<bool> shouldAccept{true};
@@ -640,8 +641,9 @@ TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
     return;
   }
 
+  const std::uint16_t port = testnet::getFreePortTCP();
   iora::network::WebhookServer server;
-  server.setPort(8443);
+  server.setPort(port);
 
   iora::network::WebhookServer::TlsConfig tlsCfg;
   tlsCfg.certFile = certFile;
@@ -670,7 +672,7 @@ TEST_CASE("WebhookServer TLS (SSL) basic functionality", "[webhookserver][tls]")
     client.setTlsConfig(tlsCfg);
     try
     {
-      auto res = client.get("https://localhost:8443/tls-test");
+      auto res = client.get("https://localhost:" + std::to_string(port) + "/tls-test");
       REQUIRE(res.success());
       auto json = iora::network::HttpClient::parseJsonOrThrow(res);
       REQUIRE(json["tls"] == true);

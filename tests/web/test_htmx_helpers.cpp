@@ -21,7 +21,6 @@
 #include <iora/web/htmx.hpp>
 
 #include <arpa/inet.h>
-#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -36,6 +35,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include "iora_test_net_utils.hpp"
 
 using iora::network::HttpServer;
 using Request = HttpServer::Request;
@@ -77,8 +77,6 @@ std::string headerValue(const Response &res, const std::string &k)
 // adapted from tests/web/test_routing_extensions.cpp.
 // ---------------------------------------------------------------------------
 
-std::atomic<int> g_nextPort{18230};
-int nextPort() { return g_nextPort.fetch_add(1); }
 
 std::string lower(std::string s)
 {
@@ -278,7 +276,7 @@ RawResponse rawRequest(int port, const std::string &method, const std::string &t
 
 int startOn(HttpServer &srv)
 {
-  int port = nextPort();
+  int port = testnet::getFreePortTCP();
   srv.setPort(port);
   srv.start();
   std::this_thread::sleep_for(std::chrono::milliseconds(300));

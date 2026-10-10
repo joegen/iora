@@ -7,7 +7,7 @@
 //
 // Real-socket integration: a real HttpServer on 127.0.0.1:<free_port>, a real
 // core::TimerService, a real Assets (embedded or temp dir), a real Application,
-// driven over raw TCP. ctest runs -j1 (web tests share ports).
+// driven over raw TCP. ctest runs -j1.
 
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
@@ -34,6 +34,7 @@
 #include <vector>
 
 #include <iora/web/application.hpp>
+#include "iora_test_net_utils.hpp"
 
 using iora::network::HttpServer;
 using iora::web::Application;
@@ -55,9 +56,6 @@ static_assert(!std::is_move_constructible<Application>::value, "non-movable");
 namespace
 {
 using namespace std::chrono_literals;
-
-std::atomic<int> g_nextPort{19400};
-int nextPort() { return g_nextPort.fetch_add(1); }
 
 std::string lower(std::string s)
 {
@@ -131,7 +129,7 @@ struct TempTree
   explicit TempTree(const std::string &tag)
   {
     root = std::filesystem::temp_directory_path() /
-           ("iora_app_" + tag + "_" + std::to_string(nextPort()));
+           ("iora_app_" + tag + "_" + std::to_string(testnet::getFreePortTCP()));
     std::filesystem::create_directories(root / "templates");
     std::filesystem::create_directories(root / "static");
   }
@@ -421,7 +419,7 @@ struct AppFixture
 
   explicit AppFixture(std::chrono::milliseconds heartbeat = 15000ms)
       : assets(Assets::fromEmbedded(kRegistry)), app(srv, assets, timer, heartbeat),
-        port(nextPort())
+        port(testnet::getFreePortTCP())
   {
     timer.start();
     srv.setPort(port);
@@ -794,7 +792,7 @@ TEST_CASE("serveStatic security headers on a FILESYSTEM (operator-supplied) SVG/
   core::TimerService timer;
   timer.start();
   HttpServer srv;
-  int port = nextPort();
+  int port = testnet::getFreePortTCP();
   srv.setPort(port);
   Application app(srv, assets, timer);
   app.serveStatic("/static/");
@@ -859,7 +857,7 @@ TEST_CASE("serveStatic + render survive concurrent reload() in filesystem mode (
   core::TimerService timer;
   timer.start();
   HttpServer srv;
-  int port = nextPort();
+  int port = testnet::getFreePortTCP();
   srv.setPort(port);
   Application app(srv, assets, timer);
   app.page("/fs", "page.html",

@@ -407,9 +407,8 @@ if(IORA_BUILD_RPC_TESTS AND
 endif()
 
 # task-6.5 (C1): the inherited pool concurrency suite, ported from
-# src/modules/connectors/jsonrpc_client/tests/. It uses FIXED loopback ports
-# (18150-18189) in its LatchedHttpServer / RawCaptureServer fixtures, so every
-# registration is RESOURCE_LOCK'd on a shared token. The default registration runs
+# src/modules/connectors/jsonrpc_client/tests/. Its LatchedHttpServer /
+# RawCaptureServer fixtures take OS-assigned ports. The default registration runs
 # the GREEN tag set; the four CR repros run as their own focused regression guards.
 # Created here (before the IORA_SANITIZED_TEST_TARGETS loop, to which it is added)
 # because the tag-filtered default + per-repro registrations cannot be expressed
@@ -424,25 +423,30 @@ if(IORA_BUILD_RPC_TESTS AND
         COMMAND iora_test_jsonrpc_client_pool
         "[scaffold],[seam],[fixture],[phase4],[phase3],[phase5],[phase6],[phase7],[connecttimeout]")
     set_tests_properties(rpc::iora_test_jsonrpc_client_pool PROPERTIES
-        TIMEOUT 180 RESOURCE_LOCK jsonrpc_pool_ports)
+        TIMEOUT 180)
     # Per-repro standalone guards (CR-1..CR-4), each filtered to one Catch2 tag.
     add_test(NAME rpc::jsonrpc_client_pool_cr1_identity
         COMMAND iora_test_jsonrpc_client_pool "[cr1]")
     set_tests_properties(rpc::jsonrpc_client_pool_cr1_identity PROPERTIES
-        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+        TIMEOUT 60)
     add_test(NAME rpc::jsonrpc_client_pool_cr2_freed_pool
         COMMAND iora_test_jsonrpc_client_pool "[cr2]")
     set_tests_properties(rpc::jsonrpc_client_pool_cr2_freed_pool PROPERTIES
-        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+        TIMEOUT 60)
     add_test(NAME rpc::jsonrpc_client_pool_cr3_deadlock
         COMMAND iora_test_jsonrpc_client_pool "[cr3]")
     set_tests_properties(rpc::jsonrpc_client_pool_cr3_deadlock PROPERTIES
-        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+        TIMEOUT 60)
     add_test(NAME rpc::jsonrpc_client_pool_cr4_quiesce_waits
         COMMAND iora_test_jsonrpc_client_pool "[cr4]")
     set_tests_properties(rpc::jsonrpc_client_pool_cr4_quiesce_waits PROPERTIES
-        TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
+        TIMEOUT 60)
 endif()
+
+# Every test gets its ports at run time (iora_test_net_utils.hpp); this check fails
+# on a hard-coded port. Registered outside the test-group options so it always runs.
+add_test(NAME check_no_fixed_ports
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/check_no_fixed_ports.sh ${CMAKE_CURRENT_SOURCE_DIR})
 
 # The aged-file compressor's test-injection seams (Logger::TestHooks) are compiled
 # in ONLY for this test target — production/shipped builds of logger.hpp have no
