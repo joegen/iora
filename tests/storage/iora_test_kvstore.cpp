@@ -19,6 +19,8 @@ using iora::storage::MAX_VALUE_LENGTH;
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <string>
@@ -1214,6 +1216,63 @@ TEST_CASE("KVStore TTL persistence across restart", "[kvstore][ttl][persistence]
       REQUIRE(store.exists("e"));
       REQUIRE(store.ttl("e").has_value()); // expireAt survived
       REQUIRE_FALSE(store.exists("d")); // removed
+    }
+  }
+
+  cleanup(file);
+}
+
+TEST_CASE("KVStore log records match the reference encoder; empty value round-trips",
+          "[kvstore][persistence][logformat]")
+{
+  using namespace ttltest;
+  const std::string file = "test_kvstore_log_bytes.bin";
+  cleanup(file);
+
+  SECTION("S, empty S, X, X sentinel and D records are byte-identical to buildLogEntry")
+  {
+    const auto whenMs = toFutureMs(3600);
+    const sysclock::time_point when{std::chrono::milliseconds(whenMs)};
+
+    KVStore store(file, noFireConfig());
+    store.set("s", {1, 2, 3});
+    store.set("z", {});
+    store.expireAt("s", when);
+    store.persist("s");
+    store.remove("z");
+
+    std::vector<uint8_t> expected;
+    for (const auto &rec : {buildLogEntry('S', "s", 0, {1, 2, 3}), buildLogEntry('S', "z", 0, {}),
+                            buildLogEntry('X', "s", whenMs, {}),
+                            buildLogEntry('X', "s", std::numeric_limits<int64_t>::min(), {}),
+                            buildLogEntry('D', "z", 0, {})})
+    {
+      expected.insert(expected.end(), rec.begin(), rec.end());
+    }
+
+    std::ifstream in(file + ".log", std::ios::binary);
+    const std::vector<uint8_t> actual((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+    REQUIRE(actual == expected);
+  }
+
+  SECTION("an empty value replays through 'S' and through 'E'")
+  {
+    {
+      KVStore store(file, noFireConfig());
+      store.set("z", {});
+      store.set("ze", {}, std::chrono::seconds(3600));
+    }
+    REQUIRE(std::filesystem::file_size(file + ".log") > 0);
+    {
+      KVStore store(file, noFireConfig());
+      const auto z = store.get("z");
+      REQUIRE(z.has_value());
+      REQUIRE(z->empty());
+      const auto ze = store.get("ze");
+      REQUIRE(ze.has_value());
+      REQUIRE(ze->empty());
+      REQUIRE(store.ttl("ze").has_value());
     }
   }
 

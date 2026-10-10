@@ -30,6 +30,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "iora/core/buffer_view.hpp"
 #include "iora/core/timing_wheel.hpp"
 
 #ifdef __unix__
@@ -1497,8 +1498,8 @@ private:
         {
           continue;
         }
-        std::vector<std::uint8_t> value(valLen);
-        std::memcpy(value.data(), ptr, valLen);
+        const auto *bytes = reinterpret_cast<const std::uint8_t *>(ptr);
+        std::vector<std::uint8_t> value(bytes, bytes + valLen);
         _kv[key] = std::move(value);
         _expiry.erase(key); // plain set clears any prior expiry (Redis-style)
       }
@@ -1522,8 +1523,8 @@ private:
         {
           continue; // corrupt → drop
         }
-        std::vector<std::uint8_t> value(valLen);
-        std::memcpy(value.data(), ptr, valLen);
+        const auto *bytes = reinterpret_cast<const std::uint8_t *>(ptr);
+        std::vector<std::uint8_t> value(bytes, bytes + valLen);
         const auto exp = fromEpochMs(expiryMs);
         if (exp > now)
         {
@@ -1576,7 +1577,7 @@ private:
   }
 
   void writeLogEntry(char op, const std::string &key, const std::vector<std::uint8_t> &value,
-                     int64_t expiryMs = 0)
+                     std::int64_t expiryMs = 0)
   {
     if (_inMemory)
     {
@@ -1590,28 +1591,31 @@ private:
     const bool hasExpiry = (op == 'E' || op == 'X');
     const bool hasValue = (op == 'E' || op == 'S');
 
-    std::vector<std::uint8_t> buffer;
-    buffer.reserve(1 + 4 + key.size() + (hasExpiry ? 8 : 0) +
-                   (hasValue ? 4 + value.size() : 0));
+    std::vector<std::uint8_t> buffer(1 + 4 + key.size() + (hasExpiry ? 8 : 0) +
+                                     (hasValue ? 4 + value.size() : 0));
+    core::BufferWriter writer(buffer.data(), buffer.size());
+    auto put = [&writer](const void *data, std::size_t n)
+    { writer.append(static_cast<const std::uint8_t *>(data), n); };
 
-    buffer.push_back(static_cast<uint8_t>(op));
-    uint32_t keyLen = static_cast<uint32_t>(key.size());
-    appendRaw(buffer, &keyLen, 4);
-    buffer.insert(buffer.end(), key.begin(), key.end());
+    const auto opByte = static_cast<std::uint8_t>(op);
+    put(&opByte, 1);
+    const auto keyLen = static_cast<std::uint32_t>(key.size());
+    put(&keyLen, 4);
+    put(key.data(), key.size());
 
     if (hasExpiry)
     {
-      appendRaw(buffer, &expiryMs, 8);
+      put(&expiryMs, 8);
     }
     if (hasValue)
     {
-      uint32_t valLen = static_cast<uint32_t>(value.size());
-      appendRaw(buffer, &valLen, 4);
-      buffer.insert(buffer.end(), value.begin(), value.end());
+      const auto valLen = static_cast<std::uint32_t>(value.size());
+      put(&valLen, 4);
+      put(value.data(), value.size());
     }
 
-    uint32_t checksum = crc32(buffer);
-    uint32_t totalLen = static_cast<uint32_t>(buffer.size()) + 4; // +4 for checksum
+    std::uint32_t checksum = crc32(buffer);
+    std::uint32_t totalLen = static_cast<std::uint32_t>(buffer.size()) + 4; // +4 for checksum
 
     if (!_logStream.write(reinterpret_cast<const char *>(&totalLen), 4) ||
         !_logStream.write(reinterpret_cast<const char *>(buffer.data()), buffer.size()) ||
@@ -1621,12 +1625,6 @@ private:
     }
 
     _logStream.flush();
-  }
-
-  static void appendRaw(std::vector<std::uint8_t> &buffer, const void *data, size_t n)
-  {
-    const auto *bytes = reinterpret_cast<const std::uint8_t *>(data);
-    buffer.insert(buffer.end(), bytes, bytes + n);
   }
 
   // Cache management

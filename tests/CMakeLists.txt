@@ -444,13 +444,6 @@ if(IORA_BUILD_RPC_TESTS AND
         TIMEOUT 60 RESOURCE_LOCK jsonrpc_pool_ports)
 endif()
 
-# Suppress a known GCC false-positive (-Wfree-nonheap-object) triggered by
-# vector::reserve inlined from KVStore::writeLogEntry. Matches the suppression
-# the former mod_kvstore target carried.
-if(TARGET iora_test_kvstore)
-    target_compile_options(iora_test_kvstore PRIVATE -Wno-free-nonheap-object)
-endif()
-
 # The aged-file compressor's test-injection seams (Logger::TestHooks) are compiled
 # in ONLY for this test target — production/shipped builds of logger.hpp have no
 # such fault-injection surface. See logger.hpp (IORA_ENABLE_TEST_HOOKS).
