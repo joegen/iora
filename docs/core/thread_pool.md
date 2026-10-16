@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 2.2 |
-| **Date** | 2026-09-10 |
+| **Version** | 2.3 |
+| **Date** | 2026-10-16 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/thread_pool.hpp` |
 | **Compiled unit** | `src/core/iora_core.cpp` (defines the `blockingIoPool()` and `generalAsyncPool()` process-wide singletons, compiled once into `libiora_core.so`) |
@@ -22,6 +22,7 @@
 | 2.0 | 2026-09-10 | **Renamed and re-scoped** to `docs/core/thread_pool.md` and re-titled for the class it mirrors, `iora::core::ThreadPool`. The pool class -- worker model, dynamic scaling, the `ILifecycleManaged` lifecycle (`start`/`drain`/`stop`/`reset`), and the five-phase shutdown sequence -- is now the headline; `iora::core::async` / `PooledFuture<R>` remains a prominent section (5) rather than the title. Every claim re-verified against the post-async-pool-rewrite `include/iora/core/thread_pool.hpp` (1368 lines) and the singleton definitions in `src/core/iora_core.cpp`; stale claims from the 1.0 guide corrected against the current source, and every remaining behavioral caveat routed to a concrete backlog tracker under `tasks/iora/backlog/`. Restructured to the 12-section guide template with contiguous numbered sections. |
 | 2.1 | 2026-09-10 | Synced to the removal of dead scaffolding from `thread_pool.hpp` (tracker `2026-09-10-4`): deleted the `volatile` canary / `VALIDATE_CANARY` instrumentation and the dead `_workerScaling` knob (idle-exit is now unconditional, floored by `> _initialSize`) and the write-only `_threadsStarted` counter. Removed the `_workerScaling` section and the canary/`_workerScaling` Known-Limitations bullets; the `_busyThreads` primitives-table entry is retained for the downstream P0 `2026-09-09-7`. |
 | 2.2 | 2026-09-10 | Synced to the drain-quiescence P0 (tracker `2026-09-09-7`). `getInFlightCount()` is now the single-critical-section quiescence gate (`_tasks.size() + _busyThreads` under one `_mutex` hold); `drain`/`shutdown`/Phase-3 all delegate to `getInFlightCount() == 0` (removing the two-sample `_activeThreads == 0 && pending == 0` predicate and the former "P0-3" 10 ms re-check). `stop()` on a drain timeout now `forceDetachWorkers()` + a pool-local terminal flag instead of leaving a zombie `Draining` pool; `start`/`drain`/`stop`/`reset` are serialized by `_lifecycleMutex`. Corrected §3.5/§3.7/§3.8/§6.4/§6.5/§8.1/§8.2/§10 and DP-3 to the `_busyThreads` gate; added the forced-detach and stuck-`shutdown()` Known Limitations. |
+| 2.3 | 2026-10-16 | The `iora` executable's `--help` text moved from `src/iora.cpp` to `src/iora_cli_config.hpp` (tracker 2026-09-24-16); reference updated. |
 
 ---
 
@@ -693,7 +694,7 @@ There is no runtime/env-var configuration; sizing is fixed at construction. **De
 | `onTaskError` | `std::function<void(std::exception_ptr)>` | `nullptr` | Optional handler for uncaught void-task exceptions. |
 | `shutdownMode` | `ShutdownMode` | `ShutdownMode::IMMEDIATE` | Join (IMMEDIATE) or detach (DETACHED) at shutdown. |
 
-> **Divergence to be aware of (not a header default).** `IoraService` constructs its *own* per-service `ThreadPool` with different fallbacks -- `minThreads = 1`, `maxThreads = hardware_concurrency()` (or `4` if `0`), `queueSize = maxThreads * 2`, `idleTimeout = 60 s` -- and `src/iora.cpp`'s `--help` text hand-duplicates *those* values (`--threadpool-min` default `1`, `--threadpool-max` default "hardware concurrency, or 4", `--threadpool-queue` default "2 x max threads", `--threadpool-idle-timeout` default `60`). These are `IoraService`'s policy defaults, **not** the `ThreadPool` constructor defaults in the table above; the two sets do not match. When documenting or reasoning about a bare `ThreadPool`, use the header table; when reasoning about the framework-owned pool, use `IoraService`'s values.
+> **Divergence to be aware of (not a header default).** `IoraService` constructs its *own* per-service `ThreadPool` with different fallbacks -- `minThreads = 1`, `maxThreads = hardware_concurrency()` (or `4` if `0`), `queueSize = maxThreads * 2`, `idleTimeout = 60 s` -- and the `iora` executable's `--help` text (`src/iora_cli_config.hpp`) hand-duplicates *those* values (`--threadpool-min` default `1`, `--threadpool-max` default "hardware concurrency, or 4", `--threadpool-queue` default "2 x max threads", `--threadpool-idle-timeout` default `60`). These are `IoraService`'s policy defaults, **not** the `ThreadPool` constructor defaults in the table above; the two sets do not match. When documenting or reasoning about a bare `ThreadPool`, use the header table; when reasoning about the framework-owned pool, use `IoraService`'s values.
 
 ### 9.2 The immortal singletons (`src/core/iora_core.cpp`)
 

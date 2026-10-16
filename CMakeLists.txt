@@ -69,16 +69,27 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 # cases are deliberately not applied. _iora_installed_config_file is the
 # configure-time path compiled into the iora executable (src/CMakeLists.txt);
 # _iora_config_dir_code is the same directory for install(CODE), with the prefix
-# escaped so it is read at install time.
+# escaped so it is read at install time. The log and modules directories written
+# into the installed iora.cfg follow the same rule, via one helper, so the file's
+# location and its contents cannot disagree.
+function(_iora_install_time_dir out dir suffix)
+    if(IS_ABSOLUTE "${dir}")
+        set(${out} "${dir}/${suffix}" PARENT_SCOPE)
+    else()
+        set(${out} "\${CMAKE_INSTALL_PREFIX}/${dir}/${suffix}" PARENT_SCOPE)
+    endif()
+endfunction()
+
 if(IS_ABSOLUTE "${CMAKE_INSTALL_SYSCONFDIR}")
     set(_iora_sysconfdir_is_absolute TRUE)
     set(_iora_installed_config_file "${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d/iora.cfg")
-    set(_iora_config_dir_code "${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d")
 else()
     set(_iora_sysconfdir_is_absolute FALSE)
     set(_iora_installed_config_file "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d/iora.cfg")
-    set(_iora_config_dir_code "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d")
 endif()
+_iora_install_time_dir(_iora_config_dir_code "${CMAKE_INSTALL_SYSCONFDIR}" "iora.conf.d")
+_iora_install_time_dir(_iora_log_dir_code "${CMAKE_INSTALL_LOCALSTATEDIR}" "log/iora")
+_iora_install_time_dir(_iora_modules_dir_code "${CMAKE_INSTALL_LIBDIR}" "iora/modules")
 
 # Include our modular CMake files
 include(cmake/Dependencies.cmake)
@@ -138,12 +149,17 @@ install(DIRECTORY include/
 # Install iora.cfg into <sysconfdir>/iora.conf.d (rule above). The prefix and
 # DESTDIR are escaped so they are read at INSTALL time (`cmake --install --prefix`
 # and DESTDIR are honored). file(INSTALL) prepends DESTDIR itself; only the
-# no-overwrite guard adds it. An existing iora.cfg is never overwritten.
+# no-overwrite guard adds it. An existing iora.cfg is never overwritten. The
+# template's @IORA_*_DIR@ paths are filled in here, at install time, from the same
+# install-time directories (never DESTDIR).
 install(CODE "
-    set(iora_config_dir \"${_iora_config_dir_code}\")
-    set(iora_config_file \"\$ENV{DESTDIR}\${iora_config_dir}/iora.cfg\")
+    set(IORA_CONFIG_DIR \"${_iora_config_dir_code}\")
+    set(IORA_LOG_DIR \"${_iora_log_dir_code}\")
+    set(IORA_MODULES_DIR \"${_iora_modules_dir_code}\")
+    set(iora_config_file \"\$ENV{DESTDIR}\${IORA_CONFIG_DIR}/iora.cfg\")
     if(NOT EXISTS \"\${iora_config_file}\")
-        file(INSTALL DESTINATION \"\${iora_config_dir}\" TYPE FILE FILES \"${CMAKE_CURRENT_SOURCE_DIR}/src/config/iora.cfg.in\" RENAME iora.cfg)
+        configure_file(\"${CMAKE_CURRENT_SOURCE_DIR}/src/config/iora.cfg.in\" \"${CMAKE_CURRENT_BINARY_DIR}/iora.cfg.install\" @ONLY)
+        file(INSTALL DESTINATION \"\${IORA_CONFIG_DIR}\" TYPE FILE FILES \"${CMAKE_CURRENT_BINARY_DIR}/iora.cfg.install\" RENAME iora.cfg)
     else()
         message(STATUS \"Skipping install of iora.cfg: already exists at \${iora_config_file}\")
     endif()

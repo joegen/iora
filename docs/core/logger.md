@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 1.3 |
+| **Version** | 1.4 |
 | **Date** | 2026-10-16 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/logger.hpp` |
@@ -22,6 +22,7 @@
 | 1.1 | 2026-09-12 | **Mechanism B (deferred tear-out), tracker 2026-07-23-1.** The frozen-inflight accounting (`FrozenScope`/`FrozenReleaser`/`externalHandlerFrozen`/park-notify) was RETIRED. A depth>0 self-clear/set now DEFERS (`nullGateAndDeferLocked`): it nulls the gate, records `pendingTearOut`/`pendingInstall` (last-writer-wins), and returns non-waiting; the last in-flight invocation applies it (`applyDeferredTearOutLocked`). The drain predicate is reduced to `inflight == handlerReentryDepth()`; `init()` at depth>0 is non-waiting; a DEBUG `DepthGtTeardownParkerGuard` guards the `≤ 1 depth>0 teardown parker` invariant. Sections 3.6/3.7/3.10, the class map, the lock-timeline, notify-sites, design records D-2/D-3, and Known Limitations updated. |
 | 1.2 | 2026-09-24 | DOC-4: new section 3.11 (console colors: the per-level ANSI codes, the `NO_COLOR` set-and-non-empty rule, the TTY check, console-only scope); section 8's color row states the `NO_COLOR` rule exactly. Corrected section 5.6: the configuration file is TOML under `[iora.log]`, it is read only by the `iora` executable (`src/iora.cpp`), its retention key is `retentionDays`, and `compressAfterDays` is not read from the file or the command line -- it can only be set in code through `IoraService::Config::log`. |
 | 1.3 | 2026-10-16 | Section 5.6: the `iora` executable's default configuration file is now the installed `iora.cfg` (`<prefix>/etc/iora.conf.d/iora.cfg`, prefix fixed at configure time, or `<sysconfdir>/iora.conf.d/iora.cfg` when `CMAKE_INSTALL_SYSCONFDIR` is absolute), not `/etc/iora.conf.d/iora.cfg`. |
+| 1.4 | 2026-10-16 | Section 5.6 (tracker 2026-09-24-16): the `iora` executable now reads `iora.log.compressAfterDays`, and the shipped template uses the key names the executable reads (`retentionDays`, `timeFormat`); the TOML example gains `compressAfterDays`. |
 
 Historical milestones carried from the frozen sources (behaviour, not tracking):
 
@@ -483,12 +484,12 @@ void startService()
   config.log.file = "/var/log/myservice/app";
   config.log.async = true;
   config.log.retentionDays = 30;
-  config.log.compressAfterDays = 3; // no TOML key or CLI flag sets this; code only
+  config.log.compressAfterDays = 3; // TOML iora.log.compressAfterDays; no CLI flag
   iora::IoraService::init(config);
 }
 ```
 
-The shipped `iora` executable (`src/iora.cpp`) fills the same fields from its command line and, for fields still unset, from a TOML file (`-c <path>`, default: the installed `iora.cfg`, `<prefix>/etc/iora.conf.d/iora.cfg` with the configure-time prefix, `/usr/local/etc/iora.conf.d/iora.cfg` by default, or `<sysconfdir>/iora.conf.d/iora.cfg` when `CMAKE_INSTALL_SYSCONFDIR` is absolute). It reads these `[iora.log]` keys -- the names are case-sensitive and must be spelled exactly:
+The shipped `iora` executable (`src/iora.cpp`, parsing in `src/iora_cli_config.hpp`) fills the same fields from its command line and, for fields still unset, from a TOML file (`-c <path>`, default: the installed `iora.cfg`, `<prefix>/etc/iora.conf.d/iora.cfg` with the configure-time prefix, `/usr/local/etc/iora.conf.d/iora.cfg` by default, or `<sysconfdir>/iora.conf.d/iora.cfg` when `CMAKE_INSTALL_SYSCONFDIR` is absolute). It reads these `[iora.log]` keys -- the names are case-sensitive and must be spelled exactly:
 
 ```toml
 [iora.log]
@@ -497,9 +498,10 @@ file = "/var/log/myservice/app"
 async = true
 retentionDays = 30
 timeFormat = "%Y-%m-%d %H:%M:%S"
+compressAfterDays = 3
 ```
 
-`compressAfterDays` is **not** read from the file or from the command line; a `compressAfterDays` key in `[iora.log]` is ignored. The template installed as `iora.cfg` (`src/config/iora.cfg.in`) spells the retention and time-format keys `retention_days` and `time_format`, which the executable does not read, so those two settings in the stock file have no effect (see [`../iora_service.md`](../iora_service.md), Known Limitations).
+`compressAfterDays` has no command-line flag; it is set only from the file. The template installed as `iora.cfg` (`src/config/iora.cfg.in`) uses exactly these key names, and its log base name follows the install-time prefix (`<localstatedir>/log/iora/iora`; see [`../iora_service.md`](../iora_service.md), section 7).
 
 ### 5.7 Anti-patterns
 

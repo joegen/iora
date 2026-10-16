@@ -226,6 +226,7 @@ set(SERVICE_TESTS
     service/iora_test_loadfailure_teardown
     service/iora_test_unload_teardown_exception
     service/iora_test_validate_module_path
+    service/iora_test_cli_config
 )
 
 # Debug/helper tests (keep in root)
@@ -958,6 +959,23 @@ if(IORA_BUILD_SERVICE_TESTS)
         endif()
         target_link_libraries(iora_test_validate_module_path PRIVATE ${CMAKE_DL_LIBS})
     endif()
+
+    # The iora-executable config test (tracker 2026-09-24-16) includes the
+    # internal src/iora_cli_config.hpp, reads the shipped iora.cfg.in, and copies
+    # and loads plugins at runtime; depend on them so a targeted build also builds
+    # the .so's it loads, and link libdl for dlopen.
+    if(TARGET iora_test_cli_config)
+        target_include_directories(iora_test_cli_config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(iora_test_cli_config PRIVATE
+            IORA_CFG_TEMPLATE_PATH="${PROJECT_SOURCE_DIR}/src/config/iora.cfg.in")
+        foreach(_cli_plugin baseplugin dependentplugin testplugin exportthenthrowplugin
+                nonstdonloadthrowplugin)
+            if(TARGET ${_cli_plugin})
+                add_dependencies(iora_test_cli_config ${_cli_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_cli_config PRIVATE ${CMAKE_DL_LIBS})
+    endif()
 endif()
 
 # Build core test plugins (generalAsyncPool cross-.so identity test, DP-9) when
@@ -1019,6 +1037,8 @@ if(IORA_BUILD_PACKAGING_TESTS)
                 -DIORA_BUILD_DIR=${PROJECT_BINARY_DIR}
                 -DIORA_SYSCONFDIR=${CMAKE_INSTALL_SYSCONFDIR}
                 -DIORA_BINDIR=${CMAKE_INSTALL_BINDIR}
+                -DIORA_LIBDIR=${CMAKE_INSTALL_LIBDIR}
+                -DIORA_LOCALSTATEDIR=${CMAKE_INSTALL_LOCALSTATEDIR}
                 -DCONSUMER_SRC=${_pkg_dir}/installed_core_consumer
                 -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/packaging_install_work
                 -P ${_pkg_dir}/run_install_layout_test.cmake

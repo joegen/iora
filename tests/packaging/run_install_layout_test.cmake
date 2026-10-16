@@ -5,14 +5,17 @@
 # and DESTDIR for iora.cfg, never overwrites an existing iora.cfg, gives the
 # iora executable an $ORIGIN-relative RPATH, and exports IORA_CORE_SHARED + dl
 # on Iora::iora_core. Step (6) configures iora afresh with an absolute
-# CMAKE_INSTALL_SYSCONFDIR, offline, with no Catch2 request.
+# CMAKE_INSTALL_SYSCONFDIR, offline, with no Catch2 request. Every installed
+# iora.cfg has its directory paths filled in from the install-time prefix (never
+# DESTDIR).
 #
 # Inputs (-D): IORA_SRC, IORA_BUILD_DIR, IORA_SYSCONFDIR, IORA_BINDIR,
-#              CONSUMER_SRC, WORK_DIR
+#              IORA_LIBDIR, IORA_LOCALSTATEDIR, CONSUMER_SRC, WORK_DIR
 
 cmake_minimum_required(VERSION 3.15)
 include("${CMAKE_CURRENT_LIST_DIR}/packaging_common.cmake")
-_require_vars(IORA_SRC IORA_BUILD_DIR IORA_SYSCONFDIR IORA_BINDIR CONSUMER_SRC WORK_DIR)
+_require_vars(IORA_SRC IORA_BUILD_DIR IORA_SYSCONFDIR IORA_BINDIR IORA_LIBDIR IORA_LOCALSTATEDIR
+              CONSUMER_SRC WORK_DIR)
 
 if(IS_ABSOLUTE "${IORA_SYSCONFDIR}")
   message(FATAL_ERROR "IORA_SYSCONFDIR '${IORA_SYSCONFDIR}' is absolute: this test would write outside ${WORK_DIR}")
@@ -22,6 +25,36 @@ set(_w "${WORK_DIR}")
 file(REMOVE_RECURSE "${_w}")
 file(MAKE_DIRECTORY "${_w}")
 set(_cfg_rel "${IORA_SYSCONFDIR}/iora.conf.d/iora.cfg")
+
+# The installed iora.cfg holds the exact substituted line for each directory
+# path (comment lines included: the TLS lines are "#? "-marked), no leftover
+# @TOKEN@, and no trace of DESTDIR. string(FIND), not a regex: the paths
+# contain '.'.
+function(_assert_cfg_paths _file _cfg _log _mods _destdir _desc)
+  file(READ "${_file}" _text)
+  foreach(_line
+      "directory = \"${_mods}\""
+      "file = \"${_log}/iora\""
+      "file = \"${_cfg}/iora_state.json\""
+      "#? certFile = \"${_cfg}/tls/server.crt\""
+      "#? keyFile = \"${_cfg}/tls/server.key\""
+      "#? caFile = \"${_cfg}/tls/ca.crt\"")
+    string(FIND "${_text}" "${_line}" _pos)
+    if(_pos EQUAL -1)
+      message(FATAL_ERROR "FAILED: ${_desc}: ${_file} lacks the line: ${_line}")
+    endif()
+  endforeach()
+  if(_text MATCHES "@[A-Za-z_]+@")
+    message(FATAL_ERROR "FAILED: ${_desc}: ${_file} has an unsubstituted @TOKEN@")
+  endif()
+  if(_destdir)
+    string(FIND "${_text}" "${_destdir}" _pos)
+    if(NOT _pos EQUAL -1)
+      message(FATAL_ERROR "FAILED: ${_desc}: ${_file} contains DESTDIR ${_destdir}")
+    endif()
+  endif()
+  message(STATUS "ok: ${_desc}")
+endfunction()
 
 function(_install)
   cmake_parse_arguments(I "" "DESC;PREFIX;DESTDIR;BUILD_DIR" "" ${ARGN})
@@ -40,11 +73,17 @@ endfunction()
 # (1) --prefix is honored at install time.
 _install(DESC "(1) install --prefix p" PREFIX "${_w}/p")
 _assert_exists("${_w}/p/${_cfg_rel}" "(1) iora.cfg under the install-time prefix")
+_assert_cfg_paths("${_w}/p/${_cfg_rel}" "${_w}/p/${IORA_SYSCONFDIR}/iora.conf.d"
+                  "${_w}/p/${IORA_LOCALSTATEDIR}/log/iora" "${_w}/p/${IORA_LIBDIR}/iora/modules"
+                  "" "(1) iora.cfg paths follow the install-time prefix")
 
 # (2) DESTDIR is applied exactly once.
 _install(DESC "(2) install DESTDIR=d --prefix p2" PREFIX "${_w}/p2" DESTDIR "${_w}/d")
 _assert_exists("${_w}/d${_w}/p2/${_cfg_rel}" "(2) iora.cfg under DESTDIR+prefix")
 _assert_not_exists("${_w}/d${_w}/d" "(2) DESTDIR not applied twice")
+_assert_cfg_paths("${_w}/d${_w}/p2/${_cfg_rel}" "${_w}/p2/${IORA_SYSCONFDIR}/iora.conf.d"
+                  "${_w}/p2/${IORA_LOCALSTATEDIR}/log/iora" "${_w}/p2/${IORA_LIBDIR}/iora/modules"
+                  "${_w}/d" "(2) iora.cfg paths follow the prefix, not DESTDIR")
 
 # (2b) the no-overwrite guard checks the staged (DESTDIR) path.
 file(WRITE "${_w}/d${_w}/p2/${_cfg_rel}" "# edited-staged\n")
@@ -93,6 +132,9 @@ _assert_cache_lacks("${_b6}" "^CATCH_BUILD_STATIC_LIBRARY" "(6) Catch2 not reque
 _run(DESC "(6) build" CMD ${CMAKE_COMMAND} --build "${_b6}" --parallel 2)
 _install(DESC "(6) install DESTDIR=d3" BUILD_DIR "${_b6}" PREFIX "${_w}/p6" DESTDIR "${_w}/d3")
 _assert_exists("${_w}/d3${_abs}/iora.conf.d/iora.cfg" "(6) iora.cfg under DESTDIR + absolute SYSCONFDIR")
+_assert_cfg_paths("${_w}/d3${_abs}/iora.conf.d/iora.cfg" "${_abs}/iora.conf.d"
+                  "${_w}/p6/${IORA_LOCALSTATEDIR}/log/iora" "${_w}/p6/${IORA_LIBDIR}/iora/modules"
+                  "${_w}/d3" "(6) iora.cfg paths: absolute SYSCONFDIR as is, others under the prefix")
 file(STRINGS "${_b6}/src/iora" _paths REGEX "iora\\.conf\\.d/iora\\.cfg$")
 list(FIND _paths "${_abs}/iora.conf.d/iora.cfg" _i)
 if(_i EQUAL -1)

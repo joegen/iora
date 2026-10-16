@@ -319,6 +319,23 @@ public:
     virtual ~Plugin() = default;
 
     /// \brief Called when the plugin is loaded
+    ///
+    /// On a failed load onUnload is NOT called. Only the plugin destructor runs,
+    /// while the .so is still mapped, and then the .so is unloaded. So: (1) do
+    /// every step that can fail (require(), config reads, resource acquisition)
+    /// before registering any webhook route or EventQueue handler; (2) register
+    /// routes and handlers as the last steps of onLoad, never in the constructor;
+    /// (3) in the destructor, stop and join any thread, ThreadPool task or timer
+    /// the constructor or onLoad started. The destructor runs with the module
+    /// loader lock held, as onLoad and onUnload do. So it must not call
+    /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules or a
+    /// SafeApiFunction: they throw under that lock, and a throw from a destructor
+    /// calls std::terminate. A thread or task it joins must not be blocked in, or
+    /// able to start, isModuleLoaded, a SafeApiFunction call or isAvailable(), or
+    /// one of those entry points: they wait for the lock, so the join deadlocks.
+    /// Tell the thread to stop first, then join it (tracker 2026-09-24-24).
+    /// Callbacks registered before a load failure are not removed. Following these
+    /// rules narrows the window but does not close it (tracker 2026-10-16-12).
     virtual void onLoad(IoraService *service) = 0;
 
     /// \brief Called before the plugin is unloaded
@@ -835,17 +852,7 @@ public:
     }
     catch (const std::exception &e)
     {
-      std::string error_msg = e.what();
-      // Only cyclical dependency errors should return false - other dependency issues should
-      // throw
-      if (error_msg.find("Cyclical dependency detected") != std::string::npos)
-      {
-        IORA_LOG_ERROR("Failed to load module due to cyclical dependency: " + modulePath + " - " +
-                       error_msg);
-        return false;
-      }
-
-      IORA_LOG_ERROR("Failed to load module: " + modulePath + " - " + error_msg);
+      IORA_LOG_ERROR("Failed to load module: " + modulePath + " - " + e.what());
       throw; // Re-throw exceptions (including missing dependency errors) to provide detailed
              // error information
     }
@@ -1505,6 +1512,28 @@ protected:
 
   /// \brief Loads all modules configured in the modules config section
   /// Automatically called during initialization if autoLoad is true (default)
+  ///
+  /// A module that fails to load (std or non-standard exception) is logged and
+  /// skipped; the batch continues with the next module. A configured list
+  /// (Config::modules.modules) is loaded in list order; the directory scan has
+  /// no fixed order.
+  ///
+  /// On a failed load onUnload is NOT called. Only the plugin destructor runs,
+  /// while the .so is still mapped, and then the .so is unloaded. So: (1) do
+  /// every step that can fail (require(), config reads, resource acquisition)
+  /// before registering any webhook route or EventQueue handler; (2) register
+  /// routes and handlers as the last steps of onLoad, never in the constructor;
+  /// (3) in the destructor, stop and join any thread, ThreadPool task or timer
+  /// the constructor or onLoad started. The destructor runs with the module
+  /// loader lock held, as onLoad and onUnload do. So it must not call
+  /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules or a
+  /// SafeApiFunction: they throw under that lock, and a throw from a destructor
+  /// calls std::terminate. A thread or task it joins must not be blocked in, or
+  /// able to start, isModuleLoaded, a SafeApiFunction call or isAvailable(), or
+  /// one of those entry points: they wait for the lock, so the join deadlocks.
+  /// Tell the thread to stop first, then join it (tracker 2026-09-24-24).
+  /// Callbacks registered before a load failure are not removed. Following these
+  /// rules narrows the window but does not close it (tracker 2026-10-16-12).
   void loadModules()
   {
     if (_modulesPath.empty())
@@ -1530,26 +1559,58 @@ protected:
       for (const auto &moduleName : *_config.modules.modules)
       {
         std::filesystem::path modulePath = modulesPath / moduleName;
-        if (std::filesystem::exists(modulePath) && std::filesystem::is_regular_file(modulePath))
+        std::error_code statEc;
+        if (std::filesystem::exists(modulePath, statEc) &&
+            std::filesystem::is_regular_file(modulePath, statEc))
         {
-          loadSingleModule(modulePath.string());
+          try
+          {
+            loadSingleModule(modulePath.string());
+          }
+          catch (const std::exception &e)
+          {
+            IORA_LOG_ERROR("loadModules: skipping module " + modulePath.string() + ": " +
+                           e.what());
+          }
+          catch (...)
+          {
+            IORA_LOG_ERROR("loadModules: skipping module " + modulePath.string() +
+                           ": non-standard exception");
+          }
         }
         else
         {
-          IORA_LOG_ERROR("Module not found: " + modulePath.string());
+          IORA_LOG_ERROR("Module not found: " + modulePath.string() +
+                         (statEc ? ": " + statEc.message() : std::string()));
         }
       }
       return;
     }
-    else
+    for (const auto &entry : std::filesystem::directory_iterator(modulesPath))
     {
-      for (const auto &entry : std::filesystem::directory_iterator(modulesPath))
+      std::error_code typeEc;
+      if (isSupportedModuleExtension(entry.path().extension().string()) &&
+          entry.is_regular_file(typeEc))
       {
-        if (entry.is_regular_file() &&
-            isSupportedModuleExtension(entry.path().extension().string()))
+        try
         {
           loadSingleModule(entry);
         }
+        catch (const std::exception &e)
+        {
+          IORA_LOG_ERROR("loadModules: skipping module " + entry.path().string() + ": " +
+                         e.what());
+        }
+        catch (...)
+        {
+          IORA_LOG_ERROR("loadModules: skipping module " + entry.path().string() +
+                         ": non-standard exception");
+        }
+      }
+      else if (typeEc)
+      {
+        IORA_LOG_ERROR("loadModules: skipping module " + entry.path().string() + ": " +
+                       typeEc.message());
       }
     }
     IORA_LOG_INFO("Module loading complete.");
@@ -3049,14 +3110,12 @@ inline void IoraService::Plugin::require(const std::string &moduleName)
                            "(onLoad/onDependencyLoaded) running under the module loader lock");
   }
 
-  // Simply check if the required module is loaded
-  bool isLoaded = _service->isModuleLoadedLocked(moduleName);
-  if (!isLoaded)
+  if (!_service->isModuleLoadedLocked(moduleName))
   {
-    // Module not loaded - throw exception. The TOML config must ensure proper loading order
     throw std::runtime_error(
       "Required dependency '" + moduleName +
-      "' is not loaded. Ensure modules are loaded in the correct order via configuration.");
+      "' is not loaded. Load it before this module: list both in Config::modules.modules "
+      "(TOML iora.modules.modules) in dependency order; directory-scan order is unspecified.");
   }
 
   // Register this dependency relationship for tracking
