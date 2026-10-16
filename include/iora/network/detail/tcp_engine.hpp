@@ -1673,6 +1673,7 @@ private:
     bool isListener{false};
     Listener *lst{nullptr};
     Session *sess{nullptr};
+    std::uint64_t bornBatch{0};
   };
 
   void loop()
@@ -1687,6 +1688,16 @@ private:
     }
   }
 
+  /// \brief The only way to add an fd tag: stamps it with the current batch so
+  /// handleFdEvent can drop events harvested for a previous owner of \p fd.
+  void insertFdTag(int fd, std::unique_ptr<Tag> tag)
+  {
+    tag->bornBatch = _batchSeq;
+    const bool inserted = _fdTags.emplace(fd, std::move(tag)).second;
+    assert(inserted && "a closed fd's tag must be erased before the fd is reused");
+    (void)inserted;
+  }
+
   /// \brief Dispatch one epoll event. An exception escaping a session dispatch
   /// closes THAT session (Unknown, "internal error") and the loop continues; one
   /// escaping a listener dispatch is dropped (the listener stays armed).
@@ -1698,6 +1709,14 @@ private:
       return;
     }
     Tag *t = it->second.get();
+    // A tag born in this batch was registered after the harvest, so the event
+    // belongs to a previous owner of the fd number. Every close path calls
+    // delEpoll before ::close, so no stale event crosses a batch boundary.
+    if (t->bornBatch == _batchSeq)
+    {
+      ++_staleEventsDropped;
+      return;
+    }
     if (t->isListener)
     {
       try
@@ -1978,6 +1997,7 @@ private:
     std::vector<epoll_event> evs((std::size_t)_config.epollMaxEvents);
     while (_running.load())
     {
+      ++_batchSeq;
       int n = ::epoll_wait(_epollFd, evs.data(), (int)evs.size(), -1);
       if (n < 0)
       {
@@ -2020,6 +2040,7 @@ private:
     {
       try
       {
+        ++_batchSeq;
         _batchProcessor->processBatchWithSpecialFDs(
           _epollFd, _eventFd, _timerFd,
           // generalHandler — handles session/listener fds
@@ -2272,7 +2293,7 @@ private:
     auto tag = std::make_unique<Tag>();
     tag->isListener = true;
     tag->lst = rawLst;
-    _fdTags.emplace(sfd, std::move(tag));
+    insertFdTag(sfd, std::move(tag));
 
     return true;
   }
@@ -2356,7 +2377,7 @@ private:
       auto tg = std::make_unique<Tag>();
       tg->isListener = false;
       tg->sess = sPtr;
-      _fdTags.emplace(cfd, std::move(tg));
+      insertFdTag(cfd, std::move(tg));
 
       _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
       invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid, addressFromSockaddr(peer));
@@ -2877,7 +2898,7 @@ private:
     auto tg = std::make_unique<Tag>();
     tg->isListener = false;
     tg->sess = sPtr;
-    _fdTags.emplace(cfd, std::move(tg));
+    insertFdTag(cfd, std::move(tg));
 
     testMaybeThrowAt(ConnectThrowPoint::AFTER_INSERT);
 
@@ -4394,6 +4415,10 @@ private:
   // immediately sendable (sessionSendable).
   std::unordered_set<SessionId> _connecting;
   std::unordered_map<int, std::unique_ptr<Tag>> _fdTags;
+  // I/O thread only. _batchSeq advances before every epoll_wait and is never reset
+  // (see insertFdTag/handleFdEvent); _staleEventsDropped counts the dropped events.
+  std::uint64_t _batchSeq{0};
+  std::uint64_t _staleEventsDropped{0};
   // TEST-ONLY seam (tracker 2026-09-15-3): see testSetPreCloseHook. Empty in production;
   // installed before start(), then read-only on the I/O thread (no locking needed).
   std::function<void(int)> _preCloseHook;

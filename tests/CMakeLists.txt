@@ -118,6 +118,7 @@ set(NETWORK_TESTS
     network/iora_test_tcp_engine_sigpipe_guard
     network/iora_test_engine_introspection
     network/iora_test_tcp_setup_close_codes
+    network/iora_test_tcp_engine_stale_event
     # Event-driven DNS-resolve tests (tracker 2026-09-06-4). The three below
     # monopolise the process-wide blockingIoPool() (block all workers / fill the
     # queue) to drive resolve-timeout and reject-fast paths deterministically, so
@@ -606,6 +607,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_tcp_engine_teardown_race
     iora_test_tcp_connect_then_send
     iora_test_tcp_setup_close_codes
+    iora_test_tcp_engine_stale_event
     iora_test_transport_observe
     iora_test_transport_sid_surfacing
     iora_test_udp_connect_then_send

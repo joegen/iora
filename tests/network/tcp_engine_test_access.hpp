@@ -168,6 +168,14 @@ struct TcpEngineTestAccess
     auto it = e._sessions.find(sid);
     return it == e._sessions.end() ? -1 : it->second->fd;
   }
+
+  /// I/O thread ONLY: epoll events dropped because their fd's tag was created after
+  /// the epoll_wait that harvested them (tracker 2026-09-24-8).
+  static std::uint64_t staleEventsDropped(const TcpEngine &e)
+  {
+    assert(e.isOnIoThread() && "staleEventsDropped must be called on the I/O thread");
+    return e._staleEventsDropped;
+  }
 };
 
 } // namespace network
