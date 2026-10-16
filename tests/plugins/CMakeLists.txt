@@ -163,3 +163,16 @@ create_iora_plugin_target(reentrantselfplugin
 create_iora_plugin_target(onloadapicallerplugin
     SOURCES OnLoadApiCallerPlugin.cpp
 )
+
+# Plugin callback-ownership probes (tracker 2026-10-16-12). Two targets from one
+# source give two distinct modules (identity is the file name; never a symlink
+# alias, which would share one dlopen image).
+create_iora_plugin_target(callbackprobeplugin
+    SOURCES CallbackProbePlugin.cpp
+)
+create_iora_plugin_target(callbackprobeplugin_b
+    SOURCES CallbackProbePlugin.cpp
+)
+create_iora_plugin_target(callbackdependentplugin
+    SOURCES CallbackDependentPlugin.cpp
+)

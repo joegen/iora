@@ -221,6 +221,7 @@ set(SERVICE_TESTS
     service/iora_test_plugin_drain
     service/iora_test_plugin_dependencies
     service/iora_test_plugin_isolation
+    service/iora_test_plugin_callback_lifecycle
     service/iora_test_features_config
     service/iora_test_service_tls_config
     service/iora_test_api_module_reverse_map
@@ -559,6 +560,9 @@ endif()
 if(IORA_BUILD_NETWORK_TESTS AND TEST network::iora_test_http_server_owner_removal)
     set_tests_properties(network::iora_test_http_server_owner_removal PROPERTIES TIMEOUT 120)
 endif()
+if(IORA_BUILD_SERVICE_TESTS AND TEST service::iora_test_plugin_callback_lifecycle)
+    set_tests_properties(service::iora_test_plugin_callback_lifecycle PROPERTIES TIMEOUT 120)
+endif()
 
 # The self-clear deadlock suite (tracker 2026-07-21-3 / 2026-07-23-1) is the canonical
 # logger tear-out deadlock suite; a regression in a bounded-rendezvous discriminator
@@ -604,6 +608,7 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_callback_ownership
     iora_test_event_queue
     iora_test_http_server_owner_removal
+    iora_test_plugin_callback_lifecycle
     iora_test_timing_wheel
     iora_test_timing_wheel_lifecycle
     iora_test_timing_wheel_reset_ndebug
@@ -918,6 +923,18 @@ if(IORA_BUILD_SERVICE_TESTS)
     # test rebuilds the probe with its current exports.
     if(TARGET iora_test_plugin_isolation AND TARGET singletonprobe)
         add_dependencies(iora_test_plugin_isolation singletonprobe)
+    endif()
+
+    # The plugin callback-ownership lifecycle test (tracker 2026-10-16-12)
+    # dlopen's the probe plugins at runtime; depend on them so a targeted build
+    # of the test also builds the .so's it loads, and link libdl for dlopen.
+    if(TARGET iora_test_plugin_callback_lifecycle)
+        foreach(_cb_plugin callbackprobeplugin callbackprobeplugin_b callbackdependentplugin)
+            if(TARGET ${_cb_plugin})
+                add_dependencies(iora_test_plugin_callback_lifecycle ${_cb_plugin})
+            endif()
+        endforeach()
+        target_link_libraries(iora_test_plugin_callback_lifecycle PRIVATE ${CMAKE_DL_LIBS})
     endif()
 
     # The callExportedApi drain-gate test (Slice B, tracker 2026-09-07-3)

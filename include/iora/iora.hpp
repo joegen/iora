@@ -67,7 +67,9 @@ public:
   IoraService &operator=(const IoraService &) = delete;
 
   /// \brief Constructor initialises members and loads configuration.
-  IoraService() {}
+  /// The host event queue records the plugin that registers each handler
+  /// (before any plugin hook can run), so unload can remove them.
+  IoraService() { _eventQueue.enableCallbackOwnerTracking(); }
 
   /// \brief Destructor stops the server with proper cleanup.
   /// Note: Logging in destructor may be unreliable if Logger is already destroyed
@@ -210,22 +212,28 @@ public:
 
       IoraService &svc = *instancePtr;
 
-      // Prevent double shutdown
-      if (!svc._isRunning)
+      // Prevent double shutdown: exactly one caller runs the teardown (an atomic
+      // read-modify-write; a load followed by a store would let two concurrent
+      // callers both pass).
+      if (!svc._isRunning.exchange(false))
       {
         return;
       }
-
-      // Mark as shutting down immediately to prevent reentrancy
-      svc._isRunning = false;
 
       // Stop and destroy the webhook server BEFORE unloading modules.
       // Plugins may have registered route handlers (std::function callbacks)
       // on the webhook server. If modules are unloaded first, those callbacks
       // become dangling pointers into unmapped .so memory.
+      // stop() runs off _loadModulesMutex (an in-flight route handler may need
+      // it); the reset runs UNDER it, because an overlapping unload or failed
+      // load reads _webhookServer under it to remove a module's routes
+      // (removeModuleCallbacksLocked). Do not move the server out under the lock
+      // and destroy it outside: its routes must be destroyed before that module's
+      // dlclose.
       if (svc._webhookServer)
       {
         svc._webhookServer->stop();
+        LoadModulesGuard resetGuard(svc._loadModulesMutex);
         svc._webhookServer.reset();
       }
 
@@ -321,21 +329,30 @@ public:
     /// \brief Called when the plugin is loaded
     ///
     /// On a failed load onUnload is NOT called. Only the plugin destructor runs,
-    /// while the .so is still mapped, and then the .so is unloaded. So: (1) do
-    /// every step that can fail (require(), config reads, resource acquisition)
-    /// before registering any webhook route or EventQueue handler; (2) register
-    /// routes and handlers as the last steps of onLoad, never in the constructor;
-    /// (3) in the destructor, stop and join any thread, ThreadPool task or timer
-    /// the constructor or onLoad started. The destructor runs with the module
-    /// loader lock held, as onLoad and onUnload do. So it must not call
+    /// while the .so is still mapped, and then the .so is unloaded. In the
+    /// destructor, stop and join any thread, ThreadPool task or timer the
+    /// constructor or onLoad started. The destructor runs with the module loader
+    /// lock held, as onLoad and onUnload do. So it must not call
     /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules or a
     /// SafeApiFunction: they throw under that lock, and a throw from a destructor
     /// calls std::terminate. A thread or task it joins must not be blocked in, or
     /// able to start, isModuleLoaded, a SafeApiFunction call or isAvailable(), or
     /// one of those entry points: they wait for the lock, so the join deadlocks.
     /// Tell the thread to stop first, then join it (tracker 2026-09-24-24).
-    /// Callbacks registered before a load failure are not removed. Following these
-    /// rules narrows the window but does not close it (tracker 2026-10-16-12).
+    ///
+    /// Webhook routes and EventQueue handlers registered on the IoraService server
+    /// and queue from onLoad, onDependencyLoaded, onDependencyUnloaded or onUnload
+    /// belong to the plugin. They are called only after the load succeeds: while
+    /// the plugin loads or unloads its routes answer 503 and its handlers are
+    /// skipped. Before onUnload the host waits for every running one to return,
+    /// then removes them before the .so is unloaded; a failed load removes them
+    /// too. So a callback must not wait for onUnload, must not wait without a
+    /// timeout for an event handler of any plugin to run, and must not unload or
+    /// reload its own plugin (directly, or by handing it to another thread and
+    /// waiting). Objects captured by these callbacks are destroyed under the module
+    /// loader lock, with the same rules as the destructor above. Registrations made
+    /// outside a hook (a plugin thread, a callback, the destructor) are not tracked
+    /// and not removed.
     virtual void onLoad(IoraService *service) = 0;
 
     /// \brief Called before the plugin is unloaded
@@ -880,14 +897,16 @@ public:
       return false;
     }
 
-    // Self-unload guard (DP-7 / H-C): if this thread is inside a callExportedApi
-    // of this module, draining it would wait on an in-flight count that includes
-    // this thread — a deadlock. Detect and throw BEFORE claiming, so no claim is
-    // leaked (a throw after the claim would brick the module as "unloading").
-    if (inFlightApiModules().count(pluginName) > 0)
+    // Self-unload guard (DP-7 / H-C, CB-DP-6): if this thread is inside a
+    // callExportedApi of this module, or holds a callback admission of it,
+    // draining it would wait on a count that includes this thread — a deadlock.
+    // Detect and throw BEFORE claiming, so no claim is leaked (a throw after the
+    // claim would brick the module as "unloading").
+    if (moduleHeldOnThisThread(pluginName))
     {
       throw std::runtime_error("cannot unload module " + pluginName +
-                               " from within its own exported API call (self-unload deadlock)");
+                               " from within its own exported API call or callback "
+                               "(self-unload deadlock)");
     }
 
     // Claim the module: new operator() calls now observe it as "not loaded" and
@@ -899,10 +918,13 @@ public:
     // lock) can throw after a partial claim, which would brick the name as
     // permanently "unloading". Release the partial claim (openGate is no-throw)
     // and rethrow, so a failed claim leaves the name fully loaded and callable.
+    // beginApiDrain / drainApiCalls / endApiDrain on the exported-API gate are
+    // close / drain / open on the CallbackGate (plugin routes and handlers).
     try
     {
       _apiUnloadingModules.insert(pluginName);
       beginApiDrain(pluginName);
+      core::CallbackGate::close(pluginName);
     }
     catch (...)
     {
@@ -923,6 +945,7 @@ public:
       guard.unlock();
       clearSafeApiCaches(pluginName);
       drainApiCalls(pluginName);
+      core::CallbackGate::drain(pluginName);
       guard.lock();
     }
     catch (...)
@@ -961,8 +984,8 @@ public:
     openGate(pluginName);
 
     // 2.3d: release _loadModulesMutex BEFORE building/pushing the module.unload
-    // event. pushEvent enqueues onto the EventQueue (its own mutex); holding L
-    // across it would add an L -> EventQueue-mutex edge. The build+push is wrapped
+    // event (the L -> EventQueue-mutex edge itself is allowed, CB-DP-9; the push
+    // simply has no reason to hold L). The build+push is wrapped
     // log-and-continue so a bad_alloc AFTER a successful unload does not propagate
     // (reloadModule would otherwise skip its load half; R3 TS L-6). Consumer caveat
     // (R3 TS L-8): a module.unload.X does NOT mean "X is currently absent" (a
@@ -1087,22 +1110,26 @@ public:
         {
           continue; // a concurrent single-unload owns this claim
         }
-        // Self-unload skip (DP-7 / H-C): if this thread is inside a callExportedApi
-        // of this module, draining it would deadlock on our own in-flight count.
-        // SKIP it (do not claim, do not tear down) and report failure — rather than
-        // throw and abort the unrelated modules of a shutdown batch. Checked BEFORE
-        // the claim so no claim is leaked.
-        if (inFlightApiModules().count(name) > 0)
+        // Self-unload skip (DP-7 / H-C, CB-DP-6): if this thread is inside a
+        // callExportedApi of this module, or holds a callback admission of it,
+        // draining it would deadlock on our own count. SKIP it (do not claim, do
+        // not tear down) and report failure — rather than throw and abort the
+        // unrelated modules of a shutdown batch. Checked BEFORE the claim so no
+        // claim is leaked.
+        if (moduleHeldOnThisThread(name))
         {
           IORA_LOG_ERROR("Skipping unload of module " + name +
-                         " during unloadAllModules: it has an in-flight exported API call on this "
-                         "thread (self-unload deadlock).");
+                         " during unloadAllModules: it has an in-flight exported API call or "
+                         "callback on this thread (self-unload deadlock).");
           success = false;
           continue;
         }
         names.push_back(name); // record intent BEFORE claiming (see comment above)
+        // beginApiDrain / drainApiCalls / endApiDrain on the exported-API gate are
+        // close / drain / open on the CallbackGate (plugin routes and handlers).
         _apiUnloadingModules.insert(name);
         beginApiDrain(name);
+        core::CallbackGate::close(name);
       }
     }
     catch (...)
@@ -1124,6 +1151,7 @@ public:
       {
         clearSafeApiCaches(name);
         drainApiCalls(name);
+        core::CallbackGate::drain(name);
       }
       guard.lock();
     }
@@ -1334,12 +1362,16 @@ protected:
       // load — never dlcloses that live module. Idempotent (cleanupPartialLoadLocked
       // is), so the onLoad-throw path running it in the inner catch AND here is
       // harmless.
+      // It is also the single place a failed load reopens the module's
+      // CallbackGate, AFTER the dlclose; a cleanup or dlclose throw skips the
+      // open, so the module stays closed (CB-DP-12).
       auto cleanupIfRegistered = [&]()
       {
         if (pluginRegistered)
         {
           cleanupPartialLoadLocked(pluginName);
           PluginManager::unloadPlugin(pluginName);
+          core::CallbackGate::open(pluginName);
         }
       };
 
@@ -1395,6 +1427,12 @@ protected:
         loadPlugin(pluginName, resolvedPath.string());
         pluginRegistered = true; // we now own the PluginManager entry for this name
 
+        // CB-DP-3: the module's routes and event handlers are closed (503 /
+        // skipped) until the load commits; the scope tags every registration
+        // made by the factory, the constructor and onLoad with this module.
+        core::CallbackGate::close(pluginName);
+        core::CallbackOwner::Scope ownerScope(pluginName);
+
         // Resolve and call the exported loadModule function
         using LoadModuleFunc = Plugin *(*)(iora::IoraService *);
         auto loadModule = resolve<LoadModuleFunc>(pluginName, "loadModule");
@@ -1431,6 +1469,9 @@ protected:
             // the newly loaded module). Admission for X begins here; no step after
             // it may fail X's load.
             markApiCallable(pluginName);
+
+            // The load has committed: admit this module's callbacks (noexcept).
+            core::CallbackGate::open(pluginName);
 
             // Notify dependents that this module is now loaded (no-throw; SD-4b).
             notifyDependentsOfLoad(pluginName, dependentsSnapshot);
@@ -1519,21 +1560,30 @@ protected:
   /// no fixed order.
   ///
   /// On a failed load onUnload is NOT called. Only the plugin destructor runs,
-  /// while the .so is still mapped, and then the .so is unloaded. So: (1) do
-  /// every step that can fail (require(), config reads, resource acquisition)
-  /// before registering any webhook route or EventQueue handler; (2) register
-  /// routes and handlers as the last steps of onLoad, never in the constructor;
-  /// (3) in the destructor, stop and join any thread, ThreadPool task or timer
-  /// the constructor or onLoad started. The destructor runs with the module
-  /// loader lock held, as onLoad and onUnload do. So it must not call
+  /// while the .so is still mapped, and then the .so is unloaded. In the
+  /// destructor, stop and join any thread, ThreadPool task or timer the
+  /// constructor or onLoad started. The destructor runs with the module loader
+  /// lock held, as onLoad and onUnload do. So it must not call
   /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules or a
   /// SafeApiFunction: they throw under that lock, and a throw from a destructor
   /// calls std::terminate. A thread or task it joins must not be blocked in, or
   /// able to start, isModuleLoaded, a SafeApiFunction call or isAvailable(), or
   /// one of those entry points: they wait for the lock, so the join deadlocks.
   /// Tell the thread to stop first, then join it (tracker 2026-09-24-24).
-  /// Callbacks registered before a load failure are not removed. Following these
-  /// rules narrows the window but does not close it (tracker 2026-10-16-12).
+  ///
+  /// Webhook routes and EventQueue handlers registered on the IoraService server
+  /// and queue from onLoad, onDependencyLoaded, onDependencyUnloaded or onUnload
+  /// belong to the plugin. They are called only after the load succeeds: while
+  /// the plugin loads or unloads its routes answer 503 and its handlers are
+  /// skipped. Before onUnload the host waits for every running one to return,
+  /// then removes them before the .so is unloaded; a failed load removes them
+  /// too. So a callback must not wait for onUnload, must not wait without a
+  /// timeout for an event handler of any plugin to run, and must not unload or
+  /// reload its own plugin (directly, or by handing it to another thread and
+  /// waiting). Objects captured by these callbacks are destroyed under the module
+  /// loader lock, with the same rules as the destructor above. Registrations made
+  /// outside a hook (a plugin thread, a callback, the destructor) are not tracked
+  /// and not removed.
   void loadModules()
   {
     if (_modulesPath.empty())
@@ -1853,7 +1903,11 @@ protected:
 
       std::string bindAddress = _config.server.bindAddress.value_or("0.0.0.0");
       auto port = _config.server.port.value_or(DEFAULT_PORT);
-      _webhookServer = std::make_unique<network::WebhookServer>(bindAddress, port);
+      // Opt in BEFORE publishing: the server records the plugin that registers
+      // each route at every moment it is reachable through _webhookServer.
+      auto server = std::make_unique<network::WebhookServer>(bindAddress, port);
+      server->enableCallbackOwnerTracking();
+      _webhookServer = std::move(server);
       IORA_LOG_INFO("applyConfig: Setting webhook server to bind on " << bindAddress << ":" << port);
 
       // TLS — enabled when complete (cert+key). Any requested-but-incomplete config
@@ -2070,6 +2124,7 @@ protected:
         {
           try
           {
+            core::CallbackOwner::Scope depScope(dependent);
             pluginIt->second->onDependencyLoaded(moduleName);
           }
           catch (const std::exception &e)
@@ -2133,6 +2188,7 @@ protected:
         {
           try
           {
+            core::CallbackOwner::Scope depScope(dependent);
             pluginIt->second->onDependencyUnloaded(moduleName);
           }
           catch (const std::exception &e)
@@ -2214,6 +2270,12 @@ private:
   // (tracker 2026-09-07-9), and the null-instance branch + outer catch (tracker
   // 2026-09-08-2) — same acyclic direction. The once-planned load-failure drain
   // was withdrawn as vacuous, DP-10b.)
+  // Plugin callback ownership (CB-DP-9): _loadModulesMutex -> HttpServer::_mutex
+  // and _loadModulesMutex -> EventQueue::_mutex (onLoad registration;
+  // removeModuleCallbacksLocked; the shutdown() webhook reset), registry mutex
+  // -> CallbackGate mutex (admit in dispatch), and _loadModulesMutex ->
+  // CallbackGate mutex (close/open). The gate mutex is a leaf;
+  // CallbackGate::drain runs with no lock held (the release window).
   mutable std::mutex _loadModulesMutex; // Mutex for thread-safe module loading
   mutable std::mutex _apiMutex;
   std::atomic<bool> _isRunning{false};
@@ -2595,6 +2657,7 @@ private:
       {
         if (it->second)
         {
+          core::CallbackOwner::Scope ownerScope(name);
           it->second->onUnload();
         }
         // Authoritative teardown (A-C3): a single owner-checked atomic erase
@@ -2606,6 +2669,9 @@ private:
         // MUST run before erase (invalidates it) and before dlclose (which unmaps
         // the plugin's vtables). unregisterModule never throws.
         ServiceRegistry::unregisterModule(name);
+        // Routes and event handlers this module registered (drained in the
+        // release window); destroyed while the .so is still mapped.
+        removeModuleCallbacksLocked(name);
         _loadedModules.erase(it); // unique_ptr will delete
         erased = true;
         // SD-5: unmark from the callExportedApi admission set immediately after the
@@ -2716,7 +2782,32 @@ private:
     removeExportsForModule(name);
     ServiceRegistry::unregisterModule(name);
     _loadedModules.erase(name); // ~Plugin (if present) while the .so is still mapped
+    // No drain needed: the module's CallbackGate was closed before its factory
+    // ran, so none of its callbacks was ever admitted (CB-DP-3). The caller
+    // (cleanupIfRegistered) reopens the gate after the dlclose.
+    removeModuleCallbacksLocked(name);
     pruneModuleTrackingLocked(name);
+  }
+
+  /// \brief Remove every webhook route and EventQueue handler registered under
+  /// the module's name, destroying them while the .so is still mapped. PRE: holds
+  /// _loadModulesMutex (shutdown() resets _webhookServer under it too).
+  void removeModuleCallbacksLocked(const std::string &name)
+  {
+    if (_webhookServer)
+    {
+      _webhookServer->removeHandlersOwnedBy(name);
+    }
+    _eventQueue.removeHandlersOwnedBy(name);
+  }
+
+  /// \brief True when this thread holds something a drain of the module waits
+  /// for: an exported API call of it, or a callback admission of it (including
+  /// an admitted EventQueue entry that has not run yet).
+  static bool moduleHeldOnThisThread(const std::string &name)
+  {
+    return inFlightApiModules().count(name) > 0 ||
+           core::CallbackGate::admittedOnThisThread(name);
   }
 
   /// \brief Release the unloading claim AND end the callExportedApi drain for the
@@ -2747,6 +2838,7 @@ private:
     {
       // best-effort gate release; rationale above (L-3 / A8 forced_unwind).
     }
+    core::CallbackGate::open(moduleName);
   }
 
   /// \brief True if the module is currently claimed unloading. PRE: holds

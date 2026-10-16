@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | 1.5 |
-| **Date** | 2026-09-24 |
+| **Version** | 1.6 |
+| **Date** | 2026-10-17 |
 | **Status** | IMPLEMENTED |
 | **Headers** | `include/iora/network/http_server.hpp` (HttpServer + routing), `include/iora/network/webhook_server.hpp` (WebhookServer) |
 | **Namespace** | `iora::network` |
-| **Dependencies** | `iora::network::Transport` (`network/transport_impl.hpp`), `iora::core::ThreadPool` (`core/thread_pool.hpp`), `iora::core::Logger` (`core/logger.hpp`), the HTTP message model `HttpRequest`/`HttpResponse`/`HttpMethod`/`HttpHeaders` (`parsers/http_message.hpp`), and (WebhookServer only) `parsers::Json` (`parsers/json.hpp`). Linux-only via the transport engine (epoll). |
+| **Dependencies** | `iora::network::Transport` (`network/transport_impl.hpp`), `iora::core::ThreadPool` (`core/thread_pool.hpp`), `iora::core::Logger` (`core/logger.hpp`), `iora::core::CallbackOwner`/`CallbackGate` (`core/callback_ownership.hpp`, optional owner tracking), the HTTP message model `HttpRequest`/`HttpResponse`/`HttpMethod`/`HttpHeaders` (`parsers/http_message.hpp`), and (WebhookServer only) `parsers::Json` (`parsers/json.hpp`). Linux-only via the transport engine (epoll). |
 
 ---
 
@@ -17,6 +17,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.6 | 2026-10-17 | Owner tracking (tracker 2026-10-16-12). New opt-in `enableCallbackOwnerTracking()`: an opted-in server stores `CallbackOwner::current()` with each route and the default handler; `classifyRequest` admits the owner through `CallbackGate` before copying the handler, and a closed owner yields the new `OWNER_CLOSED` outcome, answered `503 Service Unavailable` with no handler run; the admission is released right after the dispatch switch. New `removeHandlersOwnedBy(owner)`. A server that is not opted in behaves as before. §5.4 (new step in the ladder and an owner-tracking paragraph), §8.2, §8.3, §10.1 and §11 updated. |
 | 1.5 | 2026-09-24 | DOC-4 doc-review fixes: corrected the oversize-JSON claim. With the default 10 MB `maxPayloadSize`, `HttpServer`'s 1 MiB per-session buffer (`MAX_BUFFER_SIZE`) answers a headers-only 413 and closes before the wrapper runs, so the wrapper's 500 size path fires only when `maxPayloadSize` < ~1 MiB (§5.5 step 1, §9.4, Known Limitations). §6.3 example `maxPayloadSize` reduced to 256 KB. Corrected the Known Limitations remedy: a `JsonHandler` has no `Response`, so only the raw `Handler` API controls the status. Made the `ex.what()` leak precise: parser errors are fixed strings, while the size-limit and handler text do leak, with no `nosniff`, and a non-`std` exception falls to the generic 500. Added a Known Limitations entry and §5.5 note on the missing `Content-Type` check (cross-origin simple POST). Added the GET-body interop note (RFC 9110 §9.3.1). Trimmed §9.1 to what the rest of the guide does not already say, and added the unvalidated `int` port narrowing, the port-0 `getPort()` gap and the unguarded double `start()`. Known Limitations rows now cite `coding_trackers:` trackers -14 / -15. |
 | 1.4 | 2026-09-24 | DOC-4: rehomed README-unique content (§9.1: `setPort`/`setBindAddress` only store the value, applied at the next `start()`); recorded in Known Limitations that the `WebhookServer` JSON wrappers answer oversize/malformed JSON with 500 (not 413/400) and echo `ex.what()`, including arbitrary handler exception text, to the client. |
 | 1.3 | 2026-09-13 | **Framing verdict single-sourced (iora `2026-09-12-1`).** `HttpServer::handleIncomingData` and `findChunkedRequestEnd` now compute their RFC 9112 §6.3/§7.1 framing decision from the SAME `iora::network::detail` helpers the strict parser uses (`decideRequestFraming`, `parseChunkSize`, `chunkDataStep`, `walkTrailerSection`, `checkHeaderLineGrammar`, `trimOws`, `parseFullUInt`, `isHexDigit`) rather than a hand-maintained copy — the "framer and parser reach the same verdict" anti-smuggling property is now structural. Behavior-preserving; the chunk-data / trailer helpers (`chunkDataStep` / `walkTrailerSection`) return a tri-state `{Ok|NeedMore|Malformed}` the framer maps to poison-vs-wait. (See `docs/parsers/http_message.md` for the out-of-range-`Content-Length` parser-side unification that accompanies this.) |
@@ -420,6 +421,24 @@ ladder, copies everything out **by value** into a `DispatchDecision`, and releas
 5. Path matches under another method -> `METHOD_NOT_ALLOWED` (compute `Allow`).
 6. Else -> `NO_ROUTE` (copy `_defaultHandler` out if set).
 
+At each of the four places a handler is copied out (steps 2, 3, 4 and 6), `admitAndCopyHandler` first
+calls `CallbackGate::admit(owner)`. If the owner is closed the outcome is `OWNER_CLOSED` instead and
+no copy is made; the dispatcher answers **503 Service Unavailable** (`text/plain`, bodyless for HEAD)
+and runs no handler. An unowned route (empty owner) is always admitted with no accounting. The
+routing-only rungs (`OPTIONS *`, auto-OPTIONS, 405) do not admit: a closed route still counts as
+existing for `Allow` and 405. Right after the dispatch switch the handler copy is destroyed and then
+the admission is released, so `CallbackGate::drain(owner)` does not wait for response serialization
+or the socket write.
+
+**Owner tracking (opt-in).** Off by default. After `enableCallbackOwnerTracking()`, `registerHandler`
+and `setDefaultHandler` store `CallbackOwner::current()` with the route (an EXACT re-registration
+replaces handler and owner). `removeHandlersOwnedBy(owner)` removes that owner's routes under every
+method and the default handler if it is the owner's, keeps the order of the remaining routes, and
+destroys the removed handlers after `_mutex` is released; it does not wait for running handlers
+(drain first). On a server that is not opted in every owner is empty, so nothing is gated and
+nothing is removed. `IoraService` opts in its webhook server so plugin routes can be removed before a
+plugin's `.so` is unloaded (`docs/iora_service.md` section 4.6; `docs/core/callback_ownership.md`).
+
 Because `Handler` is a `std::function` copied by value, a concurrent `registerHandler` that
 reallocates the vector cannot dangle the in-flight handler. The post-lock switch invokes the handler
 inside `invokeWithSafetyNet` with **no lock held**, so handlers run concurrently and may call
@@ -768,6 +787,8 @@ _wsMutex / _sseMutex  (subclass/friend, OUTER)  ->  _mutex  (HttpServer)  ->  _s
   `_sessionMutex -> _mutex` edge.
 - `_sseMutex` is prospective (owned by the future `SseStream`); the friend grant only makes the edge
   possible.
+- `_mutex -> CallbackGate mutex`: `classifyRequest` calls `CallbackGate::admit` under `_mutex`. The
+  gate mutex is a leaf, and `_sessionMutex` and the gate mutex are never co-held.
 - **Invariant:** no code holding `_mutex` calls a subclass/friend method that re-takes a higher lock.
   The dispatch narrowing (copy-then-invoke) guarantees this -- the handler is copied out and invoked
   with no lock held.
@@ -783,7 +804,9 @@ _wsMutex / _sseMutex  (subclass/friend, OUTER)  ->  _mutex  (HttpServer)  ->  _s
 | `stop` / `quiesceTransport` | `_mutex` (narrowed) + `_sessionMutex` | Idempotent (early-out on null `_transport`). Snapshot transport under `_mutex` -> atomic flag -> `transport->stop()` holding **no** `_mutex` (I/O-thread drain fires `onClose`/`onUpgradedClose`, which take `_wsMutex`) -> `_sessionMutex` clear -> pool drain holding **no** `_mutex` -> brief `_mutex` reset. `_upgradedSessions` is not cleared here. |
 | `handleIncomingData` (upgraded check / buffer / cleanup) | `_sessionMutex` (brief) | Copy-then-release before the `onUpgradedData` virtual call. |
 | `onClose` -> `onUpgradedClose` (upgraded sessions) | `_sessionMutex` (brief) | Prune under `_sessionMutex`, then invoke `onUpgradedClose` with **no** internal lock held so the override may take its own mutex and fire a user callback (copy-then-invoke). |
-| `classifyRequest` (route match) | `_mutex` (read, one pass) | Handler/Allow/params copied out by value; lock released **before** invocation. |
+| `classifyRequest` (route match) | `_mutex` (read, one pass) + gate mutex (leaf, inside `admit`) | Handler/Allow/params copied out by value; lock released **before** invocation. The owner admission lives on the worker's stack and is released right after the dispatch switch. |
+| `removeHandlersOwnedBy` | `_mutex` (write) | Removed handlers destroyed after `_mutex` is released, so a captured object's destructor may register again. |
+| `enableCallbackOwnerTracking` | none | Relaxed atomic store; registration reads the flag under `_mutex`. |
 | handler body | none | Runs on a worker with no server lock; may call `sendRaw`/`sendRawForSse`/`closeSession`/`markSessionUpgraded`. |
 | `sendRaw` / `sendRawForSse` | `_mutex` (brief) | Guarded `_transport && !_shutdown`; completion lambda is capture-only (fires synchronously). |
 | `closeSession` | `_mutex` (brief) | Guarded `_transport && !_shutdown`. |
@@ -968,6 +991,15 @@ public:
   void onDelete(const std::string &path, Handler handler);
   void setDefaultHandler(Handler handler);                   // 404 customization
 
+  /// Record the CallbackOwner of every later registration on this instance.
+  /// One-way; earlier entries stay unowned.
+  void enableCallbackOwnerTracking() noexcept;
+
+  /// Remove every route (all methods) and the default handler registered under
+  /// `owner`; destroyed off the lock; does not wait for running handlers.
+  /// Throws std::invalid_argument on "".
+  void removeHandlersOwnedBy(const std::string &owner);
+
   void start();                                              // throws on error
   void stop();
 
@@ -1051,7 +1083,7 @@ code falls back to its RFC 9110 §15 class phrase (`Informational` / `Successful
 | Non-copyable, non-movable | All four special members deleted | Owns a mutex, atomic, and transport; sharing/moving would be unsafe. |
 | Shared-ownership transport (S-3) | `std::shared_ptr<Transport>` from `Transport::tcp()` | Matches the transport's structurally-safe teardown; a worker co-owns the transport for its call. |
 | Single narrow lock pass (`classifyRequest`) | Match under `_mutex`, copy out by value, invoke unlocked | Handler concurrency; no self-deadlock when a handler writes to its own session; safe against concurrent registration. |
-| Ordered per-method `vector<pair<CompiledPattern,Handler>>` | Not a hash map | Registration order is the within-precedence tie-break; route tables are small so O(routes) scan is fine. |
+| Ordered per-method `vector<Route>` (pattern, owner, handler) | Not a hash map | Registration order is the within-precedence tie-break; route tables are small so O(routes) scan is fine. |
 | Compile patterns at registration | Throw `std::invalid_argument` at `onGet`/etc. | A bad pattern is a startup programming error, never a request-time surprise. |
 | Precedence EXACT > NAMED > WILDCARD | First hit stops the scan | Deterministic, intuitive dispatch; `/users/me` beats `/users/:id`. |
 | Raw captures / `pathRest` | Not percent-decoded | Consistent with the query parser; decode/validate (and traversal-check) is the consumer's job. |
@@ -1069,6 +1101,7 @@ code falls back to its RFC 9110 §15 class phrase (`Informational` / `Successful
 | Framer reaches the parser's framing verdict (SRV-M4) | Same CL/TE rules in `handleIncomingData` and `fromWireFormat` | A framer/parser disagreement on the request boundary is the request-smuggling primitive (RFC 9112 §6.3). |
 | WebhookServer as a thin subclass | ~160 lines; JSON wrappers over `onGet`/`onPost`; no webhook-specific semantics | JSON logic cleanly separated from transport; plain callers avoid the JSON dependency. |
 | `friend` SSE access grant (RD-17) | `SseStream` + `upgradeToSse` | Same reach a subclass gets, with no public `transport()` leak; `sendRawForSse` stays protected. |
+| Optional owner tracking (`CallbackGate`) | Opt-in per instance; admit before copy; 503 for a closed owner; remove by owner | Lets a host (IoraService) remove a plugin's routes before its `.so` is unloaded and wait for running ones. 503 tells a client the route exists but is unavailable for now. Off by default, so other servers are unchanged. |
 
 ---
 

@@ -113,6 +113,12 @@
         "core/event_queue.hpp"
       ]
     },
+    "core/callback_ownership.md": {
+      "area": "core",
+      "headers": [
+        "core/callback_ownership.hpp"
+      ]
+    },
     "core/ring_buffer.md": {
       "area": "core",
       "headers": [

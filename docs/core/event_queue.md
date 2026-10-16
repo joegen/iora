@@ -4,12 +4,12 @@
 
 | | |
 |---|---|
-| **Version** | 1.1 |
-| **Date** | 2026-09-10 |
+| **Version** | 1.2 |
+| **Date** | 2026-10-17 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/event_queue.hpp` |
 | **Namespace** | `iora::core` |
-| **Dependencies** | Standard library -- `<condition_variable>`, `<functional>`, `<map>`, `<mutex>`, `<queue>`, `<regex>`, `<string>`, `<thread>`, `<vector>`. Two intra-Iora headers: `iora/core/logger.hpp` (`iora::core::Logger` lifecycle/error trace lines) and `iora/parsers/json.hpp` (`iora::parsers::Json`, the event payload type). No external/third-party dependencies. Portable (no OS-specific syscalls). |
+| **Dependencies** | Standard library -- `<condition_variable>`, `<functional>`, `<map>`, `<mutex>`, `<queue>`, `<regex>`, `<string>`, `<thread>`, `<vector>`. Three intra-Iora headers: `iora/core/callback_ownership.hpp` (`CallbackOwner`, `CallbackGate`: optional owner tracking), `iora/core/logger.hpp` (`iora::core::Logger` lifecycle/error trace lines) and `iora/parsers/json.hpp` (`iora::parsers::Json`, the event payload type). No external/third-party dependencies. Portable (no OS-specific syscalls). |
 
 ---
 
@@ -19,6 +19,7 @@
 |---|---|---|
 | 1.0 | 2026-09-10 | Initial Architecture & Programmer's Guide. Authored directly against `include/iora/core/event_queue.hpp` (288 lines) and cross-checked against `tests/core/iora_test_event_queue.cpp` (6 test cases) and the sole in-tree consumer, `iora::IoraService` (`include/iora/iora.hpp`: `pushEvent`, `registerEventHandlerById/ByName`, `EventBuilder`). Documents the **actual** shipped behavior, including several defects surfaced during the write (see Known Limitations). |
 | 1.1 | 2026-09-10 | Sync to commit `eec6356`: a trailing `catch (...)` was added to both the id-handler and name-handler dispatch loops (logging and swallowing), and the unused `<iostream>` include was dropped. The non-`std::exception` handler-throw -> `std::terminate` hazard is now RESOLVED for the handler-invocation path; the dispatch-setup/ingest throw path is unaffected and remains open (tracked: iora backlog 2026-09-10-17). |
+| 1.2 | 2026-10-17 | Owner tracking (tracker 2026-10-16-12). New opt-in `enableCallbackOwnerTracking()`: an opted-in queue stores `CallbackOwner::current()` with each handler; dispatch admits each owned handler through `CallbackGate` before copying it, skips the handlers of a closed owner, and releases each admission right after that handler runs. New `removeHandlersOwnedBy(owner)`. A queue that is not opted in behaves as before. New section 3.7; §3.6, §8, §9, §10 and §11 updated. |
 
 ---
 
@@ -204,15 +205,23 @@ void dispatch(const parsers::Json &event, std::size_t workerId);   // private
 ```
 
 1. Read `eventId` and `eventName` from the (already-validated) event into `const std::string`s.
-2. Under `_mutex`:
-   - Copy `_handlersById[eventId]` (if present) into a local `std::vector<Handler> idHandlers`.
-   - Copy `_handlersByName[eventName]` (if present) into `std::vector<Handler> nameHandlers`.
-   - Scan **every** entry of `_compiledHandlersByName`, running `std::regex_match(eventName, regex)`; on a match, append that handler to `nameHandlers`.
-3. Release `_mutex`.
-4. Invoke every handler in `idHandlers`, then every handler in `nameHandlers`, each inside a `try { handler(event); handled = true; } catch (const std::exception &e) { /* log */ } catch (...) { /* log */ }`. A throwing handler (`std::exception`-derived or not) is logged and swallowed; the remaining handlers still run.
+2. Under `_mutex`, for each matching entry (`_handlersById[eventId]`, then `_handlersByName[eventName]`, then every `_compiledHandlersByName` pattern that `std::regex_match`es `eventName`): call `CallbackGate::admit(entry.owner)`; if the owner is closed, skip the entry; else copy it into a local `std::vector<std::pair<CallbackGate::Admission, Handler>>` (`idHandlers` or `nameHandlers`). An unowned entry (empty owner) is always admitted with no accounting. A throw from `admit` skips that entry only.
+3. Release `_mutex`. Log the number of skipped entries, if any (nothing new is logged under the lock).
+4. Invoke every handler in `idHandlers`, then every handler in `nameHandlers`, each inside a `try { handler(event); handled = true; } catch (const std::exception &e) { /* log */ } catch (...) { /* log */ }`. A throwing handler (`std::exception`-derived or not) is logged and swallowed; the remaining handlers still run. Right after each handler, its copy is destroyed and then its admission is released, so a drain of its owner waits only for the entries that run up to and including it.
 5. If nothing handled the event, log a debug "no handlers found -- discarding" line.
 
 The copy in step 2 is the load-bearing safety property: handler lists are snapshotted under the lock, so the lock can be released before any user code runs. This is why a handler may safely re-enter `push`/`onEventId`/`onEventName` -- those take `_mutex`, but `dispatch` no longer holds it while the handler executes. The trailing `catch (...)` (commit `eec6356`) means a handler throwing a non-`std::exception` type is now caught and logged, not just `std::exception`-derived throws -- the handler-invocation path no longer risks `std::terminate`. The dispatch-**setup** path (extracting `eventId`/`eventName` and the `regex_match` sweep, both outside any try) is a separate, still-open risk (see 12, tracked: iora backlog 2026-09-10-17).
+
+### 3.7 Owner tracking (opt-in) and `removeHandlersOwnedBy`
+
+```cpp
+void enableCallbackOwnerTracking() noexcept;                 // one-way
+void removeHandlersOwnedBy(const std::string &owner);         // throws std::invalid_argument on ""
+```
+
+Owner tracking is **off** by default. After `enableCallbackOwnerTracking()`, every later registration stores `CallbackOwner::current()` (the owner of the calling thread's open `CallbackOwner::Scope`, or empty) with the handler. Dispatch then gates owned handlers through `CallbackGate` (step 2 above): while an owner is closed its handlers are skipped (the event is not re-queued), and `CallbackGate::drain(owner)` waits for the handlers of that owner that were already admitted. `removeHandlersOwnedBy(owner)` removes every id, name and pattern handler of `owner` and destroys them after `_mutex` is released; it does not wait for running handlers (drain first). On a queue that is not opted in every stored owner is empty, so nothing is gated and `removeHandlersOwnedBy` matches nothing.
+
+`IoraService` opts in its own queue so plugin handlers can be removed before a plugin's `.so` is unloaded (`docs/iora_service.md` section 4.6). Other queues normally stay unowned. See `docs/core/callback_ownership.md`.
 
 ---
 
@@ -436,13 +445,15 @@ The exception log is the *only* signal that a handler threw; there is no excepti
 | `onEventId` / `onEventName` | `std::unique_lock<std::mutex>` on `_mutex` for the vector `emplace_back` + log. | Any thread, including from inside a running handler. |
 | `onEventNameMatches` | `std::unique_lock<std::mutex>` on `_mutex`; `std::regex` compiled **under the lock**; on failure logs and re-throws. | Compiling a pathological regex under the lock stalls all workers and producers for the compile duration. |
 | `workerLoop` wait/pop | `std::unique_lock<std::mutex>` on `_mutex` around `_cv.wait(pred)` + `front()/pop()`. | Predicate `!_queue.empty() || _shutdown`. Both predicate variables mutated under `_mutex` before notify -> no lost wakeup. |
-| `dispatch` collect | `std::unique_lock<std::mutex>` on `_mutex` around copying `idHandlers`/`nameHandlers` and the `regex_match` sweep of every compiled pattern. | Copy-then-invoke. The regex sweep runs **under the lock**, serializing all workers and `push`. |
+| `dispatch` collect | `std::unique_lock<std::mutex>` on `_mutex` around admitting and copying `idHandlers`/`nameHandlers` and the `regex_match` sweep of every compiled pattern. `CallbackGate::admit` takes the gate mutex (a leaf) under `_mutex`. | Copy-then-invoke. The regex sweep runs **under the lock**, serializing all workers and `push`. Each admission is created, released and destroyed on the dispatching worker. |
+| `removeHandlersOwnedBy` | `std::unique_lock<std::mutex>` on `_mutex` while moving the owner's handlers out; they are destroyed after the lock is released. | A destructor of a captured object may call `push` or register without self-deadlock. |
+| `enableCallbackOwnerTracking` | relaxed `std::atomic<bool>` store, no lock. | Registration reads the flag under `_mutex`. |
 | **Handler invocation** | **No `_mutex` held.** Handlers are invoked from the local snapshot vectors after the lock is released. | A handler may re-enter `push`/`onEventId`/`onEventName` without self-deadlock. Exceptions are caught and logged -- `std::exception`-derived via the typed `catch`, and any other thrown type via a trailing `catch (...)` (commit `eec6356`); the worker survives either way. |
 | `~EventQueue` | `std::unique_lock<std::mutex>` to set `_shutdown`, then `notify_all()` off-lock, then `join()` each worker off-lock. | Joins all workers after they drain the queue. |
 
 **Mutex/CV inventory (from the header):**
 
-- `std::mutex _mutex` -- guards `_queue`, `_handlersById`, `_handlersByName`, `_compiledHandlersByName`, and `_shutdown`. The **only** lock; no lock-ordering concerns (single leaf mutex).
+- `std::mutex _mutex` -- guards `_queue`, `_handlersById`, `_handlersByName`, `_compiledHandlersByName`, and `_shutdown`. The only lock the queue owns. Lock order: `_mutex` -> `CallbackGate` mutex (`admit` in dispatch; the gate mutex is a leaf).
 - `std::condition_variable _cv` -- worker wake source; notified by `push` (`notify_one`) and by `~EventQueue` (`notify_all`).
 - `bool _shutdown` -- drain-then-exit flag; read in the wait predicate and the post-wait check, written only in `~EventQueue`, always under `_mutex`.
 
@@ -471,7 +482,7 @@ Implicit, non-configurable limits:
 | Event backlog bound | unbounded | `_queue` grows without limit; no back-pressure and no `push` rejection (contrast `ThreadPool`'s `maxQueueSize`). |
 | Handlers per exact id/name | unbounded | `std::vector<Handler>` accumulates. |
 | Handlers per regex pattern string | **1** | last registration wins (see 12). |
-| Unregister | none | handlers live until the queue is destroyed. |
+| Unregister | by owner only | `removeHandlersOwnedBy(owner)` on an opted-in queue; unowned handlers live until the queue is destroyed. |
 | Event payload | `iora::parsers::Json` | must contain string fields `eventId` and `eventName`. |
 
 ---
@@ -509,9 +520,17 @@ public:
   void onEventName(const std::string &eventName, Handler handler);
 
   /// Register a handler for an eventName via std::regex match. One handler per
-  /// pattern STRING (re-registering the same pattern overwrites). Logs AND
-  /// re-throws on invalid regex.
+  /// pattern STRING (re-registering the same pattern overwrites, owner included).
+  /// Logs AND re-throws on invalid regex.
   void onEventNameMatches(const std::string &eventNamePattern, Handler handler);
+
+  /// Record the CallbackOwner of every later registration on this instance.
+  /// One-way; earlier entries stay unowned.
+  void enableCallbackOwnerTracking() noexcept;
+
+  /// Remove every handler registered under `owner`; destroyed off the lock.
+  /// Does not wait for running handlers. Throws std::invalid_argument on "".
+  void removeHandlersOwnedBy(const std::string &owner);
 
 private:
   bool isValidEvent(const parsers::Json &event) const;      // presence-only
@@ -523,9 +542,12 @@ private:
   std::mutex _mutex;
   std::condition_variable _cv;
   std::queue<parsers::Json> _queue;
-  std::map<std::string, std::vector<Handler>> _handlersById;
-  std::map<std::string, std::vector<Handler>> _handlersByName;
-  std::map<std::string, std::pair<std::regex, Handler>> _compiledHandlersByName;
+  struct OwnedHandler { std::string owner; Handler handler; };
+  struct PatternHandler { std::regex pattern; std::string owner; Handler handler; };
+  std::map<std::string, std::vector<OwnedHandler>> _handlersById;
+  std::map<std::string, std::vector<OwnedHandler>> _handlersByName;
+  std::map<std::string, PatternHandler> _compiledHandlersByName;
+  std::atomic<bool> _tracksCallbackOwners{false};
   std::vector<std::thread> _threads;
   bool _shutdown = false;
 };
@@ -550,13 +572,14 @@ private:
 | D-6 | Presence-only ingest validation (`eventId` + `eventName` required); unmatched events discarded. | Cheap gate that guarantees dispatch can always read the two routing keys; routing is best-effort (no handler == drop). |
 | D-7 | Drain-on-destruction: workers finish the backlog before exiting. | Events already accepted are not silently lost at shutdown; the destructor is the single quiescence point. |
 | D-8 | JSON (`iora::parsers::Json`) as the event payload. | Uniform, schema-light payload shared across Iora subsystems; producers attach arbitrary fields beyond the two required keys. |
+| D-9 | Optional owner tracking, admitted before copy and released per entry. | Lets a host (IoraService) remove a plugin's handlers before its `.so` is unloaded and wait for the ones running; per-entry release keeps that wait limited to the handlers that actually run before the owner's. Off by default, so other queues are unchanged. |
 
 ---
 
 ## 12. Known Limitations
 
 - **`threadCount == 0` produces a queue that never processes events.** The default constructor argument `std::thread::hardware_concurrency()` may return `0` (standard-permitted). With zero workers, `push()` accepts and enqueues events but nothing ever dispatches them, and `~EventQueue` discards the backlog. Always pass an explicit, clamped count (as `IoraService` does with `4`). This mirrors the sibling `ThreadPool` finding `tasks/iora/backlog/2026-09-06-10_threadpool-zero-worker-hardware-concurrency_P1.json`. **Candidate defect.** (tracked: iora backlog 2026-09-10-17)
-- **The regex handler table keeps only one handler per pattern string.** `_compiledHandlersByName` is a `std::map<std::string, std::pair<std::regex, Handler>>`; `onEventNameMatches` uses `operator[]` assignment, so a second registration under the *same pattern string* silently overwrites the first. This is inconsistent with `_handlersById`/`_handlersByName`, which are `std::vector`-valued and accumulate. Registering two distinct behaviors under `"^foo.*"` loses the first with no warning. **Candidate defect.** (tracked: iora backlog 2026-09-10-17)
+- **The regex handler table keeps only one handler per pattern string.** `_compiledHandlersByName` is a `std::map<std::string, PatternHandler>`; `onEventNameMatches` uses `operator[]` assignment, so a second registration under the *same pattern string* silently overwrites the first. This is inconsistent with `_handlersById`/`_handlersByName`, which are `std::vector`-valued and accumulate. Registering two distinct behaviors under `"^foo.*"` loses the first with no warning. **Candidate defect.** (tracked: iora backlog 2026-09-10-17)
 - **`eventNameMatches(pattern, name)` is dead code.** The private glob-style matcher (translating `*` to `.*`, escaping other non-alnum characters, then `std::regex_match`) is never called anywhere in the header; `onEventNameMatches`/`dispatch` use raw `std::regex` instead. Its presence suggests glob semantics were once intended; today it is unreachable. **Candidate defect (dead code).** (tracked: iora backlog 2026-09-10-17)
 - **`push` can throw at the producer's call site for a non-string `eventId`/`eventName`.** `isValidEvent` checks *presence* only, but `push` then calls `.get<std::string>()` on both fields unconditionally (only to build a debug log line). A present-but-non-string field raises `Json::type_error` (a `std::exception`) that propagates out of `push`, unlike a *missing* field which is dropped gracefully. Inconsistent failure handling for malformed events. **Confirmed defect** (tracked: iora backlog 2026-09-10-17).
 - **The dispatch-setup/ingest throw path is still open.** RESOLVED for the handler-**invocation** loops as of commit `eec6356` (2026-09-10): a trailing `catch (...)` was added after the existing `catch (const std::exception &)` in both the id-handler and name-handler loops in `dispatch`, so a handler throwing *any* type -- `std::exception`-derived or not -- is now logged and swallowed; the worker survives. What remains open is the dispatch **setup** path: `push`'s `event["eventId"]`/`event["eventName"]` string extraction (which can throw `Json::type_error`, see above) and `dispatch`'s `std::regex_match` sweep both run **outside any try/catch**. A throw from either still unwinds the calling thread uncaught -- at the producer's call site for `push`, or out of a worker's `dispatch`/`workerLoop` (-> `std::terminate`) for the `regex_match` case. **Candidate defect, still open** (tracked: iora backlog 2026-09-10-17).
