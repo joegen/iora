@@ -8,7 +8,11 @@
 #include <iora/iora.hpp>
 #include <iostream>
 
-#define IORA_DEFAULT_CONFIG_FILE_PATH "/etc/iora.conf.d/iora.cfg"
+// The installed iora.cfg path, set by src/CMakeLists.txt from the configure-time
+// install prefix. Falls back to the library default when built without it.
+#ifndef IORA_INSTALLED_CONFIG_FILE
+#define IORA_INSTALLED_CONFIG_FILE IORA_DEFAULT_CONFIG_FILE_PATH
+#endif
 
 /// \brief Print help message
 static void printHelp()
@@ -215,10 +219,8 @@ void parseTomlConfig(iora::IoraService::Config &config,
   {
     if (!configLoader)
     {
-      std::string defaultConfigFile;
-#ifdef IORA_DEFAULT_CONFIG_FILE_PATH
-      defaultConfigFile = IORA_DEFAULT_CONFIG_FILE_PATH;
-#endif
+      std::string defaultConfigFile = IORA_INSTALLED_CONFIG_FILE;
+      config.configFile = defaultConfigFile;
       configLoader = std::make_unique<iora::core::ConfigLoader>(defaultConfigFile);
       IORA_LOG_INFO("Using default config file: " + defaultConfigFile);
     }

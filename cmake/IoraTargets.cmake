@@ -7,20 +7,19 @@ function(create_iora_lib)
     add_library(iora_lib INTERFACE)
     
     target_include_directories(iora_lib INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
-    
+
     target_compile_features(iora_lib INTERFACE cxx_std_17)
 
-    # Conditionally link iora_core and propagate IORA_CORE_SHARED
-    if(TARGET iora_core)
-        target_link_libraries(iora_lib INTERFACE iora_core)
-        target_compile_definitions(iora_lib INTERFACE IORA_CORE_SHARED)
-        message(STATUS "iora_lib linked with iora_core (shared singleton mode)")
-    else()
-        message(STATUS "iora_lib in header-only mode (iora_core not available)")
+    # iora_core is always built (CMakeLists.txt adds src/core first); the headers
+    # need it (e.g. blockingIoPool()/generalAsyncPool() live only in iora_core.cpp).
+    if(NOT TARGET iora_core)
+        message(FATAL_ERROR "create_iora_lib: target iora_core must be defined first")
     endif()
+    target_link_libraries(iora_lib INTERFACE iora_core)
+    message(STATUS "iora_lib linked with iora_core (shared singleton mode)")
 
     message(STATUS "Created iora_lib interface library")
 endfunction()
@@ -115,12 +114,7 @@ function(create_iora_test_target target_name)
         ENABLE_OPENSSL
         LINK_LIBRARIES Catch2::Catch2WithMain ${TEST_LINK_LIBRARIES}
     )
-    
-    # Add Catch2 include directory for fetched dependencies
-    if(CATCH2_INCLUDE_DIR)
-        target_include_directories(${target_name} PRIVATE ${CATCH2_INCLUDE_DIR})
-    endif()
-    
+
     message(STATUS "Created Iora test target: ${target_name}")
 endfunction()
 

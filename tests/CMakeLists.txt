@@ -38,6 +38,7 @@ option(IORA_BUILD_SERVICE_TESTS "Build service/plugin system tests" OFF)
 option(IORA_BUILD_DEBUG_TESTS "Build debug/helper tests" OFF)
 option(IORA_BUILD_WEB_TESTS "Build web namespace tests" OFF)
 option(IORA_BUILD_RPC_TESTS "Build rpc namespace tests" OFF)
+option(IORA_BUILD_PACKAGING_TESTS "Build packaging/consumer tests" OFF)
 option(IORA_BUILD_ALL_TESTS "Build all test groups (overrides individual options)" OFF)
 
 # Opt-in sanitizer build path for the concurrency tests (default OFF so normal
@@ -58,6 +59,7 @@ if(IORA_BUILD_ALL_TESTS)
     set(IORA_BUILD_DEBUG_TESTS ON)
     set(IORA_BUILD_WEB_TESTS ON)
     set(IORA_BUILD_RPC_TESTS ON)
+    set(IORA_BUILD_PACKAGING_TESTS ON)
 endif()
 
 # Network namespace tests
@@ -321,9 +323,6 @@ function(create_individual_test test_path)
     
     # Add tests root directory to include path for helper headers
     target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    
-    # Add iora-sip tests directory for MockDnsServer.hpp
-    target_include_directories(${test_name} PRIVATE ${CMAKE_SOURCE_DIR}/../iora-modules/iora-sip/tests)
     
     # Add the test to CTest with namespace categorization
     get_filename_component(test_dir ${test_path} DIRECTORY)
@@ -989,9 +988,71 @@ if(IORA_BUILD_WEB_TESTS)
     # serial with -j1 per the web-test convention).
     add_test(NAME web::test_embed_assets
         COMMAND ${CMAKE_COMMAND}
-            -DIORA_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DIORA_BUILD_DIR=${PROJECT_BINARY_DIR}
             -DCONSUMER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/web/cmake/test_embed_assets
             -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/embed_assets_work
             -P ${CMAKE_CURRENT_SOURCE_DIR}/web/cmake/run_embed_assets_test.cmake
     )
+endif()
+
+# Packaging / consumer tests: build iora as a subproject, install it, and
+# consume the installed package. Configure/build-bound, so serial with a long
+# timeout.
+if(IORA_BUILD_PACKAGING_TESTS)
+    set(_pkg_dir ${CMAKE_CURRENT_SOURCE_DIR}/packaging)
+
+    add_test(NAME packaging::test_subproject_consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DIORA_SRC=${PROJECT_SOURCE_DIR}
+            -DCONSUMER_SRC=${_pkg_dir}/subproject_consumer
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/packaging_subproject_work
+            -P ${_pkg_dir}/run_subproject_consumer_test.cmake
+    )
+    set_tests_properties(packaging::test_subproject_consumer PROPERTIES
+        RUN_SERIAL TRUE TIMEOUT 1800)
+
+    # Writes under its own <tmp> prefix only when SYSCONFDIR is relative.
+    if(NOT _iora_sysconfdir_is_absolute)
+        add_test(NAME packaging::test_install_layout
+            COMMAND ${CMAKE_COMMAND}
+                -DIORA_SRC=${PROJECT_SOURCE_DIR}
+                -DIORA_BUILD_DIR=${PROJECT_BINARY_DIR}
+                -DIORA_SYSCONFDIR=${CMAKE_INSTALL_SYSCONFDIR}
+                -DIORA_BINDIR=${CMAKE_INSTALL_BINDIR}
+                -DCONSUMER_SRC=${_pkg_dir}/installed_core_consumer
+                -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/packaging_install_work
+                -P ${_pkg_dir}/run_install_layout_test.cmake
+        )
+        set_tests_properties(packaging::test_install_layout PROPERTIES
+            RUN_SERIAL TRUE TIMEOUT 1800)
+    else()
+        message(STATUS "packaging::test_install_layout not registered: CMAKE_INSTALL_SYSCONFDIR is absolute (${CMAKE_INSTALL_SYSCONFDIR})")
+    endif()
+
+    # The real catch2/catch.hpp, for the header-only Catch2 fallback test.
+    set(_catch2_hints "")
+    FetchContent_GetProperties(catch2)
+    if(catch2_POPULATED)
+        list(APPEND _catch2_hints "${catch2_SOURCE_DIR}/single_include")
+    elseif(TARGET Catch2::Catch2)
+        get_target_property(_catch2_inc Catch2::Catch2 INTERFACE_INCLUDE_DIRECTORIES)
+        if(_catch2_inc)
+            list(APPEND _catch2_hints ${_catch2_inc})
+        endif()
+    endif()
+    find_file(IORA_CATCH2_HEADER catch2/catch.hpp HINTS ${_catch2_hints})
+    if(IORA_CATCH2_HEADER)
+        add_test(NAME packaging::test_catch2_header_only_fallback
+            COMMAND ${CMAKE_COMMAND}
+                -DIORA_SRC=${PROJECT_SOURCE_DIR}
+                -DIORA_CATCH2_HEADER=${IORA_CATCH2_HEADER}
+                -DPROBE_SRC=${_pkg_dir}/catch2_probe
+                -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/packaging_catch2_work
+                -P ${_pkg_dir}/run_catch2_header_only_test.cmake
+        )
+        set_tests_properties(packaging::test_catch2_header_only_fallback PROPERTIES
+            RUN_SERIAL TRUE TIMEOUT 1800)
+    else()
+        message(WARNING "packaging::test_catch2_header_only_fallback not registered: catch2/catch.hpp not found")
+    endif()
 endif()

@@ -11,7 +11,7 @@ The name comes from the Common Iora, a small, agile songbird of Southeast Asia. 
 - Linux (the transport and timers use `epoll`, `eventfd`, and `timerfd`)
 - A C++17 compiler and CMake 3.14 or newer (the `cmake --install` and `ctest --test-dir` commands below need 3.15 and 3.20 respectively)
 - OpenSSL (`libssl`, `libcrypto`) and POSIX threads, both required
-- Catch2 v2.13.10, fetched from GitHub at configure time unless that exact version is already installed. This currently happens even with `-DBUILD_TESTS=OFF`, so an offline configure needs Catch2 pre-installed, built with `CATCH_BUILD_STATIC_LIBRARY=ON` (it must provide `Catch2::Catch2WithMain`, otherwise configure fails)
+- Catch2 v2.13.10, only to build iora's own tests. It is fetched from GitHub at configure time unless that exact version is already installed. A header-only install (without `Catch2::Catch2WithMain`) is accepted: iora then builds the main-function library from its headers. With `-DBUILD_TESTS=OFF`, or when iora is used as a subproject, Catch2 is not needed and configure works offline
 
 ## Quick start
 
@@ -65,11 +65,11 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Useful options: `-DBUILD_SAMPLES=OFF`, `-DBUILD_EXAMPLES=OFF` (the flagship programs in [`examples/`](examples/)), and `-DBUILD_TESTS=OFF`.
+Useful options: `-DBUILD_SAMPLES=OFF`, `-DBUILD_EXAMPLES=OFF` (the flagship programs in [`examples/`](examples/)), and `-DBUILD_TESTS=OFF`. All three default to ON, and exist only when iora is the top-level project.
 
 ### Tests
 
-Test groups roughly follow `include/iora/` and are all off by default. Enable one group with `-DIORA_BUILD_<GROUP>_TESTS=ON` (`NETWORK`, `CORE`, `PARSERS`, `UTIL`, `STORAGE`, `SERVICE`, `WEB`, `RPC`, `DEBUG`), or all of them with `-DIORA_BUILD_ALL_TESTS=ON`:
+Test groups roughly follow `include/iora/` and are all off by default. Enable one group with `-DIORA_BUILD_<GROUP>_TESTS=ON` (`NETWORK`, `CORE`, `PARSERS`, `UTIL`, `STORAGE`, `SERVICE`, `WEB`, `RPC`, `DEBUG`, `PACKAGING`), or all of them with `-DIORA_BUILD_ALL_TESTS=ON`. The `PACKAGING` group builds iora as a subproject, installs it, and builds consumers against the install, so it takes several minutes:
 
 ```bash
 cmake -S . -B build -DIORA_BUILD_ALL_TESTS=ON
@@ -83,17 +83,32 @@ ctest --test-dir build --output-on-failure
 sudo cmake --install build
 ```
 
-This installs the headers, `libiora_core`, the CMake package (`Iora::` targets plus the `iora_embed_assets()` helper), the `iora` host executable, the vendored `htmx.min.js`, and a default `iora.cfg` under `<prefix>/etc/iora.conf.d/` (an existing file is not overwritten; `<prefix>` here is the one given at configure time, `cmake --install --prefix` does not move this file). The `iora` executable looks for `/etc/iora.conf.d/iora.cfg` by default; pass `--config <file>` when the install prefix is not `/`.
+This installs the headers, `libiora_core`, the CMake package (`Iora::` targets plus the `iora_embed_assets()` helper), the `iora` host executable, the vendored `htmx.min.js`, and a default `iora.cfg` under `<prefix>/etc/iora.conf.d/` (an existing file is not overwritten). `cmake --install --prefix <dir>` and `DESTDIR` are honored, and the installed `iora` finds `libiora_core` relative to its own location.
+
+The `iora` executable's default config file is the installed one: `<prefix>/etc/iora.conf.d/iora.cfg`, using the prefix given at configure time (`/usr/local/etc/iora.conf.d/iora.cfg` by default). If you install to a different `--prefix` than you configured with, pass `--config <file>`. Packagers who want `/etc` configure with `-DCMAKE_INSTALL_SYSCONFDIR=/etc`; an absolute value is used as is, for both the installed file and the executable's default. (Libraries using `IoraService` directly keep their own default, `/etc/iora.conf.d/iora.cfg`.)
 
 ## Linking
 
-Consumers link `libiora_core`, OpenSSL, and threads. `Iora::iora_lib` adds `IORA_CORE_SHARED` for you; outside CMake, define it yourself so the headers use the shared singletons. Omitting `IORA_CORE_SHARED` while linking `libiora_core` compiles duplicate per-image singletons (an ODR violation). After a system install run `sudo ldconfig` (or link with `-Wl,-rpath,<prefix>/lib`) so the loader finds `libiora_core.so.1`; the library directory is `<prefix>/lib` or `<prefix>/lib64` depending on the platform's GNUInstallDirs. On glibc older than 2.34 every link against `libiora_core` also needs `-ldl`.
+Consumers link `libiora_core`, OpenSSL, and threads. The CMake targets (`Iora::iora_lib`, `Iora::iora_core`) add `IORA_CORE_SHARED` and the `dl` library for you. Outside CMake, define `IORA_CORE_SHARED` yourself so the headers use the shared singletons; omitting it while linking `libiora_core` compiles duplicate per-image singletons (an ODR violation). On glibc older than 2.34 a non-CMake link against `libiora_core` also needs `-ldl`. After a system install run `sudo ldconfig` (or link with `-Wl,-rpath,<prefix>/lib`) so the loader finds `libiora_core.so.1`; the library directory is `<prefix>/lib` or `<prefix>/lib64` depending on the platform's GNUInstallDirs.
 
 CMake, from an installed package:
 
 ```cmake
 find_package(Iora REQUIRED)
 target_link_libraries(my_app PRIVATE Iora::iora_lib OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+```
+
+CMake, from the source tree as a subproject (`add_subdirectory` or `FetchContent`). The targets are then named `iora_lib` and `iora_core`, without the `Iora::` prefix that only `find_package` provides. As a subproject iora builds only `libiora_core` and the `iora` executable, never its tests, samples, or examples, and does not need Catch2:
+
+```cmake
+add_subdirectory(third_party/iora)
+# or:
+# include(FetchContent)
+# FetchContent_Declare(iora GIT_REPOSITORY <iora repository URL> GIT_TAG <tag>)
+# FetchContent_MakeAvailable(iora)
+find_package(OpenSSL REQUIRED)   # iora's own find_package results are not visible here
+find_package(Threads REQUIRED)
+target_link_libraries(my_app PRIVATE iora_lib OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 ```
 
 Makefile / Autoconf: use the same flags as the quick-start compile line, with `<prefix>` in place of `/usr/local`.

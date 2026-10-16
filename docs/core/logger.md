@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.2 |
-| **Date** | 2026-09-24 |
+| **Version** | 1.3 |
+| **Date** | 2026-10-16 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/logger.hpp` |
 | **Compiled unit** | `src/core/iora_core.cpp` (defines `Logger::getData()` and `Logger::handlerReentryDepth()` once into `libiora_core.so` when `IORA_CORE_SHARED`/`IORA_CORE_BUILDING` is set; otherwise a header-only fallback compiles one copy per image) |
@@ -21,6 +21,7 @@
 | 1.0 | 2026-09-10 | Consolidated the two frozen source guides -- `coding_trackers/docs/iora/logger_external_handlers.md` (v3.8) and `coding_trackers/docs/iora/logger_gzip_compression.md` (v1.0) -- into one doc-wiki guide at `docs/core/logger.md`, restructured to the 12-section template. Every signature, default, mutex name, and threading claim was re-verified against the current `include/iora/core/logger.hpp` (3220 lines) and `src/core/iora_core.cpp`. Corrected stale claims: `init()` now takes a sixth `compressAfterDays` argument (the prior external-handlers guide's API reference showed the 5-argument form); there is no `setRetentionDays()` method -- retention is an `init()` argument. |
 | 1.1 | 2026-09-12 | **Mechanism B (deferred tear-out), tracker 2026-07-23-1.** The frozen-inflight accounting (`FrozenScope`/`FrozenReleaser`/`externalHandlerFrozen`/park-notify) was RETIRED. A depth>0 self-clear/set now DEFERS (`nullGateAndDeferLocked`): it nulls the gate, records `pendingTearOut`/`pendingInstall` (last-writer-wins), and returns non-waiting; the last in-flight invocation applies it (`applyDeferredTearOutLocked`). The drain predicate is reduced to `inflight == handlerReentryDepth()`; `init()` at depth>0 is non-waiting; a DEBUG `DepthGtTeardownParkerGuard` guards the `≤ 1 depth>0 teardown parker` invariant. Sections 3.6/3.7/3.10, the class map, the lock-timeline, notify-sites, design records D-2/D-3, and Known Limitations updated. |
 | 1.2 | 2026-09-24 | DOC-4: new section 3.11 (console colors: the per-level ANSI codes, the `NO_COLOR` set-and-non-empty rule, the TTY check, console-only scope); section 8's color row states the `NO_COLOR` rule exactly. Corrected section 5.6: the configuration file is TOML under `[iora.log]`, it is read only by the `iora` executable (`src/iora.cpp`), its retention key is `retentionDays`, and `compressAfterDays` is not read from the file or the command line -- it can only be set in code through `IoraService::Config::log`. |
+| 1.3 | 2026-10-16 | Section 5.6: the `iora` executable's default configuration file is now the installed `iora.cfg` (`<prefix>/etc/iora.conf.d/iora.cfg`, prefix fixed at configure time, or `<sysconfdir>/iora.conf.d/iora.cfg` when `CMAKE_INSTALL_SYSCONFDIR` is absolute), not `/etc/iora.conf.d/iora.cfg`. |
 
 Historical milestones carried from the frozen sources (behaviour, not tracking):
 
@@ -487,7 +488,7 @@ void startService()
 }
 ```
 
-The shipped `iora` executable (`src/iora.cpp`) fills the same fields from its command line and, for fields still unset, from a TOML file (`-c <path>`, default `/etc/iora.conf.d/iora.cfg`). It reads these `[iora.log]` keys -- the names are case-sensitive and must be spelled exactly:
+The shipped `iora` executable (`src/iora.cpp`) fills the same fields from its command line and, for fields still unset, from a TOML file (`-c <path>`, default: the installed `iora.cfg`, `<prefix>/etc/iora.conf.d/iora.cfg` with the configure-time prefix, `/usr/local/etc/iora.conf.d/iora.cfg` by default, or `<sysconfdir>/iora.conf.d/iora.cfg` when `CMAKE_INSTALL_SYSCONFDIR` is absolute). It reads these `[iora.log]` keys -- the names are case-sensitive and must be spelled exactly:
 
 ```toml
 [iora.log]

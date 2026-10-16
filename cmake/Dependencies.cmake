@@ -5,7 +5,7 @@ include(FetchContent)
 
 # Helper function to check for system libraries and fall back to FetchContent
 function(find_or_fetch_dependency)
-    set(options REQUIRED EXACT)
+    set(options EXACT)
     set(oneValueArgs
         NAME
         PACKAGE_NAME
@@ -13,8 +13,6 @@ function(find_or_fetch_dependency)
         VERSION
         GIT_REPOSITORY
         GIT_TAG
-        INCLUDE_DIR
-        SYSTEM_INCLUDE_HINTS
     )
     set(multiValueArgs COMPONENTS)
     
@@ -65,6 +63,21 @@ function(find_or_fetch_dependency)
         elseif(TARGET ${FIND_OR_FETCH_PACKAGE_NAME})
             add_library(${FIND_OR_FETCH_TARGET_NAME} ALIAS ${FIND_OR_FETCH_PACKAGE_NAME})
             set(_fof_use_system TRUE)
+        elseif(FIND_OR_FETCH_TARGET_NAME STREQUAL "Catch2::Catch2WithMain" AND TARGET Catch2::Catch2)
+            # Header-only Catch2 v2 install: it exports Catch2::Catch2 but not
+            # Catch2::Catch2WithMain. Fetching is not possible (the imported
+            # Catch2::Catch2 collides with the fetched ALIAS), so build the
+            # compiled-main archive over the system headers instead. PUBLIC so
+            # the test targets get the Catch2 include dir through this link.
+            set(_fof_main_src "${CMAKE_CURRENT_BINARY_DIR}/iora_catch2_with_main.cpp")
+            if(NOT EXISTS "${_fof_main_src}")
+                file(WRITE "${_fof_main_src}" "#define CATCH_CONFIG_MAIN\n#include <catch2/catch.hpp>\n")
+            endif()
+            add_library(iora_catch2_with_main STATIC "${_fof_main_src}")
+            target_link_libraries(iora_catch2_with_main PUBLIC Catch2::Catch2)
+            add_library(Catch2::Catch2WithMain ALIAS iora_catch2_with_main)
+            message(STATUS "Catch2: system package has no Catch2::Catch2WithMain; built it from the system headers")
+            set(_fof_use_system TRUE)
         endif()
     endif()
 
@@ -86,7 +99,7 @@ function(find_or_fetch_dependency)
         # target. Do NOT FetchContent over it — the imported target would collide
         # with the fetched build's target. Fail clearly with remediation instead.
         if(_fof_found)
-            message(FATAL_ERROR "${FIND_OR_FETCH_NAME}: system package found (version ${${FIND_OR_FETCH_PACKAGE_NAME}_VERSION}) but it does not provide the required target '${FIND_OR_FETCH_TARGET_NAME}'. Rebuild/reinstall it with that target enabled (Catch2 v2: CATCH_BUILD_STATIC_LIBRARY=ON), or uninstall the system package so the pinned version is fetched instead.")
+            message(FATAL_ERROR "${FIND_OR_FETCH_NAME}: system package found (version ${${FIND_OR_FETCH_PACKAGE_NAME}_VERSION}) but it does not provide the required target '${FIND_OR_FETCH_TARGET_NAME}'. Rebuild/reinstall it with that target enabled, or uninstall the system package so the pinned version is fetched instead.")
         endif()
         # Fall back to FetchContent (not found, or version mismatch)
         if(FIND_OR_FETCH_VERSION)
@@ -115,28 +128,14 @@ function(find_or_fetch_dependency)
         if(DEFINED ${_fof_lc_name}_SOURCE_DIR)
             set(${_fof_lc_name}_SOURCE_DIR "${${_fof_lc_name}_SOURCE_DIR}" PARENT_SCOPE)
         endif()
-
-        # Set include directory variable for backwards compatibility
-        if(FIND_OR_FETCH_INCLUDE_DIR)
-            set(${FIND_OR_FETCH_INCLUDE_DIR} "${CMAKE_BINARY_DIR}/_deps/${FIND_OR_FETCH_NAME}-src/include" PARENT_SCOPE)
-        endif()
     endif()
 endfunction()
 
 # Configure all dependencies
 function(configure_iora_dependencies)
-    # nlohmann_json - No longer needed, using built-in json2.hpp
-    # Commented out but kept for reference
-    # find_or_fetch_dependency(
-    #     NAME nlohmann_json
-    #     PACKAGE_NAME nlohmann_json
-    #     TARGET_NAME nlohmann_json::nlohmann_json
-    #     GIT_REPOSITORY https://github.com/nlohmann/json.git
-    #     GIT_TAG v3.11.2
-    #     INCLUDE_DIR NLOHMANN_JSON_INCLUDE_DIR
-    # )
-    
-    # Catch2 (for testing) - Using v2 for compatibility.
+    # Catch2 (for testing) - Using v2 for compatibility. Requested only when
+    # iora's own tests are built (top-level with BUILD_TESTS), so a subproject
+    # or a -DBUILD_TESTS=OFF configure never fetches it.
     #
     # The test targets link Catch2::Catch2WithMain (cmake/IoraTargets.cmake): a
     # STATIC library whose main() object the linker pulls only for the test
@@ -147,19 +146,20 @@ function(configure_iora_dependencies)
     # fallback path (no system Catch2 installed) the target would be missing and
     # every test would fail to configure. Force it ON before the fetch so the
     # build is self-contained and reproducible without a system Catch2 package.
-    set(CATCH_BUILD_STATIC_LIBRARY ON CACHE BOOL
-        "Build Catch2 compiled-main static lib (provides Catch2::Catch2WithMain)" FORCE)
-    find_or_fetch_dependency(
-        NAME Catch2
-        PACKAGE_NAME Catch2
-        TARGET_NAME Catch2::Catch2WithMain
-        VERSION 2.13.10
-        EXACT
-        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG v2.13.10
-        INCLUDE_DIR CATCH2_INCLUDE_DIR
-    )
-       
+    if(IORA_IS_TOP_LEVEL AND BUILD_TESTS)
+        set(CATCH_BUILD_STATIC_LIBRARY ON CACHE BOOL
+            "Build Catch2 compiled-main static lib (provides Catch2::Catch2WithMain)" FORCE)
+        find_or_fetch_dependency(
+            NAME Catch2
+            PACKAGE_NAME Catch2
+            TARGET_NAME Catch2::Catch2WithMain
+            VERSION 2.13.10
+            EXACT
+            GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+            GIT_TAG v2.13.10
+        )
+    endif()
+
     # Threads - Required globally (iora_core, all targets via configure_threading_support)
     find_package(Threads REQUIRED)
 
@@ -170,31 +170,4 @@ function(configure_iora_dependencies)
     else()
         message(FATAL_ERROR "OpenSSL is required but not found")
     endif()
-    
-    # tomlplusplus - No longer needed, using minimal built-in parser
-    # Commented out but kept for reference
-    # find_or_fetch_dependency(
-    #     NAME tomlplusplus
-    #     PACKAGE_NAME tomlplusplus
-    #     TARGET_NAME tomlplusplus::tomlplusplus
-    #     GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
-    #     GIT_TAG v3.3.0
-    #     INCLUDE_DIR TOMLPLUSPLUS_INCLUDE_DIR
-    # )
-
-    # nlohmann_json include dir no longer needed
-    # if(NOT nlohmann_json_FOUND)
-    #     set(NLOHMANN_JSON_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/nlohmann_json-src/include" PARENT_SCOPE)
-    # endif()
-    
-    if(NOT Catch2_FOUND)
-        set(CATCH2_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/catch2-src/include" PARENT_SCOPE)
-    endif()
-       
-    
-    # tomlplusplus include dir no longer needed
-    # if(NOT tomlplusplus_FOUND)
-    #     set(TOMLPLUSPLUS_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/tomlplusplus-src/include" PARENT_SCOPE)
-    # endif()
-
 endfunction()

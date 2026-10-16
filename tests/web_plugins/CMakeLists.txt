@@ -9,4 +9,4 @@ create_iora_plugin_target(web_test_registry_plugin
 )
 
 # Reach the shared cross-.so interface header at tests/web/.
-target_include_directories(web_test_registry_plugin PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_include_directories(web_test_registry_plugin PRIVATE ${PROJECT_SOURCE_DIR}/tests)

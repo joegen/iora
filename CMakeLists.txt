@@ -1,13 +1,30 @@
 cmake_minimum_required(VERSION 3.14)
 project(iora 
     VERSION 1.0.0
-    DESCRIPTION "Modern C++17 single-header microservice foundation library"
+    DESCRIPTION "Modern C++17 microservice foundation library (headers + libiora_core)"
     LANGUAGES CXX
 )
 
-# Set default build type
-if(NOT CMAKE_BUILD_TYPE)
+# TRUE when iora is the top-level project; FALSE under add_subdirectory /
+# FetchContent, where tests, samples and examples are never built.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(IORA_IS_TOP_LEVEL TRUE)
+else()
+    set(IORA_IS_TOP_LEVEL FALSE)
+endif()
+
+# Set default build type (top-level only; a consumer owns its build type)
+if(IORA_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Tests, samples and examples: options default ON and exist only when iora is the
+# top-level project. As a subproject they are never built, and a consumer's own
+# BUILD_TESTS / BUILD_SAMPLES / BUILD_EXAMPLES cache entries are not read.
+if(IORA_IS_TOP_LEVEL)
+    option(BUILD_TESTS "Build test executables" ON)
+    option(BUILD_SAMPLES "Build sample programs" ON)
+    option(BUILD_EXAMPLES "Build documentation example programs" ON)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -40,9 +57,28 @@ endif()
 # Install directories (must be before any add_subdirectory that references them)
 include(GNUInstallDirs)
 
-# RPATH configuration so installed binaries find libiora_core.so
-set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+# RPATH configuration so installed binaries find libiora_core.so. $ORIGIN-relative,
+# so the install still works after `cmake --install --prefix <other>`.
+file(RELATIVE_PATH _iora_bin_to_lib "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+set(CMAKE_INSTALL_RPATH "$ORIGIN/${_iora_bin_to_lib}")
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# Installed config directory for iora.cfg. An absolute CMAKE_INSTALL_SYSCONFDIR
+# (e.g. -DCMAKE_INSTALL_SYSCONFDIR=/etc for packagers) is used as is; otherwise it
+# is <prefix>/<sysconfdir>. GNUInstallDirs' /usr->/etc and /opt->/etc/opt special
+# cases are deliberately not applied. _iora_installed_config_file is the
+# configure-time path compiled into the iora executable (src/CMakeLists.txt);
+# _iora_config_dir_code is the same directory for install(CODE), with the prefix
+# escaped so it is read at install time.
+if(IS_ABSOLUTE "${CMAKE_INSTALL_SYSCONFDIR}")
+    set(_iora_sysconfdir_is_absolute TRUE)
+    set(_iora_installed_config_file "${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d/iora.cfg")
+    set(_iora_config_dir_code "${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d")
+else()
+    set(_iora_sysconfdir_is_absolute FALSE)
+    set(_iora_installed_config_file "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d/iora.cfg")
+    set(_iora_config_dir_code "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_SYSCONFDIR}/iora.conf.d")
+endif()
 
 # Include our modular CMake files
 include(cmake/Dependencies.cmake)
@@ -59,12 +95,10 @@ configure_iora_dependencies()
 # Build the iora_core shared library (must exist before create_iora_lib)
 add_subdirectory(src/core)
 
-# Create the main iora_lib interface library (conditionally links iora_core)
+# Create the main iora_lib interface library (links iora_core)
 create_iora_lib()
 
-# Optional: Build tests (disabled by default for external project integration)
-option(BUILD_TESTS "Build test executables" ON)
-if(BUILD_TESTS)
+if(IORA_IS_TOP_LEVEL AND BUILD_TESTS)
     # Enable testing support
     include(CTest)
     enable_testing()
@@ -77,16 +111,13 @@ if(BUILD_TESTS)
     )
 endif()
 
-# Optional: Build samples (disabled by default for external project integration)
-option(BUILD_SAMPLES "Build sample programs" ON)
-if(BUILD_SAMPLES)
+if(IORA_IS_TOP_LEVEL AND BUILD_SAMPLES)
     add_subdirectory(sample)
 endif()
 
-# Optional: Build documentation flagship examples (CI-built; a broken headline API
-# breaks the build). See docs/manifest.json and the doc-wiki initiative.
-option(BUILD_EXAMPLES "Build documentation example programs" ON)
-if(BUILD_EXAMPLES)
+# Documentation flagship examples (CI-built; a broken headline API breaks the
+# build). See docs/manifest.json and the doc-wiki initiative.
+if(IORA_IS_TOP_LEVEL AND BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
@@ -104,13 +135,17 @@ install(DIRECTORY include/
     FILES_MATCHING PATTERN "*.hpp"
 )
 
-# Install configuration file to /etc (absolute path to avoid /usr/local/etc)
+# Install iora.cfg into <sysconfdir>/iora.conf.d (rule above). The prefix and
+# DESTDIR are escaped so they are read at INSTALL time (`cmake --install --prefix`
+# and DESTDIR are honored). file(INSTALL) prepends DESTDIR itself; only the
+# no-overwrite guard adds it. An existing iora.cfg is never overwritten.
 install(CODE "
-    set(config_file \"${CMAKE_INSTALL_PREFIX}/etc/iora.conf.d/iora.cfg\")
-    if(NOT EXISTS \"\${config_file}\")
-        file(INSTALL DESTINATION \"${CMAKE_INSTALL_PREFIX}/etc/iora.conf.d\" TYPE FILE FILES \"${CMAKE_CURRENT_SOURCE_DIR}/src/config/iora.cfg.in\" RENAME iora.cfg)
+    set(iora_config_dir \"${_iora_config_dir_code}\")
+    set(iora_config_file \"\$ENV{DESTDIR}\${iora_config_dir}/iora.cfg\")
+    if(NOT EXISTS \"\${iora_config_file}\")
+        file(INSTALL DESTINATION \"\${iora_config_dir}\" TYPE FILE FILES \"${CMAKE_CURRENT_SOURCE_DIR}/src/config/iora.cfg.in\" RENAME iora.cfg)
     else()
-        message(STATUS \"Skipping install of iora.cfg: already exists at \${config_file}\")
+        message(STATUS \"Skipping install of iora.cfg: already exists at \${iora_config_file}\")
     endif()
 ")
 
