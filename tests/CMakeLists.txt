@@ -142,6 +142,7 @@ set(NETWORK_TESTS
 # Core namespace tests
 set(CORE_TESTS
     core/iora_test_blocking_queue
+    core/iora_test_callback_ownership
     core/iora_test_config_loader
     core/iora_test_config_loader_get_table
     core/iora_test_config_loader_get_table_array
@@ -545,6 +546,13 @@ if(TEST core::iora_test_logger_init_teardown_race)
     set_tests_properties(core::iora_test_logger_init_teardown_race PROPERTIES TIMEOUT 120)
 endif()
 
+# The callback-ownership gate test (tracker 2026-10-16-12) has drain liveness
+# cases; a lost wakeup must FAIL via this TIMEOUT rather than wedge the suite (the
+# in-test bounded waits are the first line).
+if(IORA_BUILD_CORE_TESTS AND TEST core::iora_test_callback_ownership)
+    set_tests_properties(core::iora_test_callback_ownership PROPERTIES TIMEOUT 120)
+endif()
+
 # The self-clear deadlock suite (tracker 2026-07-21-3 / 2026-07-23-1) is the canonical
 # logger tear-out deadlock suite; a regression in a bounded-rendezvous discriminator
 # can wedge a worker whose leftover in-flight frame then hangs process-exit teardown.
@@ -585,6 +593,8 @@ endif()
 # thread) compiled directly into the test TU, so per-target instrumentation
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
+    # plugin_callback_ownership (tracker 2026-10-16-12): owner gate + registries.
+    iora_test_callback_ownership
     iora_test_timing_wheel
     iora_test_timing_wheel_lifecycle
     iora_test_timing_wheel_reset_ndebug
@@ -892,6 +902,13 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_api_module_reverse_map PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The plugin-isolation test (singleton + callback-ownership instance probes)
+    # dlopen's singletonprobe at runtime; depend on it so a targeted build of the
+    # test rebuilds the probe with its current exports.
+    if(TARGET iora_test_plugin_isolation AND TARGET singletonprobe)
+        add_dependencies(iora_test_plugin_isolation singletonprobe)
     endif()
 
     # The callExportedApi drain-gate test (Slice B, tracker 2026-09-07-3)

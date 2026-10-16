@@ -1,4 +1,5 @@
 #include "iora/iora.hpp"
+#include "iora/core/callback_ownership.hpp"
 
 class SingletonProbePlugin : public iora::IoraService::Plugin
 {
@@ -42,6 +43,20 @@ public:
                    []() -> std::uint64_t {
                      return reinterpret_cast<std::uint64_t>(&iora::IoraService::inFlightApiModules());
                    });
+
+    // plugin_callback_ownership CB-DP-7: registration and dispatch code compiled
+    // into a plugin must see the host's ONE thread-local owner slot / admitted set
+    // and the ONE gate. current() returns a field of the single
+    // CallbackThreadState, so its address pins the thread state; the gate (no
+    // public address) is pinned by behavior: the host closes an owner and this
+    // plugin-text admit must be refused.
+    svc->exportApi(*this, "probe.callbackThreadStateInstanceAddr",
+                   []() -> std::uint64_t {
+                     return reinterpret_cast<std::uint64_t>(&iora::core::CallbackOwner::current());
+                   });
+    svc->exportApi(*this, "probe.callbackGateAdmits",
+                   [](std::string owner) -> bool
+                   { return static_cast<bool>(iora::core::CallbackGate::admit(owner)); });
   }
 
   void onUnload() override {}

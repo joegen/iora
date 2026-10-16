@@ -1,6 +1,7 @@
 // iora_core — shared library housing singleton state for cross-plugin unification.
 
 #include "iora/iora.hpp"
+#include "iora/core/callback_ownership.hpp"
 #include "iora/core/metrics.hpp"
 #include "iora/core/service_registry.hpp"
 
@@ -137,6 +138,24 @@ int &Logger::handlerReentryDepth()
 {
   static thread_local int depth = 0;
   return depth;
+}
+
+// Single definitions of the callback-ownership state (plugin_callback_ownership
+// C1, CB-DP-7). Registration and dispatch code runs in the host AND in plugin
+// .so's loaded RTLD_LOCAL, so the thread-local owner slot / admitted set and the
+// gate must each be ONE instance process-wide, behind these accessors.
+detail::CallbackThreadState &detail::callbackThreadState()
+{
+  static thread_local CallbackThreadState state;
+  return state;
+}
+
+// IMMORTAL / deliberately-leaked (R-MEM-1): a drain or an Admission release may
+// run during static destruction.
+CallbackGate::Gate &CallbackGate::gate()
+{
+  static Gate *g = new Gate();
+  return *g;
 }
 
 } // namespace core

@@ -1,6 +1,7 @@
 #define CATCH_CONFIG_RUNNER
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
+#include "iora/core/callback_ownership.hpp"
 
 using namespace iora::test;
 
@@ -93,6 +94,32 @@ TEST_CASE("Singleton isolation: Logger and IoraService shared across plugin boun
     auto pluginInstance =
       svc.callExportedApi<std::uint64_t>("probe.inFlightApiModulesInstanceAddr");
     REQUIRE(hostInstance == pluginInstance);
+  }
+
+  SECTION("CallbackOwner thread state resolves to ONE thread_local instance host<->plugin")
+  {
+    // plugin_callback_ownership CB-DP-7: a plugin-.so copy of the thread state
+    // would make a host Scope invisible to a plugin-text registration (no owner,
+    // never removed) and a plugin-text admission invisible to the host's
+    // self-unload check.
+    auto hostInstance = reinterpret_cast<std::uint64_t>(&iora::core::CallbackOwner::current());
+    auto pluginInstance =
+      svc.callExportedApi<std::uint64_t>("probe.callbackThreadStateInstanceAddr");
+    REQUIRE(hostInstance == pluginInstance);
+  }
+
+  SECTION("CallbackGate is ONE gate host<->plugin")
+  {
+    // A plugin-.so copy of the gate would admit a closed owner's callbacks.
+    const std::string owner = "probe.gatecheck";
+    iora::core::CallbackGate::close(owner);
+    bool closedAdmit = svc.callExportedApi<bool>("probe.callbackGateAdmits", std::string(owner));
+    iora::core::CallbackGate::open(owner);
+    REQUIRE_FALSE(closedAdmit);
+    REQUIRE(svc.callExportedApi<bool>("probe.callbackGateAdmits", std::string(owner)));
+    iora::core::CallbackGate::close(owner);
+    iora::core::CallbackGate::drain(owner);
+    iora::core::CallbackGate::open(owner);
   }
 
   SECTION("Cross-boundary API calls work through shared IoraService")
