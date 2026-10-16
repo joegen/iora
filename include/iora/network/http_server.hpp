@@ -27,6 +27,7 @@
 #include <variant>
 #include <vector>
 
+#include "iora/core/callback_ownership.hpp"
 #include "iora/core/logger.hpp"
 #include "iora/core/string_utils.hpp"
 #include "iora/core/thread_pool.hpp"
@@ -421,6 +422,53 @@ public:
   {
     std::lock_guard<std::mutex> lock(_mutex);
     _defaultHandler = std::move(handler);
+    _defaultHandlerOwner = ownerForNewEntry();
+  }
+
+  /// \brief Record the CallbackOwner of every later registration on this
+  /// instance. One-way; earlier entries stay unowned.
+  void enableCallbackOwnerTracking() noexcept
+  {
+    _tracksCallbackOwners.store(true, std::memory_order_relaxed);
+  }
+
+  /// \brief Remove every route (all methods) and the default handler
+  /// registered under `owner`. Removed handlers are destroyed after the server
+  /// lock is released. The remaining routes keep their order. Does not wait for
+  /// requests already running; the caller drains the owner first
+  /// (CallbackGate::drain).
+  /// \throws std::invalid_argument if owner is empty.
+  void removeHandlersOwnedBy(const std::string &owner)
+  {
+    if (owner.empty())
+    {
+      throw std::invalid_argument("HttpServer::removeHandlersOwnedBy: owner must not be empty");
+    }
+    std::vector<Handler> removed;
+    std::unique_lock<std::mutex> lock(_mutex);
+    for (auto &methodVec : _handlers)
+    {
+      auto &routes = methodVec.second;
+      for (auto it = routes.begin(); it != routes.end();)
+      {
+        if (it->owner == owner)
+        {
+          removed.push_back(std::move(it->handler));
+          it = routes.erase(it);
+        }
+        else
+        {
+          ++it;
+        }
+      }
+    }
+    if (_defaultHandler && _defaultHandlerOwner == owner)
+    {
+      removed.push_back(std::move(_defaultHandler));
+      _defaultHandler = nullptr;
+      _defaultHandlerOwner.clear();
+    }
+    lock.unlock();
   }
 
   /// \brief Starts the server. Throws on error.
@@ -1517,7 +1565,7 @@ protected:
       const std::vector<std::string> reqToks = splitPath(req.path);
 
       // ── ONE under-lock pass: match, classify, copy out, unlock (RD-9/SR-3) ──
-      const DispatchDecision decision = classifyRequest(req.method, req.path, reqToks);
+      DispatchDecision decision = classifyRequest(req.method, req.path, reqToks);
 
       // Apply captured named-segment params (path wins over a same-named query
       // param, since this runs AFTER the query parse) and the wildcard suffix
@@ -1595,7 +1643,17 @@ protected:
           res.set_content("Not Found", "text/plain");
         }
         break;
+      case DispatchDecision::Cat::OWNER_CLOSED:
+        // The route's owner is loading or unloading: no handler runs.
+        res.status = 503;
+        res.set_content("Service Unavailable", "text/plain");
+        break;
       }
+
+      // Release the owner admission as soon as the handler copy is gone, so a
+      // drain does not wait for response serialization or the socket write.
+      decision.handler = nullptr;
+      decision.admission = core::CallbackGate::Admission{};
 
       // Post-dispatch suppression check (MATCHED / NO_ROUTE-with-handler only, on
       // normal return). When the handler took over the session (e.g. SSE), send
@@ -2065,7 +2123,7 @@ protected:
       {
         std::unordered_map<std::string, std::string> caps;
         std::string rest;
-        if (patternMatches(entry.first, reqToks, caps, rest))
+        if (patternMatches(entry.pattern, reqToks, caps, rest))
         {
           anyMatch = true;
           switch (methodVec.first)
@@ -2594,12 +2652,29 @@ private:
     return true;
   }
 
+  /// \brief One registered route: compiled pattern, the CallbackOwner it was
+  /// registered under (empty = unowned) and its handler.
+  struct Route
+  {
+    CompiledPattern pattern;
+    std::string owner;
+    Handler handler;
+  };
+
+  /// \brief Owner stored with a new route or default handler: the current
+  /// CallbackOwner on an owner-tracking instance, else empty.
+  std::string ownerForNewEntry() const
+  {
+    return _tracksCallbackOwners.load(std::memory_order_relaxed) ? core::CallbackOwner::current()
+                                                                 : std::string();
+  }
+
   /// \brief Precedence-ordered match within one method's pattern vector: EXACT,
   /// then NAMED (registration order), then WILDCARD (registration order), STOP
   /// at first hit. Returns the matching entry index or -1. Must be called with
   /// _mutex held (reads the vector).
   static int matchInMethodVector(
-    const std::vector<std::pair<CompiledPattern, Handler>> &vec,
+    const std::vector<Route> &vec,
     const std::vector<std::string> &reqToks,
     std::unordered_map<std::string, std::string> &paramAdds, std::string &pathRest)
   {
@@ -2607,13 +2682,13 @@ private:
     {
       for (std::size_t i = 0; i < vec.size(); ++i)
       {
-        if (vec[i].first.kind != kind)
+        if (vec[i].pattern.kind != kind)
         {
           continue;
         }
         std::unordered_map<std::string, std::string> caps;
         std::string rest;
-        if (patternMatches(vec[i].first, reqToks, caps, rest))
+        if (patternMatches(vec[i].pattern, reqToks, caps, rest))
         {
           paramAdds = std::move(caps);
           pathRest = std::move(rest);
@@ -2637,14 +2712,15 @@ private:
     {
       for (auto &entry : vec)
       {
-        if (entry.first.kind == PatternKind::EXACT && entry.first.raw == path)
+        if (entry.pattern.kind == PatternKind::EXACT && entry.pattern.raw == path)
         {
-          entry.second = std::move(handler);
+          entry.handler = std::move(handler);
+          entry.owner = ownerForNewEntry();
           return;
         }
       }
     }
-    vec.emplace_back(std::move(cp), std::move(handler));
+    vec.push_back(Route{std::move(cp), ownerForNewEntry(), std::move(handler)});
   }
 
   /// \brief True if the path matches a pattern under any method. Must be called
@@ -2657,7 +2733,7 @@ private:
       {
         std::unordered_map<std::string, std::string> caps;
         std::string rest;
-        if (patternMatches(entry.first, reqToks, caps, rest))
+        if (patternMatches(entry.pattern, reqToks, caps, rest))
         {
           return true;
         }
@@ -2681,7 +2757,7 @@ private:
       {
         std::unordered_map<std::string, std::string> caps;
         std::string rest;
-        if (patternMatches(entry.first, reqToks, caps, rest))
+        if (patternMatches(entry.pattern, reqToks, caps, rest))
         {
           return true;
         }
@@ -2704,8 +2780,12 @@ private:
       AUTO_OPTIONS,
       OPTIONS_STAR,
       METHOD_NOT_ALLOWED,
-      NO_ROUTE
+      NO_ROUTE,
+      OWNER_CLOSED
     } cat = Cat::NO_ROUTE;
+    // Declared BEFORE handler: on an unwind the handler copy is destroyed while
+    // its owner is still admitted.
+    core::CallbackGate::Admission admission;
     Handler handler;
     bool hasHandler = false;
     std::string allow;
@@ -2746,8 +2826,7 @@ private:
       d.cat = DispatchDecision::Cat::NO_ROUTE;
       if (_defaultHandler)
       {
-        d.handler = _defaultHandler;
-        d.hasHandler = true;
+        admitAndCopyHandler(d, _defaultHandlerOwner, _defaultHandler);
       }
       return d;
     }
@@ -2766,8 +2845,8 @@ private:
         if (idx >= 0)
         {
           d.cat = DispatchDecision::Cat::MATCHED_AS_HEAD;
-          d.handler = git->second[static_cast<std::size_t>(idx)].second;
-          d.hasHandler = true;
+          const auto &route = git->second[static_cast<std::size_t>(idx)];
+          admitAndCopyHandler(d, route.owner, route.handler);
           return d;
         }
       }
@@ -2781,8 +2860,8 @@ private:
       if (idx >= 0)
       {
         d.cat = DispatchDecision::Cat::MATCHED;
-        d.handler = mit->second[static_cast<std::size_t>(idx)].second;
-        d.hasHandler = true;
+        const auto &route = mit->second[static_cast<std::size_t>(idx)];
+        admitAndCopyHandler(d, route.owner, route.handler);
         return d;
       }
     }
@@ -2800,10 +2879,26 @@ private:
     d.cat = DispatchDecision::Cat::NO_ROUTE;
     if (_defaultHandler)
     {
-      d.handler = _defaultHandler;
-      d.hasHandler = true;
+      admitAndCopyHandler(d, _defaultHandlerOwner, _defaultHandler);
     }
     return d;
+  }
+
+  /// \brief Admit `owner`, then copy the handler out. If the owner is closed,
+  /// d becomes OWNER_CLOSED with no handler. Admit before copy, so no copy of a
+  /// closed owner's handler is ever made. MUST be called with _mutex held.
+  static bool admitAndCopyHandler(DispatchDecision &d, const std::string &owner,
+                                  const Handler &handler)
+  {
+    d.admission = core::CallbackGate::admit(owner);
+    if (!d.admission)
+    {
+      d.cat = DispatchDecision::Cat::OWNER_CLOSED;
+      return false;
+    }
+    d.handler = handler;
+    d.hasHandler = true;
+    return true;
   }
 
   /// \brief Invoke a copied-out handler with the request-level safety net, run
@@ -2842,7 +2937,9 @@ private:
   // _transport->close(sid) then _sessionInfo.erase(sid) run under _sessionMutex
   // while _mutex is still held (the completion lambda itself only logs — the
   // close+erase were hoisted OUT of it) — order _mutex -> _sessionMutex; there is
-  // NO reverse _sessionMutex -> _mutex edge. No HttpServer code holding _mutex may call a
+  // NO reverse _sessionMutex -> _mutex edge. The CallbackGate mutex sits below
+  // _mutex (admit() in classifyRequest; the gate mutex is a leaf); _sessionMutex
+  // and the gate mutex are never co-held. No HttpServer code holding _mutex may call a
   // subclass/friend (SseStream/upgradeToSse) method that re-takes a higher
   // lock — the dispatch narrowing copies the handler out and invokes it with
   // no lock held. (_sseMutex is PROSPECTIVE — owned by SseStream/sse_stream.hpp,
@@ -2881,10 +2978,14 @@ private:
   // Handler storage: method -> ordered vector of (compiled pattern, handler).
   // Ordered per method so registration order is preserved for the within-
   // precedence tie-break (an unordered_map cannot provide that).
-  std::unordered_map<HttpMethod, std::vector<std::pair<CompiledPattern, Handler>>> _handlers;
+  std::unordered_map<HttpMethod, std::vector<Route>> _handlers;
 
   // Fallback handler for unmatched routes (NO_ROUTE), set via setDefaultHandler.
   Handler _defaultHandler;
+  std::string _defaultHandlerOwner;
+
+  // Set once by enableCallbackOwnerTracking(); read by registration only.
+  std::atomic<bool> _tracksCallbackOwners{false};
 
   // Sessions that have been upgraded (e.g., to WebSocket).
   // Data for these sessions is routed to onUpgradedData() instead of HTTP parsing.

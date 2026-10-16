@@ -87,6 +87,7 @@ set(NETWORK_TESTS
     network/iora_test_http_framing_detail
     network/iora_test_http_server_connection
     network/iora_test_http_server_quiesce_drain
+    network/iora_test_http_server_owner_removal
     network/iora_test_http_client_pool
     network/iora_test_http_client_lease
     network/iora_test_http_client_response_framing
@@ -546,11 +547,17 @@ if(TEST core::iora_test_logger_init_teardown_race)
     set_tests_properties(core::iora_test_logger_init_teardown_race PROPERTIES TIMEOUT 120)
 endif()
 
-# The callback-ownership gate test (tracker 2026-10-16-12) has drain liveness
-# cases; a lost wakeup must FAIL via this TIMEOUT rather than wedge the suite (the
+# The callback-ownership tests (tracker 2026-10-16-12: gate, EventQueue,
+# HttpServer owner removal) have drain / deadlock liveness cases; a lost wakeup must FAIL via this TIMEOUT rather than wedge the suite (the
 # in-test bounded waits are the first line).
 if(IORA_BUILD_CORE_TESTS AND TEST core::iora_test_callback_ownership)
     set_tests_properties(core::iora_test_callback_ownership PROPERTIES TIMEOUT 120)
+endif()
+if(IORA_BUILD_CORE_TESTS AND TEST core::iora_test_event_queue)
+    set_tests_properties(core::iora_test_event_queue PROPERTIES TIMEOUT 120)
+endif()
+if(IORA_BUILD_NETWORK_TESTS AND TEST network::iora_test_http_server_owner_removal)
+    set_tests_properties(network::iora_test_http_server_owner_removal PROPERTIES TIMEOUT 120)
 endif()
 
 # The self-clear deadlock suite (tracker 2026-07-21-3 / 2026-07-23-1) is the canonical
@@ -595,6 +602,8 @@ endif()
 set(IORA_SANITIZED_TEST_TARGETS
     # plugin_callback_ownership (tracker 2026-10-16-12): owner gate + registries.
     iora_test_callback_ownership
+    iora_test_event_queue
+    iora_test_http_server_owner_removal
     iora_test_timing_wheel
     iora_test_timing_wheel_lifecycle
     iora_test_timing_wheel_reset_ndebug

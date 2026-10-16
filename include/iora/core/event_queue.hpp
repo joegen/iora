@@ -8,16 +8,21 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <queue>
 #include <regex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "iora/core/callback_ownership.hpp"
 #include "iora/core/logger.hpp"
 #include "iora/parsers/json.hpp"
 
@@ -93,7 +98,7 @@ public:
   void onEventId(const std::string &eventId, Handler handler)
   {
     std::unique_lock<std::mutex> lock(_mutex);
-    _handlersById[eventId].emplace_back(std::move(handler));
+    _handlersById[eventId].push_back(OwnedHandler{ownerForNewEntry(), std::move(handler)});
     iora::core::Logger::info(
       "EventQueue: Registered handler for event ID: " + eventId +
       " (total handlers for this ID: " + std::to_string(_handlersById[eventId].size()) + ")");
@@ -103,7 +108,7 @@ public:
   void onEventName(const std::string &eventName, Handler handler)
   {
     std::unique_lock<std::mutex> lock(_mutex);
-    _handlersByName[eventName].emplace_back(std::move(handler));
+    _handlersByName[eventName].push_back(OwnedHandler{ownerForNewEntry(), std::move(handler)});
     iora::core::Logger::info(
       "EventQueue: Registered handler for event name: " + eventName +
       " (total handlers for this name: " + std::to_string(_handlersByName[eventName].size()) + ")");
@@ -116,7 +121,7 @@ public:
     try
     {
       _compiledHandlersByName[eventNamePattern] =
-        std::make_pair(std::regex(eventNamePattern), std::move(handler));
+        PatternHandler{std::regex(eventNamePattern), ownerForNewEntry(), std::move(handler)};
       iora::core::Logger::info("EventQueue: Registered pattern handler for event name pattern: " +
                                eventNamePattern);
     }
@@ -129,18 +134,99 @@ public:
     }
   }
 
+  /// \brief Record the CallbackOwner of every later registration on this
+  /// instance. One-way; earlier entries stay unowned.
+  void enableCallbackOwnerTracking() noexcept
+  {
+    _tracksCallbackOwners.store(true, std::memory_order_relaxed);
+  }
+
+  /// \brief Remove every handler (by id, by name and by pattern) registered
+  /// under `owner`. Removed handlers are destroyed after the queue lock is
+  /// released. Does not wait for invocations already running; the caller drains
+  /// the owner first (CallbackGate::drain).
+  /// \throws std::invalid_argument if owner is empty.
+  void removeHandlersOwnedBy(const std::string &owner)
+  {
+    if (owner.empty())
+    {
+      throw std::invalid_argument("EventQueue::removeHandlersOwnedBy: owner must not be empty");
+    }
+    std::vector<Handler> removed;
+    std::unique_lock<std::mutex> lock(_mutex);
+    const auto removeFrom = [&removed, &owner](std::map<std::string, std::vector<OwnedHandler>> &map)
+    {
+      for (auto it = map.begin(); it != map.end();)
+      {
+        auto &entries = it->second;
+        for (auto e = entries.begin(); e != entries.end();)
+        {
+          if (e->owner == owner)
+          {
+            removed.push_back(std::move(e->handler));
+            e = entries.erase(e);
+          }
+          else
+          {
+            ++e;
+          }
+        }
+        it = entries.empty() ? map.erase(it) : std::next(it);
+      }
+    };
+    removeFrom(_handlersById);
+    removeFrom(_handlersByName);
+    for (auto it = _compiledHandlersByName.begin(); it != _compiledHandlersByName.end();)
+    {
+      if (it->second.owner == owner)
+      {
+        removed.push_back(std::move(it->second.handler));
+        it = _compiledHandlersByName.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
+    lock.unlock();
+  }
+
 private:
+  struct OwnedHandler
+  {
+    std::string owner;
+    Handler handler;
+  };
+
+  struct PatternHandler
+  {
+    std::regex pattern;
+    std::string owner;
+    Handler handler;
+  };
+
+  using AdmittedHandler = std::pair<CallbackGate::Admission, Handler>;
+
+  std::string ownerForNewEntry() const
+  {
+    return _tracksCallbackOwners.load(std::memory_order_relaxed) ? CallbackOwner::current()
+                                                                 : std::string();
+  }
+
   bool isValidEvent(const parsers::Json &event) const
   {
     return event.contains("eventId") && event.contains("eventName");
   }
 
+  // Lock order: _mutex -> CallbackGate mutex (admit() in dispatch). The gate
+  // mutex is a leaf.
   std::mutex _mutex;
   std::condition_variable _cv;
   std::queue<parsers::Json> _queue;
-  std::map<std::string, std::vector<Handler>> _handlersById;
-  std::map<std::string, std::vector<Handler>> _handlersByName;
-  std::map<std::string, std::pair<std::regex, Handler>> _compiledHandlersByName;
+  std::map<std::string, std::vector<OwnedHandler>> _handlersById;
+  std::map<std::string, std::vector<OwnedHandler>> _handlersByName;
+  std::map<std::string, PatternHandler> _compiledHandlersByName;
+  std::atomic<bool> _tracksCallbackOwners{false};
   std::vector<std::thread> _threads;
   bool _shutdown = false;
 
@@ -178,31 +264,74 @@ private:
     bool handled = false;
     std::size_t totalHandlers = 0;
 
-    std::vector<Handler> idHandlers;
-    std::vector<Handler> nameHandlers;
+    std::vector<AdmittedHandler> idHandlers;
+    std::vector<AdmittedHandler> nameHandlers;
+    std::size_t skippedClosed = 0;
+    std::size_t admitFailed = 0;
 
     {
       std::unique_lock<std::mutex> lock(_mutex);
 
+      const auto admitAndCopy =
+        [&skippedClosed, &admitFailed](std::vector<AdmittedHandler> &out, const std::string &owner,
+                                       const Handler &handler)
+      {
+        try
+        {
+          auto a = CallbackGate::admit(owner);
+          if (!a)
+          {
+            ++skippedClosed;
+            return;
+          }
+          out.emplace_back(std::move(a), handler);
+        }
+        catch (const std::exception &)
+        {
+          ++admitFailed;
+        }
+      };
+
       auto idHandlersIt = _handlersById.find(eventId);
       if (idHandlersIt != _handlersById.end())
       {
-        idHandlers = idHandlersIt->second;
+        for (const auto &entry : idHandlersIt->second)
+        {
+          admitAndCopy(idHandlers, entry.owner, entry.handler);
+        }
       }
 
       auto nameHandlersIt = _handlersByName.find(eventName);
       if (nameHandlersIt != _handlersByName.end())
       {
-        nameHandlers = nameHandlersIt->second;
+        for (const auto &entry : nameHandlersIt->second)
+        {
+          admitAndCopy(nameHandlers, entry.owner, entry.handler);
+        }
       }
 
       for (const auto &[pattern, compiledHandler] : _compiledHandlersByName)
       {
-        if (std::regex_match(eventName, compiledHandler.first))
+        if (std::regex_match(eventName, compiledHandler.pattern))
         {
-          nameHandlers.emplace_back(compiledHandler.second);
+          admitAndCopy(nameHandlers, compiledHandler.owner, compiledHandler.handler);
         }
       }
+    }
+
+    if (skippedClosed > 0)
+    {
+      iora::core::Logger::debug("EventQueue: Worker " + std::to_string(workerId) + " skipped " +
+                                std::to_string(skippedClosed) +
+                                " handler(s) of a closed owner for event (id=" + eventId +
+                                ", name=" + eventName + ")");
+    }
+    if (admitFailed > 0)
+    {
+      iora::core::Logger::error("EventQueue: Worker " + std::to_string(workerId) + " skipped " +
+                                std::to_string(admitFailed) +
+                                " handler(s): owner admission failed for event (id=" + eventId +
+                                ", name=" + eventName + ")");
     }
 
     totalHandlers = idHandlers.size() + nameHandlers.size();
@@ -213,11 +342,11 @@ private:
                                 ") to " + std::to_string(totalHandlers) + " handlers");
     }
 
-    for (const auto &handler : idHandlers)
+    for (auto &entry : idHandlers)
     {
       try
       {
-        handler(event);
+        entry.second(event);
         handled = true;
       }
       catch (const std::exception &e)
@@ -230,13 +359,14 @@ private:
         iora::core::Logger::error("EventQueue: Handler threw a non-std::exception for event ID " +
                                   eventId);
       }
+      releaseAdmitted(entry);
     }
 
-    for (const auto &handler : nameHandlers)
+    for (auto &entry : nameHandlers)
     {
       try
       {
-        handler(event);
+        entry.second(event);
         handled = true;
       }
       catch (const std::exception &e)
@@ -249,6 +379,7 @@ private:
         iora::core::Logger::error("EventQueue: Handler threw a non-std::exception for event name " +
                                   eventName);
       }
+      releaseAdmitted(entry);
     }
 
     if (!handled)
@@ -256,6 +387,14 @@ private:
       iora::core::Logger::debug("EventQueue: No handlers found for event (id=" + eventId +
                                 ", name=" + eventName + ") - discarding");
     }
+  }
+
+  /// Destroys the handler copy while it is still admitted, then releases the
+  /// admission, so a drain of its owner waits only for this entry.
+  static void releaseAdmitted(AdmittedHandler &entry) noexcept
+  {
+    entry.second = nullptr;
+    entry.first = CallbackGate::Admission{};
   }
 
   bool eventNameMatches(const std::string &pattern, const std::string &name) const
