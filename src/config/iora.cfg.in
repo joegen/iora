@@ -3,8 +3,8 @@
 # This file configures the IORA server. Edit values as needed for your
 # deployment. Paths are filled in at install time from the install prefix.
 #
-# Lines that start with "#? " are optional settings that are off by default.
-# Delete the "#? " at the start of a line to enable it.
+# Lines that start with "#? " are optional settings. They are commented out,
+# so their defaults apply. Delete the "#? " at the start of a line to set it.
 #
 # Note: keep each array on one line, and never put a "#" comment inside an
 # array. Such a comment makes the whole file fail to parse, and then every
