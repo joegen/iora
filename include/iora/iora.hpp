@@ -1820,15 +1820,6 @@ protected:
           _webhookServer.reset();
           throw;
         }
-        // Client-certificate enforcement is not yet wired in the transport
-        // (see tracker 2026-09-12-8); surface the gap so an operator who asked
-        // for mTLS is not misled into believing clients are authenticated.
-        if (tlsCfg.requireClientCert)
-        {
-          IORA_LOG_WARN("applyConfig: server.tls: client-certificate enforcement is not "
-                        "yet active (pending 2026-09-12-8); TLS listener provides server "
-                        "authentication only");
-        }
       }
       else
       {

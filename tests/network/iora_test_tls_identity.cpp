@@ -32,6 +32,7 @@
 #include "transport_test_seam.hpp" // TransportEngineInjector::withEngine (fault-injection)
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -51,6 +52,7 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 using namespace iora::network;
@@ -116,7 +118,8 @@ static void addExt(X509 *cert, X509V3_CTX *ctx, int nid, const std::string &valu
 /// to sign an intermediate CA (isCa=true) or a leaf (isCa=false) by that issuer.
 static X509Ptr makeCert(EVP_PKEY *subjectKey, X509 *issuerCert, EVP_PKEY *issuerKey,
                         const std::string &cn, const std::vector<std::string> &sanEntries,
-                        bool isCa, long notBeforeSec, long notAfterSec)
+                        bool isCa, long notBeforeSec, long notAfterSec,
+                        const std::string &extKeyUsage = "serverAuth,clientAuth")
 {
   X509 *x = ::X509_new();
   REQUIRE(x != nullptr);
@@ -144,7 +147,7 @@ static X509Ptr makeCert(EVP_PKEY *subjectKey, X509 *issuerCert, EVP_PKEY *issuer
   {
     addExt(x, &ctx, NID_basic_constraints, "critical,CA:FALSE");
     addExt(x, &ctx, NID_key_usage, "critical,digitalSignature,keyEncipherment");
-    addExt(x, &ctx, NID_ext_key_usage, "serverAuth,clientAuth");
+    addExt(x, &ctx, NID_ext_key_usage, extKeyUsage);
   }
   if (!sanEntries.empty())
   {
@@ -228,12 +231,13 @@ struct TestPki
 
   std::shared_ptr<Leaf> leaf(const std::string &cn, const std::vector<std::string> &sans,
                              long notBeforeSec = -3600, long notAfterSec = 3600 * 24 * 365,
-                             X509 *signer = nullptr, EVP_PKEY *signerKey = nullptr)
+                             X509 *signer = nullptr, EVP_PKEY *signerKey = nullptr,
+                             const std::string &extKeyUsage = "serverAuth,clientAuth")
   {
     auto lf = std::make_shared<Leaf>(Leaf{genKey(), X509Ptr(nullptr, &::X509_free), nullptr, nullptr});
     lf->cert = makeCert(lf->key.get(), signer ? signer : caCert.get(),
                         signerKey ? signerKey : caKey.get(), cn, sans, false, notBeforeSec,
-                        notAfterSec);
+                        notAfterSec, extKeyUsage);
     lf->certFile = std::make_unique<TempPem>(toPemCert(lf->cert.get()), "leaf");
     lf->keyFile = std::make_unique<TempPem>(toPemKey(lf->key.get()), "key");
     return lf;
@@ -785,6 +789,312 @@ TEST_CASE("client-role guard: dual-role server accepts inbound TLS", "[tls][iden
   ::close(fd);
   ::SSL_CTX_free(cctx);
   server->stop();
+}
+
+// Server-side mTLS: an iora LISTENER with serverTls.verifyPeer requires AND verifies a
+// client certificate, and accepts session resumption. The iora SERVER is the unit under
+// test; the client is bare OpenSSL pinned to one TLS version.
+namespace
+{
+struct MtlsServer
+{
+  std::mutex m;
+  std::vector<TransportErrorInfo> closeInfos;
+  std::atomic<int> accepted{0};
+  std::atomic<int> connects{0};
+  std::atomic<int> closes{0};
+  std::atomic<std::size_t> dataBytes{0};
+  std::uint16_t port{0};
+  std::unique_ptr<TcpEngine> tx;
+
+  MtlsServer(const TestPki::Leaf &serverLeaf, const std::string &caFile, bool verifyPeer)
+  {
+    TransportConfig cfg{};
+    cfg.serverTls.enabled = true;
+    cfg.serverTls.defaultMode = TlsMode::Server;
+    cfg.serverTls.certFile = serverLeaf.certFile->path;
+    cfg.serverTls.keyFile = serverLeaf.keyFile->path;
+    cfg.serverTls.verifyPeer = verifyPeer;
+    cfg.serverTls.caFile = caFile;
+    tx = std::make_unique<TcpEngine>(cfg);
+    iora::network::detail::EngineBase::Callbacks cbs{};
+    cbs.onAccept = [this](SessionId, const TransportAddress &) { accepted++; };
+    cbs.onConnect = [this](SessionId, const TransportAddress &) { connects++; };
+    cbs.onData = [this](SessionId sid, iora::core::BufferView data,
+                        std::chrono::steady_clock::time_point)
+    {
+      dataBytes += data.size();
+      tx->send(sid, data.data(), data.size());
+    };
+    cbs.onClose = [this](SessionId, const TransportErrorInfo &e)
+    {
+      {
+        std::lock_guard<std::mutex> lk(m);
+        closeInfos.push_back(e);
+      }
+      closes++;
+    };
+    tx->setCallbacks(cbs);
+    REQUIRE(tx->start().isOk());
+    port = testnet::addLoopbackListeners(*tx, SOCK_STREAM, TlsMode::Server);
+  }
+
+  ~MtlsServer()
+  {
+    if (tx)
+    {
+      tx->stop();
+    }
+  }
+
+  std::vector<TransportErrorInfo> closeInfoList()
+  {
+    std::lock_guard<std::mutex> lk(m);
+    return closeInfos;
+  }
+
+  std::uint64_t tlsFailures() const { return tx->getStats().tlsFailures; }
+};
+
+// Blocking bare-OpenSSL client pinned to one protocol version. The socket has 5 s
+// send/receive timeouts so a hung regression fails in-test; a receive timeout is
+// reported separately and never counts as "peer closed".
+struct BareTlsClient
+{
+  std::unique_ptr<SSL_CTX, decltype(&::SSL_CTX_free)> ctx{nullptr, &::SSL_CTX_free};
+  testnet::ScopedFd fd;
+  std::unique_ptr<SSL, decltype(&::SSL_free)> ssl{nullptr, &::SSL_free};
+  bool fatal{false};
+
+  BareTlsClient(int version, const TestPki::Leaf *clientLeaf, bool noTicket = false)
+  {
+    ctx.reset(::SSL_CTX_new(::TLS_client_method()));
+    REQUIRE(ctx != nullptr);
+    REQUIRE(::SSL_CTX_set_min_proto_version(ctx.get(), version) == 1);
+    REQUIRE(::SSL_CTX_set_max_proto_version(ctx.get(), version) == 1);
+    if (noTicket)
+    {
+      ::SSL_CTX_set_options(ctx.get(), SSL_OP_NO_TICKET);
+    }
+    if (clientLeaf != nullptr)
+    {
+      REQUIRE(::SSL_CTX_use_certificate_file(ctx.get(), clientLeaf->certFile->path.c_str(),
+                                             SSL_FILETYPE_PEM) == 1);
+      REQUIRE(::SSL_CTX_use_PrivateKey_file(ctx.get(), clientLeaf->keyFile->path.c_str(),
+                                            SSL_FILETYPE_PEM) == 1);
+    }
+  }
+
+  int connect(std::uint16_t port, SSL_SESSION *resume = nullptr)
+  {
+    release();
+    fatal = false;
+    fd = testnet::ScopedFd(testnet::connectLoopbackTcp(port, 5));
+    REQUIRE(fd.get() >= 0);
+    timeval tv{};
+    tv.tv_sec = 5;
+    ::setsockopt(fd.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    ssl.reset(::SSL_new(ctx.get()));
+    REQUIRE(ssl != nullptr);
+    ::SSL_set_fd(ssl.get(), fd.get());
+    if (resume != nullptr)
+    {
+      REQUIRE(::SSL_set_session(ssl.get(), resume) == 1);
+    }
+    int rc = ::SSL_connect(ssl.get());
+    if (rc != 1)
+    {
+      fatal = true;
+    }
+    return rc;
+  }
+
+  int write(const std::string &payload)
+  {
+    int n = ::SSL_write(ssl.get(), payload.data(), static_cast<int>(payload.size()));
+    if (n <= 0)
+    {
+      fatal = true;
+    }
+    return n;
+  }
+
+  int read(std::string &out, bool &timedOut)
+  {
+    char buf[4096];
+    errno = 0;
+    int n = ::SSL_read(ssl.get(), buf, sizeof(buf));
+    int savedErrno = errno;
+    timedOut = false;
+    if (n > 0)
+    {
+      out.append(buf, static_cast<std::size_t>(n));
+      return n;
+    }
+    int e = ::SSL_get_error(ssl.get(), n);
+    timedOut = e == SSL_ERROR_WANT_READ ||
+               (e == SSL_ERROR_SYSCALL && (savedErrno == EAGAIN || savedErrno == EWOULDBLOCK));
+    fatal = true;
+    return n;
+  }
+
+  std::string readExact(std::size_t want)
+  {
+    std::string out;
+    while (out.size() < want)
+    {
+      bool timedOut = false;
+      if (read(out, timedOut) <= 0)
+      {
+        break;
+      }
+    }
+    return out;
+  }
+
+  void closeClean()
+  {
+    if (ssl != nullptr && !fatal)
+    {
+      ::SSL_shutdown(ssl.get());
+    }
+    release();
+  }
+
+  void release()
+  {
+    ssl.reset();
+    fd = testnet::ScopedFd{};
+  }
+};
+
+void expectServerRejects(int version, MtlsServer &srv, const TestPki::Leaf *clientLeaf)
+{
+  const auto failuresBefore = srv.tlsFailures();
+  BareTlsClient client(version, clientLeaf);
+  int rc = client.connect(srv.port);
+  if (version == TLS1_2_VERSION)
+  {
+    REQUIRE(rc != 1);
+  }
+  else
+  {
+    REQUIRE(rc == 1);
+    (void)client.write("ping");
+    std::string got;
+    bool timedOut = false;
+    REQUIRE(client.read(got, timedOut) <= 0);
+    REQUIRE_FALSE(timedOut);
+  }
+  REQUIRE(waitFor([&] { return srv.closes.load() == 1; }));
+  REQUIRE(srv.accepted.load() == 1);
+  REQUIRE(srv.connects.load() == 0);
+  REQUIRE(srv.dataBytes.load() == 0);
+  auto infos = srv.closeInfoList();
+  REQUIRE(infos.size() == 1);
+  REQUIRE(infos[0].code == TransportError::TLSHandshake);
+  REQUIRE(infos[0].sysErrno == 0);
+  REQUIRE(waitFor([&] { return srv.tlsFailures() - failuresBefore >= 1; }));
+  REQUIRE(srv.tlsFailures() - failuresBefore == 1);
+}
+
+void expectServerAccepts(int version, MtlsServer &srv, const TestPki::Leaf *clientLeaf)
+{
+  const auto failuresBefore = srv.tlsFailures();
+  BareTlsClient client(version, clientLeaf);
+  REQUIRE(client.connect(srv.port) == 1);
+  REQUIRE(client.write("ping") == 4);
+  REQUIRE(client.readExact(4) == "ping");
+  REQUIRE(waitFor([&] { return srv.connects.load() == 1; }));
+  REQUIRE(srv.closes.load() == 0);
+  REQUIRE(srv.tlsFailures() == failuresBefore);
+  client.closeClean();
+}
+} // namespace
+
+TEST_CASE("server mTLS: no-cert, other-CA and non-clientAuth-EKU clients are rejected",
+          "[tls][mtls]")
+{
+  const int version = GENERATE(TLS1_2_VERSION, TLS1_3_VERSION);
+  CAPTURE(version);
+  TestPki pki;
+  auto serverLeaf = pki.leaf("iora-server", {"DNS:iora-server", "IP:127.0.0.1"});
+  MtlsServer srv(*serverLeaf, pki.caFile->path, /*verifyPeer=*/true);
+
+  SECTION("no client certificate")
+  {
+    expectServerRejects(version, srv, nullptr);
+  }
+  SECTION("client certificate from another CA")
+  {
+    TestPki otherPki;
+    auto otherLeaf = otherPki.leaf("iora-client", {"DNS:iora-client"});
+    expectServerRejects(version, srv, otherLeaf.get());
+  }
+  SECTION("client certificate whose extendedKeyUsage omits clientAuth")
+  {
+    auto serverOnlyLeaf = pki.leaf("iora-client", {"DNS:iora-client"}, -3600, 3600 * 24 * 365,
+                                   nullptr, nullptr, "serverAuth");
+    expectServerRejects(version, srv, serverOnlyLeaf.get());
+  }
+}
+
+TEST_CASE("server mTLS: valid client accepted; verifyPeer=false accepts a cert-less client",
+          "[tls][mtls]")
+{
+  const int version = GENERATE(TLS1_2_VERSION, TLS1_3_VERSION);
+  CAPTURE(version);
+  TestPki pki;
+  auto serverLeaf = pki.leaf("iora-server", {"DNS:iora-server", "IP:127.0.0.1"});
+
+  SECTION("valid client certificate")
+  {
+    MtlsServer srv(*serverLeaf, pki.caFile->path, /*verifyPeer=*/true);
+    auto clientLeaf = pki.leaf("iora-client", {"DNS:iora-client"});
+    expectServerAccepts(version, srv, clientLeaf.get());
+  }
+  SECTION("verifyPeer=false, no client certificate")
+  {
+    MtlsServer srv(*serverLeaf, "", /*verifyPeer=*/false);
+    expectServerAccepts(version, srv, nullptr);
+  }
+}
+
+TEST_CASE("server mTLS: a valid client resumes its session", "[tls][mtls]")
+{
+  struct Variant
+  {
+    const char *name;
+    int version;
+    bool noTicket;
+  };
+  const auto variant = GENERATE(Variant{"TLS1.2 session-ID", TLS1_2_VERSION, true},
+                                Variant{"TLS1.2 ticket", TLS1_2_VERSION, false},
+                                Variant{"TLS1.3 ticket", TLS1_3_VERSION, false});
+  CAPTURE(variant.name);
+  TestPki pki;
+  auto serverLeaf = pki.leaf("iora-server", {"DNS:iora-server", "IP:127.0.0.1"});
+  auto clientLeaf = pki.leaf("iora-client", {"DNS:iora-client"});
+  MtlsServer srv(*serverLeaf, pki.caFile->path, /*verifyPeer=*/true);
+  BareTlsClient client(variant.version, clientLeaf.get(), variant.noTicket);
+
+  REQUIRE(client.connect(srv.port) == 1);
+  REQUIRE(client.write("ping") == 4);
+  REQUIRE(client.readExact(4) == "ping");
+  std::unique_ptr<SSL_SESSION, decltype(&::SSL_SESSION_free)> saved(
+    ::SSL_get1_session(client.ssl.get()), &::SSL_SESSION_free);
+  REQUIRE(saved != nullptr);
+  REQUIRE(::SSL_SESSION_has_ticket(saved.get()) == (variant.noTicket ? 0 : 1));
+  client.closeClean();
+  REQUIRE(waitFor([&] { return srv.closes.load() == 1; }));
+  REQUIRE(::SSL_SESSION_is_resumable(saved.get()) == 1);
+
+  REQUIRE(client.connect(srv.port, saved.get()) == 1);
+  REQUIRE(::SSL_session_reused(client.ssl.get()) == 1);
+  REQUIRE(client.write("pong") == 4);
+  REQUIRE(client.readExact(4) == "pong");
+  REQUIRE(waitFor([&] { return srv.connects.load() == 2; }));
+  client.closeClean();
 }
 
 // cert-chain presentation (SERVER): an iora LISTENER whose cert file holds

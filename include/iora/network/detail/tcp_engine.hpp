@@ -4118,7 +4118,19 @@ private:
       }
       if (_config.serverTls.verifyPeer)
       {
-        ::SSL_CTX_set_verify(_sslSrv, SSL_VERIFY_PEER, nullptr);
+        ::SSL_CTX_set_verify(_sslSrv, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+        static constexpr char SERVER_SID_CTX[] = "iora-tcp-srv";
+        static_assert(sizeof(SERVER_SID_CTX) - 1 <= SSL_MAX_SID_CTX_LENGTH,
+                      "server session id context exceeds SSL_MAX_SID_CTX_LENGTH");
+        if (::SSL_CTX_set_session_id_context(_sslSrv,
+              reinterpret_cast<const unsigned char *>(SERVER_SID_CTX),
+              sizeof(SERVER_SID_CTX) - 1) != 1)
+        {
+          setLastFatal(IoResult::failure(TransportError::Config,
+            "server session id context failed"));
+          err(TransportError::Config, "server session id context");
+          return false;
+        }
         if (!_config.serverTls.caFile.empty() || !_config.serverTls.caPath.empty())
         {
           if (::SSL_CTX_load_verify_locations(_sslSrv,

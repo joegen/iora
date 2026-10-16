@@ -20,18 +20,38 @@
 #include "iora_test_net_utils.hpp"
 
 #include <arpa/inet.h>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <openssl/ssl.h>
 #include <string>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 using namespace iora::test;
+
+// The bare-OpenSSL client in T10 writes on a connection the server may already have
+// reset; ignore SIGPIPE for this test process so that cannot kill the binary.
+namespace
+{
+struct SigpipeIgnoreListener : Catch::TestEventListenerBase
+{
+  using TestEventListenerBase::TestEventListenerBase;
+  void testRunStarting(Catch::TestRunInfo const &) override
+  {
+    testnet::ignoreSigpipeForTestProcess();
+  }
+};
+} // namespace
+CATCH_REGISTER_LISTENER(SigpipeIgnoreListener)
 
 namespace
 {
@@ -211,6 +231,63 @@ bool plaintextProbeSucceeds(int port)
   {
     return false;
   }
+}
+
+// A bare-OpenSSL client with NO client certificate, pinned to one TLS version, sends
+// an HTTP GET after its handshake. A 5 s receive timeout is reported separately so it
+// never passes as "no response". No SSL_shutdown: the reject paths end in a fatal
+// alert or a reset.
+struct NoCertGetResult
+{
+  int connectRc{0};
+  bool gotResponse{false};
+  bool timedOut{false};
+};
+
+NoCertGetResult noCertHttpsGet(int port, int version)
+{
+  NoCertGetResult result;
+  std::unique_ptr<SSL_CTX, decltype(&::SSL_CTX_free)> ctx(::SSL_CTX_new(::TLS_client_method()),
+                                                          &::SSL_CTX_free);
+  REQUIRE(ctx != nullptr);
+  REQUIRE(::SSL_CTX_set_min_proto_version(ctx.get(), version) == 1);
+  REQUIRE(::SSL_CTX_set_max_proto_version(ctx.get(), version) == 1);
+  testnet::ScopedFd fd(testnet::connectLoopbackTcp(port, 5));
+  REQUIRE(fd.get() >= 0);
+  timeval tv{};
+  tv.tv_sec = 5;
+  ::setsockopt(fd.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  std::unique_ptr<SSL, decltype(&::SSL_free)> ssl(::SSL_new(ctx.get()), &::SSL_free);
+  REQUIRE(ssl != nullptr);
+  ::SSL_set_fd(ssl.get(), fd.get());
+  auto isTimeout = [&ssl](int rc, int savedErrno)
+  {
+    const int e = ::SSL_get_error(ssl.get(), rc);
+    return e == SSL_ERROR_WANT_READ ||
+           (e == SSL_ERROR_SYSCALL && (savedErrno == EAGAIN || savedErrno == EWOULDBLOCK));
+  };
+  errno = 0;
+  result.connectRc = ::SSL_connect(ssl.get());
+  if (result.connectRc != 1)
+  {
+    result.timedOut = isTimeout(result.connectRc, errno);
+    return result;
+  }
+  const std::string req = "GET /tls-probe HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                          "Connection: close\r\n\r\n";
+  (void)::SSL_write(ssl.get(), req.data(), static_cast<int>(req.size()));
+  char buf[512];
+  errno = 0;
+  const int n = ::SSL_read(ssl.get(), buf, sizeof(buf));
+  if (n > 0)
+  {
+    result.gotResponse = true;
+  }
+  else
+  {
+    result.timedOut = isTimeout(n, errno);
+  }
+  return result;
 }
 
 std::string writeTempFile(TempDirManager &tmp, const std::string &name,
@@ -431,11 +508,13 @@ TEST_CASE("TLS T9c start() bind failure leaves no half-built server",
   REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
 }
 
-// --- T10: mTLS config brings the listener up (enforcement scoped to 2026-09-12-8) -
-//   Assert ONLY that the listener comes up. Do NOT assert a cert-less handshake
-//   succeeds — client-cert enforcement is owned by 2026-09-12-8, and encoding the
-//   current no-enforcement behavior as expected would be a masked test.
-TEST_CASE("TLS T10 mTLS config brings the listener up", "[iora][tls][config]")
+// --- T10: mTLS config brings the listener up and rejects a cert-less client --------
+//   requireClientCert maps to the transport's serverTls.verifyPeer, which requires a
+//   client certificate. TLS 1.2: the client's handshake fails. TLS 1.3: the client's
+//   handshake completes before the server judges its certificate (RFC 8446 4.4.2.4),
+//   so the rejection shows as no response; the GET write result is not asserted.
+TEST_CASE("TLS T10 mTLS config brings the listener up and rejects a cert-less client",
+          "[iora][tls][config]")
 {
   TempDirManager tmp;
   const int port = testnet::getFreePortTCP();
@@ -450,7 +529,21 @@ TEST_CASE("TLS T10 mTLS config brings the listener up", "[iora][tls][config]")
   AlwaysShutdown guard;
   REQUIRE(svc.webhookServer() != nullptr);
   waitForListener(port);
-  REQUIRE(tcpConnectSucceeds(port)); // listener up; no handshake assertion
+  REQUIRE(tcpConnectSucceeds(port));
+
+  SECTION("TLS 1.2")
+  {
+    auto r = noCertHttpsGet(port, TLS1_2_VERSION);
+    REQUIRE(r.connectRc != 1);
+    REQUIRE_FALSE(r.timedOut);
+  }
+  SECTION("TLS 1.3")
+  {
+    auto r = noCertHttpsGet(port, TLS1_3_VERSION);
+    REQUIRE(r.connectRc == 1);
+    REQUIRE_FALSE(r.gotResponse);
+    REQUIRE_FALSE(r.timedOut);
+  }
 }
 
 // --- M1: empty-string semantics (empty == unset) ---------------------------------
@@ -504,22 +597,3 @@ TEST_CASE("TLS L4 server disabled with TLS set warns and does not throw",
   REQUIRE(logs.sawContaining("features.server is disabled"));
 }
 
-// --- WARN: requireClientCert=true emits the mTLS-pending enforcement warning ------
-TEST_CASE("TLS mTLS-pending WARN is emitted for requireClientCert",
-          "[iora][tls][config]")
-{
-  TempDirManager tmp;
-  const int port = testnet::getFreePortTCP();
-  auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
-  cfg.log.level = "warn";
-  cfg.server.tls.certFile = kCertFile;
-  cfg.server.tls.keyFile = kKeyFile;
-  cfg.server.tls.caFile = kCertFile;
-  cfg.server.tls.requireClientCert = true;
-
-  LogCaptureGuard logs;
-  AlwaysShutdown guard;
-  iora::IoraService::init(cfg);
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() != nullptr);
-  REQUIRE(logs.sawContaining("client-certificate enforcement is not yet active"));
-}
