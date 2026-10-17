@@ -4,14 +4,14 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-24 |
+| **Version** | 1.1 |
+| **Date** | 2026-10-17 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/common/i_lifecycle_managed.hpp` |
 | **Namespace** | `iora::common` |
 | **Dependencies** | `<cstdint>`, `<optional>`, `<string>` (standard library only) |
 
-This guide covers `iora::common::ILifecycleManaged`, the abstract interface for components that support graceful drain, stop, and restart, together with its value types `LifecycleState`, `DrainStats`, `LifecycleResult` and the helper `lifecycleStateToString`. The two in-tree implementers are `iora::core::ThreadPool` (the alias `using ThreadPool = ThreadPoolT<false>`, `core/thread_pool.hpp:1287`; class template at `:72-73`; see [`../core/thread_pool.md`](../core/thread_pool.md)) and `iora::core::TimerService` (`core/timer.hpp:282`, see [`../core/timer.md`](../core/timer.md)). Downstream, iora_sip implements it in several layers (for example `TransactionManager`, `SipTimingWheelAdapter`, `TimerServiceAdapter`, `RegistrationManagerLifecycleWrapper`).
+This guide covers `iora::common::ILifecycleManaged`, the abstract interface for components that support graceful drain, stop, and restart, together with its value types `LifecycleState`, `DrainStats`, `LifecycleResult` and the helper `lifecycleStateToString`. The two in-tree implementers are `iora::core::ThreadPool` (the alias `using ThreadPool = ThreadPoolT<false>`, `core/thread_pool.hpp:1631`; class template at `:94-95`; see [`../core/thread_pool.md`](../core/thread_pool.md)) and `iora::core::TimerService` (`core/timer.hpp:282`, see [`../core/timer.md`](../core/timer.md)). Downstream, iora_sip implements it in several layers (for example `TransactionManager`, `SipTimingWheelAdapter`, `TimerServiceAdapter`, `RegistrationManagerLifecycleWrapper`).
 
 **Document scope.** This guide uses the sanctioned lite variant of the Architecture & Programmer's Guide template: the header is a pure interface plus three plain value types, with no implementation, no configuration, and no threading of its own, so System Architecture, Call Flow, and Configuration Reference do not apply. The behavior of each transition lives in the implementers' guides; this guide states the contract and where the implementers differ.
 
@@ -22,6 +22,7 @@ This guide covers `iora::common::ILifecycleManaged`, the abstract interface for 
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-24 | Initial guide, authored against source. Header comments corrected in the same change: `start()` restarts from `Reset` directly to `Running` (no transition back to `Created`); `stop()` is valid from `Running` or `Draining`; the state after a drain timeout is implementer-defined; the in-flight definitions now describe what each implementer actually counts; the iora_sip-specific examples (SIP CANCEL/500, Transaction Layer) were replaced with layer-neutral wording. `lifecycleStateToString` is now `noexcept`. Implementer defects found while writing this guide are tracked in coding_trackers `tasks/iora/backlog/2026-09-24-5_timerservice-concurrent-lifecycle-transitions_P0.json`, `2026-09-24-6_threadpool-lifecycle-gaps_P0.json` and `2026-09-24-7_lifecycle-state-single-source-enumerators_P1.json`. |
+| 1.1 | 2026-10-17 | Synced to the ThreadPool lifecycle hardening (tracker `2026-09-24-6`): ThreadPool now refuses transitions and `shutdown()` called from its own workers, fails fast when destroyed from one of them, serializes `shutdown()` with the transitions (and publishes `Stopped`), rejects a task enqueued behind a completed drain, and rolls back a failed `start()` to `Reset`. Updated the implementer table, the Do-NOT list, the Thread Safety Model, the method summary and the Known Limitations; refreshed `thread_pool.hpp` line citations. |
 
 ---
 
@@ -61,20 +62,20 @@ The interface does not enforce transitions; each implementer guards its own. Ver
 
 | Aspect | `ThreadPool` | `TimerService` |
 |---|---|---|
-| State after construction | `Running` (the constructor starts workers, `thread_pool.hpp:183`) | `Running` (the constructor calls `initialize()`, which sets `Running`, `timer.hpp:1096`) |
+| State after construction | `Running` (the constructor starts workers, `thread_pool.hpp:205`) | `Running` (the constructor calls `initialize()`, which sets `Running`, `timer.hpp:1096`) |
 | `start()` from `Running` or `Created` | success, "Already running" (`:421-438`) | success, "Already running" (`timer.hpp:630-646`) |
-| `start()` from `Reset` | restarts to `Running` (`:440-455`) | restarts to `Running` (`:648-652`) |
-| `drain()` valid from | `Running` only (`:483`) | `Running` only (CAS, `:681`) |
-| `drain(0)` | waits up to **one hour** (`:500`) | waits with no deadline (`:805-807`) |
-| State after a drain **timeout** | stays `Draining`, `success == false` (`:515`); `drain()` cannot be retried from `Draining` (`:483`) | back to `Running` (CAS `Draining -> Running`, `:850-859`) if the run loop had not exited when the timeout was observed and no concurrent `stop()` moved the state on; otherwise it stays where it is |
-| `stop()` valid from | `Running` or `Draining` (`:543`) | anything except `Stopped`/`Reset` (`:888`) |
-| `stop()` from `Running` | drains first with a fixed **30 s** budget (`:555`) | drains first with a fixed **5 s** budget (`:897`) |
-| `stop()` from `Draining` | **no wait**: if anything is still in flight it force-detaches immediately (`:552-576`) | proceeds to stop |
-| `stop()` when work is still in flight | force-detaches the workers and returns `success == false`, `Stopped`; the pool is then **terminally detached**: `start()`, `stop()` and `reset()` refuse from then on (`:562-576`, `refuseIfDetached` `:708`) | proceeds (from `Running`, after logging a warning that its drain failed) to join its run-loop thread, which waits for any executing callback **without a bound**; the loop's final pass still fires timers already due, and timers not yet due are abandoned; returns `success == true` (`:895-920`) |
+| `start()` from `Reset` | restarts to `Running`; on a worker-spawn failure it joins the spawned workers, stays `Reset` and rethrows (`:440-463`) | restarts to `Running` (`:648-652`) |
+| `drain()` valid from | `Running` only (`:495`) | `Running` only (CAS, `:681`) |
+| `drain(0)` | waits up to **one hour** (`:512-513`) | waits with no deadline (`:805-807`) |
+| State after a drain **timeout** | stays `Draining`, `success == false` (`:527`); `drain()` cannot be retried from `Draining` (`:495`) | back to `Running` (CAS `Draining -> Running`, `:850-859`) if the run loop had not exited when the timeout was observed and no concurrent `stop()` moved the state on; otherwise it stays where it is |
+| `stop()` valid from | `Running` or `Draining` (`:559`) | anything except `Stopped`/`Reset` (`:888`) |
+| `stop()` from `Running` | drains first with a fixed **30 s** budget (`:571`) | drains first with a fixed **5 s** budget (`:897`) |
+| `stop()` from `Draining` | **no wait**: if anything is still in flight it force-detaches immediately (`:568-592`) | proceeds to stop |
+| `stop()` when work is still in flight | force-detaches the workers and returns `success == false`, `Stopped`; the pool is then **terminally detached**: `start()`, `stop()` and `reset()` refuse from then on (`:578-592`, `refuseIfDetached` `:823`) | proceeds (from `Running`, after logging a warning that its drain failed) to join its run-loop thread, which waits for any executing callback **without a bound**; the loop's final pass still fires timers already due, and timers not yet due are abandoned; returns `success == true` (`:895-920`) |
 | Resources after `stop()` | kept (released by `reset()`) | **released**: `stop()` calls `cleanup()`, which closes its epoll/timer/event fds (`:916`, `:1130-1147`) -- contrary to the contract |
 | `reset()` valid from | `Stopped` only (`:603`); refused if terminally detached | `Stopped` only (`:938`) |
 
-In practice `Created` is never observed on either implementer: both constructors go straight to `Running`. `getState()` reads an atomic and `getInFlightCount()` is a snapshot taken under the component's mutex (ThreadPool: queued + busy tasks, `thread_pool.hpp:650-655`; TimerService: non-cancelled timer records, `timer.hpp:971-992`), both safe to call from any thread while a transition is in progress.
+In practice `Created` is never observed on either implementer: both constructors go straight to `Running`. `getState()` reads an atomic and `getInFlightCount()` is a snapshot taken under the component's mutex (ThreadPool: queued + busy tasks, `thread_pool.hpp:682-687`; TimerService: non-cancelled timer records, `timer.hpp:971-992`), both safe to call from any thread while a transition is in progress.
 
 ### `DrainStats` semantics
 
@@ -180,8 +181,8 @@ private:
 **Anti-patterns.**
 - Do NOT assume `drain(0)` is unbounded on every implementer; `ThreadPool` caps it at one hour. Pass an explicit timeout when the bound matters.
 - Do NOT assume a timed-out `drain()` leaves the component in `Draining`; `TimerService` normally returns to `Running` and keeps accepting work. Read `newState`.
-- Do NOT call a transition -- or `ThreadPool::shutdown()`, or drop the component's last owner -- from the component's own thread (a `ThreadPool` task, a `TimerService` callback). Both implementers then wait on, or join, the calling thread itself: outcomes range from a 30 s / 5 s stall to a forced detach, a permanent `drain(0)` deadlock, or `std::terminate`. See "Known implementer gaps" below.
-- Do NOT call transitions of one component concurrently from several threads unless its guide says they are serialized: `ThreadPool` serializes them (but not against `shutdown()`), `TimerService` does not. See the Thread Safety Model.
+- Do NOT call a transition -- or `ThreadPool::shutdown()`, or drop the component's last owner -- from the component's own thread (a `ThreadPool` task or its `onTaskError` handler, a `TimerService` callback). `ThreadPool` refuses such a transition (a failed `LifecycleResult`, "... called from one of this pool's own workers; refused"), ignores such a `shutdown()` with a logged error, and calls `std::terminate()` with a fatal message if its last owner is dropped on one of its workers. `TimerService` still waits on, or joins, the calling thread: outcomes range from a 5 s stall to a permanent `drain(0)` deadlock or `std::terminate`. See "Known implementer gaps" below.
+- Do NOT call transitions of one component concurrently from several threads unless its guide says they are serialized: `ThreadPool` serializes them (and `shutdown()` with them), `TimerService` does not. See the Thread Safety Model.
 - Do NOT treat a failed `LifecycleResult` as an exception-free "no-op": read `newState`, which reports the state the component is actually in (for example `drain()` from the wrong state returns `success == false` with the unchanged current state).
 - Do NOT declare a different default for `drain`'s `timeoutMs` in an override. Default arguments on virtual functions bind to the static type, so `base.drain()` and `derived.drain()` would use different values. Both in-tree implementers repeat `30000`.
 - Do NOT call `reset()` expecting it to stop a running component; both implementers reject it unless the state is `Stopped`.
@@ -192,9 +193,9 @@ private:
 
 The header itself has no state and no synchronization. The contract comment says "all methods are thread-safe unless documented otherwise" (`i_lifecycle_managed.hpp:78`): it is the implementer's obligation. `getState()` and `getInFlightCount()` are safe from any thread on both implementers (an atomic load, and a snapshot under the component's mutex). The transitions differ:
 
-- **ThreadPool** serializes `start`/`drain`/`stop`/`reset` under `_lifecycleMutex` (lock order `_lifecycleMutex -> _mutex`), so a transition blocks while another is in progress: a `stop()` meant to abort a stuck `drain()` waits until that drain returns (up to its timeout, one hour for `0`). The public `ThreadPool::shutdown()` and the destructor are **not** part of that serialization. Do not call `shutdown()` concurrently with another `shutdown()`, the destructor, or a transition: a `shutdown()` that returns because shutdown is already in progress does not mean the workers have exited (TP-6).
+- **ThreadPool** serializes `start`/`drain`/`stop`/`reset` and the public `shutdown()` under `_lifecycleMutex` (lock order `_lifecycleMutex -> _mutex`), so a call blocks while another is in progress: a `stop()` meant to abort a stuck `drain()` waits until that drain returns (up to its timeout, one hour for `0`), and every call waits behind a `shutdown()` that is joining a stuck task (without a bound). A `shutdown()` returns only after every worker thread has been joined. Each of these entry points first refuses a caller that is one of the pool's own workers, before locking, so a pool task can never wait on that lock. The destructor is not serialized: destroying a pool while another thread still uses it is the caller's undefined behavior.
 - **TimerService** has no lifecycle mutex. Only `drain()` gates its state change on a compare-and-swap (`timer.hpp:681`); `stop()`'s compare-and-swap on `_running` (`:906`) merely picks which caller joins and cleans up, and a losing concurrent `stop()` reports `Stopped` before that teardown has finished (TS-2); `start()` and `reset()` are unguarded (TS-1). Concurrent transitions are therefore **not** safe today: call its transitions from one thread. Its `stop()` and destructor join the run-loop thread without a bound (TS-8).
-- **ThreadPool's `stop()` normally force-detaches rather than hanging, but it is not strictly bounded:** it first waits for any transition in progress (up to an hour behind `drain(0)`), and a task admitted after its drain (TP-9) is joined without a bound. Its destructor and `shutdown()` join without a bound when a task is stuck (in `IMMEDIATE` mode; `DETACHED` mode detaches). After a forced detach the destructor does **not** wait for the detached workers, which still reference the pool: destroying the pool while a stuck task is still running is undefined behavior (see [`../core/thread_pool.md`](../core/thread_pool.md); tracked in `tasks/iora/backlog/2026-09-10-8_threadpool-detached-worker-shared-control-block-teardown_P2.json`). Keep such a pool alive.
+- **ThreadPool's `stop()` normally force-detaches rather than hanging, but it is not strictly bounded:** it first waits for any transition in progress (up to an hour behind `drain(0)`). Its destructor and `shutdown()` join without a bound when a task is stuck (in `IMMEDIATE` mode; `DETACHED` mode detaches). After a forced detach the destructor does **not** wait for the detached workers, which still reference the pool: destroying the pool while a stuck task is still running is undefined behavior (see [`../core/thread_pool.md`](../core/thread_pool.md); tracked in `tasks/iora/backlog/2026-09-10-8_threadpool-detached-worker-shared-control-block-teardown_P2.json`). Keep such a pool alive.
 
 `LifecycleResult` and `DrainStats` are plain value types returned by copy, so a result can be passed between threads freely.
 
@@ -260,7 +261,7 @@ inline const char *lifecycleStateToString(LifecycleState state) noexcept;
 
 | Member | Notes |
 |---|---|
-| `start()` | `Created`/`Reset` -> `Running`; may throw: `ThreadPool` on a worker-spawn failure, `TimerService` on a thread-creation `std::system_error` (it returns a failed result for its own `TimerException`) |
+| `start()` | `Created`/`Reset` -> `Running`; may throw: `ThreadPool` on a worker-spawn failure (after rolling back to `Reset`), `TimerService` on a thread-creation `std::system_error` (it returns a failed result for its own `TimerException`) |
 | `drain(timeoutMs)` | `Running` -> `Draining`; blocks; `0` = no timeout per the contract (ThreadPool caps at one hour); state after a timeout is implementer-defined |
 | `stop()` | `Running`/`Draining` -> `Stopped`; exits loops/threads; keeps resources per the contract (TimerService releases its fds) |
 | `reset()` | `Stopped` -> `Reset`; releases resources |
@@ -289,9 +290,9 @@ inline const char *lifecycleStateToString(LifecycleState state) noexcept;
 
 - **The state machine is not enforced by the interface.** Each implementer checks its own preconditions and outcomes, and they differ (see the implementer table).
 - **Known implementer gaps.** The implementers do not fully meet this contract today. The defects are tracked, and the implementer guides ([`../core/thread_pool.md`](../core/thread_pool.md), [`../core/timer.md`](../core/timer.md)) own their details:
-  - ThreadPool -- `tasks/iora/backlog/2026-09-24-6_threadpool-lifecycle-gaps_P0.json` (TP-1..TP-11): transitions, `shutdown()` or destruction from its own task (self-wait, forced detach, `std::terminate`); `shutdown()` not serialized with the transitions; a task admitted after a successful `drain()`; no grace for `stop()` from `Draining`; `drain(0)` capped at one hour and a sleep-summed budget; `timeoutMs` narrowed to `int`; spawn failures during construction or restart.
+  - ThreadPool -- the gaps tracked in `tasks/iora/ongoing/2026-09-24-6_threadpool-lifecycle-gaps_P0.json` are fixed, with two deliberate outcomes kept: `stop()` from `Draining` still gives no extra grace (intended; see the implementer table), and destroying the pool from one of its own workers terminates the process instead of being supported (real support is tracked in `tasks/iora/backlog/2026-09-10-8_threadpool-detached-worker-shared-control-block-teardown_P2.json`).
   - TimerService -- `tasks/iora/backlog/2026-09-24-5_timerservice-concurrent-lifecycle-transitions_P0.json` (TS-1..TS-9) and `tasks/iora/ongoing/2026-09-13-5_timerservice-stop-join-on-self_P0.json`: concurrent transitions; `stop()` releasing resources; `drain(0)` from a callback deadlocking; `stop()` or destruction from a callback self-joining; fd leaks on `initialize()` failures; `reset()` recycling timer IDs; the unbounded join in `stop()`; a drain-timeout restore that is not atomic with the run-loop-exit check.
-- **ThreadPool can become terminally detached.** A `stop()` that cannot quiesce force-detaches its workers; the pool can never be restarted (`thread_pool.hpp:562-576`, `:708`), and it must not be destroyed while the detached task is still running (undefined behavior; see the Thread Safety Model).
+- **ThreadPool can become terminally detached.** A `stop()` that cannot quiesce force-detaches its workers; the pool can never be restarted (`thread_pool.hpp:578-592`, `:823`), and it must not be destroyed while the detached task is still running (undefined behavior; see the Thread Safety Model).
 - **Naming.** `LifecycleState::Reset` is named after the action that produces it ("has been reset"), and `LifecycleResult::newState` is the *current* state even when the transition failed and nothing changed.
 - **`Created` is effectively unused.** Both implementers are `Running` on construction, so a caller cannot construct-then-start.
 - **Counts are 32-bit.** `DrainStats` fields and `getInFlightCount()` are `std::uint32_t`; ThreadPool saturates a larger count to the 32-bit maximum.
