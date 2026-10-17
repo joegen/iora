@@ -475,14 +475,14 @@ private:
     // getInFlightCount()==0 gate (queue depth + _busyThreads under one lock) --
     // never a two-sample (_activeThreads then a separate getPendingTaskCount())
     // read, which admits the pop->++_activeThreads TOCTOU this task fixes.
-    const int maxWaitMs = (timeoutMs == 0) ? 3600000 : static_cast<int>(timeoutMs); // 1 hour if 0
-    bool timedOut = !waitForQuiescence(maxWaitMs);
+    const std::chrono::milliseconds maxWait =
+      (timeoutMs == 0) ? std::chrono::hours(1) : std::chrono::milliseconds(timeoutMs);
+    bool timedOut = !waitForQuiescence(maxWait);
 
-    // remaining is another exact read. On the success path _accepting is already
-    // false, so no task can be admitted after quiescence -- remaining stays 0 and
-    // completed == inFlightAtStart. On the timeout path a task admitted after the
-    // inFlightAtStart snapshot can make remaining exceed it, so clamp the
-    // subtraction to avoid a std::uint32_t underflow.
+    // remaining is another exact read. No task can be admitted after the
+    // inFlightAtStart snapshot: the _accepting=false store above is sequenced before
+    // that snapshot's _mutex acquire, and enqueue re-checks _accepting under _mutex.
+    // So remaining <= inFlightAtStart on both paths; the clamp below is defensive.
     std::uint32_t remaining = getInFlightCount();
     std::uint32_t completed = (inFlightAtStart >= remaining) ? (inFlightAtStart - remaining) : 0;
 
@@ -856,30 +856,31 @@ private:
   }
 
   /// Poll until in-flight work reaches zero or the budget is exhausted. Returns
-  /// true iff quiescent (getInFlightCount()==0) within maxWaitMs. Delegates to the
-  /// accurate single-critical-section getInFlightCount() and never holds _mutex
-  /// across the sleep (getInFlightCount takes and releases it internally).
-  bool waitForQuiescence(int maxWaitMs, int *elapsedMsOut = nullptr)
+  /// true iff quiescent (getInFlightCount()==0) before a steady_clock deadline (so
+  /// time spent waiting for the getInFlightCount() lock counts against the budget).
+  /// Delegates to the accurate single-critical-section getInFlightCount() and never
+  /// holds _mutex across the sleep (getInFlightCount takes and releases it internally).
+  bool waitForQuiescence(std::chrono::milliseconds budget, int *elapsedMsOut = nullptr)
   {
-    int waitMs = 0;
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + budget;
+    bool quiescent = true;
     while (getInFlightCount() != 0)
     {
-      if (waitMs >= maxWaitMs)
+      if (std::chrono::steady_clock::now() >= deadline)
       {
-        if (elapsedMsOut)
-        {
-          *elapsedMsOut = waitMs;
-        }
-        return false;
+        quiescent = false;
+        break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      waitMs += 50;
     }
     if (elapsedMsOut)
     {
-      *elapsedMsOut = waitMs;
+      *elapsedMsOut = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count());
     }
-    return true;
+    return quiescent;
   }
 
   /// Shutdown body; the caller MUST hold _lifecycleMutex (public shutdown() and
@@ -908,7 +909,7 @@ private:
     // (queue depth + _busyThreads under one lock); with that primary predicate the
     // former P0-3 "sleep 10ms then re-check" race window is redundant and has been
     // removed. shutdown()'s join below is safe by construction.
-    if (setByThisCall && !waitForQuiescence(5000))
+    if (setByThisCall && !waitForQuiescence(std::chrono::milliseconds(5000)))
     {
       iora::core::Logger::warning("ThreadPool::shutdown() - Task completion timeout after "
                                   "5000ms - proceeding anyway");
@@ -1001,9 +1002,21 @@ private:
       throw std::runtime_error("ThreadPool is draining and not accepting new work");
     }
 
+    if constexpr (EnableTestSeam)
+    {
+      parkIfArmed(detail::ThreadPoolTestPark::ADMISSION);
+    }
+
     bool shouldSpawn = false;
     {
       std::unique_lock<std::mutex> lock(_mutex);
+      // Re-check under _mutex: drainImpl stores _accepting=false before its first
+      // _mutex acquire, so an enqueuer that passed the lock-free check above but
+      // locks after that point cannot admit a task behind a completed drain.
+      if (!_accepting.load(std::memory_order_acquire))
+      {
+        throw std::runtime_error("ThreadPool is draining and not accepting new work");
+      }
       if (_shutdown)
       {
         throw std::runtime_error("ThreadPool is shutting down");
@@ -1048,9 +1061,19 @@ private:
       return false; // Draining, reject task
     }
 
+    if constexpr (EnableTestSeam)
+    {
+      parkIfArmed(detail::ThreadPoolTestPark::ADMISSION);
+    }
+
     bool shouldSpawn = false;
     {
       std::unique_lock<std::mutex> lock(_mutex);
+      // Re-check under _mutex (see enqueueImpl).
+      if (!_accepting.load(std::memory_order_acquire))
+      {
+        return false; // Draining, reject task
+      }
       if (_shutdown)
       {
         return false; // Shutting down, reject task
@@ -1357,7 +1380,7 @@ private:
     // read via waitForQuiescence (never a two-sample check). The finalActive/
     // finalPending fields on timeout are diagnostic only.
     int elapsedMs = 0;
-    if (waitForQuiescence(5000, &elapsedMs))
+    if (waitForQuiescence(std::chrono::milliseconds(5000), &elapsedMs))
     {
       result.finalActiveCount = 0;
       result.finalPendingCount = 0;

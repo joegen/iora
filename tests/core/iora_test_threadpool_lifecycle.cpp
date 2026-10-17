@@ -10,6 +10,7 @@
 #include <iora/core/thread_pool.hpp>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1154,6 +1155,82 @@ TEST_CASE("ThreadPool shutdown: serialized with stop()",
   REQUIRE(pool.getState() == LifecycleState::Stopped);
   REQUIRE(pool.reset().success == true);
   REQUIRE(pool.start().success == true);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: no task is admitted behind a completed drain (task 3.2, TP-9). The
+// ADMISSION park holds an enqueuer after its lock-free _accepting check and
+// before it takes _mutex. Before: it then pushed the task into a Draining pool
+// whose drain() had already reported success.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool admission: no task admitted behind a completed drain",
+          "[threadpool][lifecycle][drain][admission]")
+{
+  for (const bool useTry : {false, true})
+  {
+    INFO((useTry ? "tryEnqueue" : "enqueue"));
+    ThreadPoolT<true> pool(1, 1);
+    pool.testParkArm(detail::ThreadPoolTestPark::ADMISSION);
+
+    std::atomic<bool> rejected{false};
+    std::thread enqueuer(
+      [&]()
+      {
+        if (useTry)
+        {
+          rejected.store(!pool.tryEnqueue([]() {}));
+          return;
+        }
+        try
+        {
+          pool.enqueue([]() {});
+        }
+        catch (const std::runtime_error &)
+        {
+          rejected.store(true);
+        }
+      });
+    struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{enqueuer};
+    ParkReleaser releaser{pool, detail::ThreadPoolTestPark::ADMISSION};
+
+    REQUIRE(iora::test::waitFor(
+      [&]() { return pool.testParkParked(detail::ThreadPoolTestPark::ADMISSION); },
+      std::chrono::seconds(2)));
+    REQUIRE(pool.drain(1000).success == true);
+
+    pool.testParkRelease(detail::ThreadPoolTestPark::ADMISSION);
+    enqueuer.join();
+
+    REQUIRE(rejected.load() == true);
+    REQUIRE(pool.getInFlightCount() == 0);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: a drain timeout above INT_MAX ms still waits (task 4.1, TP-3). Before:
+// static_cast<int>(UINT32_MAX) was -1, so drain() timed out at once whenever a
+// task was in flight.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool drain: a timeout above INT_MAX waits for the task",
+          "[threadpool][lifecycle][drain][timeout]")
+{
+  ThreadPoolT<true> pool(1, 1);
+  pool.testSeamArm();
+  pool.enqueue([]() {});
+  REQUIRE(iora::test::waitFor([&]() { return pool.testSeamParked(); }, std::chrono::seconds(2)));
+
+  std::thread releaser(
+    [&]()
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      pool.testSeamRelease();
+    });
+  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{releaser};
+
+  auto result = pool.drain(std::numeric_limits<std::uint32_t>::max());
+  REQUIRE(result.success == true);
 }
 
 TEST_CASE("lifecycleStateToString names every state", "[lifecycle]")
