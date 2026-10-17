@@ -781,8 +781,8 @@ public:
   /// delays every load, unload and SafeApiFunction call; a callee that hands work
   /// to another thread which needs _loadModulesMutex (a load/unload, a non-owner
   /// isModuleLoaded, a SafeApiFunction call) and waits for it deadlocks. So an
-  /// export can run under _loadModulesMutex whenever any plugin's hook calls it
-  /// (see isModuleLoaded).
+  /// export can run under _loadModulesMutex whenever code that runs under that
+  /// lock calls it, directly or through further calls (see isModuleLoaded).
   ///
   /// \note The return type MUST be HOST-OWNED. C++17 guaranteed copy elision
   /// materializes the returned object in the CALLER's frame, so a return type
@@ -1115,11 +1115,13 @@ public:
 
   /// \brief Check if a module is currently loaded
   /// \note Caller constraint: off the loader-lock thread this takes
-  /// _loadModulesMutex. Do not call it while holding a lock that plugin code may
-  /// take while _loadModulesMutex is held: a plugin's constructor, destructor and
-  /// lifecycle hooks, destructors of objects it handed to the host (export, route,
-  /// handler captures; registered services), and its exports when any plugin's
-  /// hook calls them. That thread waits for your lock while you wait for
+  /// _loadModulesMutex. Do not call it while holding a lock that any code run
+  /// under _loadModulesMutex may take: the code the loader calls (a .so's static
+  /// initializers and destructors; a plugin's constructor, destructor and
+  /// lifecycle hooks; destructors of objects it handed to the host: export,
+  /// route and handler captures, registered services) and everything that code
+  /// calls in turn (any plugin's exports, service objects, code behind a returned
+  /// reference). That thread waits for your lock while you wait for
   /// _loadModulesMutex. Full rule: docs/iora_service.md, Known Limitations TS-M-6.
   bool isModuleLoaded(const std::string &moduleName) const
   {
