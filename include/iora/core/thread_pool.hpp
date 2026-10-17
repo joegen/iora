@@ -56,6 +56,7 @@ struct ThreadPoolTestSeam
   std::atomic<bool> armed{false};    ///< One-shot: park the next worker at the seam.
   std::atomic<bool> parked{false};   ///< A worker is currently parked at the seam.
   std::atomic<bool> release{false};  ///< Release the parked worker.
+  std::atomic<std::size_t> idleWaitEntries{0};  ///< Times a worker entered the idle wait.
 };
 } // namespace detail
 
@@ -298,6 +299,12 @@ public:
   /// Call this explicitly before destroying the pool to ensure clean shutdown.
   void shutdown()
   {
+    if (isOnPoolThread())
+    {
+      iora::core::Logger::error("ThreadPool::shutdown() called from one of this pool's own "
+                                "workers; refused (a worker cannot join itself)");
+      return;
+    }
     iora::core::Logger::debug("ThreadPool::shutdown() - Starting explicit shutdown");
     {
       std::unique_lock<std::mutex> lock(_mutex);
@@ -403,11 +410,18 @@ public:
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
 
+    if (auto refusal = refuseIfOnPoolThread("start"))
+    {
+      return *refusal;
+    }
+
     // Serialize lifecycle transitions: start/drain/stop/reset take _lifecycleMutex
     // for their whole body, so concurrent callers cannot interleave check-then-act
     // on _lifecycleState (e.g. two start()s both spawning _initialSize workers).
-    // Lock order is ALWAYS _lifecycleMutex -> _mutex; workers never take
-    // _lifecycleMutex, so drain's quiescence wait cannot deadlock against them.
+    // Lock order is ALWAYS _lifecycleMutex -> _mutex. Workers never take
+    // _lifecycleMutex: a task body that calls a transition is refused by the
+    // refuseIfOnPoolThread() guard BEFORE the lock, so drain's quiescence wait (and
+    // shutdown's join) cannot deadlock against a worker waiting on the lock.
     std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
 
     auto currentState = _lifecycleState.load(std::memory_order_acquire);
@@ -465,6 +479,10 @@ public:
   /// @return Result with drain statistics.
   iora::common::LifecycleResult drain(std::uint32_t timeoutMs = 30000) override
   {
+    if (auto refusal = refuseIfOnPoolThread("drain"))
+    {
+      return *refusal;
+    }
     std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
     return drainImpl(timeoutMs);
   }
@@ -530,6 +548,10 @@ public:
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
 
+    if (auto refusal = refuseIfOnPoolThread("stop"))
+    {
+      return *refusal;
+    }
     std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
 
     auto currentState = _lifecycleState.load(std::memory_order_acquire);
@@ -590,6 +612,10 @@ public:
     using iora::common::LifecycleState;
     using iora::common::LifecycleResult;
 
+    if (auto refusal = refuseIfOnPoolThread("reset"))
+    {
+      return *refusal;
+    }
     std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
 
     auto currentState = _lifecycleState.load(std::memory_order_acquire);
@@ -700,7 +726,51 @@ public:
     return false;
   }
 
+  /// True when called on one of this pool's own workers. Test-only (always false
+  /// in production builds of the accessor).
+  bool testIsOnPoolThread() const
+  {
+    if constexpr (EnableTestSeam)
+    {
+      return isOnPoolThread();
+    }
+    return false;
+  }
+
+  /// Number of times any worker has entered the idle wait. Test-only (always 0 in
+  /// production): lets the idle-floor test prove a worker blocks instead of spinning.
+  std::size_t testIdleWaitEntries() const
+  {
+    if constexpr (EnableTestSeam)
+    {
+      return seam().idleWaitEntries.load(std::memory_order_acquire);
+    }
+    return 0;
+  }
+
 private:
+  /// True when the caller is one of this pool's own workers (stamped by each worker
+  /// at entry, erased on every exit path). Takes _mutex: never call with _mutex held.
+  bool isOnPoolThread() const
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _workerIds.count(std::this_thread::get_id()) != 0;
+  }
+
+  /// Guard that runs FIRST in every lifecycle transition, before _lifecycleMutex: a
+  /// task running on this pool must not drive the pool's own lifecycle (it would wait
+  /// on itself). Returns the refusal for `verb`, or std::nullopt for an outside caller.
+  std::optional<iora::common::LifecycleResult> refuseIfOnPoolThread(const char *verb) const
+  {
+    if (isOnPoolThread())
+    {
+      return iora::common::LifecycleResult(
+        false, getState(),
+        std::string(verb) + "() called from one of this pool's own workers; refused");
+    }
+    return std::nullopt;
+  }
+
   /// Shared lifecycle guard: if a forced stop left the pool terminally detached,
   /// return the standard refusal for `verb`; otherwise std::nullopt. Callers hold
   /// _lifecycleMutex.
@@ -834,13 +904,15 @@ private:
       }
     } // Release mutex here
 
+    // Notify BEFORE spawning: the task is already committed, and floor workers wait
+    // without a timeout, so a spawnWorker() that throws must not skip the wakeup.
+    _condition.notify_one();
+
     // Spawn outside of the lock to avoid deadlock
     if (shouldSpawn)
     {
       spawnWorker();
     }
-
-    _condition.notify_one();
   }
 
   bool tryEnqueueImpl(std::function<void()> f)
@@ -873,13 +945,14 @@ private:
       }
     } // Release mutex here
 
+    // Notify BEFORE spawning (see enqueueImpl).
+    _condition.notify_one();
+
     // Spawn outside of the lock to avoid deadlock
     if (shouldSpawn)
     {
       spawnWorker();
     }
-
-    _condition.notify_one();
     return true;
   }
 
@@ -890,6 +963,13 @@ private:
       {
         // Lifecycle tracking: thread created
         _threadsCreated.fetch_add(1, std::memory_order_relaxed);
+
+        // Stamp this worker's identity before it can run any task, so a task on it
+        // always sees isOnPoolThread()==true. Erased on both exit paths below.
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          _workerIds.insert(std::this_thread::get_id());
+        }
 
         while (true)
         {
@@ -902,8 +982,28 @@ private:
             // all threads have exited wait_for() and avoid destroying
             // condition_variable while threads are still waiting inside it.
             _waitingThreads.fetch_add(1, std::memory_order_relaxed);
-            bool waitResult = _condition.wait_for(lock, _idleTimeout,
-                                     [this]() { return _shutdown || !_tasks.empty(); });
+            if constexpr (EnableTestSeam)
+            {
+              seam().idleWaitEntries.fetch_add(1, std::memory_order_relaxed);
+            }
+            // At or below the floor this worker can never idle-exit, so it waits
+            // without a timeout: a timed wait here would wake every _idleTimeout
+            // (and spin at 100% CPU when _idleTimeout is 0). Re-evaluated on every
+            // pass, so a worker that loses the exit CAS below lands here.
+            const bool atFloor =
+              static_cast<std::size_t>(_threadsCreated.load(std::memory_order_acquire) -
+                                       _threadsExited.load(std::memory_order_acquire)) <=
+              _initialSize;
+            const auto ready = [this]() { return _shutdown || !_tasks.empty(); };
+            bool waitResult = true;
+            if (atFloor)
+            {
+              _condition.wait(lock, ready);
+            }
+            else
+            {
+              waitResult = _condition.wait_for(lock, _idleTimeout, ready);
+            }
             _waitingThreads.fetch_sub(1, std::memory_order_relaxed);
 
             if (!waitResult)
@@ -947,6 +1047,7 @@ private:
                 // Clean up our entry in the _threads map
                 // We already hold _mutex from the unique_lock above
                 auto myId = std::this_thread::get_id();
+                _workerIds.erase(myId);
                 auto it = _threads.find(myId);
                 if (it != _threads.end())
                 {
@@ -966,6 +1067,7 @@ private:
 
             if (_shutdown && _tasks.empty())
             {
+              _workerIds.erase(std::this_thread::get_id());
               _threadsExited.fetch_add(1, std::memory_order_relaxed);
               return;
             }
@@ -1233,6 +1335,9 @@ private:
 
 private:
   std::unordered_map<std::thread::id, std::thread> _threads;
+  // Ids of workers currently inside their lambda (guarded by _mutex). Stamped by the
+  // worker itself, so unlike _threads it is never ahead of or behind the thread.
+  std::unordered_set<std::thread::id> _workerIds;
   std::queue<std::function<void()>> _tasks;
   mutable std::mutex _mutex;
   std::condition_variable _condition;

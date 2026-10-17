@@ -560,6 +560,13 @@ endif()
 if(IORA_BUILD_NETWORK_TESTS AND TEST network::iora_test_http_server_owner_removal)
     set_tests_properties(network::iora_test_http_server_owner_removal PROPERTIES TIMEOUT 120)
 endif()
+
+# The ThreadPool lifecycle tests (tracker 2026-09-24-6) drive transitions from pool
+# workers and race shutdown() against stop()/reset(); a self-deadlock or a hang
+# regression must FAIL via this TIMEOUT rather than wedge the suite.
+if(IORA_BUILD_CORE_TESTS AND TEST core::iora_test_threadpool_lifecycle)
+    set_tests_properties(core::iora_test_threadpool_lifecycle PROPERTIES TIMEOUT 120)
+endif()
 if(IORA_BUILD_SERVICE_TESTS AND TEST service::iora_test_plugin_callback_lifecycle)
     set_tests_properties(service::iora_test_plugin_callback_lifecycle PROPERTIES TIMEOUT 120)
 endif()
@@ -722,6 +729,13 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_jsonrpc_gzip_response
     # task-6.5: inherited pool concurrency suite (created above, before this loop).
     iora_test_jsonrpc_client_pool
+
+    # ThreadPool lifecycle hardening (tracker 2026-09-24-6): worker-id set, guard-
+    # before-lock, serialized shutdown(), spawn-after-reap and idle-floor waits are
+    # cross-thread properties only TSan/ASan can prove clean.
+    iora_test_threadpool
+    iora_test_threadpool_cleanup
+    iora_test_threadpool_lifecycle
 )
 foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
     if(TARGET ${_san_target})

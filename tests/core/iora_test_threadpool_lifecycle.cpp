@@ -11,8 +11,11 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace iora::core;
 using namespace iora::common;
@@ -758,6 +761,205 @@ TEST_CASE("ThreadPool lifecycle: concurrent start() from Reset does not over-spa
     // The discriminator: exactly kInitial workers, not up to kThreads * kInitial.
     REQUIRE(pool.getTotalThreadCount() == kInitial);
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: worker identity (tracker 2026-09-24-6, task 1.1). Each worker stamps
+// its own id at entry and erases it on exit, so a task -- and the onTaskError
+// handler, which also runs on the worker -- sees testIsOnPoolThread()==true,
+// an outside thread sees false, and a task of pool A asking pool B sees false.
+// ══════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+constexpr const char *kRefusedText = "own workers; refused";
+
+bool messageRefused(const LifecycleResult &r)
+{
+  return r.message.find(kRefusedText) != std::string::npos;
+}
+} // namespace
+
+TEST_CASE("ThreadPool worker identity: task handler restart and other pool",
+          "[threadpool][lifecycle][identity]")
+{
+  ThreadPoolT<true> *poolPtr = nullptr;
+  std::promise<bool> handlerSaw;
+  auto handlerFuture = handlerSaw.get_future();
+  ThreadPoolT<true> pool(2, 2, std::chrono::seconds(30), 64,
+                         [&](std::exception_ptr)
+                         { handlerSaw.set_value(poolPtr->testIsOnPoolThread()); });
+  poolPtr = &pool;
+
+  REQUIRE(pool.testIsOnPoolThread() == false);
+
+  auto inTask = pool.enqueueWithResult([&]() { return pool.testIsOnPoolThread(); });
+  REQUIRE(inTask.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(inTask.get() == true);
+
+  pool.enqueue([]() { throw std::runtime_error("handler probe"); });
+  REQUIRE(handlerFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(handlerFuture.get() == true);
+
+  ThreadPoolT<true> other(1, 1);
+  auto crossPool = pool.enqueueWithResult([&]() { return other.testIsOnPoolThread(); });
+  REQUIRE(crossPool.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(crossPool.get() == false);
+
+  REQUIRE(pool.stop().success == true);
+  REQUIRE(pool.reset().success == true);
+  REQUIRE(pool.start().success == true);
+  auto afterRestart = pool.enqueueWithResult([&]() { return pool.testIsOnPoolThread(); });
+  REQUIRE(afterRestart.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(afterRestart.get() == true);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: an idle worker at the floor blocks instead of spinning (task 1.2, TP-13).
+// With idleTimeout 0 the old timed wait returned at once and looped back into
+// another wait: thousands of wait entries in 500 ms. The floor worker now enters
+// one untimed wait and stays there.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool idle floor: idleTimeout 0 does not spin",
+          "[threadpool][lifecycle][idle]")
+{
+  ThreadPoolT<true> pool(1, 1, std::chrono::milliseconds(0));
+
+  auto warm = pool.enqueueWithResult([]() { return 1; });
+  REQUIRE(warm.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(iora::test::waitFor([&]() { return pool.testIdleWaitEntries() >= 2; },
+                              std::chrono::seconds(2)));
+
+  const std::size_t before = pool.testIdleWaitEntries();
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  const std::size_t after = pool.testIdleWaitEntries();
+
+  REQUIRE(after - before <= 2);
+
+  auto stillWorks = pool.enqueueWithResult([]() { return 7; });
+  REQUIRE(stillWorks.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(stillWorks.get() == 7);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: a task calling a lifecycle transition on its own pool is refused
+// (task 1.3, TP-1). Before the guard: start() succeeded, drain(t) moved the
+// pool to Draining, stop() force-detached after 30 s, drain(0) blocked for an
+// hour. The refusal text is the only discriminator for reset(), which already
+// refused from Running.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool guard: a task cannot drive its own pool's transitions",
+          "[threadpool][lifecycle][guard]")
+{
+  ThreadPoolT<true> pool(2, 2);
+
+  auto check = [&](const char *verb, auto call)
+  {
+    INFO(verb);
+    auto future = pool.enqueueWithResult(call);
+    REQUIRE(future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+    LifecycleResult r = future.get();
+    REQUIRE(r.success == false);
+    REQUIRE(r.newState == LifecycleState::Running);
+    REQUIRE(messageRefused(r));
+  };
+
+  check("start", [&]() { return pool.start(); });
+  check("drain", [&]() { return pool.drain(1000); });
+  check("drain(0)", [&]() { return pool.drain(0); });
+  check("stop", [&]() { return pool.stop(); });
+  check("reset", [&]() { return pool.reset(); });
+
+  REQUIRE(pool.getState() == LifecycleState::Running);
+  auto stillWorks = pool.enqueueWithResult([]() { return 3; });
+  REQUIRE(stillWorks.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(stillWorks.get() == 3);
+  REQUIRE(pool.stop().success == true);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: shutdown() from one of the pool's own workers is refused (task 1.4,
+// TP-8 shutdown half). Before: the worker joined itself -> std::system_error
+// while unwinding a joinable std::thread -> std::terminate.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool guard: shutdown() from a worker is refused",
+          "[threadpool][lifecycle][guard][shutdown]")
+{
+  auto pool = std::make_unique<ThreadPoolT<true>>(2, 2);
+
+  auto future = pool->enqueueWithResult([&]() { pool->shutdown(); return true; });
+  REQUIRE(future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  REQUIRE(future.get() == true);
+
+  REQUIRE(pool->getState() == LifecycleState::Running);
+  auto stillWorks = pool->enqueueWithResult([]() { return 5; });
+  REQUIRE(stillWorks.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(stillWorks.get() == 5);
+
+  REQUIRE(pool->stop().success == true);
+  pool = nullptr;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test: the guard runs BEFORE _lifecycleMutex (task 1.5). An external stop()
+// holds _lifecycleMutex while its drain waits on a parked worker; a task on the
+// second worker that calls drain()/reset() must be refused at once, not block
+// behind the lock (which would also stall the stop()'s drain on that task).
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool guard: refusal does not wait for _lifecycleMutex",
+          "[threadpool][lifecycle][guard][lock]")
+{
+  ThreadPoolT<true> pool(2, 2);
+
+  pool.testSeamArm();
+  pool.enqueue([]() {});  // task A: parks worker 1 at the seam
+  REQUIRE(iora::test::waitFor([&]() { return pool.testSeamParked(); }, std::chrono::seconds(2)));
+
+  // Task B is enqueued BEFORE stop() (drain stores _accepting=false).
+  auto taskB = pool.enqueueWithResult(
+    [&]()
+    {
+      std::vector<std::pair<LifecycleResult, std::chrono::milliseconds>> out;
+      if (!iora::test::waitFor([&]() { return pool.getState() == LifecycleState::Draining; },
+                               std::chrono::seconds(5)))
+      {
+        return out;
+      }
+      for (int i = 0; i < 2; ++i)
+      {
+        auto t0 = std::chrono::steady_clock::now();
+        LifecycleResult r = (i == 0) ? pool.drain(1000) : pool.reset();
+        out.emplace_back(r, std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - t0));
+      }
+      return out;
+    });
+
+  std::promise<LifecycleResult> stopPromise;
+  auto stopFuture = stopPromise.get_future();
+  std::thread stopper([&]() { stopPromise.set_value(pool.stop()); });
+  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{stopper};
+
+  REQUIRE(taskB.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+  auto results = taskB.get();
+  REQUIRE(results.size() == 2);
+  for (const auto &entry : results)
+  {
+    REQUIRE(entry.first.success == false);
+    REQUIRE(messageRefused(entry.first));
+    REQUIRE(entry.second < std::chrono::milliseconds(1000));
+  }
+
+  pool.testSeamRelease();
+  REQUIRE(stopFuture.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+  auto stopResult = stopFuture.get();
+  REQUIRE(stopResult.success == true);
+  REQUIRE(pool.getState() == LifecycleState::Stopped);
+  REQUIRE(pool.reset().success == true);
 }
 
 TEST_CASE("lifecycleStateToString names every state", "[lifecycle]")
