@@ -567,6 +567,27 @@ endif()
 if(IORA_BUILD_CORE_TESTS AND TEST core::iora_test_threadpool_lifecycle)
     set_tests_properties(core::iora_test_threadpool_lifecycle PROPERTIES TIMEOUT 120)
 endif()
+
+# tracker 2026-09-24-6 task 6.1: a ThreadPool destroyed from its own worker calls
+# std::terminate, so it is a STANDALONE executable (precedent:
+# rpc::jsonrpc_quiesce_selfdestruct), one ctest per argv[1] scenario. The
+# set_terminate handler _Exit(0)s on ANY terminate, so each PASS_REGULAR_EXPRESSION
+# requires the pool's fatal message followed by the scenario stage; FAIL on
+# "FAILURE" (printed when no terminate happens). Not sanitized: it ends in
+# std::terminate by design.
+if(IORA_BUILD_CORE_TESTS)
+    create_iora_test_target(iora_test_threadpool_destructor_on_worker
+        SOURCES core/iora_test_threadpool_destructor_on_worker.cpp)
+    foreach(_scenario immediate-body immediate-capture detached-body detached-capture)
+        add_test(NAME core::threadpool_destructor_on_worker_${_scenario}
+            COMMAND iora_test_threadpool_destructor_on_worker ${_scenario})
+        set_tests_properties(core::threadpool_destructor_on_worker_${_scenario} PROPERTIES
+            TIMEOUT 30
+            PASS_REGULAR_EXPRESSION
+                "ThreadPool destroyed from one of its own workers.*stage=${_scenario}"
+            FAIL_REGULAR_EXPRESSION "FAILURE")
+    endforeach()
+endif()
 if(IORA_BUILD_SERVICE_TESTS AND TEST service::iora_test_plugin_callback_lifecycle)
     set_tests_properties(service::iora_test_plugin_callback_lifecycle PROPERTIES TIMEOUT 120)
 endif()

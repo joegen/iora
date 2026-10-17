@@ -11,6 +11,7 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <future>
@@ -221,6 +222,18 @@ public:
 
   ~ThreadPoolT()
   {
+    // Destroyed from one of its own workers (the last owner dropped inside a task):
+    // the worker would join itself, or (DETACHED) return into a freed pool. No
+    // in-destructor fix is safe, so fail fast with a clear message.
+    if (isOnPoolThread())
+    {
+      // std::fputs, not std::cerr: one diagnostic on the fatal path.
+      std::fputs("fatal: ThreadPool destroyed from one of its own workers (a worker cannot "
+                 "join itself); calling std::terminate()\n",
+                 stderr);
+      std::terminate();
+    }
+
     // Execute shutdown sequence using phased methods
 
     // Phase 1: Signal Shutdown
