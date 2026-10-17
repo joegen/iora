@@ -1377,12 +1377,29 @@ TEST_CASE("ThreadPool spawn failure: the committed task still runs",
   }
 }
 
+// The enumerators are discovered from lifecycleStateToString itself (its switch has
+// no default, so the compiler keeps it complete): a new state or a renamed one
+// changes the probed set and fails this test instead of escaping a hand-written list.
 TEST_CASE("lifecycleStateToString names every state", "[lifecycle]")
 {
-  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Created)) == "Created");
-  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Running)) == "Running");
-  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Draining)) == "Draining");
-  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Stopped)) == "Stopped");
-  REQUIRE(std::string(lifecycleStateToString(LifecycleState::Reset)) == "Reset");
+  const std::vector<std::string> expected{"Created", "Running", "Draining", "Stopped", "Reset"};
+
+  std::vector<int> indices;
+  std::vector<std::string> names;
+  for (int i = 0; i < 64; ++i)
+  {
+    const std::string name = lifecycleStateToString(static_cast<LifecycleState>(i));
+    if (name != "Unknown")
+    {
+      indices.push_back(i);
+      names.push_back(name);
+    }
+  }
+
+  REQUIRE(names == expected);
+  for (std::size_t i = 0; i < indices.size(); ++i)
+  {
+    REQUIRE(indices[i] == static_cast<int>(i));
+  }
   REQUIRE(std::string(lifecycleStateToString(static_cast<LifecycleState>(99))) == "Unknown");
 }

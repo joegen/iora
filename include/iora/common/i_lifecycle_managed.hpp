@@ -177,9 +177,9 @@ inline const char *lifecycleStateToString(LifecycleState state) noexcept
     return "Stopped";
   case LifecycleState::Reset:
     return "Reset";
-  default:
-    return "Unknown";
   }
+  // No default: -Wswitch (with -Werror) makes a missing enumerator a compile error.
+  return "Unknown";
 }
 
 } // namespace common
