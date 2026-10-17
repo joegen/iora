@@ -26,11 +26,10 @@ int main(int argc, char **argv)
     parseTomlConfig(config, configLoader, IORA_INSTALLED_CONFIG_FILE);
 
     // Note: we intentionally do NOT call setConfigLoader() on the pre-init
-    // instance. init() below calls shutdown() which destroyInstance()s any
-    // existing singleton, so a moved-in ConfigLoader would be discarded and
-    // silently recreated by applyConfig() from config.configFile. Let
-    // applyConfig() own the construction — the local configLoader above is
-    // only used to drive parseTomlConfig() above.
+    // instance. applyConfig() builds the ConfigLoader from config.configFile
+    // when none is set, and a loader set before init() is lost if init()
+    // fails. The local configLoader above is only used to drive
+    // parseTomlConfig() above.
     (void)configLoader;
 
     // Initialize the IoraService with command-line arguments
