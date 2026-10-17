@@ -73,7 +73,7 @@ struct ThreadPoolTestSeam
     std::atomic<bool> release{false}; ///< Release the parked thread.
   };
   ParkPoint worker;
-  std::array<ParkPoint, 3> callerParks; ///< Indexed by ThreadPoolTestPark.
+  std::array<ParkPoint, 3> callerParks;        ///< Indexed by ThreadPoolTestPark.
   std::atomic<std::size_t> idleWaitEntries{0}; ///< Times a worker entered the idle wait.
 };
 } // namespace detail
@@ -630,9 +630,8 @@ public:
       // Never clear() over a live thread: destroying a joinable std::thread calls
       // std::terminate, and a still-running worker would touch the reset counters.
       const bool anyJoinable =
-        !_workerIds.empty() ||
-        std::any_of(_threads.begin(), _threads.end(),
-                    [](const auto &entry) { return entry.second.joinable(); });
+        !_workerIds.empty() || std::any_of(_threads.begin(), _threads.end(), [](const auto &entry)
+                                           { return entry.second.joinable(); });
       if (anyJoinable)
       {
         return LifecycleResult(false, currentState,

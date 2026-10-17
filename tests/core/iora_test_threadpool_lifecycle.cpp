@@ -690,7 +690,7 @@ TEST_CASE("ThreadPool lifecycle: stop() on drain timeout detaches and refuses re
   // Two workers: one stuck, one idle at the floor. The idle one waits without a
   // timeout, and nothing below notifies it again, so only forceDetachWorkers()'s
   // notify_all() lets it exit before testWorkersExited() is checked.
-  auto pool = std::make_unique<ThreadPoolT<true>>(2, 2);  // <true>: exposes testWorkersExited()
+  auto pool = std::make_unique<ThreadPoolT<true>>(2, 2); // <true>: exposes testWorkersExited()
 
   // Occupy one worker with a releasable stuck task.
   std::atomic<bool> started{false};
@@ -1008,7 +1008,7 @@ TEST_CASE("ThreadPool guard: refusal does not wait for _lifecycleMutex",
 
   pool.testSeamArm();
   SeamReleaser earlyRelease{pool}; // covers the REQUIREs before the stopper exists
-  pool.enqueue([]() {}); // task A: parks worker 1 at the seam
+  pool.enqueue([]() {});           // task A: parks worker 1 at the seam
   REQUIRE(iora::test::waitFor([&]() { return pool.testSeamParked(); }, std::chrono::seconds(2)));
 
   // Task B is enqueued BEFORE stop() (drain stores _accepting=false).
