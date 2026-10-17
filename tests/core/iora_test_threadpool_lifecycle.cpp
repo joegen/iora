@@ -6,10 +6,10 @@
 #define CATCH_CONFIG_MAIN
 #include "test_helpers.hpp"
 #include <catch2/catch.hpp>
-#include <iora/common/i_lifecycle_managed.hpp>
-#include <iora/core/thread_pool.hpp>
 #include <chrono>
 #include <future>
+#include <iora/common/i_lifecycle_managed.hpp>
+#include <iora/core/thread_pool.hpp>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -796,8 +796,7 @@ TEST_CASE("ThreadPool worker identity: task handler restart and other pool",
   ThreadPoolT<true> *poolPtr = nullptr;
   std::promise<bool> handlerSaw;
   auto handlerFuture = handlerSaw.get_future();
-  ThreadPoolT<true> pool(2, 2, std::chrono::seconds(30), 64,
-                         [&](std::exception_ptr)
+  ThreadPoolT<true> pool(2, 2, std::chrono::seconds(30), 64, [&](std::exception_ptr)
                          { handlerSaw.set_value(poolPtr->testIsOnPoolThread()); });
   poolPtr = &pool;
 
@@ -831,8 +830,7 @@ TEST_CASE("ThreadPool worker identity: task handler restart and other pool",
 // one untimed wait and stays there.
 // ══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ThreadPool idle floor: idleTimeout 0 does not spin",
-          "[threadpool][lifecycle][idle]")
+TEST_CASE("ThreadPool idle floor: idleTimeout 0 does not spin", "[threadpool][lifecycle][idle]")
 {
   ThreadPoolT<true> pool(1, 1, std::chrono::milliseconds(0));
 
@@ -900,7 +898,12 @@ TEST_CASE("ThreadPool guard: shutdown() from a worker is refused",
 {
   auto pool = std::make_unique<ThreadPoolT<true>>(2, 2);
 
-  auto future = pool->enqueueWithResult([&]() { pool->shutdown(); return true; });
+  auto future = pool->enqueueWithResult(
+    [&]()
+    {
+      pool->shutdown();
+      return true;
+    });
   REQUIRE(future.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
   REQUIRE(future.get() == true);
 
@@ -926,7 +929,7 @@ TEST_CASE("ThreadPool guard: refusal does not wait for _lifecycleMutex",
   ThreadPoolT<true> pool(2, 2);
 
   pool.testSeamArm();
-  pool.enqueue([]() {});  // task A: parks worker 1 at the seam
+  pool.enqueue([]() {}); // task A: parks worker 1 at the seam
   REQUIRE(iora::test::waitFor([&]() { return pool.testSeamParked(); }, std::chrono::seconds(2)));
 
   // Task B is enqueued BEFORE stop() (drain stores _accepting=false).
@@ -952,10 +955,22 @@ TEST_CASE("ThreadPool guard: refusal does not wait for _lifecycleMutex",
   std::promise<LifecycleResult> stopPromise;
   auto stopFuture = stopPromise.get_future();
   std::thread stopper([&]() { stopPromise.set_value(pool.stop()); });
-  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{stopper};
+  struct Joiner
+  {
+    std::thread &t;
+    ~Joiner()
+    {
+      if (t.joinable())
+        t.join();
+    }
+  } joiner{stopper};
   // Declared after the joiner so it runs first: a failed REQUIRE releases worker 1
   // before the joiner waits for stop(), whose drain waits on that worker.
-  struct SeamReleaser { ThreadPoolT<true> &p; ~SeamReleaser() { p.testSeamRelease(); } } seamReleaser{pool};
+  struct SeamReleaser
+  {
+    ThreadPoolT<true> &p;
+    ~SeamReleaser() { p.testSeamRelease(); }
+  } seamReleaser{pool};
 
   REQUIRE(taskB.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
   auto results = taskB.get();
@@ -997,25 +1012,26 @@ TEST_CASE("ThreadPool shutdown: idempotent and immediate after a forced detach",
   auto release = std::make_shared<std::atomic<bool>>(false);
   auto pool = std::make_unique<ThreadPoolT<true>>(1, 1);
   std::atomic<bool> started{false};
-  pool->enqueue([release, &started]()
-                {
-                  started.store(true, std::memory_order_release);
-                  while (!release->load(std::memory_order_acquire))
-                  {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                  }
-                });
+  pool->enqueue(
+    [release, &started]()
+    {
+      started.store(true, std::memory_order_release);
+      while (!release->load(std::memory_order_acquire))
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    });
   REQUIRE(iora::test::waitFor([&]() { return started.load(); }, std::chrono::seconds(2)));
   REQUIRE(pool->drain(300).success == false);
-  REQUIRE(pool->stop().success == false);  // forced detach
+  REQUIRE(pool->stop().success == false); // forced detach
 
   auto t0 = std::chrono::steady_clock::now();
   pool->shutdown();
   REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
 
   release->store(true, std::memory_order_release);
-  REQUIRE(iora::test::waitFor([&]() { return pool->testWorkersExited(); },
-                              std::chrono::seconds(5)));
+  REQUIRE(
+    iora::test::waitFor([&]() { return pool->testWorkersExited(); }, std::chrono::seconds(5)));
   t0 = std::chrono::steady_clock::now();
   pool = nullptr;
   REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1));
@@ -1027,8 +1043,7 @@ TEST_CASE("ThreadPool shutdown: idempotent and immediate after a forced detach",
 // answered "Already running" with no workers.
 // ══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ThreadPool shutdown: state after shutdown()",
-          "[threadpool][lifecycle][shutdown][state]")
+TEST_CASE("ThreadPool shutdown: state after shutdown()", "[threadpool][lifecycle][shutdown][state]")
 {
   SECTION("from Running")
   {
@@ -1066,18 +1081,26 @@ TEST_CASE("ThreadPool shutdown: state after shutdown()",
 // The SPAWN park holds an enqueuer after its notify and before spawnWorker().
 // ══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ThreadPool spawn: no spawn after the shutdown reap",
-          "[threadpool][lifecycle][spawn]")
+TEST_CASE("ThreadPool spawn: no spawn after the shutdown reap", "[threadpool][lifecycle][spawn]")
 {
   ThreadPoolT<true> pool(1, 4);
   pool.testParkArm(detail::ThreadPoolTestPark::SPAWN);
 
   std::atomic<bool> ran{false};
   std::thread enqueuer([&]() { pool.enqueue([&]() { ran.store(true); }); });
-  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{enqueuer};
+  struct Joiner
+  {
+    std::thread &t;
+    ~Joiner()
+    {
+      if (t.joinable())
+        t.join();
+    }
+  } joiner{enqueuer};
   ParkReleaser releaser{pool, detail::ThreadPoolTestPark::SPAWN};
 
-  REQUIRE(iora::test::waitFor([&]() { return pool.testParkParked(detail::ThreadPoolTestPark::SPAWN); },
+  REQUIRE(iora::test::waitFor([&]()
+                              { return pool.testParkParked(detail::ThreadPoolTestPark::SPAWN); },
                               std::chrono::seconds(2)));
   REQUIRE(iora::test::waitFor([&]() { return ran.load(); }, std::chrono::seconds(2)));
 
@@ -1102,12 +1125,21 @@ TEST_CASE("ThreadPool spawn: concurrent enqueuers respect maxSize",
   pool.testParkArm(detail::ThreadPoolTestPark::SPAWN);
 
   std::thread enqueuerA([&]() { pool.enqueue([]() {}); });
-  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{enqueuerA};
+  struct Joiner
+  {
+    std::thread &t;
+    ~Joiner()
+    {
+      if (t.joinable())
+        t.join();
+    }
+  } joiner{enqueuerA};
   ParkReleaser releaser{pool, detail::ThreadPoolTestPark::SPAWN};
-  REQUIRE(iora::test::waitFor([&]() { return pool.testParkParked(detail::ThreadPoolTestPark::SPAWN); },
+  REQUIRE(iora::test::waitFor([&]()
+                              { return pool.testParkParked(detail::ThreadPoolTestPark::SPAWN); },
                               std::chrono::seconds(2)));
 
-  pool.enqueue([]() {});  // enqueuer B: sees size 1 < 2 and spawns
+  pool.enqueue([]() {}); // enqueuer B: sees size 1 < 2 and spawns
   REQUIRE(pool.getTotalThreadCount() == 2);
 
   pool.testParkRelease(detail::ThreadPoolTestPark::SPAWN);
@@ -1124,14 +1156,21 @@ TEST_CASE("ThreadPool spawn: concurrent enqueuers respect maxSize",
 // destroy a joinable std::thread.
 // ══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ThreadPool shutdown: serialized with stop()",
-          "[threadpool][lifecycle][shutdown][race]")
+TEST_CASE("ThreadPool shutdown: serialized with stop()", "[threadpool][lifecycle][shutdown][race]")
 {
   ThreadPoolT<true> pool(2, 2);
   pool.testParkArm(detail::ThreadPoolTestPark::SHUTDOWN_JOIN);
 
   std::thread t1([&]() { pool.shutdown(); });
-  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner1{t1};
+  struct Joiner
+  {
+    std::thread &t;
+    ~Joiner()
+    {
+      if (t.joinable())
+        t.join();
+    }
+  } joiner1{t1};
   ParkReleaser releaser{pool, detail::ThreadPoolTestPark::SHUTDOWN_JOIN};
   REQUIRE(iora::test::waitFor(
     [&]() { return pool.testParkParked(detail::ThreadPoolTestPark::SHUTDOWN_JOIN); },
@@ -1140,7 +1179,15 @@ TEST_CASE("ThreadPool shutdown: serialized with stop()",
   std::promise<LifecycleResult> stopPromise;
   auto stopFuture = stopPromise.get_future();
   std::thread t2([&]() { stopPromise.set_value(pool.stop()); });
-  struct Joiner2 { std::thread &t; ~Joiner2() { if (t.joinable()) t.join(); } } joiner2{t2};
+  struct Joiner2
+  {
+    std::thread &t;
+    ~Joiner2()
+    {
+      if (t.joinable())
+        t.join();
+    }
+  } joiner2{t2};
 
   REQUIRE(stopFuture.wait_for(std::chrono::milliseconds(300)) == std::future_status::timeout);
 
@@ -1191,7 +1238,15 @@ TEST_CASE("ThreadPool admission: no task admitted behind a completed drain",
           rejected.store(true);
         }
       });
-    struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{enqueuer};
+    struct Joiner
+    {
+      std::thread &t;
+      ~Joiner()
+      {
+        if (t.joinable())
+          t.join();
+      }
+    } joiner{enqueuer};
     ParkReleaser releaser{pool, detail::ThreadPoolTestPark::ADMISSION};
 
     REQUIRE(iora::test::waitFor(
@@ -1227,7 +1282,15 @@ TEST_CASE("ThreadPool drain: a timeout above INT_MAX waits for the task",
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       pool.testSeamRelease();
     });
-  struct Joiner { std::thread &t; ~Joiner() { if (t.joinable()) t.join(); } } joiner{releaser};
+  struct Joiner
+  {
+    std::thread &t;
+    ~Joiner()
+    {
+      if (t.joinable())
+        t.join();
+    }
+  } joiner{releaser};
 
   auto result = pool.drain(std::numeric_limits<std::uint32_t>::max());
   REQUIRE(result.success == true);
@@ -1277,7 +1340,10 @@ TEST_CASE("ThreadPool spawn failure: the committed task still runs",
                                 std::chrono::seconds(2)));
 
     std::atomic<bool> ran{false};
-    struct Disarm { ~Disarm() { ThreadPoolT<true>::testFailSpawnAfter(0); } } disarm;
+    struct Disarm
+    {
+      ~Disarm() { ThreadPoolT<true>::testFailSpawnAfter(0); }
+    } disarm;
     ThreadPoolT<true>::testFailSpawnAfter(1);
     if (useTry)
     {

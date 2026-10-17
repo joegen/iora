@@ -82,7 +82,7 @@ int runBody(const std::string &scenario, const char *stage, ThreadPool::Shutdown
     {
       waitFor(mainDropped);
       g_stage.store(stage);
-      box->reset();  // destroys the pool here, on its own worker
+      box->reset(); // destroys the pool here, on its own worker
     });
 
   pool.reset();
@@ -100,7 +100,7 @@ int runCapture(const std::string &scenario, const char *stage, ThreadPool::Shutd
     [owner = pool, &mainDropped, stage]()
     {
       waitFor(mainDropped);
-      g_stage.store(stage);  // the destroy follows when the worker resets this functor
+      g_stage.store(stage); // the destroy follows when the worker resets this functor
     });
 
   pool.reset();

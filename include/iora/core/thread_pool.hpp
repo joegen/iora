@@ -58,7 +58,7 @@ struct ThreadPoolTestSeam
   std::atomic<bool> armed{false};    ///< One-shot: park the next worker at the seam.
   std::atomic<bool> parked{false};   ///< A worker is currently parked at the seam.
   std::atomic<bool> release{false};  ///< Release the parked worker.
-  std::atomic<std::size_t> idleWaitEntries{0};  ///< Times a worker entered the idle wait.
+  std::atomic<std::size_t> idleWaitEntries{0}; ///< Times a worker entered the idle wait.
 
   /// One-shot park point for a caller thread (not a worker).
   struct ParkPoint
@@ -67,9 +67,9 @@ struct ThreadPoolTestSeam
     std::atomic<bool> parked{false};
     std::atomic<bool> release{false};
   };
-  ParkPoint shutdownJoin;  ///< shutdownImpl: after its first join, others still joinable.
-  ParkPoint admission;     ///< enqueue: after the lock-free _accepting check, before _mutex.
-  ParkPoint spawn;         ///< enqueue: after notify_one(), before spawnWorker().
+  ParkPoint shutdownJoin; ///< shutdownImpl: after its first join, others still joinable.
+  ParkPoint admission;    ///< enqueue: after the lock-free _accepting check, before _mutex.
+  ParkPoint spawn;        ///< enqueue: after notify_one(), before spawnWorker().
 };
 
 /// Selects a ThreadPoolTestSeam::ParkPoint from a test.
@@ -341,9 +341,11 @@ public:
   /// Shutdown the thread pool and wait for all threads to complete.
   /// This is a blocking call that ensures all worker threads have fully exited.
   /// Call this explicitly before destroying the pool to ensure clean shutdown.
-  /// Serialized with start()/drain()/stop()/reset(). From Running or Draining the
-  /// pool ends Stopped; from any other state the state is unchanged. Called from one
-  /// of this pool's own workers it logs an error and returns without effect.
+  /// Serialized with start()/drain()/stop()/reset(): it waits behind an in-progress
+  /// transition (up to an hour behind drain(0)), and while it joins a stuck task
+  /// every other transition waits behind it. From Running or Draining the pool ends
+  /// Stopped; from any other state the state is unchanged. Called from one of this
+  /// pool's own workers it logs an error and returns without effect.
   void shutdown()
   {
     if (isOnPoolThread())
@@ -866,12 +868,12 @@ private:
   {
     switch (which)
     {
-      case detail::ThreadPoolTestPark::SHUTDOWN_JOIN:
-        return seam().shutdownJoin;
-      case detail::ThreadPoolTestPark::ADMISSION:
-        return seam().admission;
-      case detail::ThreadPoolTestPark::SPAWN:
-        break;
+    case detail::ThreadPoolTestPark::SHUTDOWN_JOIN:
+      return seam().shutdownJoin;
+    case detail::ThreadPoolTestPark::ADMISSION:
+      return seam().admission;
+    case detail::ThreadPoolTestPark::SPAWN:
+      break;
     }
     return seam().spawn;
   }
@@ -1185,9 +1187,8 @@ private:
       int &countdown = testSpawnFailCountdown();
       if (countdown > 0 && --countdown == 0)
       {
-        throw std::system_error(
-          std::make_error_code(std::errc::resource_unavailable_try_again),
-          "ThreadPool test seam: injected spawn failure");
+        throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again),
+                                "ThreadPool test seam: injected spawn failure");
       }
     }
     std::thread t(
@@ -1222,10 +1223,9 @@ private:
             // without a timeout: a timed wait here would wake every _idleTimeout
             // (and spin at 100% CPU when _idleTimeout is 0). Re-evaluated on every
             // pass, so a worker that loses the exit CAS below lands here.
-            const bool atFloor =
-              static_cast<std::size_t>(_threadsCreated.load(std::memory_order_acquire) -
-                                       _threadsExited.load(std::memory_order_acquire)) <=
-              _initialSize;
+            const bool atFloor = static_cast<std::size_t>(
+                                   _threadsCreated.load(std::memory_order_acquire) -
+                                   _threadsExited.load(std::memory_order_acquire)) <= _initialSize;
             const auto ready = [this]() { return _shutdown || !_tasks.empty(); };
             bool waitResult = true;
             if (atFloor)
@@ -1570,6 +1570,8 @@ private:
   // worker itself, so unlike _threads it is never ahead of or behind the thread.
   std::unordered_set<std::thread::id> _workerIds;
   std::queue<std::function<void()>> _tasks;
+  // Guards _threads, _workerIds, _tasks and the _shutdown transitions. Acquired after
+  // _lifecycleMutex (never before it) and never nested with _configMutex.
   mutable std::mutex _mutex;
   std::condition_variable _condition;
 
@@ -1590,13 +1592,19 @@ private:
   std::atomic<int> _threadsExited{0};    // Total threads that returned from lambda
   std::atomic<int> _waitingThreads{0};   // Number of threads currently blocked on condition_variable
 
-  mutable std::mutex _configMutex;  // mutable: allows locking in const methods
+  // Leaf lock (mutable: allows locking in const methods): guards _onTaskError and
+  // _shutdownMode only; never held while taking another lock or calling a user callback.
+  mutable std::mutex _configMutex;
   std::function<void(std::exception_ptr)> _onTaskError;
 
-  // Serializes ILifecycleManaged transitions (start/drain/stop/reset) so concurrent
-  // callers cannot interleave check-then-act on _lifecycleState. Always acquired
-  // BEFORE _mutex (workers never take it), so the drain quiescence wait -- which
-  // takes _mutex internally via getInFlightCount() -- cannot deadlock against it.
+  // Serializes start/drain/stop/reset/shutdown so concurrent callers cannot
+  // interleave check-then-act on _lifecycleState, and so shutdown()'s join cannot
+  // race a stop()/reset(). Lock order: _lifecycleMutex -> _mutex. Workers never
+  // take it: every entry point first runs refuseIfOnPoolThread() (shutdown() its
+  // own check) BEFORE locking, so a task calling a transition is refused instead of
+  // waiting on a holder that is draining or joining that very worker. A holder can
+  // block for a long time: drain(0) up to an hour, and a shutdown() joining a stuck
+  // task without bound -- every other transition, from any thread, waits behind it.
   // getState()/getInFlightCount() are lock-free of it (observers stay responsive).
   std::mutex _lifecycleMutex;
 
