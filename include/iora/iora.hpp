@@ -780,7 +780,9 @@ public:
   /// the callee on the hook's thread with _loadModulesMutex held. A slow callee
   /// delays every load, unload and SafeApiFunction call; a callee that hands work
   /// to another thread which needs _loadModulesMutex (a load/unload, a non-owner
-  /// isModuleLoaded, a SafeApiFunction call) and waits for it deadlocks.
+  /// isModuleLoaded, a SafeApiFunction call) and waits for it deadlocks. So an
+  /// export can run under _loadModulesMutex whenever any plugin's hook calls it
+  /// (see isModuleLoaded).
   ///
   /// \note The return type MUST be HOST-OWNED. C++17 guaranteed copy elision
   /// materializes the returned object in the CALLER's frame, so a return type
@@ -790,8 +792,9 @@ public:
   ///
   /// \note A returned reference or pointer into plugin-owned state (iora_media's
   /// codecs.registry returns CodecRegistry&) is NOT protected by the drain: it is
-  /// valid only while the callee is not torn down. Inside the caller's lifecycle
-  /// hook that holds (the hook's thread holds _loadModulesMutex). A dependency does
+  /// valid only while the callee is not torn down. It stays valid for the rest of
+  /// the caller's lifecycle hook, because the hook's thread holds
+  /// _loadModulesMutex and no unload can run. A dependency does
   /// not keep the callee loaded; a holder must drop the reference in
   /// onDependencyUnloaded, and unloadAllModules sends no such notice.
   template <typename Ret, typename... Args>
@@ -1113,8 +1116,9 @@ public:
   /// \brief Check if a module is currently loaded
   /// \note Caller constraint: off the loader-lock thread this takes
   /// _loadModulesMutex. Do not call it while holding a lock that a lifecycle hook
-  /// (onLoad/onUnload/onDependency*) also takes: the unloader holds
-  /// _loadModulesMutex while it runs that hook, so the two threads deadlock.
+  /// (onLoad/onUnload/onDependency*) or one of your exports also takes: the loader
+  /// holds _loadModulesMutex while it runs a hook, and an export called from any
+  /// plugin's hook runs under it, so the two threads deadlock.
   bool isModuleLoaded(const std::string &moduleName) const
   {
     // SD-2: owner-aware. When THIS thread already holds _loadModulesMutex (a plugin
@@ -2340,10 +2344,15 @@ private:
   std::unordered_map<std::string, std::string> _apiToModule;
   // Lock order: _loadModulesMutex (outer) -> _apiMutex (inner). Any code
   // path that must hold both acquires _loadModulesMutex first. _apiCallGuard
-  // (declared below) is a leaf guarding THREE unrelated concerns: the
-  // SafeApiFunction registry, the callExportedApi drain gate (Slice B) and the
-  // callExportedApi admission set _apiCallableModules (SD-1). It is taken alone
-  // by the gate accessors, enterApiCall and the registry accessors; the load and
+  // (declared below) is a leaf guarding THREE concerns: the SafeApiFunction
+  // registry, the callExportedApi drain gate (Slice B) and the callExportedApi
+  // admission set _apiCallableModules (SD-1). The registry is unrelated to the
+  // other two. The drain gate and the admission set MUST stay under this one
+  // lock: enterApiCall checks membership and draining in one critical section
+  // (DP-5). It is taken alone by the gate accessors, enterApiCall and the
+  // registry accessors, except that a callExportedApi made from a lifecycle hook
+  // runs enterApiCall/leaveApiCall under _loadModulesMutex (the same acyclic
+  // edge); the load and
   // unload paths hold _loadModulesMutex and then take _apiCallGuard
   // (markApiCallable / unmarkApiCallable, beginApiDrain / endApiDrain via
   // openGate, and teardown -> pruneSafeApiRegistry) — the
@@ -2381,13 +2390,15 @@ private:
   // in-flight invoke of that wrapper — then (c) re-acquires and tears down/dlclose.
   //
   // Lock order (the ONLY nestings): operator() slow path takes cacheMutex ->
-  // _loadModulesMutex -> _apiMutex. The unload CLEAR takes cacheMutex with
+  // _loadModulesMutex, then cacheMutex -> _apiMutex (one after the other, not
+  // nested). The unload CLEAR takes cacheMutex with
   // _loadModulesMutex NOT held (this is what avoids a _loadModulesMutex->cacheMutex
   // edge cycling with operator()'s cacheMutex->_loadModulesMutex order — the exact
   // deadlock a naive clear-under-_loadModulesMutex would hit). _apiCallGuard is a
-  // leaf guarding the registry (snapshot + registration) AND the callExportedApi
-  // drain gate (_apiCallGates + _apiDrainCv, Slice B) — see the lock-order note
-  // above.
+  // leaf guarding the registry (snapshot + registration), the callExportedApi
+  // drain gate (_apiCallGates + _apiDrainCv, Slice B) and the admission set
+  // _apiCallableModules (SD-1) — see the lock-order note above (the drain gate
+  // and the admission set must not be split).
   mutable std::mutex _apiCallGuard;
   // Modules currently unloading (claim). Guarded by _loadModulesMutex. Gates ALL
   // same-name module-map mutations: operator()/isModuleLoadedLocked report NOT
@@ -2416,9 +2427,10 @@ private:
   // teardown, not merely before dlclose).
   //
   // Per-module {inFlight count, draining flag} + a shared CV, guarded by the
-  // EXISTING leaf _apiCallGuard (which also guards _safeApiRegistry above — the
-  // two are unrelated concerns co-located under one leaf, justified on lock-
-  // order grounds: see the lock-order comment above and DP-5/DP-11).
+  // EXISTING leaf _apiCallGuard (which also guards _safeApiRegistry and
+  // _apiCallableModules; the registry is co-located on lock-order grounds,
+  // DP-5/DP-11; the admission set must not be split from this gate: enterApiCall
+  // reads both atomically).
   struct ApiCallGate
   {
     std::size_t inFlight = 0;
@@ -2439,7 +2451,8 @@ private:
   // isModuleLoaded still take L). Invariant (SD-5): name in _apiCallableModules
   // <=> name in _loadedModules whenever no load/unload critical section is in
   // progress. Guarded by the LEAF _apiCallGuard (a THIRD concern co-located with
-  // _safeApiRegistry + the drain gates; the leaf takes no other lock). Marked as
+  // _safeApiRegistry + the drain gates; the leaf takes no other lock; it must not
+  // move off this lock). Marked as
   // the LAST fallible step of loadSingleModule (after the _loadedModules.insert,
   // before the no-throw notify; SD-4); unmarked at the successful teardown erase
   // and in cleanupPartialLoadLocked. unordered_set::erase does not allocate/throw.
@@ -2573,7 +2586,8 @@ private:
   // --- callExportedApi drain-gate methods (Slice B). All take the LEAF
   // _apiCallGuard; none nests another lock under it. callExportedApi enters and
   // leaves the gate DISJOINT from its _apiMutex copy (never both held). The
-  // unload paths call begin/end/drain while holding _loadModulesMutex (the
+  // unload paths call begin/end (claim, openGate) while holding _loadModulesMutex;
+  // drainApiCalls runs with it released (DP-3). (The
   // acyclic _loadModulesMutex -> _apiCallGuard edge — same as
   // teardownModuleHostSideLocked -> pruneSafeApiRegistry).
 
@@ -2678,9 +2692,10 @@ private:
   /// run with _loadModulesMutex RELEASED (DP-3): an in-flight call must be able
   /// to complete, and a call from a host thread or another plugin's worker may
   /// need _loadModulesMutex inside its callee, so waiting under _loadModulesMutex
-  /// could not make progress. (A call made from a lifecycle hook does hold
-  /// _loadModulesMutex across its copy+invoke, so it cannot be in flight while
-  /// another thread holds the lock to drain.) The predicate is
+  /// could not make progress. (A call made from a lifecycle hook runs while its
+  /// thread holds _loadModulesMutex, so it ends before an unload can claim the
+  /// module, because the claim needs that mutex. A hook call that starts in the
+  /// release window is rejected DRAINING.) The predicate is
   /// gate-absent OR inFlight==0 (loop-safe against spurious wakeups).
   ///
   /// KNOWN LIMITATION (TS-1, unsupported topology): the thread-local in-flight set
@@ -3190,7 +3205,8 @@ public:
   /// per-call drain/counter is needed.
   /// Throws std::logic_error when called on a thread that holds _loadModulesMutex
   /// (host-only). \note Caller constraint: it takes _loadModulesMutex (through
-  /// isModuleLoaded); do not call it while holding a lock a lifecycle hook takes.
+  /// isModuleLoaded); do not call it while holding a lock a lifecycle hook or one
+  /// of your exports takes (see isModuleLoaded).
   R operator()(Args... args) const
   {
     // SD-2 (order constraint TS H1(c)): reject a call made from plugin code running
