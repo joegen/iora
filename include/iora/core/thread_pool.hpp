@@ -57,6 +57,25 @@ struct ThreadPoolTestSeam
   std::atomic<bool> parked{false};   ///< A worker is currently parked at the seam.
   std::atomic<bool> release{false};  ///< Release the parked worker.
   std::atomic<std::size_t> idleWaitEntries{0};  ///< Times a worker entered the idle wait.
+
+  /// One-shot park point for a caller thread (not a worker).
+  struct ParkPoint
+  {
+    std::atomic<bool> armed{false};
+    std::atomic<bool> parked{false};
+    std::atomic<bool> release{false};
+  };
+  ParkPoint shutdownJoin;  ///< shutdownImpl: after its first join, others still joinable.
+  ParkPoint admission;     ///< enqueue: after the lock-free _accepting check, before _mutex.
+  ParkPoint spawn;         ///< enqueue: after notify_one(), before spawnWorker().
+};
+
+/// Selects a ThreadPoolTestSeam::ParkPoint from a test.
+enum class ThreadPoolTestPark
+{
+  SHUTDOWN_JOIN,
+  ADMISSION,
+  SPAWN
 };
 } // namespace detail
 
@@ -195,17 +214,18 @@ public:
 
     // Phase 1: Signal Shutdown
     auto phase1 = shutdownPhase1_SignalShutdown();
-    if (phase1.wasAlreadyShutdown)
+
+    // An earlier shutdown already quiesced (or force-detached), so Phases 2-3 are
+    // skipped; Phases 4-5 always run so no joinable std::thread is destroyed.
+    if (!phase1.wasAlreadyShutdown)
     {
-      return;
+      // Phase 2: Synchronization Barrier
+      // CRITICAL FIX: This prevents the "double free or corruption (!prev)" race condition
+      shutdownPhase2_SynchronizationBarrier();
+
+      // Phase 3: Drain Tasks
+      shutdownPhase3_DrainTasks();
     }
-
-    // Phase 2: Synchronization Barrier
-    // CRITICAL FIX: This prevents the "double free or corruption (!prev)" race condition
-    shutdownPhase2_SynchronizationBarrier();
-
-    // Phase 3: Drain Tasks
-    shutdownPhase3_DrainTasks();
 
     // Phase 4: Join Threads
     shutdownPhase4_JoinThreads();
@@ -297,6 +317,9 @@ public:
   /// Shutdown the thread pool and wait for all threads to complete.
   /// This is a blocking call that ensures all worker threads have fully exited.
   /// Call this explicitly before destroying the pool to ensure clean shutdown.
+  /// Serialized with start()/drain()/stop()/reset(). From Running or Draining the
+  /// pool ends Stopped; from any other state the state is unchanged. Called from one
+  /// of this pool's own workers it logs an error and returns without effect.
   void shutdown()
   {
     if (isOnPoolThread())
@@ -305,79 +328,16 @@ public:
                                 "workers; refused (a worker cannot join itself)");
       return;
     }
-    iora::core::Logger::debug("ThreadPool::shutdown() - Starting explicit shutdown");
+    std::lock_guard<std::mutex> lifecycleLock(_lifecycleMutex);
+    shutdownImpl();
+
+    const auto currentState = _lifecycleState.load(std::memory_order_acquire);
+    if (currentState == iora::common::LifecycleState::Running ||
+        currentState == iora::common::LifecycleState::Draining)
     {
-      std::unique_lock<std::mutex> lock(_mutex);
-      if (_shutdown)
-      {
-        iora::core::Logger::debug("ThreadPool::shutdown() - Already shut down");
-        return; // Already shut down
-      }
-      _shutdown = true;
+      _accepting.store(false, std::memory_order_release);
+      _lifecycleState.store(iora::common::LifecycleState::Stopped, std::memory_order_release);
     }
-    _condition.notify_all();
-
-    // Wait for all in-flight work to complete BEFORE joining threads. This
-    // prevents use-after-free when a task accesses objects being torn down.
-    // The gate is the accurate single-critical-section getInFlightCount()==0 read
-    // (queue depth + _busyThreads under one lock); with that primary predicate the
-    // former P0-3 "sleep 10ms then re-check" race window is redundant and has been
-    // removed. shutdown()'s join below is safe by construction.
-    iora::core::Logger::debug("ThreadPool::shutdown() - Waiting for in-flight tasks to complete...");
-    if (!waitForQuiescence(5000))
-    {
-      iora::core::Logger::warning("ThreadPool::shutdown() - Task completion timeout after "
-                                  "5000ms - proceeding anyway");
-    }
-
-    // P0-CRITICAL FIX: Join threads directly in the map without moving or erasing
-    // After join() completes, the thread object becomes non-joinable but remains safe in the map.
-    // The _threads map will be destroyed via RAII when shutdown() completes or destructor runs.
-    iora::core::Logger::debug("ThreadPool::shutdown() - Waiting for all threads to exit");
-
-    int joinCount = 0;
-    while (true)
-    {
-      std::thread movedThread;
-      std::thread::id threadId;
-      bool found = false;
-
-      {
-        std::lock_guard<std::mutex> lock(_mutex);
-
-        for (auto it = _threads.begin(); it != _threads.end(); ++it)
-        {
-          if (it->second.joinable())
-          {
-            // Move the thread out of the map and erase the entry under lock.
-            movedThread = std::move(it->second);
-            threadId = it->first;
-            _threads.erase(it);
-            found = true;
-            break;
-          }
-        }
-      }
-
-      if (!found)
-      {
-        break; // No more joinable threads
-      }
-
-      // Join the moved thread OUTSIDE the lock to prevent deadlock
-      std::ostringstream oss;
-      oss << threadId;
-      iora::core::Logger::debug("ThreadPool::shutdown() - Joining thread " + oss.str());
-      if (movedThread.joinable())
-      {
-        movedThread.join();
-        iora::core::Logger::debug("ThreadPool::shutdown() - Thread " + oss.str() + " joined");
-        joinCount++;
-      }
-    }
-
-    iora::core::Logger::debug("ThreadPool::shutdown() - All " + std::to_string(joinCount) +
-                              " threads joined, shutdown complete");
   }
 
   /// Try to enqueue a task, returning false if queue is full instead of
@@ -597,8 +557,8 @@ public:
                              "(forced stop, in-flight tasks abandoned)");
     }
 
-    // Quiescent: shutdown()'s join is bounded and safe by construction.
-    shutdown();
+    // Quiescent: the join is bounded and safe by construction.
+    shutdownImpl();
 
     _lifecycleState.store(LifecycleState::Stopped, std::memory_order_release);
 
@@ -635,6 +595,18 @@ public:
     // Clear any remaining tasks
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      // Never clear() over a live thread: destroying a joinable std::thread calls
+      // std::terminate, and a still-running worker would touch the reset counters.
+      bool anyJoinable = !_workerIds.empty();
+      for (const auto &entry : _threads)
+      {
+        anyJoinable = anyJoinable || entry.second.joinable();
+      }
+      if (anyJoinable)
+      {
+        return LifecycleResult(false, currentState,
+                               "ThreadPool workers still running; cannot reset");
+      }
       while (!_tasks.empty())
       {
         _tasks.pop();
@@ -748,6 +720,34 @@ public:
     return 0;
   }
 
+  /// Arm a one-shot caller park point. Test-only (no-op in production).
+  void testParkArm(detail::ThreadPoolTestPark which)
+  {
+    if constexpr (EnableTestSeam)
+    {
+      parkPoint(which).armed.store(true, std::memory_order_release);
+    }
+  }
+
+  /// True while a caller is parked at `which`. Test-only (always false in production).
+  bool testParkParked(detail::ThreadPoolTestPark which) const
+  {
+    if constexpr (EnableTestSeam)
+    {
+      return parkPoint(which).parked.load(std::memory_order_acquire);
+    }
+    return false;
+  }
+
+  /// Release the caller parked at `which`. Test-only (no-op in production).
+  void testParkRelease(detail::ThreadPoolTestPark which)
+  {
+    if constexpr (EnableTestSeam)
+    {
+      parkPoint(which).release.store(true, std::memory_order_release);
+    }
+  }
+
 private:
   /// True when the caller is one of this pool's own workers (stamped by each worker
   /// at entry, erased on every exit path). Takes _mutex: never call with _mutex held.
@@ -818,6 +818,43 @@ private:
     return static_cast<const detail::ThreadPoolTestSeam &>(*this);
   }
 
+  /// Test-seam park point selector. Only instantiated when EnableTestSeam.
+  detail::ThreadPoolTestSeam::ParkPoint &parkPoint(detail::ThreadPoolTestPark which) noexcept
+  {
+    switch (which)
+    {
+      case detail::ThreadPoolTestPark::SHUTDOWN_JOIN:
+        return seam().shutdownJoin;
+      case detail::ThreadPoolTestPark::ADMISSION:
+        return seam().admission;
+      case detail::ThreadPoolTestPark::SPAWN:
+        break;
+    }
+    return seam().spawn;
+  }
+  const detail::ThreadPoolTestSeam::ParkPoint &
+  parkPoint(detail::ThreadPoolTestPark which) const noexcept
+  {
+    return const_cast<ThreadPoolT *>(this)->parkPoint(which);
+  }
+
+  /// Park the calling thread at `which` if it is armed (one-shot). Test-only: every
+  /// call site is inside `if constexpr (EnableTestSeam)`.
+  void parkIfArmed(detail::ThreadPoolTestPark which)
+  {
+    auto &p = parkPoint(which);
+    if (p.armed.exchange(false, std::memory_order_acq_rel))
+    {
+      p.parked.store(true, std::memory_order_release);
+      while (!p.release.load(std::memory_order_acquire))
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      p.release.store(false, std::memory_order_release);
+      p.parked.store(false, std::memory_order_release);
+    }
+  }
+
   /// Poll until in-flight work reaches zero or the budget is exhausted. Returns
   /// true iff quiescent (getInFlightCount()==0) within maxWaitMs. Delegates to the
   /// accurate single-critical-section getInFlightCount() and never holds _mutex
@@ -843,6 +880,88 @@ private:
       *elapsedMsOut = waitMs;
     }
     return true;
+  }
+
+  /// Shutdown body; the caller MUST hold _lifecycleMutex (public shutdown() and
+  /// stop()). There is no early return on an already-set _shutdown: the join loop is
+  /// idempotent and always runs, so no joinable std::thread can survive a completed
+  /// shutdown whoever set the flag. Only the call that sets _shutdown waits for
+  /// quiescence: every other writer has already quiesced and joined, or (a forced
+  /// detach) left nothing joinable.
+  void shutdownImpl()
+  {
+    iora::core::Logger::debug("ThreadPool::shutdown() - Starting explicit shutdown");
+    bool setByThisCall = false;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (!_shutdown)
+      {
+        _shutdown = true;
+        setByThisCall = true;
+      }
+    }
+    _condition.notify_all();
+
+    // Wait for all in-flight work to complete BEFORE joining threads. This
+    // prevents use-after-free when a task accesses objects being torn down.
+    // The gate is the accurate single-critical-section getInFlightCount()==0 read
+    // (queue depth + _busyThreads under one lock); with that primary predicate the
+    // former P0-3 "sleep 10ms then re-check" race window is redundant and has been
+    // removed. shutdown()'s join below is safe by construction.
+    if (setByThisCall && !waitForQuiescence(5000))
+    {
+      iora::core::Logger::warning("ThreadPool::shutdown() - Task completion timeout after "
+                                  "5000ms - proceeding anyway");
+    }
+
+    int joinCount = 0;
+    while (joinOneRemainingThread())
+    {
+      ++joinCount;
+      if constexpr (EnableTestSeam)
+      {
+        if (joinCount == 1)
+        {
+          parkIfArmed(detail::ThreadPoolTestPark::SHUTDOWN_JOIN);
+        }
+      }
+    }
+
+    iora::core::Logger::debug("ThreadPool::shutdown() - All " + std::to_string(joinCount) +
+                              " threads joined, shutdown complete");
+  }
+
+  /// Move one joinable thread out of _threads under _mutex and join it with no lock
+  /// held. Returns false when no joinable thread remains.
+  bool joinOneRemainingThread()
+  {
+    std::thread movedThread;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      for (auto it = _threads.begin(); it != _threads.end(); ++it)
+      {
+        if (it->second.joinable())
+        {
+          movedThread = std::move(it->second);
+          _threads.erase(it);
+          break;
+        }
+      }
+    }
+    if (!movedThread.joinable())
+    {
+      return false;
+    }
+    movedThread.join();
+    return true;
+  }
+
+  /// Join every remaining thread (the constructor and start() spawn rollbacks).
+  void joinRemainingThreads()
+  {
+    while (joinOneRemainingThread())
+    {
+    }
   }
 
   /// Forced-stop path (drain timeout): signal shutdown and DETACH every worker
@@ -908,7 +1027,13 @@ private:
     // without a timeout, so a spawnWorker() that throws must not skip the wakeup.
     _condition.notify_one();
 
-    // Spawn outside of the lock to avoid deadlock
+    if constexpr (EnableTestSeam)
+    {
+      parkIfArmed(detail::ThreadPoolTestPark::SPAWN);
+    }
+
+    // spawnWorker() re-checks _shutdown and _maxSize under _mutex, so a decision
+    // made above can never spawn past a completed shutdown or past the cap.
     if (shouldSpawn)
     {
       spawnWorker();
@@ -948,7 +1073,12 @@ private:
     // Notify BEFORE spawning (see enqueueImpl).
     _condition.notify_one();
 
-    // Spawn outside of the lock to avoid deadlock
+    if constexpr (EnableTestSeam)
+    {
+      parkIfArmed(detail::ThreadPoolTestPark::SPAWN);
+    }
+
+    // spawnWorker() re-checks _shutdown and _maxSize under _mutex (see enqueueImpl).
     if (shouldSpawn)
     {
       spawnWorker();
@@ -956,8 +1086,18 @@ private:
     return true;
   }
 
+  /// Spawn one worker unless the pool is shut down or already at _maxSize. The check
+  /// and the insert share ONE _mutex critical section, so a spawn decided before a
+  /// shutdown's join loop (or by several concurrent enqueuers) cannot add a thread
+  /// after the reap or past the cap. The new worker blocks on _mutex at entry until
+  /// its _threads entry exists.
   void spawnWorker()
   {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_shutdown || _threads.size() >= _maxSize)
+    {
+      return;
+    }
     std::thread t(
       [this]()
       {
@@ -1128,7 +1268,6 @@ private:
 
       });
 
-    std::lock_guard<std::mutex> lock(_mutex);
     auto threadId = t.get_id();
     _threads.emplace(threadId, std::move(t));
   }
