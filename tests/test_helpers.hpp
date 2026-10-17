@@ -39,6 +39,22 @@ inline void initializeTestLogging()
 /// \brief Type alias for automatic service shutdown
 using AutoServiceShutdown = iora::IoraService::AutoServiceShutdown;
 
+/// \brief Calls IoraService::shutdown() at scope exit and swallows any exception.
+/// Needs no service reference, so it is safe before init() and after a failed init().
+struct ScopedShutdown
+{
+  ~ScopedShutdown()
+  {
+    try
+    {
+      iora::IoraService::shutdown();
+    }
+    catch (...)
+    {
+    }
+  }
+};
+
 /// \brief Helper function to create IoraService from CLI-style arguments (DEPRECATED)
 /// Use initServiceFromConfig() with Config objects instead
 inline iora::IoraService &initServiceFromArgs(int argc, const char *args[])

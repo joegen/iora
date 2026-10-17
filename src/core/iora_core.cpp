@@ -176,7 +176,7 @@ std::shared_ptr<IoraService> IoraService::instancePtr()
   auto &instance = getInstancePtr();
   if (!instance)
   {
-    instance = std::shared_ptr<IoraService>(new IoraService());
+    instance = std::make_shared<IoraService>();
   }
   return instance;
 }

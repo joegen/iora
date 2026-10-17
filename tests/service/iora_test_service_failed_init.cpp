@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -49,20 +50,6 @@ iora::IoraService::Config baseConfig(int port, TempDirManager &tmp)
   return cfg;
 }
 
-struct AlwaysShutdown
-{
-  ~AlwaysShutdown()
-  {
-    try
-    {
-      iora::IoraService::shutdown();
-    }
-    catch (...)
-    {
-    }
-  }
-};
-
 void requireMembersNull(const iora::IoraService &svc)
 {
   REQUIRE(svc.webhookServer() == nullptr);
@@ -73,43 +60,24 @@ void requireMembersNull(const iora::IoraService &svc)
   REQUIRE(svc.configLoader() == nullptr);
 }
 
-class Socket
-{
-public:
-  Socket() : _fd(::socket(AF_INET, SOCK_STREAM, 0)) {}
-  ~Socket()
-  {
-    if (_fd >= 0)
-    {
-      ::close(_fd);
-    }
-  }
-  Socket(const Socket &) = delete;
-  Socket &operator=(const Socket &) = delete;
-  int fd() const { return _fd; }
-
-private:
-  int _fd;
-};
-
 sockaddr_in loopbackAddr(int port)
 {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(port));
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
   ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
   return addr;
 }
 
 bool connectRefused(int port)
 {
-  Socket s;
-  if (s.fd() < 0)
+  testnet::ScopedFd s{::socket(AF_INET, SOCK_STREAM, 0)};
+  if (s.get() < 0)
   {
     return false;
   }
   sockaddr_in addr = loopbackAddr(port);
-  if (::connect(s.fd(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
+  if (::connect(s.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0)
   {
     return false;
   }
@@ -120,17 +88,17 @@ bool connectRefused(int port)
 // SO_REUSEADDR|SO_REUSEPORT, so this fails with EADDRINUSE while it is alive.
 bool canListenWithoutReusePort(int port)
 {
-  Socket s;
-  if (s.fd() < 0)
+  testnet::ScopedFd s{::socket(AF_INET, SOCK_STREAM, 0)};
+  if (s.get() < 0)
   {
     return false;
   }
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  addr.sin_port = htons(static_cast<uint16_t>(port));
-  return ::bind(s.fd(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
-         ::listen(s.fd(), 1) == 0;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  return ::bind(s.get(), reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
+         ::listen(s.get(), 1) == 0;
 }
 
 // Throws from the synchronous log path on the last applyConfig() message, which
@@ -160,7 +128,7 @@ TEST_CASE("Failed init before server start releases the singleton", "[iora][init
   auto cfg = baseConfig(testnet::getFreePortTCP(), tmp);
   cfg.server.tls.certFile = kCertFile;
 
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   std::weak_ptr<iora::IoraService> weak = held;
 
@@ -184,7 +152,7 @@ TEST_CASE("Failed init after server start closes the listener", "[iora][init][ro
   cfg.log.async = true;
   cfg.modules.directory = "/tmp/" + std::string(300, 'a');
 
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
 
   REQUIRE_THROWS_AS(iora::IoraService::init(cfg), std::filesystem::filesystem_error);
@@ -213,7 +181,7 @@ TEST_CASE("Failed init after a plugin loaded unloads it and a retry starts clean
   cfg.modules.modules = std::vector<std::string>{kPluginName};
 
   UnloadTeardownControl ctl;
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto exportCtl = [&ctl](iora::IoraService &svc)
   {
     svc.exportApi(std::string("test-harness"), "test.unloadctl",
@@ -240,8 +208,7 @@ TEST_CASE("Failed init after a plugin loaded unloads it and a retry starts clean
   REQUIRE(fresh->isModuleLoaded(kPluginName));
 }
 
-TEST_CASE("Concurrent shutdown calls tear the service down once",
-          "[iora][init][shutdown][concurrency]")
+TEST_CASE("Concurrent shutdown calls release the singleton", "[iora][init][shutdown][concurrency]")
 {
   constexpr int kIterations = 50;
   constexpr int kThreads = 8;
@@ -256,7 +223,7 @@ TEST_CASE("Concurrent shutdown calls tear the service down once",
   cfg.log.file = tmp.filePath("log");
   cfg.log.level = "error";
 
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   for (int iteration = 0; iteration < kIterations; ++iteration)
   {
     iora::IoraService::init(cfg);

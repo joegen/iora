@@ -203,14 +203,14 @@ public:
     throwIfUnderLoaderLock("IoraService::shutdown()");
     try
     {
-      auto instancePtr = peekInstance();
-      if (!instancePtr)
+      auto svcPtr = peekInstance();
+      if (!svcPtr)
       {
         // Already shutdown or never initialized
         return;
       }
 
-      IoraService &svc = *instancePtr;
+      IoraService &svc = *svcPtr;
 
       // Prevent double shutdown: exactly one caller runs the teardown (an atomic
       // read-modify-write; a load followed by a store would let two concurrent
@@ -302,6 +302,26 @@ private:
 
     // Finally, destroy the singleton instance
     IoraService::destroyInstance();
+  }
+
+  /// \brief Rolls back a failed start: logs the reason, then runs teardownInstance().
+  /// Errors from either step are swallowed so the caller can rethrow the original.
+  static void rollBackFailedStart(IoraService &svc, const char *reason) noexcept
+  {
+    try
+    {
+      IORA_LOG_ERROR("init: start failed, rolling back: " << reason);
+    }
+    catch (...)
+    {
+    }
+    try
+    {
+      teardownInstance(svc);
+    }
+    catch (...)
+    {
+    }
   }
 
 public:
@@ -411,15 +431,13 @@ public:
   static void init(const Config &config)
   {
     throwIfUnderLoaderLock("IoraService::init()");
-    // First ensure any previous instance is properly cleaned up
-    auto instancePtr = peekInstance();
-    if (instancePtr)
+    // If an instance exists, shut it down first (a running one is released)
+    if (peekInstance())
     {
-      // If instance exists, shut it down first to ensure clean state
       shutdown();
     }
 
-    // Now get a fresh instance
+    // Get the instance, creating it if needed
     auto svcPtr = instance();
     IoraService &svc = *svcPtr;
     if (svc._isRunning)
@@ -435,33 +453,14 @@ public:
       svc._config = config;
       svc.applyConfig();
     }
+    catch (const std::exception &e)
+    {
+      rollBackFailedStart(svc, e.what());
+      throw;
+    }
     catch (...)
     {
-      try
-      {
-        try
-        {
-          throw;
-        }
-        catch (const std::exception &e)
-        {
-          IORA_LOG_ERROR("init: start failed, rolling back: " << e.what());
-        }
-        catch (...)
-        {
-          IORA_LOG_ERROR("init: start failed, rolling back: unknown exception");
-        }
-      }
-      catch (...)
-      {
-      }
-      try
-      {
-        teardownInstance(svc);
-      }
-      catch (...)
-      {
-      }
+      rollBackFailedStart(svc, "unknown exception");
       throw;
     }
   }
@@ -1365,7 +1364,7 @@ private:
     auto &instance = getInstancePtr();
     if (!instance)
     {
-      instance = std::shared_ptr<IoraService>(new IoraService());
+      instance = std::make_shared<IoraService>();
     }
 
     return instance;

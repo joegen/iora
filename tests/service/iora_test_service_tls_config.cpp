@@ -72,30 +72,15 @@ iora::IoraService::Config baseConfig(int port, const std::string &stateFile,
   return cfg;
 }
 
-// Shut the singleton down at scope exit. A failed init() has already torn the
-// service down and released the singleton, so on the throwing cases this
-// shutdown() does nothing; it cleans up the successful cases. The throwing cases
-// hold the instance from before init() ("held") to check that it was torn down,
-// because instanceRef() after a failed init() would create a new, empty one.
-struct AlwaysShutdown
-{
-  ~AlwaysShutdown()
-  {
-    try
-    {
-      iora::IoraService::shutdown();
-    }
-    catch (...)
-    {
-    }
-  }
-};
-
-// Holds a TCP LISTEN socket on a port so a subsequent server bind on the same port
-// fails in WebhookServer::start(). This relies on the holder NOT setting
-// SO_REUSEPORT: the server listener sets SO_REUSEADDR|SO_REUSEPORT, and on Linux a
-// port can be shared only if BOTH sockets set SO_REUSEPORT — so the server's bind
-// gets EADDRINUSE here. (Do not add SO_REUSEPORT to this holder.)
+// ScopedShutdown (test_helpers.hpp) shuts the singleton down at scope exit. A
+// failed init() has already torn the service down and released the singleton, so on the throwing
+// cases this shutdown() does nothing; it cleans up the successful cases. The throwing cases hold
+// the instance from before init() ("held") to check that it was torn down, because instanceRef()
+// after a failed init() would create a new, empty one. Holds a TCP LISTEN socket on a port so a
+// subsequent server bind on the same port fails in WebhookServer::start(). This relies on the
+// holder NOT setting SO_REUSEPORT: the server listener sets SO_REUSEADDR|SO_REUSEPORT, and on Linux
+// a port can be shared only if BOTH sockets set SO_REUSEPORT — so the server's bind gets EADDRINUSE
+// here. (Do not add SO_REUSEPORT to this holder.)
 struct PortHolder
 {
   int fd{-1};
@@ -314,7 +299,7 @@ TEST_CASE("TLS T1 server-auth-only brings up TLS and refuses plaintext",
 
   iora::IoraService::init(cfg);
   auto &svc = iora::IoraService::instanceRef();
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   installProbe(svc, port);
 
   REQUIRE(httpsProbeSucceeds(port));
@@ -334,7 +319,7 @@ TEST_CASE("TLS T2 cert+key+CA without mTLS brings up TLS", "[iora][tls][config]"
 
   iora::IoraService::init(cfg);
   auto &svc = iora::IoraService::instanceRef();
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   installProbe(svc, port);
 
   REQUIRE(httpsProbeSucceeds(port));
@@ -354,7 +339,7 @@ TEST_CASE("TLS T2b bad caFile path is ignored when mTLS is off", "[iora][tls][co
 
   iora::IoraService::init(cfg);
   auto &svc = iora::IoraService::instanceRef();
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   installProbe(svc, port);
 
   REQUIRE(httpsProbeSucceeds(port)); // a bad CA path is silently accepted when mTLS off
@@ -371,7 +356,7 @@ TEST_CASE("TLS T3 requireClientCert without CA fails closed", "[iora][tls][confi
   cfg.server.tls.keyFile = kKeyFile;
   cfg.server.tls.requireClientCert = true; // no caFile
 
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("caFile is not set"));
@@ -386,7 +371,7 @@ TEST_CASE("TLS T4 cert only fails closed", "[iora][tls][config]")
   auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile; // no key
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured") &&
@@ -401,7 +386,7 @@ TEST_CASE("TLS T5 key only fails closed", "[iora][tls][config]")
   auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.keyFile = kKeyFile; // no cert
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured") &&
@@ -416,7 +401,7 @@ TEST_CASE("TLS T6 caFile only fails closed", "[iora][tls][config]")
   auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.caFile = kCertFile; // no cert/key
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured"));
@@ -430,7 +415,7 @@ TEST_CASE("TLS T7 requireClientCert only fails closed", "[iora][tls][config]")
   auto cfg = baseConfig(testnet::getFreePortTCP(), tmp.filePath("state.json"),
                         tmp.filePath("log"));
   cfg.server.tls.requireClientCert = true; // no paths at all
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured"));
@@ -448,7 +433,7 @@ TEST_CASE("TLS T8 no TLS requested serves plaintext (no throw)", "[iora][tls][co
     auto cfg = baseConfig(port, tmp.filePath("state.json"), tmp.filePath("log"));
     iora::IoraService::init(cfg);
     auto &svc = iora::IoraService::instanceRef();
-    AlwaysShutdown guard;
+    ScopedShutdown guard;
     installProbe(svc, port);
     REQUIRE(svc.webhookServer() != nullptr);
     REQUIRE(plaintextProbeSucceeds(port));
@@ -461,7 +446,7 @@ TEST_CASE("TLS T8 no TLS requested serves plaintext (no throw)", "[iora][tls][co
     cfg.server.tls.requireClientCert = false; // must NOT force a fail-closed throw
     iora::IoraService::init(cfg);
     auto &svc = iora::IoraService::instanceRef();
-    AlwaysShutdown guard;
+    ScopedShutdown guard;
     installProbe(svc, port);
     REQUIRE(svc.webhookServer() != nullptr);
     REQUIRE(plaintextProbeSucceeds(port));
@@ -477,7 +462,7 @@ TEST_CASE("TLS T9 non-PEM cert fails closed at enableTls", "[iora][tls][config]"
                         tmp.filePath("log"));
   cfg.server.tls.certFile = junkCert; // set + non-empty → complete, but invalid
   cfg.server.tls.keyFile = kKeyFile;
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("certFile") &&
@@ -498,7 +483,7 @@ TEST_CASE("TLS T9b mismatched cert/key fails in start(), no half-built server",
                         tmp.filePath("log"));
   cfg.server.tls.certFile = kKeyFile; // a key in the cert slot (valid PEM, wrong type)
   cfg.server.tls.keyFile = kCertFile; // a cert in the key slot
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_AS(iora::IoraService::init(cfg), std::runtime_error);
   REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
@@ -516,7 +501,7 @@ TEST_CASE("TLS T9c start() bind failure leaves no half-built server",
   cfg.server.tls.certFile = kCertFile;
   cfg.server.tls.keyFile = kKeyFile;
 
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   auto held = iora::IoraService::instance();
   REQUIRE_THROWS_AS(iora::IoraService::init(cfg), std::runtime_error);
   REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
@@ -541,7 +526,7 @@ TEST_CASE("TLS T10 mTLS config brings the listener up and rejects a cert-less cl
 
   iora::IoraService::init(cfg);
   auto &svc = iora::IoraService::instanceRef();
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   REQUIRE(svc.webhookServer() != nullptr);
   waitForListener(port);
   REQUIRE(tcpConnectSucceeds(port));
@@ -571,7 +556,7 @@ TEST_CASE("TLS M1 empty strings are treated as unset", "[iora][tls][config]")
                           tmp.filePath("log"));
     cfg.server.tls.certFile = ""; // empty == unset
     cfg.server.tls.keyFile = kKeyFile;
-    AlwaysShutdown guard;
+    ScopedShutdown guard;
     auto held = iora::IoraService::instance();
     REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                         Catch::Matchers::Contains("partially configured") &&
@@ -589,7 +574,7 @@ TEST_CASE("TLS M1 empty strings are treated as unset", "[iora][tls][config]")
     cfg.server.tls.caFile = "";
     iora::IoraService::init(cfg);
     auto &svc = iora::IoraService::instanceRef();
-    AlwaysShutdown guard;
+    ScopedShutdown guard;
     installProbe(svc, port);
     REQUIRE(svc.webhookServer() != nullptr);
     REQUIRE(plaintextProbeSucceeds(port));
@@ -608,7 +593,7 @@ TEST_CASE("TLS L4 server disabled with TLS set warns and does not throw",
   cfg.server.tls.certFile = kCertFile; // TLS requested but server disabled
 
   LogCaptureGuard logs;
-  AlwaysShutdown guard;
+  ScopedShutdown guard;
   REQUIRE_NOTHROW(iora::IoraService::init(cfg));
   REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
   REQUIRE(logs.sawContaining("features.server is disabled"));
