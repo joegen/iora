@@ -1233,6 +1233,64 @@ TEST_CASE("ThreadPool drain: a timeout above INT_MAX waits for the task",
   REQUIRE(result.success == true);
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Test: a worker spawn failure rolls back and rethrows (tasks 5.1/5.2, TP-4/
+// TP-10), and a committed task still runs when the enqueue-path spawn throws
+// (TS2-M1: notify before spawn). Before: the constructor's earlier joinable
+// threads hit std::terminate on unwind; start() left Running with too few
+// workers; the enqueued task waited behind the untimed floor wait.
+// ══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ThreadPool spawn failure: constructor rolls back and rethrows",
+          "[threadpool][lifecycle][spawn][failure]")
+{
+  ThreadPoolT<true>::testFailSpawnAfter(2);
+  REQUIRE_THROWS_AS(ThreadPoolT<true>(4, 4), std::system_error);
+}
+
+TEST_CASE("ThreadPool spawn failure: start() rolls back to Reset and rethrows",
+          "[threadpool][lifecycle][spawn][failure]")
+{
+  ThreadPoolT<true> pool(2, 2);
+  REQUIRE(pool.stop().success == true);
+  REQUIRE(pool.reset().success == true);
+
+  ThreadPoolT<true>::testFailSpawnAfter(2);
+  REQUIRE_THROWS_AS(pool.start(), std::system_error);
+  REQUIRE(pool.getState() == LifecycleState::Reset);
+  REQUIRE(pool.getTotalThreadCount() == 0);
+
+  REQUIRE(pool.start().success == true);
+  REQUIRE(pool.getTotalThreadCount() == 2);
+}
+
+TEST_CASE("ThreadPool spawn failure: the committed task still runs",
+          "[threadpool][lifecycle][spawn][failure]")
+{
+  for (const bool useTry : {false, true})
+  {
+    INFO((useTry ? "tryEnqueue" : "enqueue"));
+    // One worker (below maxSize, so the enqueue decides to spawn), parked in its
+    // untimed floor wait; no warm-up task, which would already spawn the second.
+    ThreadPoolT<true> pool(1, 2);
+    REQUIRE(iora::test::waitFor([&]() { return pool.testIdleWaitEntries() >= 1; },
+                                std::chrono::seconds(2)));
+
+    std::atomic<bool> ran{false};
+    struct Disarm { ~Disarm() { ThreadPoolT<true>::testFailSpawnAfter(0); } } disarm;
+    ThreadPoolT<true>::testFailSpawnAfter(1);
+    if (useTry)
+    {
+      REQUIRE_THROWS_AS(pool.tryEnqueue([&]() { ran.store(true); }), std::system_error);
+    }
+    else
+    {
+      REQUIRE_THROWS_AS(pool.enqueue([&]() { ran.store(true); }), std::system_error);
+    }
+    REQUIRE(iora::test::waitFor([&]() { return ran.load(); }, std::chrono::seconds(1)));
+  }
+}
+
 TEST_CASE("lifecycleStateToString names every state", "[lifecycle]")
 {
   REQUIRE(std::string(lifecycleStateToString(LifecycleState::Created)) == "Created");

@@ -22,6 +22,7 @@
 #include <queue>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -202,9 +203,19 @@ public:
     _accepting.store(true, std::memory_order_release);
     _lifecycleState.store(iora::common::LifecycleState::Running, std::memory_order_release);
 
-    for (std::size_t i = 0; i < _initialSize; ++i)
+    try
     {
-      spawnWorker();
+      for (std::size_t i = 0; i < _initialSize; ++i)
+      {
+        spawnWorker();
+      }
+    }
+    catch (...)
+    {
+      // No destructor runs for a throwing constructor: join the workers already
+      // spawned, or their joinable std::threads would std::terminate on unwind.
+      stopAndJoinSpawnedWorkers();
+      throw;
     }
   }
 
@@ -411,20 +422,28 @@ public:
       return LifecycleResult(true, LifecycleState::Running, "Already running");
     }
 
-    // Reset → Running: restart the pool
+    // Reset → Running: restart the pool. Spawn while _accepting stays false (enqueue
+    // keeps rejecting) and publish Running last, so a spawn failure leaves Reset.
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _shutdown.store(false, std::memory_order_release);
     }
 
+    try
+    {
+      for (std::size_t i = 0; i < _initialSize; ++i)
+      {
+        spawnWorker();
+      }
+    }
+    catch (...)
+    {
+      stopAndJoinSpawnedWorkers();
+      throw;
+    }
+
     _accepting.store(true, std::memory_order_release);
     _lifecycleState.store(LifecycleState::Running, std::memory_order_release);
-
-    // Spawn initial threads if needed
-    for (std::size_t i = 0; i < _initialSize; ++i)
-    {
-      spawnWorker();
-    }
 
     return LifecycleResult(true, LifecycleState::Running, "ThreadPool started");
   }
@@ -720,6 +739,17 @@ public:
     return 0;
   }
 
+  /// Make the k-th next spawnWorker() on the CALLING thread throw std::system_error
+  /// (k == 1: the next one); disarms itself when it fires. Static so a test can arm
+  /// it before constructing the pool. Test-only (no-op in production).
+  static void testFailSpawnAfter(int k)
+  {
+    if constexpr (EnableTestSeam)
+    {
+      testSpawnFailCountdown() = k;
+    }
+  }
+
   /// Arm a one-shot caller park point. Test-only (no-op in production).
   void testParkArm(detail::ThreadPoolTestPark which)
   {
@@ -957,12 +987,28 @@ private:
     return true;
   }
 
-  /// Join every remaining thread (the constructor and start() spawn rollbacks).
-  void joinRemainingThreads()
+  /// Spawn-failure rollback for the constructor and start(): signal shutdown and
+  /// join every worker spawned so far (no task can be queued: _accepting is false
+  /// in start(), and the constructor has not returned).
+  void stopAndJoinSpawnedWorkers()
   {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _shutdown.store(true, std::memory_order_release);
+    }
+    _condition.notify_all();
     while (joinOneRemainingThread())
     {
     }
+  }
+
+  /// Test seam: per-thread countdown; when it reaches zero the next spawnWorker()
+  /// on that thread throws. Only odr-used inside `if constexpr (EnableTestSeam)`, so
+  /// ThreadPoolT<false> never instantiates it.
+  static int &testSpawnFailCountdown()
+  {
+    static thread_local int countdown = 0;
+    return countdown;
   }
 
   /// Forced-stop path (drain timeout): signal shutdown and DETACH every worker
@@ -1120,6 +1166,16 @@ private:
     if (_shutdown || _threads.size() >= _maxSize)
     {
       return;
+    }
+    if constexpr (EnableTestSeam)
+    {
+      int &countdown = testSpawnFailCountdown();
+      if (countdown > 0 && --countdown == 0)
+      {
+        throw std::system_error(
+          std::make_error_code(std::errc::resource_unavailable_try_again),
+          "ThreadPool test seam: injected spawn failure");
+      }
     }
     std::thread t(
       [this]()
