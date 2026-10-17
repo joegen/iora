@@ -17,7 +17,7 @@
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.0 | 2026-10-17 | Initial guide (tracker 2026-10-16-12, `architecture/iora/plugin_callback_ownership.json`). Written against `include/iora/core/callback_ownership.hpp`, its users `EventQueue` and `HttpServer`, the `IoraService` lifecycle wiring, and the tests `tests/core/iora_test_callback_ownership.cpp` (U-1..U-8), `tests/core/iora_test_event_queue.cpp` (E-1..E-8), `tests/network/iora_test_http_server_owner_removal.cpp` (H-1..H-7) and `tests/service/iora_test_plugin_callback_lifecycle.cpp` (P-1..P-14). |
+| 1.0 | 2026-10-17 | Initial guide (tracker 2026-10-16-12, `architecture/iora/plugin_callback_ownership.json`). Written against `include/iora/core/callback_ownership.hpp`, its users `EventQueue` and `HttpServer`, the `IoraService` lifecycle wiring, and the tests `tests/core/iora_test_callback_ownership.cpp` (U-1..U-8), `tests/core/iora_test_event_queue.cpp` (E-1..E-8), `tests/network/iora_test_http_server_owner_removal.cpp` (H-1..H-7) and `tests/service/iora_test_plugin_callback_lifecycle.cpp` (P-1..P-11, P-13 and P-14; P-12 is a TSan run of seven of them, not a separate `TEST_CASE`). |
 
 ---
 
@@ -25,7 +25,7 @@
 
 ### Problem
 
-A plugin registers webhook routes and EventQueue handlers, usually in `onLoad`. Each one is a `std::function` whose code lives in the plugin's `.so` and usually captures the plugin's `this`. Before this component, nothing removed them when the plugin was unloaded, reloaded or failed to load: `EventQueue::onEventId` / `onEventName` / `onEventNameMatches` only appended, and `HttpServer` had no removal API. After `dlclose`, a worker that dispatched the event or served the route called into unmapped code through a destroyed object -- a crash or a use-after-free. A reload also registered every handler a second time.
+A plugin registers webhook routes and EventQueue handlers, usually in `onLoad`. Each one is a `std::function` whose code lives in the plugin's `.so` and usually captures the plugin's `this`. Before this component, nothing removed them when the plugin was unloaded, reloaded or failed to load: `EventQueue::onEventId` / `onEventName` only appended and `onEventNameMatches` only added or replaced the entry for its pattern, and `HttpServer` had no removal API. After `dlclose`, a worker that dispatched the event or served the route called into unmapped code through a destroyed object -- a crash or a use-after-free. A reload also registered every handler a second time.
 
 ### Solution
 
@@ -344,3 +344,5 @@ public:
 - **Only opted-in instances are tracked.** Entries on a registry that never called `enableCallbackOwnerTracking()` are never gated or removed by owner.
 - **Owner names share one process-wide namespace.** Owners are plain strings; `IoraService` uses module file names.
 - **Two gates exist.** The `callExportedApi` drain gate in `IoraService` and `CallbackGate` have the same shape; `IoraService` drives both at each unload step.
+- **A closed owner's callbacks are skipped, not deferred.** While a module loads or unloads, an event that matches one of its EventQueue handlers is not delivered to that handler and is not re-queued, and a request to one of its routes gets 503. For example, the handler for an event pushed during the module's own `onLoad` may never run for that event.
+- **Only webhook routes and EventQueue handlers are covered.** An SSE stream opened by a plugin route, a plugin `ThreadPool` task and a `Logger` external handler installed by a plugin are not gated, drained or removed. The route admission ends at the dispatch switch, so a stream the handler leaves running is not waited for. A plugin stops these in `onUnload`.

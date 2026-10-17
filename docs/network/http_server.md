@@ -17,7 +17,7 @@
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.6 | 2026-10-17 | Owner tracking (tracker 2026-10-16-12). New opt-in `enableCallbackOwnerTracking()`: an opted-in server stores `CallbackOwner::current()` with each route and the default handler; `classifyRequest` admits the owner through `CallbackGate` before copying the handler, and a closed owner yields the new `OWNER_CLOSED` outcome, answered `503 Service Unavailable` with no handler run; the admission is released right after the dispatch switch. New `removeHandlersOwnedBy(owner)`. A server that is not opted in behaves as before. §5.4 (new step in the ladder and an owner-tracking paragraph), §8.2, §8.3, §10.1 and §11 updated. |
+| 1.6 | 2026-10-17 | Owner tracking (tracker 2026-10-16-12). New opt-in `enableCallbackOwnerTracking()`: an opted-in server stores `CallbackOwner::current()` with each route and the default handler; `classifyRequest` admits the owner through `CallbackGate` before copying the handler, and a closed owner yields the new `OWNER_CLOSED` outcome, answered `503 Service Unavailable` with no handler run; the admission is released right after the dispatch switch. New `removeHandlersOwnedBy(owner)`. A server that is not opted in behaves as before. §5.4 (new step in the ladder and an owner-tracking paragraph), §8.2, §8.3, §10.1 and §11 updated. §4.1, §7.2, §8.1 and §12 also updated. |
 | 1.5 | 2026-09-24 | DOC-4 doc-review fixes: corrected the oversize-JSON claim. With the default 10 MB `maxPayloadSize`, `HttpServer`'s 1 MiB per-session buffer (`MAX_BUFFER_SIZE`) answers a headers-only 413 and closes before the wrapper runs, so the wrapper's 500 size path fires only when `maxPayloadSize` < ~1 MiB (§5.5 step 1, §9.4, Known Limitations). §6.3 example `maxPayloadSize` reduced to 256 KB. Corrected the Known Limitations remedy: a `JsonHandler` has no `Response`, so only the raw `Handler` API controls the status. Made the `ex.what()` leak precise: parser errors are fixed strings, while the size-limit and handler text do leak, with no `nosniff`, and a non-`std` exception falls to the generic 500. Added a Known Limitations entry and §5.5 note on the missing `Content-Type` check (cross-origin simple POST). Added the GET-body interop note (RFC 9110 §9.3.1). Trimmed §9.1 to what the rest of the guide does not already say, and added the unvalidated `int` port narrowing, the port-0 `getPort()` gap and the unguarded double `start()`. Known Limitations rows now cite `coding_trackers:` trackers -14 / -15. |
 | 1.4 | 2026-09-24 | DOC-4: rehomed README-unique content (§9.1: `setPort`/`setBindAddress` only store the value, applied at the next `start()`); recorded in Known Limitations that the `WebhookServer` JSON wrappers answer oversize/malformed JSON with 500 (not 413/400) and echo `ex.what()`, including arbitrary handler exception text, to the client. |
 | 1.3 | 2026-09-13 | **Framing verdict single-sourced (iora `2026-09-12-1`).** `HttpServer::handleIncomingData` and `findChunkedRequestEnd` now compute their RFC 9112 §6.3/§7.1 framing decision from the SAME `iora::network::detail` helpers the strict parser uses (`decideRequestFraming`, `parseChunkSize`, `chunkDataStep`, `walkTrailerSection`, `checkHeaderLineGrammar`, `trimOws`, `parseFullUInt`, `isHexDigit`) rather than a hand-maintained copy — the "framer and parser reach the same verdict" anti-smuggling property is now structural. Behavior-preserving; the chunk-data / trailer helpers (`chunkDataStep` / `walkTrailerSection`) return a tri-state `{Ok|NeedMore|Malformed}` the framer maps to poison-vs-wait. (See `docs/parsers/http_message.md` for the out-of-range-`Content-Length` parser-side unification that accompanies this.) |
@@ -98,11 +98,13 @@ HttpServer  (concrete base -- header-only; iora::network)
 |     `-- tryEnqueue(processHttpRequest)        -> 503 on overload (backpressure)
 |
 |-- Route table   _handlers :
-|     std::unordered_map<HttpMethod, std::vector<std::pair<CompiledPattern, Handler>>>
+|     std::unordered_map<HttpMethod, std::vector<Route>>
+|     |-- Route { CompiledPattern pattern; std::string owner; Handler handler; }
 |     |-- CompiledPattern { PatternKind kind; std::string raw; std::vector<Segment> segments;
 |     |                     bool hasTrailingWildcard; }        (compiled once at registration)
 |     |-- precedence: EXACT > NAMED > WILDCARD, then registration order
-|     `-- _defaultHandler : Handler                            (optional 404 hook)
+|     |-- _defaultHandler : Handler + _defaultHandlerOwner : std::string   (optional 404 hook)
+|     `-- _tracksCallbackOwners : std::atomic<bool>            (owner-tracking opt-in)
 |
 |-- Session state _sessionInfo :
 |     std::unordered_map<SessionId, SessionInfo>              (guarded by _sessionMutex)
@@ -390,7 +392,7 @@ Runs on a worker. If `_shutdown` is set, it emits a 503 (`Connection: close`) an
 ### 5.4 The routing subsystem
 
 **Pattern compilation.** `onGet`/`onPost`/`onPut`/`onPatch`/`onDelete` call `registerHandler`, which
-compiles the path once (`compilePattern`) under `_mutex` and appends `(CompiledPattern, Handler)` to
+compiles the path once (`compilePattern`) under `_mutex` and appends a `Route{CompiledPattern, owner, Handler}` (owner = `CallbackOwner::current()` on an opted-in server, else empty) to
 the per-method vector. `splitPath` tokenizes on `/`, **preserving leading, trailing, and interior
 empty tokens** -- so `/users` (2 tokens) differs from `/users/` (3 tokens), the load-bearing invariant
 for exact backward-compat and the wildcard empty-suffix rule.
@@ -470,7 +472,10 @@ terminal response, no keep-alive/close decision). `sendRawForSse` returns `false
 transport is down/shutting down (a secondary write-failure signal; the primary disconnect signal is
 the transport observe callback). The `friend class SseStream` / `friend void upgradeToSse(...)` grant
 gives the SSE machinery (defined in a later tier, `sse_stream.hpp`) the same reach a subclass gets,
-with no public `transport()` leak.
+with no public `transport()` leak. On a server opted in to owner tracking, the owner admission ends
+right after the dispatch switch, so a stream the handler leaves running after it returns is neither
+waited for by `CallbackGate::drain` nor removed by `removeHandlersOwnedBy`; whoever owns the stream
+must stop it (an `IoraService` plugin: in `onUnload`; see `docs/core/callback_ownership.md` section 10).
 
 ### 5.5 WebhookServer -- the JSON specialization
 
@@ -732,13 +737,14 @@ protected:
 | 9 | Worker | Build wire response from the step-4 worker-local keep-alive decision (no `SessionInfo` read); `toWireFormat` adds `Server`/`Connection`/`Date`. |
 | 10 | Worker | **Acquire `_mutex`**, `sendAsync` (completion fires synchronously, records outcome via a by-value shared atomic), **release**; connection left open (keep-alive). |
 
-### 7.2 Failure -- no route (404) and wrong method (405)
+### 7.2 Failure -- no route (404), wrong method (405) and closed owner (503)
 
 | Step | Actor | Action |
 |---|---|---|
 | 1-5 | as 7.1 | up to `classifyRequest`. |
-| 6a (404) | Worker | No pattern under any method and no `_defaultHandler` -> `NO_ROUTE`; `res.status = 404`, `set_content("Not Found", ...)`. If `_defaultHandler` is set it runs instead (under the safety net). |
+| 6a (404) | Worker | No pattern under any method and no `_defaultHandler` -> `NO_ROUTE`; `res.status = 404`, `set_content("Not Found", ...)`. If `_defaultHandler` is set it runs instead (under the safety net), unless its owner is closed (row 6c). |
 | 6b (405) | Worker | Path matches under another method -> `METHOD_NOT_ALLOWED`; `res.status = 405`, `set_content("Method Not Allowed", ...)`, `Allow` set from `getAllowedMethods`. No handler runs. |
+| 6c (503) | Worker | On an opted-in server, the owner of the matched handler (or of the default handler) is closed -> `OWNER_CLOSED`; `res.status = 503`, `set_content("Service Unavailable", "text/plain")` (bodyless for HEAD). No handler runs. |
 | 7 | Worker | Framing normalization + send as in 7.1. |
 
 ### 7.3 Failure -- parse error and handler throw
@@ -769,7 +775,7 @@ protected:
 
 | Lock | Guards | Notes |
 |---|---|---|
-| `_mutex` (`mutable std::mutex`) | `_handlers`, `_defaultHandler`, `_transport`, bind config (`_bindAddress`, `_port`, `_idleTimeout`, `_gcInterval`, `_tlsConfig`, `_listenerId`) | Held only briefly: the `classifyRequest` route-table read, each `sendRaw`/`sendRawForSse`/`closeSession`, the send-enqueue, route registration, config setters, and `stop()`'s transport-stop/reset. |
+| `_mutex` (`mutable std::mutex`) | `_handlers`, `_defaultHandler`, `_defaultHandlerOwner`, `_transport`, bind config (`_bindAddress`, `_port`, `_idleTimeout`, `_gcInterval`, `_tlsConfig`, `_listenerId`) | Held only briefly: the `classifyRequest` route-table read, each `sendRaw`/`sendRawForSse`/`closeSession`, the send-enqueue, route registration and `setDefaultHandler`, `removeHandlersOwnedBy` (moving the owner's entries out; they are destroyed after release), config setters, and `stop()`'s transport-stop/reset. |
 | `_sessionMutex` (`mutable std::mutex`) | `_sessionInfo`, `_upgradedSessions` | Buffer append/read, peer-info read, keep-alive decision, `markSessionUpgraded`, session/upgraded cleanup. |
 | `_shutdown` (`std::atomic<bool>`) | shutdown flag | Plain atomic store at the top of `stop()` (no `_mutex`); read lock-free in the fast path and `ShutdownChecker`. The subsequent `_mutex`-guarded transport reset establishes happens-before for stragglers. |
 
@@ -1122,6 +1128,7 @@ defect dressed up as "by design". The genuinely by-design entries are API-shape 
 | **No `onHead`/`onOptions` registrar** | Auto HEAD-for-GET and auto-OPTIONS are the only mechanisms; the HEAD/OPTIONS pattern vectors are always empty. | By design (v1) -- API shape, not a defect. |
 | **Single trailing wildcard only** | Patterns support exact, named-segment, and one trailing `*` -- no mid-path wildcards, multiple wildcards, or regex. Per-method lookup is O(routes). | By design -- API shape. |
 | **Re-registering an identical NAMED/WILDCARD pattern appends a dead entry** | Only EXACT re-registration overwrites; a duplicate NAMED/WILDCARD registration leaves an unreachable second entry (first-registered wins, the documented tie-break). | By design -- documented registration contract. |
+| **Owner tracking ends when the handler returns** | On an opted-in server the owner admission is released right after the dispatch switch. An SSE stream or a session a handler took over keeps running after that, and `CallbackGate::drain` / `removeHandlersOwnedBy` do not cover it (Section 5.4). | By design -- scope. |
 | **JSON wrappers only for GET and POST** | `WebhookServer` has no `onJsonPut`/`onJsonPatch`/`onJsonDelete`; use the raw `Handler` API for those methods. | By design -- API shape. |
 | **`WebhookServer` JSON wrappers answer every failure with 500 and echo `ex.what()`** | `onJsonGet`/`onJsonPost` catch every `std::exception` in one handler and answer **500** with `ex.what()` as the `text/plain` body (no `X-Content-Type-Options: nosniff`). Malformed JSON (including an empty `onJsonPost` body) gets **500**, not 400. An oversize body gets **500**, not 413, but only when `maxPayloadSize` is below ~1 MiB. With the 10 MB default, `HttpServer`'s 1 MiB per-session buffer answers a headers-only 413 and closes first (Section 5.5 step 1). Parser messages are fixed strings with no request bytes. What leaks is the size-limit text (which reveals `maxPayloadSize`) and the text of any `std::exception` the user's `JsonHandler` throws. A `JsonHandler` has the signature `parsers::Json(const parsers::Json&)` and has no `Response`, so it cannot set a status. Catching inside the handler only stops the exception text leaking, and the client then gets **200** with whatever JSON the handler returned. Size and parse failures happen before the handler runs, so the handler cannot intercept them. Only the raw `Handler` API (`onPost`/`onGet` with a `Response&`) controls the status code. | **Open -- P1**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-14_webhook-json-wrapper-status-codes-and-exception-leak_P1.json`. |
 | **JSON wrappers do not check `Content-Type` (cross-origin simple POST)** | `onJsonPost` parses any body as JSON whatever its `Content-Type`. A browser cross-origin "simple" POST (for example `text/plain`, a CORS-safelisted type, so no preflight is sent) therefore reaches a JSON handler, whose side effects run even though the attacking page cannot read the response. Authenticate requests to state-changing JSON endpoints, and require `application/json` (raw `Handler` API) where that is a concern. | **Open -- P1**, tracked `coding_trackers:tasks/iora/backlog/2026-09-24-14_webhook-json-wrapper-status-codes-and-exception-leak_P1.json` (proposes 415 for a non-JSON type). |
