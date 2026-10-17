@@ -336,8 +336,8 @@ public:
     return _shutdownMode;
   }
 
-  /// Shutdown the thread pool and wait for all threads to complete.
-  /// This is a blocking call that ensures all worker threads have fully exited.
+  /// Shutdown the thread pool and join every worker the pool still owns.
+  /// This is a blocking call; workers detached by a forced stop() are not waited for.
   /// Call this explicitly before destroying the pool to ensure clean shutdown.
   /// Serialized with start()/drain()/stop()/reset(): it waits behind an in-progress
   /// transition (up to an hour behind drain(0)), and while it joins a stuck task
