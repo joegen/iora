@@ -321,8 +321,7 @@ TEST_CASE("FeaturesConfig jsonFileStore=false does not abort with asserts enable
   REQUIRE(svc.jsonFileStore() == nullptr);
 }
 
-TEST_CASE("TempDirManager gives each instance its own directory",
-          "[iora][TempDirManager]")
+TEST_CASE("TempDirManager gives each instance its own directory", "[iora][TempDirManager]")
 {
   auto first = std::make_unique<TempDirManager>();
   TempDirManager second;

@@ -72,12 +72,11 @@ iora::IoraService::Config baseConfig(int port, const std::string &stateFile,
   return cfg;
 }
 
-// Shut the singleton down at scope exit. NOTE: after a FAILED init, shutdown() is
-// currently a no-op — IoraService::shutdown() early-returns on !_isRunning and
-// _isRunning is only set at the end of applyConfig (tracked: failed-init lifecycle
-// defect, iora 2026-10-01 followups). So on the throwing cases this guard does not
-// release the singleton; the suite tolerates that only because each subsequent
-// init() overwrites the stale members. It DOES clean up the successful cases.
+// Shut the singleton down at scope exit. A failed init() has already torn the
+// service down and released the singleton, so on the throwing cases this
+// shutdown() does nothing; it cleans up the successful cases. The throwing cases
+// hold the instance from before init() ("held") to check that it was torn down,
+// because instanceRef() after a failed init() would create a new, empty one.
 struct AlwaysShutdown
 {
   ~AlwaysShutdown()
@@ -373,9 +372,11 @@ TEST_CASE("TLS T3 requireClientCert without CA fails closed", "[iora][tls][confi
   cfg.server.tls.requireClientCert = true; // no caFile
 
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("caFile is not set"));
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 // --- T4/T5/T6/T7: partial configs fail closed at the EARLY predicate check --------
@@ -386,10 +387,12 @@ TEST_CASE("TLS T4 cert only fails closed", "[iora][tls][config]")
                         tmp.filePath("log"));
   cfg.server.tls.certFile = kCertFile; // no key
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured") &&
                         Catch::Matchers::Contains("keyFile"));
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 TEST_CASE("TLS T5 key only fails closed", "[iora][tls][config]")
@@ -399,10 +402,12 @@ TEST_CASE("TLS T5 key only fails closed", "[iora][tls][config]")
                         tmp.filePath("log"));
   cfg.server.tls.keyFile = kKeyFile; // no cert
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured") &&
                         Catch::Matchers::Contains("certFile"));
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 TEST_CASE("TLS T6 caFile only fails closed", "[iora][tls][config]")
@@ -412,9 +417,11 @@ TEST_CASE("TLS T6 caFile only fails closed", "[iora][tls][config]")
                         tmp.filePath("log"));
   cfg.server.tls.caFile = kCertFile; // no cert/key
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured"));
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 TEST_CASE("TLS T7 requireClientCert only fails closed", "[iora][tls][config]")
@@ -424,9 +431,11 @@ TEST_CASE("TLS T7 requireClientCert only fails closed", "[iora][tls][config]")
                         tmp.filePath("log"));
   cfg.server.tls.requireClientCert = true; // no paths at all
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("partially configured"));
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 // --- T8: intentional plaintext (nothing set; and requireClientCert=false alone) --
@@ -469,10 +478,12 @@ TEST_CASE("TLS T9 non-PEM cert fails closed at enableTls", "[iora][tls][config]"
   cfg.server.tls.certFile = junkCert; // set + non-empty → complete, but invalid
   cfg.server.tls.keyFile = kKeyFile;
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                       Catch::Matchers::Contains("certFile") &&
                         Catch::Matchers::Contains("PEM format"));
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 // --- T9b: valid-PEM but MISMATCHED cert/key (swapped) → throws in start() ----------
@@ -488,8 +499,10 @@ TEST_CASE("TLS T9b mismatched cert/key fails in start(), no half-built server",
   cfg.server.tls.certFile = kKeyFile; // a key in the cert slot (valid PEM, wrong type)
   cfg.server.tls.keyFile = kCertFile; // a cert in the key slot
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_AS(iora::IoraService::init(cfg), std::runtime_error);
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 // --- T9c: a start() bind failure (port held) → start()-catch reset (extra proof) --
@@ -504,8 +517,10 @@ TEST_CASE("TLS T9c start() bind failure leaves no half-built server",
   cfg.server.tls.keyFile = kKeyFile;
 
   AlwaysShutdown guard;
+  auto held = iora::IoraService::instance();
   REQUIRE_THROWS_AS(iora::IoraService::init(cfg), std::runtime_error);
-  REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+  REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+  REQUIRE(held->webhookServer() == nullptr);
 }
 
 // --- T10: mTLS config brings the listener up and rejects a cert-less client --------
@@ -557,10 +572,12 @@ TEST_CASE("TLS M1 empty strings are treated as unset", "[iora][tls][config]")
     cfg.server.tls.certFile = ""; // empty == unset
     cfg.server.tls.keyFile = kKeyFile;
     AlwaysShutdown guard;
+    auto held = iora::IoraService::instance();
     REQUIRE_THROWS_WITH(iora::IoraService::init(cfg),
                         Catch::Matchers::Contains("partially configured") &&
                           Catch::Matchers::Contains("certFile"));
-    REQUIRE(iora::IoraService::instanceRef().webhookServer() == nullptr);
+    REQUIRE(iora::IoraService::getInstancePtr() == nullptr);
+    REQUIRE(held->webhookServer() == nullptr);
   }
   SECTION("all-empty TLS block is not-requested → plaintext, no throw")
   {

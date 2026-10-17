@@ -224,6 +224,7 @@ set(SERVICE_TESTS
     service/iora_test_plugin_callback_lifecycle
     service/iora_test_features_config
     service/iora_test_service_tls_config
+    service/iora_test_service_failed_init
     service/iora_test_api_module_reverse_map
     service/iora_test_callexportedapi_gating
     service/iora_test_loadfailure_teardown
@@ -757,6 +758,10 @@ set(IORA_SANITIZED_TEST_TARGETS
     iora_test_threadpool
     iora_test_threadpool_cleanup
     iora_test_threadpool_lifecycle
+
+    # Failed-init rollback with live server/pool/purge/logger threads, and the
+    # concurrent shutdown() singleton read.
+    iora_test_service_failed_init
 )
 foreach(_san_target ${IORA_SANITIZED_TEST_TARGETS})
     if(TARGET ${_san_target})
@@ -1025,6 +1030,12 @@ if(IORA_BUILD_SERVICE_TESTS)
             endif()
         endforeach()
         target_link_libraries(iora_test_unload_teardown_exception PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+
+    # The failed-init rollback test loads onunloadrecordplugin at runtime.
+    if(TARGET iora_test_service_failed_init)
+        add_dependencies(iora_test_service_failed_init onunloadrecordplugin)
+        set_tests_properties(service::iora_test_service_failed_init PROPERTIES TIMEOUT 120)
     endif()
 
     # The validateModulePath traversal-guard test (tracker 2026-09-10-12) copies
