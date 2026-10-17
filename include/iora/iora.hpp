@@ -362,10 +362,12 @@ public:
     /// while the .so is still mapped, and then the .so is unloaded. In the
     /// destructor, stop and join any thread, ThreadPool task or timer the
     /// constructor or onLoad started. The destructor runs with the module loader
-    /// lock held, as onLoad and onUnload do. So it must not call
-    /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules or a
-    /// SafeApiFunction: they throw under that lock, and a throw from a destructor
-    /// calls std::terminate. A thread or task it joins must not be blocked in, or
+    /// lock held, as onLoad and onUnload do. So it must not call init, shutdown,
+    /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules,
+    /// registerDependency, a SafeApiFunction call or isAvailable(): they throw under
+    /// that lock, and a throw from a destructor calls std::terminate. A rejected
+    /// callExportedApi (not loaded / is unloading / API not found) throws too, so
+    /// it also ends in std::terminate. A thread or task it joins must not be blocked in, or
     /// able to start, isModuleLoaded, a SafeApiFunction call or isAvailable(), or
     /// one of those entry points: they wait for the lock, so the join deadlocks.
     /// Tell the thread to stop first, then join it (tracker 2026-09-24-24).
@@ -766,17 +768,32 @@ public:
   /// loaded / is unloading, or the signature does not match.
   ///
   /// The exported callable is copied out of _apiExports and invoked+destroyed on
-  /// the caller stack outside any lock, but the copy is protected against a
-  /// concurrent module unload by the per-module in-flight drain gate: the owning
-  /// module is resolved, entered (rejected if an unload is draining it), and the
+  /// the caller stack outside any lock this function takes, but the copy is
+  /// protected against a concurrent module unload by the per-module in-flight
+  /// drain gate: the owning module is resolved, admitted by enterApiCall (rejected
+  /// if it is not in _apiCallableModules or an unload is draining it), and the
   /// unload path WAITS for this call to complete before it tears the module down
-  /// (DP-1b). \note The return type MUST be HOST-OWNED. C++17 guaranteed copy
-  /// elision materializes the returned object in the CALLER's frame, so a return
-  /// type whose destructor lives in the plugin .so would run AFTER the drain
-  /// releases — outside the gate's protection. All in-repo callers return host-
-  /// owned types (iora_media codecs return CodecRegistry& / a reference; karoo_tmc
-  /// returns Json). The copied std::function itself IS protected (it is destroyed
-  /// before leaveApiCall by the declaration order below).
+  /// (DP-1b). It never takes _loadModulesMutex (DP-10c), so plugin code in a
+  /// lifecycle hook may call it.
+  ///
+  /// \note Callee under the loader lock: a call made from a lifecycle hook runs
+  /// the callee on the hook's thread with _loadModulesMutex held. A slow callee
+  /// delays every load, unload and SafeApiFunction call; a callee that hands work
+  /// to another thread which needs _loadModulesMutex (a load/unload, a non-owner
+  /// isModuleLoaded, a SafeApiFunction call) and waits for it deadlocks.
+  ///
+  /// \note The return type MUST be HOST-OWNED. C++17 guaranteed copy elision
+  /// materializes the returned object in the CALLER's frame, so a return type
+  /// whose destructor lives in the plugin .so would run AFTER the drain releases —
+  /// outside the gate's protection. The copied std::function itself IS protected
+  /// (it is destroyed before leaveApiCall by the declaration order below).
+  ///
+  /// \note A returned reference or pointer into plugin-owned state (iora_media's
+  /// codecs.registry returns CodecRegistry&) is NOT protected by the drain: it is
+  /// valid only while the callee is not torn down. Inside the caller's lifecycle
+  /// hook that holds (the hook's thread holds _loadModulesMutex). A dependency does
+  /// not keep the callee loaded; a holder must drop the reference in
+  /// onDependencyUnloaded, and unloadAllModules sends no such notice.
   template <typename Ret, typename... Args>
   Ret callExportedApi(const std::string &name, Args &&...args)
   {
@@ -1094,6 +1111,10 @@ public:
   }
 
   /// \brief Check if a module is currently loaded
+  /// \note Caller constraint: off the loader-lock thread this takes
+  /// _loadModulesMutex. Do not call it while holding a lock that a lifecycle hook
+  /// (onLoad/onUnload/onDependency*) also takes: the unloader holds
+  /// _loadModulesMutex while it runs that hook, so the two threads deadlock.
   bool isModuleLoaded(const std::string &moduleName) const
   {
     // SD-2: owner-aware. When THIS thread already holds _loadModulesMutex (a plugin
@@ -1630,10 +1651,12 @@ protected:
   /// while the .so is still mapped, and then the .so is unloaded. In the
   /// destructor, stop and join any thread, ThreadPool task or timer the
   /// constructor or onLoad started. The destructor runs with the module loader
-  /// lock held, as onLoad and onUnload do. So it must not call
-  /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules or a
-  /// SafeApiFunction: they throw under that lock, and a throw from a destructor
-  /// calls std::terminate. A thread or task it joins must not be blocked in, or
+  /// lock held, as onLoad and onUnload do. So it must not call init, shutdown,
+  /// loadSingleModule, unloadSingleModule, reloadModule, unloadAllModules,
+  /// registerDependency, a SafeApiFunction call or isAvailable(): they throw under
+  /// that lock, and a throw from a destructor calls std::terminate. A rejected
+  /// callExportedApi (not loaded / is unloading / API not found) throws too, so
+  /// it also ends in std::terminate. A thread or task it joins must not be blocked in, or
   /// able to start, isModuleLoaded, a SafeApiFunction call or isAvailable(), or
   /// one of those entry points: they wait for the lock, so the join deadlocks.
   /// Tell the thread to stop first, then join it (tracker 2026-09-24-24).
@@ -2317,11 +2340,13 @@ private:
   std::unordered_map<std::string, std::string> _apiToModule;
   // Lock order: _loadModulesMutex (outer) -> _apiMutex (inner). Any code
   // path that must hold both acquires _loadModulesMutex first. _apiCallGuard
-  // (declared below) is a leaf guarding TWO unrelated concerns: the
-  // SafeApiFunction registry AND the callExportedApi drain gate (Slice B). It is
-  // taken alone by the gate accessors and the registry accessors; the unload
-  // paths hold _loadModulesMutex and then take _apiCallGuard (beginApiDrain /
-  // endApiDrain via openGate, and teardown -> pruneSafeApiRegistry) — the
+  // (declared below) is a leaf guarding THREE unrelated concerns: the
+  // SafeApiFunction registry, the callExportedApi drain gate (Slice B) and the
+  // callExportedApi admission set _apiCallableModules (SD-1). It is taken alone
+  // by the gate accessors, enterApiCall and the registry accessors; the load and
+  // unload paths hold _loadModulesMutex and then take _apiCallGuard
+  // (markApiCallable / unmarkApiCallable, beginApiDrain / endApiDrain via
+  // openGate, and teardown -> pruneSafeApiRegistry) — the
   // _loadModulesMutex -> _apiCallGuard edge is ACYCLIC and pre-existing; NO path
   // takes _loadModulesMutex while holding _apiCallGuard, and callExportedApi
   // enters/leaves the gate DISJOINT from its _apiMutex copy (never both held).
@@ -2424,6 +2449,10 @@ public:
   /// \brief Whether this thread currently holds _loadModulesMutex, so
   /// getExportedApiSafe can REJECT (throw on) a call made from a plugin onLoad
   /// (host-only enforcement — a plugin-resident wrapper would use-after-dlclose).
+  /// Also read by the SD-2 fail-fast checks (throwIfUnderLoaderLock), the owner
+  /// branch of isModuleLoaded, and Plugin::require's check.
+  /// \pre One IoraService instance per process: the flag is per THREAD, not per
+  /// IoraService object, so a second instance would see the first one's state.
   /// Defined ONCE in src/core/iora_core.cpp
   /// (PAT-3), NOT as a header inline variable: iora.hpp is compiled into the host
   /// AND into plugin .so's (loaded RTLD_LOCAL), and an inline variable does not
@@ -2647,8 +2676,11 @@ private:
 
   /// \brief Block until no callExportedApi call to the module is in-flight. MUST
   /// run with _loadModulesMutex RELEASED (DP-3): an in-flight call must be able
-  /// to complete (its copy+invoke never holds _loadModulesMutex), so waiting
-  /// under _loadModulesMutex could not make progress. The predicate is
+  /// to complete, and a call from a host thread or another plugin's worker may
+  /// need _loadModulesMutex inside its callee, so waiting under _loadModulesMutex
+  /// could not make progress. (A call made from a lifecycle hook does hold
+  /// _loadModulesMutex across its copy+invoke, so it cannot be in flight while
+  /// another thread holds the lock to drain.) The predicate is
   /// gate-absent OR inFlight==0 (loop-safe against spurious wakeups).
   ///
   /// KNOWN LIMITATION (TS-1, unsupported topology): the thread-local in-flight set
@@ -3156,6 +3188,9 @@ public:
   /// (also under cacheMutex, with _loadModulesMutex released) therefore serializes
   /// against an in-flight invoke and clears the cache before dlclose — no
   /// per-call drain/counter is needed.
+  /// Throws std::logic_error when called on a thread that holds _loadModulesMutex
+  /// (host-only). \note Caller constraint: it takes _loadModulesMutex (through
+  /// isModuleLoaded); do not call it while holding a lock a lifecycle hook takes.
   R operator()(Args... args) const
   {
     // SD-2 (order constraint TS H1(c)): reject a call made from plugin code running
@@ -3213,6 +3248,8 @@ public:
   }
 
   /// \brief Check if the API is currently available
+  /// Throws std::logic_error when called on a thread that holds _loadModulesMutex
+  /// (host-only). \note Caller constraint: as for operator().
   bool isAvailable() const
   {
     // SD-2: host-only, for API consistency with operator() (this takes no

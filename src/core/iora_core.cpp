@@ -200,7 +200,9 @@ std::shared_ptr<IoraService> IoraService::peekInstance()
 // guarantee a single TLS instance across a dlopen boundary. getExportedApiSafe
 // reads this to REJECT (throw) a call made while this thread holds
 // _loadModulesMutex (a plugin calling it from onLoad) — host-only enforcement, so
-// a plugin-resident wrapper can never outlive its .so. Mirrors
+// a plugin-resident wrapper can never outlive its .so. The SD-2 fail-fast
+// checks, isModuleLoaded's owner branch and Plugin::require read it too. It is
+// per thread, not per IoraService object: one IoraService per process. Mirrors
 // Logger::handlerReentryDepth() above.
 bool &IoraService::ownsLoadModulesMutex()
 {
