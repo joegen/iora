@@ -14,15 +14,12 @@
 #include "../plugins/callback_control.hpp"
 #include "iora_test_net_utils.hpp" // uses Catch2 REQUIRE -> must follow catch.hpp
 
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
-#include <netinet/in.h>
 #include <stdexcept>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 
@@ -50,6 +47,15 @@ std::string pluginPath(const std::string &name)
   return iora::util::getExecutableDir() + "/plugins/" + name;
 }
 
+/// Releases every probe parked at phase 1.
+void releaseAllProbes()
+{
+  for (auto &probe : g_ctl.probes)
+  {
+    probe.phase.store(2);
+  }
+}
+
 /// One IoraService for one TEST_CASE, with its webhook server on a free port.
 struct Service
 {
@@ -75,10 +81,7 @@ struct Service
 
   ~Service()
   {
-    for (auto &s : g_ctl.probes)
-    {
-      s.phase.store(2);
-    }
+    releaseAllProbes();
     try
     {
       iora::IoraService::shutdown();
@@ -104,41 +107,12 @@ struct Reply
 Reply http(int port, const std::string &method, const std::string &path)
 {
   Reply r;
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-  {
-    return r;
-  }
-  timeval tv{};
-  tv.tv_sec = 8;
-  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<std::uint16_t>(port));
-  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
-  {
-    ::close(fd);
-    return r;
-  }
   const std::string body = method == "POST" ? "{}" : "";
-  const std::string req = method + " " + path +
-                          " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
-                          "Content-Type: application/json\r\nContent-Length: " +
-                          std::to_string(body.size()) + "\r\n\r\n" + body;
-  ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
-  std::string raw;
-  char buf[4096];
-  for (;;)
-  {
-    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    if (n <= 0)
-    {
-      break;
-    }
-    raw.append(buf, static_cast<std::size_t>(n));
-  }
-  ::close(fd);
+  const std::string raw = testnet::rawHttpRequest(
+    port, method + " " + path +
+            " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+            "Content-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body);
   const auto sp = raw.find(' ');
   if (sp != std::string::npos && raw.size() >= sp + 4)
   {
@@ -154,14 +128,12 @@ Reply http(int port, const std::string &method, const std::string &path)
 
 bool portRefuses(int port)
 {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<std::uint16_t>(port));
-  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-  const bool refused = ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0;
-  ::close(fd);
-  return refused;
+  const int fd = testnet::connectLoopbackTcp(port, 1);
+  if (fd >= 0)
+  {
+    ::close(fd);
+  }
+  return fd < 0;
 }
 
 void push(iora::IoraService &svc, const std::string &id, const std::string &name)
@@ -216,7 +188,7 @@ template <typename T> struct Bounded
       });
   }
 
-  bool finished(std::chrono::milliseconds budget = std::chrono::duration_cast<std::chrono::milliseconds>(BOUND))
+  bool finished(std::chrono::milliseconds budget = BOUND)
   {
     if (!t.joinable())
     {
@@ -234,6 +206,14 @@ template <typename T> struct Bounded
   {
     if (t.joinable())
     {
+      if (!st->done.load())
+      {
+        // A failing test may leave the worker parked at phase 1: release it and
+        // wait (bounded) BEFORE deciding to detach, so a released worker never
+        // runs on into the service teardown that follows.
+        releaseAllProbes();
+        iora::test::waitFor([this] { return st->done.load(); }, BOUND);
+      }
       if (st->done.load())
       {
         t.join();
@@ -485,10 +465,10 @@ TEST_CASE("P-8 a handler registered inside onUnload never runs and is removed")
 
 TEST_CASE("P-9 registrations are attributed to the plugin whose hook made them")
 {
+  std::atomic<int> host{0};
   Service s;
   auto &svc = *s.svc;
   configureProbe(P, ProbeMode::NORMAL, "p");
-  std::atomic<int> host{0};
   svc.eventQueue().onEventName("host.evt", [&host](const iora::parsers::Json &) { ++host; });
   REQUIRE(svc.loadSingleModule(pluginPath(P)));
   REQUIRE(svc.loadSingleModule(pluginPath(DEP)));
@@ -507,16 +487,28 @@ TEST_CASE("P-9 registrations are attributed to the plugin whose hook made them")
     },
     BOUND));
 
+  // Reload the dependency while DEP stays loaded: notifyDependentsOfLoad runs
+  // DEP's onDependencyLoaded while the probe's own load scope is still open, so
+  // the handler it registers must still belong to DEP (not to the probe).
+  REQUIRE(svc.loadSingleModule(pluginPath(P)));
+  push(svc, "d4", "dep.reloaded");
+  REQUIRE(iora::test::waitFor([&] { return dep.depReloadedHandler.load() == 1; }, BOUND));
+  REQUIRE(svc.unloadSingleModule(P));
+  push(svc, "d4", "dep.reloaded");
+  REQUIRE(iora::test::waitFor([&] { return dep.depReloadedHandler.load() == 2; }, BOUND));
+
   REQUIRE(svc.unloadSingleModule(DEP));
   push(svc, "d1", "dep.onload");
   push(svc, "d2", "dep.loaded");
   push(svc, "d3", "dep.unloaded");
+  push(svc, "d4", "dep.reloaded");
   push(svc, "h1", "host.evt");
   REQUIRE(iora::test::waitFor([&] { return host.load() == 2; }, BOUND));
   std::this_thread::sleep_for(QUIET);
   REQUIRE(dep.onLoadHandler.load() == 1);
   REQUIRE(dep.depLoadedHandler.load() == 1);
   REQUIRE(dep.depUnloadedHandler.load() == 1);
+  REQUIRE(dep.depReloadedHandler.load() == 2);
 }
 
 TEST_CASE("P-10 shutdown waits for an event handler in flight; window is closed")
@@ -678,6 +670,7 @@ TEST_CASE("P-14 an unload from a co-dispatched handler")
 int main(int argc, char *argv[])
 {
   Catch::Session session;
+  testnet::ignoreSigpipeForTestProcess();
   iora::test::initializeTestLogging();
   const int result = session.run(argc, argv);
   iora::util::removeFilesContainingAny({"ioraservice_plugin_callback_lifecycle_log",

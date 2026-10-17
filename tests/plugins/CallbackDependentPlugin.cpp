@@ -2,9 +2,12 @@
 //
 // Callback-ownership attribution probe (tracker 2026-10-16-12). require()s the
 // probe module and registers one EventQueue handler in each of onLoad,
-// onDependencyLoaded and onDependencyUnloaded. All three must be attributed to
-// THIS module: they survive the probe's unload and are removed by this
-// module's unload.
+// onDependencyLoaded and onDependencyUnloaded. The first onDependencyLoaded
+// comes from require() (inside this module's onLoad); the second comes from
+// notifyDependentsOfLoad when the probe is loaded again while this module stays
+// loaded, and registers "dep.reloaded". All of them must be attributed to THIS
+// module: they survive the probe's unload and are removed by this module's
+// unload.
 #include "iora/iora.hpp"
 
 #include "callback_control.hpp"
@@ -38,12 +41,18 @@ public:
 
   void onDependencyLoaded(const std::string &) override
   {
-    if (!_loadedRegistered)
+    ++_loadedCalls;
+    if (_loadedCalls == 1)
     {
-      _loadedRegistered = true;
       _svc->eventQueue().onEventName("dep.loaded",
                                      [this](const iora::parsers::Json &)
                                      { _slot->depLoadedHandler.fetch_add(1); });
+    }
+    else if (_loadedCalls == 2)
+    {
+      _svc->eventQueue().onEventName("dep.reloaded",
+                                     [this](const iora::parsers::Json &)
+                                     { _slot->depReloadedHandler.fetch_add(1); });
     }
   }
 
@@ -61,7 +70,7 @@ public:
 private:
   iora::IoraService *_svc;
   DependentSlot *_slot = nullptr;
-  bool _loadedRegistered = false;
+  int _loadedCalls = 0;
   bool _unloadedRegistered = false;
 };
 

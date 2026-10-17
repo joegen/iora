@@ -89,12 +89,14 @@ struct DependentSlot
   std::atomic<int> onLoadHandler{0};
   std::atomic<int> depLoadedHandler{0};
   std::atomic<int> depUnloadedHandler{0};
+  std::atomic<int> depReloadedHandler{0};
 
   void reset()
   {
     onLoadHandler = 0;
     depLoadedHandler = 0;
     depUnloadedHandler = 0;
+    depReloadedHandler = 0;
   }
 };
 

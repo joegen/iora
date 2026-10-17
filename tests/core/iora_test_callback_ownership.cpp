@@ -116,12 +116,6 @@ TEST_CASE("U-1 Scope sets current() and nested scopes restore in order", "[callb
   REQUIRE(CallbackOwner::current().empty());
 
   std::string other;
-  std::thread(
-    [&other]
-    {
-      other = CallbackOwner::current();
-    })
-    .join();
   CallbackOwner::Scope a("A");
   std::thread(
     [&other]
@@ -138,7 +132,7 @@ TEST_CASE("U-2 admit of an empty owner is admitted and counts nothing", "[callba
   REQUIRE(static_cast<bool>(a));
   REQUIRE_FALSE(CallbackGate::admittedOnThisThread(""));
   auto f = drainAsync("");
-  REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+  REQUIRE(returnsWithin(f, BOUND));
 }
 
 TEST_CASE("U-3 admit counts, moves transfer, move-assign releases", "[callback_ownership]")
@@ -183,7 +177,7 @@ TEST_CASE("U-3 admit counts, moves transfer, move-assign releases", "[callback_o
     REQUIRE_FALSE(returnsWithin(f, SETTLE));
     second.reset();
     REQUIRE_FALSE(CallbackGate::admittedOnThisThread(A));
-    REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+    REQUIRE(returnsWithin(f, BOUND));
   }
 
   SECTION("assigning an empty admission over a counted one releases it at once")
@@ -193,7 +187,7 @@ TEST_CASE("U-3 admit counts, moves transfer, move-assign releases", "[callback_o
     REQUIRE_FALSE(returnsWithin(f, SETTLE));
     a = CallbackGate::Admission{};
     REQUIRE_FALSE(CallbackGate::admittedOnThisThread(A));
-    REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+    REQUIRE(returnsWithin(f, BOUND));
     REQUIRE_FALSE(static_cast<bool>(a));
   }
 
@@ -207,11 +201,11 @@ TEST_CASE("U-3 admit counts, moves transfer, move-assign releases", "[callback_o
     REQUIRE_FALSE(CallbackGate::admittedOnThisThread(A));
     REQUIRE(CallbackGate::admittedOnThisThread(B));
     auto fa = drainAsync(A);
-    REQUIRE(returnsWithin(fa, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+    REQUIRE(returnsWithin(fa, BOUND));
     auto fb = drainAsync(B);
     REQUIRE_FALSE(returnsWithin(fb, SETTLE));
     a = CallbackGate::Admission{};
-    REQUIRE(returnsWithin(fb, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+    REQUIRE(returnsWithin(fb, BOUND));
   }
 
   SECTION("self-move-assignment releases nothing")
@@ -259,7 +253,7 @@ TEST_CASE("U-5 drain waits for an admission on another thread", "[callback_owner
     auto f = drainAsync(owner);
     REQUIRE_FALSE(returnsWithin(f, SETTLE));
     holder.release();
-    REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+    REQUIRE(returnsWithin(f, BOUND));
     if (closeFirst)
     {
       CallbackGate::open(owner);
@@ -273,19 +267,19 @@ TEST_CASE("U-5 drain waits for an admission on another thread", "[callback_owner
 TEST_CASE("U-6 drain returns at once when idle and ignores other owners", "[callback_ownership]")
 {
   auto idle = drainAsync("u6.A");
-  REQUIRE(returnsWithin(idle, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+  REQUIRE(returnsWithin(idle, BOUND));
 
   RemoteHolder holder("u6.B");
   REQUIRE(holder.admitted());
   auto f = drainAsync("u6.A");
-  REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+  REQUIRE(returnsWithin(f, BOUND));
 }
 
 TEST_CASE("U-7 an empty owner is never gated", "[callback_ownership]")
 {
   CallbackGate::close("");
   auto f = drainAsync("");
-  REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+  REQUIRE(returnsWithin(f, BOUND));
   CallbackGate::open("");
   CallbackGate::close("");
   auto a = CallbackGate::admit("");
@@ -313,5 +307,5 @@ TEST_CASE("U-8 repeated cycles leave the owner clean", "[callback_ownership]")
   a = CallbackGate::Admission{};
   REQUIRE_FALSE(CallbackGate::admittedOnThisThread(A));
   auto f = drainAsync(A);
-  REQUIRE(returnsWithin(f, std::chrono::duration_cast<std::chrono::milliseconds>(BOUND)));
+  REQUIRE(returnsWithin(f, BOUND));
 }

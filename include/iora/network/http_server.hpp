@@ -2887,18 +2887,17 @@ private:
   /// \brief Admit `owner`, then copy the handler out. If the owner is closed,
   /// d becomes OWNER_CLOSED with no handler. Admit before copy, so no copy of a
   /// closed owner's handler is ever made. MUST be called with _mutex held.
-  static bool admitAndCopyHandler(DispatchDecision &d, const std::string &owner,
+  static void admitAndCopyHandler(DispatchDecision &d, const std::string &owner,
                                   const Handler &handler)
   {
     d.admission = core::CallbackGate::admit(owner);
     if (!d.admission)
     {
       d.cat = DispatchDecision::Cat::OWNER_CLOSED;
-      return false;
+      return;
     }
     d.handler = handler;
     d.hasHandler = true;
-    return true;
   }
 
   /// \brief Invoke a copied-out handler with the request-level safety net, run

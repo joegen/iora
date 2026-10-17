@@ -342,51 +342,44 @@ private:
                                 ") to " + std::to_string(totalHandlers) + " handlers");
     }
 
-    for (auto &entry : idHandlers)
-    {
-      try
-      {
-        entry.second(event);
-        handled = true;
-      }
-      catch (const std::exception &e)
-      {
-        iora::core::Logger::error("EventQueue: Handler exception for event ID " + eventId + ": " +
-                                  e.what());
-      }
-      catch (...)
-      {
-        iora::core::Logger::error("EventQueue: Handler threw a non-std::exception for event ID " +
-                                  eventId);
-      }
-      releaseAdmitted(entry);
-    }
-
-    for (auto &entry : nameHandlers)
-    {
-      try
-      {
-        entry.second(event);
-        handled = true;
-      }
-      catch (const std::exception &e)
-      {
-        iora::core::Logger::error("EventQueue: Handler exception for event name " + eventName +
-                                  ": " + e.what());
-      }
-      catch (...)
-      {
-        iora::core::Logger::error("EventQueue: Handler threw a non-std::exception for event name " +
-                                  eventName);
-      }
-      releaseAdmitted(entry);
-    }
+    const bool idRan = invokeAdmitted(idHandlers, event, "event ID", eventId);
+    const bool nameRan = invokeAdmitted(nameHandlers, event, "event name", eventName);
+    handled = idRan || nameRan;
 
     if (!handled)
     {
       iora::core::Logger::debug("EventQueue: No handlers found for event (id=" + eventId +
                                 ", name=" + eventName + ") - discarding");
     }
+  }
+
+  /// Invokes each admitted handler (exceptions logged and swallowed) and
+  /// releases its admission right after it runs. Returns true if any handler
+  /// returned normally.
+  static bool invokeAdmitted(std::vector<AdmittedHandler> &entries, const parsers::Json &event,
+                             const char *what, const std::string &key)
+  {
+    bool ran = false;
+    for (auto &entry : entries)
+    {
+      try
+      {
+        entry.second(event);
+        ran = true;
+      }
+      catch (const std::exception &e)
+      {
+        iora::core::Logger::error(std::string("EventQueue: Handler exception for ") + what + " " +
+                                  key + ": " + e.what());
+      }
+      catch (...)
+      {
+        iora::core::Logger::error(std::string("EventQueue: Handler threw a non-std::exception for ") +
+                                  what + " " + key);
+      }
+      releaseAdmitted(entry);
+    }
+    return ran;
   }
 
   /// Destroys the handler copy while it is still admitted, then releases the

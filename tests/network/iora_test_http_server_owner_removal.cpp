@@ -14,15 +14,12 @@
 #include "iora/network/webhook_server.hpp"
 #include "iora_test_net_utils.hpp" // uses Catch2 REQUIRE -> must follow catch.hpp
 
-#include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <future>
 #include <memory>
-#include <netinet/in.h>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 
@@ -49,39 +46,9 @@ struct Reply
 Reply http(int port, const std::string &method, const std::string &path)
 {
   Reply r;
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0)
-  {
-    return r;
-  }
-  timeval tv{};
-  tv.tv_sec = 4;
-  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<std::uint16_t>(port));
-  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
-  {
-    ::close(fd);
-    return r;
-  }
-  const std::string req = method + " " + path +
-                          " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
-                          "Content-Length: 0\r\n\r\n";
-  ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
-  std::string raw;
-  char buf[4096];
-  for (;;)
-  {
-    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-    if (n <= 0)
-    {
-      break;
-    }
-    raw.append(buf, static_cast<std::size_t>(n));
-  }
-  ::close(fd);
+  const std::string raw = testnet::rawHttpRequest(
+    port, method + " " + path +
+            " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
   const auto sp = raw.find(' ');
   if (sp != std::string::npos && raw.size() >= sp + 4)
   {
@@ -101,7 +68,20 @@ HttpServer::Handler body(const std::string &text)
   return [text](const Request &, Response &res) { res.set_content(text, "text/plain"); };
 }
 
+// A peer may reset a connection the client still writes to; ignore SIGPIPE for
+// this test process so that cannot kill the binary.
+struct SigpipeIgnoreListener : Catch::TestEventListenerBase
+{
+  using TestEventListenerBase::TestEventListenerBase;
+  void testRunStarting(Catch::TestRunInfo const &) override
+  {
+    testnet::ignoreSigpipeForTestProcess();
+  }
+};
+
 } // namespace
+
+CATCH_REGISTER_LISTENER(SigpipeIgnoreListener)
 
 TEST_CASE("H-1 removeHandlersOwnedBy removes the owner's routes; others keep order",
           "[HttpServer][owner]")
@@ -166,9 +146,11 @@ TEST_CASE("H-2 a closed owner's route answers 503; Allow and 405 are unchanged",
   REQUIRE(get.body == "Service Unavailable");
   REQUIRE(head.status == 503);
   REQUIRE(head.body.empty());
+  REQUIRE(head.head.find("Content-Length: 19") != std::string::npos);
   REQUIRE(post.status == 405);
   REQUIRE(post.head.find("Allow: GET") != std::string::npos);
   REQUIRE(options.status == 204);
+  REQUIRE(options.head.find("Allow: GET") != std::string::npos);
 
   auto after = http(port, "GET", "/h2");
   REQUIRE(after.status == 200);

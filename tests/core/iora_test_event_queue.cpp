@@ -163,25 +163,6 @@ Json ownEvent(const std::string &id, const std::string &name)
   return e;
 }
 
-template <typename Pred> bool ownWaitUntil(Pred pred, std::chrono::milliseconds bound)
-{
-  const auto deadline = std::chrono::steady_clock::now() + bound;
-  while (!pred())
-  {
-    if (std::chrono::steady_clock::now() > deadline)
-    {
-      return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  }
-  return true;
-}
-
-constexpr std::chrono::milliseconds ownBound()
-{
-  return std::chrono::duration_cast<std::chrono::milliseconds>(OWN_BOUND);
-}
-
 /// Runs drain(owner) on a detached thread so a hang fails the test instead of
 /// wedging it.
 std::shared_future<void> ownDrainAsync(const std::string &owner)
@@ -221,9 +202,9 @@ struct SlowPhase
 TEST_CASE("E-1 removeHandlersOwnedBy removes the owner's id, name and pattern handlers",
           "[EventQueue][owner]")
 {
+  std::atomic<int> aId{0}, aName{0}, aPattern{0}, bId{0}, unowned{0};
   EventQueue queue(2);
   queue.enableCallbackOwnerTracking();
-  std::atomic<int> aId{0}, aName{0}, aPattern{0}, bId{0}, unowned{0};
   {
     CallbackOwner::Scope scope("e1.A");
     queue.onEventId("e1", [&](const Json &) { ++aId; });
@@ -237,12 +218,12 @@ TEST_CASE("E-1 removeHandlersOwnedBy removes the owner's id, name and pattern ha
   queue.onEventName("n1", [&](const Json &) { ++unowned; });
 
   queue.push(ownEvent("e1", "n1"));
-  REQUIRE(ownWaitUntil([&] { return aId == 1 && aName == 1 && aPattern == 1 && bId == 1 && unowned == 1; },
-                       ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return aId == 1 && aName == 1 && aPattern == 1 && bId == 1 && unowned == 1; },
+                       OWN_BOUND));
 
   queue.removeHandlersOwnedBy("e1.A");
   queue.push(ownEvent("e1", "n1"));
-  REQUIRE(ownWaitUntil([&] { return bId == 2 && unowned == 2; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return bId == 2 && unowned == 2; }, OWN_BOUND));
   std::this_thread::sleep_for(OWN_SETTLE);
   REQUIRE(aId == 1);
   REQUIRE(aName == 1);
@@ -252,9 +233,9 @@ TEST_CASE("E-1 removeHandlersOwnedBy removes the owner's id, name and pattern ha
 
 TEST_CASE("E-2 a closed owner's handler is skipped and runs again after open", "[EventQueue][owner]")
 {
+  std::atomic<int> owned{0}, unowned{0};
   EventQueue queue(2);
   queue.enableCallbackOwnerTracking();
-  std::atomic<int> owned{0}, unowned{0};
   {
     CallbackOwner::Scope scope("e2.A");
     queue.onEventName("n2", [&](const Json &) { ++owned; });
@@ -263,21 +244,21 @@ TEST_CASE("E-2 a closed owner's handler is skipped and runs again after open", "
 
   CallbackGate::close("e2.A");
   queue.push(ownEvent("e2", "n2"));
-  REQUIRE(ownWaitUntil([&] { return unowned == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return unowned == 1; }, OWN_BOUND));
   std::this_thread::sleep_for(OWN_SETTLE);
   REQUIRE(owned == 0);
 
   CallbackGate::open("e2.A");
   queue.push(ownEvent("e2", "n2"));
-  REQUIRE(ownWaitUntil([&] { return owned == 1 && unowned == 2; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return owned == 1 && unowned == 2; }, OWN_BOUND));
 }
 
 TEST_CASE("E-3 drain waits for a handler admitted before close", "[EventQueue][owner]")
 {
   SlowPhase slow;
+  std::atomic<bool> finished{false};
   EventQueue queue(2);
   queue.enableCallbackOwnerTracking();
-  std::atomic<bool> finished{false};
   {
     CallbackOwner::Scope scope("e3.A");
     queue.onEventName("n3",
@@ -288,7 +269,7 @@ TEST_CASE("E-3 drain waits for a handler admitted before close", "[EventQueue][o
                       });
   }
   queue.push(ownEvent("e3", "n3"));
-  REQUIRE(ownWaitUntil([&] { return slow.phase == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return slow.phase == 1; }, OWN_BOUND));
 
   CallbackGate::close("e3.A");
   auto drained = ownDrainAsync("e3.A");
@@ -339,14 +320,14 @@ TEST_CASE("E-4 a removed handler is destroyed off the queue lock", "[EventQueue]
     // queue alive (the detached worker owns a reference) and fail.
     FAIL("removeHandlersOwnedBy deadlocked: removed handler destroyed under the queue lock");
   }
-  REQUIRE(ownWaitUntil([&] { return after->load() == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return after->load() == 1; }, OWN_BOUND));
 }
 
 TEST_CASE("E-5 a same-pattern overwrite moves the owner", "[EventQueue][owner]")
 {
+  std::atomic<int> a{0}, b{0};
   EventQueue queue(2);
   queue.enableCallbackOwnerTracking();
-  std::atomic<int> a{0}, b{0};
   {
     CallbackOwner::Scope scope("e5.A");
     queue.onEventNameMatches("^n5$", [&](const Json &) { ++a; });
@@ -357,7 +338,7 @@ TEST_CASE("E-5 a same-pattern overwrite moves the owner", "[EventQueue][owner]")
   }
   queue.removeHandlersOwnedBy("e5.A");
   queue.push(ownEvent("e5", "n5"));
-  REQUIRE(ownWaitUntil([&] { return b == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return b == 1; }, OWN_BOUND));
   std::this_thread::sleep_for(OWN_SETTLE);
   REQUIRE(a == 0);
 }
@@ -365,10 +346,10 @@ TEST_CASE("E-5 a same-pattern overwrite moves the owner", "[EventQueue][owner]")
 TEST_CASE("E-6 each admission is released right after its own handler", "[EventQueue][owner]")
 {
   SlowPhase slow;
-  EventQueue queue(1);
-  queue.enableCallbackOwnerTracking();
   std::atomic<int> aRan{0};
   std::atomic<int> seenAdmitted{-1};
+  EventQueue queue(1);
+  queue.enableCallbackOwnerTracking();
   {
     CallbackOwner::Scope scope("e6.A");
     queue.onEventId("e6", [&](const Json &) { ++aRan; });
@@ -381,7 +362,7 @@ TEST_CASE("E-6 each admission is released right after its own handler", "[EventQ
                     });
 
   queue.push(ownEvent("e6", "n6"));
-  REQUIRE(ownWaitUntil([&] { return slow.phase == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return slow.phase == 1; }, OWN_BOUND));
   REQUIRE(aRan == 1);
   REQUIRE(seenAdmitted == 0);
 
@@ -412,10 +393,10 @@ struct RecordAdmittedOnDestroy
 
 TEST_CASE("E-7 the handler copy is destroyed while still admitted", "[EventQueue][owner]")
 {
-  EventQueue queue(1);
-  queue.enableCallbackOwnerTracking();
   auto record = std::make_shared<std::atomic<int>>(-1);
   std::atomic<int> ran{0};
+  EventQueue queue(1);
+  queue.enableCallbackOwnerTracking();
   {
     CallbackOwner::Scope scope("e7.A");
     RecordAdmittedOnDestroy probe{record, std::this_thread::get_id()};
@@ -423,7 +404,7 @@ TEST_CASE("E-7 the handler copy is destroyed while still admitted", "[EventQueue
     probe.record.reset();
   }
   queue.push(ownEvent("e7", "n7"));
-  REQUIRE(ownWaitUntil([&] { return ran == 1 && record->load() != -1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return ran == 1 && record->load() != -1; }, OWN_BOUND));
   REQUIRE(record->load() == 1);
 }
 
@@ -450,7 +431,7 @@ TEST_CASE("E-8 an instance that is not opted in never gates or removes", "[Event
 
   CallbackGate::close("e8.A");
   plain.push(ownEvent("e8", "n8"));
-  REQUIRE(ownWaitUntil([&] { return slow.phase == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return slow.phase == 1; }, OWN_BOUND));
   REQUIRE(idCount == 1);
 
   auto drained = ownDrainAsync("e8.A");
@@ -459,11 +440,11 @@ TEST_CASE("E-8 an instance that is not opted in never gates or removes", "[Event
   CallbackGate::open("e8.A");
   slow.phase = 2;
   REQUIRE(returned);
-  REQUIRE(ownWaitUntil([&] { return patternCount == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return patternCount == 1; }, OWN_BOUND));
 
   plain.push(ownEvent("e8", "n8"));
-  REQUIRE(ownWaitUntil([&] { return idCount == 2 && nameCount == 2 && patternCount == 2; },
-                       ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return idCount == 2 && nameCount == 2 && patternCount == 2; },
+                       OWN_BOUND));
 
   // Positive control: the same registrations on an opted-in instance are gated.
   std::atomic<int> trackedOwned{0}, trackedUnowned{0};
@@ -478,7 +459,7 @@ TEST_CASE("E-8 an instance that is not opted in never gates or removes", "[Event
   tracked.onEventName("n8", [&](const Json &) { ++trackedUnowned; });
   CallbackGate::close("e8.A");
   tracked.push(ownEvent("e8", "n8"));
-  REQUIRE(ownWaitUntil([&] { return trackedUnowned == 1; }, ownBound()));
+  REQUIRE(iora::test::waitFor([&] { return trackedUnowned == 1; }, OWN_BOUND));
   std::this_thread::sleep_for(OWN_SETTLE);
   CallbackGate::open("e8.A");
   REQUIRE(trackedOwned == 0);
