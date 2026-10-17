@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 1.1 |
+| **Version** | 1.2 |
 | **Date** | 2026-10-17 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/common/i_lifecycle_managed.hpp` |
@@ -23,6 +23,7 @@ This guide covers `iora::common::ILifecycleManaged`, the abstract interface for 
 |---|---|---|
 | 1.0 | 2026-09-24 | Initial guide, authored against source. Header comments corrected in the same change: `start()` restarts from `Reset` directly to `Running` (no transition back to `Created`); `stop()` is valid from `Running` or `Draining`; the state after a drain timeout is implementer-defined; the in-flight definitions now describe what each implementer actually counts; the iora_sip-specific examples (SIP CANCEL/500, Transaction Layer) were replaced with layer-neutral wording. `lifecycleStateToString` is now `noexcept`. Implementer defects found while writing this guide are tracked in coding_trackers `tasks/iora/backlog/2026-09-24-5_timerservice-concurrent-lifecycle-transitions_P0.json`, `2026-09-24-6_threadpool-lifecycle-gaps_P0.json` and `2026-09-24-7_lifecycle-state-single-source-enumerators_P1.json`. |
 | 1.1 | 2026-10-17 | Synced to the ThreadPool lifecycle hardening (tracker `2026-09-24-6`): ThreadPool now refuses transitions and `shutdown()` called from its own workers, fails fast when destroyed from one of them, serializes `shutdown()` with the transitions (and publishes `Stopped`), rejects a task enqueued behind a completed drain, and rolls back a failed `start()` to `Reset`. Updated the implementer table, the Do-NOT list, the Thread Safety Model, the method summary and the Known Limitations; refreshed `thread_pool.hpp` line citations. Steps 13-14 review fixes: re-measured citations; `shutdown()` join scope after a forced `stop()`; `stop()` wait bound; `drain(0)` cap listed as a kept outcome. |
+| 1.2 | 2026-10-17 | `lifecycleStateToString`'s `switch` has no `default`, so a missing enumerator is a compile error (tracker `2026-09-24-7`); its test discovers the enumerators by probing values. Added a Design Decisions row and a Known Limitations entry for the GCC/Clang-only guard; repointed the ThreadPool tracker citation to `completed/`. |
 
 ---
 
@@ -282,6 +283,7 @@ inline const char *lifecycleStateToString(LifecycleState state) noexcept;
 | `drain` blocks with a timeout | Callers need a bounded shutdown; the default 30 s matches typical process-manager stop grace periods. |
 | `DrainStats` inside `std::optional` | Only drain-type operations have counts; the other transitions leave it empty rather than reporting zeros. |
 | Restart goes `Reset` -> `Running` directly | Both implementers restart from `Reset`; a separate `Created` step would add a transition nobody calls. |
+| `lifecycleStateToString`'s `switch` has no `default` | A missing case is a compile error under the build's `-Wall -Werror` (`cmake/CompilerFlags.cmake`), so the function cannot silently fall behind the enum; the `return "Unknown"` after the `switch` serves out-of-range values. A public enumerator array was rejected: it would add a plugin-facing name and, with no sentinel enumerator, could not be checked by the compiler. |
 | Enumerator names kept in PascalCase | `Created` / `Running` / `Draining` / `Stopped` / `Reset` predate the ALL_UPPERCASE enum-value rule and are part of a cross-repo interface (iora_sip implements it in several layers); renaming them would break every implementer. Waived on 2026-09-24. |
 
 ---
@@ -290,14 +292,15 @@ inline const char *lifecycleStateToString(LifecycleState state) noexcept;
 
 - **The state machine is not enforced by the interface.** Each implementer checks its own preconditions and outcomes, and they differ (see the implementer table).
 - **Known implementer gaps.** The implementers do not fully meet this contract today. The defects are tracked, and the implementer guides ([`../core/thread_pool.md`](../core/thread_pool.md), [`../core/timer.md`](../core/timer.md)) own their details:
-  - ThreadPool -- the gaps tracked in `tasks/iora/ongoing/2026-09-24-6_threadpool-lifecycle-gaps_P0.json` are fixed, with three deliberate outcomes kept: `stop()` from `Draining` still gives no extra grace (intended; see the implementer table), `drain(0)` stays capped at one hour (see the implementer table), and destroying the pool from one of its own workers terminates the process instead of being supported (real support is tracked in `tasks/iora/backlog/2026-09-10-8_threadpool-detached-worker-shared-control-block-teardown_P2.json`).
+  - ThreadPool -- the gaps tracked in `tasks/iora/completed/2026-09-24-6_threadpool-lifecycle-gaps_P0.json` are fixed, with three deliberate outcomes kept: `stop()` from `Draining` still gives no extra grace (intended; see the implementer table), `drain(0)` stays capped at one hour (see the implementer table), and destroying the pool from one of its own workers terminates the process instead of being supported (real support is tracked in `tasks/iora/backlog/2026-09-10-8_threadpool-detached-worker-shared-control-block-teardown_P2.json`).
   - TimerService -- `tasks/iora/backlog/2026-09-24-5_timerservice-concurrent-lifecycle-transitions_P0.json` (TS-1..TS-9) and `tasks/iora/ongoing/2026-09-13-5_timerservice-stop-join-on-self_P0.json`: concurrent transitions; `stop()` releasing resources; `drain(0)` from a callback deadlocking; `stop()` or destruction from a callback self-joining; fd leaks on `initialize()` failures; `reset()` recycling timer IDs; the unbounded join in `stop()`; a drain-timeout restore that is not atomic with the run-loop-exit check.
 - **ThreadPool can become terminally detached.** A `stop()` that cannot quiesce force-detaches its workers; the pool can never be restarted (`thread_pool.hpp:576-590`, `:818`), and it must not be destroyed while the detached task is still running (undefined behavior; see the Thread Safety Model).
 - **Naming.** `LifecycleState::Reset` is named after the action that produces it ("has been reset"), and `LifecycleResult::newState` is the *current* state even when the transition failed and nothing changed.
 - **`Created` is effectively unused.** Both implementers are `Running` on construction, so a caller cannot construct-then-start.
 - **Counts are 32-bit.** `DrainStats` fields and `getInFlightCount()` are `std::uint32_t`; ThreadPool saturates a larger count to the 32-bit maximum.
 - **No dependency orchestration helper.** The contract describes `stop()` draining dependencies, but there is no registry or helper that walks a dependency graph; each component does it by hand.
-- **No dedicated test file for the header.** The contract is exercised through `tests/core/iora_test_threadpool_lifecycle.cpp` and `tests/core/iora_test_timer_lifecycle.cpp`; `lifecycleStateToString` (all five names and the `"Unknown"` fallback) is tested in the former. That test lists the states by hand and the function's `switch` has a `default`, so a future sixth state would escape both (tracked in `tasks/iora/backlog/2026-09-24-7_lifecycle-state-single-source-enumerators_P1.json`).
+- **No dedicated test file for the header.** The contract is exercised through `tests/core/iora_test_threadpool_lifecycle.cpp` and `tests/core/iora_test_timer_lifecycle.cpp`; `lifecycleStateToString` is tested in the former: the test discovers the enumerators by probing values, and checks them against the expected names and the `"Unknown"` fallback.
+- **The missing-case guard is a GCC/Clang check.** `lifecycleStateToString`'s `switch` has no `default`, so `-Wswitch` (enabled by `-Wall`, an error under `-Werror`) rejects a new enumerator without a case in iora's own build. MSVC `/W4` does not enable the equivalent warning (C4062), and a consumer that includes the header as a system include does not see it.
 
 ---
 
