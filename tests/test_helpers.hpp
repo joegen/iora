@@ -8,12 +8,15 @@
 
 // Include the full iora header for now - tests need full access
 #include "iora/iora.hpp"
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 
@@ -111,17 +114,19 @@ class TempDirManager
 {
 public:
   TempDirManager(const std::string &prefix = "iora_test_")
-      : _dir("/tmp/" + prefix + std::to_string(std::time(nullptr)))
   {
-    std::filesystem::create_directories(_dir);
+    std::string buf = "/tmp/" + prefix + "XXXXXX";
+    if (::mkdtemp(buf.data()) == nullptr)
+    {
+      throw std::system_error(errno, std::generic_category(), "TempDirManager: mkdtemp");
+    }
+    _dir = buf;
   }
 
   ~TempDirManager()
   {
-    if (std::filesystem::exists(_dir))
-    {
-      std::filesystem::remove_all(_dir);
-    }
+    std::error_code ec;
+    std::filesystem::remove_all(_dir, ec);
   }
 
   const std::string &path() const { return _dir; }

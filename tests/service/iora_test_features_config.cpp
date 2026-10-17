@@ -320,3 +320,23 @@ TEST_CASE("FeaturesConfig jsonFileStore=false does not abort with asserts enable
   AutoServiceShutdown guard(svc);
   REQUIRE(svc.jsonFileStore() == nullptr);
 }
+
+TEST_CASE("TempDirManager gives each instance its own directory",
+          "[iora][TempDirManager]")
+{
+  auto first = std::make_unique<TempDirManager>();
+  TempDirManager second;
+
+  REQUIRE(first->path() != second.path());
+  REQUIRE(std::filesystem::is_directory(first->path()));
+  REQUIRE(std::filesystem::is_directory(second.path()));
+
+  const std::string file = second.filePath("keep.txt");
+  {
+    std::ofstream out(file);
+    out << "data";
+  }
+  first.reset();
+
+  REQUIRE(std::filesystem::exists(file));
+}
