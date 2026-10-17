@@ -12,6 +12,7 @@
 #include <iora/core/thread_pool.hpp>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1397,9 +1398,8 @@ TEST_CASE("lifecycleStateToString names every state", "[lifecycle]")
   }
 
   REQUIRE(names == expected);
-  for (std::size_t i = 0; i < indices.size(); ++i)
-  {
-    REQUIRE(indices[i] == static_cast<int>(i));
-  }
+  std::vector<int> expectedIndices(expected.size());
+  std::iota(expectedIndices.begin(), expectedIndices.end(), 0);
+  REQUIRE(indices == expectedIndices);
   REQUIRE(std::string(lifecycleStateToString(static_cast<LifecycleState>(99))) == "Unknown");
 }

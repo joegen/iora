@@ -283,7 +283,7 @@ inline const char *lifecycleStateToString(LifecycleState state) noexcept;
 | `drain` blocks with a timeout | Callers need a bounded shutdown; the default 30 s matches typical process-manager stop grace periods. |
 | `DrainStats` inside `std::optional` | Only drain-type operations have counts; the other transitions leave it empty rather than reporting zeros. |
 | Restart goes `Reset` -> `Running` directly | Both implementers restart from `Reset`; a separate `Created` step would add a transition nobody calls. |
-| `lifecycleStateToString`'s `switch` has no `default` | A missing case is a compile error under the build's `-Wall -Werror` (`cmake/CompilerFlags.cmake`), so the function cannot silently fall behind the enum; the `return "Unknown"` after the `switch` serves out-of-range values. A public enumerator array was rejected: it would add a plugin-facing name and, with no sentinel enumerator, could not be checked by the compiler. |
+| `lifecycleStateToString`'s `switch` has no `default` | A missing case is a compile error under the build's `-Wall -Werror` (`cmake/CompilerFlags.cmake:10-17`, GCC/Clang branch), so the function cannot silently fall behind the enum; the `return "Unknown"` after the `switch` serves out-of-range values. A public enumerator array was rejected: it would add a plugin-facing name and, with no sentinel enumerator, could not be checked by the compiler. |
 | Enumerator names kept in PascalCase | `Created` / `Running` / `Draining` / `Stopped` / `Reset` predate the ALL_UPPERCASE enum-value rule and are part of a cross-repo interface (iora_sip implements it in several layers); renaming them would break every implementer. Waived on 2026-09-24. |
 
 ---
