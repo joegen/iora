@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -47,37 +49,32 @@ struct ThreadPoolNoSeam
 {
 };
 
-/// Test-only park-point state. Present ONLY in the ThreadPoolT<true>
-/// instantiation used by the drain-quiescence regression test: it lets a worker
-/// be parked in the window between releasing _mutex after popping a task and
-/// incrementing _activeThreads, reproducing the busy-but-not-active state the
-/// quiescence gate must observe. Never instantiated in production
-/// (ThreadPoolT<false> uses ThreadPoolNoSeam).
-struct ThreadPoolTestSeam
-{
-  std::atomic<bool> armed{false};    ///< One-shot: park the next worker at the seam.
-  std::atomic<bool> parked{false};   ///< A worker is currently parked at the seam.
-  std::atomic<bool> release{false};  ///< Release the parked worker.
-  std::atomic<std::size_t> idleWaitEntries{0}; ///< Times a worker entered the idle wait.
-
-  /// One-shot park point for a caller thread (not a worker).
-  struct ParkPoint
-  {
-    std::atomic<bool> armed{false};
-    std::atomic<bool> parked{false};
-    std::atomic<bool> release{false};
-  };
-  ParkPoint shutdownJoin; ///< shutdownImpl: after its first join, others still joinable.
-  ParkPoint admission;    ///< enqueue: after the lock-free _accepting check, before _mutex.
-  ParkPoint spawn;        ///< enqueue: after notify_one(), before spawnWorker().
-};
-
-/// Selects a ThreadPoolTestSeam::ParkPoint from a test.
+/// Selects one of the caller park points in ThreadPoolTestSeam::callerParks.
 enum class ThreadPoolTestPark
 {
-  SHUTDOWN_JOIN,
-  ADMISSION,
-  SPAWN
+  SHUTDOWN_JOIN, ///< shutdownImpl: after its first join, others still joinable.
+  ADMISSION,     ///< enqueue: after the lock-free _accepting check, before _mutex.
+  SPAWN          ///< enqueue: after notify_one(), before spawnWorker().
+};
+
+/// Test-only hooks, present ONLY in the ThreadPoolT<true> instantiation used by the
+/// tests; ThreadPoolT<false> uses ThreadPoolNoSeam, so every hook compiles out. The
+/// hooks: a worker park point (in the busy-but-not-active window between releasing
+/// _mutex after a pop and incrementing _activeThreads), the caller park points named
+/// by ThreadPoolTestPark, an idle-wait entry counter, and (in ThreadPoolT) a
+/// spawn-failure injection.
+struct ThreadPoolTestSeam
+{
+  /// One-shot park point (worker or caller).
+  struct ParkPoint
+  {
+    std::atomic<bool> armed{false};   ///< One-shot: park the next thread that reaches it.
+    std::atomic<bool> parked{false};  ///< A thread is currently parked here.
+    std::atomic<bool> release{false}; ///< Release the parked thread.
+  };
+  ParkPoint worker;
+  std::array<ParkPoint, 3> callerParks; ///< Indexed by ThreadPoolTestPark.
+  std::atomic<std::size_t> idleWaitEntries{0}; ///< Times a worker entered the idle wait.
 };
 } // namespace detail
 
@@ -87,8 +84,9 @@ enum class ThreadPoolTestPark
 ///
 /// Implements ILifecycleManaged for graceful shutdown and reset capabilities.
 ///
-/// \tparam EnableTestSeam Compile-time flag that adds a test-only park point in
-///   the worker loop (see detail::ThreadPoolTestSeam). Defaults to false; the
+/// \tparam EnableTestSeam Compile-time flag that adds the test-only hooks of
+///   detail::ThreadPoolTestSeam (park points, idle-wait counter, spawn-failure
+///   injection). Defaults to false; the
 ///   `ThreadPool` alias below pins it to false so production code and every
 ///   consumer see an ordinary class. Tests instantiate ThreadPoolT<true>.
 template <bool EnableTestSeam = false>
@@ -631,11 +629,10 @@ public:
       std::lock_guard<std::mutex> lock(_mutex);
       // Never clear() over a live thread: destroying a joinable std::thread calls
       // std::terminate, and a still-running worker would touch the reset counters.
-      bool anyJoinable = !_workerIds.empty();
-      for (const auto &entry : _threads)
-      {
-        anyJoinable = anyJoinable || entry.second.joinable();
-      }
+      const bool anyJoinable =
+        !_workerIds.empty() ||
+        std::any_of(_threads.begin(), _threads.end(),
+                    [](const auto &entry) { return entry.second.joinable(); });
       if (anyJoinable)
       {
         return LifecycleResult(false, currentState,
@@ -696,7 +693,7 @@ public:
   {
     if constexpr (EnableTestSeam)
     {
-      seam().armed.store(true, std::memory_order_release);
+      seam().worker.armed.store(true, std::memory_order_release);
     }
   }
 
@@ -705,7 +702,7 @@ public:
   {
     if constexpr (EnableTestSeam)
     {
-      return seam().parked.load(std::memory_order_acquire);
+      return seam().worker.parked.load(std::memory_order_acquire);
     }
     return false;
   }
@@ -715,7 +712,7 @@ public:
   {
     if constexpr (EnableTestSeam)
     {
-      seam().release.store(true, std::memory_order_release);
+      seam().worker.release.store(true, std::memory_order_release);
     }
   }
 
@@ -866,28 +863,18 @@ private:
   /// Test-seam park point selector. Only instantiated when EnableTestSeam.
   detail::ThreadPoolTestSeam::ParkPoint &parkPoint(detail::ThreadPoolTestPark which) noexcept
   {
-    switch (which)
-    {
-    case detail::ThreadPoolTestPark::SHUTDOWN_JOIN:
-      return seam().shutdownJoin;
-    case detail::ThreadPoolTestPark::ADMISSION:
-      return seam().admission;
-    case detail::ThreadPoolTestPark::SPAWN:
-      break;
-    }
-    return seam().spawn;
+    return seam().callerParks[static_cast<std::size_t>(which)];
   }
   const detail::ThreadPoolTestSeam::ParkPoint &
   parkPoint(detail::ThreadPoolTestPark which) const noexcept
   {
-    return const_cast<ThreadPoolT *>(this)->parkPoint(which);
+    return seam().callerParks[static_cast<std::size_t>(which)];
   }
 
-  /// Park the calling thread at `which` if it is armed (one-shot). Test-only: every
-  /// call site is inside `if constexpr (EnableTestSeam)`.
-  void parkIfArmed(detail::ThreadPoolTestPark which)
+  /// Park the calling thread at `p` if it is armed (one-shot); no lock is held across
+  /// the park. Test-only: every call site is inside `if constexpr (EnableTestSeam)`.
+  void parkIfArmed(detail::ThreadPoolTestSeam::ParkPoint &p)
   {
-    auto &p = parkPoint(which);
     if (p.armed.exchange(false, std::memory_order_acq_rel))
     {
       p.parked.store(true, std::memory_order_release);
@@ -937,16 +924,7 @@ private:
   void shutdownImpl()
   {
     iora::core::Logger::debug("ThreadPool::shutdown() - Starting explicit shutdown");
-    bool setByThisCall = false;
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      if (!_shutdown)
-      {
-        _shutdown = true;
-        setByThisCall = true;
-      }
-    }
-    _condition.notify_all();
+    const bool setByThisCall = signalShutdown();
 
     // Wait for all in-flight work to complete BEFORE joining threads. This
     // prevents use-after-free when a task accesses objects being torn down.
@@ -968,7 +946,7 @@ private:
       {
         if (joinCount == 1)
         {
-          parkIfArmed(detail::ThreadPoolTestPark::SHUTDOWN_JOIN);
+          parkIfArmed(parkPoint(detail::ThreadPoolTestPark::SHUTDOWN_JOIN));
         }
       }
     }
@@ -984,14 +962,12 @@ private:
     std::thread movedThread;
     {
       std::lock_guard<std::mutex> lock(_mutex);
-      for (auto it = _threads.begin(); it != _threads.end(); ++it)
+      auto it = std::find_if(_threads.begin(), _threads.end(),
+                             [](const auto &entry) { return entry.second.joinable(); });
+      if (it != _threads.end())
       {
-        if (it->second.joinable())
-        {
-          movedThread = std::move(it->second);
-          _threads.erase(it);
-          break;
-        }
+        movedThread = std::move(it->second);
+        _threads.erase(it);
       }
     }
     if (!movedThread.joinable())
@@ -1002,16 +978,25 @@ private:
     return true;
   }
 
+  /// Set _shutdown under _mutex (which orders it for every reader), then wake every
+  /// worker. Returns true iff this call set it.
+  bool signalShutdown()
+  {
+    bool wasSet = false;
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      wasSet = _shutdown.exchange(true, std::memory_order_acq_rel);
+    }
+    _condition.notify_all();
+    return !wasSet;
+  }
+
   /// Spawn-failure rollback for the constructor and start(): signal shutdown and
   /// join every worker spawned so far (no task can be queued: _accepting is false
   /// in start(), and the constructor has not returned).
   void stopAndJoinSpawnedWorkers()
   {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _shutdown.store(true, std::memory_order_release);
-    }
-    _condition.notify_all();
+    signalShutdown();
     while (joinOneRemainingThread())
     {
     }
@@ -1057,15 +1042,28 @@ private:
 
   void enqueueImpl(std::function<void()> f)
   {
+    if (const char *reason = admitTask(f))
+    {
+      throw std::runtime_error(reason);
+    }
+  }
+
+  bool tryEnqueueImpl(std::function<void()> f) { return admitTask(f) == nullptr; }
+
+  /// Admission body shared by enqueueImpl and tryEnqueueImpl. Returns nullptr when f
+  /// was committed (f is moved from only then), else the rejection message.
+  /// spawnWorker() exceptions propagate (the task is already committed then).
+  const char *admitTask(std::function<void()> &f)
+  {
     // Check if accepting new work (for graceful drain support)
     if (!_accepting.load(std::memory_order_acquire))
     {
-      throw std::runtime_error("ThreadPool is draining and not accepting new work");
+      return "ThreadPool is draining and not accepting new work";
     }
 
     if constexpr (EnableTestSeam)
     {
-      parkIfArmed(detail::ThreadPoolTestPark::ADMISSION);
+      parkIfArmed(parkPoint(detail::ThreadPoolTestPark::ADMISSION));
     }
 
     bool shouldSpawn = false;
@@ -1076,16 +1074,16 @@ private:
       // locks after that point cannot admit a task behind a completed drain.
       if (!_accepting.load(std::memory_order_acquire))
       {
-        throw std::runtime_error("ThreadPool is draining and not accepting new work");
+        return "ThreadPool is draining and not accepting new work";
       }
       if (_shutdown)
       {
-        throw std::runtime_error("ThreadPool is shutting down");
+        return "ThreadPool is shutting down";
       }
 
       if (_tasks.size() >= _maxQueueSize)
       {
-        throw std::runtime_error("ThreadPool task queue is full");
+        return "ThreadPool task queue is full";
       }
 
       _tasks.emplace(std::move(f));
@@ -1103,7 +1101,7 @@ private:
 
     if constexpr (EnableTestSeam)
     {
-      parkIfArmed(detail::ThreadPoolTestPark::SPAWN);
+      parkIfArmed(parkPoint(detail::ThreadPoolTestPark::SPAWN));
     }
 
     // spawnWorker() re-checks _shutdown and _maxSize under _mutex, so a decision
@@ -1112,62 +1110,7 @@ private:
     {
       spawnWorker();
     }
-  }
-
-  bool tryEnqueueImpl(std::function<void()> f)
-  {
-    // Check if accepting new work (for graceful drain support)
-    if (!_accepting.load(std::memory_order_acquire))
-    {
-      return false; // Draining, reject task
-    }
-
-    if constexpr (EnableTestSeam)
-    {
-      parkIfArmed(detail::ThreadPoolTestPark::ADMISSION);
-    }
-
-    bool shouldSpawn = false;
-    {
-      std::unique_lock<std::mutex> lock(_mutex);
-      // Re-check under _mutex (see enqueueImpl).
-      if (!_accepting.load(std::memory_order_acquire))
-      {
-        return false; // Draining, reject task
-      }
-      if (_shutdown)
-      {
-        return false; // Shutting down, reject task
-      }
-
-      if (_tasks.size() >= _maxQueueSize)
-      {
-        return false; // Queue full, reject task
-      }
-
-      _tasks.emplace(std::move(f));
-
-      // Check if we should spawn a new thread
-      if (_threads.size() < _maxSize)
-      {
-        shouldSpawn = true;
-      }
-    } // Release mutex here
-
-    // Notify BEFORE spawning (see enqueueImpl).
-    _condition.notify_one();
-
-    if constexpr (EnableTestSeam)
-    {
-      parkIfArmed(detail::ThreadPoolTestPark::SPAWN);
-    }
-
-    // spawnWorker() re-checks _shutdown and _maxSize under _mutex (see enqueueImpl).
-    if (shouldSpawn)
-    {
-      spawnWorker();
-    }
-    return true;
+    return nullptr;
   }
 
   /// Spawn one worker unless the pool is shut down or already at _maxSize. The check
@@ -1321,18 +1264,7 @@ private:
             // is held across the park (getInFlightCount()/drain() stay live).
             if constexpr (EnableTestSeam)
             {
-              auto &s = seam();
-              if (s.armed.load(std::memory_order_acquire))
-              {
-                s.armed.store(false, std::memory_order_release);   // one-shot
-                s.parked.store(true, std::memory_order_release);
-                while (!s.release.load(std::memory_order_acquire))
-                {
-                  std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-                s.release.store(false, std::memory_order_release);  // re-arm for reuse
-                s.parked.store(false, std::memory_order_release);   // clear parked after release
-              }
+              parkIfArmed(seam().worker);
             }
 
             ++_activeThreads; // Thread is now executing (for monitoring)
@@ -1627,7 +1559,7 @@ private:
 /// The production thread pool: an ordinary class to every consumer. The test-seam
 /// template parameter is pinned to false here so the seam contributes zero bytes
 /// (empty-base optimization) and zero runtime cost. Tests instantiate
-/// ThreadPoolT<true> to exercise the drain-quiescence park point.
+/// ThreadPoolT<true> to use the test hooks of detail::ThreadPoolTestSeam.
 using ThreadPool = ThreadPoolT<false>;
 
 /// \brief Process-wide, immortal, hard-capped, reject-fast pool for BLOCKING I/O

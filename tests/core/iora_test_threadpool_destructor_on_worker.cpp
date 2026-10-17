@@ -63,14 +63,14 @@ void waitFor(const std::atomic<bool> &flag)
   }
 }
 
-int failNoTerminate(const std::string &scenario)
+int failNoTerminate(const char *scenario)
 {
   std::this_thread::sleep_for(std::chrono::seconds(10));
-  std::fprintf(stderr, "[%s] FAILURE: reached end without terminating\n", scenario.c_str());
+  std::fprintf(stderr, "[%s] FAILURE: reached end without terminating\n", scenario);
   return 1;
 }
 
-int runBody(const std::string &scenario, const char *stage, ThreadPool::ShutdownMode mode)
+int runBody(const char *scenario, ThreadPool::ShutdownMode mode)
 {
   auto pool = std::make_shared<ThreadPool>(1, 1);
   pool->setShutdownMode(mode);
@@ -78,10 +78,10 @@ int runBody(const std::string &scenario, const char *stage, ThreadPool::Shutdown
   std::atomic<bool> mainDropped{false};
 
   pool->enqueue(
-    [box, &mainDropped, stage]()
+    [box, &mainDropped, scenario]()
     {
       waitFor(mainDropped);
-      g_stage.store(stage);
+      g_stage.store(scenario);
       box->reset(); // destroys the pool here, on its own worker
     });
 
@@ -90,17 +90,17 @@ int runBody(const std::string &scenario, const char *stage, ThreadPool::Shutdown
   return failNoTerminate(scenario);
 }
 
-int runCapture(const std::string &scenario, const char *stage, ThreadPool::ShutdownMode mode)
+int runCapture(const char *scenario, ThreadPool::ShutdownMode mode)
 {
   auto pool = std::make_shared<ThreadPool>(1, 1);
   pool->setShutdownMode(mode);
   std::atomic<bool> mainDropped{false};
 
   pool->enqueue(
-    [owner = pool, &mainDropped, stage]()
+    [owner = pool, &mainDropped, scenario]()
     {
       waitFor(mainDropped);
-      g_stage.store(stage); // the destroy follows when the worker resets this functor
+      g_stage.store(scenario); // the destroy follows when the worker resets this functor
     });
 
   pool.reset();
@@ -116,19 +116,19 @@ int main(int argc, char **argv)
 
   if (scenario == "immediate-body")
   {
-    return runBody(scenario, "immediate-body", ThreadPool::ShutdownMode::IMMEDIATE);
+    return runBody("immediate-body", ThreadPool::ShutdownMode::IMMEDIATE);
   }
   if (scenario == "immediate-capture")
   {
-    return runCapture(scenario, "immediate-capture", ThreadPool::ShutdownMode::IMMEDIATE);
+    return runCapture("immediate-capture", ThreadPool::ShutdownMode::IMMEDIATE);
   }
   if (scenario == "detached-body")
   {
-    return runBody(scenario, "detached-body", ThreadPool::ShutdownMode::DETACHED);
+    return runBody("detached-body", ThreadPool::ShutdownMode::DETACHED);
   }
   if (scenario == "detached-capture")
   {
-    return runCapture(scenario, "detached-capture", ThreadPool::ShutdownMode::DETACHED);
+    return runCapture("detached-capture", ThreadPool::ShutdownMode::DETACHED);
   }
   std::fprintf(stderr, "FAILURE: unknown scenario %s\n", scenario.c_str());
   return 2;
