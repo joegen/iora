@@ -203,7 +203,7 @@ public:
     throwIfUnderLoaderLock("IoraService::shutdown()");
     try
     {
-      auto instancePtr = getInstancePtr();
+      auto instancePtr = peekInstance();
       if (!instancePtr)
       {
         // Already shutdown or never initialized
@@ -220,62 +220,7 @@ public:
         return;
       }
 
-      // Stop and destroy the webhook server BEFORE unloading modules.
-      // Plugins may have registered route handlers (std::function callbacks)
-      // on the webhook server. If modules are unloaded first, those callbacks
-      // become dangling pointers into unmapped .so memory.
-      // stop() runs off _loadModulesMutex (an in-flight route handler may need
-      // it); the reset runs UNDER it, because an overlapping unload or failed
-      // load reads _webhookServer under it to remove a module's routes
-      // (removeModuleCallbacksLocked). Do not move the server out under the lock
-      // and destroy it outside: its routes must be destroyed before that module's
-      // dlclose.
-      if (svc._webhookServer)
-      {
-        svc._webhookServer->stop();
-        LoadModulesGuard resetGuard(svc._loadModulesMutex);
-        svc._webhookServer.reset();
-      }
-
-      svc.unloadAllModules();
-
-      // Stop ThreadPool if it exists
-      if (svc._threadPool)
-      {
-        svc._threadPool.reset();
-      }
-
-      // Clear all dependency tracking data
-      svc._dependents.clear();
-      svc._pendingDependencies.clear();
-
-      // Clear all API exports to ensure clean state. Unsynchronized (no
-      // _apiMutex hold) is safe ONLY under the documented destroyInstance
-      // quiescence precondition — no thread may call getExportedApiSafe or
-      // (un)loadModule concurrently with service destruction (see the
-      // _safeApiRegistry SHUTDOWN PRECONDITION note near its declaration).
-      svc._apiExports.clear();
-      svc._apiToModule.clear();
-
-      // Flush the JSON file store
-      if (svc._jsonFileStore)
-      {
-        svc._jsonFileStore->flush();
-      }
-
-      // Destroy remaining unique_ptr members
-      svc._stateStore.reset();
-      svc._jsonFileStore.reset();
-      svc._configLoader.reset();
-      svc._cache.reset();
-
-      svc._config = Config(); // Reset configuration
-
-      // Flush and shutdown logger
-      core::Logger::shutdown();
-
-      // Finally, destroy the singleton instance
-      IoraService::destroyInstance();
+      teardownInstance(svc);
     }
     catch (const std::exception &e)
     {
@@ -295,6 +240,71 @@ public:
     }
   }
 
+private:
+  /// \brief Tears down every subsystem of svc and releases the singleton.
+  /// Shared by shutdown() (after it wins the once-guard) and by init()'s
+  /// rollback when the start fails.
+  static void teardownInstance(IoraService &svc)
+  {
+    // Stop and destroy the webhook server BEFORE unloading modules.
+    // Plugins may have registered route handlers (std::function callbacks)
+    // on the webhook server. If modules are unloaded first, those callbacks
+    // become dangling pointers into unmapped .so memory.
+    // stop() runs off _loadModulesMutex (an in-flight route handler may need
+    // it); the reset runs UNDER it, because an overlapping unload or failed
+    // load reads _webhookServer under it to remove a module's routes
+    // (removeModuleCallbacksLocked). Do not move the server out under the lock
+    // and destroy it outside: its routes must be destroyed before that module's
+    // dlclose.
+    if (svc._webhookServer)
+    {
+      svc._webhookServer->stop();
+      LoadModulesGuard resetGuard(svc._loadModulesMutex);
+      svc._webhookServer.reset();
+    }
+
+    svc.unloadAllModules();
+
+    // Stop ThreadPool if it exists
+    if (svc._threadPool)
+    {
+      svc._threadPool.reset();
+    }
+
+    // Clear all dependency tracking data
+    svc._dependents.clear();
+    svc._pendingDependencies.clear();
+
+    // Clear all API exports to ensure clean state. Unsynchronized (no
+    // _apiMutex hold) is safe ONLY under the documented destroyInstance
+    // quiescence precondition — no thread may call getExportedApiSafe or
+    // (un)loadModule concurrently with service destruction (see the
+    // _safeApiRegistry SHUTDOWN PRECONDITION note near its declaration).
+    svc._apiExports.clear();
+    svc._apiToModule.clear();
+
+    // Flush the JSON file store
+    if (svc._jsonFileStore)
+    {
+      svc._jsonFileStore->flush();
+    }
+
+    // Destroy remaining unique_ptr members
+    svc._stateStore.reset();
+    svc._jsonFileStore.reset();
+    svc._configLoader.reset();
+    svc._cache.reset();
+
+    svc._config = Config(); // Reset configuration
+
+    // Flush and shutdown logger
+    core::Logger::shutdown();
+
+    // Finally, destroy the singleton instance
+    IoraService::destroyInstance();
+  }
+
+public:
   /// \brief Blocks until terminate() is called. Use to keep main() alive.
   void waitForTermination()
   {
@@ -400,8 +410,9 @@ public:
   /// \brief Initialises the singleton with a configuration object.
   static void init(const Config &config)
   {
+    throwIfUnderLoaderLock("IoraService::init()");
     // First ensure any previous instance is properly cleaned up
-    auto instancePtr = getInstancePtr();
+    auto instancePtr = peekInstance();
     if (instancePtr)
     {
       // If instance exists, shut it down first to ensure clean state
@@ -411,8 +422,48 @@ public:
     // Now get a fresh instance
     auto svcPtr = instance();
     IoraService &svc = *svcPtr;
-    svc._config = config;
-    svc.applyConfig();
+    if (svc._isRunning)
+    {
+      IORA_LOG_ERROR("init: Cannot apply config while service is running");
+      throw std::runtime_error("Cannot apply config while service is running");
+    }
+    // A failed start must not leave a half-started singleton behind (a live
+    // listener, loaded plugins, worker threads): tear it down on this thread,
+    // while svcPtr is held, and rethrow the original exception.
+    try
+    {
+      svc._config = config;
+      svc.applyConfig();
+    }
+    catch (...)
+    {
+      try
+      {
+        try
+        {
+          throw;
+        }
+        catch (const std::exception &e)
+        {
+          IORA_LOG_ERROR("init: start failed, rolling back: " << e.what());
+        }
+        catch (...)
+        {
+          IORA_LOG_ERROR("init: start failed, rolling back: unknown exception");
+        }
+      }
+      catch (...)
+      {
+      }
+      try
+      {
+        teardownInstance(svc);
+      }
+      catch (...)
+      {
+      }
+      throw;
+    }
   }
 
   /// \brief Accessor for the webhook server.
@@ -1294,6 +1345,10 @@ public:
   /// \brief Explicitly destroy the singleton instance (for tests only)
   /// WARNING: Only call when no other threads are using the instance
   static void destroyInstance();
+
+private:
+  /// \brief Copies the singleton under the singleton mutex; never creates it
+  static std::shared_ptr<IoraService> peekInstance();
 #else
   /// \brief Internal singleton storage using shared_ptr for safe lifetime management
   static std::shared_ptr<IoraService> &getInstancePtr()
@@ -1305,8 +1360,7 @@ public:
   /// \brief Thread-safe singleton access with shared_ptr for safe lifetime management
   static std::shared_ptr<IoraService> instancePtr()
   {
-    static std::mutex instanceMutex;
-    std::lock_guard<std::mutex> lock(instanceMutex);
+    std::lock_guard<std::mutex> lock(instanceMutex());
 
     auto &instance = getInstancePtr();
     if (!instance)
@@ -1321,9 +1375,23 @@ public:
   /// WARNING: Only call when no other threads are using the instance
   static void destroyInstance()
   {
-    static std::mutex instanceMutex;
-    std::lock_guard<std::mutex> lock(instanceMutex);
+    std::lock_guard<std::mutex> lock(instanceMutex());
     getInstancePtr().reset();
+  }
+
+private:
+  /// \brief Single mutex shared by instancePtr(), destroyInstance() and peekInstance()
+  static std::mutex &instanceMutex()
+  {
+    static std::mutex m;
+    return m;
+  }
+
+  /// \brief Copies the singleton under the singleton mutex; never creates it
+  static std::shared_ptr<IoraService> peekInstance()
+  {
+    std::lock_guard<std::mutex> lock(instanceMutex());
+    return getInstancePtr();
   }
 #endif
 
@@ -1736,11 +1804,6 @@ protected:
   /// \brief Applies the merged configuration in _config to the service.
   void applyConfig()
   {
-    if (_isRunning)
-    {
-      IORA_LOG_ERROR("applyConfig: Cannot apply config while service is running");
-      throw std::runtime_error("Cannot apply config while service is running");
-    }
     // Fill in defaults for any unset config values
     const int DEFAULT_PORT = 8080;
     const char *DEFAULT_STATE_FILE = "state.json";

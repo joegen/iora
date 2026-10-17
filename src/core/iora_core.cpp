@@ -160,7 +160,8 @@ CallbackGate::Gate &CallbackGate::gate()
 
 } // namespace core
 
-// IoraService singleton state — single mutex shared by instancePtr() and destroyInstance()
+// IoraService singleton state — single mutex shared by instancePtr(), destroyInstance() and
+// peekInstance()
 static std::mutex sInstanceMutex;
 
 std::shared_ptr<IoraService> &IoraService::getInstancePtr()
@@ -184,6 +185,12 @@ void IoraService::destroyInstance()
 {
   std::lock_guard<std::mutex> lock(sInstanceMutex);
   getInstancePtr().reset();
+}
+
+std::shared_ptr<IoraService> IoraService::peekInstance()
+{
+  std::lock_guard<std::mutex> lock(sInstanceMutex);
+  return getInstancePtr();
 }
 
 // Single process-wide (per-thread) definition of the SafeApiFunction unload
