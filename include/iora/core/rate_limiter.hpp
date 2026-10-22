@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -184,53 +185,46 @@ public:
   std::size_t remaining() const
   {
     std::lock_guard<std::mutex> lock(_mutex);
-    auto now = Clock::now();
-    // Count non-expired entries
-    std::size_t active = 0;
-    for (const auto& ts : _timestamps)
-    {
-      if (now - ts < _window)
-      {
-        ++active;
-      }
-    }
+    auto active =
+      static_cast<std::size_t>(std::distance(firstActive(Clock::now()), _timestamps.cend()));
     return _maxRequests > active ? _maxRequests - active : 0;
   }
 
   /// \brief Time until a slot becomes available.
-  /// Returns 0ms if a slot is available now.
+  /// Returns 0ms if a slot is available now. If maxRequests is 0 (deny all),
+  /// returns the window length: a bounded back-off, never
+  /// std::chrono::milliseconds::max().
   std::chrono::milliseconds timeUntilAvailable() const
   {
     std::lock_guard<std::mutex> lock(_mutex);
+    if (_maxRequests == 0)
+    {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(_window);
+    }
     auto now = Clock::now();
-
-    if (_timestamps.size() < _maxRequests)
+    auto oldestActive = firstActive(now);
+    if (static_cast<std::size_t>(std::distance(oldestActive, _timestamps.cend())) < _maxRequests)
     {
       return std::chrono::milliseconds(0);
     }
-
-    // Find the oldest non-expired timestamp
-    for (const auto& ts : _timestamps)
-    {
-      auto age = now - ts;
-      if (age < _window)
-      {
-        // This is the oldest active entry — it will expire at ts + _window
-        auto remaining = _window - age;
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
-        return ms + std::chrono::milliseconds(1); // round up
-      }
-    }
-    return std::chrono::milliseconds(0);
+    // The oldest active entry expires at *oldestActive + _window
+    auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(_window - (now - *oldestActive));
+    return ms + std::chrono::milliseconds(1); // round up
   }
 
 private:
+  /// The only place the expiry rule is written. The deque is non-decreasing
+  /// (timestamps are read and pushed under _mutex).
+  std::deque<TimePoint>::const_iterator firstActive(TimePoint now) const
+  {
+    return std::find_if(_timestamps.cbegin(), _timestamps.cend(),
+                        [&](TimePoint ts) { return now - ts < _window; });
+  }
+
   void evictExpired(TimePoint now)
   {
-    while (!_timestamps.empty() && (now - _timestamps.front()) >= _window)
-    {
-      _timestamps.pop_front();
-    }
+    _timestamps.erase(_timestamps.cbegin(), firstActive(now));
   }
 
   std::size_t _maxRequests;
@@ -347,28 +341,33 @@ public:
   }
 
   /// \brief Evict idle buckets (not accessed within maxIdle).
-  /// Two-pass: collect under shared_lock, erase under unique_lock.
+  /// Two-pass: collect under shared_lock, then erase under unique_lock only if
+  /// the bucket is still idle as of pass 1's time. A bucket refreshed,
+  /// re-created or replaced (setKeyRate) between the passes is kept.
   void cleanup(std::chrono::seconds maxIdle)
   {
     auto now = Clock::now();
+    auto maxIdleMs = std::chrono::duration_cast<std::chrono::milliseconds>(maxIdle);
+    auto isIdle = [&](const TokenBucket& bucket)
+    {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(now - bucket.lastAccess()) >
+             maxIdleMs;
+    };
     std::vector<K> toEvict;
 
     // Pass 1: collect idle keys (forEach uses shared_lock per shard)
-    auto maxIdleMs = std::chrono::duration_cast<std::chrono::milliseconds>(maxIdle);
     _buckets.forEach([&](const K& key, const TokenBucket& bucket)
     {
-      auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - bucket.lastAccess());
-      if (idle > maxIdleMs)
+      if (isIdle(bucket))
       {
         toEvict.push_back(key);
       }
     });
 
-    // Pass 2: erase collected keys (erase uses unique_lock per shard)
+    // Pass 2: re-check and erase under one unique_lock per key
     for (const auto& key : toEvict)
     {
-      _buckets.erase(key);
+      _buckets.eraseIf(key, [&](const K&, const TokenBucket& bucket) { return isIdle(bucket); });
     }
   }
 

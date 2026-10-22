@@ -10,7 +10,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -126,6 +128,32 @@ TEST_CASE("SlidingWindowCounter: timeUntilAvailable", "[rate_limiter][window]")
   REQUIRE(wait.count() <= 1100); // within the 1-second window + margin
 }
 
+TEST_CASE("SlidingWindowCounter: timeUntilAvailable agrees after a partial rollover",
+          "[rate_limiter][window]")
+{
+  SlidingWindowCounter c(2, std::chrono::seconds(2));
+  REQUIRE(c.tryAcquire());
+  std::this_thread::sleep_for(1500ms);
+  REQUIRE(c.tryAcquire());
+  std::this_thread::sleep_for(600ms);
+  // The first entry is expired and the second is still active; a host stall
+  // long enough to expire both fails here instead of passing vacuously.
+  REQUIRE(c.remaining() == 1);
+  REQUIRE(c.timeUntilAvailable() == 0ms);
+  REQUIRE(c.tryAcquire());
+  REQUIRE(c.timeUntilAvailable() > 0ms);
+  REQUIRE_FALSE(c.tryAcquire());
+}
+
+TEST_CASE("SlidingWindowCounter: maxRequests 0 denies all and reports the window",
+          "[rate_limiter][window]")
+{
+  SlidingWindowCounter c(0, std::chrono::seconds(3));
+  REQUIRE_FALSE(c.tryAcquire());
+  REQUIRE(c.remaining() == 0);
+  REQUIRE(c.timeUntilAvailable() == 3000ms);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // RateLimiterMap
 // ══════════════════════════════════════════════════════════════════════════════
@@ -199,23 +227,17 @@ TEST_CASE("RateLimiterMap: removeKey", "[rate_limiter][map]")
   REQUIRE(limiter.tryConsume("keyX")); // new bucket, full burst
 }
 
-TEST_CASE("RateLimiterMap: cleanup evicts idle", "[rate_limiter][map]")
+TEST_CASE("RateLimiterMap: cleanup evicts only keys idle longer than maxIdle",
+          "[rate_limiter][map][cleanup]")
 {
-  RateLimiterMap<std::string> limiter(10.0, 10.0);
-
-  limiter.tryConsume("active");
-  limiter.tryConsume("idle");
-
-  std::this_thread::sleep_for(200ms);
-
-  // Touch "active" again
-  limiter.tryConsume("active");
-
-  // Cleanup with 100ms idle threshold — "idle" should be evicted
-  limiter.cleanup(std::chrono::seconds(0)); // 0 = evict everything not just accessed
-
-  // Both evicted since cleanup(0s) means maxIdle=0
-  // Let's use a more realistic test
+  RateLimiterMap<std::string> rl(10.0, 10.0);
+  REQUIRE(rl.tryConsume("idle"));
+  std::this_thread::sleep_for(1100ms);
+  REQUIRE(rl.tryConsume("active"));
+  rl.cleanup(std::chrono::seconds(1));
+  REQUIRE(rl.size() == 1);
+  REQUIRE_FALSE(rl.getKeyRate("idle").has_value());
+  REQUIRE(rl.getKeyRate("active").has_value());
 }
 
 TEST_CASE("RateLimiterMap: cleanup with idle threshold", "[rate_limiter][map]")
@@ -473,4 +495,80 @@ TEST_CASE("RateLimiterMap: negative tokens do not mint balance", "[rate_limiter]
   REQUIRE(m.tryConsume("k", 5.0));
   REQUIRE_FALSE(m.tryConsume("k", -5.0));
   REQUIRE_FALSE(m.tryConsume("k", 1.0));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// cleanup: work between pass 1 and pass 2
+// ══════════════════════════════════════════════════════════════════════════════
+
+// One-shot hook run from the key hash. ConcurrentHashMap::shardFor hashes
+// before it takes the shard lock, and cleanup's pass 1 (forEach) never hashes,
+// so the first hash after arming is pass 2's call for its first key, with no
+// lock held. The hook is disarmed before it runs, so its own map calls do not
+// re-trigger it. If shardFor ever hashes under the lock, the re-entry
+// self-deadlocks and ctest --timeout reports the failure.
+struct HookHash
+{
+  static std::function<void()>& slot()
+  {
+    static std::function<void()> hook;
+    return hook;
+  }
+
+  std::size_t operator()(int k) const
+  {
+    if (slot())
+    {
+      auto hook = std::exchange(slot(), nullptr);
+      hook();
+    }
+    return std::hash<int>{}(k);
+  }
+};
+
+TEST_CASE("RateLimiterMap: cleanup keeps a key refreshed between the passes",
+          "[rate_limiter][map][cleanup]")
+{
+  HookHash::slot() = nullptr;
+  RateLimiterMap<int, HookHash> rl(1e-3, 3.0);
+  REQUIRE(rl.tryConsume(1));
+  REQUIRE(rl.tryConsume(1));
+  REQUIRE(rl.tryConsume(2));
+  std::this_thread::sleep_for(5ms);
+
+  bool fired = false;
+  bool touched = false;
+  HookHash::slot() = [&]
+  {
+    fired = true;
+    touched = rl.tryConsume(1);
+  };
+  rl.cleanup(std::chrono::seconds(0));
+
+  REQUIRE(fired);
+  REQUIRE(touched);
+  REQUIRE(rl.size() == 1);
+  REQUIRE_FALSE(rl.getKeyRate(2).has_value());
+  REQUIRE(rl.getKeyRate(1).has_value());
+  REQUIRE_FALSE(rl.tryConsume(1));
+}
+
+TEST_CASE("RateLimiterMap: cleanup keeps a setKeyRate override installed between the passes",
+          "[rate_limiter][map][cleanup]")
+{
+  HookHash::slot() = nullptr;
+  RateLimiterMap<int, HookHash> rl(1e-3, 3.0);
+  REQUIRE(rl.tryConsume(1));
+  std::this_thread::sleep_for(5ms);
+
+  bool fired = false;
+  HookHash::slot() = [&]
+  {
+    fired = true;
+    rl.setKeyRate(1, 4.0, 8.0);
+  };
+  rl.cleanup(std::chrono::seconds(0));
+
+  REQUIRE(fired);
+  REQUIRE(rl.getKeyRate(1) == std::make_pair(4.0, 8.0));
 }
