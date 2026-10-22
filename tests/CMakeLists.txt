@@ -633,6 +633,9 @@ endif()
 # thread) compiled directly into the test TU, so per-target instrumentation
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
+    # RateLimiterMap auto-cleanup teardown use-after-free (tracker 2026-09-10-15).
+    iora_test_rate_limiter
+
     # plugin_callback_ownership (tracker 2026-10-16-12): owner gate + registries.
     iora_test_callback_ownership
     iora_test_event_queue

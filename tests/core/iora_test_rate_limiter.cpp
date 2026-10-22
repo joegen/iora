@@ -10,8 +10,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -572,3 +576,269 @@ TEST_CASE("RateLimiterMap: cleanup keeps a setKeyRate override installed between
   REQUIRE(fired);
   REQUIRE(rl.getKeyRate(1) == std::make_pair(4.0, 8.0));
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Auto-cleanup lifetime
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Dispatcher that only queues fired callbacks, so a test decides when and on
+// which thread each one runs. A popped callback is run after the queue mutex is
+// released.
+struct CallbackQueue
+{
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<TimingWheel::Callback> items;
+
+  TimingWheel::Dispatcher dispatcher()
+  {
+    return [this](TimingWheel::Callback cb)
+    {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        items.push_back(std::move(cb));
+      }
+      cv.notify_all();
+    };
+  }
+
+  bool waitForSize(std::size_t n)
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, 5s, [&] { return items.size() >= n; });
+  }
+
+  TimingWheel::Callback pop()
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto cb = std::move(items.front());
+    items.pop_front();
+    return cb;
+  }
+};
+
+// One-way open/closed handshake between test threads.
+struct Gate
+{
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool isOpen = false;
+
+  void open()
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      isOpen = true;
+    }
+    cv.notify_all();
+  }
+
+  void wait()
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return isOpen; });
+  }
+
+  bool waitFor()
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock, 5s, [&] { return isOpen; });
+  }
+};
+
+// Opens the release gate and joins the helper threads on every exit path, so a
+// failed REQUIRE never unwinds past a joinable thread or a blocked hook.
+struct ThreadGuard
+{
+  Gate& release;
+  std::thread& first;
+  std::thread& second;
+
+  ~ThreadGuard()
+  {
+    release.open();
+    if (first.joinable())
+    {
+      first.join();
+    }
+    if (second.joinable())
+    {
+      second.join();
+    }
+  }
+};
+
+// A started wheel whose fired callbacks go to a CallbackQueue. The queue is
+// declared first so it outlives the wheel's tick thread.
+struct QueuedWheel
+{
+  CallbackQueue queue;
+  TimingWheel wheel{20ms, 64, 1, queue.dispatcher()};
+
+  QueuedWheel()
+  {
+    wheel.start();
+  }
+
+  void runNextFire()
+  {
+    REQUIRE(queue.waitForSize(1));
+    queue.pop()();
+  }
+};
+
+// Blocks a cleanup pass inside pass 2's first hash on thread `pass`, then
+// destroys the map on thread `destroyer` while the pass is still blocked. The
+// guard is declared last, so it releases and joins both threads before any
+// other member is destroyed.
+struct InFlightPassFixture
+{
+  QueuedWheel qw;
+  std::unique_ptr<RateLimiterMap<int, HookHash>> map;
+  TimingWheel::Callback fire;
+  Gate entered;
+  Gate release;
+  Gate resetDone;
+  std::thread pass;
+  std::thread destroyer;
+  ThreadGuard guard{release, pass, destroyer};
+
+  void blockPassAndDestroyMap()
+  {
+    map = std::make_unique<RateLimiterMap<int, HookHash>>(
+      1.0, 3.0, &qw.wheel, std::chrono::seconds(1), std::chrono::seconds(0));
+    REQUIRE(map->tryConsume(1));
+    std::this_thread::sleep_for(5ms);
+    REQUIRE(qw.queue.waitForSize(1));
+    fire = qw.queue.pop();
+
+    HookHash::slot() = [this]
+    {
+      entered.open();
+      release.wait();
+    };
+    pass = std::thread([this] { fire(); });
+    REQUIRE(entered.waitFor());
+    destroyer = std::thread(
+      [this]
+      {
+        map.reset();
+        resetDone.open();
+      });
+    // The destructor must return while the pass is still blocked in the hook.
+    REQUIRE(resetDone.waitFor());
+  }
+};
+
+TEST_CASE("RateLimiterMap: map destroyed while its cleanup entry is pending",
+          "[rate_limiter][map][lifetime]")
+{
+  QueuedWheel qw;
+  auto map = std::make_unique<RateLimiterMap<std::string>>(
+    10.0, 10.0, &qw.wheel, std::chrono::seconds(1), std::chrono::seconds(0));
+  map.reset();
+  qw.runNextFire();
+  REQUIRE(qw.wheel.pendingCount() == 0);
+}
+
+TEST_CASE("RateLimiterMap: map destroyed after its cleanup callback was collected",
+          "[rate_limiter][map][lifetime]")
+{
+  QueuedWheel qw;
+  auto map = std::make_unique<RateLimiterMap<std::string>>(
+    10.0, 10.0, &qw.wheel, std::chrono::seconds(1), std::chrono::seconds(0));
+  REQUIRE(qw.queue.waitForSize(1));
+  map.reset();
+  qw.queue.pop()();
+  REQUIRE(qw.wheel.pendingCount() == 0);
+}
+
+TEST_CASE("RateLimiterMap: map destroyed during an in-flight cleanup pass",
+          "[rate_limiter][map][lifetime]")
+{
+  HookHash::slot() = nullptr;
+  InFlightPassFixture f;
+  f.blockPassAndDestroyMap();
+
+  f.release.open();
+  f.pass.join();
+  f.destroyer.join();
+  f.qw.runNextFire();
+  REQUIRE(f.qw.wheel.pendingCount() == 0);
+}
+
+TEST_CASE("RateLimiterMap: stopping ends the chain for a fire that overlaps a running pass",
+          "[rate_limiter][map][lifetime]")
+{
+  HookHash::slot() = nullptr;
+  InFlightPassFixture f;
+  f.blockPassAndDestroyMap();
+
+  // The blocked pass still holds the state, so only the stopping flag can stop
+  // the next fire from re-arming.
+  f.qw.runNextFire();
+  REQUIRE(f.qw.wheel.pendingCount() == 0);
+}
+
+TEST_CASE("RateLimiterMap: wheel destroyed before the map", "[rate_limiter][map][lifetime]")
+{
+  auto wheel = std::make_unique<TimingWheel>(20ms, 64, 1);
+  wheel->start();
+  auto map = std::make_unique<RateLimiterMap<std::string>>(
+    10.0, 10.0, wheel.get(), std::chrono::seconds(1), std::chrono::seconds(0));
+  wheel->stop();
+  wheel.reset();
+  map.reset();
+}
+
+TEST_CASE("RateLimiterMap: re-emplacing a map at the same address leaves one cleanup chain",
+          "[rate_limiter][map][lifetime]")
+{
+  QueuedWheel qw;
+  std::optional<RateLimiterMap<std::string>> limiter;
+  limiter.emplace(10.0, 10.0, &qw.wheel, std::chrono::seconds(1), std::chrono::seconds(0));
+  limiter.emplace(10.0, 10.0, &qw.wheel, std::chrono::seconds(1), std::chrono::seconds(0));
+  REQUIRE(qw.queue.waitForSize(2));
+  qw.queue.pop()();
+  qw.queue.pop()();
+  REQUIRE(qw.wheel.pendingCount() == 1);
+}
+
+TEST_CASE("RateLimiterMap: auto-cleanup runs one pass per fire", "[rate_limiter][map][lifetime]")
+{
+  QueuedWheel qw;
+  RateLimiterMap<std::string> rl(10.0, 10.0, &qw.wheel, std::chrono::seconds(1),
+                                 std::chrono::seconds(0));
+
+  REQUIRE(rl.tryConsume("a"));
+  std::this_thread::sleep_for(5ms);
+  qw.runNextFire();
+  REQUIRE(rl.size() == 0);
+  REQUIRE(qw.wheel.pendingCount() == 1);
+
+  REQUIRE(rl.tryConsume("b"));
+  std::this_thread::sleep_for(5ms);
+  qw.runNextFire();
+  REQUIRE(rl.size() == 0);
+  REQUIRE(qw.wheel.pendingCount() == 1);
+}
+
+TEST_CASE("RateLimiterMap: ctor throws when the cleanup wheel is not running",
+          "[rate_limiter][map][lifetime]")
+{
+  TimingWheel wheel(20ms, 64, 1);
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(1.0, 5.0, &wheel), std::runtime_error);
+  REQUIRE(wheel.pendingCount() == 0);
+
+  wheel.start();
+  wheel.stop();
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(1.0, 5.0, &wheel), std::runtime_error);
+  REQUIRE(wheel.pendingCount() == 0);
+
+  REQUIRE_NOTHROW(RateLimiterMap<std::string>(1.0, 5.0));
+}
+
+static_assert(!std::is_copy_constructible_v<RateLimiterMap<std::string>>);
+static_assert(!std::is_move_constructible_v<RateLimiterMap<std::string>>);
+static_assert(!std::is_copy_assignable_v<RateLimiterMap<std::string>>);
+static_assert(!std::is_move_assignable_v<RateLimiterMap<std::string>>);
