@@ -295,9 +295,10 @@ public:
   /// passes that already started may still finish on the wheel or dispatcher
   /// thread after this returns: with no Dispatcher or a single-thread one, at
   /// most one; with a multi-thread Dispatcher, more than one. The bucket state
-  /// is destroyed on whichever thread finishes last. At most one already-armed
-  /// wheel entry stays pending until it fires once and does nothing. Do not
-  /// call other methods concurrently with it.
+  /// is destroyed on the thread that drops the last reference. At most one
+  /// already-armed wheel entry stays pending until it fires once and does
+  /// nothing, or the wheel discards it. Do not call other methods concurrently
+  /// with it.
   ~RateLimiterMap()
   {
     _state->stopping.store(true, std::memory_order_release);
@@ -384,8 +385,11 @@ public:
 
   /// \brief Evict idle buckets (not accessed within maxIdle).
   /// Two-pass: collect under shared_lock, then erase under unique_lock only if
-  /// the bucket is still idle as of pass 1's time. A bucket refreshed,
-  /// re-created or replaced (setKeyRate) between the passes is kept.
+  /// the bucket is still idle as of pass 1's time. A bucket refreshed by
+  /// tryConsume, or removed and re-created, between the passes is kept. A
+  /// bucket replaced by setKeyRate carries the lastAccess of its new bucket,
+  /// built before the shard lock, so it is kept unless that is more than
+  /// maxIdle before pass 1's time.
   void cleanup(std::chrono::seconds maxIdle)
   {
     cleanupState(*_state, maxIdle);

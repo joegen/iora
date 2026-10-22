@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 3.2 |
-| **Date** | 2026-09-12 |
+| **Version** | 3.3 |
+| **Date** | 2026-10-22 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/timing_wheel.hpp` |
 | **Namespace** | `iora::core` |
@@ -23,6 +23,7 @@
 | 3.0 | 2026-09-10 | Migrated into the iora doc-wiki at `docs/core/timing_wheel.md` and restructured to the 12-section guide template. Re-verified every claim against the current `include/iora/core/timing_wheel.hpp` and against the production consumers (`storage/kvstore.hpp`, `core/rate_limiter.hpp`). Corrected stale claims: the `ITimerService` interface and `TimingWheelAdapter` now expose `tickDuration()`; the memory ordering of `_accepting`/`_running` is acquire/release (not relaxed); and the executive-summary motivation was re-based against the *actual* sibling `TimerService` (a single-`timerfd` min-heap, not a timerfd-per-timer). Scope narrowed to `TimingWheel`, `TimingWheelAdapter`, and the `ITimerService` seam -- the epoll/`timerfd` `TimerService` (`core/timer.hpp`) is a separate component; see `docs/core/timer.md`. |
 | 3.1 | 2026-09-11 | Over-max-delay fix landed (iora `c7095c6`, tracker `tasks/iora/completed/2026-09-10-1`). A delay beyond the wheel span is no longer masked into an earlier bucket (early misfire at `numWheels==1`, cascade re-process/hang at `numWheels>=2`): `insertEntry` now clamps it to the furthest bucket with the real deadline preserved, and the `collectFromBucket`/`cascadeDown` deadline gate re-defers it until it is in range, so it fires within one tick of its deadline. Constructor now asserts `ticksPerWheel >= 2` and `tickDuration > 0`; the tick thread releases `_tickCvMutex` before `advance()`. Updated §5.2, §6.6, §12 accordingly. |
 | 3.2 | 2026-09-12 | Lifecycle-serialization + schedule/drain-orphan fixes landed (iora `8cb9c31`, trackers `tasks/iora/completed/2026-09-10-6` and `.../2026-09-10-7`). Added an outermost `_lifecycleMutex` serializing `start`/`stop`/`drain`/`reset` (order `_lifecycleMutex -> _wheelMutex -> _poolMutex`; never held during firing or callback-destruction, so the tick-thread `join()` and callback re-entry cannot deadlock). `schedule()` now re-checks `_accepting` under `_wheelMutex` (drain/stop store it false before the lock) -- no more orphaned timer racing shutdown. `reset()` replaced its debug-only `assert(STOPPED)` with a `compare_exchange(STOPPED->RESET)` **silent no-op** (safe under `NDEBUG`); `drain()`'s terminal transition is a conditional `CAS(DRAINING->STOPPED)` (no clobber of a concurrent `stop()+reset()`); `_nextId` is kept **monotonic** across `reset()` (was zeroed) to prevent TimerId aliasing of an in-flight `schedule()`. Updated §6.5 (lifecycle), §8 (thread-safety table, lock ordering, callback re-entry), §11 (design decisions), §12 (limitations: the three lifecycle hazards are RESOLVED). |
+| 3.3 | 2026-10-22 | Section 6.2: no longer claims that `RateLimiterMap` uses the strong self-holding recurring-timer idiom. Since iora f7407fa (tracker 2026-09-10-15) it re-arms through a `weak_ptr<State>` plus `stopping` guard; section 6.2 now describes that form and points to `rate_limiter.md`. `TtlMap` is cited only for the same guard on a `TimerService` periodic timer (it does not re-arm). |
 
 ---
 
@@ -430,7 +431,7 @@ tw.reschedule(id, 1000ms);                   // preserves the TimerId
 
 ### 6.2 Recurring timer (self-reschedule from the callback)
 
-This is the pattern `RateLimiterMap` uses for periodic idle-bucket cleanup -- safe because `_wheelMutex` is not held during firing:
+A callback can re-arm itself because `_wheelMutex` is not held during firing. The example below keeps the recurring task alive through a strong self-holding handle. An owner that can be destroyed while its timer is pending should not do that. Its callback should capture only a `weak_ptr` to the owner's state, plus a `stopping` flag that the owner's destructor sets, and re-arm only when `lock()` succeeds and `stopping` is still false. `RateLimiterMap` auto-cleanup does this ([rate_limiter.md](rate_limiter.md)). The `weak_ptr` keeps a running callback memory-safe. The `stopping` flag ends the chain: on a multi-thread Dispatcher, a fire can still `lock()` the state through an overlapping run after the owner is gone. `iora::util::TtlMap` uses the same `weak_ptr` plus `stopping` guard, but with a `TimerService` periodic timer instead of a re-arming `TimingWheel` callback:
 
 ```cpp
 #include "iora/core/timing_wheel.hpp"

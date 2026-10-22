@@ -4,12 +4,13 @@
 
 | | |
 |---|---|
-| **Version** | 3.1 |
-| **Date** | 2026-09-10 |
+| **Version** | 3.2 |
+| **Date** | 2026-10-22 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/core/state_machine.hpp` |
 | **Namespace** | `iora::core` |
-| **Dependencies** | Standard library only -- `<algorithm>`, `<atomic>`, `<functional>`, `<mutex>`, `<optional>`, `<stdexcept>`, `<type_traits>`, `<utility>`, `<vector>`. Header-only, single class template, no intra-Iora and no external/third-party dependencies. |
+| **Dependencies** | One intra-Iora header -- `iora/core/atomic_thread_id.hpp` (`AtomicThreadId`, the same-thread re-entry detector). Standard library: `<algorithm>`, `<atomic>`, `<functional>`, `<mutex>`, `<optional>`, `<stdexcept>`, `<type_traits>`, `<utility>`, `<vector>`. Header-only, single class template, no external/third-party dependencies. |
+| **Architecture doc** | `coding_trackers/architecture/iora/state_machine.json` (v1.2.1) |
 
 ---
 
@@ -20,8 +21,9 @@
 | 1.0 | 2026-03-20 | Initial implementation. |
 | 1.1 | 2026-03-20 | Added `thenEvent` compound transitions, `forceState` context-free callbacks, `onAnyTransition` observer. |
 | 2.0 | 2026-03-20 | Rewritten as a full Architecture & Programmer's Guide (published as `coding_trackers/docs/iora/state_machine.md`). |
-| 3.1 | 2026-09-10 | CP-3 doc-review: comparator dedup (behavior-preserving) landed; move-ctor-elision wording, CD-1 citation, Mermaid caption, and observer-separability corrected; callbacks-under-lock/thenEvent tracked (2026-09-10-23). |
 | 3.0 | 2026-09-10 | Migrated to `docs/core/state_machine.md` and **fully re-verified against `include/iora/core/state_machine.hpp` (433 lines)** and `tests/core/iora_test_state_machine.cpp` (21 `TEST_CASE`s). Reformatted to the 12-section template with contiguous numbered sections and the `[Back to index]` link; **API Reference moved to the last substantive slot**. Drift corrected: (a) the "No self-transitions" limitation was wrong -- self-transitions *are* supported and fire `onExit` then `onEnter` (verified by `SM: self-transition fires onExit and onEnter`); reframed as a supported behavior. (b) Clarified that `onAnyTransition` fires **after** `onEnter`, still **under the mutex** (header lines 263-270), not merely "after the action". (c) Added an explicit state-transition diagram and the object-lifecycle / move-semantics coverage. (d) Added two labelled **CANDIDATE DEFECTs** to Known Limitations: user callbacks invoked while `_mutex` is held (copy-then-invoke deviation) and the non-atomic multi-leg `thenEvent` compound transition. No code was changed by this migration. |
+| 3.1 | 2026-09-10 | CP-3 doc-review: comparator dedup (behavior-preserving) landed; move-ctor-elision wording, CD-1 citation, Mermaid caption, and observer-separability corrected; callbacks-under-lock/thenEvent tracked (2026-09-10-23). |
+| 3.2 | 2026-10-22 | Re-synced to iora f0b8def (tracker 2026-09-10-23, human decisions HD-SM-1..4). Same-thread re-entry from a callback now **throws `std::logic_error`** instead of deadlocking (sections 4.6, 5, 7.5, 12). Callbacks, including `onAnyTransition`, still run under `_mutex` by design (HD-SM-2). `thenEvent` is documented as best effort (HD-SM-3), including the first-leg-only return value and the unbounded recursion of a cycle. Added the lock-order clause and the exception contract (7.5, 7.6). Removed stale header line citations. Closed CANDIDATE DEFECT-1/-2 in section 12. |
 
 ---
 
@@ -29,7 +31,7 @@
 
 ### Problem
 
-The Karoo codebase repeatedly hand-rolls finite state machines -- SIP transaction handling, dialog and call-state management, registration and session lifecycle. Each hand-rolled FSM is an ad-hoc `switch`/`case` over a state enum with per-module quirks: forgotten transitions, inconsistent guard ordering, absent or bolted-on thread safety, and no separation between the *transition table* (the data) and the *execution engine* (the code that runs exit/action/enter in the right order). Adding one state means editing several `switch` blocks across several files, and the bugs that slip through are exactly the ones a generic, tested primitive would prevent.
+The Iora codebase (iora and iora_sip) repeatedly hand-rolls finite state machines -- SIP transaction handling, dialog and call-state management, registration and session lifecycle. Each hand-rolled FSM is an ad-hoc `switch`/`case` over a state enum with per-module quirks: forgotten transitions, inconsistent guard ordering, absent or bolted-on thread safety, and no separation between the *transition table* (the data) and the *execution engine* (the code that runs exit/action/enter in the right order). Adding one state means editing several `switch` blocks across several files, and the bugs that slip through are exactly the ones a generic, tested primitive would prevent.
 
 ### Solution
 
@@ -38,7 +40,7 @@ The Karoo codebase repeatedly hand-rolls finite state machines -- SIP transactio
 - **Builder-only construction.** `StateMachine` has a deleted default constructor and a private member constructor; the only way to obtain one is `StateMachine::Builder().…​.build()`. `build()` validates that an initial state was set (else `std::logic_error`) and produces an immutable, pre-sorted transition table.
 - **Flat sorted vector + `std::equal_range`.** Transition rules live in one contiguous `std::vector<TransitionRule>`, `std::stable_sort`-ed by `(from, event)`. Lookup is a binary search to the matching range followed by a short linear scan of that range's guards -- cache-local and allocation-free at run time.
 - **Context-aware and context-free callbacks.** When `Context` is non-`void`, guards/actions/`onEnter`/`onExit` receive `const Context&`; when `Context` is `void` they take no argument. `forceState` uses a *separate* pair of context-free callbacks (`onEnterForce`/`onExitForce`) because it carries no event payload.
-- **Compound transitions (`thenEvent`).** A rule may name a follow-up event; after the primary transition fully completes, the mutex is released and `processEvent` is re-entered for the follow-up -- multi-leg transitions without a `std::recursive_mutex`.
+- **Compound transitions (`thenEvent`).** A rule may name a follow-up event; after the primary transition fully completes, the mutex is released and `processEvent` is called again for the follow-up -- multi-leg transitions without a `std::recursive_mutex`.
 - **Atomic state, mutex-serialized transitions.** The current state is a `std::atomic<StateEnum>` readable lock-free from any thread (`currentState()`); every transition runs under a single `std::mutex`, so exactly one transition executes at a time.
 
 ### Technical Impact
@@ -77,9 +79,13 @@ iora::core
     |   `-- specialization (C == void): GuardFn = function<bool()>,   ActionFn/EnterExitFn = function<void()>
     |
     |-- Runtime state
-    |   |-- _rules   : std::vector<TransitionRule>        (immutable after build)
-    |   |-- _state   : std::atomic<StateEnum>             (acquire/release)
-    |   `-- _mutex   : mutable std::mutex                 (serializes processEvent + forceState)
+    |   |-- _rules      : std::vector<TransitionRule>        (immutable after build)
+    |   |-- _state      : std::atomic<StateEnum>             (acquire/release)
+    |   |-- _mutex      : mutable std::mutex                 (serializes processEvent + forceState)
+    |   `-- _mutexOwner : iora::core::AtomicThreadId         (re-entry stamp; written only by the _mutex holder)
+    |
+    |-- OwnerRecordingLock  (private RAII class: lock _mutex, then stamp; clear stamp, then unlock)
+    |-- throwIfReentrant()  (private; throws std::logic_error if the calling thread holds _mutex)
     |
     `-- Callback tables
         |-- _onEnter / _onExit             : std::vector<std::pair<StateEnum, EnterExitFn>>   (context-aware; for processEvent)
@@ -100,14 +106,14 @@ sequenceDiagram
   participant CB as Callbacks
 
   App->>SM: processEvent(event [, ctx])
-  SM->>SM: lock_guard(_mutex)
+  SM->>SM: throwIfReentrant(), then OwnerRecordingLock(_mutex) (lock, stamp)
   SM->>S: load(relaxed) -> current
   SM->>R: equal_range(current, event)
   loop candidate rules in range
     R->>R: guard absent OR guard([ctx]) true ? first match wins
   end
   alt no match
-    SM->>SM: unlock _mutex
+    SM->>SM: clear stamp, unlock _mutex
     SM-->>App: return false
   else matched
     SM->>CB: fireOnExit(current [, ctx])
@@ -115,15 +121,15 @@ sequenceDiagram
     SM->>S: store(matched.to, release)
     SM->>CB: fireOnEnter(matched.to [, ctx])
     SM->>CB: onAnyTransition(current, event, matched.to)
-    SM->>SM: unlock _mutex
+    SM->>SM: clear stamp, unlock _mutex
     opt matched.thenEvent present
-      SM->>SM: processEvent(followUp [, ctx])  (re-entrant, mutex already released)
+      SM->>SM: processEvent(followUp [, ctx])  (new call, lock and stamp already released)
     end
     SM-->>App: return true
   end
 ```
 
-All steps from `fireOnExit` through `onAnyTransition` execute **while `_mutex` is held** (header lines 237-271 / 288-320). Only the `thenEvent` re-entry happens after the lock is released.
+All steps from the state load and guard scan through `onAnyTransition` execute **while `_mutex` is held**. Only the `thenEvent` follow-up runs after the lock is released. Before taking the lock, `processEvent` checks whether the calling thread already holds it (section 7.5) and throws `std::logic_error` if so.
 
 ### 2.3 Data flow -- `forceState`
 
@@ -135,12 +141,12 @@ sequenceDiagram
   participant CB as Force callbacks
 
   App->>SM: forceState(newState)
-  SM->>SM: lock_guard(_mutex)
+  SM->>SM: throwIfReentrant(), then OwnerRecordingLock(_mutex) (lock, stamp)
   SM->>S: load(relaxed) -> current
   SM->>CB: fireForceOnExit(current)   (context-free)
   SM->>S: store(newState, release)
   SM->>CB: fireForceOnEnter(newState) (context-free)
-  SM->>SM: unlock _mutex
+  SM->>SM: clear stamp, unlock _mutex
 ```
 
 `forceState` never consults `_rules`, never evaluates a guard, and never fires an action or `onAnyTransition`. It fires only the context-free force callbacks.
@@ -178,7 +184,7 @@ Builder& guard(GuardFn fn)
 
 If called before any `transition(...)`, they are **silent no-ops** (the `!_rules.empty()` guard) -- defensive, not an error (section 12).
 
-`build()` does three things (header lines 179-203):
+`build()` does three things:
 
 1. Throws `std::logic_error` if `initialState(...)` was never called (verified by `SM: build() throws if initialState not set`).
 2. Applies `std::stable_sort` to `_rules`, ordering by `(from, event)` on the underlying enum values. **Stable** sort is load-bearing: rules sharing one `(from, event)` keep their Builder insertion order, which is exactly the guard-priority order (section 3.3).
@@ -230,7 +236,7 @@ Because `stable_sort` preserved Builder insertion order within the group, priori
 
 ### 3.4 Transition execution order
 
-Once a rule is matched, the engine runs, **all under `_mutex`** (header lines 257-270):
+Once a rule is matched, the engine runs, **all under `_mutex`**:
 
 1. `fireOnExit(current [, ctx])` -- every `onExit` callback registered for the *current* state, in registration order.
 2. `matched->action([ctx])` -- the matched rule's action, if any.
@@ -238,7 +244,7 @@ Once a rule is matched, the engine runs, **all under `_mutex`** (header lines 25
 4. `fireOnEnter(matched->to [, ctx])` -- every `onEnter` callback for the *target* state.
 5. `_onAnyTransition(current, event, matched->to)` -- the global observer, if registered.
 
-`SM: onEnter and onExit fire in order` pins steps 1-2-4 as `exit_idle`, `action`, `enter_running`. Because the state is committed at step 3 (before `onEnter`), an `onEnter` callback -- or any concurrent poller -- that reads `currentState()` observes the **new** state. `SM: onAnyTransition receives correct triple` confirms the observer sees `(from=current, event, to=matched.to)`.
+`SM: onEnter and onExit fire in order` pins steps 1-2-4 as `exit_idle`, `action`, `enter_running`. Because the state is committed at step 3 (before `onEnter`), an `onEnter` callback that reads `currentState()` observes the **new** state. A concurrent poller sees the old or the new state; once it sees the new one, it also sees the action's writes (section 7.3). `SM: onAnyTransition receives correct triple` confirms the observer sees `(from=current, event, to=matched.to)`.
 
 `fireOnEnter`/`fireOnExit` are variadic templates (`Args&&... args`): the `void`-context call site passes no argument and the context call site forwards `ctx`, so one implementation serves both (section 11, D-11).
 
@@ -263,7 +269,8 @@ For a `void`-context machine, only the single-argument form exists; for a contex
 ```cpp
 void forceState(StateEnum newState)
 {
-  std::lock_guard lock(_mutex);
+  throwIfReentrant();
+  OwnerRecordingLock lock(_mutex, _mutexOwner);
   auto current = _state.load(std::memory_order_relaxed);
   fireForceOnExit(current);
   _state.store(newState, std::memory_order_release);
@@ -271,7 +278,7 @@ void forceState(StateEnum newState)
 }
 ```
 
-It shares `_mutex` with `processEvent`, so forced changes and event-driven transitions are mutually exclusive. Two reasons the force callbacks are a *separate* set (`_forceOnExit`/`_forceOnEnter`, type `VoidFn = std::function<void()>`):
+`throwIfReentrant()` makes a call from a callback of the same machine throw `std::logic_error` (section 7.5). It shares `_mutex` with `processEvent`, so forced changes and event-driven transitions are mutually exclusive. Two reasons the force callbacks are a *separate* set (`_forceOnExit`/`_forceOnEnter`, type `VoidFn = std::function<void()>`):
 
 - `forceState` carries **no event and no `Context`**, so it cannot invoke the context-aware `onEnter`/`onExit` (which expect `const Context&` on a context-bearing machine) without fabricating a dummy payload.
 - It is deliberately usable **identically** on a context-bearing machine: `SM: forceState on Context-bearing FSM is context-free` shows `forceState` firing a `VoidFn` on a `StateMachine<State, Event, MyContext>`.
@@ -280,12 +287,12 @@ It shares `_mutex` with `processEvent`, so forced changes and event-driven trans
 
 ### 3.7 `thenEvent` -- compound (multi-leg) transitions
 
-A rule may declare a follow-up event. After the primary leg fully completes and **the mutex is released**, `processEvent` is re-entered for the follow-up:
+A rule may declare a follow-up event. After the primary leg fully completes and **the mutex is released**, `processEvent` is called again for the follow-up:
 
 ```cpp
 // captured inside the locked scope:
 followUp = matched->thenEvent;
-// ... lock_guard scope ends here (mutex released) ...
+// ... OwnerRecordingLock scope ends here (stamp cleared, mutex released) ...
 if (followUp)
 {
   processEvent(*followUp);        // void-context overload
@@ -293,14 +300,16 @@ if (followUp)
 }
 ```
 
-Properties (all verified by the `[then]` tests):
+Properties (the `[then]` tests verify the first three, and "Not a re-entry" indirectly, because those tests would throw otherwise; the cycle and return-value statements follow from the code):
 
-- **Not recursive under the lock.** The mutex is released before re-entry, so a single non-recursive `std::mutex` suffices; each leg takes and releases the lock independently. `SM: thenEvent compound transition` drives `RUNNING --FINISH--> COMPLETED --CLEANUP--> TERMINATED` from one call.
+- **Not recursive under the lock.** The mutex is released before the follow-up call, so a single non-recursive `std::mutex` suffices; each leg takes and releases the lock independently. `SM: thenEvent compound transition` drives `RUNNING --FINISH--> COMPLETED --CLEANUP--> TERMINATED` from one call.
 - **`onAnyTransition` fires per leg.** `SM: thenEvent + onAnyTransition ordering` asserts two observer calls, `1->2` then `2->3`.
 - **Context is re-passed unchanged.** The context overload forwards the *same* `const C& ctx` to the follow-up. `SM: thenEvent with context re-passes original context` confirms both legs see `code == 42`.
-- **Chainable.** A follow-up rule may itself carry a `thenEvent`, forming an arbitrary chain; each link re-acquires the lock.
+- **Chainable.** A follow-up rule may itself carry a `thenEvent`, forming an arbitrary chain; each link re-acquires the lock. Each link is a recursive call, so a **cycle** of `thenEvent` rules recurses without bound and overflows the stack -- do not build one.
+- **Not a re-entry.** The follow-up runs after the lock and the re-entry stamp are released, so the re-entry check (section 7.5) does not fire for it.
+- **Return value.** `processEvent` returns `true` when the first leg commits and no exception propagates. The follow-up's own `true`/`false` result is discarded, so a follow-up that matches no rule is not reported. An exception from a follow-up leg propagates out of the original call; the earlier legs stay committed (section 7.6).
 
-Note the concurrency consequence: because the lock is dropped between legs, a compound transition is **not atomic across legs** -- another thread's `processEvent`/`forceState` can interleave. See the CANDIDATE DEFECT in section 12.
+**Best effort under concurrency (by design, HD-SM-3).** Because the lock is dropped between legs, a compound transition is **not atomic across legs**: another thread's `processEvent`/`forceState` can run between them. The follow-up then runs against whatever state exists when it re-acquires the lock, and may match no rule or a different rule. Running the whole chain under one lock was considered and deferred until a consumer needs it.
 
 ### 3.8 `ContextTypes` -- the `const void&` sidestep
 
@@ -487,12 +496,12 @@ void recovery()
 
 | Do | Don't |
 |---|---|
-| Use `thenEvent` for a follow-up transition triggered from within a transition. | Call `processEvent` / `forceState` from *inside* a `guard` / `action` / `onEnter` / `onExit` / `onAnyTransition` callback -- the non-recursive `_mutex` is held, so this **deadlocks** (section 12, CANDIDATE DEFECT-1). |
-| Keep callbacks short and non-blocking. | Do slow or blocking work in a callback -- it runs under `_mutex` and stalls every other `processEvent`/`forceState` caller (section 12). |
+| Use `thenEvent` for a fixed follow-up transition, or make the call after `processEvent` returns. | Call `processEvent` / `forceState` of the *same* machine from inside any callback (`guard`, `onTransition`, `onEnter`, `onExit`, `onEnterForce`, `onExitForce`, `onAnyTransition`) -- `_mutex` is held, so the call **throws `std::logic_error`** (section 7.5). |
+| Keep callbacks short and non-blocking. | Do slow or blocking work in a callback, take a lock that a caller of this machine may hold (this includes driving another machine whose callbacks drive this one), or wait on another thread that calls into this machine -- callbacks run under `_mutex` (section 7.5). |
 | Use `processEvent` with a guard for atomic test-and-transition. | Read `currentState()` and then branch on it in multi-threaded code -- another thread may transition between the read and the action (TOCTOU). |
 | Call each Builder method fluently, then `build()` once. | Attach a `guard`/`onTransition`/`thenEvent` *before* the first `transition(...)` -- it silently no-ops. Reuse a Builder after `build()` -- its vectors are moved-from. |
 | Reserve `forceState` for error recovery / re-initialization. | Use `forceState` for normal flow -- it bypasses guards, actions, the table, and `onAnyTransition`. |
-| Treat a compound (`thenEvent`) transition as best-effort sequencing. | Assume the legs of a `thenEvent` chain are atomic against other threads -- the lock is released between legs (section 12, CANDIDATE DEFECT-2). |
+| Treat a compound (`thenEvent`) transition as best-effort sequencing. | Assume the legs of a `thenEvent` chain are atomic against other threads -- the lock is released between legs (section 3.7). Build a `thenEvent` cycle -- it overflows the stack. |
 
 ---
 
@@ -502,44 +511,45 @@ void recovery()
 
 | Step | Actor | Action | Lock state |
 |---|---|---|---|
-| 1 | Caller | `processEvent(event [, ctx])`; acquire `_mutex`. | `_mutex` held |
+| 0 | Caller | `processEvent(event [, ctx])`; if this thread holds `_mutex` (re-entry stamp), throw `std::logic_error`. | no lock |
+| 1 | Caller | Acquire `_mutex` and stamp this thread as its owner (one RAII object). | `_mutex` held |
 | 2 | Caller | `current = _state.load(relaxed)`. | `_mutex` held |
 | 3 | Caller | `equal_range(current, event)`; scan for first rule with no guard or passing guard. | `_mutex` held |
 | 4 | Caller | `fireOnExit(current [, ctx])`. | `_mutex` held |
 | 5 | Caller | `matched->action([ctx])` if present. | `_mutex` held |
 | 6 | Caller | `_state.store(matched->to, release)`. | `_mutex` held |
 | 7 | Caller | `fireOnEnter(matched->to [, ctx])`. | `_mutex` held |
-| 8 | Caller | `_onAnyTransition(current, event, matched->to)` if present; capture `followUp = matched->thenEvent`. | `_mutex` held |
-| 9 | Caller | `lock_guard` scope ends -- release `_mutex`. | `_mutex` released |
-| 10 | Caller | If `followUp`, re-enter `processEvent(*followUp [, ctx])` (back to step 1, fresh lock). | no lock |
-| 11 | Caller | Return `true`. | no lock |
+| 8 | Caller | Capture `followUp = matched->thenEvent`; call `_onAnyTransition(current, event, matched->to)` if present. | `_mutex` held |
+| 9 | Caller | Lock scope ends -- clear the owner stamp, then release `_mutex`. | `_mutex` released |
+| 10 | Caller | If `followUp`, call `processEvent(*followUp [, ctx])` again (back to step 0: the re-entry check passes because the stamp was cleared at step 9; fresh lock and stamp). | no lock |
+| 11 | Caller | Return `true` (an exception from step 10 propagates instead). | no lock |
 
 ### 5.2 `processEvent` -- no matching rule / guard rejects (failure)
 
 | Step | Actor | Action | Lock state |
 |---|---|---|---|
-| 1 | Caller | Acquire `_mutex`; `current = _state.load(relaxed)`. | `_mutex` held |
+| 1 | Caller | Re-entry check (5.1 step 0); acquire `_mutex` and stamp; `current = _state.load(relaxed)`. | `_mutex` held |
 | 2 | Caller | `equal_range(current, event)` empty, or every rule's guard returned `false`. | `_mutex` held |
-| 3 | Caller | `matched == nullptr` -> release `_mutex`, return `false`. State unchanged; no callbacks fired. | released on return |
+| 3 | Caller | `matched == nullptr` -> clear the stamp, release `_mutex`, return `false`. State unchanged; no exit/action/enter/observer callbacks fired. | released on return |
 
 ### 5.3 `forceState`
 
 | Step | Actor | Action | Lock state |
 |---|---|---|---|
-| 1 | Caller | `forceState(newState)`; acquire `_mutex`. | `_mutex` held |
+| 1 | Caller | `forceState(newState)`; re-entry check (throws `std::logic_error`); acquire `_mutex` and stamp. | `_mutex` held |
 | 2 | Caller | `current = _state.load(relaxed)`; `fireForceOnExit(current)`. | `_mutex` held |
 | 3 | Caller | `_state.store(newState, release)`. | `_mutex` held |
-| 4 | Caller | `fireForceOnEnter(newState)`; `lock_guard` scope ends. | held, then released |
+| 4 | Caller | `fireForceOnEnter(newState)`; clear the stamp; release `_mutex`. | held, then released |
 
 ### 5.4 Compound transition via `thenEvent` (two legs)
 
 | Step | Actor | Action | Lock state |
 |---|---|---|---|
-| 1 | Caller | `processEvent(FINISH)`: run leg 1 per 5.1 steps 1-9 (RUNNING->COMPLETED); `followUp = CLEANUP`. | held during leg 1, released at step 9 |
-| 2 | Caller | Re-enter `processEvent(CLEANUP)`: acquire `_mutex` afresh; run leg 2 (COMPLETED->TERMINATED). | new lock for leg 2 |
+| 1 | Caller | `processEvent(FINISH)`: run leg 1 per 5.1 steps 0-9 (RUNNING->COMPLETED); `followUp = CLEANUP`. | held during leg 1, released at step 9 |
+| 2 | Caller | Call `processEvent(CLEANUP)` again: the re-entry check passes; acquire `_mutex` and stamp afresh; run leg 2 (COMPLETED->TERMINATED). | new lock for leg 2 |
 | 3 | Caller | Leg 2 has no `thenEvent` -> return `true` up the chain; leg 1 returns `true`. | released |
 
-Between step 1's release and step 2's acquire the mutex is free; another thread's transition can interleave (section 12, CANDIDATE DEFECT-2).
+Between step 1's release and step 2's acquire the mutex is free; another thread's transition can interleave (best effort, section 3.7).
 
 ### 5.5 `build` (construction)
 
@@ -582,7 +592,7 @@ stateDiagram-v2
 
 ### 6.3 Per-transition execution lifecycle
 
-Every successful `processEvent` runs the fixed sequence `onExit -> action -> commit(state) -> onEnter -> onAnyTransition` (section 3.4), entirely under `_mutex`. The state is committed in the middle (step 3 of 5), so `onEnter` and any concurrent `currentState()` poll observe the new state; `onExit` and the action still observe the old state via `currentState()` only if they read it (they receive `ctx`, not the state).
+Every successful `processEvent` runs the fixed sequence `onExit -> action -> commit(state) -> onEnter -> onAnyTransition` (section 3.4), entirely under `_mutex`. The state is committed in the middle (step 3 of 5), so `onEnter` observes the new state, and a concurrent `currentState()` poll sees the old or the new state; `onExit` and the action still observe the old state via `currentState()` only if they read it (they receive `ctx`, not the state).
 
 ---
 
@@ -594,6 +604,7 @@ Every successful `processEvent` runs the fixed sequence `onExit -> action -> com
 |---|---|---|
 | `std::atomic<StateEnum>` | `_state` | Current state. Written with `release` inside a transition; read `relaxed` inside the locked transition and `acquire` by the lock-free observers. |
 | `mutable std::mutex` | `_mutex` | Serializes `processEvent` and `forceState` (and the callbacks they invoke). `mutable` so it could be locked from a `const` method -- though in practice the lock-free observers do not take it. |
+| `iora::core::AtomicThreadId` | `_mutexOwner` | Re-entry stamp. Written only by the `_mutex` holder: stamped right after lock, cleared right before unlock, by one private RAII type (`OwnerRecordingLock`). Read (relaxed) before locking to detect same-thread re-entry. |
 | `std::vector<TransitionRule>` | `_rules` | Immutable after `build()`; read-only during `processEvent`, so no lock needed for its *contents* beyond the transition serialization. |
 | `std::vector<std::pair<...>>` x4 + `TransitionLogFn` | callback tables | Immutable after `build()`; invoked under `_mutex`. |
 
@@ -603,25 +614,43 @@ Every successful `processEvent` runs the fixed sequence `onExit -> action -> com
 |---|---|---|
 | `currentState()` | `_state.load(memory_order_acquire)`; **no lock**; `noexcept` | Safe from any thread, concurrently with a transition. Sees pre- or post-commit state. |
 | `isInState(s)` | Calls `currentState()`; `acquire` load; no lock; `noexcept` | Same guarantees. |
-| `processEvent(event)` (void) | `std::lock_guard<std::mutex>` over the whole transition; internal `_state` read is `relaxed`, commit is `release`; `thenEvent` re-entry happens **after** unlock | One transition at a time. **All guard/action/enter/exit/observer callbacks run under `_mutex`** (section 12, CANDIDATE DEFECT-1). |
+| `processEvent(event)` (void) | Re-entry check, then `OwnerRecordingLock` over the whole leg; internal `_state` read is `relaxed`, commit is `release`; the `thenEvent` follow-up runs **after** unlock | One leg at a time. **All guard/action/enter/exit/observer callbacks run under `_mutex`** by design (section 7.5). |
 | `processEvent(event, ctx)` (context) | Same as the void overload | Context forwarded to guard/action/enter/exit and re-passed to a `thenEvent` leg. |
-| `forceState(newState)` | `std::lock_guard<std::mutex>`; `relaxed` read, `release` commit; force callbacks run under the lock | Mutually exclusive with `processEvent`. |
+| `forceState(newState)` | Re-entry check, then `OwnerRecordingLock`; `relaxed` read, `release` commit; force callbacks run under the lock | Mutually exclusive with `processEvent`. |
 | `Builder::*` / `build()` | **None** | Construction is single-threaded by contract (7.4). |
-| Move constructor | Reads `other._state.load(relaxed)`, moves vectors; **no lock on `other`** | Safe only under single-threaded construction (7.4). |
+| Move constructor | Reads `other._state.load(relaxed)`, moves vectors; **no lock on `other`**; `_mutexOwner` is default-constructed | Safe only under single-threaded construction (7.4). |
 
 ### 7.3 What is correct
 
-- **Lock-free, correctly-ordered state reads.** `_state` is committed with `release` under the lock and read with `acquire` lock-free, so a poller that observes the new state also observes everything the action wrote before the commit. The stress test `SM: concurrent currentState reads during transitions` runs 4 readers against 1 writer over 10000 iterations and asserts the observed state is always one of the valid enum values -- i.e. reads are never torn.
+- **Lock-free, correctly-ordered state reads.** `_state` is committed with `release` under the lock and read with `acquire` lock-free, so a poller that observes the new state also observes everything the action wrote before the commit. The stress test `SM: concurrent currentState reads during transitions` runs 4 readers against 1 writer over 10000 iterations; the readers record any invalid state into an atomic and the main thread asserts none was seen -- i.e. reads are never torn.
 - **Serialized transitions.** A single non-recursive `std::mutex` guarantees exactly one `processEvent`/`forceState` body runs at a time; `_rules` and the callback tables are immutable after `build()`, so they need no further protection.
-- **`thenEvent` avoids recursive locking by design.** The lock is released before the follow-up re-enters, so a non-recursive mutex is sufficient for a legitimately-used chain.
+- **`thenEvent` avoids recursive locking by design.** The lock is released before the follow-up call, so a non-recursive mutex is sufficient for a legitimately-used chain.
 
 ### 7.4 Construction is single-threaded by contract
 
-The Builder mutates plain `std::vector`s with no synchronization, and the move constructor reads `other._state` and moves `other`'s vectors without locking `other._mutex`. This is safe **only** because a machine is built on one thread before being shared (and `build()`'s return is elided -- no move -- under C++17). Do not publish a `StateMachine` to other threads until `build()` (and any explicit move into its final home) has completed. See section 12 for the move-constructor hazard if this contract is broken.
+The Builder mutates plain `std::vector`s with no synchronization, and the move constructor reads `other._state` and moves `other`'s vectors without locking `other._mutex`. This is safe **only** because a machine is built on one thread before being shared (`build()`'s return is a prvalue, so C++17 guaranteed elision constructs it in place with no move). Do not publish a `StateMachine` to other threads until `build()` (and any explicit move into its final home) has completed. See section 12 for the move-constructor hazard if this contract is broken.
 
-### 7.5 Lock ordering
+### 7.5 Callbacks under the lock, re-entry and lock order
 
-There is exactly one lock (`_mutex`) and it is never held while acquiring another lock **of this object** -- but note that a user callback invoked under `_mutex` could acquire the caller's own locks, creating an external ordering dependency the FSM cannot see. More importantly, a callback that re-enters `processEvent`/`forceState` on the *same* machine tries to re-acquire the non-recursive `_mutex` and deadlocks (section 12, CANDIDATE DEFECT-1).
+Every callback (`guard`, `onTransition` action, `onEnter`, `onExit`, `onEnterForce`, `onExitForce`, `onAnyTransition`) runs while `_mutex` is held. This is the design, not a defect: a guard selects the rule against the current state, and exit/action/enter run at fixed points around the `_state` commit, so they must be serialized with it (architecture designPrinciples[1]). The observer stays under the lock too, so its calls are serialized and in commit order (HD-SM-2). The contract for callback authors:
+
+1. **No re-entry.** Calling `processEvent` or `forceState` of the **same** machine from any callback **throws `std::logic_error`** (HD-SM-1). Use `Builder::thenEvent` for a fixed follow-up, or make the call after `processEvent` returns. Calling a **different** machine is allowed, but it takes that machine's `_mutex` while this one is held. If A's callbacks call B, no B callback may call A, directly or through another thread: two threads crossing in opposite directions deadlock, and the re-entry check does not detect it (rule 2).
+2. **Lock order.** `_mutex` is taken before any lock a callback takes. A callback must not take a lock that a caller of this machine may hold while calling `processEvent`/`forceState`, and must not wait on another thread that calls into this machine.
+3. **Short and non-blocking.** A callback delays every other caller for its full duration.
+
+**How re-entry is detected.** A private RAII type, `OwnerRecordingLock`, takes `_mutex` and then stamps the calling thread into `_mutexOwner` (an `iora::core::AtomicThreadId`); its destructor clears the stamp and then releases the lock. Each of `processEvent` (both overloads) and `forceState` first calls `throwIfReentrant()`, which throws if the stamp names the calling thread, and only then takes the lock. Relaxed memory order is enough. A thread's id is written into the stamp only by that thread, and that thread's last write before it checks is a clear (or it never wrote one), so another thread can never read its own id; the owner always reads its own stamp. Because the stamp is always cleared before unlock, no stamp outlives its thread, so a reused thread id cannot cause a false positive. The detector costs one relaxed load and one `std::this_thread::get_id()` call before locking, plus two relaxed stores (stamp and clear) per lock hold, so one pair per `thenEvent` leg. It catches same-thread re-entry only; a callback that hands work to another thread and waits for it is covered by rule 2, not by the check.
+
+### 7.6 Exceptions
+
+An exception from any callback -- including the `std::logic_error` above, if the callback does not catch it -- propagates out of `processEvent`/`forceState`. The stamp is cleared and `_mutex` is released on the way out. The state is as of the last commit:
+
+- a guard or action that throws leaves the state unchanged (an action that throws after `onExit` leaves the state at `from` with `onExit` already run);
+- an `onEnter` or observer that throws leaves the state at `to`;
+- an `onEnterForce` that throws leaves the state at `newState`;
+- an `onExit` or `onExitForce` that throws leaves the state unchanged; exit callbacks registered before it for that state have already run;
+- an exception in a `thenEvent` follow-up leg propagates from the original call after the earlier legs committed and their observer calls ran; the state is that of the last committed leg, not the state before the call.
+
+The rest of that leg, the observer and any `thenEvent` follow-up are skipped. The machine stays usable: the next call from the same thread is not refused as re-entry.
 
 ---
 
@@ -709,16 +738,18 @@ public:
   bool isInState(StateEnum s) const noexcept;
 
   // Context == void overload (SFINAE-selected).
+  // Throws std::logic_error if called from a callback of the same machine.
   template<typename C = Context>
   std::enable_if_t<std::is_void_v<C>, bool>
   processEvent(EventEnum event);
 
-  // Context != void overload (SFINAE-selected).
+  // Context != void overload (SFINAE-selected). Same re-entry rule.
   template<typename C = Context>
   std::enable_if_t<!std::is_void_v<C>, bool>
   processEvent(EventEnum event, const C& ctx);
 
   // Bypass the transition table; fire context-free force callbacks only.
+  // Throws std::logic_error if called from a callback of the same machine.
   void forceState(StateEnum newState);
 };
 
@@ -740,7 +771,7 @@ public:
 
 | Method | `true` means | `false` means |
 |---|---|---|
-| `processEvent` (both) | a rule matched, guard passed, transition committed | no `(from, event)` rule, or every matching rule's guard rejected -- state unchanged |
+| `processEvent` (both) | a rule matched, the guard passed, and the first leg committed (a `thenEvent` follow-up's `true`/`false` result is not reported) | no `(from, event)` rule, or every matching rule's guard rejected -- state unchanged. Throws `std::logic_error` on same-thread re-entry from a callback. Any callback exception propagates, including one from a `thenEvent` follow-up leg after the first leg committed (section 7.6). |
 | `isInState(s)` | current state `== s` | current state `!= s` |
 | `build()` | (returns the machine) | -- (throws `std::logic_error` if `initialState` unset) |
 
@@ -755,7 +786,7 @@ public:
 | D-3 | Builder-only construction (deleted default ctor, private value ctor). | The transition table is validated and frozen at `build()`; a half-built machine is unrepresentable. |
 | D-4 | `ContextTypes` partial specialization instead of `std::conditional_t`. | `conditional_t` instantiates both branches, and `const void&` is ill-formed; the specialization forms only the matching signatures. |
 | D-5 | Separate context-free force callbacks (`onEnterForce`/`onExitForce`). | `forceState` has no event and no `Context`; dedicated nullary hooks avoid fabricating a dummy payload and keep `forceState` usable identically on context-bearing machines. |
-| D-6 | `thenEvent` releases `_mutex` before re-entering `processEvent`. | A non-recursive `std::mutex` suffices; avoids `std::recursive_mutex` and unbounded in-lock recursion. (Trade-off: legs are not atomic against other threads -- section 12.) |
+| D-6 | `thenEvent` releases `_mutex` before calling `processEvent` again for the follow-up. | A non-recursive `std::mutex` suffices; avoids `std::recursive_mutex` and unbounded in-lock recursion. (Trade-off: legs are not atomic against other threads -- section 12.) |
 | D-7 | `thenEvent` re-passes the same `Context`. | Both legs of a compound protocol transition refer to the same message; stashing context externally would be error-prone. |
 | D-8 | `onAnyTransition` fires once per leg. | Compound transitions emit one trace/metric per intermediate state rather than hiding them behind a single combined entry. |
 | D-9 | `std::atomic<StateEnum>` with release-commit / acquire-read; transitions under `_mutex`. | Lock-free polling from monitoring threads while transitions stay serialized; the `release`/`acquire` pair publishes action-written data to readers of the new state. |
@@ -767,16 +798,17 @@ public:
 
 ## 12. Known Limitations
 
-- **CANDIDATE DEFECT-1 -- user callbacks are invoked while `_mutex` is held (guard evaluation and callbacks alike: `state_machine.hpp:238-265`, `:286-314`, `:327-334`).** Every `guard`, `action`, `onEnter`, `onExit`, `onAnyTransition`, and force callback runs inside the `std::lock_guard` critical section -- the guard scan (`:238-245` / `:286-295`) as well as the exit/action/enter/observer sequence -- i.e. the machine does **not** follow the copy-then-invoke discipline (release the user-facing lock before calling into user code) that the Iora thread-safety conventions prefer. Two concrete consequences: (a) **re-entrancy deadlock** -- a callback that calls `processEvent`/`forceState` on the same machine re-locks the non-recursive `_mutex` and deadlocks (documented as an anti-pattern in 4.6; `thenEvent` is the sanctioned alternative); (b) **lock-hold amplification** -- a slow or blocking callback stalls all other transition callers for its full duration. This appears **intentional**: a transition's exit/action/enter are logically one atomic unit and the design deliberately serializes them, and `thenEvent` exists precisely to defer re-entrant follow-ups until after the unlock.
+- **Callbacks run while `_mutex` is held (by design; was CANDIDATE DEFECT-1).** Resolved by tracker 2026-09-10-23 (iora f0b8def): the under-lock invocation is now the documented contract (section 7.5), and same-thread re-entry throws `std::logic_error` instead of deadlocking. A slow or blocking callback still delays every other caller. The original analysis is kept below for history.
+- **(History) CANDIDATE DEFECT-1 -- user callbacks are invoked while `_mutex` is held (guard evaluation and callbacks alike).** Every `guard`, `action`, `onEnter`, `onExit`, `onAnyTransition`, and force callback runs inside the `_mutex` critical section -- the guard scan as well as the exit/action/enter/observer sequence -- i.e. the machine does **not** follow the copy-then-invoke discipline (release the user-facing lock before calling into user code) that the Iora thread-safety conventions prefer. Two concrete consequences: (a) **re-entrancy deadlock** -- before iora f0b8def, a callback that called `processEvent`/`forceState` on the same machine re-locked the non-recursive `_mutex` and deadlocked (it now throws, section 7.5; `thenEvent` is the sanctioned alternative); (b) **lock-hold amplification** -- a slow or blocking callback stalls all other transition callers for its full duration. This appears **intentional**: a transition's exit/action/enter are logically one atomic unit and the design deliberately serializes them, and `thenEvent` exists precisely to defer re-entrant follow-ups until after the unlock.
 
   The callbacks are **not uniformly un-hoistable**, however:
   - The **intrinsic** callbacks -- `guard`, `action`, `onEnter`, `onExit` (and the force hooks) -- genuinely *are* part of the atomic transition: a guard participates in selecting the rule, and exit/action/enter run at defined points relative to the `_state` commit. Copy-then-invoke cannot be applied to them without changing transition semantics.
   - `onAnyTransition` is a **pure observer**. Its entire input -- the `(from, event, to)` triple -- is already captured by value during the transition (`matched->to` and the pre-commit `current` are local copies). It could be snapshotted under the lock and invoked **after** the unlock, satisfying copy-then-invoke (HR-9 / P-6) without affecting any transition outcome. The guide does not claim this is done today -- it is not -- only that, unlike the intrinsic callbacks, it is the one callback that genuinely *could* be hoisted.
 
-  No code change is made here; a maintainer should decide whether to document the under-lock invocation as a hard contract or to hoist the `onAnyTransition` observer to after the unlock. **The callbacks-under-lock behavior (and the `thenEvent` non-atomicity and move-ctor hazard below) remain unfixed and are tracked in backlog `2026-09-10-23`.** Historically tracked as the "callbacks execute under the mutex" limitation.
-- **CANDIDATE DEFECT-2 -- `thenEvent` compound transitions are not atomic across legs (`state_machine.hpp:268-273`, `:316-321`; tracked in backlog `2026-09-10-23`).** Because `_mutex` is released between the primary leg and the follow-up `processEvent`, another thread can observe the intermediate state and run its own `processEvent`/`forceState` before the follow-up leg acquires the lock. A chain that looks like an atomic `RUNNING -> CLEANUP -> TERMINATED` is really two independently-locked transitions. In single-threaded use (the tested scenario) this is invisible; under concurrent callers the follow-up leg runs against whatever state exists when it re-acquires the lock, and may find no matching rule (returning `false` silently for that leg). This is the direct trade-off of D-6 (non-recursive mutex). Flagged for a maintainer to confirm whether multi-leg atomicity is a requirement; no code change is proposed here.
-- **Move-constructor has no synchronization (`state_machine.hpp:80-89`; tracked in backlog `2026-09-10-23`).** The move ctor reads `other._state` with `relaxed` and moves `other`'s vectors without locking `other._mutex`. This is safe only under the single-threaded construction contract (section 7.4); move-constructing a machine that another thread is concurrently transitioning is a data race. In practice `build()`'s return invokes **no** move (C++17 mandatory copy elision), so a move occurs only if user code explicitly moves the machine -- which should happen only before it is shared -- but the public move constructor does not enforce this.
-- **Callbacks must be fast and non-blocking.** Direct corollary of CANDIDATE DEFECT-1: long-running `onEnter`/`onExit`/`onTransition`/`onAnyTransition` work blocks every other transition.
+  Decision (2026-10-22, HD-SM-1/HD-SM-2): keep every callback, including the observer, under the lock as a documented contract, and detect same-thread re-entry.
+- **`thenEvent` compound transitions are not atomic across legs (best effort by design, HD-SM-3; was CANDIDATE DEFECT-2).** Because `_mutex` is released between the primary leg and the follow-up `processEvent`, another thread can observe the intermediate state and run its own `processEvent`/`forceState` before the follow-up leg acquires the lock. A chain that looks like an atomic `RUNNING -> CLEANUP -> TERMINATED` is really two independently-locked transitions. In single-threaded use (the tested scenario) this is invisible; under concurrent callers the follow-up leg runs against whatever state exists when it re-acquires the lock, and may find no matching rule (returning `false` silently for that leg). This is the direct trade-off of D-6 (non-recursive mutex). Multi-leg atomicity is not a requirement (HD-SM-3); `processEvent` returns `true` when the first leg commits, even if the follow-up matches no rule; an exception from a follow-up leg propagates out of the original call after the earlier legs committed (section 7.6). A `thenEvent` cycle recurses without bound and overflows the stack.
+- **Move-constructor has no synchronization (by contract).** The move ctor reads `other._state` with `relaxed` and moves `other`'s vectors without locking `other._mutex`. This is safe only under the single-threaded construction contract (section 7.4); move-constructing a machine that another thread is concurrently transitioning is a data race. `build()`'s return invokes **no** move (C++17 guaranteed elision of the prvalue), so a move occurs only if user code explicitly moves the machine -- which should happen only before it is shared -- but the public move constructor does not enforce this.
+- **Callbacks must be fast and non-blocking.** Direct corollary of running under the lock (section 7.5): long-running `onEnter`/`onExit`/`onTransition`/`onAnyTransition` work blocks every other transition.
 - **`thenEvent` always re-passes the same `Context`.** A follow-up leg that semantically needs a *different* payload cannot get one through the chain; issue separate `processEvent(event, otherCtx)` calls instead.
 - **No wildcard states or events.** Every rule is an explicit `(from, event, to)` triple; there is no "any state" / "any event" match. "Global" behavior must be registered per state.
 - **`onAnyTransition` is single (last-wins).** Calling `onAnyTransition` more than once on the Builder overwrites the prior observer (it is a stored member, not a list); there is no multi-observer fan-out.
