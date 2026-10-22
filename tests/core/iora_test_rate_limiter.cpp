@@ -10,9 +10,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace iora::core;
@@ -342,4 +345,132 @@ TEST_CASE("RateLimiterMap: setDefaultRate publishes (rate,burst) as an atomic pa
   }
 
   REQUIRE(mixed.load() == 0); // never a torn (mixed rate/burst) pair
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Input validation
+// ══════════════════════════════════════════════════════════════════════════════
+
+constexpr double QUIET_NAN = std::numeric_limits<double>::quiet_NaN();
+constexpr double POS_INF = std::numeric_limits<double>::infinity();
+
+TEST_CASE("TokenBucket: ctor rejects a non-finite or non-positive rate",
+          "[rate_limiter][validation]")
+{
+  for (double r : {0.0, -1.0, QUIET_NAN, POS_INF})
+  {
+    CAPTURE(r);
+    REQUIRE_THROWS_AS(TokenBucket(r, 5.0), std::invalid_argument);
+  }
+}
+
+TEST_CASE("TokenBucket: ctor rejects a non-finite or negative burst", "[rate_limiter][validation]")
+{
+  for (double b : {-1.0, QUIET_NAN, POS_INF})
+  {
+    CAPTURE(b);
+    REQUIRE_THROWS_AS(TokenBucket(1.0, b), std::invalid_argument);
+  }
+}
+
+TEST_CASE("TokenBucket: ctor accepts a tiny rate and a zero burst", "[rate_limiter][validation]")
+{
+  REQUIRE_NOTHROW(TokenBucket(1e-9, 0.0));
+  REQUIRE_NOTHROW(TokenBucket(1.0, 0.0));
+}
+
+TEST_CASE("TokenBucket: negative tokens do not mint balance", "[rate_limiter][validation]")
+{
+  TokenBucket b(1e-3, 10.0);
+  REQUIRE(b.tryConsume(10.0));
+  REQUIRE_FALSE(b.tryConsume(-5.0));
+  REQUIRE_FALSE(b.tryConsume(5.0));
+}
+
+TEST_CASE("TokenBucket: NaN and infinite tokens are denied", "[rate_limiter][validation]")
+{
+  TokenBucket b(10.0, 10.0);
+  REQUIRE_FALSE(b.tryConsume(QUIET_NAN));
+  REQUIRE_FALSE(b.tryConsume(POS_INF));
+}
+
+TEST_CASE("TokenBucket: timeUntilAvailable is max() for a never-satisfiable request",
+          "[rate_limiter][validation]")
+{
+  TokenBucket b(10.0, 5.0);
+  for (double t : {-1.0, QUIET_NAN, POS_INF, 8.0})
+  {
+    CAPTURE(t);
+    REQUIRE(b.timeUntilAvailable(t) == std::chrono::milliseconds::max());
+  }
+}
+
+TEST_CASE("TokenBucket: timeUntilAvailable stays finite at tokens == burst",
+          "[rate_limiter][validation]")
+{
+  TokenBucket b(10.0, 5.0);
+  REQUIRE(b.tryConsume(5.0));
+  auto w = b.timeUntilAvailable(5.0);
+  REQUIRE(w > 0ms);
+  REQUIRE(w <= 1000ms);
+}
+
+TEST_CASE("TokenBucket: timeUntilAvailable saturates instead of overflowing",
+          "[rate_limiter][validation]")
+{
+  TokenBucket b(1e-16, 10.0);
+  REQUIRE(b.tryConsume(10.0));
+  REQUIRE(b.timeUntilAvailable(10.0) == std::chrono::milliseconds::max());
+}
+
+TEST_CASE("RateLimiterMap: ctor rejects invalid defaults", "[rate_limiter][validation]")
+{
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(0.0, 5.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(1.0, -1.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(QUIET_NAN, 5.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(1.0, POS_INF), std::invalid_argument);
+}
+
+TEST_CASE("RateLimiterMap: ctor validates before scheduling auto-cleanup",
+          "[rate_limiter][validation]")
+{
+  TimingWheel wheel(10ms, 64, 1);
+  wheel.start();
+  REQUIRE_THROWS_AS(RateLimiterMap<std::string>(0.0, 5.0, &wheel), std::invalid_argument);
+  REQUIRE(wheel.pendingCount() == 0);
+  {
+    RateLimiterMap<std::string> ok(1.0, 5.0, &wheel);
+    REQUIRE(wheel.pendingCount() == 1);
+    wheel.stop();
+  }
+}
+
+TEST_CASE("RateLimiterMap: setDefaultRate validates both values before assigning",
+          "[rate_limiter][validation]")
+{
+  RateLimiterMap<std::string> m(10.0, 5.0);
+  m.setDefaultRate(20.0, 7.0);
+  REQUIRE_THROWS_AS(m.setDefaultRate(30.0, -1.0), std::invalid_argument);
+  REQUIRE_THROWS_AS(m.setDefaultRate(QUIET_NAN, 9.0), std::invalid_argument);
+  REQUIRE(m.tryConsume("new"));
+  REQUIRE(m.getKeyRate("new") == std::make_pair(20.0, 7.0));
+}
+
+TEST_CASE("RateLimiterMap: setKeyRate rejects invalid values and changes nothing",
+          "[rate_limiter][validation]")
+{
+  RateLimiterMap<std::string> m(10.0, 5.0);
+  REQUIRE_THROWS_AS(m.setKeyRate("absent", QUIET_NAN, 5.0), std::invalid_argument);
+  REQUIRE_FALSE(m.getKeyRate("absent").has_value());
+  m.setKeyRate("k", 2.0, 3.0);
+  REQUIRE_THROWS_AS(m.setKeyRate("k", 0.0, 3.0), std::invalid_argument);
+  REQUIRE(m.getKeyRate("k") == std::make_pair(2.0, 3.0));
+}
+
+TEST_CASE("RateLimiterMap: negative tokens do not mint balance", "[rate_limiter][validation]")
+{
+  RateLimiterMap<std::string> m(1e-3, 5.0);
+  REQUIRE(m.tryConsume("k", 5.0));
+  REQUIRE_FALSE(m.tryConsume("k", -5.0));
+  REQUIRE_FALSE(m.tryConsume("k", 1.0));
 }

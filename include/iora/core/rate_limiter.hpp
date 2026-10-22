@@ -13,16 +13,35 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace iora {
 namespace core {
+
+namespace detail {
+
+/// \brief Throws std::invalid_argument unless rate is finite and > 0 and
+/// burstCapacity is finite and >= 0.
+inline void requireValidTokenBucketParams(double rate, double burstCapacity)
+{
+  if (!(std::isfinite(rate) && rate > 0.0))
+  {
+    throw std::invalid_argument("rate limiter: rate must be finite and > 0");
+  }
+  if (!(std::isfinite(burstCapacity) && burstCapacity >= 0.0))
+  {
+    throw std::invalid_argument("rate limiter: burst capacity must be finite and >= 0");
+  }
+}
+
+} // namespace detail
 
 /// \brief Token bucket rate limiter with lazy replenishment.
 ///
@@ -35,6 +54,8 @@ public:
   using Clock = std::chrono::steady_clock;
   using TimePoint = Clock::time_point;
 
+  /// \throws std::invalid_argument if rate is not finite and > 0, or
+  /// burstCapacity is not finite and >= 0.
   TokenBucket(double rate, double burstCapacity)
     : _rate(rate)
     , _burstCapacity(burstCapacity)
@@ -42,6 +63,7 @@ public:
     , _lastRefill(Clock::now())
     , _lastAccess(Clock::now())
   {
+    detail::requireValidTokenBucketParams(rate, burstCapacity);
   }
 
   // Non-copyable (prevents findOrInsert copy bug at compile time)
@@ -52,11 +74,17 @@ public:
   TokenBucket(TokenBucket&&) = default;
   TokenBucket& operator=(TokenBucket&&) = default;
 
-  /// \brief Try to consume tokens. Returns false if insufficient.
+  /// \brief Try to consume tokens. Returns false without changing any state if
+  /// tokens is negative or NaN. Otherwise replenishes, then returns false if the
+  /// balance is insufficient.
   /// Only updates _lastAccess on success (denied requests don't
   /// refresh idle timer — allows cleanup of keys under sustained flood).
   bool tryConsume(double tokens = 1.0)
   {
+    if (!(tokens >= 0.0))
+    {
+      return false;
+    }
     replenish();
     if (_tokens >= tokens)
     {
@@ -77,17 +105,26 @@ public:
 
   /// \brief Time until the requested tokens are available.
   /// Returns 0ms if already available. Rounds up to milliseconds.
+  /// Returns std::chrono::milliseconds::max() if the request can never
+  /// succeed (tokens negative, NaN, or above burstCapacity) or the wait does
+  /// not fit; callers must not add that value to a time_point unchecked.
   std::chrono::milliseconds timeUntilAvailable(double tokens = 1.0) const
   {
+    if (!(tokens >= 0.0) || tokens > _burstCapacity)
+    {
+      return std::chrono::milliseconds::max();
+    }
     double available = availableTokens();
     if (available >= tokens)
     {
       return std::chrono::milliseconds(0);
     }
-    double deficit = tokens - available;
-    double seconds = deficit / _rate;
-    auto ms = static_cast<std::int64_t>(std::ceil(seconds * 1000.0));
-    return std::chrono::milliseconds(ms);
+    double ms = std::ceil((tokens - available) / _rate * 1000.0);
+    if (!(ms < static_cast<double>(std::chrono::milliseconds::max().count())))
+    {
+      return std::chrono::milliseconds::max();
+    }
+    return std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(ms));
   }
 
   /// \brief Last time this bucket was accessed (for idle cleanup).
@@ -218,6 +255,8 @@ public:
   /// \param cleanupWheel Optional TimingWheel for auto-cleanup scheduling
   /// \param cleanupInterval Interval for auto-cleanup (default 60s)
   /// \param maxIdle Max idle time before a bucket is evicted (default 300s)
+  /// \throws std::invalid_argument if defaultRate is not finite and > 0, or
+  /// defaultBurst is not finite and >= 0.
   RateLimiterMap(double defaultRate, double defaultBurst,
                  TimingWheel* cleanupWheel = nullptr,
                  std::chrono::seconds cleanupInterval = std::chrono::seconds(60),
@@ -226,6 +265,7 @@ public:
     , _defaultBurst(defaultBurst)
     , _maxIdle(maxIdle)
   {
+    detail::requireValidTokenBucketParams(defaultRate, defaultBurst);
     if (cleanupWheel)
     {
       scheduleAutoCleanup(*cleanupWheel, cleanupInterval);
@@ -269,14 +309,19 @@ public:
   /// \brief Set default rate for new buckets. Does not affect existing.
   /// Thread-safe: the (rate, burst) pair is published together under _defaultsMutex,
   /// so a concurrent bucket creation never observes a torn (newRate, oldBurst) pair.
+  /// \throws std::invalid_argument if rate is not finite and > 0, or burst is
+  /// not finite and >= 0; the previous defaults are kept.
   void setDefaultRate(double rate, double burst)
   {
+    detail::requireValidTokenBucketParams(rate, burst);
     std::lock_guard<std::mutex> lk(_defaultsMutex);
     _defaultRate = rate;
     _defaultBurst = burst;
   }
 
   /// \brief Override rate for a specific key.
+  /// \throws std::invalid_argument if rate is not finite and > 0, or burst is
+  /// not finite and >= 0; the key's bucket is unchanged.
   void setKeyRate(const K& key, double rate, double burst)
   {
     // Atomic replace via insertOrAssign (single shard lock acquisition)
