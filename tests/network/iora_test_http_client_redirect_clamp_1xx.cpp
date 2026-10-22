@@ -5,14 +5,12 @@
 // See the LICENSE file or <https://www.mozilla.org/MPL/2.0/> for details.
 //
 // HttpClient task-1.8 (tracker 2026-07-26-10): the dead redirect config
-// (defect_5), the loopback connect-timeout clamp (defect_9), and the 1xx
-// citation (defect_16). followRedirects/maxRedirects are reserved-and-inert —
-// HttpClient follows no redirects — so the default no longer advertises the
-// capability (followRedirects defaults false). The interim-1xx skip path
-// (documented RFC 9110 §15.2) must frame the final response after discarding a
-// 100-continue. The loopback clamp is a DOCUMENTED behavior (Config::connectTimeout
-// + the clamp site); it is not directly assertable here. A raw mock server
-// controls the exact response bytes. Catch2 macros run on the MAIN thread only.
+// (defect_5) and the 1xx citation (defect_16). followRedirects/maxRedirects are
+// reserved-and-inert — HttpClient follows no redirects — so the default no longer
+// advertises the capability (followRedirects defaults false). The interim-1xx skip
+// path (documented RFC 9110 §15.2) must frame the final response after discarding
+// a 100-continue. A raw mock server controls the exact response bytes. Catch2
+// macros run on the MAIN thread only.
 // Run under ASan (handle_segv=0); ctest -j1.
 
 #define CATCH_CONFIG_MAIN

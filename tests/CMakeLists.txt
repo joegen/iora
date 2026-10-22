@@ -89,6 +89,7 @@ set(NETWORK_TESTS
     network/iora_test_http_server_quiesce_drain
     network/iora_test_http_server_owner_removal
     network/iora_test_http_client_pool
+    network/iora_test_http_client_loopback_connect
     network/iora_test_http_client_lease
     network/iora_test_http_client_response_framing
     network/iora_test_http_client_host_header

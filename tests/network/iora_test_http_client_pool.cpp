@@ -769,69 +769,49 @@ TEST_CASE("HttpClientPool 1000 concurrent connections with 200 OK", "[http_clien
         {
           for (int j = 0; j < connectionsPerThread; ++j)
           {
-            bool requestSucceeded = false;
-            int retries = 0;
-            const int maxRetries = 3;
-
-            while (!requestSucceeded && retries < maxRetries)
+            try
             {
-              try
+              auto client = pool.get();
+              if (!client.isValid())
               {
-                auto client = pool.get();
-                if (!client.isValid())
-                {
-                  failureCount++;
-                  break;
-                }
+                failureCount++;
+                continue;
+              }
 
-                auto response = client.get(fixture.url("/test-get"));
+              auto response = client.get(fixture.url("/test-get"));
 
-                if (response.success())
+              if (response.success())
+              {
+                if (response.statusCode == 200)
                 {
-                  if (response.statusCode == 200)
-                  {
-                    successCount++;
-                    requestSucceeded = true;
-                  }
-                  else
-                  {
-                    non200Count++;
-                    requestSucceeded = true;
-                  }
+                  successCount++;
                 }
                 else
                 {
-                  failureCount++;
-                  requestSucceeded = true;
+                  non200Count++;
                 }
               }
-              catch (const std::exception &e)
+              else
               {
-                std::string errMsg(e.what());
-                // Retry on localhost connection timeout (transient under high concurrency)
-                if (errMsg.find("Localhost connection taking too long") != std::string::npos && retries < maxRetries - 1)
-                {
-                  retries++;
-                  continue;
-                }
-
-                exceptionCount++;
-                std::lock_guard<std::mutex> lock(exceptionMutex);
-                if (exceptionMessages.size() < 10)
-                {
-                  exceptionMessages.push_back(e.what());
-                }
-                requestSucceeded = true; // Exit retry loop
+                failureCount++;
               }
-              catch (...)
+            }
+            catch (const std::exception &e)
+            {
+              exceptionCount++;
+              std::lock_guard<std::mutex> lock(exceptionMutex);
+              if (exceptionMessages.size() < 10)
               {
-                exceptionCount++;
-                std::lock_guard<std::mutex> lock(exceptionMutex);
-                if (exceptionMessages.size() < 10)
-                {
-                  exceptionMessages.push_back("Unknown exception");
-                }
-                requestSucceeded = true; // Exit retry loop
+                exceptionMessages.push_back(e.what());
+              }
+            }
+            catch (...)
+            {
+              exceptionCount++;
+              std::lock_guard<std::mutex> lock(exceptionMutex);
+              if (exceptionMessages.size() < 10)
+              {
+                exceptionMessages.push_back("Unknown exception");
               }
             }
           }

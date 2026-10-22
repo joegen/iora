@@ -496,12 +496,10 @@ public:
   /// \brief Configuration for HTTP client
   struct Config
   {
-    /// Per-connect timeout. NOTE (defect_9): silently clamped to
-    /// min(connectTimeout, 200ms) for loopback (127.0.0.1 / ::1, and the
-    /// hostname "localhost" which resolveHostAddress maps to 127.0.0.1) — a
-    /// loopback connect resolves near-instantly, so this value is NOT observable
-    /// against loopback. To exercise a real connect timeout, target a
-    /// non-routable address such as 192.0.2.1 (TEST-NET-1).
+    /// Per-connect timeout. Applies to every address, loopback included. A
+    /// connect to an unbound loopback port fails fast only when the kernel answers
+    /// with a RST; on hosts that drop that SYN (for example WSL2) it fails at
+    /// connectTimeout.
     std::chrono::milliseconds connectTimeout;
     std::chrono::milliseconds requestTimeout;
     /// RESERVED AND INERT (defect_5): HttpClient does NOT follow redirects — no
@@ -1567,19 +1565,6 @@ private:
     //     slot, so no other thread races this connect/publish.
     TlsMode tlsMode = parsedUrl.isHttps() ? TlsMode::Client : TlsMode::None;
 
-    // LOOPBACK CONNECT-TIMEOUT CLAMP (defect_9): for 127.0.0.1 / ::1 the connect
-    // timeout is clamped to min(connectTimeout, 200ms) — a loopback connect
-    // either succeeds or is refused almost instantly, so a long timeout only
-    // delays a refusal. CONSEQUENCE: Config::connectTimeout is NOT observable
-    // against loopback (the address every in-tree test uses); a test that needs
-    // to exercise a real connect-timeout must target a non-loopback,
-    // non-routable address (e.g. 192.0.2.1, TEST-NET-1). resolveHostAddress also
-    // maps the hostname "localhost" to 127.0.0.1 (:1227), so "localhost" is
-    // clamped too. This is documented on Config::connectTimeout as well.
-    auto timeout = (resolvedHost == "127.0.0.1" || resolvedHost == "::1")
-      ? std::min(_config.connectTimeout, std::chrono::milliseconds(200))
-      : _config.connectTimeout;
-
     // TLS client identity (RFC 6125/9525): the reference identity is the ORIGINAL
     // pre-resolution host (parsedUrl.host), NOT resolvedHost (an IP). Use the SAME
     // isIPAddress predicate that resolveHostAddress used (M-B) so the verifyName-
@@ -1593,8 +1578,8 @@ private:
       tlsOpts.verifyName = isIPAddress(parsedUrl.host) ? std::string{} : parsedUrl.host;
       tlsOpts.x509HostFlags = kHttpsHostFlags;
     }
-    auto connectResult =
-      _transport->connectSync(resolvedHost, parsedUrl.port, tlsMode, tlsOpts, timeout);
+    auto connectResult = _transport->connectSync(resolvedHost, parsedUrl.port, tlsMode, tlsOpts,
+                                                 _config.connectTimeout);
     if (connectResult.isErr())
     {
       const std::string detail =

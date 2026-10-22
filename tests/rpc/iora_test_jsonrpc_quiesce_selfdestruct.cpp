@@ -53,8 +53,14 @@
 #include "iora/network/http_client.hpp"
 #include "iora/parsers/json.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <future>
 #include <iostream>
@@ -67,6 +73,36 @@ using iora::rpc::JsonRpcClient;
 
 namespace
 {
+// A loopback port bound but not listening: the kernel refuses a connect at once.
+// (This file has no Catch2, so testnet::RefusingEndpoint cannot be used here.)
+class RefusingPort
+{
+public:
+  RefusingPort()
+  {
+    _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(a);
+    if (_fd < 0 || ::bind(_fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0 ||
+        ::getsockname(_fd, reinterpret_cast<sockaddr *>(&a), &len) != 0)
+    {
+      std::cerr << "RefusingPort: bind failed\n";
+      std::abort();
+    }
+    _port = ntohs(a.sin_port);
+  }
+  ~RefusingPort() { ::close(_fd); }
+  RefusingPort(const RefusingPort &) = delete;
+  RefusingPort &operator=(const RefusingPort &) = delete;
+  std::uint16_t port() const { return _port; }
+
+private:
+  int _fd{-1};
+  std::uint16_t _port{0};
+};
+
 // Whether a std::terminate is the EXPECTED outcome for the selected scenario.
 // selfdestruct -> true (terminate == success, _Exit(0)); otherclient -> false
 // (terminate == failure, _Exit(3)).
@@ -103,12 +139,14 @@ Config stubConfig()
 // this client's _owners, so quiesce STEP-1 must terminate.
 int runSelfDestruct()
 {
+  RefusingPort refusing;
+  const std::string refusedUrl = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
   auto client = std::make_shared<JsonRpcClient>(pool, stubConfig());
 
   std::atomic<bool> mainDidReset{false};
   client->callAsync(
-    "http://127.0.0.1:1/rpc", "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
+    refusedUrl, "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
     [client, &mainDidReset](std::exception_ptr) mutable
     {
       // Wait until main has dropped its reference so THIS captured copy is the
@@ -212,6 +250,8 @@ int runEnqueueFailSelfDestruct()
 // pass only when the terminate fired during the reset inside the window.
 int runConfigurerSelfDestruct()
 {
+  RefusingPort refusing;
+  const std::string refusedUrl = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
 
   // The SOLE facade reference. The configurer drops it while the construction
@@ -230,7 +270,7 @@ int runConfigurerSelfDestruct()
   {
     // Counted + owner-registered. acquire_ reserves, unlocks, and runs the
     // configurer above — which destroys the client from inside this frame.
-    (void)raw->call("http://127.0.0.1:1/rpc", "ping");
+    (void)raw->call(refusedUrl, "ping");
   }
   catch (const std::exception &)
   {
@@ -247,6 +287,8 @@ int runConfigurerSelfDestruct()
 // the second's, so destroying the second must NOT terminate.
 int runOtherClient()
 {
+  RefusingPort refusing;
+  const std::string refusedUrl = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
   iora::core::ThreadPool pool(/*initial*/ 1, /*max*/ 1, std::chrono::seconds(1));
   JsonRpcClient first(pool, stubConfig());                           // active; destroyed by main at end
   auto second = std::make_shared<JsonRpcClient>(pool, stubConfig()); // idle, shares the pool
@@ -254,7 +296,7 @@ int runOtherClient()
   std::atomic<bool> mainDidReset{false};
   std::atomic<bool> callbackDone{false};
   first.callAsync(
-    "http://127.0.0.1:1/rpc", "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
+    refusedUrl, "ping", iora::parsers::Json::object(), {}, [](iora::parsers::Json) {},
     [second, &mainDidReset, &callbackDone](std::exception_ptr) mutable
     {
       while (!mainDidReset.load())

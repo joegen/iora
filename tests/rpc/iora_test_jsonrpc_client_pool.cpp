@@ -2390,6 +2390,8 @@ TEST_CASE("phase3: destructor cancels and waits for an in-flight synchronous cal
 TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
           "[jsonrpc][pool][phase3][latched]")
 {
+  testnet::RefusingEndpoint refusing; // bound, not listening -> RST -> ECONNREFUSED
+  const std::string refusedUrl = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   const std::uint16_t serverPort = testnet::getFreePortTCP();
   LatchedHttpServer server(serverPort);
@@ -2407,10 +2409,10 @@ TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
     REQUIRE(f.get().is_object());
   }
 
-  // set_exception: an unroutable endpoint makes callCore_ throw; the future
+  // set_exception: a refused endpoint (bound, not listening) makes callCore_ throw; the future
   // carries the exception.
   {
-    std::future<iora::parsers::Json> f = client.callAsync("http://127.0.0.1:1/rpc", "ping");
+    std::future<iora::parsers::Json> f = client.callAsync(refusedUrl, "ping");
     REQUIRE(f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
     REQUIRE_THROWS(f.get());
   }
@@ -2418,13 +2420,13 @@ TEST_CASE("phase3: typed-future overloads deliver value and exception (H-1)",
   // callBatchAsync (vector<Json>) — the SAME InFlightToken<vector<Json>> promise
   // plumbing, proven via set_exception (the shared fixture returns a single
   // object, not a batch array, so its set_value path needs a batch-speaking
-  // server — deferred to the deterministic phase-9 fixtures, task-9.1). An
-  // unroutable endpoint makes callBatchCore_ throw; the future carries it.
+  // server — deferred to the deterministic phase-9 fixtures, task-9.1). A refused
+  // endpoint (bound, not listening) makes callBatchCore_ throw; the future carries it.
   {
     std::vector<iora::rpc::BatchItem> items;
     items.emplace_back("ping", iora::parsers::Json::object(), std::uint64_t{1});
     std::future<std::vector<iora::parsers::Json>> f =
-      client.callBatchAsync("http://127.0.0.1:1/rpc", items);
+      client.callBatchAsync(refusedUrl, items);
     REQUIRE(f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
     REQUIRE_THROWS(f.get());
   }
@@ -2618,13 +2620,15 @@ TEST_CASE("phase3: onError completes before a concurrent destructor returns (enq
 TEST_CASE("phase3: destructor interrupts a call parked in retry backoff",
           "[jsonrpc][pool][phase3]")
 {
+  testnet::RefusingEndpoint refusing; // bound, not listening -> RST -> ECONNREFUSED
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxRetries = 5;
   cfg.initialRetryDelay = std::chrono::milliseconds(2000); // long, so interruption is unmistakable
   cfg.retryBackoffMultiplier = 2.0;
   auto client = std::make_unique<JsonRpcClient>(pool, cfg);
-  const std::string ep = "http://127.0.0.1:1/rpc"; // connection refused -> retry loop
+  // connection refused -> retry loop
+  const std::string ep = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
 
   std::atomic<bool> callReturned{false};
   std::exception_ptr callErr;
@@ -3839,6 +3843,8 @@ TEST_CASE("task-6.4b(n)+(r): captured user state dies before the destructor retu
           "when onSuccess throws",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
+  testnet::RefusingEndpoint refusing; // bound, not listening -> RST -> ECONNREFUSED
+  const std::string refusedUrl = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
 
   std::atomic<bool> destructorReturned{false};
   std::atomic<bool> probeDestroyed{false};
@@ -3885,10 +3891,10 @@ TEST_CASE("task-6.4b(n)+(r): captured user state dies before the destructor retu
   {
     auto probe =
       std::make_shared<Probe>(&probeDestroyed, &probeSawDestructorReturned, &destructorReturned);
-    // (r): BOTH callables throw. The endpoint is unroutable so onError is the
-    // one that fires here; the throw must be swallowed either way (TS-4) — a
+    // (r): BOTH callables throw. The endpoint refuses (bound, not listening), so
+    // onError is the one that fires here; the throw must be swallowed either way (TS-4) — a
     // user exception escaping into a worker would terminate the process.
-    client->callAsync("http://127.0.0.1:1/rpc", "ping", iora::parsers::Json::object(), {},
+    client->callAsync(refusedUrl, "ping", iora::parsers::Json::object(), {},
                       [probe](iora::parsers::Json) { throw std::runtime_error("onSuccess threw"); },
                       [probe](std::exception_ptr) { throw std::runtime_error("onError threw"); });
     // The token's two captures are now the SOLE owners of the probe.
@@ -3941,22 +3947,23 @@ TEST_CASE("task-6.4b(n)+(r): captured user state dies before the destructor retu
 TEST_CASE("task-6.4b(g): callAsync racing destruction resolves every call and never wedges",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
+  testnet::RefusingEndpoint refusing; // bound, not listening -> RST -> ECONNREFUSED
+  const std::string refusedUrl = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
-  auto client = std::make_shared<JsonRpcClient>(pool, stubFactoryConfig());
-
   std::atomic<int> issued{0};
   std::atomic<int> resolved{0};
   std::atomic<bool> escaped{false};
   TestLatch issuing;
+  auto client = std::make_shared<JsonRpcClient>(pool, stubFactoryConfig());
 
   std::thread caller(
-    [client, &issued, &resolved, &escaped, &issuing]() mutable
+    [client, refusedUrl, &issued, &resolved, &escaped, &issuing]() mutable
     {
       for (int i = 0; i < 100; ++i)
       {
         try
         {
-          client->callAsync("http://127.0.0.1:1/rpc", "ping", iora::parsers::Json::object(), {},
+          client->callAsync(refusedUrl, "ping", iora::parsers::Json::object(), {},
                             [&resolved](iora::parsers::Json) { resolved.fetch_add(1); },
                             [&resolved](std::exception_ptr) { resolved.fetch_add(1); });
           issued.fetch_add(1);
@@ -4000,16 +4007,18 @@ TEST_CASE("task-6.4b(g): callAsync racing destruction resolves every call and ne
 TEST_CASE("task-6.4b(j): a callback that enqueues another task cannot livelock the destructor",
           "[jsonrpc][pool][phase3][phase6][quiesce]")
 {
+  testnet::RefusingEndpoint refusing; // bound, not listening -> RST -> ECONNREFUSED
+  // refused: onError fires fast
+  const std::string ep = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
   using iora::rpc::ClientShutdownError;
 
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
   Config cfg = stubFactoryConfig();
   cfg.maxRetries = 0; // no backoff between links: the chain must turn over fast
-  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
-
   std::atomic<int> links{0};
   std::atomic<int> refusals{0};
-  const std::string ep = "http://127.0.0.1:1/rpc"; // unroutable: onError fires fast
+  std::function<void(std::exception_ptr)> chain;
+  auto client = std::make_unique<JsonRpcClient>(pool, cfg);
 
   // The chain holds a RAW facade pointer, deliberately: capturing an owning
   // handle would make the tokens co-own the client and the reset() below could
@@ -4018,7 +4027,6 @@ TEST_CASE("task-6.4b(j): a callback that enqueues another task cannot livelock t
   // inside a COUNTED token, and the destructor cannot return while one is
   // outstanding, so the facade (and its _impl member) is alive throughout.
   JsonRpcClient *raw = client.get();
-  std::function<void(std::exception_ptr)> chain;
   chain = [raw, ep, &links, &refusals, &chain](std::exception_ptr e)
   {
     // Once the gate refuses, STOP. The refusal is delivered SYNCHRONOUSLY in
@@ -4138,11 +4146,13 @@ TEST_CASE("task-6.4b(h): a synchronous call unwinding under a concurrent destruc
 TEST_CASE("task-6.4b(x): a destructor waits for a creation parked in the construction window",
           "[jsonrpc][pool][phase3][phase6][quiesce][window]")
 {
+  testnet::RefusingEndpoint refusing; // bound, not listening -> RST -> ECONNREFUSED
   iora::core::ThreadPool pool(2, 2, std::chrono::seconds(1));
 
   TestLatch entered;
   TestLatch release;
-  const std::string ep = "http://127.0.0.1:1/rpc"; // unroutable: the send fails fast
+  // refused: the send fails fast
+  const std::string ep = "http://127.0.0.1:" + std::to_string(refusing.port()) + "/rpc";
 
   Config cfg = stubFactoryConfig();
   cfg.maxRetries = 0;
@@ -4534,8 +4544,7 @@ TEST_CASE("task-7.1a: requestTimeout reaches HttpClient (below the response dela
 // task-7.1a — connectionTimeout reaches HttpClient END-TO-END through the DEFAULT
 // factory (cpp17 R1-M1). Connect to a NON-ROUTABLE address (192.0.2.1, RFC 5737
 // TEST-NET-1) whose SYN is black-holed, so connect blocks until connectTimeout.
-// 192.0.2.1 is NOT loopback, so http_client's loopback clamp (min 200 ms) does
-// NOT apply, giving a clean discriminator: mapped -> ~50 ms; unmapped -> the
+// The black-holed SYN gives a clean discriminator: mapped -> ~50 ms; unmapped -> the
 // HttpClient 2000 ms default. Assert the failure lands well under 1 s.
 // (Verified 2026-09-02 that this host black-holes a non-routable SYN; if a future
 // host fast-refuses it — ENETUNREACH/ECONNREFUSED — this discriminator collapses
