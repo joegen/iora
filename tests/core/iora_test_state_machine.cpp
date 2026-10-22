@@ -8,11 +8,17 @@
 
 #include <iora/core/state_machine.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace iora::core;
+using namespace std::chrono_literals;
 
 // Test enums
 enum class State { IDLE, RUNNING, COMPLETED, TERMINATED };
@@ -391,6 +397,8 @@ TEST_CASE("SM: concurrent currentState reads during transitions", "[state_machin
     }
   });
 
+  // Readers record into an atomic; Catch2 macros run only on the main thread.
+  std::atomic<bool> sawInvalidState{false};
   std::vector<std::thread> readers;
   for (int r = 0; r < 4; ++r)
   {
@@ -399,13 +407,509 @@ TEST_CASE("SM: concurrent currentState reads during transitions", "[state_machin
       for (int i = 0; i < iterations; ++i)
       {
         auto state = sm.currentState();
-        // State must be one of the valid values
-        REQUIRE((state == State::IDLE || state == State::RUNNING ||
-                 state == State::COMPLETED || state == State::TERMINATED));
+        if (!(state == State::IDLE || state == State::RUNNING ||
+              state == State::COMPLETED || state == State::TERMINATED))
+        {
+          sawInvalidState = true;
+        }
       }
     });
   }
 
   writer.join();
-  for (auto& t : readers) t.join();
+  for (auto& t : readers)
+  {
+    t.join();
+  }
+  REQUIRE_FALSE(sawInvalidState);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Same-thread re-entry
+// ══════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+using VoidSM = StateMachine<State, Event>;
+using CtxSM = StateMachine<State, Event, MyContext>;
+
+enum class Hook { GUARD, ACTION, ON_ENTER, ON_EXIT, OBSERVER, EXIT_FORCE, ENTER_FORCE };
+enum class Reentry { PROCESS_EVENT, FORCE_STATE };
+
+// Everything the probe thread and the callbacks touch. Owned through a
+// shared_ptr that the probe thread holds, so a deadlocked probe never touches
+// freed memory; callbacks hold a raw pointer to avoid a cycle.
+template<typename SM>
+struct ReentryProbe
+{
+  std::unique_ptr<SM> sm;
+  std::atomic<bool> caughtLogicError{false};
+  std::atomic<bool> reentryReturned{false};
+  std::atomic<bool> outerResult{false};
+  std::atomic<bool> escaped{false};
+  std::promise<void> done;
+};
+
+template<typename Probe, typename Call>
+void attemptReentry(Probe* p, Call call)
+{
+  try
+  {
+    call();
+    p->reentryReturned = true;
+  }
+  catch (const std::logic_error&)
+  {
+    p->caughtLogicError = true;
+  }
+}
+
+// Builds IDLE --START--> RUNNING with the named hook re-entering the machine.
+std::shared_ptr<ReentryProbe<VoidSM>> makeVoidProbe(Hook hook, Reentry how)
+{
+  auto probe = std::make_shared<ReentryProbe<VoidSM>>();
+  auto* p = probe.get();
+  auto reenter = [p, how]()
+  {
+    attemptReentry(p,
+                   [p, how]()
+                   {
+                     if (how == Reentry::PROCESS_EVENT)
+                     {
+                       p->sm->processEvent(Event::CANCEL);
+                     }
+                     else
+                     {
+                       p->sm->forceState(State::TERMINATED);
+                     }
+                   });
+  };
+
+  VoidSM::Builder b;
+  b.initialState(State::IDLE).transition(State::IDLE, Event::START, State::RUNNING);
+  switch (hook)
+  {
+  case Hook::GUARD:
+    b.guard(
+      [reenter]()
+      {
+        reenter();
+        return true;
+      });
+    break;
+  case Hook::ACTION:
+    b.onTransition(reenter);
+    break;
+  case Hook::ON_ENTER:
+    b.onEnter(State::RUNNING, reenter);
+    break;
+  case Hook::ON_EXIT:
+    b.onExit(State::IDLE, reenter);
+    break;
+  case Hook::OBSERVER:
+    b.onAnyTransition([reenter](State, Event, State) { reenter(); });
+    break;
+  case Hook::EXIT_FORCE:
+    b.onExitForce(State::IDLE, reenter);
+    break;
+  case Hook::ENTER_FORCE:
+    b.onEnterForce(State::RUNNING, reenter);
+    break;
+  }
+  probe->sm = std::make_unique<VoidSM>(b.build());
+  return probe;
+}
+
+// Runs the outer call on a detached thread and waits a bounded time, so a
+// deadlocked re-entry fails the row instead of hanging the suite.
+template<typename SM, typename Outer>
+void runReentryProbe(const std::shared_ptr<ReentryProbe<SM>>& probe, Outer outer)
+{
+  auto done = probe->done.get_future();
+  std::thread(
+    [probe, outer]()
+    {
+      try
+      {
+        probe->outerResult = outer(*probe->sm);
+      }
+      catch (...)
+      {
+        probe->escaped = true;
+      }
+      probe->done.set_value();
+    })
+    .detach();
+
+  REQUIRE(done.wait_for(2s) == std::future_status::ready);
+  REQUIRE_FALSE(probe->escaped);
+  REQUIRE(probe->caughtLogicError);
+  REQUIRE_FALSE(probe->reentryReturned);
+  REQUIRE(probe->outerResult);
+  REQUIRE(probe->sm->currentState() == State::RUNNING);
+}
+
+void runVoidProcessEventProbe(Hook hook, Reentry how)
+{
+  runReentryProbe(makeVoidProbe(hook, how),
+                  [](VoidSM& sm) { return sm.processEvent(Event::START); });
+}
+
+void runVoidForceStateProbe(Hook hook, Reentry how)
+{
+  runReentryProbe(makeVoidProbe(hook, how),
+                  [](VoidSM& sm)
+                  {
+                    sm.forceState(State::RUNNING);
+                    return true;
+                  });
+}
+
+} // namespace
+
+TEST_CASE("SM reentry: guard -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::GUARD, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: guard -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::GUARD, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: action -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::ACTION, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: action -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::ACTION, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: onEnter -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::ON_ENTER, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: onEnter -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::ON_ENTER, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: onExit -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::ON_EXIT, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: onExit -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::ON_EXIT, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: onAnyTransition -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::OBSERVER, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: onAnyTransition -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidProcessEventProbe(Hook::OBSERVER, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: onExitForce -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidForceStateProbe(Hook::EXIT_FORCE, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: onExitForce -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidForceStateProbe(Hook::EXIT_FORCE, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: onEnterForce -> processEvent throws", "[state_machine][reentry]")
+{
+  runVoidForceStateProbe(Hook::ENTER_FORCE, Reentry::PROCESS_EVENT);
+}
+
+TEST_CASE("SM reentry: onEnterForce -> forceState throws", "[state_machine][reentry]")
+{
+  runVoidForceStateProbe(Hook::ENTER_FORCE, Reentry::FORCE_STATE);
+}
+
+TEST_CASE("SM reentry: context action -> processEvent throws", "[state_machine][reentry]")
+{
+  auto probe = std::make_shared<ReentryProbe<CtxSM>>();
+  auto* p = probe.get();
+  CtxSM::Builder b;
+  b.initialState(State::IDLE)
+    .transition(State::IDLE, Event::START, State::RUNNING)
+    .onTransition([p](const MyContext& ctx)
+                  { attemptReentry(p, [p, &ctx]() { p->sm->processEvent(Event::CANCEL, ctx); }); });
+  probe->sm = std::make_unique<CtxSM>(b.build());
+  runReentryProbe(probe, [](CtxSM& sm) { return sm.processEvent(Event::START, MyContext{}); });
+}
+
+TEST_CASE("SM reentry: context guard -> forceState throws", "[state_machine][reentry]")
+{
+  auto probe = std::make_shared<ReentryProbe<CtxSM>>();
+  auto* p = probe.get();
+  CtxSM::Builder b;
+  b.initialState(State::IDLE)
+    .transition(State::IDLE, Event::START, State::RUNNING)
+    .guard(
+      [p](const MyContext&)
+      {
+        attemptReentry(p, [p]() { p->sm->forceState(State::TERMINATED); });
+        return true;
+      });
+  probe->sm = std::make_unique<CtxSM>(b.build());
+  runReentryProbe(probe, [](CtxSM& sm) { return sm.processEvent(Event::START, MyContext{}); });
+}
+
+TEST_CASE("SM reentry: a callback may drive a different machine", "[state_machine][reentry]")
+{
+  auto other = VoidSM::Builder()
+                 .initialState(State::IDLE)
+                 .transition(State::IDLE, Event::START, State::RUNNING)
+                 .build();
+  bool otherMoved = false;
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .onTransition(
+                [&]()
+                {
+                  otherMoved = other.processEvent(Event::START);
+                  other.forceState(State::COMPLETED);
+                })
+              .build();
+
+  REQUIRE(sm.processEvent(Event::START));
+  REQUIRE(otherMoved);
+  REQUIRE(other.currentState() == State::COMPLETED);
+  REQUIRE(sm.currentState() == State::RUNNING);
+}
+
+// The rows below are regression guards for "the re-entry stamp is released on
+// every exit path": each ends with a same-thread call that must not throw
+// std::logic_error. They pass on the code before the detector existed too.
+
+TEST_CASE("SM stamp release: void guard rejects", "[state_machine][reentry]")
+{
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .guard([]() { return false; })
+              .transition(State::IDLE, Event::FINISH, State::COMPLETED)
+              .build();
+
+  REQUIRE_FALSE(sm.processEvent(Event::START));
+  REQUIRE(sm.processEvent(Event::FINISH));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM stamp release: void guard throws", "[state_machine][reentry]")
+{
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .guard([]() -> bool { throw std::runtime_error("guard"); })
+              .transition(State::IDLE, Event::FINISH, State::COMPLETED)
+              .build();
+
+  REQUIRE_THROWS_AS(sm.processEvent(Event::START), std::runtime_error);
+  REQUIRE(sm.currentState() == State::IDLE);
+  REQUIRE(sm.processEvent(Event::FINISH));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM stamp release: context action throws", "[state_machine][reentry]")
+{
+  auto sm = CtxSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .onTransition([](const MyContext&) { throw std::runtime_error("action"); })
+              .transition(State::IDLE, Event::FINISH, State::COMPLETED)
+              .build();
+
+  REQUIRE_THROWS_AS(sm.processEvent(Event::START, MyContext{}), std::runtime_error);
+  REQUIRE(sm.currentState() == State::IDLE);
+  REQUIRE(sm.processEvent(Event::FINISH, MyContext{}));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM stamp release: context guard rejects", "[state_machine][reentry]")
+{
+  auto sm = CtxSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .guard([](const MyContext&) { return false; })
+              .transition(State::IDLE, Event::FINISH, State::COMPLETED)
+              .build();
+
+  REQUIRE_FALSE(sm.processEvent(Event::START, MyContext{}));
+  REQUIRE(sm.processEvent(Event::FINISH, MyContext{}));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM exceptions: action throws after onExit", "[state_machine][reentry]")
+{
+  bool exited = false;
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .onTransition([]() { throw std::runtime_error("action"); })
+              .transition(State::IDLE, Event::FINISH, State::COMPLETED)
+              .onExit(State::IDLE, [&]() { exited = true; })
+              .build();
+
+  REQUIRE_THROWS_AS(sm.processEvent(Event::START), std::runtime_error);
+  REQUIRE(exited);
+  REQUIRE(sm.currentState() == State::IDLE);
+  REQUIRE(sm.processEvent(Event::FINISH));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM exceptions: onEnter throws after the commit", "[state_machine][reentry]")
+{
+  int observed = 0;
+  bool enterThrown = false;
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .thenEvent(Event::FINISH)
+              .transition(State::RUNNING, Event::FINISH, State::COMPLETED)
+              .onEnter(State::RUNNING,
+                       [&]()
+                       {
+                         if (!enterThrown)
+                         {
+                           enterThrown = true;
+                           throw std::runtime_error("onEnter");
+                         }
+                       })
+              .onAnyTransition([&](State, Event, State) { ++observed; })
+              .build();
+
+  REQUIRE_THROWS_AS(sm.processEvent(Event::START), std::runtime_error);
+  REQUIRE(sm.currentState() == State::RUNNING);
+  REQUIRE(observed == 0);
+  REQUIRE(sm.processEvent(Event::FINISH));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM exceptions: observer throws after onEnter", "[state_machine][reentry]")
+{
+  bool observerThrown = false;
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .thenEvent(Event::FINISH)
+              .transition(State::RUNNING, Event::FINISH, State::COMPLETED)
+              .onAnyTransition(
+                [&](State, Event, State)
+                {
+                  if (!observerThrown)
+                  {
+                    observerThrown = true;
+                    throw std::runtime_error("observer");
+                  }
+                })
+              .build();
+
+  REQUIRE_THROWS_AS(sm.processEvent(Event::START), std::runtime_error);
+  REQUIRE(sm.currentState() == State::RUNNING);
+  REQUIRE(sm.processEvent(Event::FINISH));
+  REQUIRE(sm.currentState() == State::COMPLETED);
+}
+
+TEST_CASE("SM exceptions: onEnterForce throws after the commit", "[state_machine][reentry]")
+{
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .onEnterForce(State::RUNNING, []() { throw std::runtime_error("onEnterForce"); })
+              .build();
+
+  REQUIRE_THROWS_AS(sm.forceState(State::RUNNING), std::runtime_error);
+  REQUIRE(sm.currentState() == State::RUNNING);
+  REQUIRE_NOTHROW(sm.forceState(State::IDLE));
+  REQUIRE(sm.currentState() == State::IDLE);
+}
+
+TEST_CASE("SM reentry: no false positive across threads", "[state_machine][reentry][thread]")
+{
+  std::atomic<int> observed{0};
+  auto sm = VoidSM::Builder()
+              .initialState(State::IDLE)
+              .transition(State::IDLE, Event::START, State::RUNNING)
+              .transition(State::RUNNING, Event::FINISH, State::COMPLETED)
+              .transition(State::COMPLETED, Event::CLEANUP, State::TERMINATED)
+              .transition(State::TERMINATED, Event::START, State::IDLE)
+              .onAnyTransition([&](State, Event, State) { ++observed; })
+              .build();
+
+  constexpr int iterations = 2000;
+  std::atomic<int> trueReturns{0};
+  std::atomic<int> logicErrors{0};
+  std::atomic<int> otherErrors{0};
+
+  auto guarded = [&](auto body)
+  {
+    try
+    {
+      body();
+    }
+    catch (const std::logic_error&)
+    {
+      ++logicErrors;
+    }
+    catch (...)
+    {
+      ++otherErrors;
+    }
+  };
+
+  std::vector<std::thread> workers;
+  for (int w = 0; w < 3; ++w)
+  {
+    workers.emplace_back(
+      [&]()
+      {
+        guarded(
+          [&]()
+          {
+            for (int i = 0; i < iterations; ++i)
+            {
+              for (auto e : {Event::START, Event::FINISH, Event::CLEANUP, Event::START})
+              {
+                if (sm.processEvent(e))
+                {
+                  ++trueReturns;
+                }
+              }
+            }
+          });
+      });
+  }
+  workers.emplace_back(
+    [&]()
+    {
+      guarded(
+        [&]()
+        {
+          for (int i = 0; i < iterations; ++i)
+          {
+            sm.forceState(State::IDLE);
+          }
+        });
+    });
+
+  for (auto& t : workers)
+  {
+    t.join();
+  }
+  REQUIRE(logicErrors == 0);
+  REQUIRE(otherErrors == 0);
+  REQUIRE(observed == trueReturns);
 }

@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "iora/core/atomic_thread_id.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -28,6 +30,21 @@ namespace core {
 /// - Context: optional event payload type (default void)
 ///
 /// Thread safety: atomic state reads, mutex-protected transitions.
+/// Callbacks (guard, onTransition action, onEnter, onExit, onEnterForce,
+/// onExitForce, onAnyTransition) run while the transition mutex is held.
+/// Calling processEvent or forceState of the same machine from any of them
+/// throws std::logic_error; use Builder::thenEvent for a fixed follow-up, or
+/// make the call after processEvent returns. Lock order: the mutex is taken
+/// before any lock a callback takes; a callback must not take a lock that a
+/// caller of this machine may hold while calling processEvent/forceState, and
+/// must not wait on another thread that calls into this machine. Callbacks
+/// must be short and non-blocking; they delay every other caller.
+/// Exceptions: an exception from any callback (including that
+/// std::logic_error, if the callback does not catch it) propagates; the mutex
+/// and the re-entry stamp are released; the state is as of the last commit (an
+/// action that throws after onExit leaves the state at 'from' with onExit
+/// already run); the rest of that leg, the observer and the follow-up are
+/// skipped.
 /// Only obtainable via Builder::build().
 template<typename StateEnum, typename EventEnum, typename Context = void>
 class StateMachine
@@ -74,9 +91,11 @@ public:
   // Deleted default constructor — only obtainable via Builder::build()
   StateMachine() = delete;
 
-  // Non-copyable, non-movable
+  // Non-copyable. Movable only before the machine is shared.
   StateMachine(const StateMachine&) = delete;
   StateMachine& operator=(const StateMachine&) = delete;
+  /// \brief The source must be unpublished and quiescent; the move is not
+  /// synchronized.
   StateMachine(StateMachine&& other) noexcept
     : _rules(std::move(other._rules))
     , _state(other._state.load(std::memory_order_relaxed))
@@ -110,6 +129,7 @@ public:
     }
 
     /// \brief Attach a guard to the most recently added transition.
+    /// Runs under the transition mutex; see the class thread-safety notes.
     Builder& guard(GuardFn fn)
     {
       if (!_rules.empty())
@@ -120,6 +140,7 @@ public:
     }
 
     /// \brief Attach an action to the most recently added transition.
+    /// Runs under the transition mutex; see the class thread-safety notes.
     Builder& onTransition(ActionFn fn)
     {
       if (!_rules.empty())
@@ -130,7 +151,11 @@ public:
     }
 
     /// \brief Fire a follow-up event after the transition completes.
-    /// The mutex is released before re-entering processEvent.
+    /// The mutex is released before re-entering processEvent. Best effort
+    /// under concurrency: another caller can act between the legs, so the
+    /// follow-up may match no rule or a different rule; processEvent still
+    /// returns true (it reports only the first leg). A thenEvent cycle
+    /// recurses without bound and overflows the stack, so do not build one.
     Builder& thenEvent(EventEnum followUp)
     {
       if (!_rules.empty())
@@ -141,6 +166,7 @@ public:
     }
 
     /// \brief Register a per-state entry callback.
+    /// Runs under the transition mutex; see the class thread-safety notes.
     Builder& onEnter(StateEnum state, EnterExitFn fn)
     {
       _onEnter.push_back({state, std::move(fn)});
@@ -148,6 +174,7 @@ public:
     }
 
     /// \brief Register a per-state exit callback.
+    /// Runs under the transition mutex; see the class thread-safety notes.
     Builder& onExit(StateEnum state, EnterExitFn fn)
     {
       _onExit.push_back({state, std::move(fn)});
@@ -155,6 +182,7 @@ public:
     }
 
     /// \brief Register a context-free entry callback for forceState.
+    /// Runs under the transition mutex; see the class thread-safety notes.
     Builder& onEnterForce(StateEnum state, VoidFn fn)
     {
       _forceOnEnter.push_back({state, std::move(fn)});
@@ -162,6 +190,7 @@ public:
     }
 
     /// \brief Register a context-free exit callback for forceState.
+    /// Runs under the transition mutex; see the class thread-safety notes.
     Builder& onExitForce(StateEnum state, VoidFn fn)
     {
       _forceOnExit.push_back({state, std::move(fn)});
@@ -169,6 +198,10 @@ public:
     }
 
     /// \brief Register a global transition observer (logging/metrics).
+    /// Runs under the transition mutex, once per committed processEvent leg,
+    /// after onEnter and before the thenEvent follow-up; calls are serialized
+    /// and in commit order. forceState never calls it. Calling processEvent or
+    /// forceState of the same machine from it throws std::logic_error.
     Builder& onAnyTransition(TransitionLogFn fn)
     {
       _onAnyTransition = std::move(fn);
@@ -227,9 +260,10 @@ public:
   std::enable_if_t<std::is_void_v<C>, bool>
   processEvent(EventEnum event)
   {
+    throwIfReentrant();
     std::optional<EventEnum> followUp;
     {
-      std::lock_guard lock(_mutex);
+      OwnerRecordingLock lock(_mutex, _mutexOwner);
       auto current = _state.load(std::memory_order_relaxed);
 
       // Find matching transition via equal_range
@@ -278,9 +312,10 @@ public:
   std::enable_if_t<!std::is_void_v<C>, bool>
   processEvent(EventEnum event, const C& ctx)
   {
+    throwIfReentrant();
     std::optional<EventEnum> followUp;
     {
-      std::lock_guard lock(_mutex);
+      OwnerRecordingLock lock(_mutex, _mutexOwner);
       auto current = _state.load(std::memory_order_relaxed);
 
       auto [begin, end] = findRules(current, event);
@@ -326,7 +361,8 @@ public:
   /// Under mutex.
   void forceState(StateEnum newState)
   {
-    std::lock_guard lock(_mutex);
+    throwIfReentrant();
+    OwnerRecordingLock lock(_mutex, _mutexOwner);
     auto current = _state.load(std::memory_order_relaxed);
     fireForceOnExit(current);
     _state.store(newState, std::memory_order_release);
@@ -334,6 +370,41 @@ public:
   }
 
 private:
+  /// Owns the transition lock and the re-entry stamp, so 'lock -> stamp' and
+  /// 'clear -> unlock' hold on every exit path.
+  class OwnerRecordingLock
+  {
+  public:
+    OwnerRecordingLock(std::mutex& m, iora::core::AtomicThreadId& owner)
+      : _lock(m)
+      , _owner(owner)
+    {
+      _owner.stamp();
+    }
+
+    ~OwnerRecordingLock()
+    {
+      _owner.clear();
+    }
+
+    OwnerRecordingLock(const OwnerRecordingLock&) = delete;
+    OwnerRecordingLock& operator=(const OwnerRecordingLock&) = delete;
+
+  private:
+    std::lock_guard<std::mutex> _lock;
+    iora::core::AtomicThreadId& _owner;
+  };
+
+  void throwIfReentrant() const
+  {
+    if (_mutexOwner.isCurrentThread())
+    {
+      throw std::logic_error(
+        "StateMachine: processEvent/forceState called from a callback of the same machine; use "
+        "Builder::thenEvent for a fixed follow-up, or make the call after processEvent returns");
+    }
+  }
+
   StateMachine(
     StateEnum initialState,
     std::vector<TransitionRule> rules,
@@ -429,7 +500,10 @@ private:
   TransitionLogFn _onAnyTransition;
   std::vector<std::pair<StateEnum, VoidFn>> _forceOnEnter;
   std::vector<std::pair<StateEnum, VoidFn>> _forceOnExit;
+  // Transition mutex: held while every callback runs. Re-entry, lock-order and exception contract: see the class thread-safety notes.
   mutable std::mutex _mutex;
+  // Written only by the _mutex holder: stamped after lock, cleared before unlock.
+  iora::core::AtomicThreadId _mutexOwner;
 };
 
 } // namespace core

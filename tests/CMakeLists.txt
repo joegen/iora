@@ -633,6 +633,9 @@ endif()
 # thread) compiled directly into the test TU, so per-target instrumentation
 # covers the race surface. Mirrors the IORA_ENABLE_TSAN/ASAN options above.
 set(IORA_SANITIZED_TEST_TARGETS
+    # StateMachine same-thread re-entry detector and callbacks under lock (tracker 2026-09-10-23).
+    iora_test_state_machine
+
     # RateLimiterMap auto-cleanup teardown use-after-free (tracker 2026-09-10-15).
     iora_test_rate_limiter
 
