@@ -202,6 +202,34 @@ struct UdpEngineTestAccess
     return UdpEngine::classifyLocalSrc(sockFamily, msg);
   }
 
+  /// The PURE via-destination selector, driven by literals: builds the bound and seed LocalSrc with
+  /// parseIpLiteral and normalises the seed to the listener family (production order). Throws
+  /// std::invalid_argument on a bad literal or a seed normaliseHintToListener rejects.
+  static const addrinfo *selectViaCandidate(int sockFamily, const char *bound, const char *seed,
+                                            const addrinfo *res)
+  {
+    auto b = UdpEngine::parseIpLiteral(bound);
+    if (!b)
+    {
+      throw std::invalid_argument("bad bound literal");
+    }
+    UdpEngine::LocalSrc s{};
+    if (seed)
+    {
+      auto p = UdpEngine::parseIpLiteral(seed);
+      if (!p)
+      {
+        throw std::invalid_argument("bad seed literal");
+      }
+      s = *p;
+      if (!UdpEngine::normaliseHintToListener(s, sockFamily))
+      {
+        throw std::invalid_argument("seed rejected for listener family");
+      }
+    }
+    return UdpEngine::selectViaCandidate(sockFamily, *b, s, res);
+  }
+
   /// Set a ServerPeer session's captured local source to a v4 literal (I/O thread) — the T8
   /// source-not-local seam: point it at a non-local address (e.g. 192.0.2.1) so the next send's
   /// sendmsg fails and DD7 closes the session. Runs on the I/O thread; the write to a PUBLISHED

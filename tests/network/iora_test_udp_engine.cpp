@@ -47,6 +47,9 @@ struct UdpFixture
   std::atomic<bool> sendFailed{false};
   std::atomic<int> acceptCount{0};
   std::atomic<int> connectCount{0};
+  // Host of the last onConnect address; written on the I/O thread BEFORE connectCount++, so a
+  // reader that waited on connectCount sees it.
+  std::string lastConnectHost;
   std::atomic<int> dataCount{0};
   std::atomic<int> closeCount{0};
 
@@ -139,12 +142,13 @@ struct UdpFixture
       acceptCount++;
       acceptedSessions.push_back(sid);
     };
-    cbs.onConnect = [&](SessionId sid, const TransportAddress &)
+    cbs.onConnect = [&](SessionId sid, const TransportAddress &addr)
     {
       if (onConnectHook)
       {
         onConnectHook(sid);
       }
+      lastConnectHost = addr.host;
       clientSid = sid;
       connected = true;
       connectCount++;
@@ -1632,7 +1636,7 @@ TEST_CASE("UDP dual-stack :: wildcard reply egresses the v4 request local dest I
   REQUIRE(reply.second == "d-ds");
   REQUIRE(reply.first == "127.0.0.2"); // RED pre-fix (v4-mapped reply from the kernel source)
   // Structural (M6): the key uses the CANONICAL v4-mapped form ::ffff:a.b.c.d for both the peer and
-  // the captured local (DD4; this exact spelling is what sibling 2026-10-03-2 must match).
+  // the captured local (DD4; a via to the bare-IPv4 peer is keyed in this same spelling).
   UdpEngineTestAccess::ioBarrier(f.tx);
   REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
                                                "::ffff:127.0.0.2") ==
@@ -2069,22 +2073,31 @@ TEST_CASE("UDP getLocalAddress presents a dual-stack v4-mapped captured local as
   f.tx.stop();
 }
 
+namespace
+{
+bool ipv6LoopbackAvailable()
+{
+  testnet::ScopedFd probe{::socket(AF_INET6, SOCK_DGRAM, 0)};
+  sockaddr_in6 a{};
+  a.sin6_family = AF_INET6;
+  if (::inet_pton(AF_INET6, "::1", &a.sin6_addr) != 1)
+  {
+    return false;
+  }
+  return probe.get() >= 0 && ::bind(probe.get(), reinterpret_cast<sockaddr *>(&a), sizeof(a)) == 0;
+}
+} // namespace
+
 TEST_CASE("UDP getLocalAddress presents a native IPv6 captured local bare, no brackets (GLA3)",
           "[udp][wildcard][srcip][getlocal][dualstack]")
 {
   using iora::network::UdpEngineTestAccess;
   // Skip (not fail) on a host/container with IPv6 loopback disabled (disable_ipv6=1): a ::1 bind is
   // unavailable there though AF_INET6 :: sockets still work (cpp17 L-6 / sip L-5).
+  if (!ipv6LoopbackAvailable())
   {
-    testnet::ScopedFd probe{::socket(AF_INET6, SOCK_DGRAM, 0)};
-    sockaddr_in6 a{};
-    a.sin6_family = AF_INET6;
-    REQUIRE(::inet_pton(AF_INET6, "::1", &a.sin6_addr) == 1);
-    if (probe.get() < 0 || ::bind(probe.get(), reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0)
-    {
-      WARN("IPv6 loopback (::1) unavailable on this host — skipping native-v6 getLocalAddress test");
-      return;
-    }
+    WARN("IPv6 loopback (::1) unavailable on this host — skipping native-v6 getLocalAddress test");
+    return;
   }
   UdpFixture f;
   REQUIRE(f.tx.start().isOk());
@@ -2132,9 +2145,7 @@ TEST_CASE("UDP getLocalAddress/getListenerAddress unmap a v4-mapped specific bin
   f.tx.stop();
 
   // ::ffff:0.0.0.0 is treated as a wildcard bind (engine) → getListenerAddress returns bare 0.0.0.0.
-  // (An unadopted-via getLocalAddress on this mapped-wildcard would also return 0.0.0.0, but creating
-  // that via needs connectViaListener-to-v4 on a dual-stack socket — the UNFIXED 2026-10-03-2 path;
-  // the unadopted-via → wildcard fallback itself is covered by GLA5 on 0.0.0.0.)
+  // (The unadopted-via → wildcard fallback on this mapped-wildcard is covered by GLA5.)
   UdpFixture f2;
   REQUIRE(f2.tx.start().isOk());
   auto port2 = testnet::getFreePortUDP();
@@ -2149,13 +2160,12 @@ TEST_CASE("UDP getLocalAddress: unadopted via → wildcard, then captured local 
           "[udp][wildcard][srcip][getlocal][via]")
 {
   using iora::network::UdpEngineTestAccess;
-  // 0.0.0.0 only: the via-adopt path uses connectViaListener to a v4 peer, and originating to a v4
-  // peer on a dual-stack :: listener is the separate UNFIXED limitation iora 2026-10-03-2
-  // (viaFromAddrs rejects the AF mismatch). The dual-stack CAPTURE-presents-bare half is covered by
-  // GLA2 (inbound v4-mapped); the dual-stack via-adopt presentation becomes testable once
-  // 2026-10-03-2 lands.
-  const char *bind = "0.0.0.0";
-  const std::string wildcardHost = "0.0.0.0";
+  // All three wildcard binds: the via is to a BARE IPv4 peer, which a :: or ::ffff:0.0.0.0 listener
+  // maps to ::ffff:127.0.0.1. The adopt datagram goes to 127.0.0.2 so local != peer (DS-5).
+  auto bindCase = GENERATE(std::make_pair("0.0.0.0", "0.0.0.0"), std::make_pair("::", "::"),
+                           std::make_pair("::ffff:0.0.0.0", "0.0.0.0"));
+  const char *bind = bindCase.first;
+  const std::string wildcardHost = bindCase.second;
   UdpFixture f;
   REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
@@ -2176,6 +2186,17 @@ TEST_CASE("UDP getLocalAddress: unadopted via → wildcard, then captured local 
   // empty because localSrc stays AF_UNSPEC.
   REQUIRE(f.tx.getLocalAddress(via).host == wildcardHost);
   REQUIRE(UdpEngineTestAccess::localSrcText(f.tx, via).empty());
+
+  // The via reaches the bare-IPv4 peer from the listener port on every bind.
+  REQUIRE(f.tx.send(via, "gla5", 4));
+  {
+    sockaddr_in src{};
+    socklen_t sl = sizeof(src);
+    char buf[64];
+    auto n = ::recvfrom(peer.get(), buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&src), &sl);
+    REQUIRE(n == 4);
+    REQUIRE(ntohs(src.sin_port) == port);
+  }
 
   // First unicast inbound adopts the via onto the (listener,local,peer) key → captured local,
   // presented bare even on the dual-stack bind.
@@ -3124,23 +3145,38 @@ TEST_CASE("UDP connectViaListener preferred-source on a :: listener to a v4-mapp
   f.tx.stop();
 }
 
-// (b2b) Dual-stack :: listener, v4 hint to a BARE-v4 destination → reject Config (scoped out →
-// tracker 2026-10-03-2; the only remaining dual-stack gap).
-TEST_CASE("UDP connectViaListener preferred-source :: + bare-v4 dest is rejected (prefsrc-b2b)",
+// (b2b / DS-4) Dual-stack :: listener, v4 hint to a BARE-v4 destination: the destination is mapped
+// to ::ffff:127.0.0.1 and keyed exactly like the inbound path.
+TEST_CASE("UDP connectViaListener preferred-source :: + bare-v4 dest maps and pins (prefsrc-b2b)",
           "[udp][via][prefsrc][dualstack]")
 {
+  using iora::network::UdpEngineTestAccess;
   UdpFixture f;
+  f.echoEnabled = false;
   REQUIRE(f.tx.start().isOk());
   auto port = testnet::getFreePortUDP();
   auto lr = f.tx.addListener("::", port, TlsMode::None);
   REQUIRE(lr.isOk());
   ListenerId lid = lr.value();
-  auto rv = f.tx.connectViaListener(lid, "127.0.0.1", 9, "127.0.0.2"); // bare-v4 literal dest
-  REQUIRE(rv.isOk());                                                   // async: terminal via onClose
-  REQUIRE(f.waitForCount(f.closeCount, 1));
-  REQUIRE(f.lastClose().first == TransportError::Config); // EARLY Config, not a late Socket close
-  REQUIRE(f.connectCount.load() == 0);
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort, 3000);
+  auto rv = f.tx.connectViaListener(lid, "127.0.0.1", pPort, "127.0.0.2"); // bare-v4 literal dest
+  REQUIRE(rv.isOk());
+  SessionId via = rv.value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  REQUIRE(f.closeCount.load() == 0);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
+                                               "::ffff:127.0.0.2") ==
+          std::vector<SessionId>{via});
+  REQUIRE(f.tx.send(via, "b2b", 3));
+  auto reply = recvV4Src(peer.get());
+  REQUIRE(reply.second == "b2b");
+  REQUIRE(reply.first == "127.0.0.2");
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "b2bback");
+  REQUIRE(f.waitForCount(f.dataCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
   REQUIRE(f.acceptCount.load() == 0);
+  REQUIRE(f.sidForPayload("b2bback") == via);
   f.tx.stop();
 }
 
@@ -3170,16 +3206,10 @@ TEST_CASE("UDP connectViaListener preferred-source native-v6 pin + spelling cano
           "[udp][via][prefsrc][srcip][dualstack]")
 {
   using iora::network::UdpEngineTestAccess;
-  { // skip (not fail) where ::1 is unavailable (disable_ipv6=1)
-    testnet::ScopedFd probe{::socket(AF_INET6, SOCK_DGRAM, 0)};
-    sockaddr_in6 a{};
-    a.sin6_family = AF_INET6;
-    REQUIRE(::inet_pton(AF_INET6, "::1", &a.sin6_addr) == 1);
-    if (probe.get() < 0 || ::bind(probe.get(), reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0)
-    {
-      WARN("IPv6 loopback (::1) unavailable — skipping native-v6 preferred-source test");
-      return;
-    }
+  if (!ipv6LoopbackAvailable())
+  {
+    WARN("IPv6 loopback (::1) unavailable — skipping native-v6 preferred-source test");
+    return;
   }
   const char *spelling = GENERATE("::1", "0:0:0:0:0:0:0:1", "0000:0000:0000:0000:0000:0000:0000:0001");
   UdpFixture f;
@@ -3217,16 +3247,10 @@ TEST_CASE("UDP connectViaListener preferred-source native-v6 pin + spelling cano
 TEST_CASE("UDP connectViaListener non-local v6 preferred-source (prefsrc-i-v6)",
           "[udp][via][prefsrc][dualstack]")
 {
-  { // skip where ::1 is unavailable
-    testnet::ScopedFd probe{::socket(AF_INET6, SOCK_DGRAM, 0)};
-    sockaddr_in6 a{};
-    a.sin6_family = AF_INET6;
-    REQUIRE(::inet_pton(AF_INET6, "::1", &a.sin6_addr) == 1);
-    if (probe.get() < 0 || ::bind(probe.get(), reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0)
-    {
-      WARN("IPv6 loopback unavailable — skipping prefsrc-i-v6");
-      return;
-    }
+  if (!ipv6LoopbackAvailable())
+  {
+    WARN("IPv6 loopback unavailable — skipping prefsrc-i-v6");
+    return;
   }
   bool nonlocalBind = false;
   if (std::ifstream f6("/proc/sys/net/ipv6/ip_nonlocal_bind"); f6)
@@ -3330,7 +3354,7 @@ TEST_CASE("UDP connectViaListener wildcard hint behaves as no hint (prefsrc-d)",
   f.tx.stop();
 
   // On a :: listener a wildcard hint is ALSO no-hint, not a family reject (caller-side, DP5). Use a
-  // v4-mapped literal destination (a bare-v4 dest on :: with no hint would AF-mismatch — 2026-10-03-2).
+  // v4-mapped literal destination.
   UdpFixture f6;
   f6.echoEnabled = false;
   REQUIRE(f6.tx.start().isOk());
@@ -3846,4 +3870,293 @@ TEST_CASE("UDP seeded via getLocalAddress is race-free during publication (prefs
   REQUIRE(sawSeed);              // FAIL on deadline — never relax it
   REQUIRE_FALSE(sawWildcard);   // a seeded via is final-from-publication (DP8/DP13)
   REQUIRE_FALSE(gateTimedOut);
+}
+// ===== Dual-stack origination to a bare-IPv4 destination (listener address class) =====
+
+namespace
+{
+// A synthetic SOCK_DGRAM (or other socktype) addrinfo chain built from numeric literals, for the
+// pure selector rows. Owns its nodes and sockaddrs.
+struct FakeChain
+{
+  struct Node
+  {
+    addrinfo ai{};
+    sockaddr_storage ss{};
+  };
+  std::vector<std::unique_ptr<Node>> nodes;
+
+  FakeChain &add(const char *ip, int socktype = SOCK_DGRAM)
+  {
+    auto n = std::make_unique<Node>();
+    in6_addr a6{};
+    in_addr a4{};
+    if (::inet_pton(AF_INET6, ip, &a6) == 1)
+    {
+      auto *s6 = reinterpret_cast<sockaddr_in6 *>(&n->ss);
+      s6->sin6_family = AF_INET6;
+      s6->sin6_addr = a6;
+      s6->sin6_port = htons(5060);
+      n->ai.ai_family = AF_INET6;
+      n->ai.ai_addrlen = sizeof(sockaddr_in6);
+    }
+    else
+    {
+      REQUIRE(::inet_pton(AF_INET, ip, &a4) == 1);
+      auto *s4 = reinterpret_cast<sockaddr_in *>(&n->ss);
+      s4->sin_family = AF_INET;
+      s4->sin_addr = a4;
+      s4->sin_port = htons(5060);
+      n->ai.ai_family = AF_INET;
+      n->ai.ai_addrlen = sizeof(sockaddr_in);
+    }
+    n->ai.ai_socktype = socktype;
+    n->ai.ai_addr = reinterpret_cast<sockaddr *>(&n->ss);
+    if (!nodes.empty())
+    {
+      nodes.back()->ai.ai_next = &n->ai;
+    }
+    nodes.push_back(std::move(n));
+    return *this;
+  }
+  const addrinfo *head() const { return nodes.empty() ? nullptr : &nodes.front()->ai; }
+  const addrinfo *at(std::size_t i) const { return &nodes.at(i)->ai; }
+};
+} // namespace
+
+// DS-1 + DS-13: unseeded via from :: to a bare IPv4 peer; sentinel key, symmetric source port, reply
+// to a DIFFERENT local adopts the via under (::ffff:peer, ::ffff:local). onConnect / getRemoteAddress
+// still present the mapped form (unmap owned by tracker 2026-10-04-3).
+TEST_CASE("UDP dual-stack :: unseeded via to a bare-IPv4 peer maps and adopts (DS-1)",
+          "[udp][via][dualstack][v4map]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort, 3000);
+
+  auto rv = f.tx.connectViaListener(lid, "127.0.0.1", pPort);
+  REQUIRE(rv.isOk());
+  SessionId via = rv.value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.closeCount.load() == 0);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
+                                               UdpEngineTestAccess::VIA_LOCAL_SENTINEL) ==
+          std::vector<SessionId>{via});
+  // DS-13 presentation pin.
+  REQUIRE(f.lastConnectHost == "::ffff:127.0.0.1");
+  REQUIRE(f.tx.getRemoteAddress(via).host == "::ffff:127.0.0.1");
+
+  REQUIRE(f.tx.send(via, "ds1", 3));
+  sockaddr_in src{};
+  socklen_t sl = sizeof(src);
+  char buf[64];
+  auto n = ::recvfrom(peer.get(), buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&src), &sl);
+  REQUIRE(n == 3);
+  REQUIRE(std::string(buf, 3) == "ds1");
+  REQUIRE(ntohs(src.sin_port) == port); // RFC 3581: sent from the listener port
+
+  sendV4ToDest(peer.get(), "127.0.0.2", port, "ds1back");
+  REQUIRE(f.waitForCount(f.dataCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.acceptCount.load() == 0);
+  REQUIRE(f.sidForPayload("ds1back") == via);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
+                                               "::ffff:127.0.0.2") ==
+          std::vector<SessionId>{via});
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
+                                               UdpEngineTestAccess::VIA_LOCAL_SENTINEL)
+            .empty());
+  f.tx.stop();
+}
+
+// DS-2: v4-mapped specific bind; inbound first, then a via to the bare literal joins the same key.
+TEST_CASE("UDP v4-mapped specific bind: inbound then bare-IPv4 via share one key (DS-2)",
+          "[udp][via][dualstack][v4map][peerindex]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::ffff:127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  sendV4ToDest(peer.get(), "127.0.0.1", port, "first");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  SessionId a = f.serverSid;
+
+  auto rv = f.tx.connectViaListener(lid, "127.0.0.1", pPort);
+  REQUIRE(rv.isOk());
+  SessionId via = rv.value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.closeCount.load() == 0);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort) ==
+          std::vector<SessionId>{a, via});
+  REQUIRE(f.tx.send(via, "ds2", 3));
+  sockaddr_in src{};
+  socklen_t sl = sizeof(src);
+  char buf[64];
+  auto n = ::recvfrom(peer.get(), buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&src), &sl);
+  REQUIRE(n == 3);
+  REQUIRE(std::string(buf, 3) == "ds2");
+  REQUIRE(ntohs(src.sin_port) == port);
+  sendV4ToDest(peer.get(), "127.0.0.1", port, "second");
+  REQUIRE(f.waitForCount(f.dataCount, 2));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.sidForPayload("second") == a);
+  f.tx.stop();
+}
+
+// DS-3: a bare and a v4-mapped spelling of one peer produce byte-identical keys.
+TEST_CASE("UDP dual-stack :: vias to bare and v4-mapped spellings share one key (DS-3)",
+          "[udp][via][dualstack][v4map]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+  auto r1 = f.tx.connectViaListener(lid, "127.0.0.1", 9);
+  REQUIRE(r1.isOk());
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  auto r2 = f.tx.connectViaListener(lid, "::ffff:127.0.0.1", 9);
+  REQUIRE(r2.isOk());
+  REQUIRE(f.waitForCount(f.connectCount, 2));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.closeCount.load() == 0);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", 9,
+                                               UdpEngineTestAccess::VIA_LOCAL_SENTINEL) ==
+          std::vector<SessionId>{r1.value(), r2.value()});
+  f.tx.stop();
+}
+
+namespace
+{
+// Bind `bind`, via to dest (optional seed), expect an early Config close with exactly `msg`, no
+// onConnect.
+void expectViaConfig(const char *bind, const char *dest, const char *seed, const std::string &msg)
+{
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener(bind, port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  auto rv = seed ? f.tx.connectViaListener(lr.value(), dest, 9, seed)
+                 : f.tx.connectViaListener(lr.value(), dest, 9);
+  REQUIRE(rv.isOk());
+  REQUIRE(f.waitForCount(f.closeCount, 1));
+  auto lc = f.lastClose();
+  REQUIRE(lc.first == TransportError::Config);
+  REQUIRE(lc.second == msg);
+  REQUIRE(f.connectCount.load() == 0);
+  f.tx.stop();
+}
+} // namespace
+
+// DS-7 / DS-8: a native-v6 specific bind cannot send IPv4 — bare or v4-mapped destination fails early.
+TEST_CASE("UDP native-v6 specific bind rejects IPv4 destinations early (DS-7, DS-8)",
+          "[udp][via][dualstack][v4map]")
+{
+  if (!ipv6LoopbackAvailable())
+  {
+    WARN("IPv6 loopback (::1) unavailable — skipping DS-7/DS-8");
+    return;
+  }
+  const char *dest = GENERATE("127.0.0.1", "::ffff:127.0.0.1");
+  expectViaConfig("::1", dest, nullptr, "AF mismatch: listener IPv6, remote IPv4 only");
+}
+
+// DS-9: a v4-mapped bind is IPv4-only — a native-v6 destination fails early.
+TEST_CASE("UDP v4-mapped bind rejects a native-v6 destination early (DS-9)",
+          "[udp][via][dualstack][v4map]")
+{
+  expectViaConfig("::ffff:127.0.0.1", "::1", nullptr,
+                  "AF mismatch: listener IPv4-mapped, remote IPv6 only");
+}
+
+// DS-10: :: with a native-v6 seed cannot reach an IPv4-only destination.
+TEST_CASE("UDP :: native-v6 seed to a bare-IPv4 destination is rejected (DS-10)",
+          "[udp][via][prefsrc][dualstack][v4map]")
+{
+  expectViaConfig("::", "127.0.0.1", "::1",
+                  "preferred-source: a native-IPv6 source cannot reach an IPv4 destination");
+}
+
+// A v4 seed on :: cannot reach an IPv6-only destination.
+TEST_CASE("UDP :: v4 seed to an IPv6-only destination is rejected (DS-10b)",
+          "[udp][via][prefsrc][dualstack][v4map]")
+{
+  expectViaConfig("::", "::1", "127.0.0.2",
+                  "preferred-source: an IPv4 source cannot reach an IPv6-only destination");
+}
+
+// DS-11: a native-v6 seed on an IPv4-only (::ffff:0.0.0.0) listener is rejected at the seed check.
+TEST_CASE("UDP ::ffff:0.0.0.0 rejects a native-v6 seed (DS-11)", "[udp][via][prefsrc][v4map]")
+{
+  expectViaConfig("::ffff:0.0.0.0", "127.0.0.1", "::1",
+                  "preferred-source: IPv6 address cannot source on an IPv4 listener");
+}
+
+// DS-12: the pure selector over synthetic chains (order policy + listener class + seed class).
+TEST_CASE("UDP selectViaCandidate order and class rules (DS-12)", "[udp][via][dualstack][v4map]")
+{
+  using iora::network::UdpEngineTestAccess;
+  auto sel = [](int fam, const char *bound, const char *seed, const FakeChain &c)
+  { return UdpEngineTestAccess::selectViaCandidate(fam, bound, seed, c.head()); };
+
+  FakeChain aaaaA;
+  aaaaA.add("::1").add("127.0.0.1");
+  FakeChain aAaaa;
+  aAaaa.add("127.0.0.1").add("::1");
+  FakeChain aOnly;
+  aOnly.add("127.0.0.1");
+  FakeChain aaaaOnly;
+  aaaaOnly.add("::1");
+  FakeChain mappedOnly;
+  mappedOnly.add("::ffff:127.0.0.1");
+  FakeChain aMappedAaaa;
+  aMappedAaaa.add("127.0.0.1").add("::ffff:127.0.0.1").add("::1");
+  FakeChain mappedA;
+  mappedA.add("::ffff:127.0.0.1").add("127.0.0.1");
+  FakeChain streamThenA;
+  streamThenA.add("127.0.0.2", SOCK_STREAM).add("127.0.0.1");
+
+  // (a)-(c) LD: same family first, mapped A only as a fallback.
+  CHECK(sel(AF_INET6, "::", nullptr, aaaaA) == aaaaA.at(0));
+  CHECK(sel(AF_INET6, "::", nullptr, aAaaa) == aAaaa.at(1));
+  CHECK(sel(AF_INET6, "::", nullptr, aOnly) == aOnly.at(0));
+  // (d) LM skips the native AAAA.
+  CHECK(sel(AF_INET6, "::ffff:127.0.0.1", nullptr, aaaaA) == aaaaA.at(1));
+  // (e) L6 never takes an IPv4-class candidate.
+  CHECK(sel(AF_INET6, "2001:db8::5", nullptr, aMappedAaaa) == aMappedAaaa.at(2));
+  CHECK(sel(AF_INET6, "2001:db8::5", nullptr, aOnly) == nullptr);
+  CHECK(sel(AF_INET6, "2001:db8::5", nullptr, mappedOnly) == nullptr);
+  // (f) L4 takes only AF_INET.
+  CHECK(sel(AF_INET, "0.0.0.0", nullptr, mappedA) == mappedA.at(1));
+  CHECK(sel(AF_INET, "0.0.0.0", nullptr, mappedOnly) == nullptr);
+  // (g) LD with a seed: candidate class must equal seed class.
+  CHECK(sel(AF_INET6, "::", "127.0.0.2", aaaaA) == aaaaA.at(1));
+  CHECK(sel(AF_INET6, "::", "::1", aOnly) == nullptr);
+  // (h) non-DGRAM entries are skipped.
+  CHECK(sel(AF_INET, "0.0.0.0", nullptr, streamThenA) == streamThenA.at(1));
+  CHECK(sel(AF_INET6, "::", nullptr, streamThenA) == streamThenA.at(1));
+  // (i) LM wildcard with a v4 seed maps through pass 2.
+  CHECK(sel(AF_INET6, "::ffff:0.0.0.0", "::ffff:127.0.0.2", aaaaA) == aaaaA.at(1));
+  CHECK(sel(AF_INET6, "::ffff:0.0.0.0", "::ffff:127.0.0.2", aaaaOnly) == nullptr);
 }

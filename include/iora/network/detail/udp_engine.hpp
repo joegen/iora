@@ -880,8 +880,8 @@ private:
   /// never getnameinfo; never emits '<'/'>'/'|'). A stack buffer, NOT a std::string, so the inbound
   /// hot path makes no heap allocation per datagram (a v4-mapped/v6 literal exceeds SSO). Empty on
   /// AF_UNSPEC. CANONICAL FORM (tracker 2026-10-03-1 DD4): a v4-mapped local renders as
-  /// "::ffff:a.b.c.d" — this exact spelling is the key form that sibling 2026-10-03-2 (dual-stack
-  /// ::→IPv4 origination) MUST match so the two tasks' keys interoperate.
+  /// "::ffff:a.b.c.d", and every keyed path (inbound and via, including a via to a bare-IPv4
+  /// destination mapped by viaFromAddrs) uses this spelling so the keys interoperate.
   static void localToText(const LocalSrc &ls, char (&out)[INET6_ADDRSTRLEN])
   {
     out[0] = '\0';
@@ -1052,6 +1052,71 @@ private:
     }
     return ai->ai_family == AF_INET6 &&
            IN6_IS_ADDR_V4MAPPED(&reinterpret_cast<const sockaddr_in6 *>(ai->ai_addr)->sin6_addr);
+  }
+
+  /// \brief Can a listener of this socket family and bound address send to IPv4 peers? True for
+  /// AF_INET, and for AF_INET6 bound to :: or a v4-mapped address (incl. ::ffff:0.0.0.0). A
+  /// native-v6 specific bind has no IPv4 source, so it cannot.
+  static bool listenerSendsV4(int sockFamily, const LocalSrc &bound)
+  {
+    if (sockFamily == AF_INET)
+    {
+      return true;
+    }
+    return sockFamily == AF_INET6 && bound.family == AF_INET6 &&
+           (IN6_IS_ADDR_UNSPECIFIED(&bound.addr.v6) || IN6_IS_ADDR_V4MAPPED(&bound.addr.v6));
+  }
+
+  /// \brief Can a listener of this socket family and bound address send to native-IPv6 peers?
+  /// False for AF_INET and for a v4-mapped bind (an IPv4-only socket).
+  static bool listenerSendsNativeV6(int sockFamily, const LocalSrc &bound)
+  {
+    return sockFamily == AF_INET6 &&
+           !(bound.family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&bound.addr.v6));
+  }
+
+  /// \brief PURE via-destination selection from a resolved chain (SOCK_DGRAM entries only). A
+  /// candidate is acceptable iff the listener can send to its address class and, with a seed,
+  /// its class equals the seed's (DP6). Pass 1: the first acceptable candidate of the listener's
+  /// own family (resolver order — unchanged for existing callers). Pass 2, only for an AF_INET6
+  /// listener that can send IPv4 (bound :: or v4-mapped): the first acceptable AF_INET candidate,
+  /// which the caller maps to ::ffff:a.b.c.d. nullptr = no usable candidate.
+  static const addrinfo *selectViaCandidate(int sockFamily, const LocalSrc &bound,
+                                            const LocalSrc &seed, const addrinfo *res)
+  {
+    const bool v4Ok = listenerSendsV4(sockFamily, bound);
+    const bool v6Ok = listenerSendsNativeV6(sockFamily, bound);
+    auto acceptable = [&](const addrinfo *ai)
+    {
+      if (ai->ai_socktype != SOCK_DGRAM)
+      {
+        return false;
+      }
+      const bool v4Class = addrinfoIsV4Class(ai);
+      if (v4Class ? !v4Ok : !v6Ok)
+      {
+        return false;
+      }
+      return seed.family == AF_UNSPEC || isV4ClassLocal(seed) == v4Class;
+    };
+    for (const addrinfo *ai = res; ai; ai = ai->ai_next)
+    {
+      if (ai->ai_family == sockFamily && acceptable(ai))
+      {
+        return ai;
+      }
+    }
+    if (sockFamily == AF_INET6 && v4Ok)
+    {
+      for (const addrinfo *ai = res; ai; ai = ai->ai_next)
+      {
+        if (ai->ai_family == AF_INET && acceptable(ai))
+        {
+          return ai;
+        }
+      }
+    }
+    return nullptr;
   }
 
   /// PURE classification of a received datagram's local destination from its control messages
@@ -2913,8 +2978,9 @@ private:
   }
 
   /// \brief Create a via-listener peer session from an EXTERNALLY-owned addrinfo
-  /// chain: RE-LOOK-UP the listener (lid), AF-match the resolved chain against
-  /// the listener's CURRENT AF, then create the peer session on the LISTENER fd
+  /// chain: RE-LOOK-UP the listener (lid), select a candidate the listener can send
+  /// to (selectViaCandidate; a bare-IPv4 candidate on a :: or v4-mapped-bound AF_INET6
+  /// listener is mapped to ::ffff:a.b.c.d), then create the peer session on the LISTENER fd
   /// (source-port preserved, RFC 3581). NEVER calls ::freeaddrinfo — the caller
   /// owns res (#6). Every post-resolution terminal is a one-shot eraser-fire:
   /// listener-gone / AF-mismatch / session-cap -> onClose(Config); success ->
@@ -2945,9 +3011,10 @@ private:
     // checks on the I/O thread against the re-looked-up listener. ===
     if (seed.family != AF_UNSPEC)
     {
-      // DP4: normalise to the listener socket family (a native-v6 hint on an AF_INET listener
-      // cannot source → reject).
-      if (!normaliseHintToListener(seed, af))
+      // DP4: normalise to the listener socket family. A native-v6 seed cannot source on an
+      // IPv4-only listener: an AF_INET socket, or an AF_INET6 socket bound to a v4-mapped address.
+      if (!normaliseHintToListener(seed, af) ||
+          (!isV4ClassLocal(seed) && !listenerSendsNativeV6(af, lst->bound)))
       {
         preInsertTerminal(sid, TransportErrorInfo{
                                  TransportError::Config,
@@ -2969,57 +3036,56 @@ private:
         seed = LocalSrc{};
       }
     }
-    // DP6: choose the destination ADDRESS-CLASS-consistent with the seed (class by address, via
-    // isV4ClassLocal / addrinfoIsV4Class — NOT ai_family; a dual-stack IPV6_PKTINFO source is valid
-    // only toward a v4-mapped destination). With no seed the selection is unchanged. Also note whether
-    // a bare-AF_INET candidate existed, to tell the scoped-out (2026-10-03-2) case apart from a plain
-    // family mismatch in the reject diagnostic.
-    const addrinfo *chosen = nullptr;
-    bool sawBareV4 = false;
-    for (const addrinfo *ai = res; ai; ai = ai->ai_next)
-    {
-      if (ai->ai_family == AF_INET && ai->ai_socktype == SOCK_DGRAM)
-      {
-        sawBareV4 = true;
-      }
-      if (ai->ai_family != af || ai->ai_socktype != SOCK_DGRAM)
-      {
-        continue;
-      }
-      if (seed.family == AF_UNSPEC || isV4ClassLocal(seed) == addrinfoIsV4Class(ai))
-      {
-        chosen = ai;
-        break;
-      }
-    }
+    // DP6 + listener class: selectViaCandidate (class by address, never ai_family alone).
+    const addrinfo *chosen = selectViaCandidate(af, lst->bound, seed, res);
     if (!chosen)
     {
       // NO ::freeaddrinfo — caller owns res (#6).
       std::string m;
-      if (seed.family != AF_UNSPEC && af == AF_INET6 && isV4ClassLocal(seed))
+      if (af == AF_INET)
       {
-        // v4-class seed on a dual-stack listener with no v4-mapped candidate. A bare-AF_INET
-        // candidate means this needs the v4→::ffff: DESTINATION mapping owned by tracker 2026-10-03-2
-        // (scoped out of this task); otherwise the IPv4 source simply cannot reach an IPv6-only peer.
-        m = sawBareV4 ? "preferred-source: IPv4 origination to a bare-IPv4 destination on a "
-                        "dual-stack listener is unsupported"
-                      : "preferred-source: an IPv4 source cannot reach an IPv6-only destination";
+        m = "AF mismatch: listener IPv4, remote IPv6 only";
       }
-      else if (seed.family != AF_UNSPEC && af == AF_INET6)
+      else if (seed.family != AF_UNSPEC)
       {
-        m = "preferred-source: a native-IPv6 source cannot reach a v4-mapped destination";
+        m = isV4ClassLocal(seed)
+                ? "preferred-source: an IPv4 source cannot reach an IPv6-only destination"
+                : "preferred-source: a native-IPv6 source cannot reach an IPv4 destination";
+      }
+      else if (!listenerSendsNativeV6(af, lst->bound))
+      {
+        m = "AF mismatch: listener IPv4-mapped, remote IPv6 only";
+      }
+      else if (!listenerSendsV4(af, lst->bound))
+      {
+        m = "AF mismatch: listener IPv6, remote IPv4 only";
       }
       else
       {
-        m = (af == AF_INET) ? "AF mismatch: listener IPv4, remote IPv6 only"
-                            : "AF mismatch: listener IPv6, remote IPv4 only";
+        m = "no usable datagram destination address";
       }
       preInsertTerminal(sid, TransportErrorInfo{TransportError::Config, m});
       return false;
     }
     sockaddr_storage to{};
-    socklen_t tl = static_cast<socklen_t>(chosen->ai_addrlen); // getaddrinfo/resolveLiteralSync set it
-    std::memcpy(&to, chosen->ai_addr, chosen->ai_addrlen);
+    socklen_t tl = 0;
+    if (chosen->ai_family == AF_INET && af == AF_INET6)
+    {
+      // Bare IPv4 on a dual-stack/v4-mapped listener: send, store and key the ::ffff: form, the
+      // same bytes an inbound datagram from this peer carries (DD4).
+      const auto *in4 = reinterpret_cast<const sockaddr_in *>(chosen->ai_addr);
+      sockaddr_in6 m6{};
+      m6.sin6_family = AF_INET6;
+      m6.sin6_port = in4->sin_port;
+      m6.sin6_addr = v4MappedV6(in4->sin_addr);
+      std::memcpy(&to, &m6, sizeof(m6));
+      tl = static_cast<socklen_t>(sizeof(m6));
+    }
+    else
+    {
+      tl = static_cast<socklen_t>(chosen->ai_addrlen); // getaddrinfo/resolveLiteralSync set it
+      std::memcpy(&to, chosen->ai_addr, chosen->ai_addrlen);
+    }
     // NO ::freeaddrinfo — caller owns res (#6).
     // KEY (tracker 2026-10-04-1 DP3): a SEEDED via is keyed EXACTLY under lid|localToText(seed)|P
     // (the DD4 canonical v4-mapped form) so adoptWildcardVia never touches it and it is final from
