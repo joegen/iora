@@ -33,7 +33,6 @@ bool waitFor(std::function<bool()> cond, int ms = 1000)
 struct TcpIntrospectFixture
 {
   TransportConfig cfg{};
-  TcpEngine tx{cfg};
 
   std::atomic<int> acceptCount{0};
   std::atomic<int> connectCount{0};
@@ -44,6 +43,8 @@ struct TcpIntrospectFixture
   std::string acceptHost;
   std::string connectHost;
   std::mutex mu;
+  // Declared LAST: destroyed first, so ~TcpEngine's drain (onClose) never touches a dead member.
+  TcpEngine tx{cfg};
 
   TcpIntrospectFixture()
   {

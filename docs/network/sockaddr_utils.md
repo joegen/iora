@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Date** | 2026-09-18 |
+| **Version** | 1.1 |
+| **Date** | 2026-10-23 |
 | **Status** | IMPLEMENTED |
 | **Header** | `include/iora/network/sockaddr_utils.hpp` |
 | **Namespace** | `iora::network` |
@@ -18,6 +18,7 @@
 | Version | Date | Changes |
 |---|---|---|
 | 1.0 | 2026-09-18 | Initial guide, authored against the implementation. Documents the three free functions `addressFromSockaddr`, `toSockaddr`, and `applyDscpToFd`, the de-duplication history that motivated the header, the dual-stack DSCP mirroring for IPv4-mapped IPv6 sockets, and the explicit `AF_INET` gate on the DSCP path. |
+| 1.1 | 2026-10-23 | Documents `unmappedAddressFromSockaddr` (§3.1a, §8): every engine getter and onAccept/onConnect address now presents through it (iora tracker 2026-10-04-3), and the engines no longer call `addressFromSockaddr` directly. Corrected the "engines forward to it" text and the §2.1 diagram. |
 
 ---
 
@@ -29,9 +30,10 @@ Converting between a POSIX `sockaddr_storage` and Iora's `TransportAddress` (a `
 
 ### Solution
 
-`sockaddr_utils.hpp` lifts the shared conversions into three inline free functions in `iora::network`:
+`sockaddr_utils.hpp` lifts the shared conversions into four inline free functions in `iora::network`:
 
-- **`addressFromSockaddr(ss)`** — the single implementation of the `sockaddr` → `TransportAddress` direction (both engines now forward to it, retiring all three copies).
+- **`addressFromSockaddr(ss)`** — the single implementation of the `sockaddr` → `TransportAddress` direction (retiring all three copies).
+- **`unmappedAddressFromSockaddr(ss)`** — the presentation form: like `addressFromSockaddr`, but a v4-mapped IPv6 address renders as bare IPv4. Both engines present every local and remote address through it.
 - **`toSockaddr(addr, out, outLen)`** — `TransportAddress` → `sockaddr_storage`, using the already-parsed `IpAddress` value rather than a string round-trip.
 - **`applyDscpToFd(fd, dscp)`** — set the DSCP mark on a socket, with dual-stack mirroring so an IPv4-mapped IPv6 socket still marks its egress.
 
@@ -51,7 +53,8 @@ Converting between a POSIX `sockaddr_storage` and Iora's `TransportAddress` (a `
 
 ```
         sockaddr_utils.hpp   (depends on BOTH headers below)
-        │        ├── addressFromSockaddr  <- forwarded to by TcpEngine & UdpEngine
+        │        ├── unmappedAddressFromSockaddr <- TcpEngine & UdpEngine presentation
+        │        ├── addressFromSockaddr  <- raw render; unmappedAddressFromSockaddr delegates to it
         │        ├── toSockaddr           <- consumers today are outside this library
         │        └── applyDscpToFd        <- per-session setDscp() + at-creation config.dscpValue
         │
@@ -102,7 +105,17 @@ Renders `AF_INET` / `AF_INET6` to a `TransportAddress` via `inet_ntop` into an `
 - A family other than `AF_INET`/`AF_INET6` yields a **default-constructed** `TransportAddress` (empty host, port 0).
 - If `inet_ntop` fails, `host` is left empty but the **port is still set** from the `sockaddr` (the port assignment is unconditional within each family branch).
 
-This is the one implementation of the direction; `TcpEngine` and `UdpEngine` forward to it.
+This is the one implementation of the direction. The engines reach it through `unmappedAddressFromSockaddr` (§3.1a).
+
+### 3.1a `unmappedAddressFromSockaddr` — the presentation form
+
+```cpp
+inline TransportAddress unmappedAddressFromSockaddr(const sockaddr_storage& ss);
+```
+
+If `ss` is `AF_INET6` and the binary `IN6_IS_ADDR_V4MAPPED` test is true, it builds an `AF_INET` `sockaddr` from the low 32 bits, keeps the port as-is (network order), and renders that with `addressFromSockaddr`. Every other input goes to `addressFromSockaddr` unchanged, so native IPv6 (including v4-compatible `::a.b.c.d` and NAT64 `64:ff9b::/96`) comes back bare, without brackets. It never strips a `::ffff:` prefix from text.
+
+It is for presentation only. Every `TcpEngine` / `UdpEngine` getter (`getListenerAddress`, `getLocalAddress`, `getRemoteAddress`) and the `onAccept` / `onConnect` address use it; internal peer keys and send paths keep the v4-mapped form. A caller that passes a presented address to `toSockaddr` for an `AF_INET6` socket must re-map it to `::ffff:a.b.c.d` first.
 
 ### 3.2 `toSockaddr` — the build direction (no string round-trip)
 
@@ -241,6 +254,10 @@ namespace iora { namespace network {
 
 /// sockaddr_storage -> TransportAddress (empty host+port 0 for unsupported family).
 inline TransportAddress addressFromSockaddr(const sockaddr_storage& ss);
+
+/// Presentation form: a v4-mapped AF_INET6 address (IN6_IS_ADDR_V4MAPPED) renders as bare
+/// IPv4 with the same port; anything else is addressFromSockaddr(ss).
+inline TransportAddress unmappedAddressFromSockaddr(const sockaddr_storage& ss);
 
 /// TransportAddress -> sockaddr_storage. Returns false if addr.host is not a valid
 /// IP literal (does NOT resolve hostnames). outLen set to sizeof(sockaddr_in|in6).

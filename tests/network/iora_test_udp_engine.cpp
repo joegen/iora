@@ -4234,7 +4234,8 @@ TEST_CASE("UDP native ::1 peer stays ::1 on every getter (T7)",
 }
 
 // Tracker 2026-10-04-3 T8: on a :: wildcard listener, inbound first, the BARE onAccept host fed back
-// to connectViaListener resolves to the existing ServerPeer's key (no second session, no error).
+// to connectViaListener resolves to the same (listener, local, peer) key as the inbound session; the
+// via is a twin behind it, inbound dispatch stays on front() == a; no error.
 TEST_CASE("UDP dual-stack :: inbound then via to the presented bare host share one key (T8)",
           "[udp][via][dualstack][v4map][peerindex][presentation]")
 {

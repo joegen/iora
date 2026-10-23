@@ -8,7 +8,8 @@
 /// detail/tcp_engine.hpp and detail/udp_engine.hpp (byte-for-byte identical);
 /// because both were private, a third consumer (iora_media's RTP transport
 /// binding) could not reach either and copied it again. Lifting it here retired
-/// all three copies: both engines now forward to it.
+/// all three copies. Both engines present addresses through
+/// unmappedAddressFromSockaddr, which delegates to it for the raw rendering.
 ///
 /// toSockaddr is the shared implementation of the OPPOSITE direction, but it has
 /// not yet displaced the in-library sockaddr-building code: TcpEngine still
