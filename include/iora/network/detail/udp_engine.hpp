@@ -604,14 +604,14 @@ public:
       {
         return {};
       }
-      return addressFromSockaddr(ss);
+      return iora::network::unmappedAddressFromSockaddr(ss);
     }
     // ServerPeer — use stored peer address
     if (s->plen == 0)
     {
       return {};
     }
-    return addressFromSockaddr(s->peer);
+    return iora::network::unmappedAddressFromSockaddr(s->peer);
   }
 
   bool setDscp(SessionId sid, std::uint8_t dscp) override
@@ -1248,14 +1248,6 @@ private:
       std::memcpy(CMSG_DATA(c), &pi, sizeof(pi));
     }
     return ::sendmsg(fd, &msg, MSG_NOSIGNAL);
-  }
-
-  /// Forwards to the shared iora::network::addressFromSockaddr. This was a
-  /// private copy identical to tcp_engine's; both are retired in favour of the
-  /// one public implementation (a third consumer could not reach either).
-  static TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
-  {
-    return iora::network::addressFromSockaddr(ss);
   }
 
   /// Build a sockaddr_storage from a captured LocalSrc plus a network-order port, for the
@@ -2502,7 +2494,7 @@ private:
             // steps-4-8 R2 (simp/cpp17): route onAccept through invokeUserCallback so a
             // throwing user handler cannot unwind the I/O loop (mirror tcp_engine).
             invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid,
-                               addressFromSockaddr(from));
+                               iora::network::unmappedAddressFromSockaddr(from));
           }
           // steps-4-8 R3 (cpp17/TS LOW): use const find() (not non-const operator[]) on the
           // I/O thread — operator[] would be a formal data race vs caller-thread shared_lock
@@ -2896,7 +2888,7 @@ private:
         TransportAddress peerAddr;
         if (::getpeername(sfd, reinterpret_cast<sockaddr *>(&peerSs), &peerSl) == 0)
         {
-          peerAddr = addressFromSockaddr(peerSs);
+          peerAddr = iora::network::unmappedAddressFromSockaddr(peerSs);
         }
         invokeUserCallback(connectCb, cr.sid, peerAddr);
       }
@@ -3157,7 +3149,8 @@ private:
     bumpSess();
     vec.push_back(sid); // noexcept: capacity reserved above
     // steps-4-8 R2: onConnect via invokeUserCallback (see connectFromAddrs).
-    invokeUserCallback(copyCallback(_cbMutex, _cbs.onConnect), sid, addressFromSockaddr(to));
+    invokeUserCallback(copyCallback(_cbMutex, _cbs.onConnect), sid,
+                       iora::network::unmappedAddressFromSockaddr(to));
     // A3.1b: replay datagrams buffered during the resolve window, in order (ServerPeer
     // -> ::sendto on the listener fd / the owning listener's write queue).
     replayPendingWq(sid, pendingWq);

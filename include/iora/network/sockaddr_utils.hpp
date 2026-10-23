@@ -77,9 +77,8 @@ inline TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
 /// alone). Native IPv6 is returned bare (no brackets — bracketing is the SIP
 /// serializer's job). A caller that keeps a v4-MAPPED internal key form (e.g. a
 /// peer-index key) renders that separately; this is the presentation form only.
-/// Shared by every outward LOCAL getter so the presentation is uniform across
-/// engines (origin: tracker 2026-10-04-2; the TcpEngine twins + remote getters
-/// follow in 2026-10-04-3).
+/// Shared by every outward getter and callback so the presentation is uniform
+/// across engines (trackers 2026-10-04-2, 2026-10-04-3).
 inline TransportAddress unmappedAddressFromSockaddr(const sockaddr_storage &ss)
 {
   if (ss.ss_family == AF_INET6)

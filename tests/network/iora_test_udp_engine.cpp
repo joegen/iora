@@ -50,6 +50,8 @@ struct UdpFixture
   // Host of the last onConnect address; written on the I/O thread BEFORE connectCount++, so a
   // reader that waited on connectCount sees it.
   std::string lastConnectHost;
+  // Host of the last onAccept address; same publication rule (written BEFORE accepted/acceptCount).
+  std::string lastAcceptHost;
   std::atomic<int> dataCount{0};
   std::atomic<int> closeCount{0};
 
@@ -135,8 +137,9 @@ struct UdpFixture
   explicit UdpFixture(TransportConfig c = TransportConfig{}) : cfg(std::move(c))
   {
     iora::network::detail::EngineBase::Callbacks cbs{};
-    cbs.onAccept = [&](SessionId sid, const TransportAddress &)
+    cbs.onAccept = [&](SessionId sid, const TransportAddress &addr)
     {
+      lastAcceptHost = addr.host;
       serverSid = sid;
       accepted = true;
       acceptCount++;
@@ -3926,7 +3929,7 @@ struct FakeChain
 
 // DS-1 + DS-13: unseeded via from :: to a bare IPv4 peer; sentinel key, symmetric source port, reply
 // to a DIFFERENT local adopts the via under (::ffff:peer, ::ffff:local). onConnect / getRemoteAddress
-// still present the mapped form (unmap owned by tracker 2026-10-04-3).
+// present the bare form (tracker 2026-10-04-3 T6); the key keeps the mapped form.
 TEST_CASE("UDP dual-stack :: unseeded via to a bare-IPv4 peer maps and adopts (DS-1)",
           "[udp][via][dualstack][v4map]")
 {
@@ -3950,9 +3953,9 @@ TEST_CASE("UDP dual-stack :: unseeded via to a bare-IPv4 peer maps and adopts (D
   REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
                                                UdpEngineTestAccess::VIA_LOCAL_SENTINEL) ==
           std::vector<SessionId>{via});
-  // DS-13 presentation pin.
-  REQUIRE(f.lastConnectHost == "::ffff:127.0.0.1");
-  REQUIRE(f.tx.getRemoteAddress(via).host == "::ffff:127.0.0.1");
+  // DS-13 presentation pin (unmapped since tracker 2026-10-04-3).
+  REQUIRE(f.lastConnectHost == "127.0.0.1");
+  REQUIRE(f.tx.getRemoteAddress(via).host == "127.0.0.1");
 
   REQUIRE(f.tx.send(via, "ds1", 3));
   sockaddr_in src{};
@@ -4159,4 +4162,113 @@ TEST_CASE("UDP selectViaCandidate order and class rules (DS-12)", "[udp][via][du
   // (i) LM wildcard with a v4 seed maps through pass 2.
   CHECK(sel(AF_INET6, "::ffff:0.0.0.0", "::ffff:127.0.0.2", aaaaA) == aaaaA.at(1));
   CHECK(sel(AF_INET6, "::ffff:0.0.0.0", "::ffff:127.0.0.2", aaaaOnly) == nullptr);
+}
+
+// Tracker 2026-10-04-3 T4: an IPv4 peer reaching a dual-stack :: listener is presented bare on
+// onAccept (udp_engine onAccept site) and getRemoteAddress (ServerPeer branch); the key stays mapped.
+TEST_CASE("UDP dual-stack :: inbound IPv4 ServerPeer presents the remote unmapped (T4)",
+          "[udp][dualstack][v4map][presentation]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  sendV4ToDest(peer.get(), "127.0.0.1", port, "t4");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.lastAcceptHost == "127.0.0.1");
+  auto remote = f.tx.getRemoteAddress(f.serverSid);
+  REQUIRE(remote.host == "127.0.0.1");
+  REQUIRE(remote.port == pPort);
+  f.tx.stop();
+}
+
+// Tracker 2026-10-04-3 T5: Transport::connect to the v4-mapped literal makes an AF_INET6 connected
+// socket; onConnect (post-connect getpeername) and getRemoteAddress (ClientConnected getpeername
+// branch) present it bare.
+TEST_CASE("UDP connect to a v4-mapped literal presents the remote unmapped (T5)",
+          "[udp][dualstack][v4map][presentation]")
+{
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  auto cr = f.tx.connect("::ffff:127.0.0.1", pPort, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  iora::network::UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.lastConnectHost == "127.0.0.1");
+  auto remote = f.tx.getRemoteAddress(cr.value());
+  REQUIRE(remote.host == "127.0.0.1");
+  REQUIRE(remote.port == pPort);
+  f.tx.stop();
+}
+
+// Tracker 2026-10-04-3 T7 (UDP): a native-IPv6 peer is not over-unmapped.
+TEST_CASE("UDP native ::1 peer stays ::1 on every getter (T7)",
+          "[udp][dualstack][v4map][presentation]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  REQUIRE(f.tx.getListenerAddress(lr.value()).host == "::1");
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV6Source("::1", pPort);
+  sendV6ToDest(peer.get(), "::1", port, "t7");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.lastAcceptHost == "::1");
+  REQUIRE(f.tx.getRemoteAddress(f.serverSid).host == "::1");
+  REQUIRE(f.tx.getLocalAddress(f.serverSid).host == "::1");
+  f.tx.stop();
+}
+
+// Tracker 2026-10-04-3 T8: on a :: wildcard listener, inbound first, the BARE onAccept host fed back
+// to connectViaListener resolves to the existing ServerPeer's key (no second session, no error).
+TEST_CASE("UDP dual-stack :: inbound then via to the presented bare host share one key (T8)",
+          "[udp][via][dualstack][v4map][peerindex][presentation]")
+{
+  using iora::network::UdpEngineTestAccess;
+  UdpFixture f;
+  f.echoEnabled = false;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortUDP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  ListenerId lid = lr.value();
+  std::uint16_t pPort = 0;
+  testnet::ScopedFd peer = bindV4Source("127.0.0.1", pPort);
+  sendV4ToDest(peer.get(), "127.0.0.1", port, "first");
+  REQUIRE(f.waitFor(f.accepted));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  SessionId a = f.serverSid;
+  const std::string host = f.lastAcceptHost;
+  REQUIRE(host == "127.0.0.1");
+  const std::string local = f.tx.getLocalAddress(a).host;
+  REQUIRE(local == "127.0.0.1");
+
+  auto rv = f.tx.connectViaListener(lid, host, pPort, local);
+  REQUIRE(rv.isOk());
+  SessionId via = rv.value();
+  REQUIRE(f.waitForCount(f.connectCount, 1));
+  UdpEngineTestAccess::ioBarrier(f.tx);
+  REQUIRE(f.closeCount.load() == 0);
+  REQUIRE(UdpEngineTestAccess::peerIndexLookup(f.tx, lid, "::ffff:127.0.0.1", pPort,
+                                               "::ffff:127.0.0.1") ==
+          std::vector<SessionId>{a, via});
+  REQUIRE(f.tx.send(via, "t8", 2));
+  char buf[16];
+  auto n = ::recv(peer.get(), buf, sizeof(buf), 0);
+  REQUIRE(n == 2);
+  f.tx.stop();
 }

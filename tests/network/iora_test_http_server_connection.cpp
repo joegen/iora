@@ -32,6 +32,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <netinet/in.h>
 #include <sstream>
 #include <string>
@@ -648,4 +649,35 @@ TEST_CASE("HttpServer logs the enriched half-close diagnostic when a request hal
 
   CHECK(warned);                                   // the enriched diagnostic was emitted
   CHECK(got.find("200") == std::string::npos);     // the response was dropped (not sent)
+}
+
+// ── Tracker 2026-10-04-3 T9: an IPv4 client of a :: listener sees a bare remote_addr ──
+
+TEST_CASE("HttpServer on a :: listener presents an IPv4 client's remote_addr unmapped (T9)",
+          "[http_server][v4map]")
+{
+  HttpServer srv;
+  const int port = static_cast<int>(testnet::getFreePortTCP());
+  srv.setBindAddress("::");
+  srv.setPort(port);
+  std::mutex mu;
+  std::string remoteAddr;
+  srv.onGet("/a",
+            [&](const HttpServer::Request &req, HttpServer::Response &res)
+            {
+              {
+                std::lock_guard<std::mutex> lk(mu);
+                remoteAddr = req.remote_addr;
+              }
+              res.set_content("a", "text/plain");
+            });
+  srv.start();
+
+  Conn c;
+  REQUIRE(c.open(port));
+  c.sendRaw("GET /a HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+  auto r = c.readResponse();
+  REQUIRE(r.status == 200);
+  std::lock_guard<std::mutex> lk(mu);
+  REQUIRE(remoteAddr == "127.0.0.1");
 }

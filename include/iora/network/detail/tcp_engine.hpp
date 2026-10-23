@@ -591,7 +591,7 @@ public:
     {
       return {};
     }
-    return addressFromSockaddr(ss);
+    return iora::network::unmappedAddressFromSockaddr(ss);
   }
 
   TransportAddress getLocalAddress(SessionId sid) const override
@@ -608,7 +608,7 @@ public:
     {
       return {};
     }
-    return addressFromSockaddr(ss);
+    return iora::network::unmappedAddressFromSockaddr(ss);
   }
 
   TransportAddress getRemoteAddress(SessionId sid) const override
@@ -619,7 +619,7 @@ public:
     {
       return {};
     }
-    return addressFromSockaddr(it->second->peer);
+    return iora::network::unmappedAddressFromSockaddr(it->second->peer);
   }
 
   bool setDscp(SessionId sid, std::uint8_t dscp) override
@@ -890,13 +890,6 @@ private:
       return out;
     }
     return {};
-  }
-
-  /// Forwards to the shared iora::network::addressFromSockaddr (see the
-  /// udp_engine twin — both were byte-identical private copies).
-  static TransportAddress addressFromSockaddr(const sockaddr_storage &ss)
-  {
-    return iora::network::addressFromSockaddr(ss);
   }
 
   void armGc(std::chrono::seconds sec)
@@ -2380,7 +2373,8 @@ private:
       insertFdTag(cfd, std::move(tg));
 
       _atomicStats.accepted.fetch_add(1, std::memory_order_relaxed);
-      invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid, addressFromSockaddr(peer));
+      invokeUserCallback(copyCallback(_cbMutex, _cbs.onAccept), sid,
+                         iora::network::unmappedAddressFromSockaddr(peer));
     }
   }
 
@@ -3015,7 +3009,7 @@ private:
     if (connectCb)
     {
       _atomicStats.connected.fetch_add(1, std::memory_order_relaxed);
-      invokeUserCallback(connectCb, s->id, addressFromSockaddr(s->peer));
+      invokeUserCallback(connectCb, s->id, iora::network::unmappedAddressFromSockaddr(s->peer));
     }
     return true;
   }

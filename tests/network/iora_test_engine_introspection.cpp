@@ -41,21 +41,25 @@ struct TcpIntrospectFixture
   SessionId serverSid{0};
   SessionId clientSid{0};
   ListenerId listenerId{0};
+  std::string acceptHost;
+  std::string connectHost;
   std::mutex mu;
 
   TcpIntrospectFixture()
   {
     iora::network::detail::EngineBase::Callbacks cbs{};
-    cbs.onAccept = [&](SessionId sid, const TransportAddress &)
+    cbs.onAccept = [&](SessionId sid, const TransportAddress &addr)
     {
       std::lock_guard<std::mutex> lk(mu);
       serverSid = sid;
+      acceptHost = addr.host;
       acceptCount++;
     };
-    cbs.onConnect = [&](SessionId sid, const TransportAddress &)
+    cbs.onConnect = [&](SessionId sid, const TransportAddress &addr)
     {
       std::lock_guard<std::mutex> lk(mu);
       clientSid = sid;
+      connectHost = addr.host;
       connectCount++;
     };
     cbs.onData = [&](SessionId, iora::core::BufferView, std::chrono::steady_clock::time_point) {};
@@ -133,6 +137,94 @@ TEST_CASE("TCP getLocalAddress and getRemoteAddress after connect", "[tcp][intro
   REQUIRE(serverRemote.port == clientLocal.port);
 
   f.tx.stop();
+}
+
+// ─── TCP v4-mapped presentation (tracker 2026-10-04-3) ──────────────
+
+// T1: an IPv4 client of a dual-stack :: listener; onAccept, getRemoteAddress and getLocalAddress of
+// the server session are bare. TLS shares these engine sites.
+TEST_CASE("TCP dual-stack :: accept presents local and remote unmapped (T1)",
+          "[tcp][introspection][v4map]")
+{
+  TcpIntrospectFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  auto lr = f.tx.addListener("::", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  REQUIRE(f.tx.getListenerAddress(lr.value()).host == "::");
+
+  auto cr = f.tx.connect("127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return f.acceptCount > 0 && f.connectCount > 0; }));
+
+  std::lock_guard<std::mutex> lk(f.mu);
+  REQUIRE(f.acceptHost == "127.0.0.1");
+  auto serverRemote = f.tx.getRemoteAddress(f.serverSid);
+  REQUIRE(serverRemote.host == "127.0.0.1");
+  REQUIRE(serverRemote.port == f.tx.getLocalAddress(f.clientSid).port);
+  auto serverLocal = f.tx.getLocalAddress(f.serverSid);
+  REQUIRE(serverLocal.host == "127.0.0.1");
+  REQUIRE(serverLocal.port == port);
+}
+
+// T2: a listener bound to a SPECIFIC v4-mapped address presents bare (a :: bind cannot tell).
+TEST_CASE("TCP v4-mapped bind presents getListenerAddress unmapped (T2)",
+          "[tcp][introspection][v4map]")
+{
+  TcpIntrospectFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  auto lr = f.tx.addListener("::ffff:127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  auto addr = f.tx.getListenerAddress(lr.value());
+  REQUIRE(addr.host == "127.0.0.1");
+  REQUIRE(addr.port == port);
+}
+
+// T3: connect to the v4-mapped literal; the client onConnect host, getRemoteAddress and
+// getLocalAddress are bare.
+TEST_CASE("TCP connect to a v4-mapped literal presents the client side unmapped (T3)",
+          "[tcp][introspection][v4map]")
+{
+  TcpIntrospectFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  auto lr = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+
+  auto cr = f.tx.connect("::ffff:127.0.0.1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return f.acceptCount > 0 && f.connectCount > 0; }));
+
+  std::lock_guard<std::mutex> lk(f.mu);
+  REQUIRE(f.connectHost == "127.0.0.1");
+  auto clientRemote = f.tx.getRemoteAddress(f.clientSid);
+  REQUIRE(clientRemote.host == "127.0.0.1");
+  REQUIRE(clientRemote.port == port);
+  REQUIRE(f.tx.getLocalAddress(f.clientSid).host == "127.0.0.1");
+}
+
+// T7 (TCP): a native-IPv6 peer is not over-unmapped.
+TEST_CASE("TCP native ::1 session stays ::1 on every getter (T7)", "[tcp][introspection][v4map]")
+{
+  TcpIntrospectFixture f;
+  REQUIRE(f.tx.start().isOk());
+  auto port = testnet::getFreePortTCP();
+  auto lr = f.tx.addListener("::1", port, TlsMode::None);
+  REQUIRE(lr.isOk());
+  REQUIRE(f.tx.getListenerAddress(lr.value()).host == "::1");
+
+  auto cr = f.tx.connect("::1", port, TlsMode::None);
+  REQUIRE(cr.isOk());
+  REQUIRE(waitFor([&] { return f.acceptCount > 0 && f.connectCount > 0; }));
+
+  std::lock_guard<std::mutex> lk(f.mu);
+  REQUIRE(f.acceptHost == "::1");
+  REQUIRE(f.connectHost == "::1");
+  REQUIRE(f.tx.getRemoteAddress(f.serverSid).host == "::1");
+  REQUIRE(f.tx.getLocalAddress(f.serverSid).host == "::1");
+  REQUIRE(f.tx.getRemoteAddress(f.clientSid).host == "::1");
+  REQUIRE(f.tx.getLocalAddress(f.clientSid).host == "::1");
 }
 
 TEST_CASE("TCP getLocalAddress returns empty for invalid sid", "[tcp][introspection]")

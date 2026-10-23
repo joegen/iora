@@ -200,14 +200,14 @@ public:
 
   // ===== Session Introspection =====
   /// \brief The address listener `lid` is bound to (getsockname).
-  /// Presented UNMAPPED on the UDP engine (tracker 2026-10-04-2): a `::ffff:a.b.c.d`
-  /// bind is returned as bare IPv4; a wildcard (`0.0.0.0` / `::`) bind returns the
+  /// Presented UNMAPPED on every engine (trackers 2026-10-04-2, 2026-10-04-3): a
+  /// `::ffff:a.b.c.d` bind is returned as bare IPv4; a wildcard (`0.0.0.0` / `::`) bind returns the
   /// wildcard; native IPv6 bare without brackets. The value is the local SOCKET
   /// address + bound port, NOT a NAT / VIP / advertised alias — behind 1:1 NAT a
   /// Via/Contact still needs the configured alias. A link-local address carries no
-  /// zone id, so it must not be advertised. (TcpEngine does not unmap yet — see DP7.)
+  /// zone id, so it must not be advertised.
   virtual TransportAddress getListenerAddress(ListenerId lid) const = 0;
-  /// \brief The captured per-session LOCAL address (reply source), UNMAPPED (UDP).
+  /// \brief The captured per-session LOCAL address (reply source), UNMAPPED.
   /// CONTRACT (tracker 2026-10-04-2):
   /// - DP3 (inward re-map): an API that accepts this address BACK as a source hint
   ///   (the connectViaListener preferred-source 4-arg overload, iora/2026-10-04-1) re-maps
@@ -223,9 +223,11 @@ public:
   ///   pre-adoption value of an unseeded via.
   /// - DP5: a wildcard result means NO pinned local — never place it in a SIP header;
   ///   substitute the configured advertised address (RFC 3261 §18.1.1).
-  /// - DP7 (scope): the UDP LOCAL getters are unmapped; getRemoteAddress (all engines)
-  ///   and the TcpEngine local getters are still v4-mapped (::ffff:) until
-  ///   iora/2026-10-04-3 — do not assume local/remote (or UDP/TCP) share a spelling.
+  /// - Presentation (tracker 2026-10-04-3): every engine presents local AND remote
+  ///   addresses (these getters and the onAccept/onConnect address) unmapped — a v4-mapped
+  ///   peer is bare IPv4. A caller that passes a presented address to toSockaddr for an
+  ///   AF_INET6 socket must re-map it to `::ffff:a.b.c.d` first (an AF_INET sockaddr on an
+  ///   AF_INET6 socket fails with EAFNOSUPPORT).
   virtual TransportAddress getLocalAddress(SessionId sid) const = 0;
   virtual TransportAddress getRemoteAddress(SessionId sid) const = 0;
   virtual void setSessionData(SessionId sid, void *data,
