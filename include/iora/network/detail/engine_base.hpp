@@ -126,9 +126,10 @@ public:
   virtual SessionId allocateSid() { return 0; }
 
   /// \brief Mint the next process-wide session id. Every engine in the process (TCP,
-  /// TLS and UDP; host and every plugin) takes its ids from this one counter, so a
-  /// SessionId names at most one session for the life of the process, also across
-  /// engine restarts. Ids start at 1 (0 stays invalid). Thread-safe; defined once in
+  /// TLS and UDP; host and every plugin) takes its ids from this one counter, so an id
+  /// that an engine mints names at most one session for the life of the process, also
+  /// across engine restarts. connectWith() mints nothing: it uses the caller's id.
+  /// Ids start at 1 (0 stays invalid). Thread-safe; defined once in
   /// libiora_core.so (src/core/iora_core.cpp).
   static SessionId nextProcessSessionId() noexcept;
 
