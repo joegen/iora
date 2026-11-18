@@ -77,10 +77,8 @@ iora::IoraService::Config baseConfig(int port, const std::string &stateFile,
 // cases this shutdown() does nothing; it cleans up the successful cases. The throwing cases hold
 // the instance from before init() ("held") to check that it was torn down, because instanceRef()
 // after a failed init() would create a new, empty one. Holds a TCP LISTEN socket on a port so a
-// subsequent server bind on the same port fails in WebhookServer::start(). This relies on the
-// holder NOT setting SO_REUSEPORT: the server listener sets SO_REUSEADDR|SO_REUSEPORT, and on Linux
-// a port can be shared only if BOTH sockets set SO_REUSEPORT — so the server's bind gets EADDRINUSE
-// here. (Do not add SO_REUSEPORT to this holder.)
+// subsequent server bind on the same port fails in WebhookServer::start(): a listening socket
+// blocks any other bind of its port, so the server's bind gets EADDRINUSE here.
 struct PortHolder
 {
   int fd{-1};

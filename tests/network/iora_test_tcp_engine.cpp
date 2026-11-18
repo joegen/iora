@@ -875,13 +875,101 @@ TEST_CASE("TCP duplicate listener error handling", "[tcp][duplicatelistener]")
 
   REQUIRE(f.tx.addListener("127.0.0.1", port, TlsMode::None).isOk());
 
-  // Second bind to same port — may succeed (SO_REUSEADDR) or fail
-  (void)f.tx.addListener("127.0.0.1", port, TlsMode::None);
-
-  // Give time for async bind failures to surface
-  std::this_thread::sleep_for(100ms);
+  auto second = f.tx.addListener("127.0.0.1", port, TlsMode::None);
+  REQUIRE(second.isErr());
+  REQUIRE(second.error().code == TransportError::Bind);
 
   f.tx.stop();
+}
+
+namespace
+{
+sockaddr_storage loopbackAddr(int family, std::uint16_t port, socklen_t &len)
+{
+  sockaddr_storage ss{};
+  if (family == AF_INET6)
+  {
+    auto *a6 = reinterpret_cast<sockaddr_in6 *>(&ss);
+    a6->sin6_family = AF_INET6;
+    a6->sin6_addr = in6addr_loopback;
+    a6->sin6_port = htons(port);
+    len = sizeof(sockaddr_in6);
+  }
+  else
+  {
+    auto *a4 = reinterpret_cast<sockaddr_in *>(&ss);
+    a4->sin_family = AF_INET;
+    a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a4->sin_port = htons(port);
+    len = sizeof(sockaddr_in);
+  }
+  return ss;
+}
+
+testnet::ScopedFd connectRawLoopback(int family, std::uint16_t port)
+{
+  testnet::ScopedFd fd{::socket(family, SOCK_STREAM, 0)};
+  REQUIRE(fd.get() >= 0);
+  socklen_t len = 0;
+  sockaddr_storage ss = loopbackAddr(family, port, len);
+  REQUIRE(::connect(fd.get(), reinterpret_cast<sockaddr *>(&ss), len) == 0);
+  return fd;
+}
+
+int bindWithoutReuseErrno(int family, std::uint16_t port)
+{
+  testnet::ScopedFd fd{::socket(family, SOCK_STREAM, 0)};
+  REQUIRE(fd.get() >= 0);
+  socklen_t len = 0;
+  sockaddr_storage ss = loopbackAddr(family, port, len);
+  if (::bind(fd.get(), reinterpret_cast<sockaddr *>(&ss), len) == 0)
+  {
+    return 0;
+  }
+  return errno;
+}
+
+void checkListenerRebindsHeldPort(int family, const char *host, std::uint16_t port)
+{
+  testnet::ScopedFd client;
+  {
+    TcpFixture first;
+    REQUIRE(first.tx.start().isOk());
+    REQUIRE(first.tx.addListener(host, port, TlsMode::None).isOk());
+    client = connectRawLoopback(family, port);
+    REQUIRE(first.waitForCondition([&]() { return first.acceptCount > 0; }));
+    first.tx.stop();
+  }
+
+  REQUIRE(bindWithoutReuseErrno(family, port) == EADDRINUSE);
+
+  TcpFixture second;
+  REQUIRE(second.tx.start().isOk());
+  REQUIRE(second.tx.addListener(host, port, TlsMode::None).isOk());
+  testnet::ScopedFd probe = connectRawLoopback(family, port);
+  REQUIRE(second.waitForCondition([&]() { return second.acceptCount > 0; }));
+  second.tx.stop();
+}
+} // namespace
+
+TEST_CASE("TCP v4 listener rebinds a port its stopped predecessor still holds",
+          "[tcp][restart][reuseaddr]")
+{
+  checkListenerRebindsHeldPort(AF_INET, "127.0.0.1", testnet::getFreePortTCP());
+}
+
+TEST_CASE("TCP v6 listener rebinds a port its stopped predecessor still holds",
+          "[tcp][restart][reuseaddr]")
+{
+  bool v6Available = false;
+  auto port = testnet::probeDualLoopbackPort(SOCK_STREAM, v6Available);
+  if (!v6Available)
+  {
+    WARN("::1 unavailable on loopback; skipping the v6 listener rebind check");
+    SUCCEED();
+    return;
+  }
+  checkListenerRebindsHeldPort(AF_INET6, "::1", port);
 }
 
 TEST_CASE("TCP transport restart with existing sessions", "[tcp][restart]")

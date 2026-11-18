@@ -84,9 +84,9 @@ bool connectRefused(int port)
   return errno == ECONNREFUSED;
 }
 
-// Binds and listens WITHOUT SO_REUSEPORT. The server listener sets
-// SO_REUSEADDR|SO_REUSEPORT, so this fails with EADDRINUSE while it is alive.
-bool canListenWithoutReusePort(int port)
+// Binds and listens with no reuse option. It fails with EADDRINUSE while the
+// server listener is alive.
+bool canListenWithoutReuse(int port)
 {
   testnet::ScopedFd s{::socket(AF_INET, SOCK_STREAM, 0)};
   if (s.get() < 0)
@@ -160,7 +160,7 @@ TEST_CASE("Failed init after server start closes the listener", "[iora][init][ro
   requireMembersNull(*held);
 
   REQUIRE(connectRefused(port));
-  REQUIRE(canListenWithoutReusePort(port));
+  REQUIRE(canListenWithoutReuse(port));
 
   auto retryCfg = baseConfig(port, tmp);
   REQUIRE_NOTHROW(iora::IoraService::init(retryCfg));

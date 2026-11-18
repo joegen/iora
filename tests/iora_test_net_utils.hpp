@@ -254,10 +254,9 @@ struct DualLoopbackBinding
 /// (ephemeral), then ::1 at the same port.
 ///
 /// Socket-option discipline (matches what the engine listeners do, so a successful
-/// probe predicts a successful engine bind): the v4 probe sets SO_REUSEADDR (the engine's
-/// v4 listener sets REUSEADDR+REUSEPORT); the ::1 probe sets NO reuse option (neither the
-/// TCP v6 listener nor any UDP listener sets one), so the probe does not falsely succeed
-/// where the engine would collide.
+/// probe predicts a successful engine bind): the v4 probe sets SO_REUSEADDR (as the engine's
+/// TCP listeners do); the ::1 probe sets NO reuse option (the UDP listeners set none), so the
+/// probe does not falsely succeed where any engine listener would collide.
 ///
 /// errno discipline: retry ONLY on EADDRINUSE at ::1; EADDRNOTAVAIL/EAFNOSUPPORT (or
 /// EAFNOSUPPORT/EPROTONOSUPPORT from socket()) => ::1 unavailable, v4-only; any other
@@ -280,7 +279,7 @@ inline DualLoopbackBinding bindDualLoopback(int sockType)
       }
       FAIL("socket(AF_INET6) failed: " << std::strerror(errno));
     }
-    // No reuse option on the ::1 probe — match the engine's v6/UDP listeners.
+    // No reuse option on the ::1 probe — the strictest engine listener (UDP) sets none.
     sockaddr_in6 a6{};
     a6.sin6_family = AF_INET6;
     a6.sin6_addr = in6addr_loopback;
@@ -345,8 +344,8 @@ std::uint16_t addLoopbackListeners(Engine &engine, int sockType, TlsModeT tls,
     std::uint16_t port = probeDualLoopbackPort(sockType, probeV6);
     if (probeV6)
     {
-      // ::1 FIRST: the v6 listener has no SO_REUSEPORT, so a lost race fails cleanly
-      // with no v4 listener yet to undo. On that rare race, retry a fresh port.
+      // ::1 FIRST: a lost race fails with no v4 listener yet to undo.
+      // On that rare race, retry a fresh port.
       if (!engine.addListener("::1", port, tls).isOk())
       {
         continue;

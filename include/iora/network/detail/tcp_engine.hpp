@@ -2213,6 +2213,8 @@ private:
       }
       int v6only = 0;
       ::setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+      int one = 1;
+      ::setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
       sockaddr_in6 sa6{};
       sa6.sin6_family = AF_INET6;
       sa6.sin6_port = htons(lc.port);
@@ -2236,9 +2238,6 @@ private:
       }
       int one = 1;
       ::setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#ifdef SO_REUSEPORT
-      ::setsockopt(sfd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#endif
       sockaddr_in sa4{};
       sa4.sin_family = AF_INET;
       sa4.sin_port = htons(lc.port);
