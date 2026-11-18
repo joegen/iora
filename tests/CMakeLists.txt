@@ -123,6 +123,8 @@ set(NETWORK_TESTS
     network/iora_test_engine_introspection
     network/iora_test_tcp_setup_close_codes
     network/iora_test_tcp_engine_stale_event
+    network/iora_test_engine_session_id
+    network/iora_test_tcp_reset_drain
     # Event-driven DNS-resolve tests (tracker 2026-09-06-4). The three below
     # monopolise the process-wide blockingIoPool() (block all workers / fill the
     # queue) to drive resolve-timeout and reject-fast paths deterministically, so
@@ -164,6 +166,7 @@ set(CORE_TESTS
     core/iora_test_threadpool_lifecycle
     core/iora_test_async_pool
     core/iora_test_async_pool_crossso
+    core/iora_test_session_id_crossso
     core/iora_test_timer
     core/iora_test_timer_lifecycle
     core/iora_test_metrics
@@ -640,6 +643,10 @@ set(IORA_SANITIZED_TEST_TARGETS
     # RateLimiterMap auto-cleanup teardown use-after-free (tracker 2026-09-10-15).
     iora_test_rate_limiter
 
+    # Process-wide session ids and read-before-reset-close (iora 2026-11-18-1).
+    iora_test_engine_session_id
+    iora_test_tcp_reset_drain
+
     # plugin_callback_ownership (tracker 2026-10-16-12): owner gate + registries.
     iora_test_callback_ownership
     iora_test_event_queue
@@ -1082,6 +1089,10 @@ if(IORA_BUILD_CORE_TESTS)
     if(TARGET iora_test_async_pool_crossso AND TARGET core_test_async_pool_plugin)
         add_dependencies(iora_test_async_pool_crossso core_test_async_pool_plugin)
         target_link_libraries(iora_test_async_pool_crossso PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    if(TARGET iora_test_session_id_crossso AND TARGET core_test_session_id_plugin)
+        add_dependencies(iora_test_session_id_crossso core_test_session_id_plugin)
+        target_link_libraries(iora_test_session_id_crossso PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 

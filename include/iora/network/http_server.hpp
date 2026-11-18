@@ -869,8 +869,8 @@ protected:
   /// closed during the upgrade handshake window. This is authoritative because the
   /// transport onClose lambda erases _upgradedSessions AND _sessionInfo in a single
   /// _sessionMutex section, so _sessionInfo absence here means the close already
-  /// ran. Relies on SessionIds being monotonic and never recycled (tcp_engine.hpp
-  /// _nextSessionId is fetch_add-only), so a live _sessionInfo entry cannot be a
+  /// ran. Relies on SessionIds being monotonic and never recycled
+  /// (EngineBase::nextProcessSessionId is fetch_add-only), so a live _sessionInfo entry cannot be a
   /// different connection reusing sid. The plain markSessionUpgraded above is left
   /// unchanged for the SSE upgrade path (sse_stream.hpp) and the test double.
   bool markSessionUpgradedIfLive(SessionId sid)

@@ -125,6 +125,13 @@ public:
   /// sid — ids start at 1); the TCP/UDP engines override with a real atomic mint.
   virtual SessionId allocateSid() { return 0; }
 
+  /// \brief Mint the next process-wide session id. Every engine in the process (TCP,
+  /// TLS and UDP; host and every plugin) takes its ids from this one counter, so a
+  /// SessionId names at most one session for the life of the process, also across
+  /// engine restarts. Ids start at 1 (0 stays invalid). Thread-safe; defined once in
+  /// libiora_core.so (src/core/iora_core.cpp).
+  static SessionId nextProcessSessionId() noexcept;
+
   /// \brief DP-SS2: the enqueue half of connect() for a caller-supplied \p sid
   /// (from allocateSid()) — insert into the connecting registry then enqueue the
   /// connect command, ENQUEUE LAST. Because the caller's register write is sequenced

@@ -3466,7 +3466,9 @@ TEST_CASE("UDP connectViaListener rejects a non-literal hint synchronously (pref
     REQUIRE_FALSE(r.isOk()); // synchronous err (no async onClose), no sid minted
   }
   const SessionId after = f.tx.allocateSid();
-  REQUIRE(after == before + 1); // the rejected calls minted NO sid (parse precedes _nextSessionId++)
+  // The rejected calls minted NO sid (parse precedes the mint). The counter is
+  // process-wide, so this holds only while no other engine is live in this test process.
+  REQUIRE(after == before + 1);
   REQUIRE(f.closeCount.load() == 0); // nothing minted → nothing closed
   f.tx.stop();
 }

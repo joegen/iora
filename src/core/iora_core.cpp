@@ -4,6 +4,7 @@
 #include "iora/core/callback_ownership.hpp"
 #include "iora/core/metrics.hpp"
 #include "iora/core/service_registry.hpp"
+#include "iora/network/detail/engine_base.hpp"
 
 namespace iora {
 namespace core {
@@ -295,4 +296,18 @@ ServiceRegistry::Storage &ServiceRegistry::storage()
   return s;
 }
 
+} // namespace iora
+
+namespace iora {
+namespace network {
+namespace detail {
+
+SessionId EngineBase::nextProcessSessionId() noexcept
+{
+  static std::atomic<SessionId> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+} // namespace detail
+} // namespace network
 } // namespace iora

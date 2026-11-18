@@ -421,14 +421,14 @@ public:
   {
     // DP-SS7: the sid-agnostic path — mint here and flush in one call, behaviour
     // byte-for-byte as before (checkInUse=false skips the single-shot lookup).
-    return connectEnqueue(_nextSessionId++, host, port, tls, opts, /*checkInUse=*/false);
+    return connectEnqueue(nextProcessSessionId(), host, port, tls, opts, /*checkInUse=*/false);
   }
 
   /// \brief DP-SS1: mint a session id ONLY (no _connecting insert, no enqueue). See
   /// EngineBase::allocateSid. A sid returned here is NOT yet sessionSendable — a
   /// send() before connectWith() is rejected (not silently dropped), because
   /// sessionSendable() finds it in neither _sessions nor _connecting.
-  SessionId allocateSid() override { return _nextSessionId++; }
+  SessionId allocateSid() override { return nextProcessSessionId(); }
 
   /// \brief DP-SS2: the enqueue half for a caller-supplied \p sid (from
   /// allocateSid()). Inserts into _connecting under _sessionRwMutex, RELEASES it,
@@ -1181,7 +1181,7 @@ private:
     // Defensive: reject the invalid-sid sentinel (0) on the connectWith path — a caller
     // that forwards an unallocated sid, or the sid from an unsupported allocateSid()
     // default (returns 0), must not be turned into a live reservation. connect() mints
-    // via _nextSessionId (starts at 1, checkInUse=false), so this never fires for it.
+    // via nextProcessSessionId (starts at 1, checkInUse=false), so this never fires for it.
     if (checkInUse && sid == 0)
     {
       return ConnectResult::err(
@@ -2320,7 +2320,7 @@ private:
 
       applySockOpts(cfd);
 
-      SessionId sid = _nextSessionId++;
+      SessionId sid = nextProcessSessionId();
       auto s = std::make_unique<Session>();
       s->id = sid;
       s->fd = cfd;
@@ -3080,10 +3080,16 @@ private:
     // Handle error conditions first (connection closed, etc.)
     if (events & (EPOLLHUP | EPOLLERR))
     {
-      core::Logger::debug("Transport: Detected EPOLLHUP/EPOLLERR for session " +
-                          std::to_string(s->id) + ", events=0x" + std::to_string(events));
+      IORA_LOG_DEBUG("Transport: Detected EPOLLHUP/EPOLLERR for session " << s->id << ", events=0x"
+                                                                         << std::hex << events
+                                                                         << std::dec);
+      const int closeErrno = eventCloseErrno(s);
+      if (s->readEnabled)
+      {
+        drainBeforeResetClose(s);
+      }
       closeNow(s, TransportError::PeerClosed, "Connection closed by peer (EPOLLHUP/EPOLLERR)",
-               eventCloseErrno(s), 0);
+               closeErrno, 0);
       return;
     }
 
@@ -3386,6 +3392,76 @@ private:
              sslFailureErrno(sslError, e, sysErrno), static_cast<int>(e));
   }
 
+  /// \brief Deliver one received chunk of \p n bytes to onData (shared by readAvail and
+  /// drainBeforeResetClose).
+  void deliverChunk(Session *s, const std::uint8_t *data, int n)
+  {
+    _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
+    s->lastActivity = MonoClock::now();
+    const auto dataCb = copyCallback(_cbMutex, _cbs.onData);
+    if (dataCb)
+    {
+      IORA_LOG_DEBUG("[RECV] Calling onData callback for sid=" << s->id << ", bytes=" << n);
+      invokeUserCallback(dataCb, s->id, iora::core::BufferView{data, (std::size_t)n},
+                         std::chrono::steady_clock::now());
+    }
+    else
+    {
+      IORA_LOG_WARN("[RECV] onData callback is NULL for sid=" << s->id << ", dropping " << n
+                                                                << " bytes");
+    }
+  }
+
+  /// \brief On EPOLLHUP/EPOLLERR, read and deliver the bytes that already arrived, before
+  /// the caller closes the session (architecture/iora/engine_session_id_and_reset_drain.json
+  /// IP-2). The first read that returns no data ends the drain; the drain never closes and
+  /// never changes the close code. The caller has already read SO_ERROR.
+  ///
+  /// The session stays valid through the drain: no entry point that onData can reach frees
+  /// a session inline. send/sendAsync enqueue only (enqueueSend); connect, connectViaListener
+  /// and connectWith enqueue only (engine_base.hpp contract); close and setReadEnabled
+  /// enqueue only; runOnIoThread always posts; detachForTermination frees no session; stop()
+  /// enqueues the shutdown and its self-join throw is caught by invokeUserCallback. Only
+  /// closeNow and shutdownDrain free a session, both on the I/O thread and neither reachable
+  /// from onData. If any of these ever closes inline, this drain must re-look-up the session.
+  void drainBeforeResetClose(Session *s)
+  {
+    std::vector<std::uint8_t> buf(_config.ioReadChunk);
+    for (;;)
+    {
+      int n = 0;
+      if (s->tlsMode != TlsMode::None && s->tlsState == TlsState::Open)
+      {
+        if (!beforeSslRead(s->id))
+        {
+          return;
+        }
+        ::ERR_clear_error();
+        n = ::SSL_read(s->ssl, buf.data(), (int)buf.size());
+        if (n <= 0)
+        {
+          const int ge = ::SSL_get_error(s->ssl, n);
+          if (ge == SSL_ERROR_SYSCALL || ge == SSL_ERROR_SSL)
+          {
+            bool unexpectedEof = false;
+            (void)drainSslErrors(unexpectedEof);
+            ::SSL_set_quiet_shutdown(s->ssl, 1);
+          }
+          return;
+        }
+      }
+      else
+      {
+        n = ::recv(s->fd, buf.data(), (int)buf.size(), 0);
+        if (n <= 0)
+        {
+          return;
+        }
+      }
+      deliverChunk(s, buf.data(), n);
+    }
+  }
+
   void readAvail(Session *s)
   {
     std::vector<std::uint8_t> buf(_config.ioReadChunk);
@@ -3452,26 +3528,7 @@ private:
         }
       }
 
-      if (n > 0)
-      {
-        _atomicStats.bytesIn.fetch_add(n, std::memory_order_relaxed);
-        s->lastActivity = MonoClock::now();
-        const auto dataCb = copyCallback(_cbMutex, _cbs.onData);
-        if (dataCb)
-        {
-          IORA_LOG_DEBUG("[RECV] Calling onData callback for sid=" << s->id << ", bytes=" << n);
-          invokeUserCallback(dataCb, s->id, iora::core::BufferView{buf.data(), (std::size_t)n},
-                             std::chrono::steady_clock::now());
-        }
-        else
-        {
-          IORA_LOG_WARN("[RECV] onData callback is NULL for sid=" << s->id << ", dropping " << n << " bytes");
-        }
-      }
-      else
-      {
-        break;
-      }
+      deliverChunk(s, buf.data(), n);
     }
   }
 
@@ -4426,7 +4483,6 @@ private:
   std::atomic<bool> _testEnqueueFailure{false};
   std::atomic<ConnectThrowPoint> _testConnectThrowPoint{ConnectThrowPoint::NONE};
 
-  std::atomic<SessionId> _nextSessionId{1};
   std::atomic<ListenerId> _nextListenerId{1};
 
   // TLS contexts and per-instance ALPN preference

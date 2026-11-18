@@ -1648,7 +1648,7 @@ private:
   /// teardown on the I/O thread (it does NOT block on I/O), which is why calling
   /// it while _mutex is held here — and on the idle-eviction path in
   /// acquireConnection — does not violate LEASE-7. SessionId is a monotonically increasing
-  /// uint64 counter (tcp_engine/udp_engine: _nextSessionId{1}, post-increment) and
+  /// uint64 counter (EngineBase::nextProcessSessionId, one per process, starts at 1) and
   /// is NEVER reused, so a still-pending close for this evicted id cannot tear
   /// down a later connection that happens to reuse the value. This is the same
   /// guarantee acquireConnection's idle-eviction close relies on.

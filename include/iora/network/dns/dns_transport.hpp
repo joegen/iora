@@ -266,10 +266,11 @@ private:
   ///
   /// Stored in a std::atomic<uint64_t> (lock-free -- no libatomic) so the (sid,isTcp)
   /// pair is never read torn during a UDP->TCP fallback: a torn pair could false-match a
-  /// session close and spuriously fail a live query. SessionIds are minted from a
-  /// monotonic counter starting at 1 (udp/tcp _nextSessionId) and never approach 2^63, so
-  /// the top bit safely carries the protocol flag. Packed value 0 == never sent (a real
-  /// session sid is always >= 1, so a never-sent query never matches a real close).
+  /// session close and spuriously fail a live query. SessionIds are minted from one
+  /// process-wide monotonic counter starting at 1 (EngineBase::nextProcessSessionId) and
+  /// never approach 2^63, so the top bit safely carries the protocol flag. Packed value
+  /// 0 == never sent (a real session sid is always >= 1, so a never-sent query never
+  /// matches a real close).
   static constexpr std::uint64_t SENT_TCP_BIT = 1ULL << 63;
   static std::uint64_t packSentSession(SessionId sid, bool isTcp)
   {
@@ -702,9 +703,10 @@ private:
 
   // Session management
   std::map<std::string, SessionId> _serverSessions; // server:port[:tcp] -> SessionId
-  // (isTcp, SessionId) -> (server, port). Keyed by the protocol bit because the UDP
-  // and TCP engines mint SessionIds from independent counters both starting at 1, so
-  // a bare SessionId aliases a colliding UDP/TCP session pair (tracker 2026-09-11-5).
+  // (isTcp, SessionId) -> (server, port). Keyed by the protocol bit (tracker
+  // 2026-09-11-5). The UDP and TCP engines now share one process-wide counter
+  // (EngineBase::nextProcessSessionId), so a UDP and a TCP sid no longer collide; the
+  // protocol bit is kept as defense in depth.
   std::map<std::pair<bool, SessionId>, std::pair<std::string, std::uint16_t>> _sessionToServer;
   mutable std::mutex _sessionsMutex;
 
@@ -717,13 +719,11 @@ private:
   // containers are guarded by _sessionsMutex (the same mutex guarding
   // _serverSessions/_sessionToServer); no lock is held across a transport->send().
   //
-  // Keyed by (isTcp, SessionId): the UDP and TCP engines mint SessionIds from
-  // independent counters (both start at 1 — see udp_engine.hpp/tcp_engine.hpp
-  // _nextSessionId{1}), so a UDP sid and a TCP sid CAN collide. handleConnect is
-  // shared by both transports and receives only the sid, so a bare-sid key would
-  // let a UDP connect event drain a colliding TCP session's buffer (wrong framing,
-  // session not yet connected) and vice versa. The protocol bit in the key makes
-  // these structures collision-safe.
+  // Keyed by (isTcp, SessionId). handleConnect is shared by both transports and
+  // receives only the sid. When the UDP and TCP engines had separate counters, a
+  // bare-sid key let a UDP connect event drain a colliding TCP session's buffer.
+  // The engines now share one process-wide counter (EngineBase::nextProcessSessionId),
+  // so the sids no longer collide; the protocol bit is kept as defense in depth.
   std::set<std::pair<bool, SessionId>> _connectedSessions;
   std::map<std::pair<bool, SessionId>, std::vector<std::shared_ptr<PendingQuery>>>
     _pendingOnConnect;

@@ -8,9 +8,10 @@
 /// \brief Regression tests for the cross-engine bare-SessionId keying collision in
 ///        DnsTransport (tracker 2026-09-11-5).
 ///
-/// The UDP and TCP transport engines mint SessionIds from independent counters that
-/// both start at 1, so the first UDP session and the first TCP session both get
-/// sid == 1. Before the fix, _sessionToServer was keyed by a bare SessionId and
+/// The UDP and TCP transport engines used to mint SessionIds from separate counters
+/// that both started at 1, so the first UDP session and the first TCP session both got
+/// sid == 1. They now share one process-wide counter; these tests inject equal sids to
+/// keep the keying fix covered. Before the fix, _sessionToServer was keyed by a bare SessionId and
 /// handleClose erased _serverSessions/_tcpBuffers ignoring the protocol, so a
 /// colliding UDP/TCP sid pair aliased each other's server mapping (wrong-server
 /// attribution) and one protocol's close tore down the other's still-live state.

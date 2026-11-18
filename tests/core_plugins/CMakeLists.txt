@@ -7,3 +7,8 @@
 create_iora_plugin_target(core_test_async_pool_plugin
     SOURCES AsyncPoolAddrPlugin.cpp
 )
+
+# EngineBase::nextProcessSessionId cross-.so identity test (IP-T1(d)).
+create_iora_plugin_target(core_test_session_id_plugin
+    SOURCES SessionIdPlugin.cpp
+)

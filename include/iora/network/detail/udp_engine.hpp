@@ -279,7 +279,7 @@ public:
       return ConnectResult::err(
         TransportErrorInfo{TransportError::Config, "TLS/DTLS not supported on UDP"});
     }
-    SessionId sid = _nextSessionId++;
+    SessionId sid = nextProcessSessionId();
     return insertConnectingAndEnqueue(
       sid, [&] { return Cmd::connect(ConnectReq{sid, host, port}); },
       "connect: transport shutting down");
@@ -313,7 +313,7 @@ public:
         hint = *parsed;
       }
     }
-    SessionId sid = _nextSessionId++;
+    SessionId sid = nextProcessSessionId();
     // UDP-specific: unlike TCP (a not-supported stub), connectViaListener genuinely
     // enqueues here; same A3.1a ordering via the shared helper.
     return insertConnectingAndEnqueue(
@@ -324,7 +324,7 @@ public:
   /// \brief DP-SS1: mint a session id ONLY (no _connecting insert, no enqueue). See
   /// EngineBase::allocateSid. Not yet sendable until connectWith() (a premature send()
   /// is rejected, not dropped — trySend finds it in neither _sessions nor _connecting).
-  SessionId allocateSid() override { return _nextSessionId++; }
+  SessionId allocateSid() override { return nextProcessSessionId(); }
 
   /// \brief DP-SS2: enqueue the connect for a caller-supplied \p sid (from
   /// allocateSid()) via the shared helper (insert _connecting -> release -> enqueue),
@@ -359,7 +359,7 @@ public:
                                            const char *shuttingDownMsg, bool checkInUse = false)
   {
     // Defensive: reject the invalid-sid sentinel (0) on the connectWith path (checkInUse);
-    // connect()/connectViaListener() mint via _nextSessionId (starts at 1) so it never fires.
+    // connect()/connectViaListener() mint via nextProcessSessionId (starts at 1) so it never fires.
     if (checkInUse && sid == 0)
     {
       return ConnectResult::err(TransportErrorInfo{TransportError::Unknown, "connectWith: invalid sid"});
@@ -2461,7 +2461,7 @@ private:
             {
               continue; // no SessionId yet -> silent drop (peer retransmits)
             }
-            sid = _nextSessionId++;
+            sid = nextProcessSessionId();
             auto s = std::make_unique<Session>();
             s->id = sid;
             s->role = Role::ServerPeer;
@@ -3753,7 +3753,6 @@ private:
   // resolveTimeoutOnIo via the GC scan, Close drain, shutdownDrain) runs on the
   // I/O loop thread, so no lock is taken.
   std::unordered_map<SessionId, PendingConnect> _pendingConnects;
-  std::atomic<SessionId> _nextSessionId{1};
   std::atomic<ListenerId> _nextListenerId{1};
 
   // Batch processor (created when batching is enabled)
