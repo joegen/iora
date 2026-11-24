@@ -85,6 +85,20 @@ struct TcpEngineTestAccess
     return e._pendingConnects.size();
   }
 
+  /// True iff the server SSL_CTX is allocated. Call only while the engine is not running.
+  static bool hasServerSslCtx(const TcpEngine &e)
+  {
+    assert(!e._running.load() && "call when not running");
+    return e._sslSrv != nullptr;
+  }
+
+  /// True iff the client SSL_CTX is allocated. Call only while the engine is not running.
+  static bool hasClientSslCtx(const TcpEngine &e)
+  {
+    assert(!e._running.load() && "call when not running");
+    return e._sslCli != nullptr;
+  }
+
   /// True iff \p sid is an inserted, not-closed session.
   static bool hasSession(const TcpEngine &e, SessionId sid)
   {

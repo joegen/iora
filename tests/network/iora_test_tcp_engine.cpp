@@ -2,6 +2,7 @@
 #include <catch2/catch.hpp>
 #include "iora/network/detail/tcp_engine.hpp"
 #include "iora_test_net_utils.hpp"
+#include "network/tcp_engine_test_access.hpp"
 #include "test_helpers.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
@@ -1396,6 +1397,50 @@ inline bool tlsHalfCloseCerts(std::string &certFile, std::string &keyFile)
   return testnet::tlsCertFileReadable(certFile);
 }
 } // namespace
+
+TEST_CASE("TcpEngine start() with an unreadable server cert frees the TLS contexts",
+          "[tcp][tls][inittls-fail]")
+{
+  using iora::network::TcpEngineTestAccess;
+  TransportConfig cfg{};
+  cfg.serverTls.enabled = true;
+  cfg.serverTls.defaultMode = TlsMode::Server;
+  cfg.serverTls.certFile = "/nonexistent/iora-inittls-fail-cert.pem";
+  cfg.serverTls.keyFile = "/nonexistent/iora-inittls-fail-key.pem";
+  TcpEngine e(cfg);
+
+  auto r = e.start();
+  REQUIRE(r.isErr());
+  CHECK(r.error().code == TransportError::Config);
+  CHECK(r.error().message.find("Server cert file not readable") != std::string::npos);
+  CHECK_FALSE(TcpEngineTestAccess::hasServerSslCtx(e));
+  CHECK_FALSE(TcpEngineTestAccess::hasClientSslCtx(e));
+}
+
+TEST_CASE("TcpEngine start() failing in the client TLS context also frees the built server context",
+          "[tcp][tls][inittls-fail]")
+{
+  using iora::network::TcpEngineTestAccess;
+  std::string certFile, keyFile;
+  REQUIRE(tlsHalfCloseCerts(certFile, keyFile));
+
+  TransportConfig cfg{};
+  cfg.serverTls.enabled = true;
+  cfg.serverTls.defaultMode = TlsMode::Server;
+  cfg.serverTls.certFile = certFile;
+  cfg.serverTls.keyFile = keyFile;
+  cfg.clientTls.enabled = true;
+  cfg.clientTls.defaultMode = TlsMode::Client;
+  cfg.clientTls.certFile = "/nonexistent/iora-inittls-fail-client-cert.pem";
+  TcpEngine e(cfg);
+
+  auto r = e.start();
+  REQUIRE(r.isErr());
+  CHECK(r.error().code == TransportError::Config);
+  CHECK(r.error().message.find("Client cert file not readable") != std::string::npos);
+  CHECK_FALSE(TcpEngineTestAccess::hasServerSslCtx(e));
+  CHECK_FALSE(TcpEngineTestAccess::hasClientSslCtx(e));
+}
 
 TEST_CASE("TLS full exchange echoes (positive control for the half-close pin)",
           "[tcp][halfclose][tls]")
