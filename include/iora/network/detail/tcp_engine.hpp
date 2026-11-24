@@ -215,6 +215,7 @@ public:
     if (!initTls())
     {
       _running.store(false);
+      freeTls();
       return StartResult::err(lastError());
     }
 
